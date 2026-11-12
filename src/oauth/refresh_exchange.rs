@@ -11,17 +11,16 @@ fn body_network_failure(error: &reqwest::Error) -> bool {
     // reqwest 0.13. Inspect typed causes rather than retrying every decode error.
     let mut source = error.source();
     while let Some(cause) = source {
-        if let Some(error) = cause.downcast_ref::<hyper::Error>() {
-            if error.is_incomplete_message()
+        if let Some(error) = cause.downcast_ref::<hyper::Error>()
+            && (error.is_incomplete_message()
                 || error.is_closed()
                 || error.is_canceled()
-                || error.is_timeout()
-            {
-                return true;
-            }
+                || error.is_timeout())
+        {
+            return true;
         }
-        if let Some(error) = cause.downcast_ref::<std::io::Error>() {
-            if matches!(
+        if let Some(error) = cause.downcast_ref::<std::io::Error>()
+            && matches!(
                 error.kind(),
                 std::io::ErrorKind::ConnectionReset
                     | std::io::ErrorKind::ConnectionAborted
@@ -29,9 +28,9 @@ fn body_network_failure(error: &reqwest::Error) -> bool {
                     | std::io::ErrorKind::NotConnected
                     | std::io::ErrorKind::UnexpectedEof
                     | std::io::ErrorKind::TimedOut
-            ) {
-                return true;
-            }
+            )
+        {
+            return true;
         }
         source = cause.source();
     }
@@ -74,10 +73,10 @@ pub(super) async fn execute_started(
         Err(error) => {
             // Only connector evidence proves that no request reached the
             // authorization server. Every ambiguous dispatch retains its fence.
-            if error.is_connect() {
-                if let Some(guard) = connector_guard {
-                    guard.mark_request_not_sent(&error).await?;
-                }
+            if error.is_connect()
+                && let Some(guard) = connector_guard
+            {
+                guard.mark_request_not_sent(&error).await?;
             }
             return Err(observed(
                 if error.is_timeout() {
