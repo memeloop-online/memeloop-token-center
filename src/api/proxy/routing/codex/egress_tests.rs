@@ -96,6 +96,7 @@ impl Fixture {
             .await
             .unwrap();
         let route = PreparedProxyRoute {
+            request_workspace: None,
             inspect_stream_rejection: false,
             route: ResolvedUpstream {
                 route_id: Uuid::new_v4(),
