@@ -673,10 +673,9 @@ export async function run(binary: string, output: string): Promise<boolean> {
       try { await deadline(Promise.all(clients.map((client) => client.uploaded)), 30_000, "concurrent upload boundaries"); }
       finally { responseGate.release(); responseGate = undefined; }
       const results = await Promise.all(clients.map((client) => client.result));
-      assert(results.every((item) => item.status === 200 || (item.status === 503 && Number(item.retryAfter) >= 1)), "pressure may fail closed only with 503 and Retry-After");
+      assert(results.every((item) => item.status === 200 && item.bytes === current.bytes && item.sha256 === planHash(current)), "all four concurrent 16MiB requests must complete with exact response bytes/hash");
       assert(upstreamCalls - callsBefore === results.filter((item) => item.status === 200).length, "rejected pressure requests must not dispatch upstream");
-      // Admission winners depend on scheduling; even an all-503 pressure batch
-      // is valid. Require deterministic real work after every owner drains.
+      // Require deterministic real work after every owner drains.
       await drain();
       const recovery = await send(base, key, responsesInputPlan(16 * MIB)).result;
       assert(recovery.status === 200 && recovery.bytes === current.bytes && recovery.sha256 === planHash(current), "single 16MiB recovery must succeed with exact response bytes");

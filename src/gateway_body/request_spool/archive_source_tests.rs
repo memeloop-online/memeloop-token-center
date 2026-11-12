@@ -56,7 +56,7 @@ async fn archive_source_survives_request_drop_without_pinning_upload_bytes_on_da
     drop(raw);
     source.release_retained();
     drop(memory);
-    assert!(budget.snapshot().0 >= body.len());
+    assert_eq!(budget.snapshot().0, 0, "local file owns the pending upload");
     release.send(()).unwrap();
     assert!(
         tokio::time::timeout(Duration::from_secs(1), source.upload_outcome())
@@ -272,7 +272,11 @@ async fn failed_source_retries_the_original_bytes_without_releasing_their_budget
     source.release_retained();
     drop(source);
     drop(memory);
-    assert!(budget.snapshot().0 >= 128 * 1024);
+    assert_eq!(
+        budget.snapshot().0,
+        0,
+        "failed archive retries retain the local file, not raw memory"
+    );
     drop(held);
     store.fail_writes.store(false, Ordering::Release);
     tokio::time::timeout(Duration::from_secs(3), async {

@@ -47,15 +47,15 @@ pub(super) async fn parse(
     source: Arc<RequestSpool>,
     memory: Arc<ProxyMemoryReservation>,
 ) -> Result<Value, AppError> {
-    let mut working = None;
-    source.reclaim_for(|| {
-        working = memory.try_reserve_archive_output(64 * 1024);
-        working.is_some()
-    });
-    let working = working.ok_or_else(|| AppError::capacity_error("proxy_memory_json"))?;
-    if !source.reclaim_for(|| memory.try_reserve_json_shape(source.len(), source.json_nodes())) {
-        return Err(AppError::capacity_error("proxy_memory_json"));
-    }
+    // Upload and parse both reopen the complete local file. Neither needs the
+    // resident cache to remain charged while JSON admission waits.
+    source.release_local_retained();
+    let working = memory
+        .reserve_source_json(source.len(), source.json_nodes(), || {
+            source.reclaim_for(|| false);
+        })
+        .await
+        .ok_or_else(|| AppError::capacity_error("proxy_memory_json"))?;
     let download = source
         .open_stream()
         .await
