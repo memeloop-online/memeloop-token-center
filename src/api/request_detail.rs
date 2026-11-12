@@ -484,7 +484,9 @@ async fn archive_value(state: &AppState, location: &str) -> ArchiveValue {
                 return Err(AppError::storage("archive_preview_range_mismatch"));
             }
         }
-        if size > MAX_ARCHIVE_DETAIL_BODY as u64 || is_sse_prefix(&prefix) {
+        if size > MAX_ARCHIVE_DETAIL_BODY as u64
+            || (is_sse_prefix(&prefix) && size > MAX_ARCHIVE_DETAIL_JSON_STRING_BYTES as u64)
+        {
             return Ok(ArchiveValue::streamed(size));
         }
         let bytes = state
@@ -526,6 +528,16 @@ fn is_sse_prefix(bytes: &[u8]) -> bool {
 }
 
 fn decode_archive_value(bytes: &[u8]) -> ArchiveValue {
+    // SSE is framed text, not one JSON document. Preserve existing small text
+    // previews without applying JSON node/depth accounting across all frames.
+    if bytes.len() <= MAX_ARCHIVE_DETAIL_JSON_STRING_BYTES && is_sse_prefix(bytes) {
+        return ArchiveValue {
+            value: Value::String(String::from_utf8_lossy(bytes).into_owned()),
+            complete: true,
+            reason: None,
+            preview: None,
+        };
+    }
     if bytes.len() > MAX_ARCHIVE_DETAIL_BODY || !json_bytes_structure_is_bounded(bytes) {
         return ArchiveValue::gap("archive_payload_invalid");
     }

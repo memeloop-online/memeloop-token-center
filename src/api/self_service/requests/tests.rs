@@ -422,10 +422,24 @@ async fn request_detail_serializes_the_shared_supplier_reason_at_the_top_level()
 #[tokio::test]
 async fn readable_stream_archives_are_not_reported_as_missing_or_invalid() {
     let (state, _directory) = test_state().await;
+    let small = b"data: {\"choices\":[{\"delta\":{\"content\":\"original\"}}]}\n\ndata: [DONE]\n\n";
+    let small_location = format!("detail-preview/{}.body", Uuid::now_v7());
+    state
+        .archive
+        .put(&small_location, small.as_slice().into())
+        .await
+        .unwrap();
+    let mut small_refs = request_detail_refs(Uuid::now_v7());
+    small_refs.response_object = Some(small_location);
+    let small_detail = crate::api::request_detail::request_detail(&state, small_refs).await;
+    assert!(small_detail.archive_complete);
+    assert_eq!(
+        small_detail.response_body,
+        Value::String(String::from_utf8(small.to_vec()).unwrap())
+    );
+    assert!(small_detail.archive.response.preview.is_none());
     let cases = [
-        b"data: {\"choices\":[{\"delta\":{\"content\":\"original\"}}]}\n\ndata: [DONE]\n\n"
-            .to_vec(),
-        ("data: {\"choices\":[{\"delta\":{\"content\":\"original\"}}]}\n\n".repeat(3000)
+        ("data: {\"choices\":[{\"delta\":{\"content\":\"original\"}}]}\n\n".repeat(6000)
             + "data: [DONE]\n\n")
             .into_bytes(),
         format!(
