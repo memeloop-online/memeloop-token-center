@@ -106,10 +106,10 @@ export async function bridge(options: Options, connect = (binary: string, args: 
     try {
       const child = await run(options.kimiModel, p.arguments.task, undefined, id => { delegation.childThreadId = id; });
       delegation.result = child.result; delegation.status = child.result.status; await save();
-      return { success: child.result.status === 'completed', contentItems: [{ type: 'inputText', text: JSON.stringify(child) }] };
+      return { success: child.result.status === 'completed', contentItems: [{ type: 'inputText', text: JSON.stringify(child).replaceAll(options.apiKey, '[redacted]') }] };
     } catch (error) {
       delegation.status = 'failed'; delegation.error = error instanceof Error ? error.message : 'child_failed'; await save();
-      return { success: false, contentItems: [{ type: 'inputText', text: JSON.stringify(delegation) }] };
+      return { success: false, contentItems: [{ type: 'inputText', text: JSON.stringify(delegation).replaceAll(options.apiKey, '[redacted]') }] };
     }
   };
   try {
