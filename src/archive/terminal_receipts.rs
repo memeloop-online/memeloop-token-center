@@ -10,10 +10,7 @@ impl ArchiveStore {
     pub(crate) fn terminal_receipts(
         &self,
         namespace: &str,
-    ) -> Result<
-        impl Stream<Item = Result<TerminalReceipt, AppError>> + Send + '_,
-        AppError,
-    > {
+    ) -> Result<impl Stream<Item = Result<TerminalReceipt, AppError>> + Send + '_, AppError> {
         let prefix = archive_path(&format!("terminal-receipts/v1/{namespace}"))?;
         Ok(self.inner.list(Some(&prefix)).filter_map(move |entry| {
             let prefix = prefix.clone();
