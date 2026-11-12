@@ -992,14 +992,19 @@ fn evict_oldest_settled(usage: &RequestSpoolUsage) -> bool {
         let Some(shared) = resident.upgrade() else {
             continue;
         };
-        let still_resident = shared
+        let reclaimable = shared
             .body
             .lock()
             .unwrap_or_else(|error| error.into_inner())
             .as_ref()
-            .is_some_and(Bytes::is_unique);
-        if !still_resident {
-            continue;
+            .map(Bytes::is_unique);
+        match reclaimable {
+            None => continue,
+            Some(false) => {
+                residents.push_back(Arc::downgrade(&shared));
+                continue;
+            }
+            Some(true) => {}
         }
         if shared.local.is_none()
             && (!shared.residency.durable_settled.load(Ordering::Acquire)
