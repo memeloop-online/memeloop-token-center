@@ -1634,7 +1634,11 @@ async fn unknown_failure_retries_operational_projection() {
     } else {
         // The operational/statistical terminal can exist while finance still
         // owns the pending request. Real evidence then uses the normal finish.
-        assert!(progressed);
+        // Financial commit can precede asynchronous receipt publication and
+        // retirement. Recovery reports progress only once both have completed.
+        if progressed {
+            assert!(!recovery.contains_receipt_for_test(receipt_id));
+        }
         assert_eq!(financial.0, "applied");
         assert!(financial.1.unwrap() > 0);
         assert_eq!(financial.2, 1);
