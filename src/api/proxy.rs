@@ -1344,7 +1344,7 @@ async fn proxy_with_cancellation_guard(
         protocol,
         tenant_id: key.tenant_id,
         original_response_capture: false,
-        memory,
+        memory: memory.clone(),
     };
     // Native streams and source-backed Responses retain their charged request
     // under the process-wide budget without occupying buffered-response
