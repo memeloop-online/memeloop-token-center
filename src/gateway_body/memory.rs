@@ -74,6 +74,7 @@ impl ProxyMemoryBudget {
     pub(crate) fn reservation(&self) -> Arc<ProxyMemoryReservation> {
         Arc::new(ProxyMemoryReservation {
             permits: self.permits.clone(),
+            capacity: self.capacity,
             held: Mutex::new((0, None)),
             response_reserved: AtomicBool::new(false),
             response_bytes: AtomicUsize::new(0),
@@ -130,6 +131,7 @@ impl ProxyMemoryBudget {
 }
 
 pub(crate) struct ProxyMemoryReservation {
+    capacity: usize,
     permits: Arc<Semaphore>,
     held: Mutex<(usize, Option<OwnedSemaphorePermit>)>,
     response_reserved: AtomicBool,
@@ -619,6 +621,34 @@ impl ProxyMemoryReservation {
         self.try_reserve_json_shape(body.len(), nodes)
     }
 
+    /// Wait without joining the semaphore FIFO: a large JSON waiter must not
+    /// prevent active requests from acquiring small response buffers and releasing
+    /// their JSON owners. The caller retains only its locally replayable source.
+    pub(crate) async fn reserve_source_json(
+        self: &Arc<Self>,
+        bytes: usize,
+        nodes: usize,
+    ) -> Option<ArchiveOutputMemory> {
+        let json = bytes.checked_mul(3)?.checked_add(nodes.checked_mul(256)?)?;
+        let working = 64 * 1024;
+        let total = json.checked_add(working)?;
+        if total.div_ceil(UNIT_BYTES) > self.capacity / UNIT_BYTES {
+            return None;
+        }
+        while !self.try_grow(total, 1) {
+            // No parsed tree, raw read buffer, or partial JSON permit is held.
+            // Dropping the request cancels this wait without a detached task.
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        self.json_body_ceiling.store(bytes, Ordering::Release);
+        self.json_node_ceiling.store(nodes, Ordering::Release);
+        self.json_reserved_bytes.fetch_add(json, Ordering::AcqRel);
+        Some(ArchiveOutputMemory {
+            reservation: self.clone(),
+            bytes: working,
+        })
+    }
+
     pub(crate) fn try_reserve_json_shape(&self, bytes: usize, nodes: usize) -> bool {
         let Some(required) = bytes.checked_mul(3).and_then(|bytes| {
             nodes
@@ -709,6 +739,28 @@ pub(crate) fn json_encoded_length(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn source_json_wait_does_not_block_response_allocation_or_leak_on_cancel() {
+        let budget = ProxyMemoryBudget::new(1024 * 1024);
+        let active = budget.reservation();
+        assert!(active.try_grow(768 * 1024, 1));
+        let waiting = budget.reservation();
+        let mut admission = Box::pin(waiting.reserve_source_json(128 * 1024, 1));
+        assert!(futures_util::poll!(&mut admission).is_pending());
+        assert_eq!(budget.snapshot().0, 768 * 1024);
+        // The waiter must not enter the semaphore FIFO ahead of this owner.
+        let response = active.try_reserve_archive_output(64 * 1024).unwrap();
+        drop(admission);
+        assert_eq!(budget.snapshot().0, 832 * 1024);
+        drop(response);
+        active.release(768 * 1024, 1);
+        let working = waiting.reserve_source_json(128 * 1024, 1).await.unwrap();
+        assert!(waiting.request_json_reserved_bytes() > 0);
+        drop(working);
+        waiting.release_unretained_json();
+        assert_eq!(budget.snapshot().0, 0);
+    }
 
     #[test]
     fn four_gib_budget_keeps_full_capacity_and_releases_large_reservations() {

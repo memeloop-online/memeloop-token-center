@@ -220,12 +220,13 @@ struct BodyResidency {
     metadata: Mutex<Option<Arc<tokio::sync::OwnedSemaphorePermit>>>,
     memory_released: AtomicBool,
     durable_settled: AtomicBool,
+    local_backed: bool,
 }
 
 impl BodyResidency {
     fn release_if_idle(&self) {
         if self.memory_released.load(Ordering::Acquire)
-            && self.durable_settled.load(Ordering::Acquire)
+            && (self.local_backed || self.durable_settled.load(Ordering::Acquire))
         {
             if let Ok(mut frames) = self.frames.lock() {
                 frames.clear();
@@ -361,7 +362,8 @@ impl RequestSpoolAdmission {
         let mut hasher = blake3::Hasher::new();
         let mut json_scanner = super::memory::JsonMemoryScanner::default();
         let mut spilling = memory.is_some() && metadata.is_none();
-        let mut sink = if spilling {
+        let local_backed = memory.is_some();
+        let mut sink = if spilling || local_backed {
             Some(open_spill(&self.usage.directory).await?)
         } else {
             None
@@ -387,6 +389,9 @@ impl RequestSpoolAdmission {
                 abort_spill(sink).await;
                 return Err(RequestSpoolCaptureError::TooLarge);
             }
+            if local_backed && let Some(sink) = sink.as_mut() {
+                write_spill(sink, chunk.clone()).await?;
+            }
             if !spilling {
                 let mut frame_memory = memory
                     .and_then(|memory| memory.try_reserve_ingress_bytes(chunk.len()).map(Arc::new));
@@ -406,8 +411,10 @@ impl RequestSpoolAdmission {
                     if let Ok(mut lease) = lease.lock() {
                         lease.release_all();
                     }
-                    sink = Some(open_spill(&self.usage.directory).await?);
-                    if let Some(sink) = sink.as_mut() {
+                    if !local_backed {
+                        sink = Some(open_spill(&self.usage.directory).await?);
+                    }
+                    if !local_backed && let Some(sink) = sink.as_mut() {
                         write_spill(sink, prior).await?;
                         write_spill(sink, chunk.clone()).await?;
                     }
@@ -421,7 +428,7 @@ impl RequestSpoolAdmission {
                         .record_written(chunk.len());
                     retained.extend_from_slice(&chunk);
                 }
-            } else if let Some(sink) = sink.as_mut() {
+            } else if !local_backed && let Some(sink) = sink.as_mut() {
                 write_spill(sink, chunk.clone()).await?;
             }
             hasher.update(&chunk);
@@ -451,12 +458,16 @@ impl RequestSpoolAdmission {
                 })
                 .arm());
         }
+        let local = match sink.take() {
+            Some(sink) => Some(finish_spill(sink).await?),
+            None => None,
+        };
         let retained = Bytes::from(retained);
         let publish = durable.is_some() && object_key.is_some();
         Ok(self
             .finished_spool(CapturedBody {
                 body: Some(retained),
-                local: None,
+                local,
                 length,
                 json_nodes: json_scanner.observe(&[]),
                 digest,
@@ -471,6 +482,7 @@ impl RequestSpoolAdmission {
     }
 
     fn finished_spool(&self, captured: CapturedBody) -> RequestSpool {
+        let local_backed = captured.local.is_some();
         let durable_ok = captured.durable_settled && captured.durable.is_some();
         RequestSpool {
             shared: Arc::new(SharedBody {
@@ -484,6 +496,7 @@ impl RequestSpoolAdmission {
                     metadata: Mutex::new(captured.metadata),
                     memory_released: AtomicBool::new(false),
                     durable_settled: AtomicBool::new(captured.durable_settled),
+                    local_backed,
                 }),
                 lease: captured.lease,
                 durable: captured.durable,
@@ -686,6 +699,13 @@ impl RequestSpool {
     }
     pub(crate) fn len(&self) -> usize {
         self.shared.length
+    }
+
+    /// The complete local file owns replay independently of archive upload.
+    pub(crate) fn release_local_retained(&self) {
+        if self.shared.local.is_some() {
+            release_resident_memory(&self.shared);
+        }
     }
 
     pub(crate) fn json_nodes(&self) -> usize {
@@ -1003,7 +1023,9 @@ fn publish_durable(shared: &Arc<SharedBody>) {
         .body
         .lock()
         .unwrap_or_else(|error| error.into_inner())
-        .clone();
+        .as_ref()
+        .filter(|_| shared.local.is_none())
+        .cloned();
     let local = shared.local.clone();
     if bytes.is_none() && local.is_none() {
         return;
@@ -1239,6 +1261,41 @@ mod tests {
 
     fn file_count(directory: &Path) -> usize {
         std::fs::read_dir(directory).map_or(0, |entries| entries.count())
+    }
+
+    #[tokio::test]
+    async fn local_source_releases_cache_while_archive_upload_is_paused() {
+        let directory = tempfile::tempdir().unwrap();
+        let store = MemoryObjectStore::new();
+        let resume = store.pause_next_write();
+        let admission = RequestSpoolAdmission::new(directory.path().to_owned())
+            .with_memory_store(store.clone());
+        let budget = crate::gateway_body::memory::ProxyMemoryBudget::new(1024 * 1024);
+        let body = Bytes::from(vec![b'x'; 128 * 1024]);
+        let source = admission
+            .capture_with_memory(
+                Body::from(body.clone()),
+                body.len(),
+                Some(body.len()),
+                Some(&budget.reservation()),
+                0,
+                None,
+            )
+            .await
+            .unwrap();
+        while store.entered_writes.load(Ordering::Acquire) == 0 {
+            tokio::task::yield_now().await;
+        }
+        assert!(budget.snapshot().0 > 0);
+        assert!(!source.shared.durable_ok.load(Ordering::Acquire));
+        source.release_local_retained();
+        assert_eq!(budget.snapshot().0, 0);
+        assert_eq!(source.read_all().await.unwrap(), body);
+        assert_eq!(store.reads.load(Ordering::Acquire), 0);
+        assert!(!source.shared.durable_ok.load(Ordering::Acquire));
+        resume.send(()).unwrap();
+        assert!(source.upload_outcome().await);
+        assert_eq!(source.read_all().await.unwrap(), body);
     }
 
     #[tokio::test]
