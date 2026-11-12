@@ -244,6 +244,7 @@ impl Database {
                 "terminal projection owner changed".into(),
             ));
         }
+        super::super::history_immutable_outbox::capture_native_in_transaction(&mut transaction, &request_id).await?;
         transaction.commit().await?;
         Ok(true)
     }

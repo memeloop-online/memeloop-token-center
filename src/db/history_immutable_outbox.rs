@@ -106,13 +106,22 @@ impl Database {
         page_size: i64,
     ) -> Result<Vec<crate::request_history::HistorySnapshot>, crate::request_history::HistoryError> {
         use crate::request_history::{HistoryError, HistoryIdentity, HistorySnapshot};
-        let rows = sqlx::query("SELECT revision,snapshot,delivery_snapshot FROM request_history_immutable_outbox ORDER BY revision LIMIT $1")
+        let rows = sqlx::query("SELECT revision,source,request_id,tenant_id,key_id,created_at,snapshot,delivery_snapshot FROM request_history_immutable_outbox ORDER BY revision LIMIT $1")
             .bind(page_size).fetch_all(&self.pool).await?;
         let mut snapshots = Vec::with_capacity(rows.len());
         for row in rows {
             let revision: i64 = row.try_get("revision")?;
+            let stored_identity = HistoryIdentity {
+                source: row.try_get("source")?, request_id: parse_uuid(row.try_get("request_id")?)?,
+                tenant_id: parse_uuid(row.try_get("tenant_id")?)?, key_id: parse_uuid(row.try_get("key_id")?)?,
+                created_at: row.try_get("created_at")?,
+            };
             if let Some(frozen) = row.try_get::<Option<String>,_>("delivery_snapshot")? {
-                snapshots.push(serde_json::from_str(&frozen)?);
+                let snapshot: HistorySnapshot = serde_json::from_str(&frozen)?;
+                if snapshot.identity != stored_identity || snapshot.revision != revision {
+                    return Err(HistoryError::Invalid("immutable delivery identity"));
+                }
+                snapshots.push(snapshot);
                 continue;
             }
             let original: String = row.try_get("snapshot")?;
@@ -121,7 +130,7 @@ impl Database {
                 return Err(HistoryError::Invalid("immutable history envelope version or source"));
             }
             let identity: HistoryIdentity = serde_json::from_value(envelope.clone())?;
-            if envelope["revision"].as_i64() != Some(revision) {
+            if identity != stored_identity || envelope["revision"].as_i64() != Some(revision) {
                 return Err(HistoryError::Invalid("immutable history envelope revision"));
             }
             // A previously frozen legacy delivery remains authoritative for
@@ -152,5 +161,50 @@ impl Database {
             }
         }
         Ok(snapshots)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::request_history::{HistoryIdentity, HistorySnapshot};
+
+    #[tokio::test]
+    async fn immutable_history_delivery_survives_source_absence_restart_and_stale_ack() {
+        let directory = tempfile::tempdir().unwrap();
+        let url = format!("sqlite://{}?mode=rwc", directory.path().join("history.sqlite").display());
+        let db = Database::connect(&url).await.unwrap();
+        db.migrate().await.unwrap();
+        let identity = HistoryIdentity { source: "native".into(), request_id: Uuid::now_v7(), tenant_id: Uuid::now_v7(), key_id: Uuid::now_v7(), created_at: 42 };
+        let first = HistorySnapshot { identity: identity.clone(), revision: 1, filter_cost_micros: None, payload: None, statistics: None, read_model: Value::Null };
+        let second = HistorySnapshot { revision: 2, ..first.clone() };
+        for snapshot in [&first, &second] {
+            sqlx::query("INSERT INTO request_history_immutable_outbox (revision,source,request_id,tenant_id,key_id,created_at,snapshot,delivery_snapshot) VALUES ($1,$2,$3,$4,$5,$6,'{}',$7)")
+                .bind(snapshot.revision).bind(&identity.source).bind(identity.request_id.to_string()).bind(identity.tenant_id.to_string()).bind(identity.key_id.to_string()).bind(identity.created_at).bind(serde_json::to_string(snapshot).unwrap())
+                .execute(&db.pool).await.unwrap();
+        }
+        // No original request, key or source journal is present.
+        let pending = db.history_pending(1).await.unwrap();
+        assert_eq!(pending.len(), 1);
+        assert_eq!(pending[0].revision, 1);
+        let mut wrong_key = first.clone();
+        wrong_key.identity.key_id = Uuid::now_v7();
+        db.history_acknowledge(&[wrong_key]).await.unwrap();
+        let mut wrong_payload = first.clone();
+        wrong_payload.filter_cost_micros = Some(0);
+        db.history_acknowledge(&[wrong_payload]).await.unwrap();
+        assert_eq!(db.history_pending_count().await.unwrap(), 2);
+        db.history_acknowledge(&[first.clone()]).await.unwrap();
+        db.history_acknowledge(&[first]).await.unwrap();
+        assert_eq!(db.history_pending_count().await.unwrap(), 1);
+        db.pool.close().await;
+        let reopened = Database::connect(&url).await.unwrap();
+        let pending = reopened.history_pending(10).await.unwrap();
+        assert_eq!(pending.len(), 1);
+        assert_eq!(pending[0].revision, 2);
+        assert_eq!(pending[0].identity, identity);
+        assert_eq!(pending[0].filter_cost_micros, None);
+        reopened.history_acknowledge(&pending).await.unwrap();
+        assert_eq!(reopened.history_pending_count().await.unwrap(), 0);
     }
 }

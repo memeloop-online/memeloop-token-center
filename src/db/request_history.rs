@@ -293,7 +293,7 @@ impl Database {
     pub async fn history_refresh(&self) -> Result<(), HistoryError> {
         let mut tx = self.begin_write_transaction().await?;
         sqlx::query("UPDATE request_history_state SET mode = 'shadow', verified_revision = NULL, verification_json = NULL WHERE id = 1").execute(&mut *tx).await?;
-        let pending: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM request_history_export")
+        let pending: i64 = sqlx::query_scalar("SELECT (SELECT COUNT(*) FROM request_history_export) + (SELECT COUNT(*) FROM request_history_immutable_outbox)")
             .fetch_one(&mut *tx)
             .await?;
         if pending != 0 {
@@ -410,6 +410,10 @@ impl Database {
         &self,
         page_size: i64,
     ) -> Result<Vec<HistorySnapshot>, HistoryError> {
+        let immutable = self.history_immutable_pending(page_size).await?;
+        if !immutable.is_empty() {
+            return Ok(immutable);
+        }
         let rows = sqlx::query("SELECT revision, source, request_id, tenant_id, key_id, created_at, snapshot FROM request_history_export ORDER BY revision LIMIT $1")
             .bind(page_size).fetch_all(&self.pool).await?;
         let mut snapshots = Vec::new();
@@ -439,6 +443,16 @@ impl Database {
         let mut transaction = self.pool.begin().await?;
         const ACK: &str = "DELETE FROM request_history_export WHERE revision = $1 AND source = $2 AND request_id = $3 AND snapshot = $4";
         for snapshot in snapshots {
+            let frozen = serde_json::to_string(snapshot)?;
+            // During rollout the old source journal may still contain this
+            // identity. Freeze it only when the immutable delivery proves the
+            // same complete tenant/key/revision and exact delivery bytes.
+            sqlx::query("UPDATE request_history_export SET snapshot=COALESCE(snapshot,$1) WHERE revision=$2 AND source=$3 AND request_id=$4 AND tenant_id=$5 AND key_id=$6 AND EXISTS (SELECT 1 FROM request_history_immutable_outbox i WHERE i.revision=$2 AND i.source=$3 AND i.request_id=$4 AND i.tenant_id=$5 AND i.key_id=$6 AND i.delivery_snapshot=$1)")
+                .bind(&frozen).bind(snapshot.revision).bind(&snapshot.identity.source).bind(snapshot.identity.request_id.to_string()).bind(snapshot.identity.tenant_id.to_string()).bind(snapshot.identity.key_id.to_string())
+                .execute(&mut *transaction).await?;
+            sqlx::query("DELETE FROM request_history_immutable_outbox WHERE revision=$1 AND source=$2 AND request_id=$3 AND tenant_id=$4 AND key_id=$5 AND delivery_snapshot=$6")
+                .bind(snapshot.revision).bind(&snapshot.identity.source).bind(snapshot.identity.request_id.to_string()).bind(snapshot.identity.tenant_id.to_string()).bind(snapshot.identity.key_id.to_string()).bind(&frozen)
+                .execute(&mut *transaction).await?;
             let deleted = sqlx::query(ACK)
                 .bind(snapshot.revision)
                 .bind(&snapshot.identity.source)

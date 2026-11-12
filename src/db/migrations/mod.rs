@@ -823,6 +823,11 @@ pub(crate) const SQLITE_MIGRATIONS: &[Migration] = &[
         name: "archive staging durable backend identity",
         sql: include_str!("../../../migrations/common/0155_archive_staging_backend_identity.sql"),
     },
+    Migration {
+        version: 156,
+        name: "immutable history delivery envelope",
+        sql: include_str!("../../../migrations/common/0156_immutable_history_outbox.sql"),
+    },
 ];
 
 pub(crate) const POSTGRES_MIGRATIONS: &[Migration] = &[
@@ -1620,6 +1625,11 @@ pub(crate) const POSTGRES_MIGRATIONS: &[Migration] = &[
         version: 155,
         name: "archive staging durable backend identity",
         sql: include_str!("../../../migrations/common/0155_archive_staging_backend_identity.sql"),
+    },
+    Migration {
+        version: 156,
+        name: "immutable history delivery envelope",
+        sql: include_str!("../../../migrations/common/0156_immutable_history_outbox.sql"),
     },
 ];
 

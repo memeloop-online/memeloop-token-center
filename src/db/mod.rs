@@ -1,6 +1,7 @@
 use std::time::Duration;
 
 mod allocation_history;
+mod history_immutable_outbox;
 mod quota_observations;
 
 use chrono::{Days, Utc};
