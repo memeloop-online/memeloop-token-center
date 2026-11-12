@@ -417,12 +417,19 @@ export async function run(binary: string, output: string): Promise<boolean> {
   let underdeclaredResponse = false;
   let responseGate: ReturnType<typeof gate> | undefined;
   let upstreamCalls = 0;
+  const upstreamBodies: { bytes: number; sha256: string }[] = [];
   const mock = createServer(async (req, res) => {
     try {
       if (req.method === "GET") { res.end("{}"); return; }
       if (!["/v1/chat/completions", "/v1/responses"].includes(req.url ?? "")) { res.writeHead(404); res.end(); return; }
       upstreamCalls += 1;
-      for await (const _ of req) { /* real upstream consumes the forwarded body */ }
+      const requestHash = createHash("sha256");
+      let requestBytes = 0;
+      for await (const chunk of req) {
+        requestBytes += chunk.length;
+        requestHash.update(chunk);
+      }
+      upstreamBodies.push({ bytes: requestBytes, sha256: requestHash.digest("hex") });
       if (responseGate) await responseGate.promise;
       if (underdeclaredResponse) {
         // Real HTTP framing exposes only the declared JSON prefix to reqwest;
@@ -459,7 +466,7 @@ export async function run(binary: string, output: string): Promise<boolean> {
       MTC_ARCHIVE_BACKEND: "filesystem", MTC_ARCHIVE_PATH: archive,
       MTC_RESPONSES_REQUEST_SPOOL_PATH: requestSpool,
       MTC_ALLOW_OAUTH_LOOPBACK: "true", MTC_RUN_MIGRATIONS_ON_START: "false",
-      MTC_PROXY_MEMORY_BUDGET_BYTES: String(256 * MIB), MTC_RESPONSES_BODY_MAX_BYTES: String(16 * MIB),
+      MTC_PROXY_MEMORY_BUDGET_BYTES: String(256 * MIB),
       MTC_PRICING_MODELS_DEV_URL: `${mockUrl}/catalog`, MTC_PRICING_LITELLM_URL: `${mockUrl}/catalog`,
       MTC_PRICING_OPENROUTER_URL: `${mockUrl}/catalog`, RUST_LOG: "warn",
     });
@@ -691,13 +698,18 @@ export async function run(binary: string, output: string): Promise<boolean> {
       chunkedResponse = false;
       return result;
     });
-    await phase("64MiB-input-default-policy-rejection", async () => {
-      current = outputPlan(512);
+    await phase("64MiB-input-local-spool-complete", async () => {
+      current = responsesOutputPlan(512);
       const before = upstreamCalls;
-      const result = await send(base, key, responsesInputPlan(64 * MIB), { expectContinue: true }).result;
-      assert([413, 503].includes(result.status) && upstreamCalls === before, "default 16MiB ingress boundary must reject 64MiB before upstream");
-      if (result.status === 503) assert(Number(result.retryAfter) >= 1, "503 requires Retry-After");
-      return result;
+      const observedBefore = upstreamBodies.length;
+      const input = responsesInputPlan(64 * MIB);
+      const result = await send(base, key, input).result;
+      const observations = upstreamBodies.slice(observedBefore);
+      const evidence = { ...result, upstream_bodies: observations };
+      report.phases.at(-1).result = evidence;
+      assert(result.status === 200 && result.bytes === current.bytes && result.sha256 === planHash(current), "64MiB spooled input must complete with exact response bytes/hash");
+      assert(upstreamCalls === before + 1 && observations.length === 1 && observations[0].bytes === input.bytes, "64MiB input must reach upstream completely and exactly once");
+      return evidence;
     });
     await phase("encoded-body-rejected-without-dispatch", async () => {
       const before = upstreamCalls;
