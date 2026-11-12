@@ -526,6 +526,11 @@ impl Database {
         if inserted.rows_affected() != 1 {
             return Err(AppError::internal("finish_site_5"));
         }
+        super::super::super::history_immutable_outbox::capture_generation_in_transaction(
+            &mut transaction,
+            &request_id,
+        )
+        .await?;
         transaction.commit().await?;
         Ok(cost_micros)
     }

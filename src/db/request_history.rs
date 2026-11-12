@@ -410,6 +410,7 @@ impl Database {
         &self,
         page_size: i64,
     ) -> Result<Vec<HistorySnapshot>, HistoryError> {
+        self.history_capture_pending(page_size).await?;
         let immutable = self.history_immutable_pending(page_size).await?;
         if !immutable.is_empty() {
             return Ok(immutable);

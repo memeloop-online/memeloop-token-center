@@ -782,6 +782,22 @@ impl Database {
         session_archive_unlinked_refs_from_row(row)
     }
 
+    pub(crate) async fn history_archive_source_in_transaction(
+        transaction: &mut Transaction<'_, Any>,
+        key_id: Uuid,
+        request_id: &str,
+    ) -> Result<RequestArchiveRefs, AppError> {
+        let row = sqlx::query(
+            "SELECT u.archive_request_id AS id, u.source_started_at AS created_at, u.source_completed_at, u.protocol, u.model, u.status_code, u.duration_ms, CAST(NULL AS BIGINT) AS first_output_ms, CAST(NULL AS BIGINT) AS generation_duration_ms, CAST(NULL AS TEXT) AS usage_basis, NULLIF(u.input_tokens, 0) AS input_tokens, CAST(NULL AS BIGINT) AS cached_input_tokens, CAST(NULL AS BIGINT) AS cache_write_tokens, NULLIF(u.output_tokens, 0) AS output_tokens, u.error_code, u.request_object, u.response_object, u.source, u.external_request_id, c.proof_digest, u.conversation_cluster_id AS session_id, CASE WHEN u.conversation_cluster_id IS NULL THEN 'unlinked' ELSE 'confirmed' END AS session_association, observation.compaction, observation.session_name, observation.task_kind, observation.agent_id, observation.metadata_source AS semantics_source, CAST(NULL AS TEXT) AS tenant_external_id, CAST(NULL AS TEXT) AS credential_key_id, CAST(NULL AS TEXT) AS key_alias, CAST(NULL AS TEXT) AS principal_external_id FROM session_archive_unlinked_requests u JOIN session_archive_correlations c ON c.tenant_id = u.tenant_id AND c.source = u.source AND c.external_request_id = u.external_request_id AND c.disposition = 'unlinked' LEFT JOIN conversation_observations observation ON observation.request_id = u.archive_request_id AND observation.key_id = u.key_id AND observation.cluster_id = u.conversation_cluster_id WHERE u.archive_request_id = $1 AND u.key_id = $2",
+        )
+        .bind(request_id)
+        .bind(key_id.to_string())
+        .fetch_optional(&mut **transaction)
+        .await?
+        .ok_or(AppError::NotFound)?;
+        session_archive_unlinked_refs_from_row(row)
+    }
+
     async fn session_archive_unlinked_refs_for_tenant(
         &self,
         tenant_external_id: &str,
@@ -918,6 +934,21 @@ impl Database {
         .bind(request_id.to_string())
         .bind(key_id.to_string())
         .fetch_optional(&self.pool)
+        .await?
+        .ok_or(AppError::NotFound)?;
+        generation_archive_refs_from_row(row)
+    }
+    pub(crate) async fn history_generation_archive_in_transaction(
+        transaction: &mut Transaction<'_, Any>,
+        key_id: Uuid,
+        request_id: Uuid,
+    ) -> Result<RequestArchiveRefs, AppError> {
+        let row = sqlx::query(
+            "SELECT g.id, g.created_at, g.completed_at, g.public_model, g.upstream_model, g.upstream_account_id, g.model_route_id AS route_id, g.status, g.error_code, g.request_object, g.result_json, facts.billed_units AS facts_billed_units, NULLIF(facts.billing_unit, '') AS facts_billing_unit, facts.cost_micros AS facts_cost_micros, NULLIF(facts.currency, '') AS facts_currency, CAST(NULL AS TEXT) AS tenant_external_id, CAST(NULL AS TEXT) AS credential_key_id, CAST(NULL AS TEXT) AS key_alias, CAST(NULL AS TEXT) AS principal_external_id FROM generation_jobs g LEFT JOIN generation_stats_facts facts ON facts.job_id = g.id AND facts.tenant_id = g.tenant_id AND facts.key_id = g.key_id WHERE g.id = $1 AND g.key_id = $2",
+        )
+        .bind(request_id.to_string())
+        .bind(key_id.to_string())
+        .fetch_optional(&mut **transaction)
         .await?
         .ok_or(AppError::NotFound)?;
         generation_archive_refs_from_row(row)
