@@ -426,14 +426,16 @@ async fn contract(database: &Database) {
     .unwrap();
     // Unbind now retains the selected exit as an authoritative manual policy.
     // A cold legacy-only reader must not bypass that policy via its credential.
-    assert!(legacy
-        .select_config(
-            account.id,
-            snapshot.credential_generation,
-            &credential,
-            &snapshot.config,
-        )
-        .is_err());
+    assert!(
+        legacy
+            .select_config(
+                account.id,
+                snapshot.credential_generation,
+                &credential,
+                &snapshot.config,
+            )
+            .is_err()
+    );
     legacy
         .synchronize_managed_for_test(&database.pool)
         .await
