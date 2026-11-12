@@ -597,7 +597,7 @@ async fn passthrough_reserves_trusted_bound_and_settles_actual_usage_above_4096(
 }
 
 #[tokio::test]
-async fn passthrough_explicit_limit_remains_a_settlement_constraint() {
+async fn passthrough_explicit_limit_is_forwarded_while_actual_usage_settles_once() {
     let upstream = MockServer::start().await;
     let completed = completed_response_with_usage(3, 5_000);
     Mock::given(method("POST"))
@@ -619,20 +619,23 @@ async fn passthrough_explicit_limit_remains_a_settlement_constraint() {
     let _body = to_bytes(response.into_body(), MAX_PROXY_RESPONSE_BODY)
         .await
         .unwrap();
-    cancellation::assert_single_unknown_receipt(&fixture, 502, Some("upstream_invalid_usage"))
-        .await;
+    wait_for_request_settlement(&fixture, 1).await;
     let rows = fixture
         .state
         .db
         .list_requests(fixture.key_id, 10)
         .await
         .unwrap();
-    assert_eq!(rows[0].status_code, Some(502));
+    assert_eq!(rows.len(), 1);
+    assert_eq!(rows[0].status_code, Some(200));
+    assert_eq!(rows[0].error_code, None);
+    assert_eq!((rows[0].input_tokens, rows[0].output_tokens), (3, 5_000));
     assert_eq!(
-        rows[0].error_code.as_deref(),
-        Some("upstream_invalid_usage")
+        rows[0].cost.parse::<Decimal>().unwrap(),
+        Decimal::new(5003, 6)
     );
-    assert!(rows[0].usage.tokens.is_none());
+    assert_exactly_once_side_effects(&fixture, rows[0].request_id, Some("resp-usage-contract"))
+        .await;
     upstream.verify().await;
 }
 

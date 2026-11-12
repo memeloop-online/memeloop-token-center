@@ -7957,7 +7957,7 @@ async fn mock_streaming_responses_invalid_usage(world: &mut TokenCenterWorld) {
                     concat!(
                     "data: {\"type\":\"response.created\",\"response\":{\"id\":\"resp-invalid-usage\"}}\n\n",
                     "data: {\"type\":\"response.output_text.delta\",\"delta\":\"delivered output\"}\n\n",
-                    "data: {\"type\":\"response.completed\",\"response\":{\"id\":\"resp-invalid-usage\",\"usage\":{\"input_tokens\":1,\"output_tokens\":999}}}\n\n",
+                    "data: {\"type\":\"response.completed\",\"response\":{\"id\":\"resp-invalid-usage\",\"usage\":{\"input_tokens\":1,\"output_tokens\":-1}}}\n\n",
                     "data: [DONE]\n\n"
                     ),
                     "text/event-stream",

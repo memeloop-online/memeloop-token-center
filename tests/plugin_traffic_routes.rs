@@ -948,15 +948,17 @@ async fn deny_policy_covers_text_images_seedance_and_comfyui_before_any_upstream
         Decimal::ZERO
     );
     let records = state.db.list_requests(key.key_id, 10).await.unwrap();
-    assert_eq!(records.len(), 1);
-    assert_eq!(records[0].status_code, Some(403));
-    assert_eq!(
-        records[0].terminal_cause_code.as_deref(),
-        Some("gateway_pre_admission")
-    );
-    assert!(!records[0].billing.billable);
-    assert!(records[0].upstream_account_id.is_none());
-    assert!(records[0].route_id.is_none());
+    assert_eq!(records.len(), 2);
+    for record in &records {
+        assert_eq!(record.status_code, Some(403));
+        assert_eq!(
+            record.terminal_cause_code.as_deref(),
+            Some("gateway_pre_admission")
+        );
+        assert!(!record.billing.billable);
+        assert!(record.upstream_account_id.is_none());
+        assert!(record.route_id.is_none());
+    }
     let pool = sqlx::AnyPool::connect(&state.config.database_url)
         .await
         .unwrap();
