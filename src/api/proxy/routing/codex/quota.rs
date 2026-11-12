@@ -63,6 +63,30 @@ fn exhausted_error(error: &Value) -> bool {
     ) && reason == Some(SafeReason::InsufficientQuota)
 }
 
+// Kimi reuses access_terminated_error for a transient concurrency refusal.
+// The type alone is also compatible with authorization loss, so only the
+// observed, complete error-only envelope proves this request was rejected.
+fn concurrency_rejected_before_execution(body: &[u8]) -> bool {
+    let Ok(value) = crate::api::sse::parse_unique_json(body) else {
+        return false;
+    };
+    let Some(root) = value.as_object().filter(|root| root.len() == 1) else {
+        return false;
+    };
+    let Some(error) = root.get("error").and_then(Value::as_object) else {
+        return false;
+    };
+    error
+        .keys()
+        .all(|key| matches!(key.as_str(), "type" | "message" | "code"))
+        && error.get("code").is_none_or(Value::is_null)
+        && error.get("type").and_then(Value::as_str) == Some("access_terminated_error")
+        && error.get("message").and_then(Value::as_str)
+            == Some(
+                "You've reached your concurrent request limit. Please wait for your ongoing requests to finish and try again.",
+            )
+}
+
 pub(in crate::api::proxy) fn quota_evidence(
     headers: &HeaderMap,
     body: Option<&[u8]>,
@@ -374,7 +398,13 @@ pub(in crate::api::proxy) async fn classify_supplier_quota(
     };
     let now = unix_millis();
     let evidence = quota_evidence(&parts.headers, complete.then_some(body.as_slice()), now);
-    let kind = if forbidden && !evidence.exhausted {
+    let concurrency_rejected = forbidden
+        && complete
+        && parts
+            .content_length
+            .is_none_or(|length| length == body.len() as u64)
+        && concurrency_rejected_before_execution(&body);
+    let kind = if forbidden && !evidence.exhausted && !concurrency_rejected {
         UpstreamFailureKind::Authentication
     } else {
         classify(&parts.headers, complete.then_some(body.as_slice()), now)
@@ -394,6 +424,84 @@ mod tests {
     use super::*;
 
     const NOW: i64 = 1_700_000_000_000;
+
+    const CONCURRENCY_MESSAGE: &str = "You've reached your concurrent request limit. Please wait for your ongoing requests to finish and try again.";
+
+    #[tokio::test]
+    async fn concurrency403_requires_complete_error_only_evidence_and_preserves_wire() {
+        let rejection =
+            json!({"error":{"type":"access_terminated_error","message":CONCURRENCY_MESSAGE}});
+        let mut extra_root = rejection.clone();
+        extra_root["usage"] = json!({"total_tokens":1});
+        let mut output = rejection.clone();
+        output["error"]["output"] = json!(["already executed"]);
+        let mut revoked = rejection.clone();
+        revoked["error"]["code"] = json!("invalid_api_key");
+        let bodies = [
+            (serde_json::to_vec(&rejection).unwrap(), true),
+            (serde_json::to_vec(&extra_root).unwrap(), false),
+            (serde_json::to_vec(&output).unwrap(), false),
+            (serde_json::to_vec(&revoked).unwrap(), false),
+            (serde_json::to_vec(&json!({"error":{"type":"access_terminated_error","message":"Your access has been revoked."}})).unwrap(), false),
+            (format!(r#"{{"error":{{"type":"access_terminated_error","type":"authentication_error","message":{}}}}}"#, serde_json::to_string(CONCURRENCY_MESSAGE).unwrap()).into_bytes(), false),
+        ];
+        for (body, expected) in bodies {
+            for length_matches in [true, false] {
+                let mut headers = HeaderMap::new();
+                headers.insert(
+                    header::CONTENT_TYPE,
+                    HeaderValue::from_static("application/json"),
+                );
+                headers.insert(header::RETRY_AFTER, HeaderValue::from_static("30"));
+                let chunks = vec![
+                    Ok(Bytes::copy_from_slice(&body[..body.len() / 2])),
+                    Ok(Bytes::copy_from_slice(&body[body.len() / 2..])),
+                ];
+                let response = UpstreamResponse::Prefetched {
+                    status: StatusCode::FORBIDDEN,
+                    headers,
+                    version: http::Version::HTTP_2,
+                    content_length: Some(body.len() as u64 + u64::from(!length_matches)),
+                    stream: Box::pin(stream::iter(chunks.clone())),
+                };
+                let (response, kind, evidence) = classify_supplier_quota(response).await;
+                assert!(!evidence.exhausted);
+                if expected && length_matches {
+                    assert!(matches!(
+                        kind,
+                        UpstreamFailureKind::RateLimitedUntil {
+                            exhausted: false,
+                            ..
+                        }
+                    ));
+                } else {
+                    assert_eq!(kind, UpstreamFailureKind::Authentication);
+                }
+                assert_eq!(response.bytes_stream().collect::<Vec<_>>().await, chunks);
+            }
+        }
+        // A syntactically complete prefix followed by transport failure is
+        // still incomplete response evidence and cannot authorize replay.
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            header::CONTENT_TYPE,
+            HeaderValue::from_static("application/json"),
+        );
+        let chunks = vec![
+            Ok(Bytes::from(serde_json::to_vec(&rejection).unwrap())),
+            Err("body interrupted"),
+        ];
+        let response = UpstreamResponse::Prefetched {
+            status: StatusCode::FORBIDDEN,
+            headers,
+            version: http::Version::HTTP_2,
+            content_length: None,
+            stream: Box::pin(stream::iter(chunks.clone())),
+        };
+        let (response, kind, _) = classify_supplier_quota(response).await;
+        assert_eq!(kind, UpstreamFailureKind::Authentication);
+        assert_eq!(response.bytes_stream().collect::<Vec<_>>().await, chunks);
+    }
 
     #[tokio::test]
     async fn stream_quota_requires_complete_preoutput_evidence_and_preserves_wire() {
