@@ -803,6 +803,141 @@ impl Database {
             }))
         }
     }
+    pub(crate) async fn history_analysis_fact_in_transaction(
+        transaction: &mut Transaction<'_, Any>,
+        identity: &HistoryIdentity,
+    ) -> Result<Value, HistoryError> {
+        let sql = match identity.source.as_str() {
+            "native" => {
+                "SELECT model,protocol,error_code,upstream_account_id,model_route_id AS route_id,billing_unit,status_class, input_tokens, output_tokens, cached_input_tokens, cache_write_tokens, generation_units, duration_ms, cost_micros, currency, CAST(NULL AS TEXT) AS modality FROM request_stats_facts WHERE request_id = $1 AND tenant_id = $2 AND key_id = $3 AND created_at = $4"
+            }
+            "generation" => {
+                "SELECT model,CAST('generation' AS TEXT) AS protocol,error_code,upstream_account_id,model_route_id AS route_id,billing_unit,status_class, CAST(0 AS BIGINT) AS input_tokens, CAST(0 AS BIGINT) AS output_tokens, CAST(0 AS BIGINT) AS cached_input_tokens, CAST(0 AS BIGINT) AS cache_write_tokens, billed_units AS generation_units, duration_ms, cost_micros, currency, modality FROM generation_stats_facts WHERE job_id = $1 AND tenant_id = $2 AND key_id = $3 AND created_at = $4"
+            }
+            _ => return Ok(Value::Null),
+        };
+        let row = sqlx::query(sqlx::AssertSqlSafe(sql))
+            .bind(identity.request_id.to_string())
+            .bind(identity.tenant_id.to_string())
+            .bind(identity.key_id.to_string())
+            .bind(identity.created_at)
+            .fetch_optional(&mut **transaction)
+            .await?;
+        let Some(row) = row else {
+            return Ok(Value::Null);
+        };
+        let mut fact = serde_json::Map::new();
+        for name in [
+            "input_tokens",
+            "output_tokens",
+            "cached_input_tokens",
+            "cache_write_tokens",
+            "generation_units",
+            "duration_ms",
+            "cost_micros",
+        ] {
+            fact.insert(
+                name.into(),
+                serde_json::to_value(row.try_get::<Option<i64>, _>(name)?)?,
+            );
+        }
+        for name in [
+            "status_class",
+            "currency",
+            "modality",
+            "model",
+            "protocol",
+            "error_code",
+            "upstream_account_id",
+            "route_id",
+            "billing_unit",
+        ] {
+            fact.insert(
+                name.into(),
+                serde_json::to_value(row.try_get::<Option<String>, _>(name)?)?,
+            );
+        }
+        fact.insert("settled_fact".into(), Value::Bool(true));
+        Ok(Value::Object(fact))
+    }
+
+    pub(crate) async fn history_statistics_in_transaction(
+        transaction: &mut Transaction<'_, Any>,
+        identity: &HistoryIdentity,
+        payload: &Value,
+    ) -> Result<Option<HistoryStatistics>, HistoryError> {
+        if identity.source == "native" && !payload["completed_at"].is_null() {
+            let fact = sqlx::query("SELECT f.status_class, CASE WHEN f.protocol = 'audio-transcription' THEN 0 ELSE f.input_tokens END AS input_tokens, CASE WHEN f.protocol = 'audio-transcription' THEN 0 ELSE f.output_tokens END AS output_tokens, f.cache_known_read_tokens, f.cache_known_input_tokens, f.cost_micros, f.currency FROM request_stats_facts f WHERE f.request_id = $1 AND f.tenant_id = $2 AND f.key_id = $3 AND f.created_at = $4 AND NOT EXISTS (SELECT 1 FROM pending_proxy_settlements pending WHERE pending.request_id = f.request_id AND pending.state = 'pending') AND NOT EXISTS (SELECT 1 FROM terminal_projection_outbox outbox WHERE outbox.request_id = f.request_id AND outbox.projected_at IS NULL)")
+                .bind(identity.request_id.to_string()).bind(identity.tenant_id.to_string()).bind(identity.key_id.to_string()).bind(identity.created_at)
+                .fetch_optional(&mut **transaction).await?;
+            if let Some(fact) = fact {
+                let status: String = fact.try_get("status_class")?;
+                return Ok(Some(HistoryStatistics {
+                    status: if status == "success" {
+                        "success".into()
+                    } else {
+                        "error".into()
+                    },
+                    input_tokens: fact.try_get("input_tokens")?,
+                    output_tokens: fact.try_get("output_tokens")?,
+                    cache_known_read_tokens: fact.try_get("cache_known_read_tokens")?,
+                    cache_known_input_tokens: fact.try_get("cache_known_input_tokens")?,
+                    cost_micros: fact.try_get("cost_micros")?,
+                    currency: fact.try_get("currency")?,
+                }));
+            }
+        }
+        let terminal =
+            payload["operational_terminal"].is_object() || !payload["completed_at"].is_null();
+        let status = if !terminal {
+            "pending"
+        } else if payload["status_code"]
+            .as_i64()
+            .is_some_and(|status| (200..400).contains(&status))
+            && payload["error_code"].as_str().is_none_or(str::is_empty)
+        {
+            "success"
+        } else {
+            "error"
+        };
+        let sql = match identity.source.as_str() {
+            "native" => {
+                "SELECT CASE WHEN completed_at IS NOT NULL AND protocol != 'audio-transcription' THEN input_tokens ELSE 0 END AS input_tokens, CASE WHEN completed_at IS NOT NULL AND protocol != 'audio-transcription' THEN output_tokens ELSE 0 END AS output_tokens, CASE WHEN completed_at IS NOT NULL THEN cache_known_read_tokens ELSE NULL END AS cache_known_read_tokens, CASE WHEN completed_at IS NOT NULL THEN cache_known_input_tokens ELSE NULL END AS cache_known_input_tokens, CASE WHEN completed_at IS NOT NULL THEN cost_micros ELSE NULL END AS cost_micros, currency FROM request_records WHERE id = $1 AND tenant_id = $2 AND key_id = $3 AND created_at = $4"
+            }
+            "generation" => {
+                "SELECT CAST(0 AS BIGINT) AS input_tokens, CAST(0 AS BIGINT) AS output_tokens, CAST(NULL AS BIGINT) AS cache_known_read_tokens, CAST(NULL AS BIGINT) AS cache_known_input_tokens, cost_micros, currency FROM generation_stats_facts WHERE job_id = $1 AND tenant_id = $2 AND key_id = $3 AND created_at = $4"
+            }
+            _ => return Ok(None),
+        };
+        let row = sqlx::query(sqlx::AssertSqlSafe(sql))
+            .bind(identity.request_id.to_string())
+            .bind(identity.tenant_id.to_string())
+            .bind(identity.key_id.to_string())
+            .bind(identity.created_at)
+            .fetch_optional(&mut **transaction)
+            .await?;
+        if let Some(row) = row {
+            Ok(Some(HistoryStatistics {
+                status: status.into(),
+                input_tokens: row.try_get("input_tokens")?,
+                output_tokens: row.try_get("output_tokens")?,
+                cache_known_read_tokens: row.try_get("cache_known_read_tokens")?,
+                cache_known_input_tokens: row.try_get("cache_known_input_tokens")?,
+                cost_micros: row.try_get("cost_micros")?,
+                currency: row.try_get("currency")?,
+            }))
+        } else {
+            Ok(Some(HistoryStatistics {
+                status: "pending".into(),
+                input_tokens: 0,
+                output_tokens: 0,
+                cache_known_read_tokens: None,
+                cache_known_input_tokens: None,
+                cost_micros: None,
+                currency: payload["billing"]["currency"].as_str().map(str::to_owned),
+            }))
+        }
+    }
 }
 
 fn parse_uuid(value: String) -> Result<Uuid, HistoryError> {
