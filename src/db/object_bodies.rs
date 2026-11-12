@@ -80,9 +80,17 @@ impl Database {
         side: &str,
         object: &crate::archive::CasArchiveObject,
     ) -> Result<bool, AppError> {
-        self.body_archive()?
-            .verify_tenant_content(tenant_id, object)
-            .await?;
+        let archive = self.body_archive()?;
+        let effective = match archive
+            .verified_published_raw_capture(tenant_id, request_id, side, object)
+            .await?
+        {
+            Some(published) => published,
+            None => {
+                archive.verify_tenant_content(tenant_id, object).await?;
+                object.clone()
+            }
+        };
         let statement = match side {
             "request" => {
                 "UPDATE request_records SET request_object = $1 WHERE id = $2 AND tenant_id = $3 AND (request_object IS NULL OR request_object = '' OR request_object = $1 OR request_object = 'gap://' || id || '/request' OR request_object = 'staging/proxy/' || id || '/request/' || id || '/body.json')"
@@ -94,7 +102,7 @@ impl Database {
         };
         let mut transaction = self.begin_write_transaction().await?;
         let changed = sqlx::query(statement)
-            .bind(&object.object_locator)
+            .bind(&effective.object_locator)
             .bind(request_id.to_string())
             .bind(tenant_id.to_string())
             .execute(&mut *transaction)

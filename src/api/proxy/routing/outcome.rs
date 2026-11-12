@@ -69,17 +69,15 @@ pub(in crate::api::proxy) fn failover_disposition(
             ) => FailoverDisposition::RateLimitRejected,
             _ => FailoverDisposition::Stop,
         },
-        (Some(StatusCode::FORBIDDEN), None)
-            if matches!(
-                quota_failure,
-                Some(UpstreamFailureKind::RateLimitedUntil {
-                    exhausted: true,
-                    ..
-                })
-            ) =>
-        {
-            FailoverDisposition::QuotaRejected
-        }
+        (Some(StatusCode::FORBIDDEN), None) => match quota_failure {
+            Some(UpstreamFailureKind::RateLimitedUntil {
+                exhausted: true, ..
+            }) => FailoverDisposition::QuotaRejected,
+            Some(
+                UpstreamFailureKind::RateLimited | UpstreamFailureKind::RateLimitedUntil { .. },
+            ) => FailoverDisposition::RateLimitRejected,
+            _ => FailoverDisposition::Stop,
+        },
         _ => FailoverDisposition::Stop,
     }
 }
@@ -147,10 +145,9 @@ fn classify_response_failure(
         StatusCode::FORBIDDEN
             if matches!(
                 rate_limit,
-                Some(UpstreamFailureKind::RateLimitedUntil {
-                    exhausted: true,
-                    ..
-                })
+                Some(
+                    UpstreamFailureKind::RateLimited | UpstreamFailureKind::RateLimitedUntil { .. }
+                )
             ) =>
         {
             Some((rate_limit.unwrap(), UpstreamHealthReason::RateLimited))
@@ -222,7 +219,7 @@ mod tests {
     }
 
     #[test]
-    fn only_classified403_quota_rejection_grants_quota_failover() {
+    fn only_classified403_capacity_rejection_grants_failover() {
         let kind = UpstreamFailureKind::RateLimitedUntil {
             exhausted: true,
             until: 0,
@@ -251,7 +248,17 @@ mod tests {
                     until: i64::MAX
                 }),
             ),
-            FailoverDisposition::Stop
+            FailoverDisposition::RateLimitRejected
+        );
+        assert_eq!(
+            classify_response_failure(
+                StatusCode::FORBIDDEN,
+                Some(UpstreamFailureKind::RateLimited)
+            ),
+            Some((
+                UpstreamFailureKind::RateLimited,
+                UpstreamHealthReason::RateLimited
+            ))
         );
     }
 

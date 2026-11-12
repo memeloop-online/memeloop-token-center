@@ -164,6 +164,12 @@ impl Database {
         &self,
         input: BeginArchiveStagingInput,
     ) -> Result<BeginArchiveStagingResult, AppError> {
+        // Select only a fresh attempt's backend. An idempotent retry below uses
+        // the already persisted key even after a rollout changes write defaults.
+        let selected_key = match &self.archive {
+            Some(archive) => archive.select_staging_key(input.key)?,
+            None => input.key,
+        };
         let mut transaction = self.begin_write_transaction().await?;
         let now = archive_database_now(&mut transaction, self.backend).await?;
         let expires_at =
@@ -172,7 +178,7 @@ impl Database {
                     "archive_staging_begin_archive_staging_attempt_1",
                 ))?;
         let inserted = sqlx::query(
-            "INSERT INTO archive_staging_attempts (attempt_id, owner_kind, owner_id, purpose, intent_digest, state, writer_owner, writer_token, lease_owner, lease_token, lease_expires_at, created_at, updated_at) VALUES ($1, $2, $3, $4, $5, 'writing', $6, $7, $8, $9, $10, $11, $12) ON CONFLICT(attempt_id) DO NOTHING",
+            "INSERT INTO archive_staging_attempts (attempt_id, owner_kind, owner_id, purpose, intent_digest, state, writer_owner, writer_token, lease_owner, lease_token, lease_expires_at, created_at, updated_at, backend_identity) VALUES ($1, $2, $3, $4, $5, 'writing', $6, $7, $8, $9, $10, $11, $12, $13) ON CONFLICT(attempt_id) DO NOTHING",
         )
         .bind(input.key.attempt_id.to_string())
         .bind(input.key.owner.kind())
@@ -186,10 +192,11 @@ impl Database {
         .bind(expires_at)
         .bind(now)
         .bind(now)
+        .bind(selected_key.backend_identity_text())
         .execute(&mut *transaction)
         .await?;
         let lease = ArchiveStagingWriteLease {
-            key: input.key,
+            key: selected_key,
             owner: input.lease_owner.clone(),
             token: input.lease_token,
             expires_at,
@@ -209,7 +216,11 @@ impl Database {
         let stored_writer_token: String = row.try_get("writer_token")?;
         let stored_lease_expires_at: Option<i64> = row.try_get("lease_expires_at")?;
         let requested_token = input.lease_token.to_string();
-        let exact_identity = stored.key == input.key
+        let exact_identity = stored.key.owner == input.key.owner
+            && stored.key.purpose == input.key.purpose
+            && stored.key.attempt_id == input.key.attempt_id
+            && (input.key.backend_identity.is_none()
+                || stored.key.backend_identity == input.key.backend_identity)
             && stored.intent_digest == input.intent_digest
             && stored_writer_owner == input.lease_owner.as_str()
             && stored_writer_token == requested_token;
@@ -223,6 +234,7 @@ impl Database {
             && stored_lease_expires_at.is_some_and(|expiry| expiry > now)
         {
             let replay = ArchiveStagingWriteLease {
+                key: stored.key,
                 expires_at: stored_lease_expires_at.ok_or(AppError::internal(
                     "archive_staging_begin_archive_staging_attempt_3",
                 ))?,
@@ -688,7 +700,7 @@ impl Database {
             )
             .await;
         sqlx::query(
-            "SELECT attempt_id, owner_kind, purpose, state, lease_token, next_cleanup_at FROM archive_staging_attempts LIMIT 0",
+            "SELECT attempt_id, owner_kind, purpose, state, lease_token, next_cleanup_at, backend_identity FROM archive_staging_attempts LIMIT 0",
         )
         .fetch_optional(&mut *connection)
         .await?;
@@ -703,6 +715,12 @@ pub(super) async fn bind_archive_staging_attempt_in_transaction(
     locator: &str,
 ) -> Result<bool, AppError> {
     validate_bound_locator(lease.key, locator)?;
+    let Some(existing) = lock_attempt(transaction, backend, lease.key.attempt_id).await? else {
+        return Ok(false);
+    };
+    if archive_staging_key_from_row(&existing)? != lease.key {
+        return Ok(false);
+    }
     let now = archive_database_now(transaction, backend).await?;
     let updated = sqlx::query(
         "UPDATE archive_staging_attempts SET state = 'bound', lease_owner = NULL, lease_token = NULL, lease_expires_at = NULL, bound_locator = $1, bound_at = $2, updated_at = $3 WHERE attempt_id = $4 AND state = 'writing' AND lease_owner = $5 AND lease_token = $6 AND lease_expires_at > $7",
@@ -1033,6 +1051,10 @@ fn archive_staging_key_from_row(row: &AnyRow) -> Result<ArchiveStagingKey, AppEr
         &row.try_get::<String, _>("owner_id")?,
         &row.try_get::<String, _>("purpose")?,
         &row.try_get::<String, _>("attempt_id")?,
+    )?
+    .with_backend_identity(
+        row.try_get::<Option<String>, _>("backend_identity")?
+            .as_deref(),
     )
 }
 
@@ -1059,3 +1081,6 @@ async fn archive_database_now(
 
 #[cfg(test)]
 mod media_tests;
+
+#[cfg(test)]
+mod backend_tests;

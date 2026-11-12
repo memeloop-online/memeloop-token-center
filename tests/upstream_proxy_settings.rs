@@ -146,7 +146,33 @@ async fn explicit_proxy_read_preserves_full_url_but_excludes_other_secrets_and_r
         let (status, cache, body) = get(&state, &path, &tokens[0]).await;
         assert_eq!(status, StatusCode::OK);
         assert_eq!(cache.as_deref(), Some("private, no-store"));
-        assert_eq!(body.as_object().unwrap().len(), 6);
+        let keys = body
+            .as_object()
+            .unwrap()
+            .keys()
+            .map(String::as_str)
+            .collect::<std::collections::BTreeSet<_>>();
+        assert_eq!(
+            keys,
+            std::collections::BTreeSet::from([
+                "account_id",
+                "proxy_url",
+                "proxy_network_scope",
+                "updated_at",
+                "credential_generation",
+                "supported",
+                "source",
+                "proxy_id",
+                "group_id",
+                "selected_member_id",
+                "configuration_state",
+            ])
+        );
+        assert_eq!(body["source"], "credential");
+        assert_eq!(body["configuration_state"], "credential");
+        for identity in ["proxy_id", "group_id", "selected_member_id"] {
+            assert!(body[identity].is_null(), "{identity}");
+        }
         assert_eq!(body["supported"], configured);
         assert_eq!(body["account_id"], account.id.to_string());
         assert_eq!(body["updated_at"], account.updated_at);

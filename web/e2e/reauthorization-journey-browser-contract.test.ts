@@ -235,7 +235,17 @@ test('reauthorization saves its proxy in place, copies device codes, polls autom
       await page.locator('.provider-detail-workspace').getByRole('heading', { name: 'reauthorize@example.org', exact: true }).waitFor();
       assert.equal(await page.locator('.provider-detail-workspace').count(), 1);
       assert.equal(await page.locator('.provider-edit-workspace').count(), 0);
-      assert.equal(await reauthorize.evaluate(button => button === document.activeElement), true);
+      const returnedFocus = await reauthorize.evaluate(button => ({
+        restored: button === document.activeElement,
+        activeTag: document.activeElement?.tagName,
+        activeClass: document.activeElement?.className,
+        activeRole: document.activeElement?.getAttribute('role'),
+        activeLabel: document.activeElement?.getAttribute('aria-label'),
+        activeParent: document.activeElement?.parentElement?.className,
+        activeAction: document.activeElement?.getAttribute('data-reauthorization-trigger'),
+        targetAction: button.getAttribute('data-reauthorization-trigger'),
+      }));
+      assert.equal(returnedFocus.restored, true, `reauthorization return focus ${locale}: ${JSON.stringify(returnedFocus)}`);
       await page.screenshot({ path: `${screenshotRoot}/reauthorization-parent-${locale}-390.png`, fullPage: true });
       await reauthorize.click();
       await start.click();

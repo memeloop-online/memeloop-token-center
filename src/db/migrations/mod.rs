@@ -818,6 +818,11 @@ pub(crate) const SQLITE_MIGRATIONS: &[Migration] = &[
         name: "allocation history export coverage",
         sql: include_str!("../../../migrations/common/0154_allocation_history_coverage.sql"),
     },
+    Migration {
+        version: 155,
+        name: "archive staging durable backend identity",
+        sql: include_str!("../../../migrations/common/0155_archive_staging_backend_identity.sql"),
+    },
 ];
 
 pub(crate) const POSTGRES_MIGRATIONS: &[Migration] = &[
@@ -1610,6 +1615,11 @@ pub(crate) const POSTGRES_MIGRATIONS: &[Migration] = &[
         version: 154,
         name: "allocation history export coverage",
         sql: include_str!("../../../migrations/common/0154_allocation_history_coverage.sql"),
+    },
+    Migration {
+        version: 155,
+        name: "archive staging durable backend identity",
+        sql: include_str!("../../../migrations/common/0155_archive_staging_backend_identity.sql"),
     },
 ];
 

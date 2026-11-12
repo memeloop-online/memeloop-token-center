@@ -107,9 +107,15 @@ impl ArchiveStore {
             return Err(AppError::storage("archive_staging_backend_mismatch"));
         }
         let compressed = staged.object_locator.ends_with(super::compressed::SUFFIX);
-        let locator = path::tenant_cas_location(tenant_id, &staged.blake3_digest, compressed)?;
-        let source = path::archive_path(&staged.object_locator)?;
-        let destination = path::archive_path(&locator)?;
+        let key = path::tenant_cas_location(tenant_id, &staged.blake3_digest, compressed)?;
+        // Promotion follows the durable staged identity, never the current
+        // default for new CAS writes. Cross-backend copy is not promotion.
+        let locator = match super::routing::split_staging(&staged.object_locator)? {
+            Some((identity, _)) => format!("{}{identity}/{key}", super::routing::PREFIX),
+            None => key,
+        };
+        let (store, source) = self.resolve(&staged.object_locator)?;
+        let (_, destination) = self.resolve(&locator)?;
 
         self.verify_exact_object(
             &staged.object_locator,
@@ -117,7 +123,7 @@ impl ArchiveStore {
             &staged.blake3_digest,
         )
         .await?;
-        match self.inner.copy_if_not_exists(&source, &destination).await {
+        match store.copy_if_not_exists(&source, &destination).await {
             Ok(()) | Err(object_store::Error::AlreadyExists { .. }) => {}
             Err(error) => return Err(error.into()),
         }

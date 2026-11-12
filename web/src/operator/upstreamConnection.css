@@ -60,3 +60,14 @@
   .unified-account-proxy .network-proxy-policy-controls { grid-template-columns: repeat(2, minmax(0, 1fr)); }
   .unified-account-proxy .network-proxy-policy-controls > fieldset { grid-column: 1 / -1; }
 }
+
+/* Native select intrinsic option widths must not widen a narrow account form. */
+:is(.upstream-connection, .upstream-advanced) .fui-Select {
+  min-width: 0;
+  max-width: 100%;
+  width: 100%;
+}
+:is(.upstream-connection, .upstream-advanced) .fui-Select__select {
+  min-width: 0;
+  max-width: 100%;
+}

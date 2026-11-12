@@ -833,6 +833,7 @@ mod tests {
             inner: Arc::new(InMemory::new()),
             training: None,
             training_cas_writes: false,
+            training_staging_writes: false,
             readiness: Arc::new(tokio::sync::Mutex::new(
                 super::super::ReadinessCache::default(),
             )),

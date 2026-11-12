@@ -222,6 +222,8 @@ pub struct Config {
     pub training_s3: Option<TrainingS3Config>,
     #[serde(default)]
     pub training_cas_writes: bool,
+    #[serde(default)]
+    pub training_staging_writes: bool,
     pub upstream_openai_url: Option<String>,
     pub upstream_openai_key: Option<String>,
     pub upstream_anthropic_url: Option<String>,
@@ -524,6 +526,7 @@ impl Config {
                 None => None,
             },
             training_cas_writes: env_bool("MTC_TRAINING_CAS_WRITES", false),
+            training_staging_writes: env_bool("MTC_TRAINING_STAGING_WRITES", false),
             upstream_openai_url: env::var("MTC_UPSTREAM_OPENAI_URL").ok(),
             upstream_openai_key: env::var("MTC_UPSTREAM_OPENAI_KEY").ok(),
             upstream_anthropic_url: env::var("MTC_UPSTREAM_ANTHROPIC_URL").ok(),
@@ -611,6 +614,7 @@ impl Config {
             s3_timeouts: S3Timeouts::default(),
             training_s3: None,
             training_cas_writes: false,
+            training_staging_writes: false,
             upstream_openai_url: None,
             upstream_openai_key: None,
             upstream_anthropic_url: None,
