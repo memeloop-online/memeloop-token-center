@@ -282,7 +282,9 @@ impl Database {
                 key_id: event.key_id,
                 created_at: row.try_get("created_at")?,
             };
-            if let Some(view) = Self::history_original_view_in_transaction(transaction, &identity).await? {
+            if let Some(view) =
+                Self::history_original_view_in_transaction(transaction, &identity).await?
+            {
                 event.created_at = Some(view.created_at);
                 event.completed_at = view.completed_at;
                 event.lifecycle_state = view.lifecycle_state;
@@ -478,7 +480,10 @@ impl Database {
     ) -> Result<Option<RequestView>, AppError> {
         let query = build_request_list_query_for_history(
             RequestListScope::Global,
-            &RequestListFilter { limit: 1, ..RequestListFilter::default() },
+            &RequestListFilter {
+                limit: 1,
+                ..RequestListFilter::default()
+            },
             Some(identity),
         );
         let mut statement = sqlx::query(sqlx::AssertSqlSafe(query.statement));
@@ -489,10 +494,19 @@ impl Database {
             };
         }
         let rows = statement.fetch_all(&mut **transaction).await?;
-        let native = rows.first().map(|row| row.try_get::<i64,_>("native_terminal")).transpose()?.unwrap_or(0) == 1;
+        let native = rows
+            .first()
+            .map(|row| row.try_get::<i64, _>("native_terminal"))
+            .transpose()?
+            .unwrap_or(0)
+            == 1;
         let mut view = request_views(rows)?.into_iter().next();
         if native && let Some(view) = &mut view {
-            let mut observations = egress::request_list_egress_in_transaction(transaction, &[identity.request_id.to_string()]).await?;
+            let mut observations = egress::request_list_egress_in_transaction(
+                transaction,
+                &[identity.request_id.to_string()],
+            )
+            .await?;
             view.egress = observations.remove(&identity.request_id);
         }
         Ok(view)

@@ -30,55 +30,124 @@ pub(super) async fn capture_native_in_transaction(
     // revision already allocated by its triggers also fences this projection.
     let identity = sqlx::query("SELECT revision, tenant_id, key_id, created_at FROM request_history_export WHERE source='native' AND request_id=$1 AND EXISTS (SELECT 1 FROM request_history_state WHERE id=1 AND mode <> 'off')")
         .bind(request_id).fetch_optional(&mut **transaction).await?;
-    let Some(identity) = identity else { return Ok(()); };
+    let Some(identity) = identity else {
+        return Ok(());
+    };
     let revision: i64 = identity.try_get("revision")?;
     let terminal = sqlx::query("SELECT * FROM terminal_projection_outbox WHERE request_id=$1")
-        .bind(request_id).fetch_one(&mut **transaction).await?;
-    let request = sqlx::query("SELECT * FROM request_records WHERE id=$1 AND tenant_id=$2 AND key_id=$3")
-        .bind(request_id).bind(identity.try_get::<String,_>("tenant_id")?).bind(identity.try_get::<String,_>("key_id")?)
-        .fetch_one(&mut **transaction).await?;
+        .bind(request_id)
+        .fetch_one(&mut **transaction)
+        .await?;
+    let request =
+        sqlx::query("SELECT * FROM request_records WHERE id=$1 AND tenant_id=$2 AND key_id=$3")
+            .bind(request_id)
+            .bind(identity.try_get::<String, _>("tenant_id")?)
+            .bind(identity.try_get::<String, _>("key_id")?)
+            .fetch_one(&mut **transaction)
+            .await?;
     let mut originals = serde_json::Map::new();
     originals.insert("request".into(), original_row(&request)?);
     let mut terminal_original = original_row(&terminal)?;
     if let Some(fields) = terminal_original.as_object_mut() {
-        for delivery_field in ["lease_owner", "lease_expires_at", "attempts", "projected_at", "statistics_outcome"] {
+        for delivery_field in [
+            "lease_owner",
+            "lease_expires_at",
+            "attempts",
+            "projected_at",
+            "statistics_outcome",
+        ] {
             fields.remove(delivery_field);
         }
     }
     originals.insert("terminal".into(), terminal_original);
     for (name, sql) in [
-        ("events", "SELECT * FROM request_events WHERE request_id=$1 ORDER BY event_at,event_id"),
-        ("statistics", "SELECT * FROM request_stats_facts WHERE request_id=$1"),
-        ("egress", "SELECT * FROM request_egress_attempts WHERE request_id=$1 ORDER BY observed_at,attempt_id"),
-        ("transport", "SELECT * FROM request_upstream_transport_diagnostics WHERE request_id=$1 ORDER BY observed_at,route_id,upstream_account_id"),
-        ("observations", "SELECT * FROM conversation_observations WHERE request_id=$1 ORDER BY cluster_id,key_id"),
+        (
+            "events",
+            "SELECT * FROM request_events WHERE request_id=$1 ORDER BY event_at,event_id",
+        ),
+        (
+            "statistics",
+            "SELECT * FROM request_stats_facts WHERE request_id=$1",
+        ),
+        (
+            "egress",
+            "SELECT * FROM request_egress_attempts WHERE request_id=$1 ORDER BY observed_at,attempt_id",
+        ),
+        (
+            "transport",
+            "SELECT * FROM request_upstream_transport_diagnostics WHERE request_id=$1 ORDER BY observed_at,route_id,upstream_account_id",
+        ),
+        (
+            "observations",
+            "SELECT * FROM conversation_observations WHERE request_id=$1 ORDER BY cluster_id,key_id",
+        ),
     ] {
-        let rows = sqlx::query(sqlx::AssertSqlSafe(sql)).bind(request_id).fetch_all(&mut **transaction).await?;
-        originals.insert(name.into(), Value::Array(rows.iter().map(original_row).collect::<Result<_,_>>()?));
+        let rows = sqlx::query(sqlx::AssertSqlSafe(sql))
+            .bind(request_id)
+            .fetch_all(&mut **transaction)
+            .await?;
+        originals.insert(
+            name.into(),
+            Value::Array(rows.iter().map(original_row).collect::<Result<_, _>>()?),
+        );
     }
     let tenant: String = identity.try_get("tenant_id")?;
     let key: String = identity.try_get("key_id")?;
     let history_identity = crate::request_history::HistoryIdentity {
-        source: "native".into(), request_id: parse_uuid(request_id.to_owned())?,
-        tenant_id: parse_uuid(tenant.clone())?, key_id: parse_uuid(key.clone())?,
+        source: "native".into(),
+        request_id: parse_uuid(request_id.to_owned())?,
+        tenant_id: parse_uuid(tenant.clone())?,
+        key_id: parse_uuid(key.clone())?,
         created_at: identity.try_get("created_at")?,
     };
-    let payload = Database::history_original_view_in_transaction(transaction, &history_identity).await?;
-    let archive = Database::history_native_archive_in_transaction(transaction, &history_identity).await?;
-    let payload_json = serde_json::to_value(&payload).map_err(|_| AppError::storage("history_envelope_serialization"))?;
-    let statistics = Database::history_statistics_in_transaction(transaction, &history_identity, &payload_json).await?;
-    let fact = Database::history_analysis_fact_in_transaction(transaction, &history_identity).await?;
-    let egress = Database::history_egress_in_transaction(transaction, history_identity.request_id).await?;
-    let transport = Database::history_transport_in_transaction(transaction, history_identity.request_id).await?;
+    let payload =
+        Database::history_original_view_in_transaction(transaction, &history_identity).await?;
+    let archive =
+        Database::history_native_archive_in_transaction(transaction, &history_identity).await?;
+    let payload_json = serde_json::to_value(&payload)
+        .map_err(|_| AppError::storage("history_envelope_serialization"))?;
+    let statistics =
+        Database::history_statistics_in_transaction(transaction, &history_identity, &payload_json)
+            .await?;
+    let fact =
+        Database::history_analysis_fact_in_transaction(transaction, &history_identity).await?;
+    let egress =
+        Database::history_egress_in_transaction(transaction, history_identity.request_id).await?;
+    let transport =
+        Database::history_transport_in_transaction(transaction, history_identity.request_id)
+            .await?;
     let observation = sqlx::query("SELECT * FROM conversation_observations WHERE request_id=$1 AND key_id=$2 AND cluster_id=$3")
         .bind(request_id).bind(&key).bind(payload_json["session_context"]["session_id"].as_str())
         .fetch_optional(&mut **transaction).await?;
-    let execution = observation.as_ref().map(super::requests::conversations::execution_metadata_from_row).transpose()?.flatten();
-    let structure = observation.as_ref().map(super::requests::conversations::execution_structure_from_row).transpose()?.flatten();
-    let upstream_name: Option<String> = if let Some(upstream) = fact.get("upstream_account_id").unwrap_or(&payload_json["upstream_account_id"]).as_str().filter(|value| !value.is_empty()) {
-        sqlx::query_scalar("SELECT name FROM upstream_accounts WHERE id=$1").bind(upstream).fetch_optional(&mut **transaction).await?
-    } else { None };
-    let filter_cost_micros: Option<i64> = if request.try_get::<Option<i64>,_>("completed_at")?.is_some() { request.try_get("cost_micros")? } else { None };
+    let execution = observation
+        .as_ref()
+        .map(super::requests::conversations::execution_metadata_from_row)
+        .transpose()?
+        .flatten();
+    let structure = observation
+        .as_ref()
+        .map(super::requests::conversations::execution_structure_from_row)
+        .transpose()?
+        .flatten();
+    let upstream_name: Option<String> = if let Some(upstream) = fact
+        .get("upstream_account_id")
+        .unwrap_or(&payload_json["upstream_account_id"])
+        .as_str()
+        .filter(|value| !value.is_empty())
+    {
+        sqlx::query_scalar("SELECT name FROM upstream_accounts WHERE id=$1")
+            .bind(upstream)
+            .fetch_optional(&mut **transaction)
+            .await?
+    } else {
+        None
+    };
+    let filter_cost_micros: Option<i64> =
+        if request.try_get::<Option<i64>, _>("completed_at")?.is_some() {
+            request.try_get("cost_micros")?
+        } else {
+            None
+        };
     let read_model = serde_json::json!({"archive":archive,"fact":fact,"upstream_name":upstream_name,"execution":execution,"structure":structure,"egress_attempts":egress,"transport_diagnostics":transport});
     let envelope = serde_json::json!({
         "version": 1, "source": "native", "revision": revision,
@@ -93,11 +162,18 @@ pub(super) async fn capture_native_in_transaction(
         .bind(request_id).bind(&tenant).bind(&key).fetch_all(&mut **transaction).await?;
     for event in events {
         let event_id = parse_uuid(event.try_get("request_id")?)?;
-        let event_identity = crate::request_history::HistoryIdentity { source: "event".into(), request_id:event_id, created_at:event.try_get("created_at")?, ..history_identity.clone() };
+        let event_identity = crate::request_history::HistoryIdentity {
+            source: "event".into(),
+            request_id: event_id,
+            created_at: event.try_get("created_at")?,
+            ..history_identity.clone()
+        };
         let event_revision: i64 = event.try_get("revision")?;
-        let payload = Database::history_original_event_in_transaction(transaction,event_id).await?;
+        let payload =
+            Database::history_original_event_in_transaction(transaction, event_id).await?;
         let envelope = serde_json::json!({"version":1,"source":"event","revision":event_revision,"tenant_id":tenant,"key_id":key,"request_id":event_id,"created_at":event_identity.created_at,"payload":payload,"filter_cost_micros":null,"statistics":null,"read_model":null,"archive_identity":{"tenant_id":tenant,"request_id":request_id}});
-        insert_envelope_in_transaction(transaction,&event_identity,event_revision,&envelope).await?;
+        insert_envelope_in_transaction(transaction, &event_identity, event_revision, &envelope)
+            .await?;
     }
     Ok(())
 }
@@ -107,11 +183,14 @@ async fn insert_envelope_in_transaction(
     identity: &crate::request_history::HistoryIdentity,
     revision: i64,
     envelope: &Value,
-) -> Result<(),AppError> {
-    let frozen=serde_json::to_string(envelope).map_err(|_|AppError::storage("history_envelope_serialization"))?;
+) -> Result<(), AppError> {
+    let frozen = serde_json::to_string(envelope)
+        .map_err(|_| AppError::storage("history_envelope_serialization"))?;
     let stored:String=sqlx::query_scalar("INSERT INTO request_history_immutable_outbox (revision,source,request_id,tenant_id,key_id,created_at,snapshot) VALUES ($1,$2,$3,$4,$5,$6,$7) ON CONFLICT(revision) DO UPDATE SET snapshot=request_history_immutable_outbox.snapshot RETURNING snapshot")
         .bind(revision).bind(&identity.source).bind(identity.request_id.to_string()).bind(identity.tenant_id.to_string()).bind(identity.key_id.to_string()).bind(identity.created_at).bind(&frozen).fetch_one(&mut **transaction).await?;
-    if stored!=frozen {return Err(AppError::storage("history_envelope_revision_conflict"));}
+    if stored != frozen {
+        return Err(AppError::storage("history_envelope_revision_conflict"));
+    }
     Ok(())
 }
 
@@ -121,7 +200,8 @@ impl Database {
     pub(crate) async fn history_immutable_pending(
         &self,
         page_size: i64,
-    ) -> Result<Vec<crate::request_history::HistorySnapshot>, crate::request_history::HistoryError> {
+    ) -> Result<Vec<crate::request_history::HistorySnapshot>, crate::request_history::HistoryError>
+    {
         use crate::request_history::{HistoryError, HistoryIdentity, HistorySnapshot};
         let rows = sqlx::query("SELECT revision,source,request_id,tenant_id,key_id,created_at,snapshot,delivery_snapshot FROM request_history_immutable_outbox ORDER BY revision LIMIT $1")
             .bind(page_size).fetch_all(&self.pool).await?;
@@ -129,11 +209,13 @@ impl Database {
         for row in rows {
             let revision: i64 = row.try_get("revision")?;
             let stored_identity = HistoryIdentity {
-                source: row.try_get("source")?, request_id: parse_uuid(row.try_get("request_id")?)?,
-                tenant_id: parse_uuid(row.try_get("tenant_id")?)?, key_id: parse_uuid(row.try_get("key_id")?)?,
+                source: row.try_get("source")?,
+                request_id: parse_uuid(row.try_get("request_id")?)?,
+                tenant_id: parse_uuid(row.try_get("tenant_id")?)?,
+                key_id: parse_uuid(row.try_get("key_id")?)?,
                 created_at: row.try_get("created_at")?,
             };
-            if let Some(frozen) = row.try_get::<Option<String>,_>("delivery_snapshot")? {
+            if let Some(frozen) = row.try_get::<Option<String>, _>("delivery_snapshot")? {
                 let snapshot: HistorySnapshot = serde_json::from_str(&frozen)?;
                 if snapshot.identity != stored_identity || snapshot.revision != revision {
                     return Err(HistoryError::Invalid("immutable delivery identity"));
@@ -143,8 +225,12 @@ impl Database {
             }
             let original: String = row.try_get("snapshot")?;
             let envelope: Value = serde_json::from_str(&original)?;
-            if envelope["version"].as_i64() != Some(1) || !matches!(envelope["source"].as_str(), Some("native" | "event")) {
-                return Err(HistoryError::Invalid("immutable history envelope version or source"));
+            if envelope["version"].as_i64() != Some(1)
+                || !matches!(envelope["source"].as_str(), Some("native" | "event"))
+            {
+                return Err(HistoryError::Invalid(
+                    "immutable history envelope version or source",
+                ));
             }
             let identity: HistoryIdentity = serde_json::from_value(envelope.clone())?;
             if identity != stored_identity || envelope["revision"].as_i64() != Some(revision) {
@@ -158,23 +244,45 @@ impl Database {
             let frozen = if let Some(existing) = existing {
                 serde_json::to_string(&serde_json::from_str::<HistorySnapshot>(&existing)?)?
             } else {
-                let mut payload: Option<Value> = serde_json::from_value(envelope["payload"].clone())?;
+                let mut payload: Option<Value> =
+                    serde_json::from_value(envelope["payload"].clone())?;
                 let mut read_model = envelope["read_model"].clone();
                 if identity.source == "native" {
-                    let mut archive: crate::model::RequestArchiveRefs = serde_json::from_value(read_model["archive"].clone())?;
-                    archive.view = serde_json::from_value(payload.clone().ok_or(HistoryError::Invalid("immutable native payload"))?)?;
-                    let archive = self.resolve_raw_archive_roots(identity.tenant_id, archive).await?;
+                    let mut archive: crate::model::RequestArchiveRefs =
+                        serde_json::from_value(read_model["archive"].clone())?;
+                    archive.view = serde_json::from_value(
+                        payload
+                            .clone()
+                            .ok_or(HistoryError::Invalid("immutable native payload"))?,
+                    )?;
+                    let archive = self
+                        .resolve_raw_archive_roots(identity.tenant_id, archive)
+                        .await?;
                     payload = Some(serde_json::to_value(&archive.view)?);
                     read_model["archive"] = serde_json::to_value(archive)?;
                 } else if let Some(payload) = &mut payload {
-                    let native_request = envelope["archive_identity"]["request_id"].as_str().ok_or(HistoryError::Invalid("immutable event archive identity"))?;
-                    if let Some(summary)=self.body_archive()?.supplier_summary(identity.tenant_id,parse_uuid(native_request.to_owned())?).await? {
-                        payload["supplier_error"]=serde_json::to_value(summary)?;
+                    let native_request = envelope["archive_identity"]["request_id"]
+                        .as_str()
+                        .ok_or(HistoryError::Invalid("immutable event archive identity"))?;
+                    if let Some(summary) = self
+                        .body_archive()?
+                        .supplier_summary(
+                            identity.tenant_id,
+                            parse_uuid(native_request.to_owned())?,
+                        )
+                        .await?
+                    {
+                        payload["supplier_error"] = serde_json::to_value(summary)?;
                     }
                 }
                 serde_json::to_string(&HistorySnapshot {
-                    identity, revision, payload, read_model,
-                    filter_cost_micros: serde_json::from_value(envelope["filter_cost_micros"].clone())?,
+                    identity,
+                    revision,
+                    payload,
+                    read_model,
+                    filter_cost_micros: serde_json::from_value(
+                        envelope["filter_cost_micros"].clone(),
+                    )?,
                     statistics: serde_json::from_value(envelope["statistics"].clone())?,
                 })?
             };
@@ -196,12 +304,31 @@ mod tests {
     #[tokio::test]
     async fn immutable_history_delivery_survives_source_absence_restart_and_stale_ack() {
         let directory = tempfile::tempdir().unwrap();
-        let url = format!("sqlite://{}?mode=rwc", directory.path().join("history.sqlite").display());
+        let url = format!(
+            "sqlite://{}?mode=rwc",
+            directory.path().join("history.sqlite").display()
+        );
         let db = Database::connect(&url).await.unwrap();
         db.migrate().await.unwrap();
-        let identity = HistoryIdentity { source: "native".into(), request_id: Uuid::now_v7(), tenant_id: Uuid::now_v7(), key_id: Uuid::now_v7(), created_at: 42 };
-        let first = HistorySnapshot { identity: identity.clone(), revision: 1, filter_cost_micros: None, payload: None, statistics: None, read_model: Value::Null };
-        let second = HistorySnapshot { revision: 2, ..first.clone() };
+        let identity = HistoryIdentity {
+            source: "native".into(),
+            request_id: Uuid::now_v7(),
+            tenant_id: Uuid::now_v7(),
+            key_id: Uuid::now_v7(),
+            created_at: 42,
+        };
+        let first = HistorySnapshot {
+            identity: identity.clone(),
+            revision: 1,
+            filter_cost_micros: None,
+            payload: None,
+            statistics: None,
+            read_model: Value::Null,
+        };
+        let second = HistorySnapshot {
+            revision: 2,
+            ..first.clone()
+        };
         for snapshot in [&first, &second] {
             sqlx::query("INSERT INTO request_history_immutable_outbox (revision,source,request_id,tenant_id,key_id,created_at,snapshot,delivery_snapshot) VALUES ($1,$2,$3,$4,$5,$6,'{}',$7)")
                 .bind(snapshot.revision).bind(&identity.source).bind(identity.request_id.to_string()).bind(identity.tenant_id.to_string()).bind(identity.key_id.to_string()).bind(identity.created_at).bind(serde_json::to_string(snapshot).unwrap())
