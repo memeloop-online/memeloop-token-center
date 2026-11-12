@@ -239,6 +239,9 @@ test('reauthorization saves its proxy in place, copies device codes, polls autom
         restored: button === document.activeElement,
         activeTag: document.activeElement?.tagName,
         activeClass: document.activeElement?.className,
+        activeRole: document.activeElement?.getAttribute('role'),
+        activeLabel: document.activeElement?.getAttribute('aria-label'),
+        activeParent: document.activeElement?.parentElement?.className,
         activeAction: document.activeElement?.getAttribute('data-reauthorization-trigger'),
         targetAction: button.getAttribute('data-reauthorization-trigger'),
       }));
