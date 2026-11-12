@@ -312,7 +312,7 @@ fn emit_response(
 /// validated and the corresponding output file has been written successfully.
 /// It cannot be supplied through HTTP headers or provider JSON fields.
 #[derive(Clone)]
-pub(in crate::api::proxy) struct ValidatedCompact {
+pub(in crate::api) struct ValidatedCompact {
     usage: Option<crate::model::TokenUsage>,
     usage_invalid: bool,
     response_id: Option<String>,
