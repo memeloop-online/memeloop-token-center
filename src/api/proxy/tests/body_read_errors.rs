@@ -88,8 +88,8 @@ async fn failed_uploads_keep_typed_status_without_dispatch_billing_or_resource_l
             assert!(!String::from_utf8_lossy(&body).contains("private-upload-error-canary"));
             assert!(!String::from_utf8_lossy(&body).contains(&fixture.key));
             fixture.state.early_requests.drain_for_test().await;
-            // Early text-request journaling does not include the audio route.
-            if path != "/v1/audio/transcriptions" {
+            // Media and text admission failures share the same diagnostic identity.
+            {
                 request_count += 1;
                 let rows = fixture
                     .state
