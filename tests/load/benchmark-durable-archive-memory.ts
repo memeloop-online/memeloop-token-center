@@ -770,7 +770,7 @@ export async function run(binary: string, output: string): Promise<boolean> {
     await stop(service);
     const replayLog = `${output}.replay.log`;
     writeFileSync(replayLog, "");
-    service = spawn(binary, ["serve", "--role", "all"], { env, stdio: ["ignore", "pipe", "pipe"] });
+    service = spawn(binary, ["serve", "--role", "all"], { env: { ...env, RUST_LOG: "warn,memeloop_token_center::proxy_lifecycle::pending_terminal=info" }, stdio: ["ignore", "pipe", "pipe"] });
     service.once("error", (error) => { sampleFailure = error; });
     service.stdout?.on("data", (chunk: Buffer) => writeFileSync(replayLog, chunk, { flag: "a" }));
     service.stderr?.on("data", (chunk: Buffer) => writeFileSync(replayLog, chunk, { flag: "a" }));
@@ -779,7 +779,10 @@ export async function run(binary: string, output: string): Promise<boolean> {
         assert(!sampleFailure && service!.exitCode === null, "service exited during unknown receipt replay");
         const replayed = readFileSync(replayLog, "utf8").split("\n").some((line) => {
           let entry; try { entry = JSON.parse(line); } catch { return false; }
-          return entry.fields?.message === "terminal lacks authoritative provider usage; receipt retained without zero-usage settlement"
+          // This structured transition is emitted by a real settlement attempt
+          // in this new process, not merely by finding an existing receipt.
+          return entry.target === "memeloop_token_center::proxy_lifecycle::pending_terminal"
+            && entry.fields?.financial_state === "awaiting_evidence"
             && entry.fields?.request_id === beforeReplay.request_id && entry.fields?.receipt_id === beforeReplay.receipt_id;
         });
         if (replayed) break;
