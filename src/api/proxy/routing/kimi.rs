@@ -7,6 +7,28 @@ use crate::api::{
 };
 use std::collections::VecDeque;
 
+/// Native Chat keeps the body in one cloned tree. Assistant repair can copy
+/// tool arguments/reasoning, so those histories still need adapter workspace.
+pub(super) fn reuses_chat_workspace(protocol: Protocol, request: &Value) -> bool {
+    matches!(protocol, Protocol::OpenAiChat)
+        && request
+            .get("messages")
+            .and_then(Value::as_array)
+            .is_some_and(|messages| {
+                messages.iter().all(|message| {
+                    message.get("role").and_then(Value::as_str) != Some("assistant")
+                        || (message
+                            .get("tool_calls")
+                            .and_then(Value::as_array)
+                            .is_none_or(Vec::is_empty)
+                            && message
+                                .get("reasoning_content")
+                                .and_then(Value::as_str)
+                                .is_none_or(|text| text.trim().is_empty()))
+                })
+            })
+}
+
 pub(super) fn prepare_forwarded_request(
     route: &ResolvedUpstream,
     protocol: Protocol,

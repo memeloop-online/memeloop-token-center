@@ -12,6 +12,8 @@ mod http;
 #[cfg(test)]
 pub(super) use http::with_stalled_probe_preparation;
 pub(super) mod kimi;
+#[cfg(test)]
+mod kimi_workspace_tests;
 pub(super) mod outcome;
 mod policy;
 mod probe;
@@ -120,12 +122,14 @@ pub(super) fn plan_proxy_route(
         && state
             .providers
             .supports_responses_via_anthropic_messages_v1(&route.driver);
-    // A direct HTTP route only clones the third JSON tree already prepaid by
-    // request admission. Dialect/component/compact transformations keep their
-    // independent allowance; their extra copies do not fit this ownership proof.
-    let direct_http = (http_json || new_api)
+    // Direct HTTP and clone-only native Kimi Chat use the third tree already
+    // prepaid by admission. Histories requiring copied tool/reasoning repair,
+    // dialect/component/compact transforms retain their separate workspace.
+    let native_kimi_chat = route.driver == crate::oauth::managed::kimi::PROVIDER_DRIVER
+        && kimi::reuses_chat_workspace(protocol, request_json);
+    let direct_http = (http_json || new_api || native_kimi_chat)
         && !is_codex
-        && responses_via_chat_dialect.is_none()
+        && (responses_via_chat_dialect.is_none() || native_kimi_chat)
         && !responses_via_anthropic
         && !matches!(protocol, Protocol::OpenAiResponsesCompact)
         && !crate::api::new_api_transport::has_compaction_trigger(request_json)
