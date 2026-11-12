@@ -3,6 +3,7 @@ import assert from 'node:assert/strict';
 import fs from 'node:fs/promises';
 import os from 'node:os';
 import path from 'node:path';
+import { fileURLToPath } from 'node:url';
 import { AppServer, bridge, delegateTool } from '../../scripts/maintenance/plaintext-host-bridge.ts';
 
 test('isolated dynamic-tool delegation forwards exact plaintext into a distinct Kimi thread', async () => {
@@ -79,11 +80,8 @@ test('a child turn-start failure retains child identity, call identity and expli
 test('AppServer transports actual subprocess JSON lines and asynchronous server requests', async () => {
   // A real subprocess protocol peer, not the real Codex/model service. Live host
   // acceptance is deliberately a separate operational gate after source review.
-  const peer = `const r=require('node:readline').createInterface({input:process.stdin});
-    r.on('line',l=>{const m=JSON.parse(l);if(m.method==='initialize')process.stdout.write(JSON.stringify({id:m.id,result:{ok:true}})+'\\n');
-    if(m.method==='ask')process.stdout.write(JSON.stringify({id:99,method:'item/tool/call',params:{task:'plain'}})+'\\n');
-    if(m.id===99&&m.result)process.stdout.write(JSON.stringify({method:'peer/done',params:m.result})+'\\n');});`;
-  const server = new AppServer(process.execPath, ['-e', peer], process.env);
+  const peer = fileURLToPath(new URL('./fixtures/plaintext-host-bridge-peer.ts', import.meta.url));
+  const server = new AppServer(process.execPath, [peer], process.env);
   try {
     assert.deepEqual(await server.call('initialize', {}), { ok: true });
     const finished = new Promise(resolve => { server.notification = m => resolve(m.params); });
