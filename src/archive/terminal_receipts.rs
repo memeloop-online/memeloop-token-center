@@ -3,13 +3,15 @@ use futures_util::{Stream, StreamExt};
 use super::{ArchiveStore, path::archive_path};
 use crate::error::AppError;
 
+type TerminalReceipt = (String, Option<[u8; 32]>);
+
 impl ArchiveStore {
     /// Stream only the internal receipt namespace; never enumerate request bodies.
     pub(crate) fn terminal_receipts(
         &self,
         namespace: &str,
     ) -> Result<
-        impl Stream<Item = Result<(String, Option<[u8; 32]>), AppError>> + Send + '_,
+        impl Stream<Item = Result<TerminalReceipt, AppError>> + Send + '_,
         AppError,
     > {
         let prefix = archive_path(&format!("terminal-receipts/v1/{namespace}"))?;
