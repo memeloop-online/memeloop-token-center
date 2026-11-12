@@ -1059,6 +1059,7 @@ async fn process_metered_usage_projection_batch(state: &AppState, lease_owner: U
 }
 
 async fn process_conversation_projection_batch(state: &AppState, lease_owner: Uuid) {
+    tracing::debug!(%lease_owner, stage = "reopen_start", "conversation projection stage");
     if let Err(error) = state
         .db
         .reopen_session_body_rebuilds(PROJECTION_BATCH_LIMIT / 4)
@@ -1069,6 +1070,7 @@ async fn process_conversation_projection_batch(state: &AppState, lease_owner: Uu
             .observe_background_projection(BackgroundProjectionKind::Conversation, false);
         tracing::error!(%error, "worker 未能把已有原始请求 JSON 和原始返回 JSON 的会话正文重新排队");
     }
+    tracing::debug!(%lease_owner, stage = "claim_start", "conversation projection stage");
     let tasks = match state
         .db
         .claim_conversation_projection_tasks(lease_owner, PROJECTION_BATCH_LIMIT)
@@ -1083,7 +1085,9 @@ async fn process_conversation_projection_batch(state: &AppState, lease_owner: Uu
             return;
         }
     };
+    tracing::debug!(%lease_owner, count = tasks.len(), stage = "claim_done", "conversation projection stage");
     for task in tasks {
+        tracing::debug!(request_id = %task.request_id, %lease_owner, stage = "archive_start", "conversation projection stage");
         match archive_session_body(state, lease_owner, task.request_id).await {
             Ok(true) => state
                 .metrics
@@ -1110,6 +1114,7 @@ pub(crate) async fn archive_session_body(
     lease_owner: Uuid,
     request_id: Uuid,
 ) -> Result<bool, AppError> {
+    tracing::debug!(%request_id, %lease_owner, stage = "context_start", "conversation projection stage");
     let (tenant_id, hints, response_complete) =
         state.db.conversation_object_context(request_id).await?;
     let Some(mut locators) = state.db.session_body_locators(request_id).await? else {
@@ -1121,6 +1126,7 @@ pub(crate) async fn archive_session_body(
         )
         .await;
     };
+    tracing::debug!(%request_id, %lease_owner, stage = "raw_response_reference_start", "conversation projection stage");
     if let Some(response) = state
         .archive
         .raw_capture_reference(tenant_id, request_id, "response")
@@ -1140,6 +1146,7 @@ pub(crate) async fn archive_session_body(
         locators.response = None;
         locators.pending = false;
     }
+    tracing::debug!(%request_id, %lease_owner, stage = "raw_request_reference_start", "conversation projection stage");
     if let Some(request) = state
         .archive
         .raw_capture_reference(tenant_id, request_id, "request")
@@ -1158,6 +1165,7 @@ pub(crate) async fn archive_session_body(
             .raw_capture_failed(tenant_id, request_id, "request")
             .await?;
     if locators.pending || request_capture_pending {
+        tracing::debug!(%request_id, %lease_owner, raw_pending = locators.pending, request_capture_pending, stage = "raw_pending_defer", "conversation projection stage");
         state
             .db
             .project_claimed_conversation_identity(lease_owner, request_id)
@@ -1177,6 +1185,7 @@ pub(crate) async fn archive_session_body(
         )
         .await;
     }
+    tracing::debug!(%request_id, %lease_owner, stage = "source_stream_start", "conversation projection stage");
     let projection = state.archive.prepare_session_body_streamed(
         tenant_id,
         request_id,
@@ -1201,6 +1210,7 @@ pub(crate) async fn archive_session_body(
             }
         }
     };
+    tracing::debug!(%request_id, %lease_owner, succeeded = prepared.is_ok(), stage = "source_stream_done", "conversation projection stage");
     let prepared = match prepared {
         Ok(Some(prepared)) => prepared,
         Ok(None) => {
@@ -1295,10 +1305,13 @@ pub(crate) async fn archive_session_body(
     {
         return Ok(false);
     }
-    state
+    tracing::debug!(%request_id, %lease_owner, stage = "semantic_projection_start", "conversation projection stage");
+    let result = state
         .db
         .project_claimed_conversation_projection_task(lease_owner, request_id)
-        .await
+        .await;
+    tracing::debug!(%request_id, %lease_owner, succeeded = result.is_ok(), stage = "semantic_projection_done", "conversation projection stage");
+    result
 }
 
 async fn skip_session_body(
