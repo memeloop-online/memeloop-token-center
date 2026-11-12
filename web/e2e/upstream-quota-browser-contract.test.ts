@@ -77,7 +77,17 @@ test('upstream themes and mock-only quota demand, consent and reconciliation con
       assert.equal(focus.style, 'solid');
       assert.notEqual(focus.color, 'rgba(0, 0, 0, 0)');
         await page.setViewportSize({ width, height: 900 });
-        assert.ok(await page.evaluate(() => document.documentElement.scrollWidth <= document.documentElement.clientWidth));
+        const overflow = await page.evaluate(() => ({
+          viewport: document.documentElement.clientWidth,
+          width: document.documentElement.scrollWidth,
+          elements: Array.from(document.body.querySelectorAll<HTMLElement>('*')).flatMap(element => {
+            const rect = element.getBoundingClientRect();
+            return rect.width > 0 && (rect.left < 0 || rect.right > document.documentElement.clientWidth)
+              ? [{ tag: element.tagName, className: element.className, left: rect.left, right: rect.right, width: rect.width }]
+              : [];
+          }).slice(0, 12),
+        }));
+        assert.ok(overflow.width <= overflow.viewport, `upstream layout overflow ${theme}/${width}: ${JSON.stringify(overflow)}`);
         await page.screenshot({ path: join(artifacts, `upstream-quota-${theme}-${width}.png`), fullPage: true });
     }
     // Exercise the real UpstreamQuota, with fetch replaced by the strict local fixture.
