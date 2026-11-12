@@ -23,6 +23,7 @@ async fn two_candidates_deliver_first_event_before_release_and_keep_the_selected
             } else {
                 completed_codex_sse("selected complete")
             };
+            let original = format!("{prefix}{suffix}");
             let (release, gate) = tokio::sync::oneshot::channel::<()>();
             let (dropped, observed_drop) = tokio::sync::oneshot::channel::<()>();
             let gate = Arc::new(std::sync::Mutex::new(Some((gate, dropped))));
@@ -93,17 +94,31 @@ async fn two_candidates_deliver_first_event_before_release_and_keep_the_selected
             assert_eq!(standby_posts.load(Ordering::SeqCst), 0);
             if ending == "cancel" {
                 drop(body);
+                let receipt = cancellation::assert_single_unknown_receipt(
+                    &fixture,
+                    499,
+                    Some("client_cancelled"),
+                )
+                .await;
+                assert_eq!(standby_posts.load(Ordering::SeqCst), 0);
+                // Delivery and its request owner have stopped; the independent
+                // original capture still owns the supplier until its EOF.
+                release.send(()).unwrap();
+                tokio::time::timeout(Duration::from_secs(5), observed_drop)
+                    .await
+                    .expect("supplier EOF must release the original capture body")
+                    .unwrap_err();
+                let request_id = receipt["request_id"].as_str().unwrap().parse().unwrap();
+                cancellation::assert_original_response(&fixture, request_id, original.as_bytes())
+                    .await;
+                // Archiving late supplier bytes cannot retroactively settle
+                // the cancelled delivery or dispatch the standby.
                 cancellation::assert_single_unknown_receipt(
                     &fixture,
                     499,
                     Some("client_cancelled"),
                 )
                 .await;
-                tokio::time::timeout(Duration::from_secs(5), observed_drop)
-                    .await
-                    .expect("cancellation must release upstream body")
-                    .unwrap_err();
-                drop(release);
             } else {
                 if !comment && ending == "complete" {
                     tokio::time::timeout(Duration::from_secs(25), async {
