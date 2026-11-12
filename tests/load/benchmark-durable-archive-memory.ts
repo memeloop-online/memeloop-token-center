@@ -673,6 +673,8 @@ export async function run(binary: string, output: string): Promise<boolean> {
       try { await deadline(Promise.all(clients.map((client) => client.uploaded)), 30_000, "concurrent upload boundaries"); }
       finally { responseGate.release(); responseGate = undefined; }
       const results = await Promise.all(clients.map((client) => client.result));
+      // Preserve actual statuses and byte hashes even if the assertion fails.
+      report.phases.at(-1).result = { results };
       assert(results.every((item) => item.status === 200 && item.bytes === current.bytes && item.sha256 === planHash(current)), "all four concurrent 16MiB requests must complete with exact response bytes/hash");
       assert(upstreamCalls - callsBefore === results.filter((item) => item.status === 200).length, "rejected pressure requests must not dispatch upstream");
       // Require deterministic real work after every owner drains.

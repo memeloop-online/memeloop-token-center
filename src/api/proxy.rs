@@ -1105,6 +1105,7 @@ async fn proxy_with_cancellation_guard(
         protocol,
         request_id,
         request_json: &request_json,
+        request_memory: Some(&memory),
         codex_multi_agent_v2_request,
     };
     let mut route_plan = prepare_authorized_proxy_routes(AuthorizedProxyRoutesInput {
@@ -1141,6 +1142,8 @@ async fn proxy_with_cancellation_guard(
         .await?;
         strategy.finish("completed", None, None);
         if state.group_routing.is_some() {
+            // Release the previous plan before building its replacement.
+            drop(route_plan);
             route_plan = prepare_authorized_proxy_routes(AuthorizedProxyRoutesInput {
                 request: ProxyRequestContext {
                     state: &state,
@@ -1149,6 +1152,7 @@ async fn proxy_with_cancellation_guard(
                     protocol,
                     request_id,
                     request_json: &request_json,
+                    request_memory: Some(&memory),
                     codex_multi_agent_v2_request,
                 },
                 original_body_length: request_body_length,
@@ -1164,6 +1168,7 @@ async fn proxy_with_cancellation_guard(
         protocol,
         request_id,
         request_json: &request_json,
+        request_memory: Some(&memory),
         codex_multi_agent_v2_request,
     };
     let primary = route_plan.primary_route();
@@ -1339,7 +1344,7 @@ async fn proxy_with_cancellation_guard(
         protocol,
         tenant_id: key.tenant_id,
         original_response_capture: false,
-        memory,
+        memory: memory.clone(),
     };
     // Native streams and source-backed Responses retain their charged request
     // under the process-wide budget without occupying buffered-response
