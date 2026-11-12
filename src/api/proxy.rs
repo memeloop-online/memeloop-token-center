@@ -2978,7 +2978,7 @@ async fn execute_component_provider(
                 )
                 .await
         });
-    let upstream = request.capture_original_response(upstream.into()).await;
+    let upstream = request.capture_original_response(upstream).await;
 
     IndependentProbeTarget::response(upstream_status);
     if !upstream_status.is_success() && !upstream_status.is_redirection() {
