@@ -808,6 +808,10 @@ pub enum ConfigError {
     InvalidPricingSourceUrl(&'static str),
 }
 
+fn default_database_aux_pool_max_connections() -> u32 {
+    2
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1123,8 +1127,4 @@ mod tests {
             UpstreamHealthConfig::DEFAULT
         );
     }
-}
-
-fn default_database_aux_pool_max_connections() -> u32 {
-    2
 }
