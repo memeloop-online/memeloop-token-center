@@ -17,6 +17,7 @@ fn input() -> BeginArchiveStagingInput {
 
 async fn contract(database_url: &str) {
     let database = Database::connect_with_max(database_url, 2).await.unwrap();
+    database.migrate().await.unwrap();
     let legacy_input = input();
     let BeginArchiveStagingResult::Created(legacy) = database
         .begin_archive_staging_attempt(legacy_input.clone())
