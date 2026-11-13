@@ -5,7 +5,7 @@ import { fileURLToPath } from 'node:url';
 import test from 'node:test';
 import { chromium } from 'playwright';
 import { createServer } from 'vite';
-declare global { interface Window { requestLifecycleFixture: { finish: () => void; settle: (cost: string, kind: 'finished' | 'projected' | 'archive_bound') => void; replay: () => void; hold: () => void; release: () => void; switchScope: () => void; filter: () => void; failQuery: () => void; held: boolean; queryHeld: boolean; queryCalls: number; detailCalls: number; scopeCommits: { scope: string; drawers: number }[] }; } }
+declare global { interface Window { requestLifecycleFixture: { observe: () => void; finish: () => void; settle: (cost: string, kind: 'finished' | 'projected' | 'archive_bound') => void; replay: () => void; hold: () => void; release: () => void; switchScope: () => void; filter: () => void; failQuery: () => void; held: boolean; queryHeld: boolean; queryCalls: number; detailCalls: number; scopeCommits: { scope: string; drawers: number }[] }; } }
 
 test('low-volume terminal events reconcile operational money without opening details or overflowing', { timeout: 45_000 }, async (context) => {
   if (!existsSync(chromium.executablePath())) {
@@ -595,5 +595,33 @@ test('typed failure diagnostic replaces the repeated unknown cause in list and d
       await drawer.getByRole('button', { name: close, exact: true }).click();
       await page.close();
     }
+  } finally { await browser.close(); await server.close(); }
+});
+
+
+test('manual refresh updates the selected drawer and row from the same observation without closing it', { timeout: 45_000 }, async context => {
+  if (!existsSync(chromium.executablePath())) {
+    if (process.env.MTC_REQUIRE_BROWSER === '1') throw new Error('Chromium is required');
+    context.skip('Chromium is not installed'); return;
+  }
+  const server = await createServer({ root: fileURLToPath(new URL('..', import.meta.url)), configFile: false, logLevel: 'silent', server: { host: '127.0.0.1', port: 0 } });
+  await server.listen();
+  const address = server.httpServer?.address(); assert.ok(address && typeof address !== 'string');
+  const browser = await chromium.launch({ headless: true });
+  try {
+    const page = await browser.newPage();
+    await page.addInitScript(() => localStorage.setItem('mtc-locale', 'en'));
+    await page.goto(`http://127.0.0.1:${address.port}/e2e/fixtures/request-lifecycle.html?quiet-background-help&operational=zero`);
+    const row = page.locator('tbody tr').filter({ has: page.getByText('model-a', { exact: true }) });
+    await row.locator('.table-action').click();
+    await page.locator('.drawer').waitFor();
+    const detailCalls = await page.evaluate(() => window.requestLifecycleFixture.detailCalls);
+    await page.evaluate(() => window.requestLifecycleFixture.observe());
+    await page.locator('.traffic-heading-actions').getByRole('button', { name: 'Refresh', exact: true }).click();
+    await row.getByText('Late recorded session', { exact: true }).waitFor();
+    await page.locator('.drawer').getByText('Late recorded session', { exact: true }).waitFor();
+    assert.equal(await page.locator('.drawer').count(), 1);
+    assert.equal(await page.evaluate(() => window.requestLifecycleFixture.detailCalls), detailCalls,
+      'refresh reuses the loaded detail body rather than reopening the drawer');
   } finally { await browser.close(); await server.close(); }
 });
