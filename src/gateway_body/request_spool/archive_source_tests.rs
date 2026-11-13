@@ -474,10 +474,10 @@ async fn qualified_source_receipt_contract(database_url: &str) {
             .fetch_optional(&pool)
             .await
             .unwrap();
-            if let Some(stage) = stage {
-                if state.as_deref() == Some("bound") {
-                    break stage;
-                }
+            if let Some(stage) = stage
+                && state.as_deref() == Some("bound")
+            {
+                break stage;
             }
             tokio::task::yield_now().await;
         }
