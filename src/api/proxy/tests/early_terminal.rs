@@ -154,11 +154,45 @@ async fn early_terminal_database_lock_does_not_hold_failure_response_and_replays
 #[tokio::test]
 async fn authenticated_body_admission_failure_has_no_supplier_or_reservation() {
     let fixture = codex_route_fixture("early-terminal-body").await;
+    let pool = sqlx::AnyPool::connect(&fixture.database_url).await.unwrap();
+    sqlx::query("UPDATE upstream_accounts SET status = 'disabled' WHERE id = $1")
+        .bind(fixture.upstream_account_id.to_string())
+        .execute(&pool)
+        .await
+        .unwrap();
     let memory = fixture.state.proxy_memory_budget.reservation();
     assert!(memory.try_grow(fixture.state.config.proxy_memory_budget_bytes as usize, 1));
-    let response = reject_without_candidates(&fixture).await;
-    assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+    // Budget pressure now waits. Poll the real route while the owner holds
+    // every credit, then cancel it without releasing that owner's budget.
+    let mut cancelled = Box::pin(reject_without_candidates(&fixture));
+    assert!(futures_util::poll!(&mut cancelled).is_pending());
+    drop(cancelled);
+    let reservations: i64 =
+        sqlx::query_scalar("SELECT COUNT(*) FROM usage_reservations WHERE key_id = $1")
+            .bind(fixture.key_id.to_string())
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+    assert_eq!(
+        reservations, 0,
+        "cancelled admission cannot reserve or dispatch"
+    );
+    assert_eq!(
+        fixture.state.proxy_memory_budget.snapshot().0,
+        fixture.state.config.proxy_memory_budget_bytes
+    );
+    let mut waiting = Box::pin(reject_without_candidates(&fixture));
+    assert!(futures_util::poll!(&mut waiting).is_pending());
+    let rows = fixture
+        .state
+        .db
+        .list_requests(fixture.key_id, 10)
+        .await
+        .unwrap();
+    assert!(rows.is_empty(), "waiting admission is not a failed request");
     drop(memory);
+    let response = waiting.await;
+    assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
     fixture.state.early_requests.drain_for_test().await;
     let rows = fixture
         .state
@@ -167,10 +201,22 @@ async fn authenticated_body_admission_failure_has_no_supplier_or_reservation() {
         .await
         .unwrap();
     assert_eq!(rows.len(), 1);
-    assert!(rows[0].model.is_empty());
-    assert_eq!(rows[0].error_code.as_deref(), Some("proxy_memory_json"));
+    assert_eq!(rows[0].model, fixture.model);
+    assert_eq!(
+        rows[0].error_code.as_deref(),
+        Some("no_authorized_upstream_candidate")
+    );
     assert!(!rows[0].billing.billable);
     assert!(rows[0].upstream_account_id.is_none());
+    let reservations: i64 =
+        sqlx::query_scalar("SELECT COUNT(*) FROM usage_reservations WHERE key_id = $1")
+            .bind(fixture.key_id.to_string())
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+    assert_eq!(reservations, 0);
+    assert_eq!(fixture.state.proxy_memory_budget.snapshot().0, 0);
+    pool.close().await;
 }
 
 #[tokio::test]
