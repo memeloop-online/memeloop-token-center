@@ -286,6 +286,48 @@ async fn request_history_real_services_acceptance() {
     crate::request_history::migration::drain(&database, &client, 1)
         .await
         .unwrap();
+    // Report field paths only, never historical values or credentials.
+    fn differing_paths(left: &Value, right: &Value, path: &str, output: &mut Vec<String>) {
+        if left == right {
+            return;
+        }
+        match (left, right) {
+            (Value::Object(left), Value::Object(right)) => {
+                let keys = left
+                    .keys()
+                    .chain(right.keys())
+                    .collect::<std::collections::BTreeSet<_>>();
+                for key in keys {
+                    match (left.get(key), right.get(key)) {
+                        (Some(left), Some(right)) => {
+                            differing_paths(left, right, &format!("{path}/{key}"), output)
+                        }
+                        _ => output.push(format!("{path}/{key}")),
+                    }
+                }
+            }
+            _ => output.push(path.to_owned()),
+        }
+    }
+    for actual in client.snapshots(&query).await.unwrap() {
+        let expected = database
+            .history_snapshot(actual.identity.clone(), actual.revision)
+            .await
+            .unwrap();
+        let mut paths = Vec::new();
+        differing_paths(
+            &serde_json::to_value(expected).unwrap(),
+            &serde_json::to_value(&actual).unwrap(),
+            "",
+            &mut paths,
+        );
+        assert!(
+            paths.is_empty(),
+            "same-revision canonical mismatch source={} revision={} paths={paths:?}",
+            actual.identity.source,
+            actual.revision
+        );
+    }
     let report = crate::request_history::migration::verify(&database, &client)
         .await
         .unwrap();
