@@ -632,11 +632,11 @@ jobs:
           database="$RUNNER_TEMP/migration-smoke.sqlite"
           export MTC_DATABASE_URL="sqlite://$database?mode=rwc"
           cargo run --locked --bin memeloop-token-center -- migrate
-          # Recreate the exact predecessor schema, retaining immutable migration 153.
-          sqlite3 "$database" 'DROP TABLE group_allocation_history_hours; DROP TABLE group_allocation_history_contributions; DROP TABLE group_allocation_history_receipts; DROP TABLE group_allocation_history_state; DELETE FROM schema_migrations WHERE version = 154;'
-          test "$(sqlite3 "$database" 'SELECT max(version) FROM schema_migrations')" = 153
-          cargo run --locked --bin memeloop-token-center -- migrate
+          # Recreate schema 154 and verify upgrade and replay of migration 155.
+          sqlite3 "$database" 'ALTER TABLE archive_staging_attempts DROP COLUMN backend_identity; DELETE FROM schema_migrations WHERE version = 155;'
           test "$(sqlite3 "$database" 'SELECT max(version) FROM schema_migrations')" = 154
+          cargo run --locked --bin memeloop-token-center -- migrate
+          test "$(sqlite3 "$database" 'SELECT max(version) FROM schema_migrations')" = 155
           first_count="$(sqlite3 "$database" 'SELECT count(*) FROM schema_migrations')"
           cargo run --locked --bin memeloop-token-center -- migrate
           second_count="$(sqlite3 "$database" 'SELECT count(*) FROM schema_migrations')"
@@ -651,11 +651,11 @@ jobs:
           MTC_ARCHIVE_PATH: /tmp/mtc-migration-smoke-archive
         run: |
           cargo run --locked --bin memeloop-token-center -- migrate
-          # Exercise upgrade from 153, then replay the release migration unchanged.
-          psql -X --no-psqlrc -v ON_ERROR_STOP=1 "$MTC_DATABASE_URL" -c 'DROP TABLE group_allocation_history_hours; DROP TABLE group_allocation_history_contributions; DROP TABLE group_allocation_history_receipts; DROP TABLE group_allocation_history_state; DELETE FROM schema_migrations WHERE version = 154;'
-          test "$(psql -X --no-psqlrc -qAt "$MTC_DATABASE_URL" -c 'SELECT max(version) FROM schema_migrations')" = 153
-          cargo run --locked --bin memeloop-token-center -- migrate
+          # Exercise upgrade from 154, then replay the release migration unchanged.
+          psql -X --no-psqlrc -v ON_ERROR_STOP=1 "$MTC_DATABASE_URL" -c 'ALTER TABLE archive_staging_attempts DROP COLUMN backend_identity; DELETE FROM schema_migrations WHERE version = 155;'
           test "$(psql -X --no-psqlrc -qAt "$MTC_DATABASE_URL" -c 'SELECT max(version) FROM schema_migrations')" = 154
+          cargo run --locked --bin memeloop-token-center -- migrate
+          test "$(psql -X --no-psqlrc -qAt "$MTC_DATABASE_URL" -c 'SELECT max(version) FROM schema_migrations')" = 155
           first_count="$(psql -X --no-psqlrc -qAt "$MTC_DATABASE_URL" \
             -c 'SELECT count(*) FROM schema_migrations')"
           cargo run --locked --bin memeloop-token-center -- migrate
