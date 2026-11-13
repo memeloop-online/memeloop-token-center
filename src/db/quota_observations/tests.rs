@@ -270,6 +270,7 @@ async fn verify(config: Config) {
         route_id: route.id,
         account_id: account.id,
         driver: "kimi-oauth".into(),
+        upstream_model: "fixture-model".into(),
         transport_revision: target.config_revision,
         credential_generation: target.generation,
     };

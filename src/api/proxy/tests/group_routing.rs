@@ -176,6 +176,7 @@ async fn installed_hook_without_group_configuration_retains_native_candidates() 
         route_id: Uuid::parse_str(&route_id).unwrap(),
         account_id: fixture.accounts[0],
         driver: "openai".into(),
+        upstream_model: "fixture-model".into(),
         transport_revision: 1,
         credential_generation: generation,
     }];
@@ -237,6 +238,7 @@ async fn broken_group_configuration_continues_to_the_upstream() {
         route_id: Uuid::parse_str(&route_id).unwrap(),
         account_id: fixture.accounts[0],
         driver: "openai".into(),
+        upstream_model: "fixture-model".into(),
         transport_revision: 1,
         credential_generation: generation,
     }];
@@ -343,6 +345,7 @@ async fn preferred_account_real_gateway_uses_order_without_overriding_native_hea
             route_id: Uuid::parse_str(&route).unwrap(),
             account_id,
             driver: "openai".into(),
+            upstream_model: "fixture-model".into(),
             transport_revision: 1,
             credential_generation: generation,
         });

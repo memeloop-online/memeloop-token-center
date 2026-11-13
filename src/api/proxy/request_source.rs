@@ -47,13 +47,26 @@ pub(super) async fn parse(
     source: Arc<RequestSpool>,
     memory: Arc<ProxyMemoryReservation>,
 ) -> Result<Value, AppError> {
+    parse_with_shape(source, memory, 0, 0).await
+}
+
+pub(super) async fn parse_with_shape(
+    source: Arc<RequestSpool>,
+    memory: Arc<ProxyMemoryReservation>,
+    required_bytes: usize,
+    required_nodes: usize,
+) -> Result<Value, AppError> {
     // Upload and parse both reopen the complete local file. Neither needs the
     // resident cache to remain charged while JSON admission waits.
     source.release_local_retained();
     let working = memory
-        .reserve_source_json(source.len(), source.json_nodes(), || {
-            source.reclaim_for(|| false);
-        })
+        .reserve_source_json(
+            source.len().max(required_bytes),
+            source.json_nodes().max(required_nodes),
+            || {
+                source.reclaim_for(|| false);
+            },
+        )
         .await
         .ok_or_else(|| AppError::capacity_error("proxy_memory_json"))?;
     let download = source
@@ -83,6 +96,33 @@ pub(super) async fn parse(
             AppError::BadRequest("request body must be valid JSON".into())
         }
     })
+}
+
+/// The normalized replay is private, local and independent of the canonical
+/// archive source. Moving the tree into this function ensures none survives
+/// when its caller releases the old JSON admission and waits to parse again.
+pub(super) async fn spool_normalized(
+    value: Value,
+    directory: std::path::PathBuf,
+    memory: &Arc<ProxyMemoryReservation>,
+) -> Result<Arc<RequestSpool>, AppError> {
+    let encoded =
+        serde_json::to_vec(&value).map_err(|_| AppError::internal("request_replay_serialize"))?;
+    drop(value);
+    let length = encoded.len();
+    let source = crate::gateway_body::request_spool::RequestSpoolAdmission::new(directory)
+        .capture_with_memory(
+            axum::body::Body::from(encoded),
+            length,
+            Some(length),
+            Some(memory),
+            0,
+            None,
+        )
+        .await
+        .map_err(|_| AppError::capacity_error("request_spool_read_failed"))?;
+    source.release_local_retained();
+    Ok(Arc::new(source))
 }
 
 #[cfg(test)]

@@ -945,7 +945,7 @@ async fn proxy_with_identity_and_conversation_spool(
 async fn proxy_with_cancellation_guard(
     state: AppState,
     headers: HeaderMap,
-    body: Bytes,
+    mut body: Bytes,
     protocol: Protocol,
     key: AuthenticatedKey,
     pinned_route: Option<Uuid>,
@@ -958,7 +958,7 @@ async fn proxy_with_cancellation_guard(
         crate::api::request_normalization::is_official_codex_user_agent(&headers);
     let diagnostic_context = proxy_diagnostics::Context::current();
     let request_id = diagnostic_context.request_id;
-    let conversation_spool =
+    let mut conversation_spool =
         conversation_spool.or_else(|| state.responses_request_spool.source(request_id));
     let request_body_length = conversation_spool
         .as_ref()
@@ -989,7 +989,7 @@ async fn proxy_with_cancellation_guard(
         return Err(AppError::capacity_error("proxy_memory_json"));
     }
     let json_parse = proxy_diagnostics::Phase::new(diagnostic_context, "request_json_parse");
-    let original_request_json: Value = if streamed_source {
+    let mut original_request_json: Value = if streamed_source {
         match request_source::parse(conversation_spool.as_ref().unwrap().clone(), memory.clone())
             .await
         {
@@ -1041,7 +1041,7 @@ async fn proxy_with_cancellation_guard(
         );
         return Err(AppError::Forbidden);
     }
-    let request_json = applied.request_json;
+    let mut request_json = applied.request_json;
     let model = applied.model;
     super::early_request::observe_model(Some(&Value::String(model.clone())));
     let codex_multi_agent_v2_request = matches!(protocol, Protocol::OpenAiResponses)
@@ -1095,6 +1095,55 @@ async fn proxy_with_cancellation_guard(
         if candidates.is_empty() {
             return Err(AppError::Forbidden);
         }
+    }
+    if let Some((required_bytes, required_nodes)) =
+        routing::native_chat_candidate_shape(protocol, &mut request_json, &candidates)?
+        && !memory.covers_json_shape(required_bytes, required_nodes)
+    {
+        // Preserve the original request for archiving independently of the
+        // normalized replay. No provider-specific rewrite becomes its source.
+        if conversation_spool.is_none() {
+            conversation_spool = Some(std::sync::Arc::new(
+                state
+                    .responses_request_spool
+                    .capture_with_memory(
+                        Body::from(body.clone()),
+                        body.len(),
+                        Some(body.len()),
+                        Some(&memory),
+                        0,
+                        Some(&request_id.to_string()),
+                    )
+                    .await
+                    .map_err(|_| AppError::capacity_error("request_spool_read_failed"))?,
+            ));
+        }
+        conversation_spool
+            .as_ref()
+            .unwrap()
+            .release_local_retained();
+        memory.release(
+            body.len(),
+            crate::gateway_body::memory::CAPTURE_MEMORY_WEIGHT,
+        );
+        body = Bytes::new();
+        drop(std::mem::take(&mut original_request_json));
+        let replay = request_source::spool_normalized(
+            std::mem::take(&mut request_json),
+            std::path::PathBuf::from(&state.config.responses_request_spool_path),
+            &memory,
+        )
+        .await?;
+        memory.release_unretained_json();
+        // Only complete, independently readable local sources survive this
+        // cancellable admission. It has neither old JSON nor a partial permit.
+        request_json = request_source::parse_with_shape(
+            replay,
+            memory.clone(),
+            required_bytes,
+            required_nodes,
+        )
+        .await?;
     }
     let strategy_candidates =
         crate::group_routing::candidate_snapshot_if_enabled(&state, &candidates);
