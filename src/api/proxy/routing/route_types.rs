@@ -5,6 +5,9 @@ pub(in crate::api::proxy) struct PreparedProxyRoute {
     pub(in crate::api::proxy) inspect_stream_rejection: bool,
     pub(in crate::api::proxy) route: ResolvedUpstream,
     pub(super) forwarded_body: Bytes,
+    // Component dispatch keeps only the adapter body, but its input tree may
+    // already include protocol rewrites larger than the original ingress.
+    pub(super) component_input_bytes: usize,
     pub(in crate::api::proxy) upstream_stream: bool,
     pub(in crate::api::proxy) codex_downstream_stream: bool,
     pub(in crate::api::proxy) codex_store_disabled: bool,

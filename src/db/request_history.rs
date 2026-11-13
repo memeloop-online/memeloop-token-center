@@ -160,7 +160,7 @@ impl Database {
 
     pub async fn history_start(&self) -> Result<(), HistoryError> {
         let mut transaction = self.pool.begin().await?;
-        for (table, identity) in [
+        let sources = [
             ("request_events", Some(("event", "event_id", "event_at"))),
             ("request_records", Some(("native", "id", "created_at"))),
             ("generation_jobs", Some(("generation", "id", "created_at"))),
@@ -184,7 +184,23 @@ impl Database {
             ("key_records", None),
             ("principals", None),
             ("tenants", None),
-        ] {
+        ];
+        if matches!(self.backend, DatabaseBackend::PostgreSql) {
+            // Acquire the complete static source-table set before any DDL.
+            // NOWAIT rolls back immediately if a live writer owns a conflicting
+            // lock, rather than reversing its records/events lock order.
+            let tables = sources
+                .iter()
+                .map(|(table, _)| *table)
+                .collect::<Vec<_>>()
+                .join(", ");
+            sqlx::raw_sql(sqlx::AssertSqlSafe(format!(
+                "LOCK TABLE {tables} IN SHARE ROW EXCLUSIVE MODE NOWAIT"
+            )))
+            .execute(&mut *transaction)
+            .await?;
+        }
+        for (table, identity) in sources {
             for event in ["INSERT", "UPDATE", "DELETE"] {
                 let record = if event == "DELETE" { "OLD" } else { "NEW" };
                 let select = if let Some((source, id, created_at)) = identity {

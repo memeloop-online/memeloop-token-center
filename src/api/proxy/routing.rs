@@ -11,6 +11,8 @@ pub(super) mod diagnostics;
 mod http;
 #[cfg(test)]
 pub(super) use http::with_stalled_probe_preparation;
+#[cfg(test)]
+mod component_workspace_tests;
 pub(super) mod kimi;
 #[cfg(test)]
 mod kimi_workspace_tests;
@@ -452,64 +454,73 @@ pub(super) async fn materialize_proxy_route(
     } else {
         Some(route_temporary_memory(state, temporary_bytes)?)
     };
-    let component_request = if let Some(context) = planned.component_context {
+    let component_input_bytes = if planned.component_context.is_some() {
+        encoded_length
+    } else {
+        0
+    };
+    let (component_request, forwarded_body) = if let Some(context) = planned.component_context {
         let prepared = prepare_component_provider(
             state,
             &planned.route.driver,
             context.clone(),
             planned.route.config.clone(),
-            planned.forwarded_json.clone(),
+            planned.forwarded_json,
             _temporary_memory
                 .as_ref()
                 .expect("component workspace reserved independently")
                 .clone(),
         )
         .await?;
-        Some((prepared, context))
+        // The component owns the forwarded tree until its blocking call ends.
+        // Only its prepared body is dispatched by execute_component_primary;
+        // serializing the input again would retain an unused full body copy.
+        (Some((prepared, context)), Vec::new())
     } else {
-        None
-    };
-    let mut forwarded_body = Vec::with_capacity(encoded_length);
-    serde_json::to_writer(&mut forwarded_body, &planned.forwarded_json)
-        .map_err(|_| AppError::internal("routing_materialize_proxy_route_1"))?;
-    if let Some(context) = planned.wire_shim_context {
-        let plugins = wire_shim_runtime(state);
-        let configurations = plugins
-            .resolved_traffic_configurations(
-                context
-                    .tenant_id
-                    .parse()
-                    .map_err(|_| AppError::internal("routing_materialize_proxy_route_2"))?,
-            )
-            .await?;
-        let body = String::from_utf8(forwarded_body)
-            .map_err(|_| AppError::internal("routing_materialize_proxy_route_3"))?;
-        let driver = planned.route.driver.clone();
-        let protocol = context.protocol.clone();
-        let outcome = crate::api::plugin_execution::run(
-            state.metrics.clone(),
-            crate::api::plugin_execution::Phase::WireShimFinalize,
-            move || {
-                plugins.finalize_wire_shim(
-                    &driver,
-                    &protocol,
-                    context,
-                    &body,
-                    "{}",
-                    &configurations,
+        let mut forwarded_body = Vec::with_capacity(encoded_length);
+        serde_json::to_writer(&mut forwarded_body, &planned.forwarded_json)
+            .map_err(|_| AppError::internal("routing_materialize_proxy_route_1"))?;
+        if let Some(context) = planned.wire_shim_context {
+            let plugins = wire_shim_runtime(state);
+            let configurations = plugins
+                .resolved_traffic_configurations(
+                    context
+                        .tenant_id
+                        .parse()
+                        .map_err(|_| AppError::internal("routing_materialize_proxy_route_2"))?,
                 )
-            },
-        )
-        .await?
-        .ok_or(AppError::internal("routing_materialize_proxy_route_1"))?;
-        forwarded_body = outcome.request_json.into_bytes();
-    }
+                .await?;
+            let body = String::from_utf8(forwarded_body)
+                .map_err(|_| AppError::internal("routing_materialize_proxy_route_3"))?;
+            let driver = planned.route.driver.clone();
+            let protocol = context.protocol.clone();
+            let outcome = crate::api::plugin_execution::run(
+                state.metrics.clone(),
+                crate::api::plugin_execution::Phase::WireShimFinalize,
+                move || {
+                    plugins.finalize_wire_shim(
+                        &driver,
+                        &protocol,
+                        context,
+                        &body,
+                        "{}",
+                        &configurations,
+                    )
+                },
+            )
+            .await?
+            .ok_or(AppError::internal("routing_materialize_proxy_route_1"))?;
+            forwarded_body = outcome.request_json.into_bytes();
+        }
+        (None, forwarded_body)
+    };
     Ok(PreparedProxyRoute {
         request_workspace: planned.request_workspace,
         inspect_stream_rejection: false,
         wait_for_compaction: planned.wait_for_compaction,
         route: planned.route,
         forwarded_body: Bytes::from(forwarded_body),
+        component_input_bytes,
         upstream_stream: planned.upstream_stream,
         codex_downstream_stream: planned.codex_downstream_stream,
         codex_store_disabled: planned.codex_store_disabled,

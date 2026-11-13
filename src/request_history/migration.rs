@@ -47,6 +47,18 @@ pub async fn command(config: &Config, command: HistoryCommand) -> Result<Value, 
             "revision": database.history_revision().await?,
         }));
     }
+    let database = if matches!(
+        &command,
+        HistoryCommand::Backfill { .. }
+            | HistoryCommand::Drain { .. }
+            | HistoryCommand::Verify
+            | HistoryCommand::Switch
+            | HistoryCommand::Refresh
+    ) {
+        database.with_archive(crate::archive::ArchiveStore::from_config(config).await?)
+    } else {
+        database
+    };
     database.refresh_http_settings().await?;
     database.start_http_settings_refresh();
     let role = match command {

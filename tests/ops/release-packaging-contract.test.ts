@@ -98,8 +98,10 @@ test('release contains only runtime images and no retired migration delivery sur
   assert.match(parsed.concurrency?.group ?? '', /github\.event_name == 'pull_request'/);
   assert.match(parsed.concurrency?.group ?? '', /github\.event\.pull_request\.number/);
   assert.match(parsed.concurrency?.group ?? '', /github\.run_id/);
-  assert.match(parsed.concurrency?.['cancel-in-progress'] ?? '', /github\.event_name == 'pull_request'/);
-  assert.match(parsed.concurrency?.['cancel-in-progress'] ?? '', /github\.event_name == 'push'.*github\.ref == 'refs\/heads\/master'/);
+  const cancelInProgress = parsed.concurrency?.['cancel-in-progress'];
+  assert.equal(typeof cancelInProgress, 'string');
+  assert.match(String(cancelInProgress ?? ''), /github\.event_name == 'pull_request'/);
+  assert.match(String(cancelInProgress ?? ''), /github\.event_name == 'push'.*github\.ref == 'refs\/heads\/master'/);
   const memoryBinary = parsed.jobs?.['memory-binary'];
   const memoryAcceptance = parsed.jobs?.['memory-acceptance'];
   const releaseInputAssembly = parsed.jobs?.['release-input-assembly'];
