@@ -134,7 +134,7 @@ pub(super) struct ReadSession<'a> {
     pub(super) deadline: tokio::time::Instant,
     pub(super) budget: QuotaBudget,
     attempts: StdMutex<Vec<Attempt>>,
-    unbounded: bool,
+    pub(super) unbounded: bool,
 }
 
 impl<'a> ReadSession<'a> {

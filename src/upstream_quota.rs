@@ -1199,7 +1199,7 @@ async fn get_codex_json_with_routes(
     let fixture_url = r2_tests::fixture_url(url);
     #[cfg(test)]
     let url = fixture_url.as_deref().unwrap_or(url);
-    let deadline = session.deadline;
+    let deadline = (!session.unbounded).then_some(session.deadline);
     let route_index = std::sync::atomic::AtomicUsize::new(0);
     let attempt = std::sync::atomic::AtomicUsize::new(0);
     session
@@ -1224,7 +1224,6 @@ async fn get_codex_json_with_routes(
                 .map_err(|_| retry::Failure::terminal("quota_destination_invalid", "client"))?;
             let mut request = http
                 .get(url)
-                .timeout(deadline.saturating_duration_since(tokio::time::Instant::now()))
                 .header(
                     auth.credential_header.clone(),
                     auth.credential_value.clone(),
@@ -1244,6 +1243,10 @@ async fn get_codex_json_with_routes(
                         crate::oauth::managed::codex::ORIGINATOR
                     },
                 );
+            if let Some(deadline) = deadline {
+                request = request
+                    .timeout(deadline.saturating_duration_since(tokio::time::Instant::now()));
+            }
             if context.endpoint_kind == "credits" {
                 request = request.header("openai-beta", "codex-1");
             }
@@ -1251,7 +1254,7 @@ async fn get_codex_json_with_routes(
                 if let Some(routes) = routes {
                     routes.advance_on_failure(&route_index, &error);
                 }
-                if tokio::time::Instant::now() >= deadline {
+                if deadline.is_some_and(|deadline| tokio::time::Instant::now() >= deadline) {
                     retry::Failure::terminal("quota_timeout", "deadline")
                 } else {
                     retry::Failure::transport(error)
@@ -1273,7 +1276,7 @@ async fn decode_codex_response(
     response: reqwest::Response,
     context: QuotaRequestContext,
     started: tokio::time::Instant,
-    deadline: tokio::time::Instant,
+    deadline: Option<tokio::time::Instant>,
     read_timeout: Duration,
 ) -> Result<Value, &'static str> {
     if !response.status().is_success() {
@@ -1292,7 +1295,10 @@ async fn decode_codex_response(
     let mut bytes = Vec::new();
     let mut stream = response.bytes_stream();
     loop {
-        let read_deadline = deadline.min(tokio::time::Instant::now() + read_timeout);
+        let inactivity_deadline = tokio::time::Instant::now() + read_timeout;
+        let read_deadline = deadline.map_or(inactivity_deadline, |deadline| {
+            deadline.min(inactivity_deadline)
+        });
         let chunk = tokio::time::timeout_at(read_deadline, stream.next())
             .await
             .map_err(|_| {
