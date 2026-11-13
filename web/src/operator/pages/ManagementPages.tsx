@@ -252,7 +252,8 @@ function UpstreamProviders({ renderResetSettings, token, tenant, writeTenant = t
     const pending = returnFocus.current;
     // Keep a visible focus target while the scoped policy read disables actions.
     if (proxyEditorOpen) {
-      if (workspace?.kind === 'account') detailHeading.current?.focus();
+      const active = document.activeElement;
+      if (pending && workspace?.kind === 'account' && (!active || active === document.body || active.matches(':disabled'))) detailHeading.current?.focus();
       return;
     }
     if (pending) {
