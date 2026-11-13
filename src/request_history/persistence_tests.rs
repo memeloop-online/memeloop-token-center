@@ -984,8 +984,13 @@ async fn sqlite_immutable_request_history_projection_and_event_only_revisions() 
             .await
             .unwrap()
     );
-    let projected: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM request_events WHERE request_id=$1 AND event_kind='projected'")
-        .bind(request_id.to_string()).fetch_one(&database.pool).await.unwrap();
+    let projected: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM request_events WHERE request_id=$1 AND event_kind='projected'",
+    )
+    .bind(request_id.to_string())
+    .fetch_one(&database.pool)
+    .await
+    .unwrap();
     assert_eq!(projected, 1);
     let mut transaction = database.begin_write_transaction().await.unwrap();
     super::super::history_immutable_outbox::capture_request_in_transaction(
