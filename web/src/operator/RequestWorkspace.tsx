@@ -3,6 +3,7 @@ import { LoadingState } from '../design-system';
 import { useI18n } from '../i18n';
 import { RequestsPage } from './pages/RequestsPage';
 import { RequestWorkspaceTabs } from './RequestWorkspaceTabs';
+import { ImageGenerationQuarantine } from './ImageGenerationQuarantine';
 
 const GenerationWorkspace = lazy(() => import('./GenerationWorkspace').then((module) => ({ default: module.GenerationWorkspace })));
 
@@ -15,6 +16,7 @@ export function RequestWorkspace({ mode, onModeChange, ...props }: Omit<Componen
   if (mode === 'requests') return <RequestsPage {...props} onOpenGenerations={() => onModeChange('generations')} />;
   return <div className="request-generation-workspace">
     <div className="panel-title traffic-heading"><h2>{t('sessions.requestsMode')}</h2><RequestWorkspaceTabs selected="generations" onRequests={() => onModeChange('requests')} onGenerations={() => undefined} onSessions={props.onOpenSessions} /></div>
+    <ImageGenerationQuarantine token={props.token} tenant={props.tenant} writeTenant={props.writeTenant ?? props.tenant} />
     <Suspense fallback={<LoadingState label={t('common.loading')} />}><GenerationWorkspace token={props.token} tenant={props.tenant} writeTenant={props.writeTenant} /></Suspense>
   </div>;
 }

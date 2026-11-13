@@ -7,6 +7,7 @@ import {
   filteredRequestRefreshDelay,
   filteredRequestRefreshMaxWaitMs,
   mergeRefreshedRequestPage,
+  mergeRequestObservations,
 } from '../src/operator/traffic/requestTraffic.js';
 import type { RequestListResponse, RequestView } from '../src/types.js';
 
@@ -87,4 +88,18 @@ test('filtered views stay stable: published batches only mark them stale for a m
   assert.match(refresh, /overflowRefresh\.current\?\.defer\(ticket\)/,
     'a timer that loses eligibility keeps its overflow edge rather than completing successfully');
   assert.match(source, /RequestOverflowReconciliation/);
+});
+
+
+test('snapshot refresh keeps late observed egress and confirmed session without accepting an older exit', () => {
+  const selected = { kind: 'proxy' as const, group_id: 'group', group_version: 1, group_name: 'Exit', member_id: 'member', member_name: 'Node', scheme: 'socks5', host: 'proxy.example', port: 1080 };
+  const previous: RequestView = { ...request('late-observation', 30, 200),
+    egress: { selected, observed_at: 200 },
+    session_context: { session_id: 'specific-session', association: 'confirmed', session_name: 'Task', task_kind: null, agent_id: null, semantics_source: 'declared' } };
+  const sparse = request('late-observation', 30, 200);
+  const refreshed = mergeRefreshedRequestPage([previous], { requests: [sparse], next_cursor: null });
+  assert.deepEqual(refreshed[0].egress, previous.egress);
+  assert.deepEqual(refreshed[0].session_context, previous.session_context);
+  assert.deepEqual(mergeRequestObservations({ ...sparse, egress: { selected: { ...selected, host: 'older.example' }, observed_at: 100 } }, previous).egress, previous.egress);
+  assert.equal(mergeRequestObservations({ ...sparse, egress: { selected: { ...selected, host: 'new.example' }, observed_at: 300 } }, previous).egress?.selected.host, 'new.example');
 });

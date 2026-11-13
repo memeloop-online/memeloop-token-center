@@ -6,7 +6,6 @@ import { DrawerFrame, RequestDiagnostics, RequestTable } from '../../components'
 import { formatCurrencyDisplay, formatDurationDisplay, formatMetricDisplay, formatPercent } from '../../format';
 import { LocalSettlementNotice, localSettlementLabel } from '../../LocalSettlementNotice';
 import { AnalyticsMetric } from '../AnalyticsMetric';
-import { ImageGenerationQuarantine } from '../ImageGenerationQuarantine';
 import { displayTimeZone } from '../../charts/displayTimeZone';
 import { useI18n } from '../../i18n';
 import { useSessionParentLabel } from '../sessionTasks';
@@ -23,7 +22,7 @@ import { RequestRefreshControl } from '../traffic/RequestRefreshControl';
 import { mergeBatchedRequestPage } from '../traffic/requestRefresh';
 import { RequestOverflowReconciliation } from '../traffic/requestOverflowReconciliation';
 import {
-  emptyTypedFilterAst, mergeRefreshedRequestPage, mergeSessionContext, requestViewFromEvent,
+  emptyTypedFilterAst, mergeRefreshedRequestPage, mergeRequestObservations, requestViewFromEvent,
   summarizeVisibleRequests, typedFiltersActive, typedRequestQueryBody, visibleRequestMetricSeries,
 } from '../traffic/requestTraffic';
 
@@ -59,7 +58,6 @@ export function RequestsPage({ token, tenant, writeTenant = tenant, liveEvents, 
   const [upstreamError, setUpstreamError] = useState('');
   const [upstreamDenied, setUpstreamDenied] = useState(false);
   const [filteredResultsStale, setFilteredResultsStale] = useState(false);
-  const [imageReviewOpen, setImageReviewOpen] = useState(false);
   const sequence = useRef(0);
   const errorSource = useRef<'detail' | 'load' | 'refresh' | undefined>(undefined);
   const loadedHistoryIds = useRef(new Set<string>());
@@ -167,7 +165,7 @@ export function RequestsPage({ token, tenant, writeTenant = tenant, liveEvents, 
   }
   startOverflowRefresh.current = ticket => { void refreshOverflowFirstPage(ticket); };
 
-  async function load(nextFilters: TypedFilterAst, older = false) {
+  async function load(nextFilters: TypedFilterAst, older = false, refresh = false) {
     if (!token || !tenant) return;
     const last = requests.at(-1);
     const before = last ? { before_created_at: last.created_at, before_id: last.request_id } : undefined;
@@ -192,7 +190,7 @@ export function RequestsPage({ token, tenant, writeTenant = tenant, liveEvents, 
     if (!older) {
       loadedHistoryIds.current.clear();
       setFilteredResultsStale(false);
-      setRequests([]); setHasOlder(false); closeRequestDetail();
+      if (!refresh) { setRequests([]); setHasOlder(false); closeRequestDetail(); }
     }
     loadingRef.current = true;
     errorSource.current = undefined;
@@ -203,20 +201,21 @@ export function RequestsPage({ token, tenant, writeTenant = tenant, liveEvents, 
       });
       const latest = scope.current;
       if (controller.signal.aborted || request !== sequence.current || latest.token !== currentScope.token || latest.tenant !== currentScope.tenant || latest.filters !== currentScope.filters) return;
+      const observed = next.requests.map(row => mergeRequestObservations(row, refresh ? requestsRef.current.find(previous => previous.request_id === row.request_id) : undefined));
       if (!older && !typedFiltersActive(nextFilters)) {
-        const page = mergeBatchedRequestPage(next.requests, new Map(liveEventsRef.current), next.next_cursor !== null);
+        const page = mergeBatchedRequestPage(observed, new Map(liveEventsRef.current), next.next_cursor !== null);
         setRequests(page.requests); setHasOlder(page.hasOlder);
       } else {
         if (older) for (const request of next.requests) loadedHistoryIds.current.add(request.request_id);
         setRequests((current) => older
           ? [...current, ...next.requests.filter((value) => !current.some((existing) => existing.request_id === value.request_id))]
-          : next.requests);
+          : observed);
         setHasOlder(next.next_cursor !== null);
       }
       setSnapshotRevision(value => value + 1);
     } catch (reason) {
       if (request === sequence.current && !controller.signal.aborted) {
-        if (!older) { setRequests([]); setHasOlder(false); }
+        if (!older && !refresh) { setRequests([]); setHasOlder(false); }
         errorSource.current = 'load';
         setError(apiDiagnosticMessage(reason, t('common.requestFailed'), diagnosticLabels));
       }
@@ -248,7 +247,7 @@ export function RequestsPage({ token, tenant, writeTenant = tenant, liveEvents, 
     loadAbort.current?.abort(); loadAbort.current = null;
     errorSource.current = undefined;
     loadingRef.current = false;
-    sequence.current += 1; setFilters(emptyTypedFilterAst); setRequests([]); setDetail(undefined); setHasOlder(false); setLoading(false); setFilteredResultsStale(false); setImageReviewOpen(false); setError(''); setUpstreamError(''); setUpstreamDenied(false);
+    sequence.current += 1; setFilters(emptyTypedFilterAst); setRequests([]); setDetail(undefined); setHasOlder(false); setLoading(false); setFilteredResultsStale(false); setError(''); setUpstreamError(''); setUpstreamDenied(false);
     if (!token || !tenant) { setUpstreams([]); return () => { cancelOverflowRefresh(); loadAbort.current?.abort(); }; }
     const upstreamRequest = ++upstreamSequence.current;
     void api<UpstreamAccount[]>(`/internal/v1/upstreams${queryForTenant(tenant)}`, token)
@@ -326,7 +325,7 @@ export function RequestsPage({ token, tenant, writeTenant = tenant, liveEvents, 
       const event = liveEventsRef.current.get(request.request_id);
       const completedAt = event?.completed_at;
       const retainedTerminal = typeof completedAt === 'number' && Number.isFinite(completedAt) && completedAt >= request.created_at;
-      if (!request.operational_terminal || request.operational_terminal.financial_state === 'applied'
+      if (!request.operational_terminal
         || !event || (event.event_kind !== 'finished' && event.event_kind !== 'projected' && !retainedTerminal)
         || reconciledOperationalEvents.current.get(request.request_id) === event.event_id) continue;
       void api<RequestDetail>(`/internal/v1/requests/${request.request_id}${queryForTenant(tenant)}`, token, { signal: controller.signal })
@@ -337,9 +336,14 @@ export function RequestsPage({ token, tenant, writeTenant = tenant, liveEvents, 
             || next.request_id !== request.request_id || !next.operational_terminal) return;
           reconciledOperationalEvents.current.set(request.request_id, event.event_id);
           setRequests(current => current.map(row => {
-            if (row.request_id !== request.request_id || row.operational_terminal?.financial_state === 'applied') return row;
-            const hydrated = { ...next, egress: next.egress ?? row.egress,
-              session_context: mergeSessionContext(row.session_context, next) };
+            if (row.request_id !== request.request_id) return row;
+            // Financial finality does not imply that late transport/session
+            // observations have already reached the list projection.
+            if (row.operational_terminal?.financial_state === 'applied') {
+              const observed = mergeRequestObservations(next, row);
+              return { ...row, egress: observed.egress, session_context: observed.session_context };
+            }
+            const hydrated = mergeRequestObservations(next, row);
             const retained = liveEventsRef.current.get(row.request_id);
             return retained ? requestViewFromEvent(retained, hydrated) ?? hydrated : hydrated;
           }));
@@ -370,8 +374,7 @@ export function RequestsPage({ token, tenant, writeTenant = tenant, liveEvents, 
         const row = requestsRef.current.find(request => request.request_id === requestId);
         const previous = detailResult?.token === token && detailResult.tenant === tenant
           && detailResult.requestId === requestId ? detailResult.value : row;
-        const hydrated = { ...next, egress: next.egress ?? previous?.egress,
-          session_context: mergeSessionContext(previous?.session_context, next) };
+        const hydrated = mergeRequestObservations(next, previous);
         setDetail({ value: hydrated, token, tenant, requestId });
       }
     } catch (reason) {
@@ -453,18 +456,15 @@ export function RequestsPage({ token, tenant, writeTenant = tenant, liveEvents, 
     {upstreamError && <div className="notice error" role="alert">{t('request.upstreamSource')}: {upstreamError}</div>}
     {upstreamDenied && <div className="notice warning" role="status">{t('request.upstreamCatalogDenied')}</div>}
     {streamError && <div className="notice error" role="alert">{t('request.streamSource')}: {streamError}</div>}
-    <RequestsPanel requests={requests} upstreams={upstreams} filters={filters} loading={loading} hasOlder={hasOlder} streamState={streamState} token={token} tenant={tenant} filteredResultsStale={filteredResultsStale} requestRefresh={requestRefresh} refreshPaused={userPaused} onToggleRefreshPaused={() => setUserPaused((value) => !value)} historyLoaded={loadedHistoryIds.current.size > 0} imageReviewOpen={imageReviewOpen} onToggleImageReview={() => setImageReviewOpen((open) => !open)}
+    <RequestsPanel requests={requests} upstreams={upstreams} filters={filters} loading={loading} hasOlder={hasOlder} streamState={streamState} token={token} tenant={tenant} filteredResultsStale={filteredResultsStale} requestRefresh={requestRefresh} refreshPaused={userPaused} onToggleRefreshPaused={() => setUserPaused((value) => !value)} historyLoaded={loadedHistoryIds.current.size > 0}
       onApply={(next) => { setFilters(next); scope.current = { token, tenant, filters: next }; void load(next); }}
       onClear={() => { setFilters(emptyTypedFilterAst); scope.current = { token, tenant, filters: emptyTypedFilterAst }; void load(emptyTypedFilterAst); }}
-      onLoadOlder={() => void load(filters, true)} onRefreshFilteredResults={() => void load(filters)} onSelect={selectRequest} onOpenSessions={onOpenSessions} onOpenSession={openSession} onOpenGenerations={onOpenGenerations} />
-    {imageReviewOpen && <section className="request-image-review" aria-label={t('quarantine.title')}>
-      <ImageGenerationQuarantine token={token} tenant={tenant} writeTenant={writeTenant} />
-    </section>}
+      onLoadOlder={() => void load(filters, true)} onRefreshFilteredResults={() => void load(filters, false, true)} onSelect={selectRequest} onOpenSessions={onOpenSessions} onOpenSession={openSession} onOpenGenerations={onOpenGenerations} />
     {detail && <RequestDrawer token={token} tenant={tenant} detail={detail} upstreamName={upstreams.find((account) => account.id === detail.upstream_account_id)?.name} accountNames={new Map(upstreams.map(account => [account.id, account.name]))} onOpenSession={openSession} onClose={closeRequestDetail} />}
   </PageLoadingRegion>;
 }
 
-function RequestsPanel({ requests, upstreams, filters, loading, hasOlder, streamState, token, tenant, filteredResultsStale, onApply, onClear, onLoadOlder, onRefreshFilteredResults, onSelect, onOpenSessions, onOpenSession, onOpenGenerations, requestRefresh, refreshPaused = false, onToggleRefreshPaused, historyLoaded, imageReviewOpen, onToggleImageReview }: {
+function RequestsPanel({ requests, upstreams, filters, loading, hasOlder, streamState, token, tenant, filteredResultsStale, onApply, onClear, onLoadOlder, onRefreshFilteredResults, onSelect, onOpenSessions, onOpenSession, onOpenGenerations, requestRefresh, refreshPaused = false, onToggleRefreshPaused, historyLoaded }: {
   requests: RequestView[];
   upstreams: UpstreamAccount[];
   filters: TypedFilterAst;
@@ -475,8 +475,6 @@ function RequestsPanel({ requests, upstreams, filters, loading, hasOlder, stream
   tenant: string;
   filteredResultsStale: boolean;
   historyLoaded: boolean;
-  imageReviewOpen: boolean;
-  onToggleImageReview: () => void;
   onApply: (filters: TypedFilterAst) => void;
   onClear: () => void;
   onLoadOlder: () => void;
@@ -496,7 +494,7 @@ function RequestsPanel({ requests, upstreams, filters, loading, hasOlder, stream
   const sampling = { timestamps: points.map(point => point.timestamp), timeZone: displayTimeZone() };
   const count = (value: number) => formatMetricDisplay(value, locale);
   const settlementCurrency = summary.localCosts.length === 1 ? summary.localCosts[0].currency : undefined;
-  return <article className="panel request-page-surface" aria-busy={loading}><div className="panel-title traffic-heading"><div><h2>{typedFiltersActive(filters) ? t('traffic.filtered') : t('traffic.live')}</h2><span>{typedFiltersActive(filters) ? t('traffic.filteredHint') : t('traffic.liveHint')}</span></div><div className="traffic-heading-actions"><Button appearance="secondary" aria-expanded={imageReviewOpen} onClick={onToggleImageReview}>{t('quarantine.menuItem')}</Button><div className={`request-live-state session-live-state ${streamState}`} role="status">{t(`sessions.live.${streamState}`)}</div><RequestWorkspaceTabs selected="requests" onRequests={() => undefined} onGenerations={onOpenGenerations ?? (() => undefined)} onSessions={onOpenSessions} /></div></div>
+  return <article className="panel request-page-surface" aria-busy={loading}><div className="panel-title traffic-heading"><div><h2>{typedFiltersActive(filters) ? t('traffic.filtered') : t('traffic.live')}</h2><span>{typedFiltersActive(filters) ? t('traffic.filteredHint') : t('traffic.liveHint')}</span></div><div className="traffic-heading-actions"><Button appearance="primary" disabled={loading || !token.trim() || !tenant} onClick={onRefreshFilteredResults}>{t('usage.refresh')}</Button><div className={`request-live-state session-live-state ${streamState}`} role="status">{t(`sessions.live.${streamState}`)}</div><RequestWorkspaceTabs selected="requests" onRequests={() => undefined} onGenerations={onOpenGenerations ?? (() => undefined)} onSessions={onOpenSessions} /></div></div>
     {requestRefresh && <div className="request-refresh-row">
       <RequestRefreshControl intervalMs={requestRefresh.intervalMs} onIntervalChange={requestRefresh.onIntervalChange}
         paused={requestRefresh.paused || refreshPaused}
