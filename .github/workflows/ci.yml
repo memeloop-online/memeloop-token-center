@@ -641,6 +641,13 @@ jobs:
           second_count="$(sqlite3 "$database" 'SELECT count(*) FROM schema_migrations')"
           test "$first_count" -gt 0
           test "$second_count" = "$first_count"
+          # Exercise this migration from the preserved schema-155 predecessor.
+          sqlite3 "$database" 'DROP TABLE request_history_immutable_outbox; DELETE FROM schema_migrations WHERE version = 156;'
+          test "$(sqlite3 "$database" 'SELECT max(version) FROM schema_migrations')" = 155
+          cargo run --locked --bin memeloop-token-center -- migrate
+          test "$(sqlite3 "$database" 'SELECT max(version) FROM schema_migrations')" = 156
+          cargo run --locked --bin memeloop-token-center -- migrate
+          test "$(sqlite3 "$database" 'SELECT count(*) FROM schema_migrations')" = "$first_count"
       - name: PostgreSQL migration and replay smoke test
         env:
           MTC_DATABASE_URL: postgres://token_center:token_center@127.0.0.1:5432/memeloop_token_center_test
@@ -662,6 +669,13 @@ jobs:
             -c 'SELECT count(*) FROM schema_migrations')"
           test "$first_count" -gt 0
           test "$second_count" = "$first_count"
+          # Only remove 156 artifacts; migration 155 stays byte-for-byte intact.
+          psql -X --no-psqlrc -v ON_ERROR_STOP=1 "$MTC_DATABASE_URL" -c 'DROP TABLE request_history_immutable_outbox; DELETE FROM schema_migrations WHERE version = 156;'
+          test "$(psql -X --no-psqlrc -qAt "$MTC_DATABASE_URL" -c 'SELECT max(version) FROM schema_migrations')" = 155
+          cargo run --locked --bin memeloop-token-center -- migrate
+          test "$(psql -X --no-psqlrc -qAt "$MTC_DATABASE_URL" -c 'SELECT max(version) FROM schema_migrations')" = 156
+          cargo run --locked --bin memeloop-token-center -- migrate
+          test "$(psql -X --no-psqlrc -qAt "$MTC_DATABASE_URL" -c 'SELECT count(*) FROM schema_migrations')" = "$first_count"
       - name: Seed 100k-row observability scale fixture
         env:
           PGHOST: 127.0.0.1

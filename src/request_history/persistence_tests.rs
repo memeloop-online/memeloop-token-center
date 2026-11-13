@@ -112,6 +112,19 @@ async fn capture_replay(database: &Database) {
     .execute(&database.pool)
     .await
     .unwrap();
+    // During mixed-queue rollout the already frozen immutable delivery wins.
+    let modern_replay = native_pending(database).await;
+    assert_eq!(
+        serde_json::to_value(&modern_replay[0]).unwrap(),
+        serde_json::to_value(&current[0]).unwrap()
+    );
+    // A pre-156 frozen record has no immutable mirror. Keep this upgrade
+    // fixture on the legacy consumer rather than replaying the modern copy.
+    sqlx::query("DELETE FROM request_history_immutable_outbox WHERE revision=$1")
+        .bind(current[0].revision)
+        .execute(&database.pool)
+        .await
+        .unwrap();
     let replay = native_pending(database).await;
     assert!(replay[0].read_model.is_null());
     let mut changed = replay[0].clone();
@@ -897,10 +910,7 @@ async fn sqlite_immutable_history_late_conversation_revision_survives_stale_ack(
         native.payload.as_ref().unwrap()["session_context"]["session_id"],
         cluster.to_string()
     );
-    assert_eq!(
-        native.payload.as_ref().unwrap()["session_context"]["compaction"],
-        true
-    );
+    assert_eq!(native.payload.as_ref().unwrap()["compaction"], true);
     let corrected_hash = crate::request_history::canonical_hash(native).unwrap();
     database.history_acknowledge(&initial).await.unwrap();
     let replay = database.history_pending(500).await.unwrap();
