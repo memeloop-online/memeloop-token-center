@@ -407,12 +407,20 @@ mod tests {
             })
             .await
             .unwrap();
+        reqwest::Client::new()
+            .post(&endpoint)
+            .body(format!("CREATE DATABASE {schema}"))
+            .send()
+            .await
+            .unwrap()
+            .error_for_status()
+            .unwrap();
         let client = crate::request_history::ClickHouse::new(
             database
                 .http_clients
                 .handle(crate::http_settings::HttpPurpose::General),
             &endpoint,
-            "default".into(),
+            schema.clone(),
             "default".into(),
             String::new(),
         )
@@ -489,6 +497,14 @@ mod tests {
         .await
         .unwrap();
         assert_eq!(status, "aborted");
+        reqwest::Client::new()
+            .post(&endpoint)
+            .body(format!("DROP DATABASE {schema}"))
+            .send()
+            .await
+            .unwrap()
+            .error_for_status()
+            .unwrap();
         source.pool.close().await;
         database.pool.close().await;
         sqlx::query(sqlx::AssertSqlSafe(format!("DROP SCHEMA {schema} CASCADE")))

@@ -1348,12 +1348,20 @@ async fn request_history_real_services_acceptance_event_original_survives_ack_an
         serde_json::to_value(&expected).unwrap(),
         serde_json::to_value(&snapshot).unwrap()
     );
+    reqwest::Client::new()
+        .post(&endpoint)
+        .body(format!("CREATE DATABASE {schema}"))
+        .send()
+        .await
+        .unwrap()
+        .error_for_status()
+        .unwrap();
     let client = ClickHouse::new(
         database
             .http_clients
             .handle(crate::http_settings::HttpPurpose::General),
         &endpoint,
-        "default".into(),
+        schema.clone(),
         "default".into(),
         String::new(),
     )
@@ -1414,6 +1422,14 @@ async fn request_history_real_services_acceptance_event_original_survives_ack_an
     assert_eq!(restored["input_tokens"], 0);
     assert_eq!(restored["cost_micros"], 7);
     database.close().await;
+    reqwest::Client::new()
+        .post(&endpoint)
+        .body(format!("DROP DATABASE {schema}"))
+        .send()
+        .await
+        .unwrap()
+        .error_for_status()
+        .unwrap();
     sqlx::query(sqlx::AssertSqlSafe(format!("DROP SCHEMA {schema} CASCADE")))
         .execute(&admin)
         .await
