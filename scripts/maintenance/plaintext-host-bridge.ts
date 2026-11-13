@@ -123,11 +123,186 @@ export async function bridge(options: Options, connect = (binary: string, args: 
   } finally { await server.close(); }
 }
 
+type SessionOptions = Omit<Options, 'task'>;
+type TurnResult = { id: string; status: string; error?: unknown; visibleMessages: { id: string; text: string }[] };
+
+// One isolated parent, a caller-owned input stream, and an append-only receipt.
+// Only the current task/result is held here; previous task bodies are not copied
+// into subsequent receipt events or retained as a second conversation history.
+export async function serve(
+  options: SessionOptions,
+  commands: AsyncIterable<string>,
+  output: (result: any) => void,
+  connect = (binary: string, args: string[], env: NodeJS.ProcessEnv) => new AppServer(binary, args, env),
+  signal?: AbortSignal,
+) {
+  const cwd = await fs.realpath(options.directory);
+  const receipt = path.resolve(options.receipt);
+  const parent = await fs.realpath(path.dirname(receipt));
+  if (parent === cwd || parent.startsWith(cwd + path.sep)) throw new Error('Keep receipt outside the isolated workspace.');
+  // A new session must not silently overwrite or replay an earlier execution.
+  const journal = await fs.open(receipt, constants.O_WRONLY | constants.O_CREAT | constants.O_EXCL | constants.O_NOFOLLOW, 0o600);
+  const safe = (value: any) => JSON.parse(JSON.stringify(value).replaceAll(options.apiKey, '[redacted]'));
+  let writes = Promise.resolve();
+  const save = (event: any) => {
+    const line = JSON.stringify(safe(event)) + '\n';
+    writes = writes.then(async () => { await journal.writeFile(line); });
+    return writes;
+  };
+  const provider = 'mtc_plaintext_bridge';
+  const args = ['-c', `model_provider=${JSON.stringify(provider)}`, '-c', `model_providers.${provider}.name="MTC plaintext bridge"`, '-c', `model_providers.${provider}.base_url=${JSON.stringify(options.baseUrl)}`, '-c', `model_providers.${provider}.wire_api="responses"`, '-c', `model_providers.${provider}.env_key="MTC_BRIDGE_API_KEY"`];
+  let server: AppServer;
+  try { server = connect(options.binary, args, { ...process.env, MTC_BRIDGE_API_KEY: options.apiKey }); }
+  catch (error) { await journal.close(); throw error; }
+  const iterator = commands[Symbol.asyncIterator]();
+  let stopReading!: (result: IteratorResult<string>) => void;
+  const stopped = new Promise<IteratorResult<string>>(resolve => { stopReading = resolve; });
+  const turns = new Map<string, { id?: string; resolve: (result: TurnResult) => void; reject: (error: Error) => void; items: { id: string; text: string }[] }>();
+  let disconnected: Error | undefined;
+  let parentThreadId: string | undefined;
+  let uncertain = false;
+  let active: { id: string; task: string; calls: Map<string, { task: string; result: Promise<any> }>; children: { callId: string; childThreadId?: string; status: string }[] } | undefined;
+  const ids = new Set<string>();
+  const abort = () => {
+    stopReading({ done: true, value: undefined });
+    // Interrupt only turns belonging to this owned process. Closing it releases
+    // pending RPCs even when an interrupt acknowledgement cannot be received.
+    for (const [threadId, turn] of turns) {
+      if (turn.id) void server.call('turn/interrupt', { threadId, turnId: turn.id }).catch(() => {});
+    }
+    void server.close().catch(() => {});
+  };
+  server.disconnected = error => {
+    disconnected = error;
+    stopReading({ done: true, value: undefined });
+    for (const pending of turns.values()) pending.reject(error);
+    turns.clear();
+  };
+  server.notification = message => {
+    const p = message.params;
+    const pending = turns.get(p?.threadId);
+    if (!pending || (pending.id && p.turnId && p.turnId !== pending.id)) return;
+    if (message.method === 'item/completed' && p.item?.type === 'agentMessage') pending.items.push({ id: p.item.id, text: p.item.text });
+    if (message.method === 'turn/completed') {
+      if (pending.id && p.turn?.id !== pending.id) return;
+      turns.delete(p.threadId);
+      pending.resolve({ id: p.turn.id, status: p.turn.status, error: p.turn.error, visibleMessages: pending.items });
+    }
+  };
+  const start = async (model: string, tools?: unknown[]) => {
+    const result = await server.call('thread/start', { cwd, model, modelProvider: provider, approvalPolicy: 'never', sandbox: 'read-only', ephemeral: true, ...(tools ? { dynamicTools: tools } : {}) });
+    const id = result.thread.id;
+    await save({ type: 'thread', taskId: active?.id, threadId: id, model, kind: tools ? 'parent' : 'child' });
+    return id as string;
+  };
+  const turn = async (threadId: string, task: string, kind: string) => {
+    if (signal?.aborted || disconnected) throw disconnected ?? new Error('Bridge session interrupted');
+    let pending!: { id?: string; resolve: (result: TurnResult) => void; reject: (error: Error) => void; items: { id: string; text: string }[] };
+    const completed = new Promise<TurnResult>((resolve, reject) => { pending = { resolve, reject, items: [] }; turns.set(threadId, pending); });
+    void completed.catch(() => {});
+    try {
+      const started = await server.call('turn/start', { threadId, input: [{ type: 'text', text: task }] });
+      pending.id = started.turn.id;
+      await save({ type: 'turn', taskId: active?.id, threadId, turnId: pending.id, kind });
+      const result = await completed;
+      if (result.id !== pending.id) throw new Error('App-server turn identity mismatch');
+      await save({ type: 'result', taskId: active?.id, threadId, ...result });
+      return result;
+    } finally { turns.delete(threadId); }
+  };
+  server.request = async message => {
+    const p = message.params;
+    const task = active;
+    if (message.method !== 'item/tool/call' || p.tool !== delegateTool || p.namespace != null || typeof p.arguments?.task !== 'string' || typeof p.callId !== 'string' || typeof p.turnId !== 'string' || !task || p.threadId !== parentThreadId) throw new Error('Unsupported session delegation');
+    const parentTurn = turns.get(p.threadId);
+    if (!parentTurn || (parentTurn.id && parentTurn.id !== p.turnId)) throw new Error('Delegation does not belong to the active parent turn');
+    const previous = task.calls.get(p.callId);
+    if (previous) {
+      if (previous.task !== p.arguments.task) throw new Error('Conflicting delegated call identity');
+      return previous.result;
+    }
+    const result = (async () => {
+      const child: { callId: string; childThreadId?: string; status: string } = { callId: p.callId, status: 'started' };
+      task.children.push(child);
+      await save({ type: 'delegation', taskId: task.id, parentThreadId, parentTurnId: p.turnId, callId: p.callId, ...(p.arguments.task === task.task ? { taskRef: task.id } : { task: p.arguments.task }) });
+      try {
+        child.childThreadId = await start(options.kimiModel);
+        const result = await turn(child.childThreadId, p.arguments.task, 'child');
+        child.status = result.status;
+        await save({ type: 'call_return', taskId: task.id, callId: p.callId, childThreadId: child.childThreadId, childTurnId: result.id, status: result.status });
+        return { success: result.status === 'completed', contentItems: [{ type: 'inputText', text: JSON.stringify(safe({ threadId: child.childThreadId, result })) }] };
+      } catch (error) {
+        child.status = 'failed'; uncertain = true;
+        await save({ type: 'call_return', taskId: task.id, ...child, error: error instanceof Error ? error.message : 'child_failed', outcome: 'unknown' });
+        return { success: false, contentItems: [{ type: 'inputText', text: 'Delegated task did not complete; inspect the private receipt. Do not replay an uncertain task.' }] };
+      }
+    })();
+    task.calls.set(p.callId, { task: p.arguments.task, result });
+    return result;
+  };
+  signal?.addEventListener('abort', abort, { once: true });
+  try {
+    await save({ type: 'session', mode: 'isolated-app-server-dynamic-tool-session', cwd, native_collaboration_modified: false });
+    if (signal?.aborted) throw new Error('Bridge session interrupted');
+    await server.call('initialize', { clientInfo: { name: 'mtc-isolated-plaintext-bridge', version: '1' }, capabilities: { experimentalApi: true } });
+    server.send({ method: 'initialized', params: {} });
+    while (!signal?.aborted && !disconnected) {
+      const next = await Promise.race([iterator.next(), stopped]);
+      if (next.done) break;
+      const line = next.value;
+      if (!line.trim()) continue;
+      let command: any;
+      try { command = JSON.parse(line); }
+      catch { output({ completed: false, error: 'Expected one JSON task per line' }); continue; }
+      if (typeof command.id !== 'string' || typeof command.task !== 'string' || ids.has(command.id)) {
+        output(safe({ id: command.id, completed: false, error: 'Expected a new string id and plaintext task' })); continue;
+      }
+      ids.add(command.id);
+      active = { id: command.id, task: command.task, calls: new Map(), children: [] };
+      await save({ type: 'task', id: active.id, task: active.task });
+      try {
+        parentThreadId ??= await start(options.parentModel, [delegateSpec]);
+        const result = await turn(parentThreadId, `Use ${delegateTool} to ask Kimi to perform the following complete task, then report its actual result. Do not use collaboration spawn_agent or opaque handoff.\n\n${active.task}`, 'parent');
+        const completed = result.status === 'completed' && active.children.length > 0 && active.children.every(child => child.status === 'completed');
+        const summary = { id: active.id, completed, parentThreadId, parentTurnId: result.id, result, delegations: active.children, receipt };
+        // Results already exist once in the journal; the final event references
+        // them instead of rewriting all earlier task texts and visible output.
+        await save({ type: 'task_end', id: active.id, completed, parentThreadId, parentTurnId: result.id, delegations: active.children });
+        output(safe(summary));
+      } catch (error) {
+        const failure = safe({ id: active.id, completed: false, status: signal?.aborted ? 'interrupted' : 'failed', outcome: 'unknown', error: error instanceof Error ? error.message : 'bridge_failed', receipt });
+        await save({ type: 'task_end', ...failure }); output(failure);
+        break; // No second task is started after an uncertain transport outcome.
+      } finally { active = undefined; }
+      if (signal?.aborted || disconnected || uncertain) break;
+    }
+    await save({ type: 'session_end', interrupted: signal?.aborted === true, disconnected: !!disconnected, uncertain });
+  } finally {
+    signal?.removeEventListener('abort', abort);
+    // A generic input iterator can itself be waiting on caller-owned I/O.
+    // Request cleanup without awaiting that I/O after cancellation.
+    const inputCleanup = iterator.return?.();
+    void inputCleanup?.catch(() => {});
+    try { await server.close(); await writes; }
+    finally { await journal.close(); }
+  }
+}
+
 async function main() {
   const { MTC_BASE_URL: baseUrl, MTC_API_KEY: apiKey, MTC_TASK_DIRECTORY: directory, MTC_TASK_ARCHIVE: receipt } = process.env;
   if (!baseUrl || !apiKey || !directory || !receipt) throw new Error('Set explicit gateway, downstream key, isolated directory and private receipt.');
+  const options = { baseUrl, apiKey, directory, receipt, binary: process.env.MTC_CODEX_BINARY ?? 'codex', parentModel: process.env.MTC_PARENT_MODEL ?? 'gpt-6.1-sol', kimiModel: process.env.MTC_TASK_MODEL ?? 'k3.1-pro' };
+  if (process.argv.includes('--serve')) {
+    const controller = new AbortController();
+    const lines = createInterface({ input: process.stdin, crlfDelay: Infinity });
+    const abort = () => { controller.abort(); lines.close(); };
+    process.once('SIGINT', abort); process.once('SIGTERM', abort);
+    try { await serve(options, lines, result => { console.log(JSON.stringify(result)); if (!result.completed) process.exitCode = 1; }, undefined, controller.signal); }
+    finally { lines.close(); process.removeListener('SIGINT', abort); process.removeListener('SIGTERM', abort); }
+    return;
+  }
   let task = ''; for await (const chunk of process.stdin) task += chunk;
-  const result = await bridge({ baseUrl, apiKey, directory, receipt, task, binary: process.env.MTC_CODEX_BINARY ?? 'codex', parentModel: process.env.MTC_PARENT_MODEL ?? 'gpt-6.1-sol', kimiModel: process.env.MTC_TASK_MODEL ?? 'k3.1-pro' });
+  const result = await bridge({ ...options, task });
   console.log(JSON.stringify(result)); if (!result.completed) process.exitCode = 1;
 }
 if (process.argv[1] && import.meta.url === pathToFileURL(process.argv[1]).href) main().catch(() => { console.error('Isolated bridge did not complete.'); process.exitCode = 1; });
