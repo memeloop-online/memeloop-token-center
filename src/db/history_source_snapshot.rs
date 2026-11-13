@@ -391,16 +391,30 @@ mod tests {
             .await
             .unwrap();
         let request = Uuid::now_v7();
-        let key = Uuid::now_v7();
-        let tenant = Uuid::now_v7();
-        // The canonical operator view joins the real tenant directory.
-        sqlx::query("INSERT INTO tenants (id,external_id,created_at) VALUES ($1,$2,$3)")
-            .bind(tenant.to_string())
-            .bind(format!("baseline-{tenant}"))
-            .bind(chrono::Utc::now().timestamp_millis())
-            .execute(&database.pool)
+        // The canonical operator view requires a tenant and an eligible key
+        // (or reservation/account), exactly as real request admission does.
+        let pepper = b"baseline-fixture-pepper-at-least-32-bytes";
+        let issued = database
+            .create_key(
+                crate::db::CreateKeyInput {
+                    tenant_external_id: "baseline-tenant".into(),
+                    principal_external_id: "baseline-principal".into(),
+                    alias: "baseline-key".into(),
+                    currency: "USD".into(),
+                    policy: crate::model::KeyPolicy::default(),
+                    initial_balance: rust_decimal::Decimal::ZERO,
+                    idempotency_key: None,
+                },
+                pepper,
+            )
             .await
             .unwrap();
+        let authenticated = database
+            .authenticate_key(&issued.key, pepper)
+            .await
+            .unwrap();
+        let key = authenticated.key_id;
+        let tenant = authenticated.tenant_id;
         database
             .record_request_started(NewRequest {
                 request_id: request,
