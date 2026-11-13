@@ -1,5 +1,6 @@
 use super::*;
 use crate::request_history::{ClickHouse, HistoryQuery};
+use futures_util::StreamExt;
 
 async fn seed(database: &Database) -> (AuthenticatedKey, Uuid, String) {
     let pepper = b"test-pepper-must-have-at-least-32-bytes";
@@ -1444,7 +1445,7 @@ async fn request_history_real_services_acceptance_native_original_survives_ack_a
     let postgres = std::env::var("MTC_TEST_POSTGRES_URL").unwrap();
     let endpoint = std::env::var("MTC_TEST_CLICKHOUSE_URL").unwrap();
     let admin = sqlx::PgPool::connect(&postgres).await.unwrap();
-    for terminal_case in [false, true] {
+    for (terminal_case, cas_case) in [(false, false), (true, false), (true, true)] {
         let schema = format!("history_native_original_{}", Uuid::now_v7().simple());
         sqlx::query(sqlx::AssertSqlSafe(format!("CREATE SCHEMA {schema}")))
             .execute(&admin)
@@ -1464,6 +1465,18 @@ async fn request_history_real_services_acceptance_native_original_survives_ack_a
             // deployed schema, including raw values that differ from request view.
             sqlx::query("INSERT INTO terminal_projection_outbox (request_id,reservation_id,tenant_id,key_id,account_id,created_at,completed_at,model,protocol,status_code,error_code,upstream_account_id,model_route_id,duration_ms,input_tokens,output_tokens,cached_input_tokens,cache_write_tokens,cache_known_read_tokens,cache_known_input_tokens,generation_units,billing_unit,service_tier,currency,cost_micros,usage_basis,session_id,terminal_cause_code,response_object,account_projected_at) SELECT id,reservation_id,tenant_id,key_id,$1,created_at,completed_at,model,protocol,202,'raw-terminal',COALESCE(upstream_account_id,''),COALESCE(model_route_id,''),21,0,5,0,0,0,0,0,'','default','EUR',19,'provider_reported','raw-session','normal_stop',response_object,999 FROM request_records WHERE id=$2")
             .bind(Uuid::now_v7().to_string()).bind(request_id.to_string()).execute(&database.pool).await.unwrap();
+        }
+        if cas_case {
+            sqlx::query("ALTER TABLE request_records ADD COLUMN future_provenance TEXT")
+                .execute(&database.pool)
+                .await
+                .unwrap();
+            sqlx::query("UPDATE request_records SET future_provenance=$1 WHERE id=$2")
+                .bind("historical-business-fact".repeat(1024))
+                .bind(request_id.to_string())
+                .execute(&database.pool)
+                .await
+                .unwrap();
         }
         let snapshots = native_pending(&database).await;
         if !terminal_case {
@@ -1552,14 +1565,42 @@ async fn request_history_real_services_acceptance_native_original_survives_ack_a
             .await
             .unwrap()
             .unwrap();
-        let original = crate::request_history::native_original::reconstruct(
-            &stored.identity,
+        let original = crate::request_history::native_original::reconstruct_with_archive(
+            (&stored.identity, stored.revision),
             stored.payload.as_ref().unwrap(),
             stored.statistics.as_ref(),
             &stored.read_model,
             &stored.read_model["native_original"],
+            database.body_archive().unwrap(),
         )
+        .await
         .unwrap();
+        if cas_case {
+            assert_eq!(stored.read_model["native_original"]["version"], 2);
+            assert_eq!(
+                original["request"]["future_provenance"],
+                "historical-business-fact".repeat(1024)
+            );
+            assert!(
+                !serde_json::to_string(&stored.read_model["native_original"])
+                    .unwrap()
+                    .contains("historical-business-fact")
+            );
+            let root: crate::archive::HistoryArchiveRoot =
+                serde_json::from_value(stored.read_model["native_original"]["root"].clone())
+                    .unwrap();
+            let roots: Vec<_> = database
+                .body_archive()
+                .unwrap()
+                .durable_roots()
+                .collect::<Vec<_>>()
+                .await;
+            assert!(
+                roots
+                    .into_iter()
+                    .any(|location| location.unwrap() == root.location().unwrap())
+            );
+        }
         assert_eq!(original, expected);
         if terminal_case {
             assert!(original["terminal"].is_object());

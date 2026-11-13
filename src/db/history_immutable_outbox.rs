@@ -598,13 +598,15 @@ impl Database {
         if identity.source == "native"
             && let Some(payload) = &payload
         {
-            let fidelity = crate::request_history::native_original::read_model(
-                &identity,
+            let fidelity = crate::request_history::native_original::read_model_with_archive(
+                (&identity, revision),
                 payload,
                 statistics.as_ref(),
                 &read_model,
                 &envelope["originals"],
-            )?;
+                self.archive.as_ref(),
+            )
+            .await?;
             read_model["native_original"] = fidelity;
         }
         Ok(HistorySnapshot {
