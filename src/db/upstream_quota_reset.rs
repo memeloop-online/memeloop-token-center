@@ -1575,6 +1575,44 @@ mod tests {
             .unwrap(),
             QuotaResetClaim::Claimed { .. }
         ));
+        // Receipt recovery binds all identities before any state transition.
+        let operation_uuid = Uuid::parse_str(&observed.id).unwrap();
+        assert!(
+            !db.apply_quota_reset_receipt(
+                tenant,
+                observed_account.id,
+                operation_uuid,
+                Uuid::now_v7(),
+                true,
+                None
+            )
+            .await
+            .unwrap()
+        );
+        assert!(
+            !db.apply_quota_reset_receipt(
+                Uuid::now_v7(),
+                observed_account.id,
+                operation_uuid,
+                dispatch_owner,
+                true,
+                None
+            )
+            .await
+            .unwrap()
+        );
+        assert!(
+            !db.apply_quota_reset_receipt(
+                tenant,
+                Uuid::now_v7(),
+                operation_uuid,
+                dispatch_owner,
+                true,
+                None
+            )
+            .await
+            .unwrap()
+        );
         let replay_owner = Uuid::now_v7();
         assert!(matches!(
             db.claim_quota_reset_owned(
@@ -1615,6 +1653,42 @@ mod tests {
                 .count(),
             1,
             "a replay cannot acquire or finish another dispatch owner's claim"
+        );
+        assert!(
+            db.apply_quota_reset_receipt(
+                tenant,
+                observed_account.id,
+                operation_uuid,
+                dispatch_owner,
+                true,
+                None
+            )
+            .await
+            .unwrap()
+        );
+        assert!(
+            db.apply_quota_reset_receipt(
+                tenant,
+                observed_account.id,
+                operation_uuid,
+                dispatch_owner,
+                true,
+                None
+            )
+            .await
+            .unwrap()
+        );
+        assert!(
+            !db.apply_quota_reset_receipt(
+                tenant,
+                observed_account.id,
+                operation_uuid,
+                dispatch_owner,
+                false,
+                Some("reset_dispatch_owner_ended")
+            )
+            .await
+            .unwrap()
         );
         db.finish_quota_reset_owned(&observed.id, Some(dispatch_owner), true, None)
             .await
@@ -1657,5 +1731,62 @@ mod tests {
                 .unwrap(),
             "background evidence also settles across OAuth and transport changes"
         );
+    }
+}
+
+impl Database {
+    /// A receipt is acknowledged only with the original identity and claim nonce.
+    /// A mismatched or conflicting receipt remains available for investigation.
+    pub(crate) async fn apply_quota_reset_receipt(
+        &self,
+        tenant: Uuid,
+        account: Uuid,
+        operation: Uuid,
+        owner: Uuid,
+        accepted: bool,
+        error: Option<&str>,
+    ) -> Result<bool, AppError> {
+        let operation = operation.to_string();
+        let valid: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM upstream_quota_reset_operations op
+             JOIN upstream_quota_reset_audit owner ON owner.operation_id = op.id
+             WHERE op.id = $1 AND op.tenant_id = $2 AND op.upstream_account_id = $3
+             AND owner.id = $4 AND owner.event = 'confirmation_claimed'",
+        )
+        .bind(&operation)
+        .bind(tenant.to_string())
+        .bind(account.to_string())
+        .bind(owner.to_string())
+        .fetch_one(&self.pool)
+        .await?;
+        if valid != 1 {
+            return Ok(false);
+        }
+        self.finish_quota_reset_owned(&operation, Some(owner), accepted, error)
+            .await?;
+        let event = if accepted {
+            "dispatch_accepted"
+        } else {
+            "dispatch_unknown"
+        };
+        let opposite = if accepted {
+            "dispatch_unknown"
+        } else {
+            "dispatch_accepted"
+        };
+        let acknowledged: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM upstream_quota_reset_audit a
+             WHERE a.operation_id = $1 AND a.event = $2
+             AND (a.error_code = $3 OR (a.error_code IS NULL AND $3 IS NULL))
+             AND NOT EXISTS (SELECT 1 FROM upstream_quota_reset_audit conflict
+                 WHERE conflict.operation_id = a.operation_id AND conflict.event = $4)",
+        )
+        .bind(&operation)
+        .bind(event)
+        .bind(error)
+        .bind(opposite)
+        .fetch_one(&self.pool)
+        .await?;
+        Ok(acknowledged == 1)
     }
 }

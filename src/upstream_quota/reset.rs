@@ -13,6 +13,9 @@ const CONSUME_URL: &str = "https://chatgpt.com/backend-api/wham/rate-limit-reset
 /// an operation in submitted after its owning future has actually ended.
 struct DispatchCompletion {
     db: crate::db::Database,
+    archive: crate::archive::ArchiveStore,
+    tenant: Uuid,
+    account: Uuid,
     operation: String,
     owner: Uuid,
     accepted: bool,
@@ -26,30 +29,32 @@ impl Drop for DispatchCompletion {
             return;
         }
         let db = self.db.clone();
-        let operation = self.operation.clone();
-        let owner = self.owner;
-        let accepted = self.accepted;
-        let error = self.error.clone();
+        let archive = self.archive.clone();
+        let receipt = super::reset_receipt::Receipt {
+            version: 1,
+            tenant: self.tenant,
+            account: self.account,
+            operation: Uuid::parse_str(&self.operation).expect("database operation UUID"),
+            owner: self.owner,
+            accepted: self.accepted,
+            error: self.error.clone(),
+        };
         if let Ok(runtime) = tokio::runtime::Handle::try_current() {
             runtime.spawn(async move {
                 let mut delay = Duration::from_secs(1);
                 loop {
-                    match db
-                        .finish_quota_reset_owned(
-                            &operation,
-                            Some(owner),
-                            accepted,
-                            error.as_deref(),
-                        )
-                        .await
-                    {
-                        Ok(()) => return,
-                        Err(error) => tracing::error!(
-                            operation_id = %operation,
-                            error = %error,
-                            "quota reset outcome persistence will retry without redispatch"
-                        ),
+                    // Both operations may progress independently. Await publication before
+                    // retirement so a late PUT can never resurrect a deleted receipt.
+                    let (published, finished) =
+                        tokio::join!(receipt.publish(&archive), receipt.finish(&db));
+                    if matches!(finished, Ok(true)) {
+                        // Failed PUT may have lost its ACK: a shared worker will
+                        // discover and retire any object that actually committed.
+                        if published.is_err() || receipt.retire(&archive).await.is_ok() {
+                            return;
+                        }
                     }
+                    tracing::warn!("quota reset outcome persistence deferred without redispatch");
                     tokio::time::sleep(delay).await;
                     delay = (delay * 2).min(Duration::from_secs(30));
                 }
@@ -302,11 +307,7 @@ async fn fresh_snapshot(
     // The reset workflow's credit precheck uses one attempt. Consumption below
     // uses its own fixed transport after the fresh read completes.
     budget.attempt_limit = 1;
-    let session = retry::ReadSession::new(
-        Some(state),
-        tokio::time::Instant::now() + budget.total,
-        budget,
-    );
+    let session = retry::ReadSession::reset_precheck(state, budget);
     let observed_started_at = unix_millis();
     let account_header =
         crate::oauth::managed::codex::account_header_value(credential).map_err(|_| blocked())?;
@@ -329,22 +330,19 @@ async fn fresh_snapshot(
     let fixture_url = test_supplier_url(account, credits_url);
     #[cfg(test)]
     let credits_url = fixture_url.as_str();
-    let reset = match tokio::time::timeout(
-        budget.total,
-        get_codex_json(
-            &state.codex_clients,
-            policy,
-            auth,
-            credits_url,
-            QuotaRequestContext::for_account(account, "credits", QuotaReadTrigger::ResetWorkflow),
-            budget,
-            &session,
-        ),
+    let reset = match get_codex_json(
+        &state.codex_clients,
+        policy,
+        auth,
+        credits_url,
+        QuotaRequestContext::for_account(account, "credits", QuotaReadTrigger::ResetWorkflow),
+        budget,
+        &session,
     )
     .await
     {
-        Ok(Ok(reset)) => reset,
-        Ok(Err(error)) => {
+        Ok(reset) => reset,
+        Err(error) => {
             log_quota_read_completed(
                 account,
                 QuotaReadTrigger::ResetWorkflow,
@@ -353,16 +351,6 @@ async fn fresh_snapshot(
                 refresh_started,
             );
             return Err(temporarily_unavailable("quota_reset_read_failed"));
-        }
-        Err(_) => {
-            log_quota_read_completed(
-                account,
-                QuotaReadTrigger::ResetWorkflow,
-                "error",
-                "quota_timeout",
-                refresh_started,
-            );
-            return Err(temporarily_unavailable("quota_reset_timeout"));
         }
     };
     let observed_at = unix_millis();
@@ -638,6 +626,7 @@ async fn confirm_guarded(
     // while COMMIT is in flight cannot drop the only recovery owner before the
     // claim's database outcome is known. This task never sends to the supplier.
     let db = state.db.clone();
+    let archive = state.archive.clone();
     let claim_account = account.clone();
     let claim_operation = operation.to_owned();
     let claim_actor = actor.to_owned();
@@ -645,6 +634,9 @@ async fn confirm_guarded(
     let (claim, mut completion) = tokio::spawn(async move {
         let mut completion = DispatchCompletion {
             db: db.clone(),
+            archive,
+            tenant: claim_account.tenant_id,
+            account: claim_account.id,
             operation: claim_operation.clone(),
             owner: Uuid::now_v7(),
             accepted: false,
@@ -697,6 +689,37 @@ async fn confirm_guarded(
     let accepted = result.is_ok();
     completion.accepted = accepted;
     completion.error = result.err();
+    // A detached publisher owns this immutable outcome even while the caller
+    // awaits DB completion. It cannot manufacture a second unknown outcome.
+    let receipt = super::reset_receipt::Receipt {
+        version: 1,
+        tenant: account.tenant_id,
+        account: account.id,
+        operation: Uuid::parse_str(operation)
+            .map_err(|_| AppError::internal("quota_reset_receipt_encode"))?,
+        owner: completion.owner,
+        accepted,
+        error: completion.error.clone(),
+    };
+    let receipt_archive = state.archive.clone();
+    let receipt_db = state.db.clone();
+    tokio::spawn(async move {
+        let mut delay = Duration::from_secs(1);
+        loop {
+            let (published, finished) = tokio::join!(
+                receipt.publish(&receipt_archive),
+                receipt.finish(&receipt_db)
+            );
+            if matches!(finished, Ok(true)) {
+                if published.is_err() || receipt.retire(&receipt_archive).await.is_ok() {
+                    break;
+                }
+            }
+            tokio::time::sleep(delay).await;
+            delay = (delay * 2).min(Duration::from_secs(30));
+        }
+    });
+    completion.finished = true;
     state
         .db
         .finish_quota_reset_owned(
