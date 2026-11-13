@@ -466,12 +466,12 @@ export function RequestsPage({ token, tenant, writeTenant = tenant, liveEvents, 
     <RequestsPanel requests={requests} upstreams={upstreams} filters={filters} loading={loading} hasOlder={hasOlder} streamState={streamState} token={token} tenant={tenant} filteredResultsStale={filteredResultsStale} requestRefresh={requestRefresh} refreshPaused={userPaused} onToggleRefreshPaused={() => setUserPaused((value) => !value)} historyLoaded={loadedHistoryIds.current.size > 0}
       onApply={(next) => { setFilters(next); scope.current = { token, tenant, filters: next }; void load(next); }}
       onClear={() => { setFilters(emptyTypedFilterAst); scope.current = { token, tenant, filters: emptyTypedFilterAst }; void load(emptyTypedFilterAst); }}
-      onLoadOlder={() => void load(filters, true)} onRefreshFilteredResults={() => void load(filters, false, true)} onSelect={selectRequest} onOpenSessions={onOpenSessions} onOpenSession={openSession} onOpenGenerations={onOpenGenerations} />
+      onLoadOlder={() => void load(filters, true)} onRefreshFilteredResults={() => void load(filters, false, true)} onReturnToLatest={() => void load(filters)} onSelect={selectRequest} onOpenSessions={onOpenSessions} onOpenSession={openSession} onOpenGenerations={onOpenGenerations} />
     {detail && <RequestDrawer token={token} tenant={tenant} detail={detail} upstreamName={upstreams.find((account) => account.id === detail.upstream_account_id)?.name} accountNames={new Map(upstreams.map(account => [account.id, account.name]))} onOpenSession={openSession} onRefresh={() => void load(filters, false, true)} refreshing={loading} onClose={closeRequestDetail} />}
   </PageLoadingRegion>;
 }
 
-function RequestsPanel({ requests, upstreams, filters, loading, hasOlder, streamState, token, tenant, filteredResultsStale, onApply, onClear, onLoadOlder, onRefreshFilteredResults, onSelect, onOpenSessions, onOpenSession, onOpenGenerations, requestRefresh, refreshPaused = false, onToggleRefreshPaused, historyLoaded }: {
+function RequestsPanel({ requests, upstreams, filters, loading, hasOlder, streamState, token, tenant, filteredResultsStale, onApply, onClear, onLoadOlder, onRefreshFilteredResults, onReturnToLatest, onSelect, onOpenSessions, onOpenSession, onOpenGenerations, requestRefresh, refreshPaused = false, onToggleRefreshPaused, historyLoaded }: {
   requests: RequestView[];
   upstreams: UpstreamAccount[];
   filters: TypedFilterAst;
@@ -486,6 +486,7 @@ function RequestsPanel({ requests, upstreams, filters, loading, hasOlder, stream
   onClear: () => void;
   onLoadOlder: () => void;
   onRefreshFilteredResults: () => void;
+  onReturnToLatest: () => void;
   onSelect: (request: RequestView) => Promise<void>;
   onOpenSessions: () => void;
   onOpenSession: (sessionId: string, keyId?: string, requestId?: string) => void;
@@ -511,7 +512,7 @@ function RequestsPanel({ requests, upstreams, filters, loading, hasOlder, stream
         <ToggleButton appearance="secondary" checked={refreshPaused} onClick={onToggleRefreshPaused}>{refreshPaused ? t('traffic.resumeUpdates') : t('traffic.pauseUpdates')}</ToggleButton>
       </span>}
     </div>}
-    {historyLoaded && !typedFiltersActive(filters) && <div className="request-refresh-control"><span>{locale === 'zh-CN' ? '正在浏览历史：已显示请求继续更新，新请求暂不插入。' : 'Browsing history: visible requests keep updating; new requests are not inserted.'}</span><Button appearance="subtle" disabled={loading} onClick={onRefreshFilteredResults}>{locale === 'zh-CN' ? '返回最新请求' : 'Return to latest requests'}</Button></div>}
+    {historyLoaded && !typedFiltersActive(filters) && <div className="request-refresh-control"><span>{locale === 'zh-CN' ? '正在浏览历史：已显示请求继续更新，新请求暂不插入。' : 'Browsing history: visible requests keep updating; new requests are not inserted.'}</span><Button appearance="subtle" disabled={loading} onClick={onReturnToLatest}>{locale === 'zh-CN' ? '返回最新请求' : 'Return to latest requests'}</Button></div>}
     <TypedFilterBuilder ast={filters} disabled={!token.trim()} onApply={onApply} onClear={onClear} scope="requests" token={token} tenant={tenant} upstreams={upstreams} />
     {filteredResultsStale && typedFiltersActive(filters) && <div className="notice warning" role="status">{t('traffic.filteredResultsStale')}<Button appearance="secondary" disabled={loading} onClick={onRefreshFilteredResults}>{t('traffic.refreshFilteredResults')}</Button></div>}
     {requests.length > 0 && <section className="metrics request-traffic-metrics" aria-label={t('monitoring.summary')}>
