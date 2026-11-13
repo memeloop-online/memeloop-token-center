@@ -37,7 +37,9 @@ pub(crate) fn request_body_object_key(request_id: &str) -> Option<String> {
     })
 }
 
-fn request_body_staging_key(locator: &str) -> Option<crate::archive_staging::ArchiveStagingKey> {
+pub(crate) fn request_body_staging_key(
+    locator: &str,
+) -> Option<crate::archive_staging::ArchiveStagingKey> {
     use crate::archive_staging::{ArchiveStagingKey, ArchiveStagingOwner, ArchiveStagingPurpose};
     let (identity, bare) = match locator.strip_prefix("stores/staging/") {
         Some(qualified) => {

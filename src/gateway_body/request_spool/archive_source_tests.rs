@@ -378,3 +378,240 @@ fn request_source_identity_accepts_only_the_exact_legacy_or_qualified_body() {
     assert!(source_request_id(&format!("stores/staging/{}/{qualified}", "a".repeat(64))).is_none());
     assert!(source_request_id(&qualified.replace("body.json", "other.json")).is_none());
 }
+
+async fn qualified_source_receipt_contract(database_url: &str) {
+    use crate::archive_staging::{ArchiveStagingLeaseOwner, ArchiveStagingReferenceProof};
+    let archive = crate::archive::ArchiveStore::training_staging_memory_for_test();
+    let database = Database::connect_with_max(database_url, 4).await.unwrap();
+    database.migrate().await.unwrap();
+    let database = database.with_archive(archive.clone());
+    let directory = tempfile::tempdir().unwrap();
+    let admission =
+        RequestSpoolAdmission::new(directory.path().to_owned()).with_archive(archive.clone());
+    let request_id = uuid::Uuid::now_v7();
+    let body = Bytes::from_static(b"original source retained across database reopen");
+    let source = Arc::new(
+        admission
+            .capture_with_memory(
+                Body::from(body.clone()),
+                body.len(),
+                Some(body.len()),
+                None,
+                0,
+                Some(&request_id.to_string()),
+            )
+            .await
+            .unwrap(),
+    );
+    let locator = source.object_locator().unwrap().to_owned();
+    let typed = request_body_staging_key(&locator).unwrap();
+    let pepper = b"qualified-source-receipt-test";
+    let issued = database
+        .create_key(
+            crate::db::CreateKeyInput {
+                tenant_external_id: request_id.to_string(),
+                principal_external_id: "member".into(),
+                alias: "qualified-source".into(),
+                currency: "USD".into(),
+                policy: crate::model::KeyPolicy::default(),
+                initial_balance: rust_decimal::Decimal::TEN,
+                idempotency_key: None,
+            },
+            pepper,
+        )
+        .await
+        .unwrap();
+    let key = database
+        .authenticate_key(&issued.key, pepper)
+        .await
+        .unwrap();
+    let price = database
+        .upsert_model_price(
+            "source",
+            "USD",
+            rust_decimal::Decimal::ONE,
+            rust_decimal::Decimal::ONE,
+        )
+        .await
+        .unwrap();
+    let started = database
+        .start_proxy_request_with_source(
+            crate::db::StartProxyRequest {
+                request_id,
+                key: &key,
+                price: &price,
+                input_token_ceiling: 1,
+                output_token_ceiling: 1,
+                protocol: "openai",
+                model: "source",
+                request_object: &locator,
+                upstream_account_id: None,
+                model_route_id: None,
+            },
+            &source,
+            None,
+            Some(1),
+        )
+        .await
+        .unwrap();
+    let identity = ArchiveSpoolIdentity {
+        request_id,
+        tenant_id: key.tenant_id,
+        reservation_id: started.id,
+    };
+    assert!(source.upload_outcome().await);
+    database.drain_gateway_persistence_for_test().await;
+    let stored = database
+        .archive_staging_attempt(request_id)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        stored.key, typed,
+        "the durable cleanup identity includes the backend"
+    );
+    let pool = sqlx::AnyPool::connect(database_url).await.unwrap();
+    let bound: String = sqlx::query_scalar(
+        "SELECT bound_locator FROM request_archive_spools WHERE request_id = $1",
+    )
+    .bind(request_id.to_string())
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert_eq!(bound, locator);
+    let bare = request_body_object_key(&request_id.to_string()).unwrap();
+    archive
+        .put(&bare, Bytes::from_static(b"separate legacy object"))
+        .await
+        .unwrap();
+    let neighbour = format!("{}/neighbour", typed.canonical_prefix());
+    archive
+        .put(&neighbour, Bytes::from_static(b"neighbour"))
+        .await
+        .unwrap();
+    drop(source);
+    database.close().await;
+    let reopened = Database::connect_with_max(database_url, 4)
+        .await
+        .unwrap()
+        .with_archive(archive.clone());
+    assert_eq!(
+        reopened
+            .archive_staging_attempt(request_id)
+            .await
+            .unwrap()
+            .unwrap()
+            .key,
+        typed
+    );
+    assert_eq!(archive.get(&bound).await.unwrap(), body);
+    reopened
+        .record_request_source(
+            identity,
+            &locator,
+            body.len(),
+            *blake3::hash(&body).as_bytes(),
+            true,
+        )
+        .await
+        .unwrap();
+    // A replay cannot silently reinterpret the old NULL backend as training.
+    sqlx::query(
+        "UPDATE archive_staging_attempts SET backend_identity = NULL WHERE attempt_id = $1",
+    )
+    .bind(request_id.to_string())
+    .execute(&pool)
+    .await
+    .unwrap();
+    assert!(
+        reopened
+            .record_request_source(
+                identity,
+                &locator,
+                body.len(),
+                *blake3::hash(&body).as_bytes(),
+                true
+            )
+            .await
+            .is_err()
+    );
+    assert!(
+        reopened
+            .archive_staging_attempt(request_id)
+            .await
+            .unwrap()
+            .unwrap()
+            .key
+            .backend_identity
+            .is_none()
+    );
+    sqlx::query("UPDATE archive_staging_attempts SET backend_identity = $2 WHERE attempt_id = $1")
+        .bind(request_id.to_string())
+        .bind(typed.backend_identity_text())
+        .execute(&pool)
+        .await
+        .unwrap();
+    let claim = reopened
+        .claim_archive_staging_cleanup(
+            ArchiveStagingLeaseOwner::new("qualified-source-reaper").unwrap(),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(claim.attempt.key, typed);
+    assert_eq!(claim.canonical_prefix(), typed.canonical_prefix());
+    assert!(
+        matches!(
+            reopened
+                .prove_archive_staging_unreferenced(claim)
+                .await
+                .unwrap(),
+            ArchiveStagingReferenceProof::Protected { .. }
+        ),
+        "pending referenced source is not garbage"
+    );
+    assert_eq!(archive.get(&bound).await.unwrap(), body);
+    assert_eq!(
+        archive.get(&bare).await.unwrap(),
+        Bytes::from_static(b"separate legacy object")
+    );
+    assert_eq!(
+        archive.get(&neighbour).await.unwrap(),
+        Bytes::from_static(b"neighbour")
+    );
+    pool.close().await;
+    reopened.close().await;
+}
+
+#[tokio::test]
+async fn sqlite_qualified_source_receipt_reopens_with_training_cleanup_identity() {
+    let directory = tempfile::tempdir().unwrap();
+    qualified_source_receipt_contract(&format!(
+        "sqlite://{}?mode=rwc",
+        directory.path().join("qualified.db").display()
+    ))
+    .await;
+}
+
+#[tokio::test]
+async fn postgres_qualified_source_receipt_reopens_with_training_cleanup_identity() {
+    let Ok(url) = std::env::var("MTC_TEST_POSTGRES_URL") else {
+        return;
+    };
+    let admin = sqlx::PgPool::connect(&url).await.unwrap();
+    let schema = format!("qualified_source_{}", uuid::Uuid::now_v7().simple());
+    sqlx::query(sqlx::AssertSqlSafe(format!("CREATE SCHEMA {schema}")))
+        .execute(&admin)
+        .await
+        .unwrap();
+    let mut isolated = url::Url::parse(&url).unwrap();
+    isolated
+        .query_pairs_mut()
+        .append_pair("options", &format!("-csearch_path={schema}"));
+    qualified_source_receipt_contract(isolated.as_str()).await;
+    sqlx::query(sqlx::AssertSqlSafe(format!("DROP SCHEMA {schema} CASCADE")))
+        .execute(&admin)
+        .await
+        .unwrap();
+    admin.close().await;
+}
