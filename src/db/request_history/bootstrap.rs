@@ -107,7 +107,7 @@ impl Database {
                 ));
             }
         }
-        let actual:i64=sqlx::query_scalar("SELECT COUNT(*) FROM pg_trigger t JOIN pg_class c ON c.oid=t.tgrelid JOIN pg_namespace n ON n.oid=c.relnamespace JOIN pg_proc p ON p.oid=t.tgfoid WHERE n.nspname=current_schema() AND NOT t.tgisinternal AND t.tgname LIKE 'history_%' AND p.proname LIKE 'history_%'")
+        let actual:i64=sqlx::query_scalar("SELECT COUNT(*) FROM pg_trigger t JOIN pg_class c ON c.oid=t.tgrelid JOIN pg_namespace n ON n.oid=c.relnamespace JOIN pg_proc p ON p.oid=t.tgfoid WHERE n.nspname=current_schema() AND NOT t.tgisinternal AND t.tgparentid=0 AND t.tgname LIKE 'history_%' AND p.proname LIKE 'history_%'")
             .fetch_one(&mut *transaction).await?;
         if actual != expected {
             return Err(HistoryError::Verification(
@@ -223,6 +223,18 @@ mod tests {
             assert!(definition.matches(&mut inspection).await.unwrap());
         }
         inspection.rollback().await.unwrap();
+        // PostgreSQL clones parent row triggers onto existing partitions.
+        // Their exact parent definition is already checked above, but they
+        // must not count as additional independently installed root triggers.
+        let roots: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM pg_trigger t JOIN pg_class c ON c.oid=t.tgrelid JOIN pg_namespace n ON n.oid=c.relnamespace WHERE n.nspname=current_schema() AND NOT t.tgisinternal AND t.tgparentid=0 AND t.tgname LIKE 'history_%'")
+            .fetch_one(&resumed.pool).await.unwrap();
+        let clones: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM pg_trigger t JOIN pg_class c ON c.oid=t.tgrelid JOIN pg_namespace n ON n.oid=c.relnamespace WHERE n.nspname=current_schema() AND NOT t.tgisinternal AND t.tgparentid<>0 AND t.tgname LIKE 'history_%'")
+            .fetch_one(&resumed.pool).await.unwrap();
+        assert_eq!(roots, definitions.len() as i64);
+        assert!(
+            clones > 0,
+            "real partitioned source tables must exercise inherited triggers"
+        );
         // A matching count is insufficient: corrupt the durable version label.
         sqlx::raw_sql("COMMENT ON FUNCTION history_request_events_insert() IS 'wrong-version'")
             .execute(&resumed.pool)
