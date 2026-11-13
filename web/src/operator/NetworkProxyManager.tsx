@@ -431,7 +431,7 @@ export function NetworkProxyPolicyWorkspace({ token, tenant, accounts, accountsS
   const [draft, setDraft] = useState<PolicyDraft>(emptyPolicyDraft);
   const [dirty, setDirty] = useState(false);
   const [ready, setReady] = useState(false);
-  const [busy, setBusy] = useState(false);
+  const [busy, setBusy] = useState(true);
   const [error, setError] = useState('');
   const [message, setMessage] = useState('');
   const alive = useRef(false);
@@ -463,7 +463,7 @@ export function NetworkProxyPolicyWorkspace({ token, tenant, accounts, accountsS
 
   useNavigationGuard(async () => !embedded || await requestClose());
   useLayoutEffect(() => {
-    onEditingChange?.(dirty || pendingWrite.current !== null);
+    onEditingChange?.(dirty || busy);
     return () => onEditingChange?.(false);
   }, [dirty, busy, onEditingChange]);
 

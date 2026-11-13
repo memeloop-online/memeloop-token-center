@@ -250,13 +250,22 @@ function UpstreamProviders({ renderResetSettings, token, tenant, writeTenant = t
   useLayoutEffect(() => {
     if (busy || workspace?.kind === 'rotation' || workspace?.kind === 'reauthorization') return;
     const pending = returnFocus.current;
-    if (pending) {
-      const trigger = pending.trigger?.isConnected && pending.trigger.getClientRects().length ? pending.trigger
-        : Array.from(providerList.current?.querySelectorAll<HTMLButtonElement>(`[data-${pending.target}-trigger="${CSS.escape(pending.accountId)}"]`) ?? []).find(button => button.getClientRects().length && !button.disabled);
-      if (trigger && trigger.getClientRects().length && !trigger.matches(':disabled')) { returnFocus.current = undefined; trigger.focus(); return; }
+    // Keep a visible focus target while the scoped policy read disables actions.
+    if (proxyEditorOpen) {
+      if (workspace?.kind === 'account') detailHeading.current?.focus();
+      return;
     }
-    if (workspace?.kind === 'account') detailHeading.current?.focus();
-  }, [workspace, busy]);
+    const frame = requestAnimationFrame(() => {
+      if (returnFocus.current !== pending) return;
+      if (pending) {
+        const trigger = pending.trigger?.isConnected && pending.trigger.getClientRects().length ? pending.trigger
+          : Array.from(providerList.current?.querySelectorAll<HTMLButtonElement>(`[data-${pending.target}-trigger="${CSS.escape(pending.accountId)}"]`) ?? []).find(button => button.getClientRects().length && !button.disabled);
+        if (trigger && trigger.getClientRects().length && !trigger.matches(':disabled')) { returnFocus.current = undefined; trigger.focus(); return; }
+      }
+      if (workspace?.kind === 'account') detailHeading.current?.focus();
+    });
+    return () => cancelAnimationFrame(frame);
+  }, [workspace, busy, proxyEditorOpen]);
   useLayoutEffect(() => { if (message && !workspace && !returnFocus.current) providerSuccess.current?.focus(); }, [message]);
   function navigateWorkspace(next?: AccountWorkspace) {
     workspaceGeneration.current += 1;
