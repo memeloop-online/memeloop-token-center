@@ -454,6 +454,11 @@ pub(super) async fn materialize_proxy_route(
     } else {
         Some(route_temporary_memory(state, temporary_bytes)?)
     };
+    let component_input_bytes = if planned.component_context.is_some() {
+        encoded_length
+    } else {
+        0
+    };
     let (component_request, forwarded_body) = if let Some(context) = planned.component_context {
         let prepared = prepare_component_provider(
             state,
@@ -515,6 +520,7 @@ pub(super) async fn materialize_proxy_route(
         wait_for_compaction: planned.wait_for_compaction,
         route: planned.route,
         forwarded_body: Bytes::from(forwarded_body),
+        component_input_bytes,
         upstream_stream: planned.upstream_stream,
         codex_downstream_stream: planned.codex_downstream_stream,
         codex_store_disabled: planned.codex_store_disabled,

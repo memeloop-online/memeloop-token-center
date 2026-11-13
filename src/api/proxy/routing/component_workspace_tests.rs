@@ -61,6 +61,12 @@ async fn component_materialization_retains_only_the_dispatched_prepared_body() {
         responses_anthropic: None,
         wire_shim_context: None,
     };
+    // Planning can expand an original request before the component produces
+    // its much smaller wire body. Preserve that already-reserved input bound.
+    let original_body_length = 16;
+    assert!(source_length > original_body_length);
+    let (planned_input_bound, _, _) =
+        candidate_reservation_bounds(&planned, original_body_length, 1).unwrap();
     let prepared = materialize_proxy_route(&state, planned).await.unwrap();
     assert!(
         prepared.forwarded_body.is_empty(),
@@ -75,8 +81,11 @@ async fn component_materialization_retains_only_the_dispatched_prepared_body() {
         json!({"prompt":"from-component","model":"vendor-model"})
     );
     assert_eq!(returned_context.model, "public-model");
-    assert!(
-        prepared_input_reservation_bound(&prepared, source_length).unwrap() >= source_length as i64
+    assert!(component.body.len() < source_length);
+    assert_eq!(prepared.component_input_bytes, source_length);
+    assert_eq!(
+        prepared_input_reservation_bound(&prepared, original_body_length).unwrap(),
+        planned_input_bound
     );
     drop(prepared);
     assert_eq!(state.proxy_memory_budget.snapshot().0, 192 * 1024);

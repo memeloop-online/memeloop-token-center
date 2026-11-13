@@ -121,6 +121,7 @@ impl Fixture {
                 },
             },
             forwarded_body: bytes::Bytes::from_static(b"{}"),
+            component_input_bytes: 0,
             upstream_stream: true,
             codex_downstream_stream: true,
             codex_store_disabled: true,
