@@ -43,7 +43,7 @@ impl Database {
         &self,
         key_id: Uuid,
     ) -> Result<HistoryScope, HistoryError> {
-        let tenant: Option<String> = sqlx::query_scalar("SELECT tenant_id FROM key_records WHERE id = $1 UNION SELECT tenant_id FROM request_history_source_ids WHERE key_id = $1 LIMIT 1")
+        let tenant: Option<String> = sqlx::query_scalar("SELECT tenant_id FROM key_records WHERE id = $1 UNION SELECT tenant_id FROM request_history_identities WHERE key_id = $1 UNION SELECT tenant_id FROM request_history_source_ids WHERE key_id = $1 LIMIT 1")
             .bind(key_id.to_string()).fetch_optional(&self.pool).await?;
         Ok(match tenant {
             Some(tenant) => HistoryScope::Key {
@@ -513,6 +513,17 @@ impl Database {
                 acknowledged.push(snapshot.clone());
             }
         }
+        for snapshot in &acknowledged {
+            super::history_immutable_outbox::capture_identity_in_transaction(
+                &mut transaction,
+                &snapshot.identity,
+                snapshot.revision,
+            )
+            .await?;
+            let hash = crate::request_history::canonical_hash(snapshot)?;
+            sqlx::query("UPDATE request_history_identities SET acknowledged_revision=$1,acknowledged_hash=$2 WHERE source=$3 AND request_id=$4 AND tenant_id=$5 AND key_id=$6 AND created_at=$7 AND head_revision >= $1 AND (acknowledged_revision IS NULL OR acknowledged_revision < $1)")
+                .bind(snapshot.revision).bind(hash).bind(&snapshot.identity.source).bind(snapshot.identity.request_id.to_string()).bind(snapshot.identity.tenant_id.to_string()).bind(snapshot.identity.key_id.to_string()).bind(snapshot.identity.created_at).execute(&mut *transaction).await?;
+        }
         self.allocation_history_acknowledged(&mut transaction, &acknowledged)
             .await?;
         transaction.commit().await?;
@@ -610,7 +621,7 @@ impl Database {
         request_id: Uuid,
     ) -> Result<HistoryIdentity, HistoryError> {
         let sql = format!(
-            "SELECT {COLUMNS} FROM request_history_source_ids WHERE request_id = $1 ORDER BY source DESC LIMIT 1"
+            "SELECT {COLUMNS} FROM (SELECT {COLUMNS}, 0 AS priority FROM request_history_identities WHERE request_id=$1 UNION ALL SELECT {COLUMNS}, 1 AS priority FROM request_history_source_ids WHERE request_id=$1) candidates ORDER BY priority, source DESC LIMIT 1"
         );
         let row = sqlx::query(sqlx::AssertSqlSafe(sql))
             .bind(request_id.to_string())
