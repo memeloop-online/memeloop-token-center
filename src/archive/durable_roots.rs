@@ -4,7 +4,7 @@ use object_store::{PutMode, PutOptions, PutPayload, path::Path};
 
 use super::{
     ArchiveStore,
-    path::{archive_path, is_conversation_root_location},
+    path::{archive_path, is_durable_root_location},
 };
 use crate::error::AppError;
 
@@ -17,7 +17,7 @@ impl ArchiveStore {
             .list(Some(&Path::from("tenants")))
             .filter_map(|entry| async move {
                 match entry {
-                    Ok(entry) if is_conversation_root_location(entry.location.as_ref()) => {
+                    Ok(entry) if is_durable_root_location(entry.location.as_ref()) => {
                         Some(Ok(entry.location.to_string()))
                     }
                     Ok(_) => None,
@@ -31,8 +31,13 @@ impl ArchiveStore {
     /// before publication, just as for a newly captured conversation.
     pub async fn restore_durable_root(&self, location: &str, bytes: Bytes) -> Result<(), AppError> {
         let path = archive_path(location)?;
-        if !is_conversation_root_location(location) {
+        if !is_durable_root_location(location) {
             return Err(AppError::BadRequest("invalid durable root location".into()));
+        }
+        if super::path::is_history_root_location(location) {
+            let root = super::HistoryArchiveRoot::decode(location, &bytes)?;
+            self.verify_tenant_content(root.tenant_id, &root.object)
+                .await?;
         }
         match self
             .inner
