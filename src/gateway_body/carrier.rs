@@ -3,7 +3,7 @@
 use std::{
     fmt::Display,
     pin::Pin,
-    sync::{Arc, Mutex},
+    sync::{Arc, Mutex, Weak},
 };
 
 use bytes::{Bytes, BytesMut};
@@ -59,9 +59,10 @@ struct Allocation {
     _lease: OwnedSemaphorePermit,
     _retained: Option<OwnedSemaphorePermit>,
 }
-impl AsRef<[u8]> for Allocation {
+struct AllocationView(Arc<Allocation>);
+impl AsRef<[u8]> for AllocationView {
     fn as_ref(&self) -> &[u8] {
-        &self.bytes
+        &self.0.bytes
     }
 }
 
@@ -79,6 +80,7 @@ pub(crate) struct BodyCarrier {
     offload: tokio::sync::Mutex<()>,
     sealed_reference: Option<StagedArchiveObject>,
     parent: Option<Arc<BodyCarrier>>,
+    allocations: Mutex<Vec<Weak<Allocation>>>,
     length: u64,
     digest: String,
     owned_objects: Mutex<Vec<String>>,
@@ -108,6 +110,7 @@ impl BodyCarrier {
             offload: tokio::sync::Mutex::new(()),
             sealed_reference: None,
             parent: parent.clone(),
+            allocations: Mutex::new(Vec::new()),
             length: 0,
             digest: String::new(),
             owned_objects: Mutex::new(Vec::new()),
@@ -159,11 +162,7 @@ impl BodyCarrier {
                         }
                     }
                 };
-                let bytes = Bytes::from_owner(Allocation {
-                    bytes: Bytes::copy_from_slice(&part),
-                    _lease: lease,
-                    _retained: retained,
-                });
+                let bytes = source.leased_bytes(Bytes::copy_from_slice(&part), lease, retained);
                 source.segments.push(Mutex::new(Segment::Ram(bytes)));
             }
         }
@@ -178,21 +177,43 @@ impl BodyCarrier {
         Ok(Arc::new(source))
     }
 
+    fn leased_bytes(
+        &self,
+        bytes: Bytes,
+        lease: OwnedSemaphorePermit,
+        retained: Option<OwnedSemaphorePermit>,
+    ) -> Bytes {
+        let allocation = Arc::new(Allocation {
+            bytes,
+            _lease: lease,
+            _retained: retained,
+        });
+        let mut owners = self.allocations.lock().unwrap();
+        // Discard expired identities as new transient replay buffers arrive.
+        // Weak entries never pin bytes or their allocation credit.
+        owners.retain(|owner| owner.strong_count() != 0);
+        owners.push(Arc::downgrade(&allocation));
+        Bytes::from_owner(AllocationView(allocation))
+    }
+
     fn owns_ram(&self, bytes: &Bytes) -> bool {
         let start = bytes.as_ptr() as usize;
         let Some(end) = start.checked_add(bytes.len()) else {
             return false;
         };
-        self.segments
-            .iter()
-            .any(|segment| match &*segment.lock().unwrap() {
-                Segment::Ram(owned) => {
-                    let base = owned.as_ptr() as usize;
-                    base.checked_add(owned.len())
-                        .is_some_and(|limit| start >= base && end <= limit)
-                }
-                Segment::Object(_) => false,
-            })
+        let owned_here = self.allocations.lock().unwrap().iter().any(|owner| {
+            let Some(allocation) = owner.upgrade() else {
+                return false;
+            };
+            let base = allocation.bytes.as_ptr() as usize;
+            base.checked_add(allocation.bytes.len())
+                .is_some_and(|limit| start >= base && end <= limit)
+        });
+        owned_here
+            || self
+                .parent
+                .as_ref()
+                .is_some_and(|parent| parent.owns_ram(bytes))
     }
 
     async fn offload_one(&self) -> Result<bool, AppError> {
@@ -326,11 +347,7 @@ impl BodyCarrier {
                                             })?;
                                             let lease =
                                                 memory.reserve_workspace(bytes.len()).await?;
-                                            Ok(Bytes::from_owner(Allocation {
-                                                bytes,
-                                                _lease: lease,
-                                                _retained: None,
-                                            }))
+                                            Ok(memory.leased_bytes(bytes, lease, None))
                                         }
                                     })))
                                 }
@@ -414,11 +431,7 @@ impl BodyCarrier {
         if output.len() != length {
             return Err(AppError::storage("carrier_range_truncated"));
         }
-        Ok(Bytes::from_owner(Allocation {
-            bytes: output.freeze(),
-            _lease: lease,
-            _retained: None,
-        }))
+        Ok(self.leased_bytes(output.freeze(), lease, None))
     }
 }
 
@@ -550,6 +563,29 @@ mod tests {
         assert_eq!(source.len(), 128 * 1024);
         drop(bytes);
         drop(source);
+        assert_eq!(memory.snapshot().0, 0);
+    }
+
+    #[tokio::test]
+    async fn offloaded_parent_keeps_live_reader_allocation_provenance() {
+        let memory = Arc::new(ProxyMemoryBudget::new(128 * 1024));
+        let source = full_ram_source(memory.clone()).await;
+        let reader = source.read_range(0, 65536).await.unwrap();
+        assert!(source.offload_one().await.unwrap());
+        // The segment is now remote, but this old reader still owns its RAM.
+        assert_eq!(memory.snapshot().0, 128 * 1024);
+        let derived = BodyCarrier::capture(
+            stream::iter([Ok::<_, std::io::Error>(reader.slice(4..12))]),
+            CarrierCapture::derived_from(&source, key()),
+        )
+        .await
+        .unwrap();
+        assert_eq!(memory.snapshot().0, 128 * 1024);
+        assert_eq!(derived.read_range(0, 8).await.unwrap(), b"aaaaaaaa"[..]);
+        drop(reader);
+        drop(source);
+        assert_eq!(memory.snapshot().0, 128 * 1024);
+        drop(derived);
         assert_eq!(memory.snapshot().0, 0);
     }
 
