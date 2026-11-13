@@ -838,6 +838,11 @@ pub(crate) const SQLITE_MIGRATIONS: &[Migration] = &[
         name: "history delivery watermark fence",
         sql: include_str!("../../../migrations/common/0158_history_delivery_ceiling.sql"),
     },
+    Migration {
+        version: 159,
+        name: "consistent history baseline receipts",
+        sql: include_str!("../../../migrations/common/0159_history_baseline_receipts.sql"),
+    },
 ];
 
 pub(crate) const POSTGRES_MIGRATIONS: &[Migration] = &[
@@ -1650,6 +1655,11 @@ pub(crate) const POSTGRES_MIGRATIONS: &[Migration] = &[
         version: 158,
         name: "history delivery watermark fence",
         sql: include_str!("../../../migrations/common/0158_history_delivery_ceiling.sql"),
+    },
+    Migration {
+        version: 159,
+        name: "consistent history baseline receipts",
+        sql: include_str!("../../../migrations/common/0159_history_baseline_receipts.sql"),
     },
 ];
 
