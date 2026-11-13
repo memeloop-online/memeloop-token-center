@@ -319,6 +319,30 @@ async fn body_enrichment_preserves_relations(fixture: &Fixture) {
 }
 
 async fn declared_identity_before_body_contract(database_url: String) {
+    let malformed = Fixture::new(database_url.clone(), false).await;
+    sqlx::query("UPDATE conversation_projection_outbox SET hints_json = $1 WHERE request_id = $2")
+        .bind("{invalid hints")
+        .bind(malformed.request_id.to_string())
+        .execute(&malformed.state.db.pool)
+        .await
+        .unwrap();
+    let unclaimed = Fixture::new(database_url.clone(), false).await;
+    sqlx::query("UPDATE conversation_projection_outbox SET hints_json = $1 WHERE request_id = $2")
+        .bind(
+            serde_json::to_string(&ConversationHints {
+                session_id: Some("unclaimed-declared-thread".into()),
+                ..Default::default()
+            })
+            .unwrap(),
+        )
+        .bind(unclaimed.request_id.to_string())
+        .execute(&unclaimed.state.db.pool)
+        .await
+        .unwrap();
+    let unclaimed_before: (Option<String>, Option<i64>, i64, Option<String>, Option<i64>) =
+        sqlx::query_as("SELECT lease_owner, lease_expires_at, attempts, terminal_lease_owner, terminal_lease_expires_at FROM conversation_projection_outbox WHERE request_id = $1")
+            .bind(unclaimed.request_id.to_string()).fetch_one(&unclaimed.state.db.pool).await.unwrap();
+    assert_eq!(unclaimed_before.2, 0);
     let fixture = Fixture::new(database_url, false).await;
     body_enrichment_preserves_relations(&fixture).await;
     let mut hints = ConversationHints {
@@ -335,6 +359,55 @@ async fn declared_identity_before_body_contract(database_url: String) {
         .execute(&fixture.state.db.pool)
         .await
         .unwrap();
+    let terminal_projected: i64 = sqlx::query_scalar(
+        "SELECT projected_at FROM terminal_projection_outbox WHERE request_id = $1",
+    )
+    .bind(fixture.request_id.to_string())
+    .fetch_one(&fixture.state.db.pool)
+    .await
+    .unwrap();
+    sqlx::query("UPDATE terminal_projection_outbox SET projected_at = NULL WHERE request_id = $1")
+        .bind(fixture.request_id.to_string())
+        .execute(&fixture.state.db.pool)
+        .await
+        .unwrap();
+    fixture
+        .state
+        .db
+        .project_declared_conversation_identities(None, 32)
+        .await
+        .unwrap();
+    let absent: i64 =
+        sqlx::query_scalar("SELECT COUNT(*) FROM conversation_observations WHERE request_id = $1")
+            .bind(fixture.request_id.to_string())
+            .fetch_one(&fixture.state.db.pool)
+            .await
+            .unwrap();
+    assert_eq!(absent, 0, "unprojected terminal cannot publish identity");
+    let unclaimed_after: (Option<String>, Option<i64>, i64, Option<String>, Option<i64>) =
+        sqlx::query_as("SELECT lease_owner, lease_expires_at, attempts, terminal_lease_owner, terminal_lease_expires_at FROM conversation_projection_outbox WHERE request_id = $1")
+            .bind(unclaimed.request_id.to_string()).fetch_one(&unclaimed.state.db.pool).await.unwrap();
+    assert_eq!(unclaimed_before, unclaimed_after);
+    let unclaimed_visible: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM conversation_observations WHERE request_id = $1 AND explicit_session_id = $2")
+        .bind(unclaimed.request_id.to_string()).bind("unclaimed-declared-thread").fetch_one(&unclaimed.state.db.pool).await.unwrap();
+    assert_eq!(
+        unclaimed_visible, 1,
+        "metadata progresses before any body claim"
+    );
+
+    sqlx::query("UPDATE terminal_projection_outbox SET projected_at = $1 WHERE request_id = $2")
+        .bind(terminal_projected)
+        .bind(fixture.request_id.to_string())
+        .execute(&fixture.state.db.pool)
+        .await
+        .unwrap();
+    let malformed_pending: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM conversation_projection_outbox WHERE request_id = $1 AND projected_at IS NULL AND attempts = 0")
+        .bind(malformed.request_id.to_string()).fetch_one(&fixture.state.db.pool).await.unwrap();
+    assert_eq!(
+        malformed_pending, 1,
+        "bad metadata remains retryable without blocking the next identity"
+    );
+
     let owner = fixture.claim().await;
     fixture
         .state
@@ -349,6 +422,36 @@ async fn declared_identity_before_body_contract(database_url: String) {
             .await
             .unwrap();
     assert_eq!(before, 0, "stale worker cannot publish identity");
+    let lease_before: (Option<String>, Option<i64>, i64, Option<String>, Option<i64>) =
+        sqlx::query_as("SELECT lease_owner, lease_expires_at, attempts, terminal_lease_owner, terminal_lease_expires_at FROM conversation_projection_outbox WHERE request_id = $1")
+            .bind(fixture.request_id.to_string()).fetch_one(&fixture.state.db.pool).await.unwrap();
+    // Metadata publication does not call body/archive IO or claim its lease.
+    let cursor = fixture
+        .state
+        .db
+        .project_declared_conversation_identities(None, 32)
+        .await
+        .unwrap();
+    assert_eq!(
+        cursor.as_deref(),
+        Some(fixture.request_id.to_string().as_str())
+    );
+    fixture
+        .state
+        .db
+        .project_declared_conversation_identities(None, 32)
+        .await
+        .unwrap();
+    let lease_after: (Option<String>, Option<i64>, i64, Option<String>, Option<i64>) =
+        sqlx::query_as("SELECT lease_owner, lease_expires_at, attempts, terminal_lease_owner, terminal_lease_expires_at FROM conversation_projection_outbox WHERE request_id = $1")
+            .bind(fixture.request_id.to_string()).fetch_one(&fixture.state.db.pool).await.unwrap();
+    assert_eq!(
+        lease_before, lease_after,
+        "identity cannot take or release the body lease"
+    );
+    let pending: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM conversation_projection_outbox WHERE request_id = $1 AND projected_at IS NULL AND statistics_outcome IS NULL")
+        .bind(fixture.request_id.to_string()).fetch_one(&fixture.state.db.pool).await.unwrap();
+    assert_eq!(pending, 1, "identity does not acknowledge body completion");
     assert!(
         !crate::worker::archive_session_body(&fixture.state, owner, fixture.request_id)
             .await

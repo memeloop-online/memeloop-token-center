@@ -28,17 +28,78 @@ impl Database {
         let Some(row) = row else {
             return Ok(());
         };
+        self.project_conversation_identity_row_in_transaction(&mut transaction, request_id, row)
+            .await?;
+        transaction.commit().await?;
+        Ok(())
+    }
+
+    /// Independent metadata-only consumer: row locks serialize identity, while
+    /// the body's owner, lease, attempts and completion remain untouched.
+    pub(crate) async fn project_declared_conversation_identities(
+        &self,
+        after: Option<&str>,
+        limit: i64,
+    ) -> Result<Option<String>, AppError> {
+        // Parse declared identity per row below: one corrupt legacy hints value
+        // must not poison the entire page before its cursor can advance.
+        let eligible = "c.projected_at IS NULL AND c.key_snapshot_json IS NOT NULL
+            AND t.projected_at IS NOT NULL AND t.tenant_id = c.tenant_id AND t.key_id = c.key_id
+            AND NOT EXISTS (SELECT 1 FROM conversation_observations o WHERE o.request_id = c.request_id)
+            AND NOT EXISTS (SELECT 1 FROM observability_prune_boundaries b WHERE b.scope = 'global' AND b.before_day > t.created_at / 86400000)";
+        let ids: Vec<String> = sqlx::query_scalar(sqlx::AssertSqlSafe(format!(
+            "SELECT c.request_id FROM conversation_projection_outbox c JOIN terminal_projection_outbox t ON t.request_id = c.request_id WHERE c.request_id > $1 AND {eligible} ORDER BY c.request_id LIMIT $2"
+        )))
+        .bind(after.unwrap_or(""))
+        .bind(limit.clamp(1, CONVERSATION_PROJECTION_BATCH_LIMIT))
+        .fetch_all(&self.pool).await?;
+        let next = ids.last().cloned();
+        for id in ids {
+            let result = async {
+                let request_id = parse_uuid(id.clone())?;
+                let mut transaction = self.begin_write_transaction().await?;
+                // Keep the original stats/prune lock -> outbox row lock order.
+                lock_request_stats_projection_writer_in_transaction(&mut transaction).await?;
+                let lock = match self.backend {
+                    DatabaseBackend::PostgreSql => " FOR UPDATE OF c SKIP LOCKED",
+                    DatabaseBackend::Sqlite => "",
+                };
+                let row = sqlx::query(sqlx::AssertSqlSafe(format!(
+                    "SELECT c.tenant_id, c.key_id, c.principal_id, c.hints_json, c.key_snapshot_json, c.client_name, c.upstream_response_id, c.observed_at FROM conversation_projection_outbox c JOIN terminal_projection_outbox t ON t.request_id = c.request_id WHERE c.request_id = $1 AND {eligible}{lock}"
+                )))
+                .bind(&id).fetch_optional(&mut *transaction).await?;
+                if let Some(row) = row {
+                    self.project_conversation_identity_row_in_transaction(&mut transaction, request_id, row).await?;
+                }
+                transaction.commit().await?;
+                Ok::<(), AppError>(())
+            }.await;
+            if let Err(error) = result {
+                // Keep evidence/task for a later cursor pass; one bad snapshot
+                // must not prevent other declared chats becoming visible.
+                tracing::error!(%error, request_id = %id, "declared conversation identity remains pending");
+            }
+        }
+        Ok(next)
+    }
+
+    async fn project_conversation_identity_row_in_transaction(
+        &self,
+        transaction: &mut Transaction<'_, Any>,
+        request_id: Uuid,
+        row: sqlx::any::AnyRow,
+    ) -> Result<(), AppError> {
         if let Some(terminal) = sqlx::query(
             "SELECT created_at, projected_at FROM terminal_projection_outbox WHERE request_id = $1",
         )
         .bind(request_id.to_string())
-        .fetch_optional(&mut *transaction)
+        .fetch_optional(&mut **transaction)
         .await?
             && (terminal
                 .try_get::<Option<i64>, _>("projected_at")?
                 .is_none()
                 || super::super::terminal_projection::statistics_pruned_in_transaction(
-                    &mut transaction,
+                    transaction,
                     terminal.try_get("created_at")?,
                 )
                 .await?)
@@ -56,7 +117,7 @@ impl Database {
             "SELECT COUNT(*) FROM conversation_observations WHERE request_id = $1",
         )
         .bind(request_id.to_string())
-        .fetch_one(&mut *transaction)
+        .fetch_one(&mut **transaction)
         .await?;
         if existing != 0 {
             return Ok(());
@@ -87,7 +148,7 @@ impl Database {
         let client_name: Option<String> = row.try_get("client_name")?;
         let response_id: Option<String> = row.try_get("upstream_response_id")?;
         self.record_conversation_observation_with_snapshot_in_transaction(
-            &mut transaction,
+            transaction,
             ConversationObservationInput {
                 key: &key,
                 request_id,
@@ -103,7 +164,6 @@ impl Database {
         )
         .await
         .map_err(AppError::from)?;
-        transaction.commit().await?;
         Ok(())
     }
 }
