@@ -235,8 +235,8 @@ impl AppState {
             .map_err(|_| InitializationError::Archive)?;
         let db = db.with_archive(archive.clone());
         responses_request_spool = responses_request_spool.with_archive(archive.clone());
-        let persistence_db = db.independent_persistence_pool();
-        let routing_persistence_db = db.independent_persistence_pool();
+        let persistence_db = db.independent_persistence_pool_for("raw-persistence");
+        let routing_persistence_db = db.independent_persistence_pool_for("routing-persistence");
         let early_requests = early_request::Journal::new(
             std::path::Path::new(&config.responses_request_spool_path)
                 .join("early-terminals")
@@ -245,7 +245,7 @@ impl AppState {
                         .to_hex()
                         .as_str(),
                 ),
-            db.independent_persistence_pool(),
+            db.independent_persistence_pool_for("early-terminals"),
         );
         let pending_terminals = proxy_lifecycle::pending_terminal::Journal::with_archive(
             std::path::Path::new(&config.responses_request_spool_path)
@@ -255,7 +255,7 @@ impl AppState {
                         .to_hex()
                         .as_str(),
                 ),
-            db.independent_persistence_pool(),
+            db.independent_persistence_pool_for("pending-terminals"),
             archive.clone(),
         );
         let plugins = PluginRuntime::load(config.plugin_dir.as_deref(), db.clone())
