@@ -219,6 +219,20 @@ impl ProxyMemoryReservation {
         })
     }
 
+    pub(crate) fn try_reserve_carrier_ingress(
+        &self,
+        bytes: usize,
+    ) -> Option<(OwnedSemaphorePermit, OwnedSemaphorePermit)> {
+        let units = u32::try_from(bytes.div_ceil(UNIT_BYTES)).ok()?;
+        let retained = self
+            .retained_requests
+            .clone()
+            .try_acquire_many_owned(units)
+            .ok()?;
+        let allocation = self.permits.clone().try_acquire_many_owned(units).ok()?;
+        Some((allocation, retained))
+    }
+
     pub(crate) async fn reserve_carrier_bytes(
         &self,
         bytes: usize,

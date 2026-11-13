@@ -19,6 +19,7 @@ pub(crate) struct CarrierCapture {
     memory: Arc<ProxyMemoryBudget>,
     archive: Option<ArchiveStore>,
     staging: ArchiveStagingKey,
+    parent: Option<Arc<BodyCarrier>>,
 }
 
 impl CarrierCapture {
@@ -31,6 +32,18 @@ impl CarrierCapture {
             memory,
             archive,
             staging,
+            parent: None,
+        }
+    }
+
+    /// Only pointer ranges owned by this sealed source may share its allocation
+    /// credit. Copied or transformed bytes still acquire their own real lease.
+    pub(crate) fn derived_from(source: &Arc<BodyCarrier>, staging: ArchiveStagingKey) -> Self {
+        Self {
+            memory: source.memory.clone(),
+            archive: source.archive.clone(),
+            staging,
+            parent: Some(source.clone()),
         }
     }
 }
@@ -40,6 +53,7 @@ impl CarrierCapture {
 struct Allocation {
     bytes: Bytes,
     _lease: OwnedSemaphorePermit,
+    _retained: Option<OwnedSemaphorePermit>,
 }
 impl AsRef<[u8]> for Allocation {
     fn as_ref(&self) -> &[u8] {
@@ -59,6 +73,7 @@ pub(crate) struct BodyCarrier {
     segments: Vec<Segment>,
     length: u64,
     digest: String,
+    owned_objects: Vec<String>,
 }
 
 impl BodyCarrier {
@@ -72,6 +87,7 @@ impl BodyCarrier {
         S: Stream<Item = Result<Bytes, E>> + Send,
         E: Display,
     {
+        let parent = capture.parent;
         let staging = match &capture.archive {
             Some(archive) => archive.select_staging_key(capture.staging)?,
             None => capture.staging,
@@ -83,6 +99,7 @@ impl BodyCarrier {
             segments: Vec::new(),
             length: 0,
             digest: String::new(),
+            owned_objects: Vec::new(),
         };
         let mut hash = blake3::Hasher::new();
         futures_util::pin_mut!(input);
@@ -101,24 +118,61 @@ impl BodyCarrier {
                 // Bounded owned allocations prevent a small slice from pinning
                 // an arbitrarily large input frame for the lifetime of a request.
                 let part = remaining.split_to(remaining.len().min(64 * 1024));
-                let lease = loop {
-                    if let Some(lease) = source.memory.try_reserve_ingress_bytes(part.len()) {
-                        break lease;
+                if parent.as_ref().is_some_and(|parent| parent.owns_ram(&part)) {
+                    source.segments.push(Segment::Ram(part));
+                    continue;
+                }
+                let mut retry = std::time::Duration::from_millis(100);
+                let (lease, retained) = loop {
+                    if let Some((lease, retained)) =
+                        source.memory.try_reserve_carrier_ingress(part.len())
+                    {
+                        break (lease, Some(retained));
                     }
-                    if source.offload_one().await? {
-                        continue;
+                    match source.offload_one().await {
+                        Ok(true) => continue,
+                        Ok(false) => {
+                            break (source.memory.reserve_carrier_bytes(part.len()).await?, None);
+                        }
+                        Err(_) => {
+                            // Remote failure cannot discard the sole source. If
+                            // real RAM is available retain it and continue;
+                            // otherwise stop polling input and retry this owned
+                            // prefix, without a request deadline or fake seal.
+                            if let Some(lease) = source.memory.try_reserve_ingress_bytes(part.len())
+                            {
+                                break (lease, None);
+                            }
+                            tokio::time::sleep(retry).await;
+                            retry = (retry * 2).min(std::time::Duration::from_secs(300));
+                        }
                     }
-                    break source.memory.reserve_carrier_bytes(part.len()).await?;
                 };
                 let bytes = Bytes::from_owner(Allocation {
                     bytes: Bytes::copy_from_slice(&part),
                     _lease: lease,
+                    _retained: retained,
                 });
                 source.segments.push(Segment::Ram(bytes));
             }
         }
         source.digest = hash.finalize().to_hex().to_string();
         Ok(Arc::new(source))
+    }
+
+    fn owns_ram(&self, bytes: &Bytes) -> bool {
+        let start = bytes.as_ptr() as usize;
+        let Some(end) = start.checked_add(bytes.len()) else {
+            return false;
+        };
+        self.segments.iter().any(|segment| match segment {
+            Segment::Ram(owned) => {
+                let base = owned.as_ptr() as usize;
+                base.checked_add(owned.len())
+                    .is_some_and(|limit| start >= base && end <= limit)
+            }
+            Segment::Object(_) => false,
+        })
     }
 
     async fn offload_one(&mut self) -> Result<bool, AppError> {
@@ -140,6 +194,9 @@ impl BodyCarrier {
             self.staging.canonical_prefix(),
             uuid::Uuid::now_v7()
         );
+        // Register exact ownership before any remote operation: a finish whose
+        // acknowledgement is lost must not orphan an object outside cleanup.
+        self.owned_objects.push(locator.clone());
         let mut writer = archive.start_writer(&locator).await?;
         if let Err(error) = writer.write(bytes.clone()).await {
             let _ = writer.abort().await;
@@ -222,17 +279,54 @@ impl BodyCarrier {
             .checked_add(length as u64)
             .filter(|end| *end <= self.length)
             .ok_or_else(|| AppError::storage("carrier_range_invalid"))?;
+        if length == 0 {
+            return Ok(Bytes::new());
+        }
+        let mut position = 0u64;
+        for segment in &self.segments {
+            let size = match segment {
+                Segment::Ram(bytes) => bytes.len() as u64,
+                Segment::Object(reference) => reference.size_bytes,
+            };
+            if offset >= position && end <= position + size {
+                if let Segment::Ram(bytes) = segment {
+                    return Ok(bytes.slice((offset - position) as usize..(end - position) as usize));
+                }
+            }
+            position += size;
+        }
         let lease = self.memory.reserve_carrier_bytes(length).await?;
         let mut output = BytesMut::with_capacity(length);
-        let mut position = 0u64;
-        let mut input = self.open_stream();
-        while let Some(chunk) = input.next().await {
-            let chunk = chunk?;
-            let next = position + chunk.len() as u64;
+        position = 0;
+        for segment in &self.segments {
+            let size = match segment {
+                Segment::Ram(bytes) => bytes.len() as u64,
+                Segment::Object(reference) => reference.size_bytes,
+            };
+            let next = position + size;
             if next > offset && position < end {
-                let start = offset.saturating_sub(position) as usize;
-                let stop = (end.min(next) - position) as usize;
-                output.extend_from_slice(&chunk[start..stop]);
+                let start = offset.saturating_sub(position);
+                let stop = end.min(next) - position;
+                match segment {
+                    Segment::Ram(bytes) => {
+                        output.extend_from_slice(&bytes[start as usize..stop as usize])
+                    }
+                    Segment::Object(reference) => {
+                        let archive = self
+                            .archive
+                            .as_ref()
+                            .ok_or_else(|| AppError::storage("carrier_backend_missing"))?;
+                        let mut download = archive
+                            .open_stream(&reference.object_locator, Some(start..stop))
+                            .await?
+                            .stream;
+                        while let Some(chunk) = download.next().await {
+                            let chunk = chunk
+                                .map_err(|_| AppError::storage("carrier_object_read_failed"))?;
+                            output.extend_from_slice(&chunk);
+                        }
+                    }
+                }
             }
             position = next;
             if position >= end {
@@ -245,6 +339,7 @@ impl BodyCarrier {
         Ok(Bytes::from_owner(Allocation {
             bytes: output.freeze(),
             _lease: lease,
+            _retained: None,
         }))
     }
 }
@@ -254,14 +349,7 @@ impl Drop for BodyCarrier {
         let Some(archive) = self.archive.clone() else {
             return;
         };
-        let objects: Vec<_> = self
-            .segments
-            .iter()
-            .filter_map(|segment| match segment {
-                Segment::Object(reference) => Some(reference.object_locator.clone()),
-                Segment::Ram(_) => None,
-            })
-            .collect();
+        let objects = std::mem::take(&mut self.owned_objects);
         let staging = self.staging;
         if objects.is_empty() {
             return;
@@ -282,5 +370,92 @@ impl Drop for BodyCarrier {
                 }
             });
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::archive_staging::{ArchiveStagingOwner, ArchiveStagingPurpose};
+
+    fn key() -> ArchiveStagingKey {
+        ArchiveStagingKey::new(
+            ArchiveStagingOwner::ProxyRequest(uuid::Uuid::now_v7()),
+            ArchiveStagingPurpose::Request,
+            uuid::Uuid::now_v7(),
+        )
+        .unwrap()
+    }
+
+    #[tokio::test]
+    async fn range_slice_and_stream_keep_real_allocation_after_source_drop() {
+        let memory = Arc::new(ProxyMemoryBudget::new(1024 * 1024));
+        let source = BodyCarrier::capture(
+            stream::iter([Ok::<_, std::io::Error>(Bytes::from_static(
+                b"immutable raw body",
+            ))]),
+            CarrierCapture::new(memory.clone(), None, key()),
+        )
+        .await
+        .unwrap();
+        let bytes = source.read_range(10, 3).await.unwrap();
+        assert_eq!(bytes, b"raw"[..]);
+        let mut replay = source.open_stream();
+        drop(source);
+        assert!(memory.snapshot().0 > 0);
+        assert_eq!(
+            replay.next().await.unwrap().unwrap(),
+            b"immutable raw body"[..]
+        );
+        drop(replay);
+        assert!(memory.snapshot().0 > 0); // the returned range is still an owner
+        drop(bytes);
+        assert_eq!(memory.snapshot().0, 0);
+    }
+
+    #[tokio::test]
+    async fn pressure_seals_readable_objects_without_local_files_and_replays_ranges() {
+        let memory = Arc::new(ProxyMemoryBudget::new(256 * 1024));
+        let archive = ArchiveStore::memory_for_test();
+        let body = vec![
+            Bytes::from(vec![b'a'; 65536]),
+            Bytes::from(vec![b'b'; 65536]),
+            Bytes::from(vec![b'c'; 65536]),
+        ];
+        let expected_hash = {
+            let mut hash = blake3::Hasher::new();
+            for chunk in &body {
+                hash.update(chunk);
+            }
+            hash.finalize().to_hex().to_string()
+        };
+        let source = BodyCarrier::capture(
+            stream::iter(body.into_iter().map(Ok::<_, std::io::Error>)),
+            CarrierCapture::new(memory.clone(), Some(archive), key()),
+        )
+        .await
+        .unwrap();
+        assert_eq!(source.len(), 3 * 65536);
+        assert_eq!(source.digest(), expected_hash);
+        assert!(
+            source
+                .segments
+                .iter()
+                .any(|segment| matches!(segment, Segment::Object(_)))
+        );
+        assert_eq!(
+            source.read_range(65530, 12).await.unwrap(),
+            b"aaaaaabbbbbb"[..]
+        );
+        let mut replay = source.open_stream();
+        let mut hash = blake3::Hasher::new();
+        let mut size = 0;
+        while let Some(chunk) = replay.next().await {
+            let chunk = chunk.unwrap();
+            size += chunk.len();
+            hash.update(&chunk);
+        }
+        assert_eq!(size, source.len() as usize);
+        assert_eq!(hash.finalize().to_hex().as_str(), source.digest());
     }
 }
