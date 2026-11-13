@@ -554,6 +554,30 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn derived_cross_segment_range_releases_both_alias_owners() {
+        let memory = Arc::new(ProxyMemoryBudget::new(128 * 1024));
+        let source = full_ram_source(memory.clone()).await;
+        let derived = BodyCarrier::capture(
+            source.open_stream(),
+            CarrierCapture::derived_from(&source, key()),
+        )
+        .await
+        .unwrap();
+        assert_eq!(memory.snapshot().0, 128 * 1024);
+        assert_eq!(
+            derived.read_range(65530, 12).await.unwrap(),
+            b"aaaaaabbbbbb"[..]
+        );
+        assert_eq!(
+            source.read_range(65530, 12).await.unwrap(),
+            b"aaaaaabbbbbb"[..]
+        );
+        drop(derived);
+        drop(source);
+        assert_eq!(memory.snapshot().0, 0);
+    }
+
+    #[tokio::test]
     async fn object_replay_offloads_other_sealed_ram_before_waiting_for_credit() {
         let memory = Arc::new(ProxyMemoryBudget::new(128 * 1024));
         let source = full_ram_source(memory.clone()).await;
