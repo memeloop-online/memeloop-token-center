@@ -257,8 +257,15 @@ mod tests {
                 .await
                 .unwrap()
                 .unwrap_err();
-        let HistoryError::Sql(error) = error else {
-            panic!("activation must fail on the still-live off writer");
+        let error = match error {
+            HistoryError::Sql(error) => error,
+            HistoryError::Verification(reason) => {
+                panic!("activation catalog rejected before writer barrier: {reason}")
+            }
+            HistoryError::Changed => {
+                panic!("activation mode or maintenance ownership changed before writer barrier")
+            }
+            _ => panic!("activation returned a non-SQL failure before writer barrier"),
         };
         assert_eq!(
             error.as_database_error().unwrap().code().as_deref(),
