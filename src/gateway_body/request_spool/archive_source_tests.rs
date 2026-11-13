@@ -461,16 +461,33 @@ async fn qualified_source_receipt_contract(database_url: &str) {
     };
     assert!(source.upload_outcome().await);
     database.drain_gateway_persistence_for_test().await;
-    let stored = database
-        .archive_staging_attempt(request_id)
-        .await
-        .unwrap()
-        .unwrap();
+    let pool = sqlx::AnyPool::connect(database_url).await.unwrap();
+    // Upload completion precedes the independent source receipt handoff. The
+    // gateway task drain does not drain that worker; wait for its real commit.
+    let stored = tokio::time::timeout(Duration::from_secs(5), async {
+        loop {
+            let stage = database.archive_staging_attempt(request_id).await.unwrap();
+            let state: Option<String> = sqlx::query_scalar(
+                "SELECT state FROM request_archive_spools WHERE request_id = $1",
+            )
+            .bind(request_id.to_string())
+            .fetch_optional(&pool)
+            .await
+            .unwrap();
+            if let Some(stage) = stage {
+                if state.as_deref() == Some("bound") {
+                    break stage;
+                }
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("source handoff must commit the bound receipt and staging identity");
     assert_eq!(
         stored.key, typed,
         "the durable cleanup identity includes the backend"
     );
-    let pool = sqlx::AnyPool::connect(database_url).await.unwrap();
     let bound: String = sqlx::query_scalar(
         "SELECT bound_locator FROM request_archive_spools WHERE request_id = $1",
     )
