@@ -668,15 +668,7 @@ mod tests {
     use super::*;
     use crate::request_history::{HistoryIdentity, HistorySnapshot};
 
-    #[tokio::test]
-    async fn request_history_compact_identity_keeps_head_after_old_ack_and_rejects_scope_change() {
-        let directory = tempfile::tempdir().unwrap();
-        let database = Database::connect(&format!(
-            "sqlite://{}?mode=rwc",
-            directory.path().join("identity.sqlite").display()
-        ))
-        .await
-        .unwrap();
+    async fn compact_identity_receipt_contract(database: &Database) {
         database.migrate().await.unwrap();
         let identity = HistoryIdentity {
             source: "event".into(),
@@ -741,6 +733,42 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(database.history_pending_count().await.unwrap(), 0);
+    }
+
+    #[tokio::test]
+    async fn request_history_compact_identity_keeps_head_after_old_ack_and_rejects_scope_change() {
+        let directory = tempfile::tempdir().unwrap();
+        let database = Database::connect(&format!(
+            "sqlite://{}?mode=rwc",
+            directory.path().join("identity.sqlite").display()
+        ))
+        .await
+        .unwrap();
+        compact_identity_receipt_contract(&database).await;
+    }
+
+    #[tokio::test]
+    #[ignore = "existing CI supplies the real PostgreSQL service"]
+    async fn request_history_real_services_acceptance_compact_identity_receipt() {
+        let postgres = std::env::var("MTC_TEST_POSTGRES_URL").expect("PostgreSQL acceptance URL");
+        let admin = sqlx::PgPool::connect(&postgres).await.unwrap();
+        let schema = format!("history_identity_{}", Uuid::now_v7().simple());
+        sqlx::query(sqlx::AssertSqlSafe(format!("CREATE SCHEMA {schema}")))
+            .execute(&admin)
+            .await
+            .unwrap();
+        let mut isolated = url::Url::parse(&postgres).unwrap();
+        isolated
+            .query_pairs_mut()
+            .append_pair("options", &format!("-csearch_path={schema}"));
+        let database = Database::connect(isolated.as_str()).await.unwrap();
+        compact_identity_receipt_contract(&database).await;
+        database.close().await;
+        sqlx::query(sqlx::AssertSqlSafe(format!("DROP SCHEMA {schema} CASCADE")))
+            .execute(&admin)
+            .await
+            .unwrap();
+        admin.close().await;
     }
 
     #[tokio::test]
