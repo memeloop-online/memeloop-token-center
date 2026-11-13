@@ -219,6 +219,19 @@ impl ProxyMemoryReservation {
         })
     }
 
+    pub(crate) async fn reserve_carrier_bytes(
+        &self,
+        bytes: usize,
+    ) -> Result<OwnedSemaphorePermit, crate::error::AppError> {
+        let units = u32::try_from(bytes.div_ceil(UNIT_BYTES))
+            .map_err(|_| crate::error::AppError::internal("carrier_allocation_overflow"))?;
+        self.permits
+            .clone()
+            .acquire_many_owned(units)
+            .await
+            .map_err(|_| crate::error::AppError::internal("carrier_budget_closed"))
+    }
+
     pub(crate) fn try_reserve_ingress_bytes(&self, bytes: usize) -> Option<OwnedSemaphorePermit> {
         let units = u32::try_from(bytes.div_ceil(UNIT_BYTES)).ok()?;
         self.permits.clone().try_acquire_many_owned(units).ok()
