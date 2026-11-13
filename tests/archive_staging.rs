@@ -477,7 +477,7 @@ async fn cleaned_requires_two_separate_empty_observations_across_stability_windo
         .await
         .unwrap()
     {
-        ArchiveStagingReferenceProof::Unreferenced(proof) => proof,
+        ArchiveStagingReferenceProof::Unreferenced(proof) => *proof,
         ArchiveStagingReferenceProof::Protected { .. } => panic!("unexpected reference"),
     };
     assert!(matches!(
@@ -514,7 +514,7 @@ async fn cleaned_requires_two_separate_empty_observations_across_stability_windo
         .await
         .unwrap()
     {
-        ArchiveStagingReferenceProof::Unreferenced(proof) => proof,
+        ArchiveStagingReferenceProof::Unreferenced(proof) => *proof,
         ArchiveStagingReferenceProof::Protected { .. } => panic!("unexpected reference"),
     };
     assert_eq!(
