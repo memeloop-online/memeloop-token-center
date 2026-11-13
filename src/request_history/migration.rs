@@ -15,6 +15,22 @@ use crate::{
 #[derive(Debug, Subcommand)]
 pub enum HistoryCommand {
     Start,
+    /// Verify a consistent source baseline; this does not authorize cutover.
+    BaselineSource {
+        #[arg(long)]
+        owner: uuid::Uuid,
+        #[arg(long, default_value_t = 64, value_parser = clap::value_parser!(i64).range(1..=64))]
+        page_size: i64,
+        #[arg(long, default_value_t = 300, value_parser = clap::value_parser!(u64).range(1..=3600))]
+        max_seconds: u64,
+    },
+    /// Abort a lost source snapshot and release only its exact delivery fence.
+    AbortBaseline {
+        #[arg(long)]
+        owner: uuid::Uuid,
+        #[arg(long)]
+        epoch: i64,
+    },
     /// Cap subsequent delivery revisions; capture continues, quiescence is not proved.
     FenceDelivery {
         #[arg(long)]
@@ -65,6 +81,12 @@ pub async fn command(config: &Config, command: HistoryCommand) -> Result<Value, 
         }));
     }
     match &command {
+        HistoryCommand::AbortBaseline { owner, epoch } => {
+            database
+                .history_abort_source_snapshot(*owner, *epoch)
+                .await?;
+            return database.history_delivery_status().await;
+        }
         HistoryCommand::FenceDelivery { owner } => {
             return database.history_fence_delivery(*owner).await;
         }
@@ -77,6 +99,7 @@ pub async fn command(config: &Config, command: HistoryCommand) -> Result<Value, 
     let database = if matches!(
         &command,
         HistoryCommand::Backfill { .. }
+            | HistoryCommand::BaselineSource { .. }
             | HistoryCommand::Drain { .. }
             | HistoryCommand::Verify
             | HistoryCommand::Switch
@@ -104,6 +127,47 @@ pub async fn command(config: &Config, command: HistoryCommand) -> Result<Value, 
     )?
     .ok_or(HistoryError::Invalid("MTC_REQUEST_HISTORY_URL is required"))?;
     match command {
+        HistoryCommand::BaselineSource {
+            owner,
+            page_size,
+            max_seconds,
+        } => {
+            let reader = ClickHouse::reader_from_env(
+                database
+                    .http_clients
+                    .handle(crate::http_settings::HttpPurpose::General),
+            )?
+            .ok_or(HistoryError::Invalid("request history reader is required"))?;
+            let source_database = database
+                .clone()
+                .with_auxiliary_pool_max_connections(1)
+                .independent_persistence_pool();
+            let mut source = database
+                .history_begin_source_snapshot(&source_database, owner)
+                .await?;
+            let epoch = source.receipt["epoch"]
+                .as_i64()
+                .ok_or(HistoryError::Mismatch)?;
+            let result = tokio::time::timeout(std::time::Duration::from_secs(max_seconds), async {
+                while source
+                    .verify_next_page(&database, &client, &reader, page_size)
+                    .await?
+                    != 0
+                {}
+                source.finish(&database).await
+            })
+            .await
+            .unwrap_or(Err(HistoryError::Changed));
+            match result {
+                Ok(receipt) => return Ok(receipt),
+                Err(error) => {
+                    // No cursor is resumed with a replacement RR snapshot.
+                    // All queued delta survives this exact-epoch release.
+                    database.history_abort_source_snapshot(owner, epoch).await?;
+                    return Err(error);
+                }
+            }
+        }
         HistoryCommand::Start => {
             client.initialize().await?;
             database.history_start().await?;
@@ -149,7 +213,8 @@ pub async fn command(config: &Config, command: HistoryCommand) -> Result<Value, 
         HistoryCommand::Rollback
         | HistoryCommand::Status
         | HistoryCommand::FenceDelivery { .. }
-        | HistoryCommand::ResumeDelivery { .. } => unreachable!(),
+        | HistoryCommand::ResumeDelivery { .. }
+        | HistoryCommand::AbortBaseline { .. } => unreachable!(),
     }
     Ok(
         json!({"mode": database.history_mode().await?, "pending": database.history_pending_count().await?}),
