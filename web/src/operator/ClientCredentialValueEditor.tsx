@@ -91,7 +91,7 @@ export function ClientCredentialValueEditor({ value, token, tenant, disabled, on
     {saved && <p role="status">{t('credentials.valueSaved')}</p>}
     <div className="row-actions">
       <Button type="button" appearance="primary" disabled={!available || busy || !visible || !draft || draft === baseline} onClick={() => void save()}>{t('credentials.saveValue')}</Button>
-      {visible && baseline && <CopyButton value={baseline} fluent />}
+      {visible && draft && <CopyButton value={draft} fluent />}
     </div>
   </section>;
 }
