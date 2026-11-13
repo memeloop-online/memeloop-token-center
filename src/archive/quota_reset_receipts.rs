@@ -36,9 +36,16 @@ impl ArchiveStore {
             Err(error) => Err(error.into()),
         }
     }
-    pub(crate) async fn quota_reset_receipts(&self) -> Result<Vec<String>, AppError> {
+    pub(crate) async fn quota_reset_receipts(
+        &self,
+        after: Option<&str>,
+    ) -> Result<Vec<String>, AppError> {
         let prefix = object_store::path::Path::from(PREFIX);
-        let mut objects = self.inner.list(Some(&prefix));
+        let offset = after.map(object_store::path::Path::from);
+        let mut objects = match offset.as_ref() {
+            Some(offset) => self.inner.list_with_offset(Some(&prefix), offset),
+            None => self.inner.list(Some(&prefix)),
+        };
         let mut keys = Vec::new();
         while let Some(object) = objects.next().await {
             keys.push(object?.location.to_string());

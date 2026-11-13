@@ -948,6 +948,152 @@ mod tests {
     };
 
     #[tokio::test]
+    async fn accepted_receipt_survives_database_outage_without_supplier_replay() {
+        let supplier = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/consume"))
+            .respond_with(ResponseTemplate::new(200))
+            .expect(1)
+            .mount(&supplier)
+            .await;
+        let directory = tempfile::tempdir().unwrap();
+        let state = AppState::initialize(crate::config::Config::for_test(format!(
+            "sqlite://{}?mode=rwc",
+            directory.path().join("reset-recovery.db").display()
+        )))
+        .await
+        .unwrap();
+        let tenant = "reset-recovery-fixture";
+        let credential = UpstreamCredential::OAuth {
+            access_token: "fixture-only".into(),
+            refresh_token: None,
+            expires_at: None,
+            header: "authorization".into(),
+            prefix: "Bearer ".into(),
+            adapter_state: Some(json!({
+                "schema": "openai-codex-oauth-v1", "account_id": "fixture-account"
+            })),
+            proxy_url: None,
+            proxy_network_scope: None,
+        };
+        let account = state
+            .db
+            .create_upstream_account(
+                crate::db::CreateUpstreamAccountInput {
+                    tenant_external_id: tenant.into(),
+                    name: "reset recovery".into(),
+                    driver: "openai-codex".into(),
+                    config: json!({
+                        "base_url": "https://chatgpt.com",
+                        "reset_test_supplier_url": format!("{}/", supplier.uri())
+                    }),
+                    credential: credential.clone(),
+                    oauth_session_id: None,
+                    oauth_driver: None,
+                    oauth_refresh_url: None,
+                },
+                state.config.key_pepper.as_bytes(),
+            )
+            .await
+            .unwrap();
+        let operation = state
+            .db
+            .prepare_quota_reset(PrepareQuotaReset {
+                id: Uuid::now_v7(),
+                account: account.clone(),
+                actor: "fixture".into(),
+                confirmation_hash: "fixture".into(),
+                prepare_idempotency_hash: "fixture".into(),
+                available: 2,
+                applicable: 2,
+                observed_at: unix_millis() - 1_000,
+            })
+            .await
+            .unwrap()
+            .operation;
+        let owner = Uuid::now_v7();
+        state
+            .db
+            .claim_quota_reset_owned(
+                &account,
+                &operation.id,
+                "fixture",
+                "fixture",
+                "fixture",
+                None,
+                Some(owner),
+            )
+            .await
+            .unwrap();
+        let client = crate::build_no_retry_http_client(None, &[]).unwrap();
+        dispatch_once(
+            &client,
+            &credential,
+            "fixture-account".into(),
+            &format!("{}/consume", supplier.uri()),
+            "fixture-redeem",
+        )
+        .await
+        .unwrap();
+        let receipt = super::super::reset_receipt::Receipt {
+            version: 1,
+            tenant: account.tenant_id,
+            account: account.id,
+            operation: Uuid::parse_str(&operation.id).unwrap(),
+            owner,
+            accepted: true,
+            error: None,
+        };
+        let url = format!(
+            "sqlite://{}?mode=rwc",
+            directory.path().join("reset-recovery.db").display()
+        );
+        let pool = sqlx::AnyPool::connect(&url).await.unwrap();
+        sqlx::query("ALTER TABLE upstream_quota_reset_operations RENAME TO outage_operations")
+            .execute(&pool)
+            .await
+            .unwrap();
+        assert!(receipt.finish(&state.db).await.is_err());
+        receipt.publish(&state.archive).await.unwrap();
+        // A lost publication ACK is safe: immutable identical publication is idempotent.
+        receipt.publish(&state.archive).await.unwrap();
+        sqlx::query("ALTER TABLE outage_operations RENAME TO upstream_quota_reset_operations")
+            .execute(&pool)
+            .await
+            .unwrap();
+        // A separate application instance discovers the receipt from the shared store.
+        // The in-memory store is a fixture, not a production cross-Pod durability claim.
+        let mut recovering = AppState::initialize(crate::config::Config::for_test(url))
+            .await
+            .unwrap();
+        recovering.archive = state.archive.clone();
+        super::super::reset_receipt::recover(&recovering).await;
+        super::super::reset_receipt::recover(&recovering).await;
+        assert_eq!(
+            recovering
+                .db
+                .quota_reset_operation(
+                    &account.tenant_id.to_string(),
+                    &account.id.to_string(),
+                    &operation.id
+                )
+                .await
+                .unwrap()
+                .state,
+            "accepted"
+        );
+        assert!(
+            recovering
+                .archive
+                .quota_reset_receipts(None)
+                .await
+                .unwrap()
+                .is_empty()
+        );
+        assert!(receipt.finish(&recovering.db).await.unwrap());
+        supplier.verify().await;
+    }
+    #[tokio::test]
     async fn explicit_unknown_recovery_only_reads_credits_and_never_consumes() {
         let supplier = MockServer::start().await;
         Mock::given(method("GET"))

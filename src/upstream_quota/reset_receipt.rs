@@ -72,12 +72,21 @@ impl Receipt {
     }
 }
 pub(crate) async fn recover(state: &crate::AppState) {
-    let keys = match state.archive.quota_reset_receipts().await {
+    // Cursor is only a scan optimization: immutable remote objects remain the
+    // recovery authority, and every new process starts scanning from the prefix.
+    static CURSOR: std::sync::Mutex<Option<String>> = std::sync::Mutex::new(None);
+    let after = CURSOR.lock().unwrap_or_else(|e| e.into_inner()).clone();
+    let keys = match state.archive.quota_reset_receipts(after.as_deref()).await {
         Ok(keys) => keys,
         Err(_) => {
             tracing::warn!("quota reset receipt listing deferred");
             return;
         }
+    };
+    *CURSOR.lock().unwrap_or_else(|e| e.into_inner()) = if keys.len() == 100 {
+        keys.last().cloned()
+    } else {
+        None
     };
     for key in keys {
         let result = async {
