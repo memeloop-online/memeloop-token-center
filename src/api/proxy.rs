@@ -1207,6 +1207,7 @@ async fn proxy_with_cancellation_guard(
         let replay = request_source::spool_normalized(
             std::mem::take(&mut request_json),
             std::path::PathBuf::from(&state.config.responses_request_spool_path),
+            &memory,
         )
         .await?;
         memory.release_unretained_json();

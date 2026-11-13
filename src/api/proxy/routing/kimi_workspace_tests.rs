@@ -71,10 +71,13 @@ async fn native_kimi_chat_uses_its_prepaid_workspace_under_budget_contention() {
     let shape = planned.native_chat_reentry_shape().unwrap().unwrap();
     let route = planned.route.clone();
     drop(planned);
-    let replay =
-        super::super::request_source::spool_normalized(request, directory.path().to_owned())
-            .await
-            .unwrap();
+    let replay = super::super::request_source::spool_normalized(
+        request,
+        directory.path().to_owned(),
+        &memory,
+    )
+    .await
+    .unwrap();
     memory.release_unretained_json();
     let mut admission = Box::pin(super::super::request_source::parse_with_shape(
         replay.clone(),

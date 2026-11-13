@@ -104,6 +104,7 @@ pub(super) async fn parse_with_shape(
 pub(super) async fn spool_normalized(
     value: Value,
     directory: std::path::PathBuf,
+    memory: &Arc<ProxyMemoryReservation>,
 ) -> Result<Arc<RequestSpool>, AppError> {
     let encoded =
         serde_json::to_vec(&value).map_err(|_| AppError::internal("request_replay_serialize"))?;
@@ -114,7 +115,7 @@ pub(super) async fn spool_normalized(
             axum::body::Body::from(encoded),
             length,
             Some(length),
-            None,
+            Some(memory),
             0,
             None,
         )
