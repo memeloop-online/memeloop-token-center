@@ -34,8 +34,9 @@ test('streaming review joins split UTF-8 content and terminal usage without retu
     controller.enqueue(bytes.slice(position, position + 1));
     position++;
   } });
-  const result = await review({ baseUrl: 'https://gateway.invalid/v1', apiKey: 'test-key', model: 'k3.1-pro', task: 'Review.' }, async () => new Response(body, { headers: { 'content-type': 'text/event-stream' } }));
+  const result = await review({ baseUrl: 'https://gateway.invalid/v1', apiKey: 'test-key', model: 'k3.1-pro', task: 'Review.' }, async () => new Response(body, { headers: { 'content-type': 'text/event-stream', 'x-mtc-request-id': 'stream-request' } }));
   assert.equal(result.review, '中文审查完成');
+  assert.equal(result.request_id, 'stream-request');
   assert.equal(result.finish_reason, 'stop');
   assert.equal(result.stream_complete, true);
   assert.deepEqual(result.usage, { completion_tokens: 12000 });
@@ -54,10 +55,11 @@ test('provider failure is returned without a retry or exposing a credential in i
   let calls = 0;
   const result = await review({ baseUrl: 'https://gateway.invalid/v1', apiKey: 'test-key', model: 'k3.1-pro', task: 'Review.' }, async () => {
     calls++;
-    return new Response(JSON.stringify({ error: { type: 'upstream_error', message: 'rejected test-key' } }), { status: 400 });
+    return new Response(JSON.stringify({ request_id: 'body-request', error: { type: 'upstream_error', message: 'rejected test-key' } }), { status: 400, headers: { 'x-mtc-request-id': 'gateway-request', 'x-request-id': 'provider-request' } });
   });
   assert.equal(calls, 1);
   assert.equal(result.status, 400);
+  assert.equal(result.request_id, 'gateway-request');
   assert.equal(result.review, undefined);
   assert.equal(result.error?.message, 'rejected [redacted]');
 });

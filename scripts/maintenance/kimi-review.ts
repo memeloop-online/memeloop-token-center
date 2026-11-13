@@ -88,7 +88,7 @@ export async function review(options: ReviewOptions, send: typeof fetch = fetch)
   // result. Do not substitute reasoning, opaque content or a success summary.
   return {
     status: response.status,
-    request_id: response.headers.get('x-request-id') ?? data.request_id,
+    request_id: response.headers.get('x-mtc-request-id') ?? response.headers.get('x-request-id') ?? data.request_id,
     model: data.model,
     usage: data.usage,
     finish_reason: data.choices?.[0]?.finish_reason,
