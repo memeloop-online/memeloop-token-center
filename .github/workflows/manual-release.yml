@@ -111,11 +111,6 @@ jobs:
         with:
           ref: ${{ needs.build-release-input.outputs.source }}
           persist-credentials: false
-      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
-        with:
-          ref: ${{ github.sha }}
-          path: .release-tools
-          persist-credentials: false
       - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
         with:
           node-version: 24.18.0
@@ -130,6 +125,11 @@ jobs:
         env:
           RELEASE_REGISTRY: ghcr.io/${{ github.repository_owner }}
         run: node scripts/ci/validate-release-inputs.ts "$RELEASE_REGISTRY" "$RELEASE_SOURCE_SHA" prefixed
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+        with:
+          ref: ${{ github.sha }}
+          path: .release-tools
+          persist-credentials: false
       - name: Install checksum-pinned crane registry client
         run: |
           archive="$RUNNER_TEMP/go-containerregistry_Linux_x86_64.tar.gz"
