@@ -46,6 +46,7 @@ impl HttpSnapshot {
         }
     }
 
+    #[cfg(test)]
     pub(crate) fn builder(&self, purpose: HttpPurpose) -> reqwest::ClientBuilder {
         self.builder_with_connect_read_timeouts(purpose, None, None)
     }

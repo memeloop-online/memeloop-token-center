@@ -15,6 +15,10 @@ use crate::{
 #[derive(Debug, Subcommand)]
 pub enum HistoryCommand {
     Start,
+    /// Install only free source tables while capture remains off; retry pending tables later.
+    Bootstrap,
+    /// Validate every installed definition, then atomically enable capture without DDL.
+    Activate,
     /// Re-export every retained source after upgrading the read-model contract.
     Refresh,
     Backfill {
@@ -62,7 +66,10 @@ pub async fn command(config: &Config, command: HistoryCommand) -> Result<Value, 
     database.refresh_http_settings().await?;
     database.start_http_settings_refresh();
     let role = match command {
-        HistoryCommand::Start | HistoryCommand::Refresh => "ADMIN",
+        HistoryCommand::Start
+        | HistoryCommand::Bootstrap
+        | HistoryCommand::Activate
+        | HistoryCommand::Refresh => "ADMIN",
         HistoryCommand::Verify | HistoryCommand::Switch => "READER",
         _ => "WRITER",
     };
@@ -77,6 +84,14 @@ pub async fn command(config: &Config, command: HistoryCommand) -> Result<Value, 
         HistoryCommand::Start => {
             client.initialize().await?;
             database.history_start().await?;
+        }
+        HistoryCommand::Bootstrap => {
+            client.initialize().await?;
+            return database.history_bootstrap_capture().await;
+        }
+        HistoryCommand::Activate => {
+            client.initialize().await?;
+            database.history_activate_capture().await?;
         }
         HistoryCommand::Refresh => {
             client.initialize().await?;

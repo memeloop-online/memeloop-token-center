@@ -36,3 +36,25 @@ Before use, independently review the protocol and run its regressions through
 GitHub Actions. A schema export alone does not prove model/provider acceptance
 or a completed child task. Current desktop version must not be inferred from
 this standalone CLI binary or the older locally audited 0.154 source.
+
+
+For a persistent **new isolated parent**, use `--serve` and a new private
+`MTC_TASK_ARCHIVE` filename (append-only NDJSON rather than the one-shot JSON):
+
+```console
+node scripts/maintenance/plaintext-host-bridge.ts --serve
+{"id":"review-1","task":"Review the specified isolated workspace change."}
+{"id":"review-2","task":"Check the follow-up change and report actual findings."}
+```
+
+Keep stdin open to submit subsequent tasks. The parent thread is reused;
+each delegation starts a distinct plaintext child. Tasks execute sequentially,
+and stdout contains one redacted JSON result per task. Receipt events correlate
+task, thread, turn and call IDs without rewriting prior task bodies. Duplicate
+IDs are rejected without execution. EOF drains the active task and closes the
+owned app-server. SIGINT/SIGTERM interrupts its known active turns and closes
+that process; uncertain transport outcomes stop the session and are never
+automatically replayed. Use a fresh receipt filename for a new session.
+This entry does not attach tools to the current desktop parent or repair its
+built-in opaque collaboration producer. All existing sandbox and authorized
+provider boundaries remain in effect.

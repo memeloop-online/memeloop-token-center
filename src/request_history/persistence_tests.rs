@@ -257,6 +257,16 @@ async fn request_history_real_services_acceptance() {
     let page = client.list(&query).await.unwrap();
     assert_eq!(page.requests.len(), 1);
     assert!(page.requests[0]["credential_identity"].is_null());
+    assert_eq!(page.requests[0]["archive_state"], serde_json::json!("gap"));
+    let stored = client.snapshots(&query).await.unwrap();
+    assert_eq!(
+        stored[0].read_model["archive"]["view"]["archive_state"],
+        serde_json::json!("gap")
+    );
+    assert_eq!(
+        stored[0].read_model["archive"]["request_archive_state"],
+        serde_json::json!("pending")
+    );
     let stats = client.statistics(&query).await.unwrap();
     assert_eq!(stats.summary.total_requests, 1);
     assert_eq!(stats.summary.successful_requests, 1);
@@ -286,6 +296,48 @@ async fn request_history_real_services_acceptance() {
     crate::request_history::migration::drain(&database, &client, 1)
         .await
         .unwrap();
+    // Report field paths only, never historical values or credentials.
+    fn differing_paths(left: &Value, right: &Value, path: &str, output: &mut Vec<String>) {
+        if left == right {
+            return;
+        }
+        match (left, right) {
+            (Value::Object(left), Value::Object(right)) => {
+                let keys = left
+                    .keys()
+                    .chain(right.keys())
+                    .collect::<std::collections::BTreeSet<_>>();
+                for key in keys {
+                    match (left.get(key), right.get(key)) {
+                        (Some(left), Some(right)) => {
+                            differing_paths(left, right, &format!("{path}/{key}"), output)
+                        }
+                        _ => output.push(format!("{path}/{key}")),
+                    }
+                }
+            }
+            _ => output.push(path.to_owned()),
+        }
+    }
+    for actual in client.snapshots(&query).await.unwrap() {
+        let expected = database
+            .history_snapshot(actual.identity.clone(), actual.revision)
+            .await
+            .unwrap();
+        let mut paths = Vec::new();
+        differing_paths(
+            &serde_json::to_value(expected).unwrap(),
+            &serde_json::to_value(&actual).unwrap(),
+            "",
+            &mut paths,
+        );
+        assert!(
+            paths.is_empty(),
+            "same-revision canonical mismatch source={} revision={} paths={paths:?}",
+            actual.identity.source,
+            actual.revision
+        );
+    }
     let report = crate::request_history::migration::verify(&database, &client)
         .await
         .unwrap();
@@ -1296,12 +1348,20 @@ async fn request_history_real_services_acceptance_event_original_survives_ack_an
         serde_json::to_value(&expected).unwrap(),
         serde_json::to_value(&snapshot).unwrap()
     );
+    reqwest::Client::new()
+        .post(&endpoint)
+        .body(format!("CREATE DATABASE {schema}"))
+        .send()
+        .await
+        .unwrap()
+        .error_for_status()
+        .unwrap();
     let client = ClickHouse::new(
         database
             .http_clients
             .handle(crate::http_settings::HttpPurpose::General),
         &endpoint,
-        "default".into(),
+        schema.clone(),
         "default".into(),
         String::new(),
     )
@@ -1362,6 +1422,14 @@ async fn request_history_real_services_acceptance_event_original_survives_ack_an
     assert_eq!(restored["input_tokens"], 0);
     assert_eq!(restored["cost_micros"], 7);
     database.close().await;
+    reqwest::Client::new()
+        .post(&endpoint)
+        .body(format!("DROP DATABASE {schema}"))
+        .send()
+        .await
+        .unwrap()
+        .error_for_status()
+        .unwrap();
     sqlx::query(sqlx::AssertSqlSafe(format!("DROP SCHEMA {schema} CASCADE")))
         .execute(&admin)
         .await

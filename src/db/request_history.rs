@@ -1,3 +1,4 @@
+mod bootstrap;
 use super::*;
 
 const PENDING_COUNT_SQL: &str = "SELECT (SELECT COUNT(*) FROM request_history_export) + (SELECT COUNT(*) FROM request_history_immutable_outbox i WHERE NOT EXISTS (SELECT 1 FROM request_history_export e WHERE e.revision=i.revision))";
@@ -6,6 +7,15 @@ use crate::request_history::{
 };
 
 const COLUMNS: &str = "source, request_id, tenant_id, key_id, created_at";
+
+struct CaptureDefinition {
+    table: &'static str,
+    event: &'static str,
+    name: String,
+    body: String,
+    manifest: String,
+    sql: String,
+}
 
 impl Database {
     /// A selected ClickHouse reader fails closed if its endpoint is missing.
@@ -158,8 +168,7 @@ impl Database {
         Ok(directory)
     }
 
-    pub async fn history_start(&self) -> Result<(), HistoryError> {
-        let mut transaction = self.pool.begin().await?;
+    fn history_capture_definitions(&self) -> Result<Vec<CaptureDefinition>, HistoryError> {
         let sources = [
             ("request_events", Some(("event", "event_id", "event_at"))),
             ("request_records", Some(("native", "id", "created_at"))),
@@ -185,21 +194,7 @@ impl Database {
             ("principals", None),
             ("tenants", None),
         ];
-        if matches!(self.backend, DatabaseBackend::PostgreSql) {
-            // Acquire the complete static source-table set before any DDL.
-            // NOWAIT rolls back immediately if a live writer owns a conflicting
-            // lock, rather than reversing its records/events lock order.
-            let tables = sources
-                .iter()
-                .map(|(table, _)| *table)
-                .collect::<Vec<_>>()
-                .join(", ");
-            sqlx::raw_sql(sqlx::AssertSqlSafe(format!(
-                "LOCK TABLE {tables} IN SHARE ROW EXCLUSIVE MODE NOWAIT"
-            )))
-            .execute(&mut *transaction)
-            .await?;
-        }
+        let mut definitions = Vec::new();
         for (table, identity) in sources {
             for event in ["INSERT", "UPDATE", "DELETE"] {
                 let record = if event == "DELETE" { "OLD" } else { "NEW" };
@@ -286,20 +281,58 @@ impl Database {
                     String::new()
                 };
                 let name = format!("history_{table}_{}", event.to_lowercase());
+                let body = format!(
+                    "BEGIN PERFORM id FROM request_history_state WHERE id = 1 FOR SHARE; IF (SELECT mode FROM request_history_state WHERE id=1)='off' THEN RETURN NULL; END IF; {identity_guard} {enqueue} RETURN NULL; END"
+                );
+                let manifest = format!(
+                    "mtc-history-bootstrap-v1-{}",
+                    crate::request_history::canonical_hash(&(1, table, event, &body))?
+                );
                 let sql = match self.backend {
                     DatabaseBackend::PostgreSql => format!(
-                        "CREATE OR REPLACE FUNCTION {name}() RETURNS trigger LANGUAGE plpgsql AS $history$ BEGIN PERFORM id FROM request_history_state WHERE id = 1 FOR SHARE; {identity_guard} {enqueue} RETURN NULL; END $history$;
+                        "CREATE OR REPLACE FUNCTION {name}() RETURNS trigger LANGUAGE plpgsql VOLATILE SECURITY INVOKER AS $history${body}$history$;
                          DROP TRIGGER IF EXISTS {name} ON {table};
-                         CREATE TRIGGER {name} AFTER {event} ON {table} FOR EACH ROW EXECUTE FUNCTION {name}();"
+                         CREATE TRIGGER {name} AFTER {event} ON {table} FOR EACH ROW EXECUTE FUNCTION {name}();
+                         ALTER FUNCTION {name}() RESET ALL;
+                         COMMENT ON FUNCTION {name}() IS '{manifest}';"
                     ),
                     DatabaseBackend::Sqlite => format!(
                         "DROP TRIGGER IF EXISTS {name}; CREATE TRIGGER {name} AFTER {event} ON {table} BEGIN {identity_guard} {enqueue} END;"
                     ),
                 };
-                sqlx::raw_sql(sqlx::AssertSqlSafe(sql))
-                    .execute(&mut *transaction)
-                    .await?;
+                definitions.push(CaptureDefinition {
+                    table,
+                    event,
+                    name,
+                    body,
+                    manifest,
+                    sql,
+                });
             }
+        }
+        Ok(definitions)
+    }
+
+    pub async fn history_start(&self) -> Result<(), HistoryError> {
+        let definitions = self.history_capture_definitions()?;
+        let mut transaction = self.pool.begin().await?;
+        if matches!(self.backend, DatabaseBackend::PostgreSql) {
+            let tables = definitions
+                .chunks(3)
+                .map(|group| group[0].table)
+                .collect::<Vec<_>>()
+                .join(", ");
+            sqlx::raw_sql(sqlx::AssertSqlSafe(format!(
+                "LOCK TABLE {tables} IN SHARE ROW EXCLUSIVE MODE NOWAIT"
+            )))
+            .execute(&mut *transaction)
+            .await?;
+            Self::history_bootstrap_maintenance_lock(&mut transaction).await?;
+        }
+        for definition in definitions {
+            sqlx::raw_sql(sqlx::AssertSqlSafe(definition.sql))
+                .execute(&mut *transaction)
+                .await?;
         }
         sqlx::query(
             "UPDATE request_history_state SET mode = 'shadow' WHERE id = 1 AND mode = 'off'",

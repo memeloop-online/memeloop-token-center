@@ -47,3 +47,8 @@
 .quota-summary-provenance { color: var(--colorNeutralForeground2, #a6bac0); font-size: var(--fontSizeBase200, 12px); }
 
 .quota-window-display-choice { display: flex; flex-wrap: wrap; align-items: center; gap: 8px; margin-block: 12px; }
+
+/* Supplier window labels may be wider than a narrow account viewport. */
+.quota-window-display-choice { min-width: 0; max-width: 100%; }
+.quota-window-display-choice .fui-Select { min-width: 0; max-width: 100%; }
+.quota-window-display-choice .fui-Select__select { min-width: 0; max-width: 100%; }

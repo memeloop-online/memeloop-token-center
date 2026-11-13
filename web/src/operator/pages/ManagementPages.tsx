@@ -2,7 +2,7 @@ import { HealthProbeSettings } from '../HealthProbeSettings';
 import { useConfirmDialog } from '../../useConfirmDialog';
 import RjsfForm, { type FormProps } from '@rjsf/core/lib/components/Form.js';
 import type { RJSFSchema } from '@rjsf/utils';
-import { useEffect, useId, useLayoutEffect, useMemo, useRef, useState, type FormEvent, type ReactNode } from 'react';
+import { useCallback, useEffect, useId, useLayoutEffect, useMemo, useRef, useState, type FormEvent, type ReactNode } from 'react';
 import { ApiError, api, apiRead } from '../../api';
 import { CopyButton } from '../../CopyButton';
 import { formatCurrency, formatNumber, formatPercent } from '../../format';
@@ -227,6 +227,11 @@ function UpstreamProviders({ renderResetSettings, token, tenant, writeTenant = t
   const [providerAuthorizationLocked, setProviderAuthorizationLocked] = useState(false);
   const [routeCacheRevisions, setRouteCacheRevisions] = useState<Record<string, number>>({});
   const [proxyEditorOpen, setProxyEditorOpen] = useState(false);
+  const proxyEditing = useRef(false);
+  const updateProxyEditing = useCallback((editing: boolean) => {
+    proxyEditing.current = editing;
+    setProxyEditorOpen(editing);
+  }, []);
   const [providerEditDraft, setProviderEditDraft] = useState<Record<string, unknown>>();
   const [notesDirty, setNotesDirty] = useState(false);
   const providerSuccess = useRef<HTMLDivElement>(null);
@@ -250,13 +255,19 @@ function UpstreamProviders({ renderResetSettings, token, tenant, writeTenant = t
   useLayoutEffect(() => {
     if (busy || workspace?.kind === 'rotation' || workspace?.kind === 'reauthorization') return;
     const pending = returnFocus.current;
+    // Keep a visible focus target while the scoped policy read disables actions.
+    if (proxyEditing.current) {
+      const active = document.activeElement;
+      if (pending && workspace?.kind === 'account' && (!active || active === document.body || active.matches(':disabled'))) detailHeading.current?.focus();
+      return;
+    }
     if (pending) {
       const trigger = pending.trigger?.isConnected && pending.trigger.getClientRects().length ? pending.trigger
         : Array.from(providerList.current?.querySelectorAll<HTMLButtonElement>(`[data-${pending.target}-trigger="${CSS.escape(pending.accountId)}"]`) ?? []).find(button => button.getClientRects().length && !button.disabled);
       if (trigger && trigger.getClientRects().length && !trigger.matches(':disabled')) { returnFocus.current = undefined; trigger.focus(); return; }
     }
     if (workspace?.kind === 'account') detailHeading.current?.focus();
-  }, [workspace, busy]);
+  }, [workspace, busy, proxyEditorOpen]);
   useLayoutEffect(() => { if (message && !workspace && !returnFocus.current) providerSuccess.current?.focus(); }, [message]);
   function navigateWorkspace(next?: AccountWorkspace) {
     workspaceGeneration.current += 1;
@@ -377,7 +388,7 @@ function UpstreamProviders({ renderResetSettings, token, tenant, writeTenant = t
   useEffect(() => {
     returnFocus.current = undefined;
     navigateWorkspace();
-    setProviderEditDraft(undefined); setMethod('direct'); setDriver(''); setProxyEditorOpen(false);
+    setProviderEditDraft(undefined); setMethod('direct'); setDriver(''); updateProxyEditing(false);
     setProviderCreateDrafts({}); setProviderListRetry(false); setProviderAuthorizationLocked(false); providerCreateLock.current = undefined;
     setBusy(''); setHealth({}); setDeletionReadiness({}); setRouteCacheRevisions({}); setMessage(''); setError('');
   }, [token, tenant, writeTenant]);
@@ -556,7 +567,7 @@ function UpstreamProviders({ renderResetSettings, token, tenant, writeTenant = t
     providerIdentity: <ProviderAccountIdentity account={editing} editing />,
     providerConnectionTitle: connectionCopy.network,
     providerConnection: <>
-      <UpstreamConnection key={`${token}\0${writeTenant}\0${editing.id}\0${editing.credential_generation}`} embedded account={editing} token={token} tenant={writeTenant} disabled={!canManage(editing) || Boolean(busy)} onChanged={onChanged} onEditingChange={setProxyEditorOpen} onSaved={updated => { if (ownsWorkspace()) setWorkspaceState(current => current?.kind === 'settings' && current.account.id === updated.id ? { ...current, account: { ...updated, name: current.account.name, config: current.account.config } } : current); }} />
+      <UpstreamConnection key={`${token}\0${writeTenant}\0${editing.id}\0${editing.credential_generation}`} embedded account={editing} token={token} tenant={writeTenant} disabled={!canManage(editing) || Boolean(busy)} onChanged={onChanged} onEditingChange={updateProxyEditing} onSaved={updated => { if (ownsWorkspace()) setWorkspaceState(current => current?.kind === 'settings' && current.account.id === updated.id ? { ...current, account: { ...updated, name: current.account.name, config: current.account.config } } : current); }} />
       {proxyEditorOpen && <p role="status">{t('connection.finishProxyFirst')}</p>}
     </>,
     providerAuthentication: <FormSection title={connectionCopy.authentication}>
@@ -624,7 +635,7 @@ function UpstreamProviders({ renderResetSettings, token, tenant, writeTenant = t
             <ProviderAccountStatus account={value} />
             {needsReauthorization && canReauthorizeAccount(value, providers.find(provider => provider.id === value.driver)) && <Button data-reauthorization-trigger={value.id} appearance="primary" type="button" disabled={!manageable || Boolean(busy) || proxyEditorOpen} onClick={() => openReauthorization(value)}>{value.driver === 'kimi-oauth' ? connectionCopy.signInAgain : t('providers.reauthorize')}</Button>}
             <ProviderAccountIdentity account={value} />
-            <UpstreamConnection key={`connection\0${token}\0${writeTenant}\0${value.id}`} readOnOpen account={value} token={token} tenant={writeTenant} disabled={!manageable || Boolean(busy)} onChanged={onChanged} onEditingChange={setProxyEditorOpen} />
+            <UpstreamConnection key={`connection\0${token}\0${writeTenant}\0${value.id}`} readOnOpen account={value} token={token} tenant={writeTenant} disabled={!manageable || Boolean(busy)} onChanged={onChanged} onEditingChange={updateProxyEditing} />
             <Disclosure title={t('providers.recentAvailability')}><UpstreamAvailability account={value} snapshot={availabilitySnapshot} window={availabilityWindow} loading={availabilityLoading} manualHealth={currentHealth} onOpenRequest={onOpenRequest} /></Disclosure>
             <UpstreamQuota key={`${token}\0${tenant}\0${value.id}\0${generation}`} accountId={value.id} accountName={value.name} resetSettings={snapshot => renderResetSettings?.(value, snapshot)} credentialGeneration={generation} tenant={value.tenant_external_id ?? tenant} token={token} readState={cachedQuota?.generation === generation ? cachedQuota : undefined} onRefresh={() => void quotaReads.read(value)} refreshDisabled={Boolean(cachedQuota?.generation === generation && cachedQuota.busy)} canRecover={manageable} />
             {currentReadiness && <small className={`status ${currentReadiness.can_delete ? 'ok' : 'pending'}`}>{deletionBlockers.join(' · ')}</small>}
@@ -702,7 +713,7 @@ function UpstreamProviders({ renderResetSettings, token, tenant, writeTenant = t
       {editing && message && <div className="notice success" role="status">{message}</div>}
       {error && providerWorkspaceActive && <div className="notice error" role="alert">{error}</div>}
       {editing || rotating ? providerEditors : reauthorizing ? <>
-      <AuthorizationConnection key={`${token}\0${writeTenant}\0reauthorize-${reauthorizing.id}`} token={token} tenant={writeTenant} providers={providers} existing={reauthorizing} onEditName={() => { if (!ownsWorkspace() || !canManage(reauthorizing) || busy || proxyEditorOpen) return; setProviderEditDraft(undefined); setError(''); setMessage(''); navigateWorkspace({ kind: 'settings', account: reauthorizing }); }} onConnectionChanged={onChanged} onAccountSaved={updated => { if (ownsWorkspace()) setWorkspaceState(current => current?.kind === 'reauthorization' && current.account.id === updated.id ? { ...current, account: updated } : current); }} onEditingChange={setProxyEditorOpen} onChanged={async updated => { if (!ownsWorkspace()) return; await reloadAccounts(Boolean(updated), true); if (!ownsWorkspace()) return; returnFromReauthorization(updated); setProviderEditDraft(undefined); setMessage(authorizationJourneyCopy(locale).saved); }} />
+      <AuthorizationConnection key={`${token}\0${writeTenant}\0reauthorize-${reauthorizing.id}`} token={token} tenant={writeTenant} providers={providers} existing={reauthorizing} onEditName={() => { if (!ownsWorkspace() || !canManage(reauthorizing) || busy || proxyEditorOpen) return; setProviderEditDraft(undefined); setError(''); setMessage(''); navigateWorkspace({ kind: 'settings', account: reauthorizing }); }} onConnectionChanged={onChanged} onAccountSaved={updated => { if (ownsWorkspace()) setWorkspaceState(current => current?.kind === 'reauthorization' && current.account.id === updated.id ? { ...current, account: updated } : current); }} onEditingChange={updateProxyEditing} onChanged={async updated => { if (!ownsWorkspace()) return; await reloadAccounts(Boolean(updated), true); if (!ownsWorkspace()) return; returnFromReauthorization(updated); setProviderEditDraft(undefined); setMessage(authorizationJourneyCopy(locale).saved); }} />
       <Button appearance="secondary" type="button" disabled={Boolean(busy) || proxyEditorOpen} onClick={() => returnFromReauthorization()}>{authorizationJourneyCopy(locale).back}</Button>
     </> : <>
       <div className="segmented" role="group" aria-label={t('providers.method')}><Button appearance="secondary" type="button" disabled={Boolean(busy) || providerAuthorizationLocked} aria-pressed={method === 'direct'} className={method === 'direct' ? 'active' : ''} onClick={() => setMethod('direct')}>{t('providers.direct')}</Button><Button appearance="secondary" type="button" disabled={Boolean(busy) || providerAuthorizationLocked} aria-pressed={method === 'authorization'} className={method === 'authorization' ? 'active' : ''} onClick={() => setMethod('authorization')}>{t('providers.oauth')}</Button></div>
