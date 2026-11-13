@@ -272,7 +272,15 @@ mod tests {
             1
         );
         old_writer.commit().await.unwrap();
-        resumed.history_activate_capture().await.unwrap();
+        let (first_activation, second_activation) = tokio::join!(
+            resumed.history_activate_capture(),
+            database.history_activate_capture(),
+        );
+        assert_ne!(
+            first_activation.is_ok(),
+            second_activation.is_ok(),
+            "exactly one concurrent activation owns the off-to-shadow transition"
+        );
         assert_eq!(resumed.history_mode().await.unwrap(), "shadow");
         let new_event = Uuid::now_v7();
         let mut new_writer = writers.pool.begin().await.unwrap();
