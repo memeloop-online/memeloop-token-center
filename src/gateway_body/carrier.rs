@@ -255,10 +255,21 @@ impl BodyCarrier {
                             };
                             match archive.open_stream(&reference.object_locator, None).await {
                                 Ok(download) => {
-                                    remote = Some(Box::pin(download.stream.map(|result| {
-                                        result.map_err(|_| {
-                                            AppError::storage("carrier_object_read_failed")
-                                        })
+                                    let memory = source.memory.clone();
+                                    remote = Some(Box::pin(download.stream.then(move |result| {
+                                        let memory = memory.clone();
+                                        async move {
+                                            let bytes = result.map_err(|_| {
+                                                AppError::storage("carrier_object_read_failed")
+                                            })?;
+                                            let lease =
+                                                memory.reserve_carrier_bytes(bytes.len()).await?;
+                                            Ok(Bytes::from_owner(Allocation {
+                                                bytes,
+                                                _lease: lease,
+                                                _retained: None,
+                                            }))
+                                        }
                                     })))
                                 }
                                 Err(error) => return Some((Err(error), (source, index, None))),
@@ -323,6 +334,9 @@ impl BodyCarrier {
                         while let Some(chunk) = download.next().await {
                             let chunk = chunk
                                 .map_err(|_| AppError::storage("carrier_object_read_failed"))?;
+                            if chunk.len() > length.saturating_sub(output.len()) {
+                                return Err(AppError::storage("carrier_range_overrun"));
+                            }
                             output.extend_from_slice(&chunk);
                         }
                     }
@@ -410,6 +424,41 @@ mod tests {
         drop(replay);
         assert!(memory.snapshot().0 > 0); // the returned range is still an owner
         drop(bytes);
+        assert_eq!(memory.snapshot().0, 0);
+    }
+
+    #[tokio::test]
+    async fn derived_alias_shares_allocation_but_copied_bytes_are_charged() {
+        let memory = Arc::new(ProxyMemoryBudget::new(1024 * 1024));
+        let source = BodyCarrier::capture(
+            stream::iter([Ok::<_, std::io::Error>(Bytes::from_static(
+                b"raw WAV bytes",
+            ))]),
+            CarrierCapture::new(memory.clone(), None, key()),
+        )
+        .await
+        .unwrap();
+        let original_charge = memory.snapshot().0;
+        let slice = source.read_range(4, 3).await.unwrap();
+        let derived = BodyCarrier::capture(
+            stream::iter([Ok::<_, std::io::Error>(slice)]),
+            CarrierCapture::derived_from(&source, key()),
+        )
+        .await
+        .unwrap();
+        assert_eq!(memory.snapshot().0, original_charge);
+        let copied = BodyCarrier::capture(
+            stream::iter([Ok::<_, std::io::Error>(Bytes::copy_from_slice(b"WAV"))]),
+            CarrierCapture::derived_from(&source, key()),
+        )
+        .await
+        .unwrap();
+        assert!(memory.snapshot().0 > original_charge);
+        drop(copied);
+        drop(source);
+        assert_eq!(memory.snapshot().0, original_charge);
+        assert_eq!(derived.read_range(0, 3).await.unwrap(), b"WAV"[..]);
+        drop(derived);
         assert_eq!(memory.snapshot().0, 0);
     }
 
