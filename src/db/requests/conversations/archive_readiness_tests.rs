@@ -401,6 +401,13 @@ async fn declared_identity_before_body_contract(database_url: String) {
         .execute(&fixture.state.db.pool)
         .await
         .unwrap();
+    let malformed_pending: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM conversation_projection_outbox WHERE request_id = $1 AND projected_at IS NULL AND attempts = 0")
+        .bind(malformed.request_id.to_string()).fetch_one(&fixture.state.db.pool).await.unwrap();
+    assert_eq!(
+        malformed_pending, 1,
+        "bad metadata remains retryable without blocking the next identity"
+    );
+
     let owner = fixture.claim().await;
     fixture
         .state
@@ -429,13 +436,6 @@ async fn declared_identity_before_body_contract(database_url: String) {
         cursor.as_deref(),
         Some(fixture.request_id.to_string().as_str())
     );
-    let malformed_pending: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM conversation_projection_outbox WHERE request_id = $1 AND projected_at IS NULL AND attempts = 0")
-        .bind(malformed.request_id.to_string()).fetch_one(&fixture.state.db.pool).await.unwrap();
-    assert_eq!(
-        malformed_pending, 1,
-        "bad metadata remains retryable without blocking the next identity"
-    );
-
     fixture
         .state
         .db
