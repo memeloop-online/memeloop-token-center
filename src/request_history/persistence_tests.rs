@@ -1287,3 +1287,152 @@ async fn request_history_real_services_acceptance_start_nowait_rolls_back_partia
         .unwrap();
     admin.close().await;
 }
+
+#[tokio::test]
+#[ignore = "existing CI supplies real PostgreSQL and ClickHouse services"]
+async fn request_history_real_services_acceptance_event_original_survives_ack_and_source_removal() {
+    let postgres = std::env::var("MTC_TEST_POSTGRES_URL").expect("PostgreSQL acceptance URL");
+    let endpoint = std::env::var("MTC_TEST_CLICKHOUSE_URL").expect("ClickHouse acceptance URL");
+    let admin = sqlx::PgPool::connect(&postgres).await.unwrap();
+    let schema = format!("history_fidelity_{}", Uuid::now_v7().simple());
+    sqlx::query(sqlx::AssertSqlSafe(format!("CREATE SCHEMA {schema}")))
+        .execute(&admin)
+        .await
+        .unwrap();
+    let mut isolated = url::Url::parse(&postgres).unwrap();
+    isolated
+        .query_pairs_mut()
+        .append_pair("options", &format!("-csearch_path={schema}"));
+    let database = Database::connect(isolated.as_str())
+        .await
+        .unwrap()
+        .with_archive(crate::archive::ArchiveStore::memory_for_test());
+    database.migrate().await.unwrap();
+    database.history_start().await.unwrap();
+    let (key, request_id, _) = seed(&database).await;
+    finish(&database, request_id).await;
+    let event_id = Uuid::now_v7();
+    sqlx::query("INSERT INTO request_events (tenant_id,event_id,request_id,event_at,event_kind,key_id,protocol,model,status_code,duration_ms,input_tokens,output_tokens,cost_micros,error_code) SELECT tenant_id,$1,id,$2,'original_fidelity_fixture',key_id,protocol,model,202,3,0,0,7,NULL FROM request_records WHERE id=$3")
+        .bind(event_id.to_string()).bind(unix_millis()).bind(request_id.to_string()).execute(&database.pool).await.unwrap();
+    let mut transaction = database.pool.begin().await.unwrap();
+    let original = super::super::history_immutable_outbox::original_event_in_transaction(
+        &mut transaction,
+        event_id,
+    )
+    .await
+    .unwrap();
+    transaction.commit().await.unwrap();
+    let pending = database.history_pending(500).await.unwrap();
+    let snapshot = pending
+        .iter()
+        .find(|snapshot| {
+            snapshot.identity.source == "event" && snapshot.identity.request_id == event_id
+        })
+        .unwrap()
+        .clone();
+    assert_eq!(snapshot.payload.as_ref().unwrap()["status_code"], 200);
+    assert_eq!(
+        crate::request_history::event_original::reconstruct(
+            &snapshot.identity,
+            snapshot.payload.as_ref().unwrap(),
+            &snapshot.read_model
+        )
+        .unwrap(),
+        original
+    );
+    let expected = database
+        .history_snapshot(snapshot.identity.clone(), snapshot.revision)
+        .await
+        .unwrap();
+    assert_eq!(
+        serde_json::to_value(&expected).unwrap(),
+        serde_json::to_value(&snapshot).unwrap()
+    );
+    reqwest::Client::new()
+        .post(&endpoint)
+        .body(format!("CREATE DATABASE {schema}"))
+        .send()
+        .await
+        .unwrap()
+        .error_for_status()
+        .unwrap();
+    let client = ClickHouse::new(
+        database
+            .http_clients
+            .handle(crate::http_settings::HttpPurpose::General),
+        &endpoint,
+        schema.clone(),
+        "default".into(),
+        String::new(),
+    )
+    .unwrap();
+    client.initialize().await.unwrap();
+    client.append(&pending).await.unwrap();
+    client.append(&pending).await.unwrap();
+    database.history_acknowledge(&pending).await.unwrap();
+    assert_eq!(database.history_pending_count().await.unwrap(), 0);
+    let remaining: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM request_history_immutable_outbox WHERE request_id=$1",
+    )
+    .bind(event_id.to_string())
+    .fetch_one(&database.pool)
+    .await
+    .unwrap();
+    assert_eq!(remaining, 0);
+    // Isolated fixture retirement: stop its capture before removing its source.
+    // Production retirement remains gated on the complete inventory/proofs.
+    sqlx::query("UPDATE request_history_state SET mode='off' WHERE id=1")
+        .execute(&database.pool)
+        .await
+        .unwrap();
+    sqlx::query("DELETE FROM request_events WHERE event_id=$1")
+        .bind(event_id.to_string())
+        .execute(&database.pool)
+        .await
+        .unwrap();
+    let rows = client
+        .event_snapshots(
+            crate::request_history::HistoryScope::Key {
+                tenant_id: key.tenant_id,
+                key_id: key.key_id,
+            },
+            0,
+            None,
+            500,
+        )
+        .await
+        .unwrap();
+    let copies: Vec<_> = rows
+        .iter()
+        .filter(|row| row.identity.request_id == event_id)
+        .collect();
+    assert_eq!(
+        copies.len(),
+        1,
+        "duplicate deliveries have one logical latest event"
+    );
+    let restored = crate::request_history::event_original::reconstruct(
+        &copies[0].identity,
+        copies[0].payload.as_ref().unwrap(),
+        &copies[0].read_model,
+    )
+    .unwrap();
+    assert_eq!(restored, original);
+    assert_eq!(restored["status_code"], 202);
+    assert_eq!(restored["input_tokens"], 0);
+    assert_eq!(restored["cost_micros"], 7);
+    database.close().await;
+    reqwest::Client::new()
+        .post(&endpoint)
+        .body(format!("DROP DATABASE {schema}"))
+        .send()
+        .await
+        .unwrap()
+        .error_for_status()
+        .unwrap();
+    sqlx::query(sqlx::AssertSqlSafe(format!("DROP SCHEMA {schema} CASCADE")))
+        .execute(&admin)
+        .await
+        .unwrap();
+    admin.close().await;
+}
