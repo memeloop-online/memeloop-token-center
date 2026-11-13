@@ -308,7 +308,7 @@ pub(crate) fn capture(
                         .failed
                         .fetch_add(1, Ordering::Relaxed);
                     tracing::warn!(request_id = %identity.request_id, error_category = error.diagnostic_category(),
-                        "buffered archive capture retains original bytes for retry");
+                        "buffered archive capture retains source or durable reference for retry");
                 }
             }
             tokio::time::sleep(Duration::from_millis(250)).await;
