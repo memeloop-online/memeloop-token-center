@@ -16,15 +16,20 @@ pub(super) fn reuses_chat_workspace(protocol: Protocol, request: &Value) -> bool
             .and_then(Value::as_array)
             .is_some_and(|messages| {
                 messages.iter().all(|message| {
-                    message.get("role").and_then(Value::as_str) != Some("assistant")
-                        || (message
-                            .get("tool_calls")
-                            .and_then(Value::as_array)
-                            .is_none_or(Vec::is_empty)
-                            && message
-                                .get("reasoning_content")
-                                .and_then(Value::as_str)
-                                .is_none_or(|text| text.trim().is_empty()))
+                    match message.get("role").and_then(Value::as_str).map(str::trim) {
+                        Some("tool") => false,
+                        Some("assistant") => {
+                            message
+                                .get("tool_calls")
+                                .and_then(Value::as_array)
+                                .is_none_or(Vec::is_empty)
+                                && message
+                                    .get("reasoning_content")
+                                    .and_then(Value::as_str)
+                                    .is_none_or(|text| text.trim().is_empty())
+                        }
+                        _ => true,
+                    }
                 })
             })
 }

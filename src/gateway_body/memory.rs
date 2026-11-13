@@ -152,6 +152,9 @@ pub(crate) struct RequestRouteWorkspace {
 }
 
 impl RequestRouteWorkspace {
+    pub(crate) fn covers_shape(&self, bytes: usize, nodes: usize) -> bool {
+        self.covers(bytes) && nodes <= self.reservation.json_node_ceiling.load(Ordering::Acquire)
+    }
     pub(crate) fn covers(&self, bytes: usize) -> bool {
         bytes <= self.reservation.json_body_ceiling.load(Ordering::Acquire)
             && self.reservation.request_json_reserved_bytes() > 0
@@ -755,6 +758,35 @@ pub(crate) fn bounded_json_fits(bytes: &[u8], budget: usize) -> bool {
         .saturating_mul(2)
         .saturating_add(nodes.saturating_mul(256))
         <= budget
+}
+
+pub(crate) fn json_encoded_shape(
+    value: &serde_json::Value,
+) -> Result<(usize, usize), crate::error::AppError> {
+    struct Count {
+        bytes: usize,
+        scanner: JsonMemoryScanner,
+    }
+    impl std::io::Write for Count {
+        fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+            self.bytes = self
+                .bytes
+                .checked_add(bytes.len())
+                .ok_or_else(|| std::io::Error::other("JSON size overflow"))?;
+            self.scanner.observe(bytes);
+            Ok(bytes.len())
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+    let mut count = Count {
+        bytes: 0,
+        scanner: JsonMemoryScanner::default(),
+    };
+    serde_json::to_writer(&mut count, value)
+        .map_err(|_| crate::error::AppError::internal("memory_flush_1"))?;
+    Ok((count.bytes, count.scanner.nodes))
 }
 
 pub(crate) fn json_encoded_length(
