@@ -670,7 +670,13 @@ mod tests {
 
     #[tokio::test]
     async fn request_history_compact_identity_keeps_head_after_old_ack_and_rejects_scope_change() {
-        let database = Database::connect("sqlite::memory:").await.unwrap();
+        let directory = tempfile::tempdir().unwrap();
+        let database = Database::connect(&format!(
+            "sqlite://{}?mode=rwc",
+            directory.path().join("identity.sqlite").display()
+        ))
+        .await
+        .unwrap();
         database.migrate().await.unwrap();
         let identity = HistoryIdentity {
             source: "event".into(),
