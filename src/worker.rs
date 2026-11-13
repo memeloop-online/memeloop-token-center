@@ -421,15 +421,19 @@ pub async fn run_until_shutdown_with_oauth_stop(
             process_metered_usage_projection_batch(state, projection_owner).await;
         }
     );
-    let identity_projection_cursor = Mutex::new(None::<String>);
+    let identity_projection_cursor = Mutex::new((None::<String>, None::<String>));
     periodic!(
         "conversation_identity",
         PROJECTION_INTERVAL,
         async |state: &AppState, _shutdown: &watch::Receiver<bool>| {
-            let after = identity_projection_cursor.lock().unwrap().clone();
+            let (live_after, history_before) = identity_projection_cursor.lock().unwrap().clone();
             match state
                 .db
-                .project_declared_conversation_identities(after.as_deref(), PROJECTION_BATCH_LIMIT)
+                .project_declared_conversation_identity_pages(
+                    live_after.as_deref(),
+                    history_before.as_deref(),
+                    PROJECTION_BATCH_LIMIT,
+                )
                 .await
             {
                 Ok(next) => *identity_projection_cursor.lock().unwrap() = next,

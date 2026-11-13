@@ -1,9 +1,21 @@
+mod bootstrap;
 use super::*;
+
+const PENDING_COUNT_SQL: &str = "SELECT (SELECT COUNT(*) FROM request_history_export) + (SELECT COUNT(*) FROM request_history_immutable_outbox i WHERE NOT EXISTS (SELECT 1 FROM request_history_export e WHERE e.revision=i.revision))";
 use crate::request_history::{
     HistoryError, HistoryIdentity, HistoryScope, HistorySnapshot, HistoryStatistics,
 };
 
 const COLUMNS: &str = "source, request_id, tenant_id, key_id, created_at";
+
+struct CaptureDefinition {
+    table: &'static str,
+    event: &'static str,
+    name: String,
+    body: String,
+    manifest: String,
+    sql: String,
+}
 
 impl Database {
     /// A selected ClickHouse reader fails closed if its endpoint is missing.
@@ -41,7 +53,7 @@ impl Database {
         &self,
         key_id: Uuid,
     ) -> Result<HistoryScope, HistoryError> {
-        let tenant: Option<String> = sqlx::query_scalar("SELECT tenant_id FROM key_records WHERE id = $1 UNION SELECT tenant_id FROM request_history_source_ids WHERE key_id = $1 LIMIT 1")
+        let tenant: Option<String> = sqlx::query_scalar("SELECT tenant_id FROM key_records WHERE id = $1 UNION SELECT tenant_id FROM request_history_identities WHERE key_id = $1 UNION SELECT tenant_id FROM request_history_source_ids WHERE key_id = $1 LIMIT 1")
             .bind(key_id.to_string()).fetch_optional(&self.pool).await?;
         Ok(match tenant {
             Some(tenant) => HistoryScope::Key {
@@ -156,8 +168,7 @@ impl Database {
         Ok(directory)
     }
 
-    pub async fn history_start(&self) -> Result<(), HistoryError> {
-        let mut transaction = self.pool.begin().await?;
+    fn history_capture_definitions(&self) -> Result<Vec<CaptureDefinition>, HistoryError> {
         let sources = [
             ("request_events", Some(("event", "event_id", "event_at"))),
             ("request_records", Some(("native", "id", "created_at"))),
@@ -174,6 +185,7 @@ impl Database {
             ("request_egress_attempts", None),
             ("request_upstream_transport_diagnostics", None),
             ("generation_stats_facts", None),
+            ("generation_assets", None),
             ("request_stats_facts", None),
             ("terminal_projection_outbox", None),
             ("upstream_accounts", None),
@@ -182,21 +194,7 @@ impl Database {
             ("principals", None),
             ("tenants", None),
         ];
-        if matches!(self.backend, DatabaseBackend::PostgreSql) {
-            // Acquire the complete static source-table set before any DDL.
-            // NOWAIT rolls back immediately if a live writer owns a conflicting
-            // lock, rather than reversing its records/events lock order.
-            let tables = sources
-                .iter()
-                .map(|(table, _)| *table)
-                .collect::<Vec<_>>()
-                .join(", ");
-            sqlx::raw_sql(sqlx::AssertSqlSafe(format!(
-                "LOCK TABLE {tables} IN SHARE ROW EXCLUSIVE MODE NOWAIT"
-            )))
-            .execute(&mut *transaction)
-            .await?;
-        }
+        let mut definitions = Vec::new();
         for (table, identity) in sources {
             for event in ["INSERT", "UPDATE", "DELETE"] {
                 let record = if event == "DELETE" { "OLD" } else { "NEW" };
@@ -209,7 +207,7 @@ impl Database {
                         "session_archive_correlations" => format!(
                             "source = 'archive' AND request_id IN (SELECT archive_request_id FROM session_archive_unlinked_requests WHERE tenant_id = {record}.tenant_id AND source = {record}.source AND external_request_id = {record}.external_request_id)"
                         ),
-                        "generation_stats_facts" => {
+                        "generation_stats_facts" | "generation_assets" => {
                             format!("source = 'generation' AND request_id = {record}.job_id")
                         }
                         "upstream_accounts" => format!(
@@ -243,7 +241,9 @@ impl Database {
                         "request_records" | "generation_jobs" => {
                             format!("request_id = {record}.id")
                         }
-                        "generation_stats_facts" => format!("request_id = {record}.job_id"),
+                        "generation_stats_facts" | "generation_assets" => {
+                            format!("request_id = {record}.job_id")
+                        }
                         "key_records" => format!("key_id = {record}.id"),
                         "tenants" => format!("tenant_id = {record}.id"),
                         "principals" => format!(
@@ -281,20 +281,58 @@ impl Database {
                     String::new()
                 };
                 let name = format!("history_{table}_{}", event.to_lowercase());
+                let body = format!(
+                    "BEGIN PERFORM id FROM request_history_state WHERE id = 1 FOR SHARE; IF (SELECT mode FROM request_history_state WHERE id=1)='off' THEN RETURN NULL; END IF; {identity_guard} {enqueue} RETURN NULL; END"
+                );
+                let manifest = format!(
+                    "mtc-history-bootstrap-v1-{}",
+                    crate::request_history::canonical_hash(&(1, table, event, &body))?
+                );
                 let sql = match self.backend {
                     DatabaseBackend::PostgreSql => format!(
-                        "CREATE OR REPLACE FUNCTION {name}() RETURNS trigger LANGUAGE plpgsql AS $history$ BEGIN PERFORM id FROM request_history_state WHERE id = 1 FOR SHARE; {identity_guard} {enqueue} RETURN NULL; END $history$;
+                        "CREATE OR REPLACE FUNCTION {name}() RETURNS trigger LANGUAGE plpgsql VOLATILE SECURITY INVOKER AS $history${body}$history$;
                          DROP TRIGGER IF EXISTS {name} ON {table};
-                         CREATE TRIGGER {name} AFTER {event} ON {table} FOR EACH ROW EXECUTE FUNCTION {name}();"
+                         CREATE TRIGGER {name} AFTER {event} ON {table} FOR EACH ROW EXECUTE FUNCTION {name}();
+                         ALTER FUNCTION {name}() RESET ALL;
+                         COMMENT ON FUNCTION {name}() IS '{manifest}';"
                     ),
                     DatabaseBackend::Sqlite => format!(
                         "DROP TRIGGER IF EXISTS {name}; CREATE TRIGGER {name} AFTER {event} ON {table} BEGIN {identity_guard} {enqueue} END;"
                     ),
                 };
-                sqlx::raw_sql(sqlx::AssertSqlSafe(sql))
-                    .execute(&mut *transaction)
-                    .await?;
+                definitions.push(CaptureDefinition {
+                    table,
+                    event,
+                    name,
+                    body,
+                    manifest,
+                    sql,
+                });
             }
+        }
+        Ok(definitions)
+    }
+
+    pub async fn history_start(&self) -> Result<(), HistoryError> {
+        let definitions = self.history_capture_definitions()?;
+        let mut transaction = self.pool.begin().await?;
+        if matches!(self.backend, DatabaseBackend::PostgreSql) {
+            let tables = definitions
+                .chunks(3)
+                .map(|group| group[0].table)
+                .collect::<Vec<_>>()
+                .join(", ");
+            sqlx::raw_sql(sqlx::AssertSqlSafe(format!(
+                "LOCK TABLE {tables} IN SHARE ROW EXCLUSIVE MODE NOWAIT"
+            )))
+            .execute(&mut *transaction)
+            .await?;
+            Self::history_bootstrap_maintenance_lock(&mut transaction).await?;
+        }
+        for definition in definitions {
+            sqlx::raw_sql(sqlx::AssertSqlSafe(definition.sql))
+                .execute(&mut *transaction)
+                .await?;
         }
         sqlx::query(
             "UPDATE request_history_state SET mode = 'shadow' WHERE id = 1 AND mode = 'off'",
@@ -309,7 +347,7 @@ impl Database {
     pub async fn history_refresh(&self) -> Result<(), HistoryError> {
         let mut tx = self.begin_write_transaction().await?;
         sqlx::query("UPDATE request_history_state SET mode = 'shadow', verified_revision = NULL, verification_json = NULL WHERE id = 1").execute(&mut *tx).await?;
-        let pending: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM request_history_export")
+        let pending: i64 = sqlx::query_scalar(PENDING_COUNT_SQL)
             .fetch_one(&mut *tx)
             .await?;
         if pending != 0 {
@@ -366,6 +404,13 @@ impl Database {
             ));
         }
         let mut transaction = self.pool.begin().await?;
+        if matches!(self.backend, DatabaseBackend::PostgreSql) {
+            // Backfill also allocates global revisions and must participate in
+            // the same commit barrier as source triggers.
+            sqlx::query("SELECT id FROM request_history_state WHERE id=1 FOR SHARE")
+                .execute(&mut *transaction)
+                .await?;
+        }
         let lock = if matches!(self.backend, DatabaseBackend::PostgreSql) {
             " FOR UPDATE"
         } else {
@@ -426,8 +471,21 @@ impl Database {
         &self,
         page_size: i64,
     ) -> Result<Vec<HistorySnapshot>, HistoryError> {
-        let rows = sqlx::query("SELECT revision, source, request_id, tenant_id, key_id, created_at, snapshot FROM request_history_export ORDER BY revision LIMIT $1")
-            .bind(page_size).fetch_all(&self.pool).await?;
+        self.history_pending_through(page_size, None).await
+    }
+
+    pub(crate) async fn history_pending_through(
+        &self,
+        page_size: i64,
+        ceiling: Option<i64>,
+    ) -> Result<Vec<HistorySnapshot>, HistoryError> {
+        self.history_capture_pending(page_size).await?;
+        let immutable = self.history_immutable_pending(page_size, ceiling).await?;
+        if !immutable.is_empty() {
+            return Ok(immutable);
+        }
+        let rows = sqlx::query("SELECT revision, source, request_id, tenant_id, key_id, created_at, snapshot FROM request_history_export WHERE revision <= COALESCE($2,9223372036854775807) ORDER BY revision LIMIT $1")
+            .bind(page_size).bind(ceiling).fetch_all(&self.pool).await?;
         let mut snapshots = Vec::new();
         for row in rows {
             let revision: i64 = row.try_get("revision")?;
@@ -453,8 +511,19 @@ impl Database {
         snapshots: &[HistorySnapshot],
     ) -> Result<(), HistoryError> {
         let mut transaction = self.pool.begin().await?;
+        let mut acknowledged = Vec::new();
         const ACK: &str = "DELETE FROM request_history_export WHERE revision = $1 AND source = $2 AND request_id = $3 AND snapshot = $4";
         for snapshot in snapshots {
+            let frozen = serde_json::to_string(snapshot)?;
+            // During rollout the old source journal may still contain this
+            // identity. Freeze it only when the immutable delivery proves the
+            // same complete tenant/key/revision and exact delivery bytes.
+            sqlx::query("UPDATE request_history_export SET snapshot=COALESCE(snapshot,$1) WHERE revision=$2 AND source=$3 AND request_id=$4 AND tenant_id=$5 AND key_id=$6 AND EXISTS (SELECT 1 FROM request_history_immutable_outbox i WHERE i.revision=$2 AND i.source=$3 AND i.request_id=$4 AND i.tenant_id=$5 AND i.key_id=$6 AND i.delivery_snapshot=$1)")
+                .bind(&frozen).bind(snapshot.revision).bind(&snapshot.identity.source).bind(snapshot.identity.request_id.to_string()).bind(snapshot.identity.tenant_id.to_string()).bind(snapshot.identity.key_id.to_string())
+                .execute(&mut *transaction).await?;
+            let immutable_deleted = sqlx::query("DELETE FROM request_history_immutable_outbox WHERE revision=$1 AND source=$2 AND request_id=$3 AND tenant_id=$4 AND key_id=$5 AND delivery_snapshot=$6")
+                .bind(snapshot.revision).bind(&snapshot.identity.source).bind(snapshot.identity.request_id.to_string()).bind(snapshot.identity.tenant_id.to_string()).bind(snapshot.identity.key_id.to_string()).bind(&frozen)
+                .execute(&mut *transaction).await?;
             let deleted = sqlx::query(ACK)
                 .bind(snapshot.revision)
                 .bind(&snapshot.identity.source)
@@ -462,7 +531,9 @@ impl Database {
                 .bind(serde_json::to_string(snapshot)?)
                 .execute(&mut *transaction)
                 .await?;
+            let mut did_ack = immutable_deleted.rows_affected() != 0;
             if deleted.rows_affected() != 0 {
+                acknowledged.push(snapshot.clone());
                 continue;
             }
             // Older frozen JSON may omit a newly defaulted read-model field.
@@ -476,28 +547,41 @@ impl Database {
                 if crate::request_history::canonical_hash(&decoded)?
                     == crate::request_history::canonical_hash(snapshot)?
                 {
-                    sqlx::query(ACK)
+                    let compatible_deleted = sqlx::query(ACK)
                         .bind(snapshot.revision)
                         .bind(&snapshot.identity.source)
                         .bind(snapshot.identity.request_id.to_string())
                         .bind(frozen)
                         .execute(&mut *transaction)
                         .await?;
+                    did_ack |= compatible_deleted.rows_affected() != 0;
                 }
             }
+            if did_ack {
+                acknowledged.push(snapshot.clone());
+            }
         }
-        self.allocation_history_acknowledged(&mut transaction, snapshots)
+        for snapshot in &acknowledged {
+            super::history_immutable_outbox::capture_identity_in_transaction(
+                &mut transaction,
+                &snapshot.identity,
+                snapshot.revision,
+            )
+            .await?;
+            let hash = crate::request_history::canonical_hash(snapshot)?;
+            sqlx::query("UPDATE request_history_identities SET acknowledged_revision=$1,acknowledged_hash=$2 WHERE source=$3 AND request_id=$4 AND tenant_id=$5 AND key_id=$6 AND created_at=$7 AND head_revision >= $1 AND (acknowledged_revision IS NULL OR acknowledged_revision < $1)")
+                .bind(snapshot.revision).bind(hash).bind(&snapshot.identity.source).bind(snapshot.identity.request_id.to_string()).bind(snapshot.identity.tenant_id.to_string()).bind(snapshot.identity.key_id.to_string()).bind(snapshot.identity.created_at).execute(&mut *transaction).await?;
+        }
+        self.allocation_history_acknowledged(&mut transaction, &acknowledged)
             .await?;
         transaction.commit().await?;
         Ok(())
     }
 
     pub async fn history_pending_count(&self) -> Result<i64, HistoryError> {
-        Ok(
-            sqlx::query_scalar("SELECT COUNT(*) FROM request_history_export")
-                .fetch_one(&self.pool)
-                .await?,
-        )
+        Ok(sqlx::query_scalar(PENDING_COUNT_SQL)
+            .fetch_one(&self.pool)
+            .await?)
     }
 
     pub async fn history_revision(&self) -> Result<i64, HistoryError> {
@@ -561,7 +645,7 @@ impl Database {
             let current: i64 = sqlx::query_scalar(revision_sql)
                 .fetch_one(&mut *transaction)
                 .await?;
-            let pending: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM request_history_export")
+            let pending: i64 = sqlx::query_scalar(PENDING_COUNT_SQL)
                 .fetch_one(&mut *transaction)
                 .await?;
             let backfill: i64 =
@@ -585,7 +669,7 @@ impl Database {
         request_id: Uuid,
     ) -> Result<HistoryIdentity, HistoryError> {
         let sql = format!(
-            "SELECT {COLUMNS} FROM request_history_source_ids WHERE request_id = $1 ORDER BY source DESC LIMIT 1"
+            "SELECT {COLUMNS} FROM (SELECT {COLUMNS}, 0 AS priority FROM request_history_identities WHERE request_id=$1 UNION ALL SELECT {COLUMNS}, 1 AS priority FROM request_history_source_ids WHERE request_id=$1) candidates ORDER BY priority, source DESC LIMIT 1"
         );
         let row = sqlx::query(sqlx::AssertSqlSafe(sql))
             .bind(request_id.to_string())
@@ -605,13 +689,25 @@ impl Database {
                 .await?
                 .map(|event| serde_json::to_value(&event))
                 .transpose()?;
+            let mut transaction = self.pool.begin().await?;
+            let original = super::history_immutable_outbox::original_event_in_transaction(
+                &mut transaction,
+                identity.request_id,
+            )
+            .await?;
+            transaction.commit().await?;
+            let read_model = crate::request_history::event_original::read_model(
+                &identity,
+                payload.as_ref().unwrap_or(&Value::Null),
+                &original,
+            )?;
             return Ok(HistorySnapshot {
                 identity,
                 revision,
                 payload,
                 filter_cost_micros: None,
                 statistics: None,
-                read_model: Value::Null,
+                read_model,
             });
         }
         let payload = self
@@ -631,7 +727,7 @@ impl Database {
         } else {
             None
         };
-        let read_model = if let Some(payload) = &payload {
+        let mut read_model = if let Some(payload) = &payload {
             let mut archive = self
                 .source_request_archive_refs(identity.key_id, identity.request_id)
                 .await?;
@@ -674,6 +770,21 @@ impl Database {
         } else {
             Value::Null
         };
+        if identity.source == "native"
+            && let Some(payload) = &payload
+        {
+            let originals = self.history_native_business_originals(&identity).await?;
+            let fidelity = crate::request_history::native_original::read_model_with_archive(
+                (&identity, revision),
+                payload,
+                statistics.as_ref(),
+                &read_model,
+                &originals,
+                self.archive.as_ref(),
+            )
+            .await?;
+            read_model["native_original"] = fidelity;
+        }
         Ok(HistorySnapshot {
             identity,
             revision,
@@ -796,6 +907,141 @@ impl Database {
             .bind(identity.key_id.to_string())
             .bind(identity.created_at)
             .fetch_optional(&self.pool)
+            .await?;
+        if let Some(row) = row {
+            Ok(Some(HistoryStatistics {
+                status: status.into(),
+                input_tokens: row.try_get("input_tokens")?,
+                output_tokens: row.try_get("output_tokens")?,
+                cache_known_read_tokens: row.try_get("cache_known_read_tokens")?,
+                cache_known_input_tokens: row.try_get("cache_known_input_tokens")?,
+                cost_micros: row.try_get("cost_micros")?,
+                currency: row.try_get("currency")?,
+            }))
+        } else {
+            Ok(Some(HistoryStatistics {
+                status: "pending".into(),
+                input_tokens: 0,
+                output_tokens: 0,
+                cache_known_read_tokens: None,
+                cache_known_input_tokens: None,
+                cost_micros: None,
+                currency: payload["billing"]["currency"].as_str().map(str::to_owned),
+            }))
+        }
+    }
+    pub(crate) async fn history_analysis_fact_in_transaction(
+        transaction: &mut Transaction<'_, Any>,
+        identity: &HistoryIdentity,
+    ) -> Result<Value, HistoryError> {
+        let sql = match identity.source.as_str() {
+            "native" => {
+                "SELECT model,protocol,error_code,upstream_account_id,model_route_id AS route_id,billing_unit,status_class, input_tokens, output_tokens, cached_input_tokens, cache_write_tokens, generation_units, duration_ms, cost_micros, currency, CAST(NULL AS TEXT) AS modality FROM request_stats_facts WHERE request_id = $1 AND tenant_id = $2 AND key_id = $3 AND created_at = $4"
+            }
+            "generation" => {
+                "SELECT model,CAST('generation' AS TEXT) AS protocol,error_code,upstream_account_id,model_route_id AS route_id,billing_unit,status_class, CAST(0 AS BIGINT) AS input_tokens, CAST(0 AS BIGINT) AS output_tokens, CAST(0 AS BIGINT) AS cached_input_tokens, CAST(0 AS BIGINT) AS cache_write_tokens, billed_units AS generation_units, duration_ms, cost_micros, currency, modality FROM generation_stats_facts WHERE job_id = $1 AND tenant_id = $2 AND key_id = $3 AND created_at = $4"
+            }
+            _ => return Ok(Value::Null),
+        };
+        let row = sqlx::query(sqlx::AssertSqlSafe(sql))
+            .bind(identity.request_id.to_string())
+            .bind(identity.tenant_id.to_string())
+            .bind(identity.key_id.to_string())
+            .bind(identity.created_at)
+            .fetch_optional(&mut **transaction)
+            .await?;
+        let Some(row) = row else {
+            return Ok(Value::Null);
+        };
+        let mut fact = serde_json::Map::new();
+        for name in [
+            "input_tokens",
+            "output_tokens",
+            "cached_input_tokens",
+            "cache_write_tokens",
+            "generation_units",
+            "duration_ms",
+            "cost_micros",
+        ] {
+            fact.insert(
+                name.into(),
+                serde_json::to_value(row.try_get::<Option<i64>, _>(name)?)?,
+            );
+        }
+        for name in [
+            "status_class",
+            "currency",
+            "modality",
+            "model",
+            "protocol",
+            "error_code",
+            "upstream_account_id",
+            "route_id",
+            "billing_unit",
+        ] {
+            fact.insert(
+                name.into(),
+                serde_json::to_value(row.try_get::<Option<String>, _>(name)?)?,
+            );
+        }
+        fact.insert("settled_fact".into(), Value::Bool(true));
+        Ok(Value::Object(fact))
+    }
+
+    pub(crate) async fn history_statistics_in_transaction(
+        transaction: &mut Transaction<'_, Any>,
+        identity: &HistoryIdentity,
+        payload: &Value,
+    ) -> Result<Option<HistoryStatistics>, HistoryError> {
+        if identity.source == "native" && !payload["completed_at"].is_null() {
+            let fact = sqlx::query("SELECT f.status_class, CASE WHEN f.protocol = 'audio-transcription' THEN 0 ELSE f.input_tokens END AS input_tokens, CASE WHEN f.protocol = 'audio-transcription' THEN 0 ELSE f.output_tokens END AS output_tokens, f.cache_known_read_tokens, f.cache_known_input_tokens, f.cost_micros, f.currency FROM request_stats_facts f WHERE f.request_id = $1 AND f.tenant_id = $2 AND f.key_id = $3 AND f.created_at = $4 AND NOT EXISTS (SELECT 1 FROM pending_proxy_settlements pending WHERE pending.request_id = f.request_id AND pending.state = 'pending') AND NOT EXISTS (SELECT 1 FROM terminal_projection_outbox outbox WHERE outbox.request_id = f.request_id AND outbox.projected_at IS NULL)")
+                .bind(identity.request_id.to_string()).bind(identity.tenant_id.to_string()).bind(identity.key_id.to_string()).bind(identity.created_at)
+                .fetch_optional(&mut **transaction).await?;
+            if let Some(fact) = fact {
+                let status: String = fact.try_get("status_class")?;
+                return Ok(Some(HistoryStatistics {
+                    status: if status == "success" {
+                        "success".into()
+                    } else {
+                        "error".into()
+                    },
+                    input_tokens: fact.try_get("input_tokens")?,
+                    output_tokens: fact.try_get("output_tokens")?,
+                    cache_known_read_tokens: fact.try_get("cache_known_read_tokens")?,
+                    cache_known_input_tokens: fact.try_get("cache_known_input_tokens")?,
+                    cost_micros: fact.try_get("cost_micros")?,
+                    currency: fact.try_get("currency")?,
+                }));
+            }
+        }
+        let terminal =
+            payload["operational_terminal"].is_object() || !payload["completed_at"].is_null();
+        let status = if !terminal {
+            "pending"
+        } else if payload["status_code"]
+            .as_i64()
+            .is_some_and(|status| (200..400).contains(&status))
+            && payload["error_code"].as_str().is_none_or(str::is_empty)
+        {
+            "success"
+        } else {
+            "error"
+        };
+        let sql = match identity.source.as_str() {
+            "native" => {
+                "SELECT CASE WHEN completed_at IS NOT NULL AND protocol != 'audio-transcription' THEN input_tokens ELSE 0 END AS input_tokens, CASE WHEN completed_at IS NOT NULL AND protocol != 'audio-transcription' THEN output_tokens ELSE 0 END AS output_tokens, CASE WHEN completed_at IS NOT NULL THEN cache_known_read_tokens ELSE NULL END AS cache_known_read_tokens, CASE WHEN completed_at IS NOT NULL THEN cache_known_input_tokens ELSE NULL END AS cache_known_input_tokens, CASE WHEN completed_at IS NOT NULL THEN cost_micros ELSE NULL END AS cost_micros, currency FROM request_records WHERE id = $1 AND tenant_id = $2 AND key_id = $3 AND created_at = $4"
+            }
+            "generation" => {
+                "SELECT CAST(0 AS BIGINT) AS input_tokens, CAST(0 AS BIGINT) AS output_tokens, CAST(NULL AS BIGINT) AS cache_known_read_tokens, CAST(NULL AS BIGINT) AS cache_known_input_tokens, cost_micros, currency FROM generation_stats_facts WHERE job_id = $1 AND tenant_id = $2 AND key_id = $3 AND created_at = $4"
+            }
+            _ => return Ok(None),
+        };
+        let row = sqlx::query(sqlx::AssertSqlSafe(sql))
+            .bind(identity.request_id.to_string())
+            .bind(identity.tenant_id.to_string())
+            .bind(identity.key_id.to_string())
+            .bind(identity.created_at)
+            .fetch_optional(&mut **transaction)
             .await?;
         if let Some(row) = row {
             Ok(Some(HistoryStatistics {

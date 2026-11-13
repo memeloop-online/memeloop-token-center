@@ -108,6 +108,23 @@ pub(super) fn is_conversation_root_location(location: &str) -> bool {
     )
 }
 
+pub(super) fn is_history_root_location(location: &str) -> bool {
+    let mut segments = location.split('/');
+    matches!(
+        (
+            segments.next(),
+            segments.next(),
+            segments.next(),
+            segments.next()
+        ),
+        (Some("tenants"), Some(_), Some("history"), Some("v1"))
+    )
+}
+
+pub(super) fn is_durable_root_location(location: &str) -> bool {
+    is_conversation_root_location(location) || is_history_root_location(location)
+}
+
 pub(super) fn may_include_v1_cas_location(location: &str) -> bool {
     let location = if let Some(rest) = location.strip_prefix(super::routing::PREFIX) {
         let Some((_, key)) = rest.split_once('/') else {
@@ -126,7 +143,7 @@ pub(super) fn may_include_v1_cas_location(location: &str) -> bool {
     }
     matches!(
         segments.next(),
-        None | Some("cas" | "raw" | "conversations")
+        None | Some("cas" | "raw" | "conversations" | "history")
     )
 }
 
