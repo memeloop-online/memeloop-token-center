@@ -165,8 +165,17 @@ async fn authenticated_body_admission_failure_has_no_supplier_or_reservation() {
     // Budget pressure now waits. Poll the real route while the owner holds
     // every credit, then cancel it without releasing that owner's budget.
     let mut cancelled = Box::pin(reject_without_candidates(&fixture));
-    assert!(futures_util::poll!(&mut cancelled).is_pending());
+    futures_util::future::poll_fn(|context| {
+        assert!(std::future::Future::poll(cancelled.as_mut(), context).is_pending());
+        if fixture.state.proxy_lifecycles.active() == 1 {
+            std::task::Poll::Ready(())
+        } else {
+            std::task::Poll::Pending
+        }
+    })
+    .await;
     drop(cancelled);
+    assert_eq!(fixture.state.proxy_lifecycles.active(), 0);
     let reservations: i64 =
         sqlx::query_scalar("SELECT COUNT(*) FROM usage_reservations WHERE key_id = $1")
             .bind(fixture.key_id.to_string())
@@ -179,10 +188,18 @@ async fn authenticated_body_admission_failure_has_no_supplier_or_reservation() {
     );
     assert_eq!(
         fixture.state.proxy_memory_budget.snapshot().0,
-        fixture.state.config.proxy_memory_budget_bytes
+        fixture.state.config.proxy_memory_budget_bytes as usize
     );
     let mut waiting = Box::pin(reject_without_candidates(&fixture));
-    assert!(futures_util::poll!(&mut waiting).is_pending());
+    futures_util::future::poll_fn(|context| {
+        assert!(std::future::Future::poll(waiting.as_mut(), context).is_pending());
+        if fixture.state.proxy_lifecycles.active() == 1 {
+            std::task::Poll::Ready(())
+        } else {
+            std::task::Poll::Pending
+        }
+    })
+    .await;
     let rows = fixture
         .state
         .db
