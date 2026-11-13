@@ -590,12 +590,24 @@ impl Database {
                             .clone()
                             .ok_or(HistoryError::Invalid("immutable native payload"))?,
                     )?;
-                    let archive = if identity.source == "native" {
+                    let mut archive = if identity.source == "native" {
                         self.resolve_raw_archive_roots(identity.tenant_id, archive)
                             .await?
                     } else {
                         archive
                     };
+                    // Match source history_snapshot: raw-root availability
+                    // enriches private archive refs, not the SQL canonical
+                    // archive_state. Public list enrichment adds only a
+                    // supplier summary for errors.
+                    let mut canonical: crate::model::RequestView =
+                        serde_json::from_value(payload.clone().ok_or(HistoryError::Mismatch)?)?;
+                    if identity.source == "native"
+                        && canonical.status_code.is_some_and(|status| status >= 400)
+                    {
+                        canonical.supplier_error = archive.view.supplier_error.clone();
+                    }
+                    archive.view = canonical;
                     payload = Some(serde_json::to_value(&archive.view)?);
                     read_model["archive"] = serde_json::to_value(archive)?;
                 } else if let Some(payload) = &mut payload
@@ -703,7 +715,9 @@ mod tests {
         wrong_payload.filter_cost_micros = Some(0);
         db.history_acknowledge(&[wrong_payload]).await.unwrap();
         assert_eq!(db.history_pending_count().await.unwrap(), 2);
-        db.history_acknowledge(&[first.clone()]).await.unwrap();
+        db.history_acknowledge(std::slice::from_ref(&first))
+            .await
+            .unwrap();
         db.history_acknowledge(&[first]).await.unwrap();
         assert_eq!(db.history_pending_count().await.unwrap(), 1);
         db.pool.close().await;
