@@ -94,8 +94,15 @@ export function RequestsPage({ token, tenant, writeTenant = tenant, liveEvents, 
   const refreshedTerminalEvent = useRef<string | undefined>(undefined);
   // Gate during render: effects must not expose a previous credential/tenant's
   // detail for even the first commit after a scope change.
-  const detail = detailResult?.token === token && detailResult.tenant === tenant
+  const scopedDetail = detailResult?.token === token && detailResult.tenant === tenant
     && detailResult.requestId === selectedRequestId.current ? detailResult.value : undefined;
+  // The drawer retains its loaded body and selection, while sharing the row's
+  // latest observations after either a manual refresh or terminal hydration.
+  const visibleDetailRow = scopedDetail && requests.find(row => row.request_id === scopedDetail.request_id);
+  const detailObservations = scopedDetail && mergeRequestObservations(visibleDetailRow ?? scopedDetail, scopedDetail);
+  const detail = scopedDetail && detailObservations ? {
+    ...scopedDetail, egress: detailObservations.egress, session_context: detailObservations.session_context,
+  } : undefined;
   // The initial snapshot and the live stream resolve independently. Keep the
   // latest event map available to an in-flight snapshot so an event received
   // before the snapshot completes cannot be overwritten by that stale result.
