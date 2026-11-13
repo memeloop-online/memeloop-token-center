@@ -142,7 +142,10 @@ test('independent proxy save updates concurrency metadata without dropping the p
       assert.equal(await row.locator('[data-manage-account-trigger]').evaluate(button => button === document.activeElement), true);
     }
     await row.getByRole('button', { name: '管理账号', exact: true }).click();
-    await page.getByLabel(/^固定出口\s*\*?$/).selectOption('exit-20');
+    const detailProxy = page.locator('.provider-detail-workspace').getByLabel(/^固定出口\s*\*?$/);
+    await detailProxy.focus();
+    await detailProxy.selectOption('exit-20');
+    assert.equal(await detailProxy.evaluate(control => control === document.activeElement), true, 'editing a proxy draft keeps focus on its control');
     assert.equal(await page.locator('.provider-detail-workspace').getByRole('button', { name: '返回账号列表', exact: true }).isEnabled(), false);
     assert.equal(await page.locator('.provider-detail-workspace').getByRole('button', { name: '编辑', exact: true }).isEnabled(), false);
     await page.locator('.network-proxy-policy-workspace').getByRole('button', { name: '取消修改', exact: true }).click();

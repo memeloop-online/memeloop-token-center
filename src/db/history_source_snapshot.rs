@@ -393,6 +393,14 @@ mod tests {
         let request = Uuid::now_v7();
         let key = Uuid::now_v7();
         let tenant = Uuid::now_v7();
+        // The canonical operator view joins the real tenant directory.
+        sqlx::query("INSERT INTO tenants (id,external_id,created_at) VALUES ($1,$2,$3)")
+            .bind(tenant.to_string())
+            .bind(format!("baseline-{tenant}"))
+            .bind(chrono::Utc::now().timestamp_millis())
+            .execute(&database.pool)
+            .await
+            .unwrap();
         database
             .record_request_started(NewRequest {
                 request_id: request,

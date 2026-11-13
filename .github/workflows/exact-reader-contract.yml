@@ -14,6 +14,10 @@ on:
           - e2db-raw
           - staging-155
           - next-release
+          - admission-cancel
+          - quota-outage
+          - conversation-812
+          - release-927-928
 permissions:
   contents: read
 jobs:
@@ -187,3 +191,105 @@ jobs:
           run_exact api::proxy::routing::http::inference_lifetime_tests::inference_real_truncated_body_is_still_an_error_and_never_replayed
           run_exact http_settings::factory::inference_policy_tests::inference_total_deadline_policy_is_cache_isolated_from_control_requests
           run_exact http_settings::factory::inference_policy_tests::inference_preserves_an_explicit_read_inactivity_policy
+  admission-quota-contract:
+    if: inputs.contract == 'admission-cancel' || inputs.contract == 'quota-outage'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+    steps:
+      - name: Require an exact source commit
+        env:
+          SOURCE_REVISION: ${{ inputs.source_revision }}
+        run: '[[ "$SOURCE_REVISION" =~ ^[0-9a-f]{40}$ ]]'
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+        with:
+          ref: ${{ inputs.source_revision }}
+          persist-credentials: false
+      - name: Record checked-out source
+        run: git rev-parse HEAD
+      - uses: dtolnay/rust-toolchain@4360b52568e2003a75bf9bc1d59f33a8e3fc893c
+        with:
+          toolchain: 1.95.0
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6
+      - uses: ./.github/actions/checkout-plugin-examples
+      - name: Verify admission cancellation
+        if: inputs.contract == 'admission-cancel'
+        run: |
+          set -o pipefail
+          cargo test --locked --lib api::proxy::tests::early_terminal::authenticated_body_admission_failure_has_no_supplier_or_reservation -- --exact 2>&1 | tee /tmp/admission-contract.log
+          grep -F '1 passed; 0 failed' /tmp/admission-contract.log
+          cargo test --locked --lib db::request_pool::tests::cancelled_executor_wait_sends_no_sql_and_closed_pool_is_not_retried -- --exact 2>&1 | tee /tmp/cancel-contract.log
+          grep -F '1 passed; 0 failed' /tmp/cancel-contract.log
+      - name: Verify quota outage recovery
+        if: inputs.contract == 'quota-outage'
+        run: |
+          set -o pipefail
+          cargo test --locked --lib upstream_quota::reset::tests::accepted_receipt_survives_database_outage_without_supplier_replay -- --exact 2>&1 | tee /tmp/quota-contract.log
+          grep -F '1 passed; 0 failed' /tmp/quota-contract.log
+  conversation-812-contract:
+    if: inputs.contract == 'conversation-812'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+    steps:
+      - name: Require an exact source commit
+        env:
+          SOURCE_REVISION: ${{ inputs.source_revision }}
+        run: '[[ "$SOURCE_REVISION" =~ ^[0-9a-f]{40}$ ]]'
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+        with:
+          ref: ${{ inputs.source_revision }}
+          persist-credentials: false
+      - uses: ./.github/actions/checkout-plugin-examples
+      - uses: dtolnay/rust-toolchain@4360b52568e2003a75bf9bc1d59f33a8e3fc893c
+        with:
+          toolchain: 1.95.0
+      - name: Verify both exact conversation contracts
+        run: |
+          set -o pipefail
+          git rev-parse HEAD
+          cargo test --locked --lib api::operator_inference::tests::control_responses_preserves_image_generation_and_archives_the_conversation -- --exact 2>&1 | tee /tmp/contract-812-a.log
+          grep -F '1 passed; 0 failed' /tmp/contract-812-a.log
+          cargo test --locked --lib api::operator_inference::tests::control_responses_streams_image_events_and_archives_usage_and_conversation -- --exact 2>&1 | tee /tmp/contract-812-b.log
+          grep -F '1 passed; 0 failed' /tmp/contract-812-b.log
+  release-927-928-contract:
+    if: inputs.contract == 'release-927-928'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+    env:
+      MTC_TEST_POSTGRES_URL: postgres://token_center:token_center@127.0.0.1:5432/memeloop_token_center_test
+    services:
+      postgres:
+        image: postgres:16-alpine
+        env:
+          POSTGRES_USER: token_center
+          POSTGRES_PASSWORD: token_center
+          POSTGRES_DB: memeloop_token_center_test
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd pg_isready
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 5
+    steps:
+      - name: Require an exact source commit
+        env:
+          SOURCE_REVISION: ${{ inputs.source_revision }}
+        run: '[[ "$SOURCE_REVISION" =~ ^[0-9a-f]{40}$ ]]'
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+        with:
+          ref: ${{ inputs.source_revision }}
+          persist-credentials: false
+      - uses: ./.github/actions/checkout-plugin-examples
+      - uses: dtolnay/rust-toolchain@4360b52568e2003a75bf9bc1d59f33a8e3fc893c
+        with:
+          toolchain: 1.95.0
+      - name: Verify exact release contracts
+        run: |
+          set -o pipefail
+          git rev-parse HEAD
+          cargo test --locked --lib db::requests::conversations::archive_readiness_tests::sqlite_identity_scheduler_bounds_pages_and_revisits_delayed_evidence -- --exact 2>&1 | tee /tmp/release-927-sqlite.log
+          grep -F '1 passed; 0 failed' /tmp/release-927-sqlite.log
+          cargo test --locked --lib db::requests::conversations::archive_readiness_tests::postgres_identity_scheduler_bounds_pages_and_revisits_delayed_evidence -- --exact 2>&1 | tee /tmp/release-927-pg.log
+          grep -F '1 passed; 0 failed' /tmp/release-927-pg.log
+          cargo test --locked --all-features --lib db::request_history::bootstrap::tests::request_history_real_services_acceptance_bootstrap_partial_recovery_and_activation_barrier -- --ignored --exact --nocapture 2>&1 | tee /tmp/release-928.log
+          grep -F '1 passed; 0 failed' /tmp/release-928.log
