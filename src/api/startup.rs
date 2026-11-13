@@ -98,7 +98,7 @@ fn degraded_router(role: RuntimeRole, code: &'static str, message: &str, root: P
     let mut app = Router::new()
         .route("/livez", get(liveness))
         .route("/healthz", get(deprecated_health))
-        .route("/initializedz", get(unavailable.clone()))
+        .route("/startupz", get(unavailable.clone()))
         .route("/readyz", get(unavailable.clone()))
         .route("/ui-assets/service-status", get(unavailable.clone()))
         .route("/ui-assets/{*path}", get(asset))
@@ -189,7 +189,7 @@ mod tests {
             );
             assert_eq!(call(&app, "GET", "/livez").await.status(), StatusCode::OK);
             for path in [
-                "/initializedz",
+                "/startupz",
                 "/readyz",
                 "/ui-assets/service-status",
                 "/internal/v1/keys",
@@ -233,7 +233,7 @@ mod tests {
         );
         assert_eq!(call(&app, "GET", "/livez").await.status(), StatusCode::OK);
         assert_eq!(
-            call(&app, "GET", "/initializedz").await.status(),
+            call(&app, "GET", "/startupz").await.status(),
             StatusCode::SERVICE_UNAVAILABLE
         );
         let (state, _directory) = super::super::tests::test_state().await;
@@ -244,14 +244,14 @@ mod tests {
             StatusCode::UNAUTHORIZED
         );
         assert_eq!(
-            call(&app, "GET", "/initializedz").await.status(),
+            call(&app, "GET", "/startupz").await.status(),
             StatusCode::OK
         );
         assert_eq!(call(&app, "GET", "/livez").await.status(), StatusCode::OK);
         assert_eq!(call(&app, "GET", "/readyz").await.status(), StatusCode::OK);
         database.pool.close().await;
         assert_eq!(
-            call(&app, "GET", "/initializedz").await.status(),
+            call(&app, "GET", "/startupz").await.status(),
             StatusCode::OK
         );
         assert_eq!(call(&app, "GET", "/livez").await.status(), StatusCode::OK);
