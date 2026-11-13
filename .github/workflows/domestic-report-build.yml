@@ -9,23 +9,39 @@ jobs:
     runs-on: ubuntu-24.04
     timeout-minutes: 45
     steps:
-      - name: Fetch exact private website revision
+      - name: Restore verified source from encrypted secrets
         env:
-          REPORT_USER: ${{ secrets.REPORT_FORGEJO_USER }}
-          REPORT_PASSWORD: ${{ secrets.REPORT_FORGEJO_PASSWORD }}
+          REPORT_PART_00: ${{ secrets.RELEASE_REPORT_PART_00 }}
+          REPORT_PART_01: ${{ secrets.RELEASE_REPORT_PART_01 }}
+          REPORT_PART_02: ${{ secrets.RELEASE_REPORT_PART_02 }}
+          REPORT_PART_03: ${{ secrets.RELEASE_REPORT_PART_03 }}
+          REPORT_PART_04: ${{ secrets.RELEASE_REPORT_PART_04 }}
+          REPORT_PART_05: ${{ secrets.RELEASE_REPORT_PART_05 }}
+          REPORT_PART_06: ${{ secrets.RELEASE_REPORT_PART_06 }}
+          REPORT_PART_07: ${{ secrets.RELEASE_REPORT_PART_07 }}
+          REPORT_PART_08: ${{ secrets.RELEASE_REPORT_PART_08 }}
+          REPORT_PART_09: ${{ secrets.RELEASE_REPORT_PART_09 }}
+          REPORT_PART_10: ${{ secrets.RELEASE_REPORT_PART_10 }}
+          REPORT_PART_11: ${{ secrets.RELEASE_REPORT_PART_11 }}
+          REPORT_PART_12: ${{ secrets.RELEASE_REPORT_PART_12 }}
+          REPORT_PART_13: ${{ secrets.RELEASE_REPORT_PART_13 }}
+          REPORT_PART_14: ${{ secrets.RELEASE_REPORT_PART_14 }}
+          REPORT_PART_15: ${{ secrets.RELEASE_REPORT_PART_15 }}
+          REPORT_PART_16: ${{ secrets.RELEASE_REPORT_PART_16 }}
+          REPORT_PART_17: ${{ secrets.RELEASE_REPORT_PART_17 }}
+          REPORT_PART_18: ${{ secrets.RELEASE_REPORT_PART_18 }}
         run: |
           set -euo pipefail
-          test -n "$REPORT_USER" && test -n "$REPORT_PASSWORD"
-          auth=$(printf '%s:%s' "$REPORT_USER" "$REPORT_PASSWORD" | base64 -w0)
-          echo "::add-mask::$auth"
-          export GIT_CONFIG_COUNT=1 GIT_CONFIG_KEY_0=http.extraHeader
-          export GIT_CONFIG_VALUE_0="Authorization: Basic $auth"
-          git init website-source
-          git -C website-source remote add origin https://git.k3s.onetwo.website/website/domestic-model-report.git
-          git -C website-source fetch --depth=1 origin 69006304f110e1d3f255998bb49c024b44068184
-          git -C website-source checkout --detach FETCH_HEAD
-          test "$(git -C website-source rev-parse HEAD)" = 69006304f110e1d3f255998bb49c024b44068184
-          unset GIT_CONFIG_VALUE_0 auth REPORT_USER REPORT_PASSWORD
+          umask 077
+          for i in $(seq -w 0 18); do
+            name="REPORT_PART_$i"
+            test -n "${!name}"
+            printf '%s' "${!name}"
+          done | base64 -d > "$RUNNER_TEMP/report-source.tar.gz"
+          echo '40e7d4a9bbd8000296c39c9f0fb4e3cb0f7f99be0ac3eb1c4811676120a0a488  '"$RUNNER_TEMP/report-source.tar.gz" | sha256sum --check
+          mkdir -p website-source
+          tar -xzf "$RUNNER_TEMP/report-source.tar.gz" --strip-components=1 -C website-source
+          rm -f "$RUNNER_TEMP/report-source.tar.gz"
       - uses: docker/setup-buildx-action@8d2750c68a42422c14e847fe6c8ac0403b4cbd6f
       - uses: docker/login-action@c94ce9fb468520275223c153574b00df6fe4bcc9
         with:
