@@ -447,12 +447,28 @@ pub(super) async fn capture_request_in_transaction(
     Ok(())
 }
 
+/// Ownership is immutable; revisions share the existing export sequence domain.
+/// Keeping only the head and last receipt does not duplicate historical payloads.
+pub(super) async fn capture_identity_in_transaction(
+    transaction: &mut Transaction<'_, Any>,
+    identity: &crate::request_history::HistoryIdentity,
+    revision: i64,
+) -> Result<(), AppError> {
+    let changed = sqlx::query("INSERT INTO request_history_identities (source,request_id,tenant_id,key_id,created_at,head_revision) VALUES ($1,$2,$3,$4,$5,$6) ON CONFLICT(source,request_id) DO UPDATE SET head_revision=CASE WHEN excluded.head_revision>request_history_identities.head_revision THEN excluded.head_revision ELSE request_history_identities.head_revision END WHERE request_history_identities.tenant_id=excluded.tenant_id AND request_history_identities.key_id=excluded.key_id AND request_history_identities.created_at=excluded.created_at")
+        .bind(&identity.source).bind(identity.request_id.to_string()).bind(identity.tenant_id.to_string()).bind(identity.key_id.to_string()).bind(identity.created_at).bind(revision).execute(&mut **transaction).await?;
+    if changed.rows_affected() != 1 {
+        return Err(AppError::storage("history_identity_changed"));
+    }
+    Ok(())
+}
+
 async fn insert_envelope_in_transaction(
     transaction: &mut Transaction<'_, Any>,
     identity: &crate::request_history::HistoryIdentity,
     revision: i64,
     envelope: &Value,
 ) -> Result<(), AppError> {
+    capture_identity_in_transaction(transaction, identity, revision).await?;
     let frozen = serde_json::to_string(envelope)
         .map_err(|_| AppError::storage("history_envelope_serialization"))?;
     let stored:String=sqlx::query_scalar("INSERT INTO request_history_immutable_outbox (revision,source,request_id,tenant_id,key_id,created_at,snapshot) VALUES ($1,$2,$3,$4,$5,$6,$7) ON CONFLICT(revision) DO UPDATE SET snapshot=request_history_immutable_outbox.snapshot RETURNING snapshot")
@@ -663,6 +679,109 @@ impl Database {
 mod tests {
     use super::*;
     use crate::request_history::{HistoryIdentity, HistorySnapshot};
+
+    async fn compact_identity_receipt_contract(database: &Database) {
+        database.migrate().await.unwrap();
+        let identity = HistoryIdentity {
+            source: "event".into(),
+            request_id: Uuid::now_v7(),
+            tenant_id: Uuid::now_v7(),
+            key_id: Uuid::now_v7(),
+            created_at: 42,
+        };
+        let mut transaction = database.pool.begin().await.unwrap();
+        capture_identity_in_transaction(&mut transaction, &identity, 5)
+            .await
+            .unwrap();
+        capture_identity_in_transaction(&mut transaction, &identity, 3)
+            .await
+            .unwrap();
+        transaction.commit().await.unwrap();
+        assert_eq!(
+            database
+                .history_identity_for_view(identity.request_id)
+                .await
+                .unwrap(),
+            identity
+        );
+        let mut wrong = identity.clone();
+        wrong.tenant_id = Uuid::now_v7();
+        let mut transaction = database.pool.begin().await.unwrap();
+        assert!(
+            capture_identity_in_transaction(&mut transaction, &wrong, 6)
+                .await
+                .is_err()
+        );
+        transaction.rollback().await.unwrap();
+        let snapshot = HistorySnapshot {
+            identity: identity.clone(),
+            revision: 3,
+            payload: None,
+            read_model: Value::Null,
+            statistics: None,
+            filter_cost_micros: None,
+        };
+        let frozen = serde_json::to_string(&snapshot).unwrap();
+        sqlx::query("INSERT INTO request_history_immutable_outbox (revision,source,request_id,tenant_id,key_id,created_at,snapshot,delivery_snapshot) VALUES (3,$1,$2,$3,$4,42,'{}',$5)")
+            .bind(&identity.source).bind(identity.request_id.to_string()).bind(identity.tenant_id.to_string()).bind(identity.key_id.to_string()).bind(frozen).execute(&database.pool).await.unwrap();
+        database
+            .history_acknowledge(std::slice::from_ref(&snapshot))
+            .await
+            .unwrap();
+        let row = sqlx::query("SELECT head_revision,acknowledged_revision,acknowledged_hash,tenant_id FROM request_history_identities WHERE source=$1 AND request_id=$2")
+            .bind(&identity.source).bind(identity.request_id.to_string()).fetch_one(&database.pool).await.unwrap();
+        assert_eq!(row.try_get::<i64, _>("head_revision").unwrap(), 5);
+        assert_eq!(row.try_get::<i64, _>("acknowledged_revision").unwrap(), 3);
+        assert_eq!(
+            row.try_get::<String, _>("tenant_id").unwrap(),
+            identity.tenant_id.to_string()
+        );
+        assert_eq!(
+            row.try_get::<String, _>("acknowledged_hash").unwrap(),
+            crate::request_history::canonical_hash(&snapshot).unwrap()
+        );
+        database
+            .history_acknowledge(std::slice::from_ref(&snapshot))
+            .await
+            .unwrap();
+        assert_eq!(database.history_pending_count().await.unwrap(), 0);
+    }
+
+    #[tokio::test]
+    async fn request_history_compact_identity_keeps_head_after_old_ack_and_rejects_scope_change() {
+        let directory = tempfile::tempdir().unwrap();
+        let database = Database::connect(&format!(
+            "sqlite://{}?mode=rwc",
+            directory.path().join("identity.sqlite").display()
+        ))
+        .await
+        .unwrap();
+        compact_identity_receipt_contract(&database).await;
+    }
+
+    #[tokio::test]
+    #[ignore = "existing CI supplies the real PostgreSQL service"]
+    async fn request_history_real_services_acceptance_compact_identity_receipt() {
+        let postgres = std::env::var("MTC_TEST_POSTGRES_URL").expect("PostgreSQL acceptance URL");
+        let admin = sqlx::PgPool::connect(&postgres).await.unwrap();
+        let schema = format!("history_identity_{}", Uuid::now_v7().simple());
+        sqlx::query(sqlx::AssertSqlSafe(format!("CREATE SCHEMA {schema}")))
+            .execute(&admin)
+            .await
+            .unwrap();
+        let mut isolated = url::Url::parse(&postgres).unwrap();
+        isolated
+            .query_pairs_mut()
+            .append_pair("options", &format!("-csearch_path={schema}"));
+        let database = Database::connect(isolated.as_str()).await.unwrap();
+        compact_identity_receipt_contract(&database).await;
+        database.close().await;
+        sqlx::query(sqlx::AssertSqlSafe(format!("DROP SCHEMA {schema} CASCADE")))
+            .execute(&admin)
+            .await
+            .unwrap();
+        admin.close().await;
+    }
 
     #[tokio::test]
     async fn immutable_history_delivery_survives_source_absence_restart_and_stale_ack() {

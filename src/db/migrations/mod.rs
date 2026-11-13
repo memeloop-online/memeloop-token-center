@@ -828,6 +828,11 @@ pub(crate) const SQLITE_MIGRATIONS: &[Migration] = &[
         name: "immutable history delivery envelope",
         sql: include_str!("../../../migrations/common/0156_immutable_history_outbox.sql"),
     },
+    Migration {
+        version: 157,
+        name: "compact history identity and delivery receipts",
+        sql: include_str!("../../../migrations/common/0157_history_identity_receipts.sql"),
+    },
 ];
 
 pub(crate) const POSTGRES_MIGRATIONS: &[Migration] = &[
@@ -1630,6 +1635,11 @@ pub(crate) const POSTGRES_MIGRATIONS: &[Migration] = &[
         version: 156,
         name: "immutable history delivery envelope",
         sql: include_str!("../../../migrations/common/0156_immutable_history_outbox.sql"),
+    },
+    Migration {
+        version: 157,
+        name: "compact history identity and delivery receipts",
+        sql: include_str!("../../../migrations/common/0157_history_identity_receipts.sql"),
     },
 ];
 
