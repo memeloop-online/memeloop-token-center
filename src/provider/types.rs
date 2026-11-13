@@ -61,6 +61,9 @@ pub struct AuthorizedUpstreamCandidate {
     pub route_id: Uuid,
     pub account_id: Uuid,
     pub(crate) driver: String,
+    // Freeze the selected mapping with its authorization snapshot. Native Chat
+    // admission sizes every candidate before credential materialization.
+    pub(crate) upstream_model: String,
     pub(crate) transport_revision: i64,
     pub(crate) credential_generation: i64,
 }

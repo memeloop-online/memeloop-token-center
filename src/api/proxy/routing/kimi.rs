@@ -7,6 +7,124 @@ use crate::api::{
 };
 use std::collections::VecDeque;
 
+/// Native Chat keeps the body in one cloned tree. Assistant repair can copy
+/// tool arguments/reasoning, so those histories still need adapter workspace.
+pub(super) fn reuses_chat_workspace(protocol: Protocol, request: &Value) -> bool {
+    matches!(protocol, Protocol::OpenAiChat)
+        && request
+            .get("messages")
+            .and_then(Value::as_array)
+            .is_some_and(|messages| {
+                messages.iter().all(|message| {
+                    match message.get("role").and_then(Value::as_str).map(str::trim) {
+                        Some("tool") => false,
+                        Some("assistant") => {
+                            message
+                                .get("tool_calls")
+                                .and_then(Value::as_array)
+                                .is_none_or(Vec::is_empty)
+                                && message
+                                    .get("reasoning_content")
+                                    .and_then(Value::as_str)
+                                    .is_none_or(|text| text.trim().is_empty())
+                        }
+                        _ => true,
+                    }
+                })
+            })
+}
+
+/// Prepay the actual metadata shape for every authorized native Chat model
+/// before any credential is materialized or forwarded tree is cloned.
+pub(super) fn candidate_shape(
+    protocol: Protocol,
+    request: &mut Value,
+    candidates: &[crate::provider::AuthorizedUpstreamCandidate],
+) -> Result<Option<(usize, usize)>, AppError> {
+    if !reuses_chat_workspace(protocol, request)
+        || !candidates
+            .iter()
+            .any(|candidate| candidate.driver == crate::oauth::managed::kimi::PROVIDER_DRIVER)
+    {
+        return Ok(None);
+    }
+    let streaming = request.get("stream").and_then(Value::as_bool) == Some(true);
+    if streaming
+        && request
+            .get("stream_options")
+            .is_some_and(|options| !options.is_object())
+    {
+        // Preserve candidate-local validation: malformed native-only options
+        // must not reject a healthy primary using another transport.
+        return Ok(None);
+    }
+    let source_shape = crate::gateway_body::memory::json_encoded_shape(request)?;
+    let original_model = request
+        .as_object_mut()
+        .unwrap()
+        .insert("model".into(), Value::Null);
+    let had_options = request.get("stream_options").is_some();
+    let original_usage = if streaming {
+        request
+            .as_object_mut()
+            .unwrap()
+            .entry("stream_options")
+            .or_insert_with(|| json!({}))
+            .as_object_mut()
+            .unwrap()
+            .insert("include_usage".into(), Value::Bool(true))
+    } else {
+        None
+    };
+    let result = (|| {
+        let base = crate::gateway_body::memory::json_encoded_shape(request)?;
+        let mut required = source_shape;
+        for candidate in candidates
+            .iter()
+            .filter(|candidate| candidate.driver == crate::oauth::managed::kimi::PROVIDER_DRIVER)
+        {
+            let model = Value::String(crate::api::kimi_transport::normalize_model(
+                &candidate.upstream_model,
+            ));
+            let model_shape = crate::gateway_body::memory::json_encoded_shape(&model)?;
+            let bytes = base
+                .0
+                .checked_sub(4)
+                .and_then(|bytes| bytes.checked_add(model_shape.0))
+                .ok_or_else(|| AppError::internal("native_chat_metadata_shape"))?;
+            let nodes = base
+                .1
+                .checked_sub(1)
+                .and_then(|nodes| nodes.checked_add(model_shape.1))
+                .ok_or_else(|| AppError::internal("native_chat_metadata_shape"))?;
+            required.0 = required.0.max(bytes);
+            required.1 = required.1.max(nodes);
+        }
+        Ok(Some(required))
+    })();
+    let object = request.as_object_mut().unwrap();
+    object.remove("model");
+    if let Some(model) = original_model {
+        object.insert("model".into(), model);
+    }
+    if streaming {
+        if had_options {
+            let options = object
+                .get_mut("stream_options")
+                .unwrap()
+                .as_object_mut()
+                .unwrap();
+            options.remove("include_usage");
+            if let Some(usage) = original_usage {
+                options.insert("include_usage".into(), usage);
+            }
+        } else {
+            object.remove("stream_options");
+        }
+    }
+    result
+}
+
 pub(super) fn prepare_forwarded_request(
     route: &ResolvedUpstream,
     protocol: Protocol,

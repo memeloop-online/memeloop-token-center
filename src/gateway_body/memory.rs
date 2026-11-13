@@ -196,6 +196,11 @@ impl Drop for SseStreamingMemory {
 }
 
 impl ProxyMemoryReservation {
+    pub(crate) fn covers_json_shape(&self, bytes: usize, nodes: usize) -> bool {
+        self.request_json_reserved_bytes() > 0
+            && bytes <= self.json_body_ceiling.load(Ordering::Acquire)
+            && nodes <= self.json_node_ceiling.load(Ordering::Acquire)
+    }
     pub(crate) fn borrow_route_workspace(
         self: &Arc<Self>,
         bytes: usize,
@@ -757,6 +762,35 @@ pub(crate) fn bounded_json_fits(bytes: &[u8], budget: usize) -> bool {
         <= budget
 }
 
+pub(crate) fn json_encoded_shape(
+    value: &serde_json::Value,
+) -> Result<(usize, usize), crate::error::AppError> {
+    struct Count {
+        bytes: usize,
+        scanner: JsonMemoryScanner,
+    }
+    impl std::io::Write for Count {
+        fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+            self.bytes = self
+                .bytes
+                .checked_add(bytes.len())
+                .ok_or_else(|| std::io::Error::other("JSON size overflow"))?;
+            self.scanner.observe(bytes);
+            Ok(bytes.len())
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+    let mut count = Count {
+        bytes: 0,
+        scanner: JsonMemoryScanner::default(),
+    };
+    serde_json::to_writer(&mut count, value)
+        .map_err(|_| crate::error::AppError::internal("memory_flush_1"))?;
+    Ok((count.bytes, count.scanner.observe(&[])))
+}
+
 pub(crate) fn json_encoded_length(
     value: &serde_json::Value,
 ) -> Result<usize, crate::error::AppError> {
@@ -782,6 +816,24 @@ pub(crate) fn json_encoded_length(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn encoded_shape_matches_the_captured_json_scanner() {
+        for value in [
+            serde_json::json!({"model":"escaped \"model\"", "stream":true}),
+            serde_json::json!({"messages":[{"role":"user","content":"large unicode正文"}],
+                "stream_options":{"include_usage":true}}),
+        ] {
+            let encoded = serde_json::to_vec(&value).unwrap();
+            assert_eq!(
+                json_encoded_shape(&value).unwrap(),
+                (
+                    encoded.len(),
+                    JsonMemoryScanner::default().observe(&encoded)
+                )
+            );
+        }
+    }
 
     #[test]
     fn route_workspace_borrows_one_prepaid_copy_without_a_second_charge() {
