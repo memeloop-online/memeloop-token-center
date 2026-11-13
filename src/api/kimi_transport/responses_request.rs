@@ -1814,7 +1814,7 @@ mod owned_input_tests {
             "input":[
                 {"role":"user","content":[
                     {"type":"input_text","text":"u".repeat(16384)},
-                    {"type":"input_image","image_url":format!("data:image/png;base64,{}", "a".repeat(16384)),"detail":"original"}
+                    {"type":"input_image","image_url":format!("data:image/png;base64,{}", "a".repeat(16384)),"detail":"high"}
                 ]},
                 {"type":"function_call","name":"inspect","call_id":"call-1","arguments":format!("{{\"code\":\"{}\"}}", "c".repeat(16384))},
                 {"type":"function_call_output","call_id":"call-1","output":"o".repeat(16384)},
