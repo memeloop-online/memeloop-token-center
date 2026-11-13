@@ -2851,7 +2851,7 @@ async fn execute_component_provider(
     // The component chooses the HTTP method. Treat every prepared operation
     // as non-replayable unless a future adapter contract proves otherwise.
     let outbound_http = match network::client_for_config_url_no_retry(
-        &request.state.http,
+        &crate::http_settings::inference(&request.state.http),
         &target,
         config,
         credential.proxy(),
@@ -2870,23 +2870,9 @@ async fn execute_component_provider(
             .await;
         }
     };
-    let timeout = match super::traffic::configured_http_timeout(config) {
-        Ok(timeout) => timeout,
-        Err(_) => {
-            return finish_component_provider_failure(
-                &request,
-                Some("component_request_timeout"),
-                "provider_invalid_config",
-            )
-            .await;
-        }
-    };
     let mut upstream_request = outbound_http
         .request(prepared.method, target)
         .body(prepared.body);
-    if let Some(timeout) = timeout {
-        upstream_request = upstream_request.timeout(timeout);
-    }
     for (name, value) in prepared.headers {
         let name = match reqwest::header::HeaderName::from_bytes(name.as_bytes()) {
             Ok(name) => name,
