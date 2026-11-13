@@ -97,7 +97,7 @@ test('upstream themes and mock-only quota demand, consent and reconciliation con
     await view.waitFor();
     assert.deepEqual(await page.evaluate(() => [window.quotaReads, window.quotaWrites]), [0, 0]);
     await view.click();
-    await page.getByText('Codex usage · 5-hour limit', { exact: true }).waitFor();
+    await page.locator('.upstream-quota-windows').getByText('Codex usage · 5-hour limit', { exact: true }).waitFor();
     assert.equal(await page.getByRole('region', { name: 'Quota reset', exact: true }).count(), 1, 'one flat reset section owns explanation and action');
     const reset = page.getByRole('button', { name: 'Reset upstream quota', exact: true });
     await page.waitForFunction(() => window.quotaCurrents === 1 && !document.querySelector<HTMLButtonElement>('.upstream-quota-reset-action button')?.disabled);
@@ -195,7 +195,7 @@ test('upstream themes and mock-only quota demand, consent and reconciliation con
       await view.click();
       await page.getByRole('alert').getByText(message, { exact: true }).waitFor();
       if (mode !== 'permission') {
-        await page.getByText('Codex usage · 5-hour limit', { exact: true }).waitFor();
+        await page.locator('.upstream-quota-windows').getByText('Codex usage · 5-hour limit', { exact: true }).waitFor();
         await page.getByText(/This refresh failed\. The values below are the last successful observation from .+ and may be outdated\. Retry manually for current quota\./).waitFor();
         assert.equal(await page.getByRole('meter').count(), 1);
       }
