@@ -540,6 +540,181 @@ async fn postgres_declared_identity_is_readable_while_body_is_pending() {
     isolated.cleanup().await;
 }
 
+async fn seed_identity_page_task(fixture: &Fixture, id: Uuid, session: Option<&str>, ready: bool) {
+    let hints = serde_json::to_string(&ConversationHints {
+        session_id: session.map(str::to_owned),
+        ..Default::default()
+    })
+    .unwrap();
+    sqlx::query("INSERT INTO conversation_projection_outbox (request_id, tenant_id, key_id, principal_id, request_json, hints_json, observed_at, key_snapshot_json, semantic_snapshot_json, lease_owner, lease_expires_at) SELECT $1, tenant_id, key_id, principal_id, '{}', $2, observed_at, key_snapshot_json, semantic_snapshot_json, 'terminal-v118', 9223372036854775807 FROM conversation_projection_outbox WHERE request_id = $3")
+        .bind(id.to_string()).bind(hints).bind(fixture.request_id.to_string()).execute(&fixture.state.db.pool).await.unwrap();
+    sqlx::query("INSERT INTO terminal_projection_outbox (request_id, reservation_id, tenant_id, key_id, account_id, created_at, completed_at, model, protocol, status_code, error_code, upstream_account_id, model_route_id, duration_ms, input_tokens, output_tokens, cached_input_tokens, cache_write_tokens, generation_units, billing_unit, service_tier, currency, cost_micros, usage_basis, session_id, response_object, projected_at) SELECT $1, $2, tenant_id, key_id, account_id, created_at, completed_at, model, protocol, status_code, error_code, upstream_account_id, model_route_id, duration_ms, input_tokens, output_tokens, cached_input_tokens, cache_write_tokens, generation_units, billing_unit, service_tier, currency, cost_micros, usage_basis, session_id, response_object, $3 FROM terminal_projection_outbox WHERE request_id = $4")
+        .bind(id.to_string()).bind(Uuid::now_v7().to_string()).bind(ready.then_some(1_i64)).bind(fixture.request_id.to_string()).execute(&fixture.state.db.pool).await.unwrap();
+}
+
+async fn identity_page_scheduler_contract(database_url: String) {
+    let fixture = Fixture::new(database_url, false).await;
+    let db = &fixture.state.db;
+    let base = 0x00000000000070008000000000000000_u128;
+    let id = |offset: u128| Uuid::from_u128(base + offset);
+    for index in 0..64_u128 {
+        seed_identity_page_task(&fixture, id(index * 2), None, true).await;
+    }
+    let ready_later = id(64);
+    sqlx::query("UPDATE conversation_projection_outbox SET hints_json = $1 WHERE request_id = $2")
+        .bind(
+            serde_json::to_string(&ConversationHints {
+                session_id: Some("later-ready".into()),
+                ..Default::default()
+            })
+            .unwrap(),
+        )
+        .bind(ready_later.to_string())
+        .execute(&db.pool)
+        .await
+        .unwrap();
+    sqlx::query("UPDATE terminal_projection_outbox SET projected_at = NULL WHERE request_id = $1")
+        .bind(ready_later.to_string())
+        .execute(&db.pool)
+        .await
+        .unwrap();
+    sqlx::query(
+        "UPDATE conversation_projection_outbox SET hints_json = '{invalid' WHERE request_id = $1",
+    )
+    .bind(id(100).to_string())
+    .execute(&db.pool)
+    .await
+    .unwrap();
+    sqlx::query("UPDATE conversation_projection_outbox SET hints_json = $1 WHERE request_id = $2")
+        .bind(
+            serde_json::to_string(&ConversationHints {
+                session_id: Some("latest-ready".into()),
+                ..Default::default()
+            })
+            .unwrap(),
+        )
+        .bind(fixture.request_id.to_string())
+        .execute(&db.pool)
+        .await
+        .unwrap();
+    let mut cursor = db
+        .project_declared_conversation_identity_pages(None, None, 8)
+        .await
+        .unwrap();
+    let count = |request: Uuid| async move {
+        sqlx::query_scalar::<_, i64>(
+            "SELECT COUNT(*) FROM conversation_observations WHERE request_id = $1",
+        )
+        .bind(request.to_string())
+        .fetch_one(&db.pool)
+        .await
+        .unwrap()
+    };
+    assert_eq!(
+        count(fixture.request_id).await,
+        1,
+        "cold startup must publish the latest identity ahead of old ineligible pages"
+    );
+    let live = id(u128::MAX - base - 1);
+    seed_identity_page_task(&fixture, live, Some("new-live"), true).await;
+    let previous_history = cursor.1.clone();
+    cursor = db
+        .project_declared_conversation_identity_pages(cursor.0.as_deref(), cursor.1.as_deref(), 8)
+        .await
+        .unwrap();
+    assert_eq!(
+        count(live).await,
+        1,
+        "live lane must advance while history remains"
+    );
+    assert!(
+        cursor.1 < previous_history,
+        "an ineligible history page must advance"
+    );
+    // Arrives behind the history cursor: only a later wrap can discover it.
+    let late = id(125);
+    seed_identity_page_task(&fixture, late, Some("late-insert"), true).await;
+    for _ in 0..10 {
+        cursor = db
+            .project_declared_conversation_identity_pages(
+                cursor.0.as_deref(),
+                cursor.1.as_deref(),
+                8,
+            )
+            .await
+            .unwrap();
+    }
+    assert_eq!(count(ready_later).await, 0);
+    sqlx::query("UPDATE terminal_projection_outbox SET projected_at = 1 WHERE request_id = $1")
+        .bind(ready_later.to_string())
+        .execute(&db.pool)
+        .await
+        .unwrap();
+    for _ in 0..80 {
+        cursor = db
+            .project_declared_conversation_identity_pages(
+                cursor.0.as_deref(),
+                cursor.1.as_deref(),
+                8,
+            )
+            .await
+            .unwrap();
+    }
+    assert_eq!(count(late).await, 1, "history wrap must revisit late IDs");
+    assert_eq!(
+        count(ready_later).await,
+        1,
+        "later readiness must be retried without changing its body lease"
+    );
+    assert_eq!(count(id(100)).await, 0, "bad metadata remains isolated");
+    let unchanged: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM conversation_projection_outbox WHERE attempts <> 0 OR lease_owner <> 'terminal-v118' OR lease_expires_at <> 9223372036854775807 OR projected_at IS NOT NULL OR terminal_lease_owner IS NOT NULL OR terminal_lease_expires_at IS NOT NULL")
+        .fetch_one(&db.pool).await.unwrap();
+    assert_eq!(
+        unchanged, 0,
+        "metadata scheduling cannot consume body ownership"
+    );
+    assert_eq!(count(fixture.request_id).await, 1);
+    assert_eq!(count(live).await, 1);
+    if matches!(db.backend, DatabaseBackend::PostgreSql) {
+        let mut transaction = db.pool.begin().await.unwrap();
+        // Tiny test databases may prefer a sequential scan. This checks the
+        // bounded PK range is available, not the production optimizer choice
+        // (which is recorded separately from read-only production EXPLAIN).
+        sqlx::query("SET LOCAL enable_seqscan = off")
+            .execute(&mut *transaction)
+            .await
+            .unwrap();
+        let plan: Vec<String> = sqlx::query_scalar("EXPLAIN (COSTS OFF) SELECT request_id FROM conversation_projection_outbox WHERE request_id > $1 ORDER BY request_id ASC LIMIT $2")
+            .bind(id(40).to_string()).bind(4_i64).fetch_all(&mut *transaction).await.unwrap();
+        let plan = plan.join("\n");
+        assert!(
+            plan.contains("Limit") && plan.contains("conversation_projection_outbox_pkey"),
+            "ID page must support the PK range: {plan}"
+        );
+        assert!(!plan.contains("Join") && !plan.contains("conversation_observations"));
+        transaction.rollback().await.unwrap();
+    }
+}
+
+#[tokio::test]
+async fn sqlite_identity_scheduler_bounds_pages_and_revisits_delayed_evidence() {
+    let directory = tempfile::tempdir().unwrap();
+    identity_page_scheduler_contract(format!(
+        "sqlite://{}?mode=rwc",
+        directory.path().join("identity-pages.db").display()
+    ))
+    .await;
+}
+
+#[tokio::test]
+async fn postgres_identity_scheduler_bounds_pages_and_revisits_delayed_evidence() {
+    let url = std::env::var("MTC_TEST_POSTGRES_URL")
+        .expect("identity scheduler regression requires CI PostgreSQL");
+    let isolated = PostgresTestDatabase::create(&url).await;
+    identity_page_scheduler_contract(isolated.url().to_owned()).await;
+    isolated.cleanup().await;
+}
+
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum ArchiveBeforeTerminal {
     Pending,
