@@ -786,7 +786,7 @@ pub(crate) fn json_encoded_shape(
     };
     serde_json::to_writer(&mut count, value)
         .map_err(|_| crate::error::AppError::internal("memory_flush_1"))?;
-    Ok((count.bytes, count.scanner.nodes))
+    Ok((count.bytes, count.scanner.observe(&[])))
 }
 
 pub(crate) fn json_encoded_length(
@@ -814,6 +814,24 @@ pub(crate) fn json_encoded_length(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn encoded_shape_matches_the_captured_json_scanner() {
+        for value in [
+            serde_json::json!({"model":"escaped \"model\"", "stream":true}),
+            serde_json::json!({"messages":[{"role":"user","content":"large unicode正文"}],
+                "stream_options":{"include_usage":true}}),
+        ] {
+            let encoded = serde_json::to_vec(&value).unwrap();
+            assert_eq!(
+                json_encoded_shape(&value).unwrap(),
+                (
+                    encoded.len(),
+                    JsonMemoryScanner::default().observe(&encoded)
+                )
+            );
+        }
+    }
 
     #[test]
     fn route_workspace_borrows_one_prepaid_copy_without_a_second_charge() {
