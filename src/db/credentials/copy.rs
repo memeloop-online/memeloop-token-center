@@ -47,6 +47,97 @@ impl Database {
         Ok(())
     }
 
+    /// Replace only the observed generation, preserving the key's identity and
+    /// request/account relationships. Existing admitted requests keep their owner.
+    pub async fn replace_key_credential_plaintext(
+        &self,
+        key_id: Uuid,
+        credential: &str,
+        expected_generation: i64,
+        pepper: &[u8],
+    ) -> Result<CopiedClientCredential, AppError> {
+        if expected_generation < 1
+            || credential.len() < 16
+            || credential.len() > 512
+            || credential.contains(['\0', '\r', '\n'])
+        {
+            return Err(AppError::BadRequest("credential is invalid".into()));
+        }
+        let mut tx = self.begin_write_transaction().await?;
+        let select = match self.backend {
+            DatabaseBackend::PostgreSql => {
+                "SELECT k.status, k.credential_generation, c.id AS credential_id, c.secret_hash FROM key_records k JOIN key_credentials c ON c.key_id = k.id AND c.generation = k.credential_generation AND c.revoked_at IS NULL WHERE k.id = $1 FOR UPDATE OF k"
+            }
+            DatabaseBackend::Sqlite => {
+                "SELECT k.status, k.credential_generation, c.id AS credential_id, c.secret_hash FROM key_records k JOIN key_credentials c ON c.key_id = k.id AND c.generation = k.credential_generation AND c.revoked_at IS NULL WHERE k.id = $1"
+            }
+        };
+        let row = sqlx::query(select)
+            .bind(key_id.to_string())
+            .fetch_optional(&mut *tx)
+            .await?
+            .ok_or(AppError::NotFound)?;
+        if row.try_get::<String, _>("status")? != "active" {
+            return Err(AppError::Forbidden);
+        }
+        let current_generation: i64 = row.try_get("credential_generation")?;
+        let current_hash: Vec<u8> = row.try_get("secret_hash")?;
+        let unchanged = crypto::verify_credential(credential, pepper, &current_hash);
+        // A lost response can be read back without rotating a second time.
+        let replay = unchanged && expected_generation.checked_add(1) == Some(current_generation);
+        if current_generation != expected_generation && !replay {
+            return Err(AppError::Conflict(
+                "credential generation changed; reload before saving".into(),
+            ));
+        }
+        let generation = if unchanged {
+            sqlx::query("UPDATE key_credentials SET secret_plaintext = $1 WHERE id = $2")
+                .bind(credential)
+                .bind(row.try_get::<String, _>("credential_id")?)
+                .execute(&mut *tx)
+                .await?;
+            current_generation
+        } else {
+            let generation = current_generation
+                .checked_add(1)
+                .ok_or_else(|| AppError::Conflict("credential generation is exhausted".into()))?;
+            let now = unix_millis();
+            let (hash, fingerprint) = crypto::hash_credential(credential, pepper);
+            // The global unique hash constraint also fences another key saving
+            // the same value concurrently. A conflict rolls back revocation.
+            sqlx::query("UPDATE key_credentials SET revoked_at = $1, secret_plaintext = NULL WHERE key_id = $2 AND revoked_at IS NULL")
+                .bind(now).bind(key_id.to_string()).execute(&mut *tx).await?;
+            let inserted = sqlx::query("INSERT INTO key_credentials (id, key_id, generation, secret_hash, fingerprint, secret_plaintext, created_at) VALUES ($1, $2, $3, $4, $5, $6, $7)")
+                .bind(Uuid::now_v7().to_string()).bind(key_id.to_string()).bind(generation).bind(hash).bind(fingerprint).bind(credential).bind(now).execute(&mut *tx).await;
+            if let Err(error) = inserted {
+                if error
+                    .as_database_error()
+                    .is_some_and(|error| error.is_unique_violation())
+                {
+                    return Err(AppError::Conflict(
+                        "credential value is already in use".into(),
+                    ));
+                }
+                return Err(error.into());
+            }
+            sqlx::query(
+                "UPDATE key_records SET credential_generation = $1, updated_at = $2 WHERE id = $3",
+            )
+            .bind(generation)
+            .bind(now)
+            .bind(key_id.to_string())
+            .execute(&mut *tx)
+            .await?;
+            generation
+        };
+        tx.commit().await?;
+        Ok(CopiedClientCredential {
+            key_id,
+            credential_generation: generation,
+            key: credential.to_owned(),
+        })
+    }
+
     /// Copy the stored original only while its generation is active, scoped to
     /// the caller's tenant, and still matches the authentication hash.
     pub async fn copy_key_credential(

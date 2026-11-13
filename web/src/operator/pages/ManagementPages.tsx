@@ -1,3 +1,4 @@
+import { ClientCredentialValueEditor } from '../ClientCredentialValueEditor';
 import { HealthProbeSettings } from '../HealthProbeSettings';
 import { useConfirmDialog } from '../../useConfirmDialog';
 import RjsfForm, { type FormProps } from '@rjsf/core/lib/components/Form.js';
@@ -1521,7 +1522,7 @@ function CredentialWorkspace({ token, tenant, writeTenant = tenant, createSchema
   }
   const [values, setValues] = useState<KeyView[]>([]);
   const [routes, setRoutes] = useState<ModelRouteView[]>([]);
-  type CredentialEditor = 'edit' | 'grant' | 'limits' | 'credential';
+  type CredentialEditor = 'edit' | 'grant' | 'limits';
   const [workspace, setWorkspace] = useState<{ kind: 'create' } | { kind: CredentialEditor; keyId: string }>();
   const activeEditorRegion = useRef<HTMLDivElement>(null);
   const editorGeneration = useRef(0);
@@ -1537,9 +1538,6 @@ function CredentialWorkspace({ token, tenant, writeTenant = tenant, createSchema
   }, [workspace, routingDraft]);
   const [aliasDrafts, setAliasDrafts] = useState<Record<string, string>>({});
   const [policyErrors, setPolicyErrors] = useState<Record<string, FormProps['extraErrors']>>({});
-  const editingCredential = workspace?.kind === 'credential' ? workspace.keyId : undefined;
-  const [credentialValue, setCredentialValue] = useState('');
-  const setEditingCredential = (keyId?: string) => { setCredentialValue(''); activateEditor('credential', keyId); };
   const [limitSnapshots, setLimitSnapshots] = useState<Record<string, KeyLimitSnapshot>>({});
   const granting = workspace?.kind === 'grant' ? workspace.keyId : undefined;
   const setGranting = (keyId?: string) => activateEditor('grant', keyId);
@@ -1679,7 +1677,7 @@ function CredentialWorkspace({ token, tenant, writeTenant = tenant, createSchema
   useEffect(() => {
     secretRequest.current?.abort(); secretRequest.current = undefined; secretOperation.current = undefined; secretRef.current = undefined;
     routingSaveLock.current = undefined; routingBaseline.current = undefined; scopeGeneration.current += 1; setValues([]); setRoutes([]); setRoutingDraft(undefined);
-    setAliasDrafts({}); setPolicyErrors({}); setEditingCredential(undefined); setCredentialValue(''); setLimitSnapshots({}); setGranting(undefined); setGrant({ amount: '', source: '' }); setBusy('');
+    setAliasDrafts({}); setPolicyErrors({}); setLimitSnapshots({}); setGranting(undefined); setGrant({ amount: '', source: '' }); setBusy('');
     setPolicyDrafts({}); setCreateCredentialDraft(undefined); setCreatePrincipalOverride(''); setNewRouteIds([]); setNewRouteGroupIds([]); setGroupFilter('all'); setSearch(''); setNextCursor(undefined); setKeyListState('initial-loading'); setKeyError(''); setRouteError(''); setSecret(undefined); setMessage(''); setError(''); setWriteDenied(''); setEditNotice('');
     void loadRoutes(token, tenant, scopeGeneration.current);
     setCreationSource(tenant === 'default' ? 'manual_or_unknown' : 'all');
@@ -1913,6 +1911,7 @@ function CredentialWorkspace({ token, tenant, writeTenant = tenant, createSchema
             <Field label={t('schema.Principal')} hint={t('credentials.editPrincipalHint')}>
               <Input readOnly value={value.principal_external_id ?? t('common.unknownPrincipal')} />
             </Field>
+            <ClientCredentialValueEditor key={`${token}\0${tenant}\0${value.key_id}\0${value.credential_generation}`} value={value} token={token} tenant={writeTenant ?? ''} disabled={!canManage(value) || Boolean(busy)} onSaved={async () => { setMessage(t('credentials.valueSaved')); await load(); }} />
             {policyFormSchema && <section className="credential-edit-section" aria-label={t('credentials.editPolicy')}><h4>{t('credentials.editPolicy')}</h4><CredentialPolicySummary policy={value.policy} currency={value.currency} /><Form key={value.key_id} schema={localizeSchema(policyFormSchema as RJSFSchema, locale)} formData={policyDrafts[value.key_id] ?? value.policy} onChange={({ formData }) => { setPolicyDrafts(current => ({ ...current, [value.key_id]: formData })); setPolicyErrors(current => { const { [value.key_id]: _cleared, ...remaining } = current; return remaining; }); }} uiSchema={credentialPolicyUiSchema} fields={credentialFormFields} validator={validator} templates={credentialFormTemplates} widgets={fluentFormWidgets} extraErrors={policyErrors[value.key_id]}><></></Form></section>}
             <section className="credential-edit-section routing-editor" aria-label={t('credentials.routing')}><h4>{t('credentials.routing')}</h4><p className="muted">{t('credentials.routingHint')}</p>
               {routingDraft ? <>
@@ -1923,7 +1922,6 @@ function CredentialWorkspace({ token, tenant, writeTenant = tenant, createSchema
             {editNotice && <p className="muted" role="status">{editNotice}</p>}
             <div className="journey-actions"><Button appearance="primary" type="button" disabled={!canWrite || Boolean(busy) || !credentialAliasReady(aliasDrafts[value.key_id] ?? value.alias)} onClick={() => void saveCredentialEdit(value)}>{t('common.save')}</Button></div>
           </div>}
-          {editingCredential === value.key_id && <div className="inline-editor form-panel"><h3>{t('credentials.storeFor', { alias: value.alias })}</h3><p className="muted">{t('credentials.storeHint')}</p><label>{t('credentials.revealedValue')}<Input type="password" autoComplete="off" value={credentialValue} onChange={(event) => setCredentialValue(event.target.value)} /></label><Button appearance="primary" type="button" disabled={!canManage(value) || Boolean(busy) || !credentialValue} onClick={async () => { const knownValue = credentialValue; setBusy(`store-${value.key_id}`); setError(''); setMessage(''); try { await api<void>(`/internal/v1/keys/${value.key_id}/credential`, token, { ...secretResponseRequestPolicy, method: 'PUT', body: JSON.stringify({ key: knownValue }) }); if (scopeRef.current.token !== token || scopeRef.current.tenant !== tenant || scopeRef.current.writeTenant !== writeTenant) return; setCredentialValue(''); setEditingCredential(undefined); setMessage(t('credentials.stored', { alias: value.alias })); await load(); } catch (reason) { if (scopeRef.current.token === token && scopeRef.current.tenant === tenant && scopeRef.current.writeTenant === writeTenant) setError(messageOf(reason, t('common.requestFailed'))); } finally { if (scopeRef.current.token === token && scopeRef.current.tenant === tenant && scopeRef.current.writeTenant === writeTenant) setBusy(''); } }}>{t('common.save')}</Button></div>}
           {workspace?.kind === 'limits' && (limitSnapshots[value.key_id] ? <LimitSnapshot value={limitSnapshots[value.key_id]} /> : <><LoadingProgress active label={t('common.loading')} level="page" /><LoadingState label={t('common.loading')} variant="detail" /></>)}
           {granting === value.key_id && value.account_id && <div className="inline-editor form-panel"><h3>{t('credentials.grantFor', { alias: value.alias })}</h3><label>{t('credentials.grantAmount')} ({value.currency})<input inputMode="decimal" value={grant.amount} onChange={(event) => setGrant({ ...grant, amount: event.target.value })} /></label><label>{t('credentials.grantSource')}<input value={grant.source} onChange={(event) => setGrant({ ...grant, source: event.target.value })} /></label><Button appearance="primary" type="button" disabled={!canWrite || Boolean(busy) || !isPositiveDecimal(grant.amount) || !grant.source.trim()} onClick={async () => { const amount = grant.amount.trim(); const source = grant.source.trim(); if (!await confirm(`${t('credentials.grantFor', { alias: value.alias })}\n${t('credentials.grantAmount')}: ${amount} ${value.currency}\n${t('credentials.grantSource')}: ${source}`)) return; setBusy(`grant-${value.key_id}`); try { await api(`/internal/v1/accounts/${value.account_id}/grants`, token, { method: 'POST', headers: { 'Idempotency-Key': crypto.randomUUID() }, body: JSON.stringify({ amount, source }) }); if (scopeRef.current.token !== token || scopeRef.current.tenant !== tenant) return; setGranting(undefined); setGrant({ amount: '', source: '' }); setMessage(t('credentials.granted')); await load(); } catch (reason) { if (scopeRef.current.token === token && scopeRef.current.tenant === tenant) setError(messageOf(reason, t('common.requestFailed'))); } finally { if (scopeRef.current.token === token && scopeRef.current.tenant === tenant) setBusy(''); } }}>{t('credentials.confirmGrant')}</Button></div>}
   </div>;
@@ -1954,7 +1952,6 @@ function CredentialWorkspace({ token, tenant, writeTenant = tenant, createSchema
               catch (reason) { if (scopeRef.current.token === token && scopeRef.current.tenant === tenant && editorGeneration.current === generation) setError(messageOf(reason, t('common.requestFailed'))); }
             } },
             { id: 'rotate', label: t('credentials.rotate'), disabled: !canWrite || (value.status ?? 'active') !== 'active', description: value.status === 'revoked' ? t('credentials.copyRevoked') : value.status === 'suspended' ? t('credentials.rotateSuspended') : undefined, onSelect: () => rotateCredential(value) },
-            { id: 'credential', label: t('credentials.store'), disabled: !canManage(value) || value.status === 'revoked', onSelect: () => setEditingCredential(value.key_id) },
             { id: 'grant', label: t('credentials.grant'), disabled: !canWrite || !value.account_id || value.status === 'revoked', description: !value.account_id ? t('credentials.accountMissing') : undefined, onSelect: () => setGranting(value.key_id) },
             ...(value.status === 'revoked' ? [] : [{ id: 'status', label: value.status === 'active' ? t('credentials.suspend') : t('credentials.resume'), disabled: !canWrite, onSelect: async () => {
               const nextStatus = value.status === 'active' ? 'suspended' : 'active';
@@ -1963,7 +1960,7 @@ function CredentialWorkspace({ token, tenant, writeTenant = tenant, createSchema
             } }]),
           ]} /></div>
         </div>})}</div>{keyListState === 'failed' ? <div className="load-more"><button type="button" className="secondary" onClick={() => void load()}>{t('credentials.retryLoad')}</button></div> : nextCursor && (keyListState === 'more' || keyListState === 'loading-more') && <div className="load-more"><button type="button" className="secondary" disabled={!canLoadMore} onClick={() => void loadMore()}>{loadingKeys ? t('common.loading') : t('credentials.loadMore')}</button></div>}</article>
-    <CreateJourney title={activeCredential ? `${t('credentials.title')} · ${activeCredential.alias}` : t('credentials.createTitle')} description={formJourneyCopy(locale).credentialFlowHint} open={Boolean(workspace)} busy={Boolean(busy) || Boolean(visibleSecret)} closeLabel={workspace?.kind === 'edit' ? t('common.back') : undefined} closePlacement={workspace?.kind === 'edit' ? 'start' : 'end'} onOpenChange={(open) => { editorGeneration.current += 1; if (!open) setCredentialValue(''); setWorkspace(open ? { kind: 'create' } : undefined); }}>
+    <CreateJourney title={activeCredential ? `${t('credentials.title')} · ${activeCredential.alias}` : t('credentials.createTitle')} description={formJourneyCopy(locale).credentialFlowHint} open={Boolean(workspace)} busy={Boolean(busy) || Boolean(visibleSecret)} closeLabel={workspace?.kind === 'edit' ? t('common.back') : undefined} closePlacement={workspace?.kind === 'edit' ? 'start' : 'end'} onOpenChange={(open) => { editorGeneration.current += 1; setWorkspace(open ? { kind: 'create' } : undefined); }}>
       {(error || routeError || routeGroups.error) && <div className="notice error" role="alert">{error || routeError || routeGroups.error}</div>}
       {activeCredential && credentialEditor(activeCredential)}
       <div hidden={workspace?.kind !== 'create'}>
