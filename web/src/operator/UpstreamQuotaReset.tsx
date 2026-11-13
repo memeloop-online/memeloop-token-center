@@ -3,7 +3,7 @@ import { api, ApiError } from '../api';
 import { formatCountdown } from '../format';
 import { useI18n } from '../i18n';
 import { useConfirmDialog } from '../useConfirmDialog';
-import { UPSTREAM_QUOTA_READ_TIMEOUT_MILLIS, type UpstreamQuotaSnapshot } from './upstreamQuota';
+import type { UpstreamQuotaSnapshot } from './upstreamQuota';
 import { useQuotaClock } from './useQuotaClock';
 import { Button, Disclosure } from '../design-system';
 
@@ -35,6 +35,7 @@ export function UpstreamQuotaReset({ accountId, accountName, tenant, token, snap
   if (identity.current !== scope) { identity.current = scope; secret.current = null; }
   const alive = useRef(true);
   const working = useRef(false);
+  const prepareRequest = useRef<AbortController | null>(null);
   const prepareIdempotencyKey = useRef<string | null>(null);
   const confirmIdempotencyKey = useRef<string | null>(null);
   const [busy, setBusy] = useState(false);
@@ -67,7 +68,7 @@ export function UpstreamQuotaReset({ accountId, accountName, tenant, token, snap
           setBusy(false);
         }
       });
-    return () => { controller.abort(); alive.current = false; secret.current = null; prepareIdempotencyKey.current = null; confirmIdempotencyKey.current = null; };
+    return () => { controller.abort(); prepareRequest.current?.abort(); prepareRequest.current = null; alive.current = false; secret.current = null; prepareIdempotencyKey.current = null; confirmIdempotencyKey.current = null; };
   }, [scope, currentPath, token, accountId]);
   const current = () => alive.current && identity.current === scope;
   function acceptOperation(response: QuotaResetOperation | null) {
@@ -109,8 +110,10 @@ export function UpstreamQuotaReset({ accountId, accountName, tenant, token, snap
     if (working.current || operation || error === 'status-unavailable' || !current()) return;
     working.current = true; setBusy(true); setError(undefined); setSettled(undefined);
     prepareIdempotencyKey.current ??= `quota-prepare-${crypto.randomUUID()}`;
+    const controller = new AbortController();
+    prepareRequest.current = controller;
     try {
-      const result = await api<{ operation: QuotaResetOperation; confirmation_token: string; idempotency_replayed: boolean }>(path('prepare'), token, { method: 'POST', headers: { 'Idempotency-Key': prepareIdempotencyKey.current }, signal: AbortSignal.timeout(UPSTREAM_QUOTA_READ_TIMEOUT_MILLIS) });
+      const result = await api<{ operation: QuotaResetOperation; confirmation_token: string; idempotency_replayed: boolean }>(path('prepare'), token, { method: 'POST', headers: { 'Idempotency-Key': prepareIdempotencyKey.current }, signal: controller.signal });
       if (!current()) return;
       if (!valid(result.operation) || result.operation.effect !== 'supplier_defined_codex_rate_limits' || result.operation.consumes_credits !== 1) throw new Error('Invalid reset contract');
       if (result.operation.state === 'expired') { prepareIdempotencyKey.current = null; throw new Error('Reset preparation expired'); }
@@ -127,10 +130,11 @@ export function UpstreamQuotaReset({ accountId, accountName, tenant, token, snap
       catch { if (current()) setError('dispatch-unknown'); }
     } catch (reason) {
       // Preparation never dispatches the supplier credit-consuming request.
-      // A timeout may still have created the same idempotent prepared record,
+      // An interrupted request may still have created the same idempotent prepared record,
       // so keep the key and let this exact button safely recover it.
       if (current()) setError(reason instanceof ApiError && reason.status === 409 ? 'prepare-rejected' : 'prepare-unavailable');
     } finally {
+      if (prepareRequest.current === controller) prepareRequest.current = null;
       if (current()) { working.current = false; setBusy(false); }
     }
   }
