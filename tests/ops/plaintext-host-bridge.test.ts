@@ -89,6 +89,11 @@ test('AppServer transports actual subprocess JSON lines and asynchronous server 
     server.request = async m => ({ echoed: m.params.task });
     server.send({ method: 'ask', params: {} });
     assert.deepEqual(await finished, { echoed: 'plain' });
+    const pending = assert.rejects(server.call('no-response', {}), /closing/);
+    const closing = server.close();
+    await assert.rejects(server.call('after-close', {}), /closed/);
+    server.send({ method: 'late-tool-result' });
+    await pending; await closing;
   } finally { await server.close(); }
 });
 
