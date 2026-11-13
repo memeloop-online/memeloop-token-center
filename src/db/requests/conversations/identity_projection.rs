@@ -1,5 +1,10 @@
 use super::*;
 
+const IDENTITY_FORWARD_PAGE: &str = "SELECT request_id FROM conversation_projection_outbox WHERE request_id > $1 ORDER BY request_id ASC LIMIT $2";
+const IDENTITY_HISTORY_PAGE: &str = "SELECT request_id FROM conversation_projection_outbox WHERE request_id < $1 ORDER BY request_id DESC LIMIT $2";
+const IDENTITY_LATEST_PAGE: &str =
+    "SELECT request_id FROM conversation_projection_outbox ORDER BY request_id DESC LIMIT $1";
+
 impl Database {
     /// Publish only the bounded identity already captured in the durable
     /// receipt. Missing/slow body archives must not erase a declared chat.
@@ -34,53 +39,130 @@ impl Database {
         Ok(())
     }
 
-    /// Independent metadata-only consumer: row locks serialize identity, while
-    /// the body's owner, lease, attempts and completion remain untouched.
+    /// The page boundary precedes all eligibility work. LIMIT on the old
+    /// join/anti-join bounded results but still scanned the entire backlog.
+    pub(crate) async fn project_declared_conversation_identity_pages(
+        &self,
+        live_after: Option<&str>,
+        history_before: Option<&str>,
+        limit: i64,
+    ) -> Result<(Option<String>, Option<String>), AppError> {
+        let budget = limit.clamp(2, CONVERSATION_PROJECTION_BATCH_LIMIT);
+        let live_budget = (budget + 1) / 2;
+        let live: Vec<String> = if let Some(after) = live_after {
+            sqlx::query_scalar(IDENTITY_FORWARD_PAGE)
+                .bind(after)
+                .bind(live_budget)
+                .fetch_all(&self.pool)
+                .await?
+        } else {
+            sqlx::query_scalar(IDENTITY_LATEST_PAGE)
+                .bind(live_budget)
+                .fetch_all(&self.pool)
+                .await?
+        };
+        let next_live = if live_after.is_some() {
+            live.last()
+        } else {
+            live.first()
+        }
+        .cloned()
+        .or_else(|| live_after.map(str::to_owned));
+        let before = history_before
+            .map(str::to_owned)
+            .or_else(|| live.last().cloned());
+        let history: Vec<String> = if let Some(before) = before {
+            sqlx::query_scalar(IDENTITY_HISTORY_PAGE)
+                .bind(before)
+                .bind(budget / 2)
+                .fetch_all(&self.pool)
+                .await?
+        } else {
+            Vec::new()
+        };
+        let next_history = history.last().cloned().or_else(|| next_live.clone());
+        let mut ids = live;
+        ids.extend(history);
+        let mut seen = std::collections::HashSet::new();
+        ids.retain(|id| seen.insert(id.clone()));
+        self.project_conversation_identity_ids(ids).await;
+        Ok((next_live, next_history))
+    }
+
+    #[cfg(test)]
     pub(crate) async fn project_declared_conversation_identities(
         &self,
         after: Option<&str>,
         limit: i64,
     ) -> Result<Option<String>, AppError> {
-        // Parse declared identity per row below: one corrupt legacy hints value
-        // must not poison the entire page before its cursor can advance.
+        let ids: Vec<String> = sqlx::query_scalar(IDENTITY_FORWARD_PAGE)
+            .bind(after.unwrap_or(""))
+            .bind(limit.clamp(1, CONVERSATION_PROJECTION_BATCH_LIMIT))
+            .fetch_all(&self.pool)
+            .await?;
+        let next = ids.last().cloned();
+        self.project_conversation_identity_ids(ids).await;
+        Ok(next)
+    }
+
+    async fn project_conversation_identity_ids(&self, ids: Vec<String>) {
         let eligible = "c.projected_at IS NULL AND c.key_snapshot_json IS NOT NULL
             AND t.projected_at IS NOT NULL AND t.tenant_id = c.tenant_id AND t.key_id = c.key_id
             AND NOT EXISTS (SELECT 1 FROM conversation_observations o WHERE o.request_id = c.request_id)
             AND NOT EXISTS (SELECT 1 FROM observability_prune_boundaries b WHERE b.scope = 'global' AND b.before_day > t.created_at / 86400000)";
-        let ids: Vec<String> = sqlx::query_scalar(sqlx::AssertSqlSafe(format!(
-            "SELECT c.request_id FROM conversation_projection_outbox c JOIN terminal_projection_outbox t ON t.request_id = c.request_id WHERE c.request_id > $1 AND {eligible} ORDER BY c.request_id LIMIT $2"
-        )))
-        .bind(after.unwrap_or(""))
-        .bind(limit.clamp(1, CONVERSATION_PROJECTION_BATCH_LIMIT))
-        .fetch_all(&self.pool).await?;
-        let next = ids.last().cloned();
+        let row_sql = format!(
+            "SELECT c.tenant_id, c.key_id, c.principal_id, c.hints_json, c.key_snapshot_json, c.client_name, c.upstream_response_id, c.observed_at FROM conversation_projection_outbox c JOIN terminal_projection_outbox t ON t.request_id = c.request_id WHERE c.request_id = $1 AND {eligible}"
+        );
         for id in ids {
             let result = async {
                 let request_id = parse_uuid(id.clone())?;
+                // Read/parse metadata before taking the shared stats writer.
+                // Invalid/unrelated historical rows must not queue on that lock.
+                let Some(row) = sqlx::query(sqlx::AssertSqlSafe(row_sql.clone()))
+                    .bind(&id)
+                    .fetch_optional(&self.pool)
+                    .await?
+                else {
+                    return Ok(());
+                };
+                let hints: crate::conversation::ConversationHints =
+                    serde_json::from_str(&row.try_get::<String, _>("hints_json")?)
+                        .map_err(|_| AppError::internal("conversation_identity_hints"))?;
+                if hints
+                    .session_id
+                    .as_deref()
+                    .is_none_or(|session| session.trim().is_empty())
+                {
+                    return Ok(());
+                }
                 let mut transaction = self.begin_write_transaction().await?;
-                // Keep the original stats/prune lock -> outbox row lock order.
                 lock_request_stats_projection_writer_in_transaction(&mut transaction).await?;
                 let lock = match self.backend {
                     DatabaseBackend::PostgreSql => " FOR UPDATE OF c SKIP LOCKED",
                     DatabaseBackend::Sqlite => "",
                 };
-                let row = sqlx::query(sqlx::AssertSqlSafe(format!(
-                    "SELECT c.tenant_id, c.key_id, c.principal_id, c.hints_json, c.key_snapshot_json, c.client_name, c.upstream_response_id, c.observed_at FROM conversation_projection_outbox c JOIN terminal_projection_outbox t ON t.request_id = c.request_id WHERE c.request_id = $1 AND {eligible}{lock}"
-                )))
-                .bind(&id).fetch_optional(&mut *transaction).await?;
+                // Preflight grants no authority: recheck eligibility under the
+                // original stats/prune -> outbox locking order before publishing.
+                let row = sqlx::query(sqlx::AssertSqlSafe(format!("{row_sql}{lock}")))
+                    .bind(&id)
+                    .fetch_optional(&mut *transaction)
+                    .await?;
                 if let Some(row) = row {
-                    self.project_conversation_identity_row_in_transaction(&mut transaction, request_id, row).await?;
+                    self.project_conversation_identity_row_in_transaction(
+                        &mut transaction,
+                        request_id,
+                        row,
+                    )
+                    .await?;
                 }
                 transaction.commit().await?;
                 Ok::<(), AppError>(())
-            }.await;
+            }
+            .await;
             if let Err(error) = result {
-                // Keep evidence/task for a later cursor pass; one bad snapshot
-                // must not prevent other declared chats becoming visible.
                 tracing::error!(%error, request_id = %id, "declared conversation identity remains pending");
             }
         }
-        Ok(next)
     }
 
     async fn project_conversation_identity_row_in_transaction(

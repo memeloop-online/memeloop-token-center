@@ -178,3 +178,12 @@ jobs:
           grep -F '1 passed; 0 failed' /tmp/history-cli.log
           cargo test --locked --all-features --lib db::request_history::tests::request_history_real_services_acceptance_start_nowait_rolls_back_partial_locks -- --ignored --exact --nocapture 2>&1 | tee /tmp/history-pg.log
           grep -F '1 passed; 0 failed' /tmp/history-pg.log
+          test -n "$MTC_TEST_POSTGRES_URL"
+          run_exact gateway_body::request_spool::archive_source_tests::sqlite_qualified_source_receipt_reopens_with_training_cleanup_identity
+          run_exact gateway_body::request_spool::archive_source_tests::postgres_qualified_source_receipt_reopens_with_training_cleanup_identity
+          run_exact api::proxy::routing::http::inference_lifetime_tests::inference_legacy_600_seconds_never_limits_headers_or_buffered_body
+          run_exact api::proxy::routing::http::inference_lifetime_tests::inference_stream_has_no_absolute_or_inherited_idle_600_second_window
+          run_exact api::proxy::routing::http::inference_lifetime_tests::inference_caller_cancellation_closes_headers_and_body_sockets_without_replay
+          run_exact api::proxy::routing::http::inference_lifetime_tests::inference_real_truncated_body_is_still_an_error_and_never_replayed
+          run_exact http_settings::factory::inference_policy_tests::inference_total_deadline_policy_is_cache_isolated_from_control_requests
+          run_exact http_settings::factory::inference_policy_tests::inference_preserves_an_explicit_read_inactivity_policy

@@ -9,7 +9,7 @@ use crate::{
 };
 use rust_decimal::Decimal;
 use serde_json::json;
-use std::sync::Arc;
+use std::{sync::Arc, time::Duration};
 use tracing::instrument::WithSubscriber;
 use tracing_subscriber::layer::SubscriberExt;
 use wit_component::{ComponentEncoder, StringEncoding, embed_component_metadata};
