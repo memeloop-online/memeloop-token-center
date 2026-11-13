@@ -7,7 +7,7 @@ import {
 
 const SCOPE = 'published image verification';
 const [image = '', digestValue = '', cacheScope = '', runnerTemporary = ''] = process.argv.slice(2);
-const revision = requireRevision(process.env.GITHUB_SHA, SCOPE);
+const revision = requireRevision(process.env.RELEASE_SOURCE_SHA ?? process.env.GITHUB_SHA, SCOPE);
 if (process.env.GITHUB_REPOSITORY !== 'memeloop-online/memeloop-token-center') fail(SCOPE, 'unexpected GitHub repository');
 const owner = process.env.GITHUB_REPOSITORY_OWNER;
 if (owner === undefined || !/^[a-z0-9-]+$/.test(owner)) fail(SCOPE, 'repository owner is invalid');
