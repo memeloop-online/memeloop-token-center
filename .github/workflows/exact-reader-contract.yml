@@ -114,6 +114,6 @@ jobs:
           cargo test --locked --lib db::archive_staging::backend_tests 2>&1 | tee /tmp/staging-db.log
           grep -F '2 passed; 0 failed' /tmp/staging-db.log
           cargo test --locked --lib archive::routing_tests 2>&1 | tee /tmp/staging-routing.log
-          grep -F '5 passed; 0 failed' /tmp/staging-routing.log
+          grep -F '6 passed; 0 failed' /tmp/staging-routing.log
           cargo test --locked --lib training_cas_real_s3_configuration_and_reader -- --ignored 2>&1 | tee /tmp/staging-rustfs.log
           grep -F '1 passed; 0 failed' /tmp/staging-rustfs.log
