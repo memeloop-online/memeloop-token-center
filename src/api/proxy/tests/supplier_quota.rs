@@ -317,8 +317,8 @@ async fn default_probe_skips_unusable_cheaper_models_and_explicit_alias_stays_sk
     assert_eq!(reloaded["error_code"], "probe_route_unavailable");
     assert_eq!(reloaded["last_result"]["checked_at"], result["checked_at"]);
     assert_eq!(reloaded["last_result"]["actual_model"], "upstream-0");
-    // A local preparation timeout is not a dispatched probe and cannot
-    // overwrite the real result, even though it is a connection-class error.
+    // A local preparation failure is not a dispatched probe and cannot
+    // overwrite the real result. No artificial request deadline is required.
     save_probe(Some("upstream-0")).await;
     config["timeout_seconds"] = json!(1);
     sqlx::query("UPDATE upstream_accounts SET config_json=$2 WHERE id=$1")
@@ -327,7 +327,7 @@ async fn default_probe_skips_unusable_cheaper_models_and_explicit_alias_stays_sk
         .execute(&pool)
         .await
         .unwrap();
-    let response = routing::with_stalled_probe_preparation(invoke())
+    let response = routing::with_failed_probe_preparation(invoke())
         .await
         .unwrap();
     let undispatched: Value = serde_json::from_slice(

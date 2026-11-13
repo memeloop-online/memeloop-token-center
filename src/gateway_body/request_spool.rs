@@ -37,10 +37,32 @@ pub(crate) fn request_body_object_key(request_id: &str) -> Option<String> {
     })
 }
 
-pub(crate) fn source_request_id(locator: &str) -> Option<uuid::Uuid> {
-    let request_id = locator.strip_prefix("staging/proxy/")?.split('/').next()?;
+pub(crate) fn request_body_staging_key(
+    locator: &str,
+) -> Option<crate::archive_staging::ArchiveStagingKey> {
+    use crate::archive_staging::{ArchiveStagingKey, ArchiveStagingOwner, ArchiveStagingPurpose};
+    let (identity, bare) = match locator.strip_prefix("stores/staging/") {
+        Some(qualified) => {
+            let (identity, bare) = qualified.split_once('/')?;
+            (Some(identity), bare)
+        }
+        None => (None, locator),
+    };
+    let request_id = bare.strip_prefix("staging/proxy/")?.split('/').next()?;
     let request_id = uuid::Uuid::parse_str(request_id).ok()?;
-    (request_body_object_key(&request_id.to_string())?.as_str() == locator).then_some(request_id)
+    let key = ArchiveStagingKey::new(
+        ArchiveStagingOwner::ProxyRequest(request_id),
+        ArchiveStagingPurpose::Request,
+        request_id,
+    )
+    .ok()?
+    .with_backend_identity(identity)
+    .ok()?;
+    (format!("{}/body.json", key.canonical_prefix()) == locator).then_some(key)
+}
+
+pub(crate) fn source_request_id(locator: &str) -> Option<uuid::Uuid> {
+    request_body_staging_key(locator).map(|key| key.owner.id())
 }
 
 #[derive(Clone)]
@@ -184,7 +206,13 @@ impl DurableRequestBodies {
     async fn delete(&self, key: &str) {
         match self {
             Self::Archive(archive) => {
-                let _ = archive.delete(key).await;
+                if key.starts_with("stores/staging/") {
+                    if let Some(typed) = request_body_staging_key(key) {
+                        let _ = archive.delete_archive_staging_object(typed, key).await;
+                    }
+                } else {
+                    let _ = archive.delete(key).await;
+                }
             }
             #[cfg(test)]
             Self::Memory(store) => {
@@ -328,6 +356,23 @@ impl RequestSpoolAdmission {
         let object_key = {
             request_body_object_key(body_key.unwrap_or(""))
                 .or_else(|| request_body_object_key(&uuid::Uuid::now_v7().to_string()))
+        };
+        // Select the configured backend once, without database or object-store
+        // IO. The full locator is carried by the source and its durable receipt;
+        // retries and reads must not consult the current write default again.
+        let object_key = match (&durable, object_key) {
+            (Some(DurableRequestBodies::Archive(archive)), Some(locator)) => {
+                let locator = if let Some(key) = request_body_staging_key(&locator) {
+                    let key = archive
+                        .select_staging_key(key)
+                        .map_err(|_| RequestSpoolCaptureError::Unavailable)?;
+                    format!("{}/body.json", key.canonical_prefix())
+                } else {
+                    locator
+                };
+                Some(locator)
+            }
+            (_, locator) => locator,
         };
         let metadata_bytes = request_metadata_bytes
             .saturating_add(std::mem::size_of::<RequestSpool>())

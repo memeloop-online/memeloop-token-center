@@ -1,4 +1,4 @@
-use std::{collections::BTreeMap, time::Duration};
+use std::collections::BTreeMap;
 
 use axum::{
     Json,
@@ -640,29 +640,4 @@ pub(super) fn component_provider_url(base_url: &str, path: &str) -> Result<Strin
 
 fn named_memory_rejection(stage: &'static str, error: AppError) -> AppError {
     error.name_if_overloaded(stage)
-}
-
-/// Only explicit account configuration adds a request-local deadline. Shared
-/// client defaults and purpose overrides are installed by the HTTP factory.
-pub(super) fn configured_http_timeout(config: &Value) -> Result<Option<Duration>, &'static str> {
-    let Some(value) = config.get("timeout_seconds") else {
-        return Ok(None);
-    };
-    let seconds = value
-        .as_u64()
-        .or_else(|| {
-            value
-                .as_f64()
-                .filter(|seconds| {
-                    seconds.fract() == 0.0 && *seconds > 0.0 && *seconds < u64::MAX as f64
-                })
-                .map(|seconds| seconds as u64)
-        })
-        .filter(|seconds| *seconds > 0)
-        .ok_or("invalid_request_timeout")?;
-    let duration = Duration::from_secs(seconds);
-    tokio::time::Instant::now()
-        .checked_add(duration)
-        .ok_or("invalid_request_timeout")?;
-    Ok(Some(duration))
 }

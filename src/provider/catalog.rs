@@ -411,7 +411,7 @@ impl ProviderCatalog {
                     "default": "public",
                     "description": "Private destinations require a global operator credential."
                 },
-                "timeout_seconds": {"type": "integer", "minimum": 1, "description": "Optional explicit end-to-end request timeout in seconds. When omitted, no application deadline is imposed."},
+                "timeout_seconds": {"type": "integer", "minimum": 1, "description": "Legacy compatibility value. Inference waits for completion or caller cancellation; this value does not limit the request or response duration."},
                 "reservation_token_bounds": {
                     "type": "object",
                     "propertyNames": {"minLength": 1, "maxLength": 500},
@@ -903,7 +903,7 @@ impl ProviderCatalog {
         kimi.config_schema["properties"]["timeout_seconds"] = json!({
             "type": "integer",
             "minimum": 1,
-            "description": "Optional explicit request timeout in seconds, including the complete response stream. When omitted, no application deadline is imposed."
+            "description": "Legacy compatibility value. Inference waits for completion or caller cancellation; this value does not limit the request or response duration."
         });
         kimi.oauth_adapter = Some(OAuthAdapterContribution {
             api_version: "oauth-adapter-v1".to_owned(),
