@@ -7,6 +7,9 @@ use std::{
 
 use super::{HttpPurpose, HttpSettingsDocument, ValueSource};
 
+#[cfg(all(test, target_os = "linux"))]
+mod tcp_policy_tests;
+
 #[derive(Default)]
 pub struct ClientOptions<'a> {
     pub purpose: Option<HttpPurpose>,
@@ -76,6 +79,15 @@ impl HttpSnapshot {
             .tcp_keepalive(codex.then_some(Duration::from_secs(60)))
             .tcp_keepalive_interval(codex.then_some(Duration::from_secs(30)))
             .tcp_keepalive_retries(codex.then_some(3));
+        // Reqwest 0.13.4 otherwise installs TCP_USER_TIMEOUT=30s on Linux.
+        // Let the OS handle unacknowledged TCP data rather than silently
+        // shortening the operator's HTTP deadline during a network outage.
+        // Explicit HTTP deadlines, caller cancellation and Codex keepalive
+        // still reclaim requests/connections; None does not disable OS retries.
+        #[cfg(any(target_os = "android", target_os = "fuchsia", target_os = "linux"))]
+        {
+            builder = builder.tcp_user_timeout(None);
+        }
         if let Some(timeout) = connect_timeout_ms {
             builder = builder.connect_timeout(Duration::from_millis(timeout));
         }
