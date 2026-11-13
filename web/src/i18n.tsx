@@ -1824,7 +1824,7 @@ const schemaFields: Record<string, [string, string]> = {
   dispatch_max_in_flight: ['调度最大并发数', 'Maximum dispatch concurrency'],
   dispatch_max_queued: ['调度队列容量', 'Dispatch queue capacity'],
   dispatch_queue_timeout_millis: ['调度排队超时（毫秒）', 'Dispatch queue timeout (ms)'],
-  timeout_seconds: ['请求超时（秒）', 'Request timeout (seconds)'],
+  timeout_seconds: ['旧版超时值（秒）', 'Legacy timeout value (seconds)'],
   header: ['认证请求头名称', 'Authentication header name'], prefix: ['凭据前缀', 'Credential prefix'],
   tenant_external_id: ['租户', 'Tenant'], principal_external_id: ['用户主体', 'Principal'], alias: ['凭据别名', 'Credential alias'],
   currency: ['币种', 'Currency'], initial_balance: ['初始额度', 'Initial credit'], policy: ['权限与限流策略', 'Policy and rate limits'],
