@@ -419,6 +419,23 @@ pub(super) async fn capture_archive_in_transaction(
     Ok(())
 }
 
+pub(super) async fn capture_request_in_transaction(
+    transaction: &mut Transaction<'_, Any>,
+    request_id: &str,
+) -> Result<(), AppError> {
+    let sources:Vec<String>=sqlx::query_scalar("SELECT source FROM request_history_export WHERE request_id=$1 AND source IN ('native','generation','archive') AND EXISTS (SELECT 1 FROM request_history_state WHERE id=1 AND mode<>'off')")
+        .bind(request_id).fetch_all(&mut **transaction).await?;
+    for source in sources {
+        match source.as_str() {
+            "native" => capture_native_in_transaction(transaction, request_id).await?,
+            "generation" => capture_generation_in_transaction(transaction, request_id).await?,
+            "archive" => capture_archive_in_transaction(transaction, request_id).await?,
+            _ => unreachable!("bounded source SQL"),
+        }
+    }
+    Ok(())
+}
+
 async fn insert_envelope_in_transaction(
     transaction: &mut Transaction<'_, Any>,
     identity: &crate::request_history::HistoryIdentity,

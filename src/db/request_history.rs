@@ -293,7 +293,7 @@ impl Database {
     pub async fn history_refresh(&self) -> Result<(), HistoryError> {
         let mut tx = self.begin_write_transaction().await?;
         sqlx::query("UPDATE request_history_state SET mode = 'shadow', verified_revision = NULL, verification_json = NULL WHERE id = 1").execute(&mut *tx).await?;
-        let pending: i64 = sqlx::query_scalar("SELECT (SELECT COUNT(*) FROM request_history_export) + (SELECT COUNT(*) FROM request_history_immutable_outbox)")
+        let pending: i64 = sqlx::query_scalar("SELECT (SELECT COUNT(*) FROM request_history_export) + (SELECT COUNT(*) FROM request_history_immutable_outbox i WHERE NOT EXISTS (SELECT 1 FROM request_history_export e WHERE e.revision=i.revision))")
             .fetch_one(&mut *tx)
             .await?;
         if pending != 0 {
