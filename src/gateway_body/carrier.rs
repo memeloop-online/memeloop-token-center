@@ -1,6 +1,10 @@
 //! Immutable application bodies. Only RAM allocations and typed object-store
 //! objects may carry bytes; migration journals are deliberately outside this API.
-use std::{fmt::Display, pin::Pin, sync::Arc};
+use std::{
+    fmt::Display,
+    pin::Pin,
+    sync::{Arc, Mutex},
+};
 
 use bytes::{Bytes, BytesMut};
 use futures_util::{Stream, StreamExt, stream};
@@ -61,6 +65,7 @@ impl AsRef<[u8]> for Allocation {
     }
 }
 
+#[derive(Clone)]
 enum Segment {
     Ram(Bytes),
     Object(StagedArchiveObject),
@@ -70,10 +75,13 @@ pub(crate) struct BodyCarrier {
     memory: Arc<ProxyMemoryBudget>,
     archive: Option<ArchiveStore>,
     staging: ArchiveStagingKey,
-    segments: Vec<Segment>,
+    segments: Vec<Mutex<Segment>>,
+    offload: tokio::sync::Mutex<()>,
+    sealed_reference: Option<StagedArchiveObject>,
+    parent: Option<Arc<BodyCarrier>>,
     length: u64,
     digest: String,
-    owned_objects: Vec<String>,
+    owned_objects: Mutex<Vec<String>>,
 }
 
 impl BodyCarrier {
@@ -97,9 +105,12 @@ impl BodyCarrier {
             archive: capture.archive,
             staging,
             segments: Vec::new(),
+            offload: tokio::sync::Mutex::new(()),
+            sealed_reference: None,
+            parent: parent.clone(),
             length: 0,
             digest: String::new(),
-            owned_objects: Vec::new(),
+            owned_objects: Mutex::new(Vec::new()),
         };
         let mut hash = blake3::Hasher::new();
         futures_util::pin_mut!(input);
@@ -119,7 +130,7 @@ impl BodyCarrier {
                 // an arbitrarily large input frame for the lifetime of a request.
                 let part = remaining.split_to(remaining.len().min(64 * 1024));
                 if parent.as_ref().is_some_and(|parent| parent.owns_ram(&part)) {
-                    source.segments.push(Segment::Ram(part));
+                    source.segments.push(Mutex::new(Segment::Ram(part)));
                     continue;
                 }
                 let mut retry = std::time::Duration::from_millis(100);
@@ -132,7 +143,7 @@ impl BodyCarrier {
                     match source.offload_one().await {
                         Ok(true) => continue,
                         Ok(false) => {
-                            break (source.memory.reserve_carrier_bytes(part.len()).await?, None);
+                            break (source.reserve_workspace(part.len()).await?, None);
                         }
                         Err(_) => {
                             // Remote failure cannot discard the sole source. If
@@ -153,10 +164,17 @@ impl BodyCarrier {
                     _lease: lease,
                     _retained: retained,
                 });
-                source.segments.push(Segment::Ram(bytes));
+                source.segments.push(Mutex::new(Segment::Ram(bytes)));
             }
         }
         source.digest = hash.finalize().to_hex().to_string();
+        source.sealed_reference = match source.segments.as_slice() {
+            [segment] => match &*segment.lock().unwrap() {
+                Segment::Object(reference) => Some(reference.clone()),
+                Segment::Ram(_) => None,
+            },
+            _ => None,
+        };
         Ok(Arc::new(source))
     }
 
@@ -165,28 +183,31 @@ impl BodyCarrier {
         let Some(end) = start.checked_add(bytes.len()) else {
             return false;
         };
-        self.segments.iter().any(|segment| match segment {
-            Segment::Ram(owned) => {
-                let base = owned.as_ptr() as usize;
-                base.checked_add(owned.len())
-                    .is_some_and(|limit| start >= base && end <= limit)
-            }
-            Segment::Object(_) => false,
-        })
+        self.segments
+            .iter()
+            .any(|segment| match &*segment.lock().unwrap() {
+                Segment::Ram(owned) => {
+                    let base = owned.as_ptr() as usize;
+                    base.checked_add(owned.len())
+                        .is_some_and(|limit| start >= base && end <= limit)
+                }
+                Segment::Object(_) => false,
+            })
     }
 
-    async fn offload_one(&mut self) -> Result<bool, AppError> {
+    async fn offload_one(&self) -> Result<bool, AppError> {
+        let _owner = self.offload.lock().await;
         let Some(archive) = &self.archive else {
             return Ok(false);
         };
         let Some(index) = self
             .segments
             .iter()
-            .position(|segment| matches!(segment, Segment::Ram(_)))
+            .position(|segment| matches!(&*segment.lock().unwrap(), Segment::Ram(_)))
         else {
             return Ok(false);
         };
-        let Segment::Ram(bytes) = &self.segments[index] else {
+        let Segment::Ram(bytes) = self.segments[index].lock().unwrap().clone() else {
             unreachable!()
         };
         let locator = format!(
@@ -196,7 +217,7 @@ impl BodyCarrier {
         );
         // Register exact ownership before any remote operation: a finish whose
         // acknowledgement is lost must not orphan an object outside cleanup.
-        self.owned_objects.push(locator.clone());
+        self.owned_objects.lock().unwrap().push(locator.clone());
         let mut writer = archive.start_writer(&locator).await?;
         if let Err(error) = writer.write(bytes.clone()).await {
             let _ = writer.abort().await;
@@ -204,14 +225,58 @@ impl BodyCarrier {
         }
         let staged = writer.finish_staged().await?;
         if staged.size_bytes != bytes.len() as u64
-            || staged.blake3_digest != blake3::hash(bytes).to_hex().as_str()
+            || staged.blake3_digest != blake3::hash(&bytes).to_hex().as_str()
         {
             return Err(AppError::storage("carrier_stage_identity_mismatch"));
         }
         // A complete object, not an UploadPart ACK, is now replayable. Only
         // replacing this segment releases the unique RAM allocation lease.
-        self.segments[index] = Segment::Object(staged);
+        *self.segments[index].lock().unwrap() = Segment::Object(staged);
         Ok(true)
+    }
+
+    // Never join the semaphore queue while this source can release its own
+    // allocations. One uploader owns each replacement; failed publication keeps
+    // RAM and its lease intact and retries without discarding the source.
+    async fn reserve_workspace(&self, bytes: usize) -> Result<OwnedSemaphorePermit, AppError> {
+        let mut retry = std::time::Duration::from_millis(100);
+        loop {
+            if let Some(lease) = self.memory.try_reserve_ingress_bytes(bytes) {
+                return Ok(lease);
+            }
+            match self.offload_one().await {
+                Ok(true) => continue,
+                Ok(false) => {
+                    // A derived alias can retain the same allocation in its
+                    // parent. Release that owner too before waiting for credit.
+                    let mut parent = self.parent.as_ref();
+                    let mut released = false;
+                    while let Some(source) = parent {
+                        match source.offload_one().await {
+                            Ok(true) => {
+                                released = true;
+                                break;
+                            }
+                            Ok(false) => parent = source.parent.as_ref(),
+                            Err(_) => {
+                                tokio::time::sleep(retry).await;
+                                retry = (retry * 2).min(std::time::Duration::from_secs(300));
+                                released = true;
+                                break;
+                            }
+                        }
+                    }
+                    if released {
+                        continue;
+                    }
+                    return self.memory.reserve_carrier_bytes(bytes).await;
+                }
+                Err(_) => {
+                    tokio::time::sleep(retry).await;
+                    retry = (retry * 2).min(std::time::Duration::from_secs(300));
+                }
+            }
+        }
     }
 
     pub(crate) fn len(&self) -> u64 {
@@ -221,10 +286,7 @@ impl BodyCarrier {
         &self.digest
     }
     pub(crate) fn sealed_staged_reference(&self) -> Option<&StagedArchiveObject> {
-        match self.segments.as_slice() {
-            [Segment::Object(reference)] => Some(reference),
-            _ => None,
-        }
+        self.sealed_reference.as_ref()
     }
 
     pub(crate) fn open_stream(self: &Arc<Self>) -> CarrierStream {
@@ -239,9 +301,9 @@ impl BodyCarrier {
                         }
                         remote = None;
                     }
-                    let segment = source.segments.get(index)?;
+                    let segment = source.segments.get(index)?.lock().unwrap().clone();
                     index += 1;
-                    match segment {
+                    match &segment {
                         Segment::Ram(bytes) => {
                             return Some((Ok(bytes.clone()), (source, index, remote)));
                         }
@@ -255,7 +317,7 @@ impl BodyCarrier {
                             };
                             match archive.open_stream(&reference.object_locator, None).await {
                                 Ok(download) => {
-                                    let memory = source.memory.clone();
+                                    let memory = source.clone();
                                     remote = Some(Box::pin(download.stream.then(move |result| {
                                         let memory = memory.clone();
                                         async move {
@@ -263,7 +325,7 @@ impl BodyCarrier {
                                                 AppError::storage("carrier_object_read_failed")
                                             })?;
                                             let lease =
-                                                memory.reserve_carrier_bytes(bytes.len()).await?;
+                                                memory.reserve_workspace(bytes.len()).await?;
                                             Ok(Bytes::from_owner(Allocation {
                                                 bytes,
                                                 _lease: lease,
@@ -295,22 +357,24 @@ impl BodyCarrier {
         }
         let mut position = 0u64;
         for segment in &self.segments {
-            let size = match segment {
+            let segment = segment.lock().unwrap().clone();
+            let size = match &segment {
                 Segment::Ram(bytes) => bytes.len() as u64,
                 Segment::Object(reference) => reference.size_bytes,
             };
             if offset >= position && end <= position + size {
-                if let Segment::Ram(bytes) = segment {
+                if let Segment::Ram(bytes) = &segment {
                     return Ok(bytes.slice((offset - position) as usize..(end - position) as usize));
                 }
             }
             position += size;
         }
-        let lease = self.memory.reserve_carrier_bytes(length).await?;
+        let lease = self.reserve_workspace(length).await?;
         let mut output = BytesMut::with_capacity(length);
         position = 0;
         for segment in &self.segments {
-            let size = match segment {
+            let segment = segment.lock().unwrap().clone();
+            let size = match &segment {
                 Segment::Ram(bytes) => bytes.len() as u64,
                 Segment::Object(reference) => reference.size_bytes,
             };
@@ -318,7 +382,7 @@ impl BodyCarrier {
             if next > offset && position < end {
                 let start = offset.saturating_sub(position);
                 let stop = end.min(next) - position;
-                match segment {
+                match &segment {
                     Segment::Ram(bytes) => {
                         output.extend_from_slice(&bytes[start as usize..stop as usize])
                     }
@@ -363,7 +427,7 @@ impl Drop for BodyCarrier {
         let Some(archive) = self.archive.clone() else {
             return;
         };
-        let objects = std::mem::take(&mut self.owned_objects);
+        let objects = std::mem::take(self.owned_objects.get_mut().unwrap());
         let staging = self.staging;
         if objects.is_empty() {
             return;
@@ -462,6 +526,54 @@ mod tests {
         assert_eq!(memory.snapshot().0, 0);
     }
 
+    async fn full_ram_source(memory: Arc<ProxyMemoryBudget>) -> Arc<BodyCarrier> {
+        let mut source = BodyCarrier::capture(
+            stream::iter([
+                Ok::<_, std::io::Error>(Bytes::from(vec![b'a'; 65536])),
+                Ok(Bytes::from(vec![b'b'; 65536])),
+            ]),
+            CarrierCapture::new(memory, None, key()),
+        )
+        .await
+        .unwrap();
+        Arc::get_mut(&mut source).unwrap().archive = Some(ArchiveStore::memory_for_test());
+        source
+    }
+
+    #[tokio::test]
+    async fn sealed_cross_segment_range_releases_its_own_full_budget() {
+        let memory = Arc::new(ProxyMemoryBudget::new(128 * 1024));
+        let source = full_ram_source(memory.clone()).await;
+        assert_eq!(memory.snapshot().0, 128 * 1024);
+        let bytes = source.read_range(65530, 12).await.unwrap();
+        assert_eq!(bytes, b"aaaaaabbbbbb"[..]);
+        assert_eq!(source.len(), 128 * 1024);
+        drop(bytes);
+        drop(source);
+        assert_eq!(memory.snapshot().0, 0);
+    }
+
+    #[tokio::test]
+    async fn object_replay_offloads_other_sealed_ram_before_waiting_for_credit() {
+        let memory = Arc::new(ProxyMemoryBudget::new(128 * 1024));
+        let source = full_ram_source(memory.clone()).await;
+        assert!(source.offload_one().await.unwrap());
+        let external = memory.try_reserve_ingress_bytes(65536).unwrap();
+        assert_eq!(memory.snapshot().0, 128 * 1024);
+        let mut replay = source.open_stream();
+        let first = replay.next().await.unwrap().unwrap();
+        assert_eq!(first, vec![b'a'; 65536]);
+        drop(first);
+        let second = replay.next().await.unwrap().unwrap();
+        assert_eq!(second, vec![b'b'; 65536]);
+        drop(second);
+        assert!(replay.next().await.is_none());
+        drop(replay);
+        drop(source);
+        drop(external);
+        assert_eq!(memory.snapshot().0, 0);
+    }
+
     #[tokio::test]
     async fn pressure_seals_readable_objects_without_local_files_and_replays_ranges() {
         let memory = Arc::new(ProxyMemoryBudget::new(256 * 1024));
@@ -490,7 +602,7 @@ mod tests {
             source
                 .segments
                 .iter()
-                .any(|segment| matches!(segment, Segment::Object(_)))
+                .any(|segment| matches!(&*segment.lock().unwrap(), Segment::Object(_)))
         );
         assert_eq!(
             source.read_range(65530, 12).await.unwrap(),
