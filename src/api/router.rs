@@ -9,6 +9,9 @@ pub fn router_for_role(mut state: AppState, role: RuntimeRole) -> Router {
     let request_id_header = header::HeaderName::from_static(REQUEST_ID_HEADER);
     let mut application = Router::new()
         .route("/healthz", get(deprecated_health))
+        // This router is installed only after AppState initialization succeeds.
+        // Keep traffic admission independent of recurring remote dependency checks.
+        .route("/initializedz", get(liveness))
         .route("/livez", get(liveness))
         .route("/readyz", get(readiness));
     if matches!(
