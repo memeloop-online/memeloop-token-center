@@ -6,7 +6,7 @@ use std::{
     sync::{Arc, Mutex, Weak},
 };
 
-use bytes::{Bytes, BytesMut};
+use bytes::Bytes;
 use futures_util::{Stream, StreamExt, stream};
 use tokio::sync::OwnedSemaphorePermit;
 
@@ -339,17 +339,45 @@ impl BodyCarrier {
                             match archive.open_stream(&reference.object_locator, None).await {
                                 Ok(download) => {
                                     let memory = source.clone();
-                                    remote = Some(Box::pin(download.stream.then(move |result| {
-                                        let memory = memory.clone();
-                                        async move {
-                                            let bytes = result.map_err(|_| {
-                                                AppError::storage("carrier_object_read_failed")
-                                            })?;
-                                            let lease =
-                                                memory.reserve_workspace(bytes.len()).await?;
-                                            Ok(memory.leased_bytes(bytes, lease, None))
-                                        }
-                                    })))
+                                    remote = Some(Box::pin(
+                                        download
+                                            .stream
+                                            .map(move |result| {
+                                                let memory = memory.clone();
+                                                Box::pin(stream::try_unfold(
+                                                    (result, 0usize),
+                                                    move |(result, offset)| {
+                                                        let memory = memory.clone();
+                                                        async move {
+                                                            let bytes = result.map_err(|_| {
+                                                                AppError::storage(
+                                                                    "carrier_object_read_failed",
+                                                                )
+                                                            })?;
+                                                            if offset == bytes.len() {
+                                                                return Ok(None);
+                                                            }
+                                                            let count = (bytes.len() - offset)
+                                                                .min(64 * 1024);
+                                                            let lease = memory
+                                                                .reserve_workspace(count)
+                                                                .await?;
+                                                            let owned = Bytes::copy_from_slice(
+                                                                &bytes[offset..offset + count],
+                                                            );
+                                                            let owned = memory
+                                                                .leased_bytes(owned, lease, None);
+                                                            Ok(Some((
+                                                                owned,
+                                                                (Ok(bytes), offset + count),
+                                                            )))
+                                                        }
+                                                    },
+                                                ))
+                                                    as CarrierStream
+                                            })
+                                            .flatten(),
+                                    ))
                                 }
                                 Err(error) => return Some((Err(error), (source, index, None))),
                             }
@@ -386,9 +414,31 @@ impl BodyCarrier {
             }
             position += size;
         }
+        if length > self.memory.snapshot().1 || self.archive.is_none() {
+            return Err(AppError::internal(
+                "carrier_contiguous_read_requires_stream_or_owned_workspace",
+            ));
+        }
         let lease = self.reserve_workspace(length).await?;
-        let mut output = BytesMut::with_capacity(length);
-        position = 0;
+        let mut output = vec![0; length];
+        self.read_into(offset, &mut output).await?;
+        Ok(self.leased_bytes(Bytes::from(output), lease, None))
+    }
+
+    /// The caller supplies and owns this workspace. RAM slices copy directly;
+    /// no second allocation or semaphore acquisition can depend on this source.
+    pub(crate) async fn read_into(
+        self: &Arc<Self>,
+        offset: u64,
+        output: &mut [u8],
+    ) -> Result<(), AppError> {
+        let length = output.len();
+        let end = offset
+            .checked_add(length as u64)
+            .filter(|end| *end <= self.length)
+            .ok_or_else(|| AppError::storage("carrier_range_invalid"))?;
+        let mut position = 0u64;
+        let mut written = 0usize;
         for segment in &self.segments {
             let segment = segment.lock().unwrap().clone();
             let size = match &segment {
@@ -401,7 +451,9 @@ impl BodyCarrier {
                 let stop = end.min(next) - position;
                 match &segment {
                     Segment::Ram(bytes) => {
-                        output.extend_from_slice(&bytes[start as usize..stop as usize])
+                        let bytes = &bytes[start as usize..stop as usize];
+                        output[written..written + bytes.len()].copy_from_slice(bytes);
+                        written += bytes.len();
                     }
                     Segment::Object(reference) => {
                         let archive = self
@@ -412,13 +464,18 @@ impl BodyCarrier {
                             .open_stream(&reference.object_locator, Some(start..stop))
                             .await?
                             .stream;
+                        let expected = written + (stop - start) as usize;
                         while let Some(chunk) = download.next().await {
                             let chunk = chunk
                                 .map_err(|_| AppError::storage("carrier_object_read_failed"))?;
-                            if chunk.len() > length.saturating_sub(output.len()) {
+                            if chunk.len() > expected.saturating_sub(written) {
                                 return Err(AppError::storage("carrier_range_overrun"));
                             }
-                            output.extend_from_slice(&chunk);
+                            output[written..written + chunk.len()].copy_from_slice(&chunk);
+                            written += chunk.len();
+                        }
+                        if written != expected {
+                            return Err(AppError::storage("carrier_range_truncated"));
                         }
                     }
                 }
@@ -428,10 +485,10 @@ impl BodyCarrier {
                 break;
             }
         }
-        if output.len() != length {
+        if written != length {
             return Err(AppError::storage("carrier_range_truncated"));
         }
-        Ok(self.leased_bytes(output.freeze(), lease, None))
+        Ok(())
     }
 }
 
@@ -536,6 +593,34 @@ mod tests {
         assert_eq!(memory.snapshot().0, original_charge);
         assert_eq!(derived.read_range(0, 3).await.unwrap(), b"WAV"[..]);
         drop(derived);
+        assert_eq!(memory.snapshot().0, 0);
+    }
+
+    #[tokio::test]
+    async fn ram_only_full_source_reads_into_caller_workspace_and_streams() {
+        let memory = Arc::new(ProxyMemoryBudget::new(128 * 1024));
+        let source = BodyCarrier::capture(
+            stream::iter([
+                Ok::<_, std::io::Error>(Bytes::from(vec![b'a'; 65536])),
+                Ok(Bytes::from(vec![b'b'; 65536])),
+            ]),
+            CarrierCapture::new(memory.clone(), None, key()),
+        )
+        .await
+        .unwrap();
+        assert_eq!(memory.snapshot().0, 128 * 1024);
+        let mut header = [0; 12];
+        source.read_into(65530, &mut header).await.unwrap();
+        assert_eq!(&header, b"aaaaaabbbbbb");
+        assert_eq!(memory.snapshot().0, 128 * 1024);
+        let mut replay = source.open_stream();
+        let mut hash = blake3::Hasher::new();
+        while let Some(bytes) = replay.next().await {
+            hash.update(&bytes.unwrap());
+        }
+        assert_eq!(hash.finalize().to_hex().as_str(), source.digest());
+        drop(replay);
+        drop(source);
         assert_eq!(memory.snapshot().0, 0);
     }
 
