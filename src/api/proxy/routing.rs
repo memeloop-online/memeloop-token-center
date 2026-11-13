@@ -55,6 +55,14 @@ pub(super) use route_types::{
     ProxyRouteResponse, ProxySendError, TransportFailureKind,
 };
 
+pub(super) fn native_chat_candidate_shape(
+    protocol: Protocol,
+    request: &mut Value,
+    candidates: &[AuthorizedUpstreamCandidate],
+) -> Result<Option<(usize, usize)>, AppError> {
+    kimi::candidate_shape(protocol, request, candidates)
+}
+
 fn route_temporary_memory(
     state: &AppState,
     bytes: usize,

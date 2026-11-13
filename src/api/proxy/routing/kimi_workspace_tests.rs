@@ -7,7 +7,7 @@ async fn native_kimi_chat_uses_its_prepaid_workspace_under_budget_contention() {
         crate::gateway_body::memory::ProxyMemoryBudget::new(8 * 1024 * 1024),
     );
     let memory = state.proxy_memory_budget.reservation();
-    let request = json!({
+    let mut request = json!({
         "model":"k3.1-pro", "messages":[{"role":"user","content":"x".repeat(1024 * 1024)}],
         "stream":true, "max_tokens":1
     });
@@ -51,26 +51,38 @@ async fn native_kimi_chat_uses_its_prepaid_workspace_under_budget_contention() {
             proxy_network_scope: None,
         },
     };
-    let planned = plan_proxy_route(ProxyRoutePlanInput {
-        request: ProxyRequestContext {
-            state: &state,
-            key: &key,
-            model: "k3.1-pro",
-            protocol: Protocol::OpenAiChat,
-            request_id: Uuid::now_v7(),
-            request_json: &request,
-            request_memory: Some(&memory),
-            codex_multi_agent_v2_request: false,
+    let candidates = [
+        crate::provider::AuthorizedUpstreamCandidate {
+            route_id: Uuid::now_v7(),
+            account_id: Uuid::now_v7(),
+            driver: "http-json".into(),
+            upstream_model: "relay-primary".into(),
+            transport_revision: 1,
+            credential_generation: 1,
         },
-        route,
-        preparation_now: unix_millis(),
-    })
-    .unwrap();
-    assert!(planned.request_workspace.is_some());
+        crate::provider::AuthorizedUpstreamCandidate {
+            route_id: route.route_id,
+            account_id: route.account_id,
+            driver: route.driver.clone(),
+            upstream_model: "k3.1-pro".into(),
+            transport_revision: 1,
+            credential_generation: 1,
+        },
+        crate::provider::AuthorizedUpstreamCandidate {
+            route_id: Uuid::now_v7(),
+            account_id: route.account_id,
+            driver: route.driver.clone(),
+            upstream_model: route.upstream_model.clone(),
+            transport_revision: 1,
+            credential_generation: 1,
+        },
+    ];
+    let shape = native_chat_candidate_shape(Protocol::OpenAiChat, &mut request, &candidates)
+        .unwrap()
+        .unwrap();
+    assert_eq!(request["model"], "k3.1-pro");
+    assert!(request.get("stream_options").is_none());
     assert_eq!(state.proxy_memory_budget.snapshot(), before);
-    let shape = planned.native_chat_reentry_shape().unwrap().unwrap();
-    let route = planned.route.clone();
-    drop(planned);
     let replay = super::super::request_source::spool_normalized(
         request,
         directory.path().to_owned(),
@@ -104,38 +116,42 @@ async fn native_kimi_chat_uses_its_prepaid_workspace_under_budget_contention() {
     let request = admission.await.unwrap();
     assert_eq!(request["model"], "k3.1-pro");
     assert!(request.get("stream_options").is_none());
-    let planned = plan_proxy_route(ProxyRoutePlanInput {
-        request: ProxyRequestContext {
-            state: &state,
-            key: &key,
-            model: "k3.1-pro",
-            protocol: Protocol::OpenAiChat,
-            request_id: Uuid::now_v7(),
-            request_json: &request,
-            request_memory: Some(&memory),
-            codex_multi_agent_v2_request: false,
-        },
-        route,
-        preparation_now: unix_millis(),
-    })
-    .unwrap();
-    assert!(planned.native_chat_reentry_shape().unwrap().is_none());
-    let readmitted = state.proxy_memory_budget.snapshot();
+    for model in ["k3.1-pro", "k3.1-pro(long \"escaped model\")"] {
+        let mut next_route = route.clone();
+        next_route.upstream_model = model.into();
+        let planned = plan_proxy_route(ProxyRoutePlanInput {
+            request: ProxyRequestContext {
+                state: &state,
+                key: &key,
+                model: "k3.1-pro",
+                protocol: Protocol::OpenAiChat,
+                request_id: Uuid::now_v7(),
+                request_json: &request,
+                request_memory: Some(&memory),
+                codex_multi_agent_v2_request: false,
+            },
+            route: next_route,
+            preparation_now: unix_millis(),
+        })
+        .unwrap();
+        assert!(planned.request_workspace.is_some());
+        let readmitted = state.proxy_memory_budget.snapshot();
+        let mut prepared = materialize_proxy_route(&state, planned).await.unwrap();
+        assert_eq!(state.proxy_memory_budget.snapshot(), readmitted);
+        let forwarded: Value = serde_json::from_slice(&prepared.forwarded_body).unwrap();
+        let content = forwarded["messages"][0]["content"].as_str().unwrap();
+        assert_eq!(content.len(), 1024 * 1024);
+        assert!(content.bytes().all(|byte| byte == b'x'));
+        assert_eq!(forwarded["stream_options"]["include_usage"], true);
+        assert_eq!(forwarded["max_tokens"], 1);
+        assert_eq!(forwarded["model"], model);
+        assert!(memory.borrow_route_workspace(1).is_none());
+        prepared.release_request_buffers();
+        assert!(prepared.forwarded_body.is_empty());
+        assert!(memory.borrow_route_workspace(1).is_some());
+        drop(prepared);
+    }
     drop(request);
-    let mut prepared = materialize_proxy_route(&state, planned).await.unwrap();
-    assert_eq!(state.proxy_memory_budget.snapshot(), readmitted);
-    let forwarded: Value = serde_json::from_slice(&prepared.forwarded_body).unwrap();
-    let content = forwarded["messages"][0]["content"].as_str().unwrap();
-    assert_eq!(content.len(), 1024 * 1024);
-    assert!(content.bytes().all(|byte| byte == b'x'));
-    assert_eq!(forwarded["stream_options"]["include_usage"], true);
-    assert_eq!(forwarded["max_tokens"], 1);
-    assert_eq!(forwarded["model"], "k3.1-pro(long \"escaped model\")");
-    assert!(memory.borrow_route_workspace(1).is_none());
-    prepared.release_request_buffers();
-    assert!(prepared.forwarded_body.is_empty());
-    assert!(memory.borrow_route_workspace(1).is_some());
-    drop(prepared);
     drop(memory);
     assert_eq!(state.proxy_memory_budget.snapshot().0, 0);
 }
@@ -161,4 +177,56 @@ fn native_chat_histories_with_copied_tool_or_reasoning_state_keep_adapter_accoun
             &json!({"messages":[message]})
         ));
     }
+}
+
+#[test]
+fn native_chat_metadata_shape_covers_all_candidates_and_restores_source() {
+    let candidates = ["k2.7-code", "k3.1-pro(long \"escaped model\")"].map(|model| {
+        crate::provider::AuthorizedUpstreamCandidate {
+            route_id: Uuid::now_v7(),
+            account_id: Uuid::now_v7(),
+            driver: crate::oauth::managed::kimi::PROVIDER_DRIVER.into(),
+            upstream_model: model.into(),
+            transport_revision: 1,
+            credential_generation: 1,
+        }
+    });
+    for options in [
+        None,
+        Some(json!({})),
+        Some(json!({"include_usage":false,"extension":{"text":"保留"}})),
+        Some(json!({"include_usage":"replaced client value"})),
+    ] {
+        let mut request = json!({"model":"public alias", "stream":true,
+            "messages":[{"role":"user","content":"正文"}]});
+        if let Some(options) = options {
+            request["stream_options"] = options;
+        }
+        let original = request.clone();
+        let shape = native_chat_candidate_shape(Protocol::OpenAiChat, &mut request, &candidates)
+            .unwrap()
+            .unwrap();
+        assert_eq!(request, original);
+        for candidate in &candidates {
+            let mut actual = request.clone();
+            crate::api::kimi_transport::prepare(
+                Protocol::OpenAiChat,
+                &candidate.upstream_model,
+                &mut actual,
+            )
+            .unwrap();
+            let actual_shape = crate::gateway_body::memory::json_encoded_shape(&actual).unwrap();
+            assert!(actual_shape.0 <= shape.0);
+            assert!(actual_shape.1 <= shape.1);
+        }
+    }
+    let mut malformed = json!({"model":"public alias","stream":true,
+        "stream_options":[],"messages":[{"role":"user","content":"body"}]});
+    let original = malformed.clone();
+    assert!(
+        native_chat_candidate_shape(Protocol::OpenAiChat, &mut malformed, &candidates)
+            .unwrap()
+            .is_none()
+    );
+    assert_eq!(malformed, original);
 }

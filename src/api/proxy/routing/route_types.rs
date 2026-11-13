@@ -40,19 +40,6 @@ pub(in crate::api::proxy) struct PlannedProxyRoute {
 }
 
 impl PlannedProxyRoute {
-    pub(in crate::api::proxy) fn native_chat_reentry_shape(
-        &self,
-    ) -> Result<Option<(usize, usize)>, AppError> {
-        if self.route.driver != crate::oauth::managed::kimi::PROVIDER_DRIVER {
-            return Ok(None);
-        }
-        let Some(workspace) = self.request_workspace.as_ref() else {
-            return Ok(None);
-        };
-        let shape = crate::gateway_body::memory::json_encoded_shape(&self.forwarded_json)?;
-        Ok((!workspace.covers_shape(shape.0, shape.1)).then_some(shape))
-    }
-
     pub(in crate::api::proxy) fn is_component(&self) -> bool {
         self.component_context.is_some()
     }

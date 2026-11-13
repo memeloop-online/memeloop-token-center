@@ -42,6 +42,7 @@ async fn empty_and_oversized_snapshots_do_not_wait_for_database_preflight() {
                 route_id: Uuid::from_u128(1),
                 account_id: Uuid::from_u128(2),
                 driver: "http-json".into(),
+                upstream_model: "fixture-model".into(),
                 transport_revision: 1,
                 credential_generation: 1,
             };
@@ -130,6 +131,7 @@ async fn blocked_snapshot_with_maximum_candidates_cannot_extend_frozen_deadline(
             route_id: Uuid::from_u128(id),
             account_id: Uuid::from_u128(id + 2048),
             driver: "http-json".into(),
+            upstream_model: "fixture-model".into(),
             transport_revision: 1,
             credential_generation: 1,
         })
@@ -221,6 +223,7 @@ fn failed_high_priority_bucket_keeps_slots_before_success_and_native_tail() {
                 route_id: Uuid::from_u128(id),
                 account_id: Uuid::from_u128(id + 100),
                 driver: "http-json".into(),
+                upstream_model: "fixture-model".into(),
                 transport_revision: 1,
                 credential_generation: 1,
             },

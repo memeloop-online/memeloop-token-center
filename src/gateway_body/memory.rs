@@ -152,9 +152,6 @@ pub(crate) struct RequestRouteWorkspace {
 }
 
 impl RequestRouteWorkspace {
-    pub(crate) fn covers_shape(&self, bytes: usize, nodes: usize) -> bool {
-        self.covers(bytes) && nodes <= self.reservation.json_node_ceiling.load(Ordering::Acquire)
-    }
     pub(crate) fn covers(&self, bytes: usize) -> bool {
         bytes <= self.reservation.json_body_ceiling.load(Ordering::Acquire)
             && self.reservation.request_json_reserved_bytes() > 0
@@ -199,6 +196,11 @@ impl Drop for SseStreamingMemory {
 }
 
 impl ProxyMemoryReservation {
+    pub(crate) fn covers_json_shape(&self, bytes: usize, nodes: usize) -> bool {
+        self.request_json_reserved_bytes() > 0
+            && bytes <= self.json_body_ceiling.load(Ordering::Acquire)
+            && nodes <= self.json_node_ceiling.load(Ordering::Acquire)
+    }
     pub(crate) fn borrow_route_workspace(
         self: &Arc<Self>,
         bytes: usize,
