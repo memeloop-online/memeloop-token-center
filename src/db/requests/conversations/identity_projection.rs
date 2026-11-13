@@ -41,18 +41,12 @@ impl Database {
         after: Option<&str>,
         limit: i64,
     ) -> Result<Option<String>, AppError> {
-        let declared = match self.backend {
-            DatabaseBackend::PostgreSql => {
-                "NULLIF(trim(c.hints_json::jsonb->>'session_id'), '') IS NOT NULL"
-            }
-            DatabaseBackend::Sqlite => {
-                "NULLIF(trim(json_extract(c.hints_json, '$.session_id')), '') IS NOT NULL"
-            }
-        };
-        let eligible = format!("c.projected_at IS NULL AND c.key_snapshot_json IS NOT NULL AND {declared}
+        // Parse declared identity per row below: one corrupt legacy hints value
+        // must not poison the entire page before its cursor can advance.
+        let eligible = "c.projected_at IS NULL AND c.key_snapshot_json IS NOT NULL
             AND t.projected_at IS NOT NULL AND t.tenant_id = c.tenant_id AND t.key_id = c.key_id
             AND NOT EXISTS (SELECT 1 FROM conversation_observations o WHERE o.request_id = c.request_id)
-            AND NOT EXISTS (SELECT 1 FROM observability_prune_boundaries b WHERE b.scope = 'global' AND b.before_day > t.created_at / 86400000)");
+            AND NOT EXISTS (SELECT 1 FROM observability_prune_boundaries b WHERE b.scope = 'global' AND b.before_day > t.created_at / 86400000)";
         let ids: Vec<String> = sqlx::query_scalar(sqlx::AssertSqlSafe(format!(
             "SELECT c.request_id FROM conversation_projection_outbox c JOIN terminal_projection_outbox t ON t.request_id = c.request_id WHERE c.request_id > $1 AND {eligible} ORDER BY c.request_id LIMIT $2"
         )))
