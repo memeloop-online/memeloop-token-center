@@ -1236,6 +1236,7 @@ mod tests {
                 credential: UpstreamCredential::None,
             },
             forwarded_body: Bytes::from_static(b"{}"),
+            component_input_bytes: 0,
             upstream_stream: false,
             codex_downstream_stream: false,
             codex_store_disabled: false,
