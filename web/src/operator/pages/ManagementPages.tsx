@@ -255,16 +255,12 @@ function UpstreamProviders({ renderResetSettings, token, tenant, writeTenant = t
       if (workspace?.kind === 'account') detailHeading.current?.focus();
       return;
     }
-    const frame = requestAnimationFrame(() => {
-      if (returnFocus.current !== pending) return;
-      if (pending) {
-        const trigger = pending.trigger?.isConnected && pending.trigger.getClientRects().length ? pending.trigger
-          : Array.from(providerList.current?.querySelectorAll<HTMLButtonElement>(`[data-${pending.target}-trigger="${CSS.escape(pending.accountId)}"]`) ?? []).find(button => button.getClientRects().length && !button.disabled);
-        if (trigger && trigger.getClientRects().length && !trigger.matches(':disabled')) { returnFocus.current = undefined; trigger.focus(); return; }
-      }
-      if (workspace?.kind === 'account') detailHeading.current?.focus();
-    });
-    return () => cancelAnimationFrame(frame);
+    if (pending) {
+      const trigger = pending.trigger?.isConnected && pending.trigger.getClientRects().length ? pending.trigger
+        : Array.from(providerList.current?.querySelectorAll<HTMLButtonElement>(`[data-${pending.target}-trigger="${CSS.escape(pending.accountId)}"]`) ?? []).find(button => button.getClientRects().length && !button.disabled);
+      if (trigger && trigger.getClientRects().length && !trigger.matches(':disabled')) { returnFocus.current = undefined; trigger.focus(); return; }
+    }
+    if (workspace?.kind === 'account') detailHeading.current?.focus();
   }, [workspace, busy, proxyEditorOpen]);
   useLayoutEffect(() => { if (message && !workspace && !returnFocus.current) providerSuccess.current?.focus(); }, [message]);
   function navigateWorkspace(next?: AccountWorkspace) {

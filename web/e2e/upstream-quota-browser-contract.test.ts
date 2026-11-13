@@ -195,7 +195,7 @@ test('upstream themes and mock-only quota demand, consent and reconciliation con
       await view.click();
       await page.getByRole('alert').getByText(message, { exact: true }).waitFor();
       if (mode !== 'permission') {
-        await page.getByText('Codex usage · 5-hour limit', { exact: true }).waitFor();
+        await page.locator('.upstream-quota-windows').getByText('Codex usage · 5-hour limit', { exact: true }).waitFor();
         await page.getByText(/This refresh failed\. The values below are the last successful observation from .+ and may be outdated\. Retry manually for current quota\./).waitFor();
         assert.equal(await page.getByRole('meter').count(), 1);
       }
