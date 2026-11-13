@@ -499,11 +499,10 @@ impl Database {
         success: Option<bool>,
         recovery: bool,
     ) -> Result<bool, AppError> {
-        if crate::gateway_body::request_spool::source_request_id(locator)
-            != Some(identity.request_id)
-        {
-            return Err(AppError::internal("gateway_request_source_identity"));
-        }
+        let source_key = crate::gateway_body::request_spool::request_body_staging_key(locator)
+            .filter(|key| key.owner.id() == identity.request_id)
+            .ok_or_else(|| AppError::internal("gateway_request_source_identity"))?;
+        let backend_identity = source_key.backend_identity_text();
         let mut transaction = self.begin_write_transaction().await?;
         let owned = sqlx::query("UPDATE request_records SET request_object = request_object WHERE id = $1 AND tenant_id = $2 AND reservation_id = $3 AND request_object = $4 RETURNING key_id")
             .bind(identity.request_id.to_string()).bind(identity.tenant_id.to_string()).bind(identity.reservation_id.to_string()).bind(locator)
@@ -524,19 +523,24 @@ impl Database {
             .await?;
         let expires_at =
             now.saturating_add(crate::archive_staging::ARCHIVE_STAGING_WRITE_LEASE_MILLIS);
-        let inserted = sqlx::query("INSERT INTO archive_staging_attempts (attempt_id, owner_kind, owner_id, purpose, intent_digest, state, writer_owner, writer_token, lease_owner, lease_token, lease_expires_at, next_cleanup_at, created_at, updated_at) VALUES ($1, 'proxy_request', $1, 'request', $2, 'writing', 'gateway-source', $1, 'gateway-source', $1, $3, NULL, $4, $4) ON CONFLICT(attempt_id) DO NOTHING")
+        let inserted = sqlx::query("INSERT INTO archive_staging_attempts (attempt_id, owner_kind, owner_id, purpose, intent_digest, state, writer_owner, writer_token, lease_owner, lease_token, lease_expires_at, next_cleanup_at, created_at, updated_at, backend_identity) VALUES ($1, 'proxy_request', $1, 'request', $2, 'writing', 'gateway-source', $1, 'gateway-source', $1, $3, NULL, $4, $4, $5) ON CONFLICT(attempt_id) DO NOTHING")
             .bind(identity.request_id.to_string()).bind(blake3::Hash::from_bytes(digest).to_hex().to_string())
-            .bind(expires_at).bind(now)
+            .bind(expires_at).bind(now).bind(&backend_identity)
             .execute(&mut *transaction).await?;
         if recovery && success == Some(false) && inserted.rows_affected() == 1 {
             transaction.commit().await?;
             return Ok(false);
         }
-        let stage = sqlx::query("UPDATE archive_staging_attempts SET updated_at = updated_at WHERE attempt_id = $1 AND owner_kind = 'proxy_request' AND owner_id = $1 AND purpose = 'request' AND writer_owner = 'gateway-source' AND writer_token = $1 RETURNING state, lease_owner, lease_token, lease_expires_at")
+        let stage = sqlx::query("UPDATE archive_staging_attempts SET updated_at = updated_at WHERE attempt_id = $1 AND owner_kind = 'proxy_request' AND owner_id = $1 AND purpose = 'request' AND writer_owner = 'gateway-source' AND writer_token = $1 RETURNING state, lease_owner, lease_token, lease_expires_at, backend_identity")
             .bind(identity.request_id.to_string()).fetch_optional(&mut *transaction).await?;
         let Some(stage) = stage else {
             return Ok(false);
         };
+        if stage.try_get::<Option<String>, _>("backend_identity")? != backend_identity {
+            return Err(AppError::Conflict(
+                "request source staging backend changed".into(),
+            ));
+        }
         let writing = stage.try_get::<String, _>("state")? == "writing";
         let live = writing
             && stage

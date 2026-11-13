@@ -241,12 +241,17 @@ pub(crate) fn capture(
                     Some(reference) => reference,
                     None => {
                         durable = Some({
-                            let staging = format!(
-                                "raw-capture-staging/{}/{}/{}",
-                                identity.tenant_id,
-                                identity.request_id,
-                                Uuid::now_v7()
-                            );
+                            let staging_key = background.archive.select_staging_key(
+                                crate::archive_staging::ArchiveStagingKey::new(
+                                    crate::archive_staging::ArchiveStagingOwner::ProxyRequest(identity.request_id),
+                                    match purpose {
+                                        crate::response_archive_spool::BufferedArchivePurpose::Request => crate::archive_staging::ArchiveStagingPurpose::Request,
+                                        crate::response_archive_spool::BufferedArchivePurpose::Response => crate::archive_staging::ArchiveStagingPurpose::Response,
+                                    },
+                                    Uuid::now_v7(),
+                                )?,
+                            )?;
+                            let staging = format!("{}/body", staging_key.canonical_prefix());
                             let mut writer = background.archive.start_writer(&staging).await?;
                             let (body, _) =
                                 source.as_ref().expect("undurable capture retains source");
@@ -267,7 +272,7 @@ pub(crate) fn capture(
                                     &reference,
                                 )
                                 .await?;
-                            background.archive.delete(&staged.object_locator).await?;
+                            background.archive.delete_archive_staging_segment(staging_key).await?;
                             reference
                         });
                         durable
@@ -330,14 +335,28 @@ mod tests {
 
     #[tokio::test]
     async fn buffered_archive_waits_off_frontend_and_retries_without_losing_original_bytes() {
+        for training in [false, true] {
+            buffered_capture_backend_contract(training).await;
+        }
+    }
+
+    async fn buffered_capture_backend_contract(training: bool) {
         let directory = tempfile::tempdir().unwrap();
         let database_url = format!(
             "sqlite://{}?mode=rwc",
             directory.path().join("buffered-recovery.db").display()
         );
-        let state = AppState::initialize(crate::config::Config::for_test(database_url.clone()))
+        let mut state = AppState::initialize(crate::config::Config::for_test(database_url.clone()))
             .await
             .unwrap();
+        if training {
+            state.archive = crate::archive::ArchiveStore::training_staging_memory_for_test();
+            state.db = state.db.clone().with_archive(state.archive.clone());
+            state.persistence_db = state
+                .persistence_db
+                .clone()
+                .with_archive(state.archive.clone());
+        }
         let pool = sqlx::AnyPool::connect(&database_url).await.unwrap();
         let identity = crate::db::ArchiveSpoolIdentity {
             request_id: Uuid::new_v4(),
@@ -438,6 +457,15 @@ mod tests {
                 .await
                 .unwrap();
         assert_eq!(state.archive.get(&locator).await.unwrap(), body);
+        assert_eq!(locator.starts_with("stores/training/"), training);
+        if training {
+            let bare = locator.splitn(4, '/').nth(3).unwrap();
+            assert!(
+                state.archive.head_size(bare).await.is_err(),
+                "training body must not be copied into legacy CAS"
+            );
+        }
+
         assert!(!crate::response_archive_spool::process_one_for_test(&state).await);
         let retained: i64 = sqlx::query_scalar(
             "SELECT cipher_bytes FROM response_archive_spool_budget WHERE singleton = 1",

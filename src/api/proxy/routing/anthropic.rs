@@ -15,8 +15,7 @@ pub(super) fn prepare_forwarded_request(
     if normalize_multi_agent {
         crate::api::request_normalization::normalize_codex_multi_agent_v2(&mut forwarded, true)?;
     }
-    let context = responses_via_anthropic::prepare(&route.upstream_model, &mut forwarded)?;
-    Ok((forwarded, context))
+    responses_via_anthropic::prepare_owned(&route.upstream_model, forwarded)
 }
 
 struct StreamState {

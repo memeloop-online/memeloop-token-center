@@ -808,9 +808,19 @@ impl Database {
         if matches!(error, sqlx::Error::PoolTimedOut) {
             let pool_size = self.pool.size();
             let pool_idle = self.pool.num_idle();
+            let diagnostics = self.pool.diagnostics();
+            let (waiters, initializing, cancelled, failed, returned, discarded) =
+                diagnostics.snapshot();
             tracing::warn!(
                 operation,
                 pool_role = self.pool_role,
+                pool_label = diagnostics.label,
+                pool_acquire_waiters = waiters,
+                pool_session_initializing = initializing,
+                pool_session_initialization_cancelled = cancelled,
+                pool_session_initialization_failed = failed,
+                pool_return_callbacks = returned,
+                pool_protocol_discards = discarded,
                 phase = "acquire",
                 error_kind = "pool_timeout",
                 elapsed_ms = started.elapsed().as_millis() as u64,
@@ -830,6 +840,10 @@ impl Database {
     }
 
     pub(crate) fn independent_persistence_pool(&self) -> Self {
+        self.independent_persistence_pool_for("independent-persistence")
+    }
+
+    pub(crate) fn independent_persistence_pool_for(&self, label: &'static str) -> Self {
         Self {
             archive: self.archive.clone(),
             http_clients: self.http_clients.clone(),
@@ -838,35 +852,50 @@ impl Database {
             pool: {
                 let backend = self.backend;
                 let profile = self.connection_profile;
-                let application_name = postgres_application_name("mtc-auxiliary");
-                self.pool
+                let application_name = postgres_application_name(&format!("mtc-{label}"));
+                let diagnostics = request_pool::PoolDiagnostics::new(label);
+                let initialization_diagnostics = diagnostics.clone();
+                let release_diagnostics = diagnostics.clone();
+                let pool: sqlx::AnyPool = self
+                    .pool
                     .options()
                     .clone()
                     .min_connections(0)
                     .max_connections(self.auxiliary_pool_max_connections)
                     .after_connect(move |connection, _| {
                         let application_name = application_name.clone();
+                        let mut initialization = initialization_diagnostics.initializing();
                         Box::pin(async move {
-                            match backend {
-                                DatabaseBackend::Sqlite => {
-                                    sqlx::query("PRAGMA busy_timeout = 10000")
-                                        .execute(&mut *connection)
+                            let result = async {
+                                match backend {
+                                    DatabaseBackend::Sqlite => {
+                                        sqlx::query("PRAGMA busy_timeout = 10000")
+                                            .execute(&mut *connection)
+                                            .await?;
+                                    }
+                                    DatabaseBackend::PostgreSql => {
+                                        initialize_postgres_connection(
+                                            connection,
+                                            &application_name,
+                                            profile,
+                                        )
                                         .await?;
+                                    }
                                 }
-                                DatabaseBackend::PostgreSql => {
-                                    initialize_postgres_connection(
-                                        connection,
-                                        &application_name,
-                                        profile,
-                                    )
-                                    .await?;
-                                }
+                                Ok(())
                             }
-                            Ok(())
+                            .await;
+                            initialization.finish(result.is_ok());
+                            result
                         })
                     })
-                    .connect_lazy_with(self.pool.connect_options().as_ref().clone())
-                    .into()
+                    .after_release(move |connection, _| {
+                        let reusable = request_connection::can_reuse(connection, backend);
+                        release_diagnostics.released(reusable);
+                        Box::pin(async move { Ok(reusable) })
+                    })
+                    .connect_lazy_with(self.pool.connect_options().as_ref().clone());
+                request_pool::RequestPool::from(pool).with_diagnostics(diagnostics)
             },
             backend: self.backend,
             terminal_projection_enabled: self.terminal_projection_enabled,
@@ -879,7 +908,7 @@ impl Database {
 
     pub(crate) fn refresh_closed_persistence_pool(&mut self) {
         if self.pool_role == "independent_persistence" && self.pool.is_closed() {
-            *self = self.independent_persistence_pool();
+            *self = self.independent_persistence_pool_for(self.pool.diagnostics().label);
         }
     }
 

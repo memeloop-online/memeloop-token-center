@@ -86,15 +86,28 @@ impl Context {
     }
 }
 
+#[cfg(test)]
 pub(in crate::api) fn prepare(model: &str, request: &mut Value) -> Result<Context, AppError> {
-    validate_top_level(request)?;
+    let (output, context) = prepare_owned(model, request.clone())?;
+    *request = output;
+    Ok(context)
+}
+
+pub(in crate::api) fn prepare_owned(
+    model: &str,
+    mut request: Value,
+) -> Result<(Value, Context), AppError> {
+    validate_top_level(&request)?;
     let public_model = request
         .get("model")
         .and_then(Value::as_str)
         .filter(|model| !model.is_empty())
         .ok_or_else(|| AppError::BadRequest("model is required".into()))?
         .to_owned();
-    let (tools, identities) = collect_tools(request)?;
+    let (tools, identities) = collect_tools(&request)?;
+    // The translated declarations now own the necessary schema values.
+    // The canonical caller input is separate; this working copy is consumed.
+    drop(take_field(&mut request, "tools"));
     let context = Context {
         model: public_model,
         tools: identities,
@@ -104,10 +117,16 @@ pub(in crate::api) fn prepare(model: &str, request: &mut Value) -> Result<Contex
     if let Some(instructions) = request.get("instructions").and_then(Value::as_str)
         && !instructions.trim().is_empty()
     {
-        system.push(json!({"type":"text","text":instructions}));
+        let mut block = json!({"type":"text"});
+        block["text"] = take_field(&mut request, "instructions");
+        system.push(block);
     }
     let mut messages = Vec::new();
-    convert_input(request, &mut system, &mut messages)?;
+    convert_input(
+        take_field(&mut request, "input"),
+        &mut system,
+        &mut messages,
+    )?;
     if messages.is_empty() {
         return Err(AppError::BadRequest(
             "Responses-via-Anthropic requires at least one message".into(),
@@ -115,9 +134,9 @@ pub(in crate::api) fn prepare(model: &str, request: &mut Value) -> Result<Contex
     }
     let mut output = json!({
         "model":model,
-        "messages":messages,
         "stream":request.get("stream").and_then(Value::as_bool).unwrap_or(false)
     });
+    output["messages"] = Value::Array(messages);
     if !system.is_empty() {
         output["system"] = Value::Array(system);
     }
@@ -152,9 +171,8 @@ pub(in crate::api) fn prepare(model: &str, request: &mut Value) -> Result<Contex
         }
         output["service_tier"] = tier.into();
     }
-    apply_tool_choice(&mut output, request, &context.tools)?;
-    *request = output;
-    Ok(context)
+    apply_tool_choice(&mut output, &request, &context.tools)?;
+    Ok((output, context))
 }
 
 fn unix_now() -> i64 {
@@ -368,11 +386,12 @@ fn collect_tool_array(
                 .unwrap_or_else(|| json!({"type":"object","properties":{}}))
         };
         validate_object_schema(&schema)?;
-        output.push(json!({
+        let mut declaration = json!({
             "name":wire_name,
-            "description":definition.get("description").and_then(Value::as_str).unwrap_or_default(),
-            "input_schema":schema
-        }));
+            "description":definition.get("description").and_then(Value::as_str).unwrap_or_default()
+        });
+        declaration["input_schema"] = schema;
+        output.push(declaration);
         identities.insert(
             wire_name,
             ToolIdentity {
@@ -414,17 +433,26 @@ fn qualify(namespace: &str, name: &str) -> String {
     }
 }
 
+fn take_field(value: &mut Value, field: &str) -> Value {
+    value
+        .as_object_mut()
+        .and_then(|object| object.remove(field))
+        .unwrap_or(Value::Null)
+}
+
 fn convert_input(
-    request: &Value,
+    input: Value,
     system: &mut Vec<Value>,
     messages: &mut Vec<Value>,
 ) -> Result<(), AppError> {
-    let input = match request.get("input") {
-        Some(Value::String(text)) => {
-            push_message(messages, "user", vec![json!({"type":"text","text":text})]);
+    let mut input = match input {
+        Value::String(text) => {
+            let mut block = json!({"type":"text"});
+            block["text"] = Value::String(text);
+            push_message(messages, "user", vec![block]);
             return Ok(());
         }
-        Some(Value::Array(items)) => items,
+        Value::Array(items) => items,
         _ => {
             return Err(AppError::BadRequest(
                 "Responses input must be a string or array".into(),
@@ -433,17 +461,21 @@ fn convert_input(
     };
     let mut index = 0;
     while index < input.len() {
-        let item = &input[index];
+        let item = &mut input[index];
         let kind = item
             .get("type")
             .and_then(Value::as_str)
-            .unwrap_or("message");
-        match kind {
+            .unwrap_or("message")
+            .to_owned();
+        match kind.as_str() {
             "message" => {
-                let role = item.get("role").and_then(Value::as_str).unwrap_or("user");
-                let blocks =
-                    responses_content(item.get("content").unwrap_or(&Value::Null), role == "user")?;
-                if matches!(role, "system" | "developer") {
+                let role = item
+                    .get("role")
+                    .and_then(Value::as_str)
+                    .unwrap_or("user")
+                    .to_owned();
+                let blocks = responses_content(take_field(item, "content"), role == "user")?;
+                if matches!(role.as_str(), "system" | "developer") {
                     if !messages.is_empty() {
                         return Err(AppError::BadRequest(
                             "Responses-via-Anthropic system messages must precede conversation messages"
@@ -451,8 +483,8 @@ fn convert_input(
                         ));
                     }
                     system.extend(blocks);
-                } else if matches!(role, "user" | "assistant") {
-                    push_message(messages, role, blocks);
+                } else if matches!(role.as_str(), "user" | "assistant") {
+                    push_message(messages, &role, blocks);
                 } else {
                     return Err(AppError::BadRequest(format!(
                         "unsupported Responses-via-Anthropic message role: {role}"
@@ -480,10 +512,14 @@ fn convert_input(
                         Some("function_call" | "custom_tool_call")
                     )
                 {
-                    let call = &input[index];
-                    let call_kind = call.get("type").and_then(Value::as_str).unwrap_or_default();
-                    let call_id = required_string(call, "call_id", "tool call_id")?;
-                    let name = required_string(call, "name", "tool name")?;
+                    let mut call = std::mem::take(&mut input[index]);
+                    let call_kind = call
+                        .get("type")
+                        .and_then(Value::as_str)
+                        .unwrap_or_default()
+                        .to_owned();
+                    let call_id = required_string(&call, "call_id", "tool call_id")?.to_owned();
+                    let name = required_string(&call, "name", "tool name")?;
                     let wire_name = qualify(
                         call.get("namespace")
                             .and_then(Value::as_str)
@@ -491,9 +527,12 @@ fn convert_input(
                         name,
                     );
                     let arguments = if call_kind == "custom_tool_call" {
-                        json!({"input":required_string(call, "input", "custom tool input")?})
+                        required_string(&call, "input", "custom tool input")?;
+                        let mut arguments = json!({});
+                        arguments["input"] = take_field(&mut call, "input");
+                        arguments
                     } else {
-                        let raw = required_string(call, "arguments", "tool arguments")?;
+                        let raw = required_string(&call, "arguments", "tool arguments")?;
                         let parsed =
                             crate::api::sse::parse_unique_json(raw.as_bytes()).map_err(|_| {
                                 AppError::BadRequest(
@@ -507,16 +546,17 @@ fn convert_input(
                         }
                         parsed
                     };
-                    calls.push(
-                        json!({"type":"tool_use","id":call_id,"name":wire_name,"input":arguments}),
-                    );
-                    call_ids.push(call_id.to_owned());
+                    drop(call);
+                    let mut block = json!({"type":"tool_use","id":call_id,"name":wire_name});
+                    block["input"] = arguments;
+                    calls.push(block);
+                    call_ids.push(call_id);
                     index += 1;
                 }
                 push_message(messages, "assistant", calls);
                 let mut results = Vec::new();
                 for call_id in call_ids {
-                    let result = input.get(index).ok_or_else(|| {
+                    let result = input.get_mut(index).ok_or_else(|| {
                         AppError::BadRequest(
                             "Responses-via-Anthropic tool history has unanswered calls".into(),
                         )
@@ -531,11 +571,9 @@ fn convert_input(
                                 .into(),
                         ));
                     }
-                    results.push(json!({
-                        "type":"tool_result",
-                        "tool_use_id":call_id,
-                        "content":tool_result_content(result.get("output").unwrap_or(&Value::Null))?
-                    }));
+                    let mut block = json!({"type":"tool_result","tool_use_id":call_id});
+                    block["content"] = tool_result_content(take_field(result, "output"))?;
+                    results.push(block);
                     index += 1;
                 }
                 push_message(messages, "user", results);
@@ -555,24 +593,30 @@ fn convert_input(
     Ok(())
 }
 
-fn responses_content(content: &Value, allow_images: bool) -> Result<Vec<Value>, AppError> {
-    if let Some(text) = content.as_str() {
+fn responses_content(content: Value, allow_images: bool) -> Result<Vec<Value>, AppError> {
+    if let Value::String(text) = content {
         if text.trim().is_empty() {
             return Err(AppError::BadRequest(
                 "Responses-via-Anthropic message content is empty".into(),
             ));
         }
-        return Ok(vec![json!({"type":"text","text":text})]);
+        let mut block = json!({"type":"text"});
+        block["text"] = Value::String(text);
+        return Ok(vec![block]);
     }
-    let parts = content.as_array().ok_or_else(|| {
-        AppError::BadRequest("Responses-via-Anthropic message content is invalid".into())
-    })?;
+    let Value::Array(parts) = content else {
+        return Err(AppError::BadRequest(
+            "Responses-via-Anthropic message content is invalid".into(),
+        ));
+    };
     let mut blocks = Vec::with_capacity(parts.len());
-    for part in parts {
+    for mut part in parts {
         match part.get("type").and_then(Value::as_str) {
             Some("input_text" | "output_text" | "text") => {
-                let text = required_string(part, "text", "message text")?;
-                blocks.push(json!({"type":"text","text":text}));
+                required_string(&part, "text", "message text")?;
+                let mut block = json!({"type":"text"});
+                block["text"] = take_field(&mut part, "text");
+                blocks.push(block);
             }
             Some("input_image") if allow_images => {
                 if part.get("detail").and_then(Value::as_str) == Some("original") {
@@ -580,8 +624,13 @@ fn responses_content(content: &Value, allow_images: bool) -> Result<Vec<Value>, 
                         "Responses-via-Anthropic does not support original image detail".into(),
                     ));
                 }
-                let url = required_string(part, "image_url", "image URL")?;
-                blocks.push(json!({"type":"image","source":anthropic_image_source(url)?}));
+                required_string(&part, "image_url", "image URL")?;
+                let Value::String(url) = take_field(&mut part, "image_url") else {
+                    unreachable!()
+                };
+                let mut block = json!({"type":"image"});
+                block["source"] = anthropic_image_source(url)?;
+                blocks.push(block);
             }
             Some("encrypted_content") => {
                 return Err(AppError::BadRequest(
@@ -608,9 +657,9 @@ fn responses_content(content: &Value, allow_images: bool) -> Result<Vec<Value>, 
     Ok(blocks)
 }
 
-fn tool_result_content(output: &Value) -> Result<Value, AppError> {
-    if let Some(text) = output.as_str() {
-        return Ok(Value::String(text.to_owned()));
+fn tool_result_content(output: Value) -> Result<Value, AppError> {
+    if output.is_string() {
+        return Ok(output);
     }
     if output.is_array() {
         return Ok(Value::Array(responses_content(output, true)?));
@@ -627,11 +676,13 @@ fn push_message(messages: &mut Vec<Value>, role: &str, mut blocks: Vec<Value>) {
     {
         content.append(&mut blocks);
     } else {
-        messages.push(json!({"role":role,"content":blocks}));
+        let mut message = json!({"role":role});
+        message["content"] = Value::Array(blocks);
+        messages.push(message);
     }
 }
 
-fn anthropic_image_source(url: &str) -> Result<Value, AppError> {
+fn anthropic_image_source(mut url: String) -> Result<Value, AppError> {
     if let Some(data) = url.strip_prefix("data:") {
         let (header, encoded) = data.split_once(',').ok_or_else(|| {
             AppError::BadRequest("Responses-via-Anthropic data image is invalid".into())
@@ -648,10 +699,17 @@ fn anthropic_image_source(url: &str) -> Result<Value, AppError> {
                 "Responses-via-Anthropic image media type is unsupported".into(),
             ));
         }
-        return Ok(json!({"type":"base64","media_type":media_type,"data":encoded}));
+        let media_type = media_type.to_owned();
+        let prefix = url.len() - encoded.len();
+        drop(url.drain(..prefix));
+        let mut source = json!({"type":"base64","media_type":media_type});
+        source["data"] = Value::String(url);
+        return Ok(source);
     }
     if url.starts_with("https://") {
-        return Ok(json!({"type":"url","url":url}));
+        let mut source = json!({"type":"url"});
+        source["url"] = Value::String(url);
+        return Ok(source);
     }
     Err(AppError::BadRequest(
         "Responses-via-Anthropic images require an HTTPS or data URL".into(),
@@ -1642,5 +1700,91 @@ mod tests {
         let mut request = json!({"model":"claude","input":"hello","service_tier":"standard_only"});
         prepare("claude", &mut request).unwrap();
         assert_eq!(request["service_tier"], "standard_only");
+    }
+}
+
+#[cfg(test)]
+mod owned_input_tests {
+    use super::*;
+
+    fn payload_pointers(value: &Value, pointers: &mut BTreeSet<usize>) {
+        match value {
+            Value::String(text) if text.len() >= 4096 => {
+                pointers.insert(text.as_ptr() as usize);
+            }
+            Value::Array(items) => {
+                for item in items {
+                    payload_pointers(item, pointers);
+                }
+            }
+            Value::Object(object) => {
+                for value in object.values() {
+                    payload_pointers(value, pointers);
+                }
+            }
+            _ => {}
+        }
+    }
+
+    #[test]
+    fn owned_preparation_moves_messages_images_custom_input_and_tool_results() {
+        let request = json!({
+            "model":"public-model", "instructions":"i".repeat(16384),
+            "tools":[{"type":"custom","name":"script"}],
+            "max_output_tokens":123, "stream":true,
+            "input":[
+                {"role":"developer","content":"d".repeat(16384)},
+                {"role":"user","content":[
+                    {"type":"input_text","text":"u".repeat(16384)},
+                    {"type":"input_image","image_url":format!("https://images.invalid/{}", "h".repeat(16384))},
+                    {"type":"input_image","image_url":format!("data:image/png;base64,{}", "A".repeat(16384))}
+                ]},
+                {"type":"custom_tool_call","name":"script","call_id":"call-1","input":"c".repeat(16384)},
+                {"type":"custom_tool_call_output","call_id":"call-1","output":"o".repeat(16384)}
+            ]
+        });
+        let mut before = BTreeSet::new();
+        payload_pointers(&request, &mut before);
+        assert_eq!(before.len(), 7);
+        let (prepared, context) = prepare_owned("claude-upstream", request).unwrap();
+        let mut after = BTreeSet::new();
+        payload_pointers(&prepared, &mut after);
+        assert_eq!(
+            after, before,
+            "conversion must move payload allocations, including in-place data-URL stripping"
+        );
+        assert_eq!(context.model, "public-model");
+        assert_eq!(prepared["model"], "claude-upstream");
+        assert_eq!(prepared["max_tokens"], 123);
+        assert_eq!(prepared["stream"], true);
+        assert_eq!(prepared["system"][0]["text"], "i".repeat(16384));
+        assert_eq!(prepared["system"][1]["text"], "d".repeat(16384));
+        let messages = prepared["messages"].as_array().unwrap();
+        assert_eq!(messages.len(), 3);
+        assert_eq!(messages[0]["content"][0]["text"], "u".repeat(16384));
+        assert_eq!(
+            messages[0]["content"][1]["source"]["url"],
+            format!("https://images.invalid/{}", "h".repeat(16384))
+        );
+        assert_eq!(
+            messages[0]["content"][2]["source"],
+            json!({"type":"base64","media_type":"image/png","data":"A".repeat(16384)})
+        );
+        assert_eq!(
+            messages[1]["content"][0]["input"]["input"],
+            "c".repeat(16384)
+        );
+        assert_eq!(messages[2]["content"][0]["tool_use_id"], "call-1");
+        assert_eq!(messages[2]["content"][0]["content"], "o".repeat(16384));
+    }
+
+    #[test]
+    fn borrowed_preparation_failure_keeps_the_original_history() {
+        let mut request = json!({"model":"public-model","input":[
+            {"type":"function_call","name":"inspect","call_id":"unanswered","arguments":"{}"}
+        ]});
+        let original = request.clone();
+        assert!(prepare("claude", &mut request).is_err());
+        assert_eq!(request, original);
     }
 }

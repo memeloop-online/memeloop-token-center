@@ -162,9 +162,9 @@ pub(super) fn prepare_forwarded_request(
             .get(crate::provider::RESPONSES_VIA_CHAT_COMPACTION_CONFIG)
             .and_then(serde_json::Value::as_bool)
             .unwrap_or(false);
-        let context = crate::api::responses_via_chat::prepare_with_dialect(
+        let (mut forwarded, context) = crate::api::responses_via_chat::prepare_owned_with_dialect(
             &route.upstream_model,
-            &mut forwarded,
+            forwarded,
             dialect,
             translate_compaction,
         )?;

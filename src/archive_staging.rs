@@ -314,7 +314,7 @@ pub enum BeginArchiveStagingResult {
 
 #[derive(Clone, Debug)]
 pub enum ArchiveStagingReferenceProof {
-    Unreferenced(ArchiveStagingUnreferencedLease),
+    Unreferenced(Box<ArchiveStagingUnreferencedLease>),
     Protected { locator: String },
 }
 

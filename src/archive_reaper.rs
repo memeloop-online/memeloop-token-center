@@ -129,7 +129,7 @@ impl ArchiveReaper {
             .prove_archive_staging_unreferenced(lease)
             .await
         {
-            Ok(ArchiveStagingReferenceProof::Unreferenced(proof)) => proof,
+            Ok(ArchiveStagingReferenceProof::Unreferenced(proof)) => *proof,
             Ok(ArchiveStagingReferenceProof::Protected { .. }) => {
                 // The proof method already released the lease and persisted the
                 // fixed `reference_present` code plus backoff.

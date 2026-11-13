@@ -2,7 +2,14 @@
 //!
 //! No detached query task or SQL replay: dropping a future/stream drops its
 //! RequestConnection, while fully consumed operations use normal pool reuse.
-use std::{fmt, future::Future, sync::Arc};
+use std::{
+    fmt,
+    future::Future,
+    sync::{
+        Arc,
+        atomic::{AtomicU64, AtomicUsize, Ordering},
+    },
+};
 
 use futures_util::{TryStreamExt, future::BoxFuture, stream::BoxStream};
 use sqlx::{
@@ -12,10 +19,88 @@ use sqlx::{
 
 use super::{DatabaseBackend, request_connection::RequestConnection};
 
+/// In-process phase counters; no SQL, body data or connection URL is retained.
+#[derive(Default)]
+pub(super) struct PoolDiagnostics {
+    pub(super) label: &'static str,
+    waiters: AtomicUsize,
+    initializing: AtomicUsize,
+    initialization_cancelled: AtomicU64,
+    initialization_failed: AtomicU64,
+    returned: AtomicU64,
+    discarded_protocol: AtomicU64,
+}
+
+impl PoolDiagnostics {
+    pub(super) fn new(label: &'static str) -> Arc<Self> {
+        Arc::new(Self {
+            label,
+            ..Self::default()
+        })
+    }
+    pub(super) fn initializing(self: &Arc<Self>) -> InitializationGuard {
+        self.initializing.fetch_add(1, Ordering::Relaxed);
+        InitializationGuard {
+            diagnostics: self.clone(),
+            completed: false,
+        }
+    }
+    pub(super) fn released(&self, reusable: bool) {
+        self.returned.fetch_add(1, Ordering::Relaxed);
+        if !reusable {
+            self.discarded_protocol.fetch_add(1, Ordering::Relaxed);
+        }
+    }
+    pub(super) fn snapshot(&self) -> (usize, usize, u64, u64, u64, u64) {
+        (
+            self.waiters.load(Ordering::Relaxed),
+            self.initializing.load(Ordering::Relaxed),
+            self.initialization_cancelled.load(Ordering::Relaxed),
+            self.initialization_failed.load(Ordering::Relaxed),
+            self.returned.load(Ordering::Relaxed),
+            self.discarded_protocol.load(Ordering::Relaxed),
+        )
+    }
+}
+
+pub(super) struct InitializationGuard {
+    diagnostics: Arc<PoolDiagnostics>,
+    completed: bool,
+}
+impl InitializationGuard {
+    pub(super) fn finish(&mut self, success: bool) {
+        self.completed = true;
+        if !success {
+            self.diagnostics
+                .initialization_failed
+                .fetch_add(1, Ordering::Relaxed);
+        }
+    }
+}
+impl Drop for InitializationGuard {
+    fn drop(&mut self) {
+        self.diagnostics
+            .initializing
+            .fetch_sub(1, Ordering::Relaxed);
+        if !self.completed {
+            self.diagnostics
+                .initialization_cancelled
+                .fetch_add(1, Ordering::Relaxed);
+        }
+    }
+}
+struct AcquisitionGuard<'a>(&'a AtomicUsize);
+impl Drop for AcquisitionGuard<'_> {
+    fn drop(&mut self) {
+        self.0.fetch_sub(1, Ordering::Relaxed);
+    }
+}
+
 #[derive(Clone)]
 pub(crate) struct RequestPool {
     inner: SqlxPool,
     backend: DatabaseBackend,
+    diagnostics: Arc<PoolDiagnostics>,
 }
 
 impl fmt::Debug for RequestPool {
@@ -31,17 +116,30 @@ impl From<SqlxPool> for RequestPool {
         } else {
             DatabaseBackend::PostgreSql
         };
-        Self { inner, backend }
+        Self {
+            inner,
+            backend,
+            diagnostics: PoolDiagnostics::new("unclassified"),
+        }
     }
 }
 
 impl RequestPool {
+    pub(super) fn with_diagnostics(mut self, diagnostics: Arc<PoolDiagnostics>) -> Self {
+        self.diagnostics = diagnostics;
+        self
+    }
+    pub(super) fn diagnostics(&self) -> &PoolDiagnostics {
+        &self.diagnostics
+    }
     #[cfg(test)]
     pub(crate) async fn connect(url: &str) -> Result<Self, sqlx::Error> {
         SqlxPool::connect(url).await.map(Self::from)
     }
 
     pub(crate) async fn acquire(&self) -> Result<RequestConnection, sqlx::Error> {
+        self.diagnostics.waiters.fetch_add(1, Ordering::Relaxed);
+        let _waiting = AcquisitionGuard(&self.diagnostics.waiters);
         self.inner
             .acquire()
             .await
@@ -61,7 +159,16 @@ impl RequestPool {
                 {
                     timeouts += 1;
                     if timeouts == 1 || timeouts.is_multiple_of(6) {
+                        let (waiters, initializing, cancelled, failed, returned, discarded) =
+                            self.diagnostics.snapshot();
                         tracing::warn!(
+                            pool_label = self.diagnostics.label,
+                            pool_acquire_waiters = waiters,
+                            pool_session_initializing = initializing,
+                            pool_session_initialization_cancelled = cancelled,
+                            pool_session_initialization_failed = failed,
+                            pool_return_callbacks = returned,
+                            pool_protocol_discards = discarded,
                             operation = "executor_acquire",
                             request_id = crate::api::current_proxy_request_id()
                                 .map(|id| id.to_string())
@@ -200,6 +307,48 @@ mod tests {
     use sqlx::Row;
     use std::time::Duration;
 
+    #[tokio::test]
+    async fn diagnostics_distinguish_cancelled_session_initialization_from_slot_waiting() {
+        sqlx::any::install_default_drivers();
+        let diagnostics = PoolDiagnostics::new("raw-persistence");
+        let paused = Arc::new(std::sync::atomic::AtomicBool::new(true));
+        let initialization_diagnostics = diagnostics.clone();
+        let pause_initialization = paused.clone();
+        let inner = AnyPoolOptions::new()
+            .min_connections(0)
+            .max_connections(1)
+            .acquire_timeout(Duration::from_millis(20))
+            .after_connect(move |_connection, _| {
+                let mut initialization = initialization_diagnostics.initializing();
+                let paused = pause_initialization.clone();
+                Box::pin(async move {
+                    if paused.load(Ordering::Relaxed) {
+                        std::future::pending::<()>().await;
+                    }
+                    initialization.finish(true);
+                    Ok(())
+                })
+            })
+            .connect_lazy("sqlite::memory:")
+            .unwrap();
+        let pool = RequestPool::from(inner).with_diagnostics(diagnostics.clone());
+        assert!(matches!(
+            pool.acquire().await,
+            Err(sqlx::Error::PoolTimedOut)
+        ));
+        let (waiting, initializing, cancelled, failed, _, _) = diagnostics.snapshot();
+        assert_eq!((waiting, initializing, failed), (0, 0, 0));
+        assert!(
+            cancelled > 0,
+            "cancelled after-connect work is distinct from held slots"
+        );
+        paused.store(false, Ordering::Relaxed);
+        let connection = pool.acquire().await.unwrap();
+        connection.finish();
+        assert_eq!(diagnostics.snapshot().0, 0);
+        pool.close().await;
+    }
+
     async fn held_test_pool() -> (RequestPool, RequestConnection) {
         sqlx::any::install_default_drivers();
         let inner = AnyPoolOptions::new()
@@ -295,8 +444,19 @@ mod tests {
                 .await
                 .is_err()
         );
+        assert_eq!(
+            pool.diagnostics.snapshot().0,
+            1,
+            "the held-slot wait is observable"
+        );
         pending.abort();
         assert!(pending.await.unwrap_err().is_cancelled());
+        assert_eq!(
+            pool.diagnostics.snapshot().0,
+            0,
+            "cancelled waiter is not retained"
+        );
+
         assert_eq!(
             sqlx::query_scalar::<_, i64>("SELECT n FROM executions")
                 .fetch_one(&mut *held)
