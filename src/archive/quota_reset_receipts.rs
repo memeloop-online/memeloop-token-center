@@ -3,7 +3,7 @@ use super::ArchiveStore;
 use crate::error::AppError;
 use bytes::Bytes;
 use futures_util::StreamExt;
-use object_store::{ObjectStoreExt, PutMode, PutOptions, PutPayload};
+use object_store::{PutMode, PutOptions, PutPayload};
 
 pub(crate) const PREFIX: &str = "quota-reset-results/v1/";
 impl ArchiveStore {

@@ -1029,7 +1029,7 @@ mod tests {
         dispatch_once(
             &client,
             &credential,
-            "fixture-account".into(),
+            reqwest::header::HeaderValue::from_static("fixture-account"),
             &format!("{}/consume", supplier.uri()),
             "fixture-redeem",
         )

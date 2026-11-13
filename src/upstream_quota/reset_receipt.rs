@@ -107,3 +107,35 @@ pub(crate) async fn recover(state: &crate::AppState) {
         }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    #[tokio::test]
+    async fn immutable_outcomes_accept_duplicate_and_reject_conflict() {
+        let archive = ArchiveStore::memory_for_test();
+        let receipt = Receipt {
+            version: 1,
+            tenant: Uuid::now_v7(),
+            account: Uuid::now_v7(),
+            operation: Uuid::now_v7(),
+            owner: Uuid::now_v7(),
+            accepted: false,
+            error: Some("reset_dispatch_owner_ended".into()),
+        };
+        receipt.publish(&archive).await.unwrap();
+        receipt.publish(&archive).await.unwrap();
+        let mut conflict = receipt.clone();
+        conflict.accepted = true;
+        conflict.error = None;
+        assert!(conflict.publish(&archive).await.is_err());
+        let stored: Receipt =
+            serde_json::from_slice(&archive.get_bounded(&receipt.key(), 4096).await.unwrap())
+                .unwrap();
+        assert!(!stored.accepted);
+        let mut invalid = receipt.clone();
+        invalid.error = Some("https://supplier.invalid/private-response".into());
+        assert!(invalid.publish(&archive).await.is_err());
+        receipt.retire(&archive).await.unwrap();
+    }
+}
