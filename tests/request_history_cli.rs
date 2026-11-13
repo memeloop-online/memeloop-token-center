@@ -70,7 +70,7 @@ async fn request_history_cli_loads_configured_archive_before_export() {
         })
         .await
         .unwrap();
-    database.close().await;
+    drop(database);
     let bodies = Arc::new(Mutex::new(Vec::<String>::new()));
     let captured = bodies.clone();
     let router = Router::new().route(
