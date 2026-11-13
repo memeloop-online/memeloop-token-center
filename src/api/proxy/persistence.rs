@@ -224,7 +224,7 @@ pub(crate) fn capture(
     state.persistence.accepted.fetch_add(1, Ordering::Relaxed);
     state.persistence.archives.fetch_add(1, Ordering::Release);
     tokio::spawn(async move {
-        let _memory = memory;
+        let mut source = Some((body, memory));
         let _job = background
             .persistence
             .jobs
@@ -248,6 +248,8 @@ pub(crate) fn capture(
                                 Uuid::now_v7()
                             );
                             let mut writer = background.archive.start_writer(&staging).await?;
+                            let (body, _) =
+                                source.as_ref().expect("undurable capture retains source");
                             for chunk in body.chunks(crate::response_archive_spool::CHUNK_BYTES) {
                                 writer.write(Bytes::copy_from_slice(chunk)).await?;
                             }
@@ -273,6 +275,10 @@ pub(crate) fn capture(
                             .expect("archive reference was just persisted")
                     }
                 };
+                // CAS bytes and their deterministic raw root are confirmed
+                // durable above. A slow metadata pool only needs the reference:
+                // it must not retain the original body or frontend budget.
+                drop(source.take());
                 background
                     .archive
                     .publish_raw_capture(
@@ -302,7 +308,7 @@ pub(crate) fn capture(
                         .failed
                         .fetch_add(1, Ordering::Relaxed);
                     tracing::warn!(request_id = %identity.request_id, error_category = error.diagnostic_category(),
-                        "buffered archive capture retains original bytes for retry");
+                        "buffered archive capture retains source or durable reference for retry");
                 }
             }
             tokio::time::sleep(Duration::from_millis(250)).await;
@@ -380,7 +386,26 @@ mod tests {
         })
         .await
         .unwrap();
-        assert!(state.proxy_memory_budget.snapshot().0 > 0);
+        assert_eq!(
+            state.proxy_memory_budget.snapshot().0,
+            0,
+            "durable raw capture releases frontend body budget before metadata recovers"
+        );
+        let durable = state
+            .archive
+            .raw_capture_reference(identity.tenant_id, identity.request_id, "response")
+            .await
+            .unwrap()
+            .expect("metadata failure must retain the published raw root");
+        assert_eq!(
+            durable.blake3_digest,
+            blake3::hash(&body).to_hex().to_string()
+        );
+        assert_eq!(
+            state.persistence.archives.load(Ordering::Acquire),
+            1,
+            "metadata binding remains outstanding after body handoff"
+        );
         assert!(futures_util::poll!(&mut shutdown).is_pending());
         sqlx::query("DROP TRIGGER pause_buffered_capture")
             .execute(&pool)
