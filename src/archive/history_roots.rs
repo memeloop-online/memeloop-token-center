@@ -110,7 +110,7 @@ mod tests {
     use futures_util::TryStreamExt;
 
     #[tokio::test]
-    async fn history_roots_reuse_cas_and_keep_exact_owner_after_retry() {
+    async fn request_history_roots_reuse_cas_and_keep_exact_owner_after_retry() {
         let store = super::super::tests::memory_store();
         let tenant = Uuid::now_v7();
         let body = Bytes::from_static(b"history originals without a local body file");
