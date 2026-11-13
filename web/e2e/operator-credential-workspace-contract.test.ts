@@ -198,7 +198,7 @@ test('credential workspaces isolate loads and preserve issued service plaintext'
     await clientCopy.waitForFunction(() => document.querySelector<HTMLInputElement>('[aria-label="Credential value"] input')?.value === 'mtc_client_copied');
     assert.equal(await actualValue.getAttribute('type'), 'text', 'opening Edit reads the actual value without revealing or copying');
     await actualValue.fill('mtc_client_known_original');
-    await valueEditor.getByRole('button', { name: 'Save', exact: true }).click();
+    await valueEditor.getByRole('button', { name: 'Save credential', exact: true }).click();
     await clientCopy.getByRole('status').filter({ hasText: 'Credential saved and read back.' }).first().waitFor();
     await clientCopy.waitForFunction(() => document.querySelector<HTMLInputElement>('[aria-label="Credential value"] input')?.value === 'mtc_client_known_original');
     assert.equal(await actualValue.inputValue(), 'mtc_client_known_original');

@@ -90,7 +90,7 @@ export function ClientCredentialValueEditor({ value, token, tenant, disabled, on
     {error && <div role="alert">{error}<Button type="button" appearance="secondary" disabled={busy || !available} onClick={() => setRetry(value => value + 1)}>{t('common.retry')}</Button></div>}
     {saved && <p role="status">{t('credentials.valueSaved')}</p>}
     <div className="row-actions">
-      <Button type="button" appearance="primary" disabled={!available || busy || !visible || !draft || draft === baseline} onClick={() => void save()}>{t('common.save')}</Button>
+      <Button type="button" appearance="primary" disabled={!available || busy || !visible || !draft || draft === baseline} onClick={() => void save()}>{t('credentials.saveValue')}</Button>
       {visible && baseline && <CopyButton value={baseline} fluent />}
     </div>
   </section>;
