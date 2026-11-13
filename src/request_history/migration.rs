@@ -15,7 +15,7 @@ use crate::{
 #[derive(Debug, Subcommand)]
 pub enum HistoryCommand {
     Start,
-    /// Freeze delivery at a committed page boundary; capture continues.
+    /// Cap subsequent delivery revisions; capture continues, quiescence is not proved.
     FenceDelivery {
         #[arg(long)]
         owner: uuid::Uuid,

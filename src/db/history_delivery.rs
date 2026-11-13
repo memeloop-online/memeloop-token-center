@@ -11,7 +11,7 @@ impl Database {
         .await?;
         Ok(serde_json::json!({"epoch":row.try_get::<i64,_>("epoch")?,
             "owner":row.try_get::<Option<String>,_>("owner")?,
-            "ceiling":row.try_get::<Option<i64>,_>("ceiling")?}))
+            "ceiling":row.try_get::<Option<i64>,_>("ceiling")?,"quiescent":false}))
     }
 
     /// Called on a dedicated, reused one-connection maintenance pool. Holding
@@ -38,8 +38,10 @@ impl Database {
 
     /// Existing source triggers hold state FOR SHARE through commit. Obtaining
     /// its conflicting lock first fences committed sequence allocations. The
-    /// separate NOWAIT control lock then proves an export page boundary. There
-    /// is no wait/retry or network operation while either exclusive lock is held.
+    /// separate NOWAIT control lock coordinates healthy page leases. A lost
+    /// lease may still have an older <= watermark HTTP request in flight, so
+    /// this does not prove target quiescence. There is no wait/retry or network
+    /// operation while either exclusive lock is held.
     pub(crate) async fn history_fence_delivery(&self, owner: Uuid) -> Result<Value, HistoryError> {
         if matches!(self.backend, DatabaseBackend::Sqlite) {
             return Err(HistoryError::Invalid(
@@ -68,9 +70,9 @@ impl Database {
         let epoch:i64=sqlx::query_scalar("UPDATE request_history_delivery_control SET epoch=epoch+1,owner=$1,ceiling=$2 WHERE id=1 RETURNING epoch")
             .bind(owner.to_string()).bind(ceiling).fetch_one(&mut *transaction).await?;
         transaction.commit().await?;
-        // This is a committed capture watermark and target-delivery fence only.
-        // It is not yet a consistent PostgreSQL source snapshot or proof receipt.
-        Ok(serde_json::json!({"owner":owner,"epoch":epoch,"ceiling":ceiling}))
+        // This bounds revisions, not completion of already sent requests.
+        // Snapshot/delta/in-flight finalization is still required for cutover.
+        Ok(serde_json::json!({"owner":owner,"epoch":epoch,"ceiling":ceiling,"quiescent":false}))
     }
 
     pub(crate) async fn history_resume_delivery(
@@ -129,7 +131,7 @@ mod tests {
 
     #[tokio::test]
     #[ignore = "existing CI supplies the real PostgreSQL service"]
-    async fn request_history_real_services_acceptance_delivery_fence_page_boundary_and_recovery() {
+    async fn request_history_real_services_acceptance_delivery_ceiling_and_recovery() {
         let postgres = std::env::var("MTC_TEST_POSTGRES_URL").expect("PostgreSQL acceptance URL");
         let admin = sqlx::PgPool::connect(&postgres).await.unwrap();
         let schema = format!("history_fence_{}", Uuid::now_v7().simple());
@@ -256,6 +258,7 @@ mod tests {
         let second = reserve(&database).await;
         let fence = database.history_fence_delivery(owner).await.unwrap();
         assert_eq!(fence["ceiling"], second);
+        assert_eq!(fence["quiescent"], false);
         let epoch = fence["epoch"].as_i64().unwrap();
         let third = reserve(&database).await;
         assert!(
