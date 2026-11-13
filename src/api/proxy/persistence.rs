@@ -220,6 +220,41 @@ pub(crate) fn capture(
     body: Bytes,
     memory: Arc<crate::gateway_body::memory::ProxyMemoryReservation>,
 ) {
+    capture_owned(
+        state,
+        identity,
+        purpose,
+        CaptureBody::Bytes(body),
+        Some(memory),
+    );
+}
+
+enum CaptureBody {
+    Bytes(Bytes),
+    File(Arc<crate::gateway_body::request_spool::RequestSpool>),
+}
+
+pub(crate) fn capture_file(
+    state: &AppState,
+    identity: crate::db::ArchiveSpoolIdentity,
+    body: Arc<crate::gateway_body::request_spool::RequestSpool>,
+) {
+    capture_owned(
+        state,
+        identity,
+        crate::response_archive_spool::BufferedArchivePurpose::Request,
+        CaptureBody::File(body),
+        None,
+    );
+}
+
+fn capture_owned(
+    state: &AppState,
+    identity: crate::db::ArchiveSpoolIdentity,
+    purpose: crate::response_archive_spool::BufferedArchivePurpose,
+    body: CaptureBody,
+    memory: Option<Arc<crate::gateway_body::memory::ProxyMemoryReservation>>,
+) {
     let background = state.clone();
     state.persistence.accepted.fetch_add(1, Ordering::Relaxed);
     state.persistence.archives.fetch_add(1, Ordering::Release);
@@ -255,8 +290,19 @@ pub(crate) fn capture(
                             let mut writer = background.archive.start_writer(&staging).await?;
                             let (body, _) =
                                 source.as_ref().expect("undurable capture retains source");
-                            for chunk in body.chunks(crate::response_archive_spool::CHUNK_BYTES) {
-                                writer.write(Bytes::copy_from_slice(chunk)).await?;
+                            match body {
+                                CaptureBody::Bytes(body) => {
+                                    for chunk in body.chunks(crate::response_archive_spool::CHUNK_BYTES) {
+                                        writer.write(Bytes::copy_from_slice(chunk)).await?;
+                                    }
+                                }
+                                CaptureBody::File(body) => {
+                                    let mut stream = body.open_stream().await
+                                        .map_err(|_| AppError::storage("audio_original_source_read"))?.stream;
+                                    while let Some(chunk) = stream.next().await {
+                                        writer.write(chunk.map_err(|_| AppError::storage("audio_original_source_read"))?).await?;
+                                    }
+                                }
                             }
                             let staged = writer.finish_staged().await?;
                             let reference = background

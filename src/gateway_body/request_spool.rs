@@ -352,7 +352,54 @@ impl RequestSpoolAdmission {
         request_metadata_bytes: usize,
         body_key: Option<&str>,
     ) -> Result<RequestSpool, RequestSpoolCaptureError> {
-        let durable = self.usage.durable.clone();
+        self.capture_inner(
+            body,
+            maximum,
+            declared_content_length,
+            memory,
+            request_metadata_bytes,
+            body_key,
+            false,
+        )
+        .await
+    }
+
+    /// Multipart replay keeps its complete original bytes in the owned file;
+    /// the parser and archive publisher share that carrier instead of a RAM body.
+    pub(crate) async fn capture_file(
+        &self,
+        body: Body,
+        declared_content_length: Option<usize>,
+        body_key: &str,
+    ) -> Result<RequestSpool, RequestSpoolCaptureError> {
+        self.capture_inner(
+            body,
+            usize::MAX,
+            declared_content_length,
+            None,
+            0,
+            Some(body_key),
+            true,
+        )
+        .await
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    async fn capture_inner(
+        &self,
+        body: Body,
+        maximum: usize,
+        declared_content_length: Option<usize>,
+        memory: Option<&Arc<super::memory::ProxyMemoryReservation>>,
+        request_metadata_bytes: usize,
+        body_key: Option<&str>,
+        force_file: bool,
+    ) -> Result<RequestSpool, RequestSpoolCaptureError> {
+        let durable = if force_file {
+            None
+        } else {
+            self.usage.durable.clone()
+        };
         let object_key = {
             request_body_object_key(body_key.unwrap_or(""))
                 .or_else(|| request_body_object_key(&uuid::Uuid::now_v7().to_string()))
@@ -406,8 +453,8 @@ impl RequestSpoolAdmission {
         let mut length = 0_usize;
         let mut hasher = blake3::Hasher::new();
         let mut json_scanner = super::memory::JsonMemoryScanner::default();
-        let mut spilling = memory.is_some() && metadata.is_none();
-        let local_backed = memory.is_some();
+        let mut spilling = force_file || (memory.is_some() && metadata.is_none());
+        let local_backed = force_file || memory.is_some();
         let mut sink = if spilling || local_backed {
             Some(open_spill(&self.usage.directory).await?)
         } else {
@@ -1313,6 +1360,42 @@ mod tests {
 
     fn file_count(directory: &Path) -> usize {
         std::fs::read_dir(directory).map_or(0, |entries| entries.count())
+    }
+
+    #[tokio::test]
+    async fn multipart_file_carrier_replays_without_resident_body_or_archive_dependency() {
+        let directory = tempfile::tempdir().unwrap();
+        let store = MemoryObjectStore::new();
+        store.fail_writes_for_test();
+        let admission = RequestSpoolAdmission::new(directory.path().to_owned())
+            .with_memory_store(store.clone());
+        let chunks =
+            stream::iter((0..80).map(|n| Ok::<_, Infallible>(Bytes::from(vec![n; 64 * 1024]))));
+        let source = admission
+            .capture_file(
+                Body::from_stream(chunks),
+                Some(80 * 64 * 1024),
+                &uuid::Uuid::now_v7().to_string(),
+            )
+            .await
+            .unwrap();
+        assert!(source.shared.body.lock().unwrap().is_none());
+        assert!(source.shared.local.is_some());
+        assert_eq!(source.len(), 80 * 64 * 1024);
+        let mut replay = source.open_stream().await.unwrap().stream;
+        let mut offset = 0;
+        while let Some(chunk) = replay.next().await {
+            for byte in chunk.unwrap() {
+                assert_eq!(byte, (offset / (64 * 1024)) as u8);
+                offset += 1;
+            }
+        }
+        assert_eq!(offset, source.len());
+        assert_eq!(store.entered_writes.load(Ordering::Acquire), 0);
+        drop(replay);
+        drop(source);
+        assert_eq!(admission.snapshot().active_files, 0);
+        assert_eq!(file_count(directory.path()), 0);
     }
 
     #[tokio::test]

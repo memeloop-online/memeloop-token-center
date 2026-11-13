@@ -1,5 +1,6 @@
 use axum::extract::{Extension, Multipart, multipart::MultipartRejection};
 use reqwest::multipart::{Form, Part};
+use tokio::io::{AsyncReadExt, AsyncSeekExt, AsyncWriteExt};
 
 use super::*;
 
@@ -28,7 +29,8 @@ impl AudioResponseFormat {
 
 #[derive(Debug)]
 struct AudioFile {
-    bytes: Bytes,
+    file: tokio::fs::File,
+    len: u64,
 }
 
 #[derive(Debug)]
@@ -78,14 +80,14 @@ pub(super) async fn create_audio_transcription(
 ) -> Result<Response, AppError> {
     let key = authenticate_downstream(&headers, &state).await?;
     let mut state = state.pin_application_plugins().await?;
-    let form = parse_audio_transcription_form(
+    let mut form = parse_audio_transcription_form(
         multipart.map_err(|_| {
             AppError::BadRequest("request body must be multipart/form-data".to_owned())
         })?,
-        state.config.audio_body_max_bytes as usize,
+        std::path::Path::new(&state.config.responses_request_spool_path),
     )
     .await?;
-    let audio = pcm16_wav_duration(&form.file.bytes)?;
+    let audio = pcm16_wav_file_duration(&mut form.file).await?;
     let applied = apply_traffic_policy(
         &state,
         &key,
@@ -144,7 +146,7 @@ pub(super) async fn create_audio_transcription(
         ));
     }
     let request_object = format!("gap://{request_id}/request");
-    let upstream_form = upstream_form(form.file, &metadata, &route.upstream_model)?;
+    let upstream_form = upstream_form(form.file, &metadata, &route.upstream_model).await?;
     let outbound_http = network::client_for_config_url_no_retry(
         &state.http,
         &route.base_url,
@@ -177,13 +179,7 @@ pub(super) async fn create_audio_transcription(
         tenant_id: key.tenant_id,
         reservation_id: reservation.reservation.id,
     };
-    super::proxy::persistence::capture(
-        &state,
-        identity,
-        crate::response_archive_spool::BufferedArchivePurpose::Request,
-        resources.raw_request.clone(),
-        resources.memory.clone(),
-    );
+    super::proxy::persistence::capture_file(&state, identity, resources.raw_request.clone());
     super::early_request::mark_admitted();
     let operation = async move {
         let _resource_owners = (&resources.lifecycle, &resources.memory);
@@ -389,7 +385,7 @@ pub(super) async fn create_audio_transcription(
 
 async fn parse_audio_transcription_form(
     mut multipart: Multipart,
-    maximum_body_bytes: usize,
+    spool_path: &std::path::Path,
 ) -> Result<AudioTranscriptionForm, AppError> {
     let mut file = None;
     let mut model = None;
@@ -397,7 +393,7 @@ async fn parse_audio_transcription_form(
     let mut hotwords = None;
     let mut response_format = None;
     let mut temperature = None;
-    while let Some(field) = multipart
+    while let Some(mut field) = multipart
         .next_field()
         .await
         .map_err(|_| AppError::BadRequest("invalid multipart request".into()))?
@@ -408,16 +404,39 @@ async fn parse_audio_transcription_form(
                 if file.is_some() {
                     return Err(AppError::BadRequest("file must be supplied once".into()));
                 }
-                let bytes = field
-                    .bytes()
+                tokio::fs::create_dir_all(spool_path)
                     .await
-                    .map_err(|_| AppError::BadRequest("invalid audio file field".into()))?;
-                if bytes.is_empty() || bytes.len() > maximum_body_bytes {
+                    .map_err(|_| AppError::internal("audio_spool_directory"))?;
+                let path = spool_path.to_owned();
+                let file_handle = tokio::task::spawn_blocking(move || tempfile::tempfile_in(path))
+                    .await
+                    .map_err(|_| AppError::internal("audio_spool_owner"))?
+                    .map_err(|_| AppError::internal("audio_spool_create"))?;
+                let mut output = tokio::fs::File::from_std(file_handle);
+                let mut len = 0_u64;
+                while let Some(chunk) = field
+                    .chunk()
+                    .await
+                    .map_err(|_| AppError::BadRequest("invalid audio file field".into()))?
+                {
+                    output
+                        .write_all(&chunk)
+                        .await
+                        .map_err(|_| AppError::internal("audio_spool_write"))?;
+                    len = len
+                        .checked_add(chunk.len() as u64)
+                        .ok_or_else(|| AppError::BadRequest("audio file length overflow".into()))?;
+                }
+                if len == 0 {
                     return Err(AppError::BadRequest(
-                        "file must contain a bounded PCM16 WAV payload".into(),
+                        "file must contain PCM16 WAV audio".into(),
                     ));
                 }
-                file = Some(AudioFile { bytes });
+                output
+                    .flush()
+                    .await
+                    .map_err(|_| AppError::internal("audio_spool_flush"))?;
+                file = Some(AudioFile { file: output, len });
             }
             "model" => set_once_text(&mut model, field, "model").await?,
             "prompt" => set_once_text(&mut prompt, field, "prompt").await?,
@@ -552,43 +571,72 @@ fn validate_hotwords(hotwords: Option<&[String]>) -> Result<(), AppError> {
     Ok(())
 }
 
-fn pcm16_wav_duration(bytes: &[u8]) -> Result<Pcm16WavDuration, AppError> {
-    if bytes.len() < 12 || &bytes[..4] != b"RIFF" || &bytes[8..12] != b"WAVE" {
+async fn pcm16_wav_file_duration(audio: &mut AudioFile) -> Result<Pcm16WavDuration, AppError> {
+    let mut header = [0_u8; 12];
+    audio
+        .file
+        .rewind()
+        .await
+        .map_err(|_| AppError::internal("audio_spool_seek"))?;
+    if audio.len < 12 {
+        return Err(AppError::BadRequest("file must be a PCM16 WAV file".into()));
+    }
+    audio
+        .file
+        .read_exact(&mut header)
+        .await
+        .map_err(|_| AppError::internal("audio_spool_read"))?;
+    if &header[..4] != b"RIFF" || &header[8..12] != b"WAVE" {
         return Err(AppError::BadRequest(
             "file must be a PCM16 WAV file in ASR phase one".into(),
         ));
     }
-    let riff_size = u32::from_le_bytes(bytes[4..8].try_into().unwrap()) as usize;
-    if riff_size.checked_add(8) != Some(bytes.len()) {
+    let riff_size = u64::from(u32::from_le_bytes(header[4..8].try_into().unwrap()));
+    if riff_size.checked_add(8) != Some(audio.len) {
         return Err(AppError::BadRequest("WAV RIFF length is invalid".into()));
     }
-    let mut offset = 12_usize;
+    let mut offset = 12_u64;
     let mut format = None;
     let mut data_bytes = None;
-    while offset.saturating_add(8) <= bytes.len() {
-        let id = &bytes[offset..offset + 4];
+    while offset.saturating_add(8) <= audio.len {
+        audio
+            .file
+            .seek(std::io::SeekFrom::Start(offset))
+            .await
+            .map_err(|_| AppError::internal("audio_spool_seek"))?;
+        let mut chunk = [0_u8; 8];
+        audio
+            .file
+            .read_exact(&mut chunk)
+            .await
+            .map_err(|_| AppError::internal("audio_spool_read"))?;
+        let id = &chunk[..4];
         let size = u32::from_le_bytes(
-            bytes[offset + 4..offset + 8]
+            chunk[4..8]
                 .try_into()
                 .map_err(|_| AppError::BadRequest("invalid WAV chunk".into()))?,
-        ) as usize;
+        ) as u64;
         let start = offset + 8;
         let end = start
             .checked_add(size)
-            .filter(|end| *end <= bytes.len())
+            .filter(|end| *end <= audio.len)
             .ok_or_else(|| AppError::BadRequest("invalid WAV chunk length".into()))?;
         if id == b"fmt " {
             if size < 16 || format.is_some() {
                 return Err(AppError::BadRequest("invalid WAV format chunk".into()));
             }
-            let audio_format = u16::from_le_bytes(bytes[start..start + 2].try_into().unwrap());
-            let channels = u16::from_le_bytes(bytes[start + 2..start + 4].try_into().unwrap());
-            let sample_rate_hz =
-                u32::from_le_bytes(bytes[start + 4..start + 8].try_into().unwrap());
-            let byte_rate = u32::from_le_bytes(bytes[start + 8..start + 12].try_into().unwrap());
-            let block_align = u16::from_le_bytes(bytes[start + 12..start + 14].try_into().unwrap());
-            let bits_per_sample =
-                u16::from_le_bytes(bytes[start + 14..start + 16].try_into().unwrap());
+            let mut format_bytes = [0_u8; 16];
+            audio
+                .file
+                .read_exact(&mut format_bytes)
+                .await
+                .map_err(|_| AppError::internal("audio_spool_read"))?;
+            let audio_format = u16::from_le_bytes(format_bytes[..2].try_into().unwrap());
+            let channels = u16::from_le_bytes(format_bytes[2..4].try_into().unwrap());
+            let sample_rate_hz = u32::from_le_bytes(format_bytes[4..8].try_into().unwrap());
+            let byte_rate = u32::from_le_bytes(format_bytes[8..12].try_into().unwrap());
+            let block_align = u16::from_le_bytes(format_bytes[12..14].try_into().unwrap());
+            let bits_per_sample = u16::from_le_bytes(format_bytes[14..16].try_into().unwrap());
             let expected_align = channels.checked_mul(2).unwrap_or_default();
             let expected_rate = sample_rate_hz.checked_mul(u32::from(expected_align));
             if audio_format != 1
@@ -604,17 +652,17 @@ fn pcm16_wav_duration(bytes: &[u8]) -> Result<Pcm16WavDuration, AppError> {
                 ));
             }
             format = Some((channels, sample_rate_hz, block_align));
-        } else if id == b"data" && data_bytes.replace(size as u64).is_some() {
+        } else if id == b"data" && data_bytes.replace(size).is_some() {
             return Err(AppError::BadRequest(
                 "WAV must contain exactly one audio data chunk".into(),
             ));
         }
         offset = end
             .checked_add(size & 1)
-            .filter(|next| *next <= bytes.len())
+            .filter(|next| *next <= audio.len)
             .ok_or_else(|| AppError::BadRequest("invalid WAV chunk padding".into()))?;
     }
-    if offset != bytes.len() {
+    if offset != audio.len {
         return Err(AppError::BadRequest("invalid WAV trailing data".into()));
     }
     let (channels, sample_rate_hz, block_align) =
@@ -647,12 +695,25 @@ fn pcm16_wav_duration(bytes: &[u8]) -> Result<Pcm16WavDuration, AppError> {
     })
 }
 
-fn upstream_form(
-    file: AudioFile,
+async fn upstream_form(
+    mut file: AudioFile,
     metadata: &RewrittenAudioMetadata,
     upstream_model: &str,
 ) -> Result<Form, AppError> {
-    let part = Part::bytes(file.bytes.to_vec())
+    file.file
+        .rewind()
+        .await
+        .map_err(|_| AppError::internal("audio_spool_seek"))?;
+    let stream = futures_util::stream::try_unfold(file.file, |mut file| async move {
+        let mut bytes = vec![0_u8; 64 * 1024];
+        let read = file.read(&mut bytes).await?;
+        if read == 0 {
+            return Ok::<_, std::io::Error>(None);
+        }
+        bytes.truncate(read);
+        Ok(Some((Bytes::from(bytes), file)))
+    });
+    let part = Part::stream_with_length(reqwest::Body::wrap_stream(stream), file.len)
         .file_name("audio.wav")
         .mime_str("audio/wav")
         .map_err(|_| AppError::internal("audio_upstream_form_1"))?;
@@ -1000,9 +1061,17 @@ mod tests {
         (boundary.to_owned(), body)
     }
 
-    #[test]
-    fn pcm16_wav_duration_preserves_milliseconds_and_bills_whole_seconds() {
-        let duration = pcm16_wav_duration(&wav(16_000, 1, 24_001)).unwrap();
+    #[tokio::test]
+    async fn pcm16_wav_duration_preserves_milliseconds_and_bills_whole_seconds() {
+        let bytes = wav(16_000, 1, 24_001);
+        let mut file = tokio::fs::File::from_std(tempfile::tempfile().unwrap());
+        file.write_all(&bytes).await.unwrap();
+        let duration = pcm16_wav_file_duration(&mut AudioFile {
+            file,
+            len: bytes.len() as u64,
+        })
+        .await
+        .unwrap();
         assert_eq!(duration.duration_ms, 1_500);
         assert_eq!(duration.billed_seconds, 2);
         assert_eq!(duration.sample_rate_hz, 16_000);
@@ -1069,7 +1138,12 @@ mod tests {
             .expect(1)
             .mount(&upstream)
             .await;
-        let (state, _directory) = crate::api::tests::test_state().await;
+        let (mut state, _directory) = crate::api::tests::test_state().await;
+        // The complete multipart and WAV are larger than the former hot-body
+        // ceiling; file replay must preserve the original financial contract.
+        std::sync::Arc::make_mut(&mut state.config).audio_body_max_bytes = 1024;
+        // An old hot-body setting must not reject a file streamed through disk.
+        std::sync::Arc::make_mut(&mut state.config).audio_body_max_bytes = 1024;
         let tenant = "audio-transcription-test";
         let model = "local-asr-test";
         let account = state
@@ -1127,7 +1201,8 @@ mod tests {
             .upsert_generation_price(model, "USD", "second", Decimal::new(25, 2))
             .await
             .unwrap();
-        let (boundary, multipart) = multipart_body(model, &wav(16_000, 1, 24_001));
+        let original_wav = wav(16_000, 1, 24_001);
+        let (boundary, multipart) = multipart_body(model, &original_wav);
         let response = router_for_role(state.clone(), RuntimeRole::Gateway)
             .oneshot(
                 Request::post("/v1/audio/transcriptions")
@@ -1173,6 +1248,13 @@ mod tests {
             json!({"word":"sensitive","start":0.0,"end":0.7})
         );
         let requests = upstream.received_requests().await.unwrap();
+        assert!(
+            requests[0]
+                .body
+                .windows(original_wav.len())
+                .any(|window| window == original_wav.as_slice()),
+            "file-backed upstream multipart retains every original WAV byte"
+        );
         assert!(
             requests[0]
                 .body

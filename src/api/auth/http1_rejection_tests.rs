@@ -64,9 +64,16 @@ impl Server {
         let app = Router::new()
             .route(
                 "/v1/audio/transcriptions",
-                post(move || {
+                post(move |request: axum::extract::Request| {
                     let calls = calls.clone();
                     async move {
+                        let body = axum::body::to_bytes(request.into_body(), usize::MAX)
+                            .await
+                            .unwrap();
+                        if body.as_ref() != b"{}" {
+                            assert_eq!(body.len(), LIMIT + 1024);
+                            assert!(body.iter().all(|byte| *byte == b'x'));
+                        }
                         calls.fetch_add(1, Ordering::Relaxed);
                         "ok"
                     }
@@ -215,18 +222,6 @@ fn response_body(response: &[u8]) -> Vec<u8> {
     }
 }
 
-fn assert_rejection(response: &[u8]) {
-    let response = std::str::from_utf8(response).unwrap();
-    assert!(response.starts_with("HTTP/1.1 413"), "{response}");
-    assert!(!response.contains("100 Continue"), "{response}");
-    let (headers, body) = response.split_once("\r\n\r\n").unwrap();
-    // Audio requests do not enter the text-request ID journal; the response
-    // framing and rejection remain mandatory for the audio admission path.
-    let json: serde_json::Value = serde_json::from_str(body).unwrap();
-    assert_eq!(json["error"]["code"], "request_body_too_large");
-    assert!(headers.contains("connection: close"));
-}
-
 #[tokio::test]
 async fn http1_completed_upload_half_close_preserves_pending_response() {
     let ready = Arc::new(Notify::new());
@@ -258,10 +253,14 @@ async fn http1_completed_upload_half_close_preserves_pending_response() {
 }
 
 #[tokio::test]
-async fn http1_large_declared_and_chunked_uploads_deliver_413_and_recover() {
+async fn http1_large_declared_and_chunked_uploads_deliver_complete_body_and_recover() {
     let server = Server::start().await;
     server.normal_request().await;
-    for (chunked, half_close) in [(false, false), (false, true), (true, false), (true, true)] {
+    for (index, (chunked, half_close)) in
+        [(false, false), (false, true), (true, false), (true, true)]
+            .into_iter()
+            .enumerate()
+    {
         let mut socket = TcpStream::connect(server.address).await.unwrap();
         let size = LIMIT + 1024;
         let framing = if chunked {
@@ -299,67 +298,40 @@ async fn http1_large_declared_and_chunked_uploads_deliver_413_and_recover() {
         let response = read_response(&mut read).await;
         assert!(
             !response.is_empty(),
-            "missing rejection: chunked={chunked}, half_close={half_close}"
+            "missing response: chunked={chunked}, half_close={half_close}"
         );
-        assert_rejection(&response);
+        assert!(response.starts_with(b"HTTP/1.1 200"));
+        assert_eq!(response_body(&response), b"ok");
         let _ = response_received.send(());
         tokio::time::timeout(DEADLINE, writer)
             .await
             .unwrap()
             .unwrap()
-            .expect("finite rejected upload is discarded while the response is delivered");
-        assert_eq!(server.reached_handler.load(Ordering::Relaxed), 1);
+            .expect("complete upload reaches the handler before its response");
+        assert_eq!(server.reached_handler.load(Ordering::Relaxed), index + 2);
         assert_eq!(server.state.gateway_body_reads.load(Ordering::Acquire), 0);
     }
     server.normal_request().await;
-    assert_eq!(server.reached_handler.load(Ordering::Relaxed), 2);
+    assert_eq!(server.reached_handler.load(Ordering::Relaxed), 6);
     server.stop().await;
 }
 
 #[tokio::test]
-async fn http1_declared_oversize_rejects_headers_only_with_and_without_expect() {
-    let server = Server::start().await;
-    for expect in ["", "Expect: 100-continue\r\n"] {
-        let mut socket = TcpStream::connect(server.address).await.unwrap();
-        socket
-            .write_all(&server.headers(&format!("Content-Length: {}\r\n{expect}", LIMIT + 1024)))
-            .await
-            .unwrap();
-        // No upload bytes: this would deadlock if cleanup preceded the 413.
-        let response = tokio::time::timeout(Duration::from_millis(750), read_response(&mut socket))
-            .await
-            .expect("413 and FIN precede the one-second cleanup deadline");
-        assert_rejection(&response);
-    }
-    assert_eq!(server.reached_handler.load(Ordering::Relaxed), 0);
-    server.normal_request().await;
-    server.stop().await;
-}
-
-#[tokio::test]
-async fn http1_never_ending_rejected_upload_does_not_block_shutdown() {
+async fn http1_incomplete_large_audio_upload_does_not_dispatch_and_releases_ownership() {
     let server = Server::start().await;
     let mut socket = TcpStream::connect(server.address).await.unwrap();
     socket
-        // Keep the declared length representable by Hyper's internal decoded
-        // length (u64::MAX is a sentinel and is rejected before admission).
         .write_all(&server.headers("Content-Length: 1099511627776\r\n"))
         .await
         .unwrap();
-    let (mut read, mut write) = socket.into_split();
-    assert_rejection(&read_response(&mut read).await);
-    // Keep the upload side open and active after the final response/FIN.
-    let writer = tokio::spawn(async move {
-        let bytes = [b'x'; 16 * 1024];
-        while write.write_all(&bytes).await.is_ok() {
-            tokio::task::yield_now().await;
-        }
-    });
+    socket.write_all(&[b'x'; 16 * 1024]).await.unwrap();
+    socket.shutdown().await.unwrap();
+    let response = read_response(&mut socket).await;
+    assert!(response.starts_with(b"HTTP/1.1 400"));
+    assert_eq!(server.reached_handler.load(Ordering::Relaxed), 0);
+    assert_eq!(server.state.gateway_body_reads.load(Ordering::Acquire), 0);
+    server.normal_request().await;
     server.stop().await;
-    tokio::time::timeout(DEADLINE, writer)
-        .await
-        .unwrap()
-        .unwrap();
 }
 
 #[tokio::test]

@@ -242,17 +242,21 @@ async fn admit_authenticated_gateway_body(
             .map(|context| proxy_diagnostics::Phase::new(context, "gateway_request_body"));
         let _body_read_activity =
             crate::gateway_body::GatewayBodyReadActivity::start(state.gateway_body_reads.clone());
-        request = match crate::gateway_body::admit_gateway_request_body_with_memory(
-            request,
-            state.gateway_body_read_permits.clone(),
-            state.responses_body_read_permits.clone(),
-            state.config.responses_body_max_bytes as usize,
-            state.config.audio_body_max_bytes as usize,
-            Some(&state.proxy_memory_budget),
-            &state.responses_request_spool,
-        )
-        .await
-        {
+        let admission = if audio_request {
+            capture_audio_request(state, request, &request_id).await
+        } else {
+            crate::gateway_body::admit_gateway_request_body_with_memory(
+                request,
+                state.gateway_body_read_permits.clone(),
+                state.responses_body_read_permits.clone(),
+                state.config.responses_body_max_bytes as usize,
+                state.config.audio_body_max_bytes as usize,
+                Some(&state.proxy_memory_budget),
+                &state.responses_request_spool,
+            )
+            .await
+        };
+        request = match admission {
             Ok(request) => request,
             Err(error) => {
                 let response = gateway_body_admission_rejection(state, &request_id, error);
@@ -278,9 +282,8 @@ async fn admit_authenticated_gateway_body(
             .unwrap_or_else(uuid::Uuid::now_v7);
         let raw_request = request
             .extensions()
-            .get::<crate::gateway_body::RawAudioRequestBody>()
+            .get::<std::sync::Arc<crate::gateway_body::request_spool::RequestSpool>>()
             .ok_or(AppError::internal("audio_original_request_missing"))?
-            .0
             .clone();
         request.extensions_mut().insert(AudioRequestResources {
             request_id,
@@ -325,6 +328,60 @@ async fn admit_authenticated_gateway_body(
         Some(permit) => hold_response_body_permit(response, permit),
         None => response,
     })
+}
+
+async fn capture_audio_request(
+    state: &AppState,
+    request: Request,
+    request_id: &str,
+) -> Result<Request, crate::gateway_body::GatewayBodyAdmissionError> {
+    use crate::gateway_body::{GatewayBodyAdmissionError, request_spool::RequestSpool};
+    if request
+        .headers()
+        .get_all(header::CONTENT_ENCODING)
+        .iter()
+        .any(|value| !value.as_bytes().eq_ignore_ascii_case(b"identity"))
+    {
+        return Err(GatewayBodyAdmissionError::UnsupportedEncoding);
+    }
+    let declared = request
+        .headers()
+        .get(header::CONTENT_LENGTH)
+        .and_then(|value| value.to_str().ok())
+        .and_then(|value| value.parse::<usize>().ok());
+    let (mut parts, body) = request.into_parts();
+    let source = std::sync::Arc::new(
+        state
+            .responses_request_spool
+            .capture_file(body, declared, request_id)
+            .await
+            .map_err(|error| match error {
+                crate::gateway_body::request_spool::RequestSpoolCaptureError::Unavailable => {
+                    GatewayBodyAdmissionError::RequestSpoolUnavailable
+                }
+                _ => {
+                    GatewayBodyAdmissionError::Rejected(crate::gateway_body::GatewayBodyRejection {
+                        route_class: crate::gateway_body::GatewayBodyRouteClass::Other,
+                        declared_content_length: declared.map(|length| length as u64),
+                        limit_bytes: usize::MAX,
+                        reason: crate::gateway_body::GatewayBodyRejectionReason::BodyReadRejected,
+                    })
+                }
+            })?,
+    );
+    let download = source
+        .open_stream()
+        .await
+        .map_err(|_| GatewayBodyAdmissionError::RequestSpoolUnavailable)?;
+    parts.extensions.insert(source.clone());
+    parts
+        .extensions
+        .insert(state.proxy_memory_budget.reservation());
+    let stream = download.stream.map(move |chunk| {
+        let _owner: &RequestSpool = &source;
+        chunk
+    });
+    Ok(Request::from_parts(parts, Body::from_stream(stream)))
 }
 
 fn gateway_body_admission_rejection(
@@ -439,7 +496,7 @@ where
 #[derive(Clone)]
 pub(super) struct AudioRequestResources {
     pub(super) request_id: uuid::Uuid,
-    pub(super) raw_request: bytes::Bytes,
+    pub(super) raw_request: std::sync::Arc<crate::gateway_body::request_spool::RequestSpool>,
     pub(super) lifecycle: std::sync::Arc<tokio::sync::OwnedSemaphorePermit>,
     pub(super) memory: std::sync::Arc<crate::gateway_body::memory::ProxyMemoryReservation>,
 }

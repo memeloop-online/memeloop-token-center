@@ -28,13 +28,9 @@ async fn failed_uploads_keep_typed_status_without_dispatch_billing_or_resource_l
         ("/v1/chat/completions", 4 * 1024 * 1024),
         ("/v1/audio/transcriptions", 4 * 1024 * 1024),
     ] {
-        // Durable inference has no hot-body size cap; audio retains a real
-        // admission limit. Exercise transport failures on both kinds of route.
-        let failures: &[&str] = if path == "/v1/audio/transcriptions" {
-            &["read", "declared_limit", "stream_limit"]
-        } else {
-            &["read"]
-        };
+        // File-backed audio and durable text both preserve transport failures,
+        // without treating the old hot-body configuration as an upload ceiling.
+        let failures: &[&str] = &["read"];
         for &failure in failures {
             let (body, declared) = match failure {
                 "declared_limit" => (Body::empty(), Some(maximum + 1)),
