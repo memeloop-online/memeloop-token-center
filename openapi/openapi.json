@@ -957,6 +957,39 @@
         }
       }
     },
+    "/startupz": {
+      "get": {
+        "tags": [
+          "System"
+        ],
+        "operationId": "getInitializationReadiness",
+        "summary": "Report whether the application router has initialized",
+        "description": "Returns 503 while the static shell is initializing or initialization failed, then 200 after AppState and the authenticated application router have been installed. This endpoint performs no recurring database or archive checks and remains 200 after installation during remote dependency degradation. Liveness and dependency diagnostics retain their separate endpoints.",
+        "security": [],
+        "responses": {
+          "200": {
+            "description": "The initialized application router is installed.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Health"
+                }
+              }
+            }
+          },
+          "503": {
+            "description": "Application initialization is still pending or failed.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Readiness"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
     "/readyz": {
       "get": {
         "tags": [
