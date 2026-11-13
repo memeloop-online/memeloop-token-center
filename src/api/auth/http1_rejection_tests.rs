@@ -268,7 +268,10 @@ async fn http1_large_declared_and_chunked_uploads_deliver_complete_body_and_reco
         } else {
             format!("Content-Length: {size}\r\n")
         };
-        socket.write_all(&server.headers(&framing)).await.unwrap();
+        socket
+            .write_all(&server.headers(&format!("{framing}Connection: close\r\n")))
+            .await
+            .unwrap();
         let (mut read, mut write) = socket.into_split();
         let (response_received, wait_for_response) = oneshot::channel();
         let writer = tokio::spawn(async move {
