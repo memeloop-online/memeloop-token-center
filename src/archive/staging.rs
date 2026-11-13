@@ -49,6 +49,18 @@ impl ArchiveStore {
         Self::delete_segment_prefix(store, prefix).await
     }
 
+    /// Deletes only the owned object, never other objects in the typed segment.
+    pub(crate) async fn delete_archive_staging_object(
+        &self,
+        key: ArchiveStagingKey,
+        locator: &str,
+    ) -> Result<(), AppError> {
+        crate::archive_staging::validate_bound_locator(key, locator)?;
+        let (store, path) = self.resolve(locator)?;
+        store.delete(&path).await?;
+        Ok(())
+    }
+
     /// Verifies that the exact typed segment is empty. As with deletion, S3's
     /// lexical list results are filtered again at the path-segment boundary.
     pub async fn archive_staging_segment_is_empty(
