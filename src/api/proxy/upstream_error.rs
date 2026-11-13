@@ -130,7 +130,9 @@ pub(super) async fn inspect_model_rejection(
     {
         return (response, false);
     }
+    // A prefetched EOF must remain safe for the later archive/delivery reader.
     let mut parts = response.into_parts();
+    parts.stream = Box::pin(parts.stream.fuse());
     let mut prefix = Vec::new();
     let mut body = Vec::new();
     let read = async {
