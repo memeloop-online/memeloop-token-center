@@ -214,14 +214,45 @@ async fn lifecycle_count_does_not_bypass_real_byte_admission() {
     let fixture = response_usage_fixture("lifecycle-byte-capacity", &upstream, 0).await;
     let held = fixture.state.proxy_memory_budget.reservation();
     assert!(held.try_grow(fixture.state.config.proxy_memory_budget_bytes as usize, 1));
-    let response = send_response_usage_request(
-        &fixture,
-        &json!({"model": fixture.model, "input": "small", "stream": true}),
-    )
+    let payload = json!({"model": fixture.model, "input": "small", "stream": true});
+    let mut waiting = Box::pin(send_response_usage_request(&fixture, &payload));
+    futures_util::future::poll_fn(|context| {
+        assert!(std::future::Future::poll(waiting.as_mut(), context).is_pending());
+        if fixture.state.proxy_lifecycles.active() == 1 {
+            std::task::Poll::Ready(())
+        } else {
+            std::task::Poll::Pending
+        }
+    })
     .await;
-    assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
-    assert_eq!(response.headers().get(header::RETRY_AFTER).unwrap(), "1");
+    assert!(upstream.received_requests().await.unwrap().is_empty());
+    assert_eq!(
+        fixture.state.proxy_memory_budget.snapshot().0,
+        fixture.state.config.proxy_memory_budget_bytes as usize
+    );
+    let pool = sqlx::AnyPool::connect(&fixture.database_url).await.unwrap();
+    let reservations: i64 =
+        sqlx::query_scalar("SELECT COUNT(*) FROM usage_reservations WHERE key_id = $1")
+            .bind(fixture.key_id.to_string())
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+    assert_eq!(
+        reservations, 0,
+        "lifecycle activity does not bypass byte credits"
+    );
+    drop(waiting);
     assert_eq!(fixture.state.proxy_lifecycles.active(), 0);
+    assert!(
+        fixture
+            .state
+            .db
+            .list_requests(fixture.key_id, 10)
+            .await
+            .unwrap()
+            .is_empty()
+    );
+    pool.close().await;
     drop(held);
     assert_eq!(fixture.state.proxy_memory_budget.snapshot().0, 0);
     upstream.verify().await;
