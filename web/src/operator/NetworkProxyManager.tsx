@@ -463,7 +463,7 @@ export function NetworkProxyPolicyWorkspace({ token, tenant, accounts, accountsS
 
   useNavigationGuard(async () => !embedded || await requestClose());
   useLayoutEffect(() => {
-    onEditingChange?.(dirty || busy);
+    onEditingChange?.(dirty || pendingWrite.current !== null);
     return () => onEditingChange?.(false);
   }, [dirty, busy, onEditingChange]);
 

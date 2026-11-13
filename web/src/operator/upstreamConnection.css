@@ -62,12 +62,12 @@
 }
 
 /* Native select intrinsic option widths must not widen a narrow account form. */
-:is(.provider-account, .upstream-connection, .upstream-advanced) .fui-Select {
+:is(.upstream-connection, .upstream-advanced) .fui-Select {
   min-width: 0;
   max-width: 100%;
   width: 100%;
 }
-:is(.provider-account, .upstream-connection, .upstream-advanced) .fui-Select__select {
+:is(.upstream-connection, .upstream-advanced) .fui-Select__select {
   min-width: 0;
   max-width: 100%;
 }
