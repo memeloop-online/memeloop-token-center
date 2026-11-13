@@ -528,12 +528,12 @@ impl Database {
             return Ok(ArchiveStagingReferenceProof::Protected { locator });
         }
         transaction.commit().await?;
-        Ok(ArchiveStagingReferenceProof::Unreferenced(
+        Ok(ArchiveStagingReferenceProof::Unreferenced(Box::new(
             ArchiveStagingUnreferencedLease {
                 lease,
                 proved_at: now,
             },
-        ))
+        )))
     }
 
     /// Records an empty listing. The first observation releases the lease and
