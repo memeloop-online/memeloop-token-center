@@ -46,6 +46,8 @@ export class AppServer {
     return new Promise((resolve, reject) => { this.pending.set(id, { resolve, reject }); this.send({ id, method, params }); });
   }
   async close() {
+    // Stop RPC admission before ending stdin, not only after process exit.
+    this.fail(new Error('App-server is closing'));
     if (!this.process.pid || this.process.exitCode !== null || this.process.signalCode !== null) return;
     const exited = new Promise(resolve => this.process.once('exit', resolve));
     this.process.stdin.end();
@@ -200,7 +202,7 @@ export async function serve(
     return id as string;
   };
   const turn = async (taskId: string, threadId: string, task: string, kind: string) => {
-    if (signal?.aborted || disconnected) throw disconnected ?? new Error('Bridge session interrupted');
+    if (uncertain || signal?.aborted || disconnected) throw disconnected ?? new Error('Bridge session interrupted');
     let pending!: { id?: string; resolve: (result: TurnResult) => void; reject: (error: Error) => void; items: { id: string; text: string }[] };
     const completed = new Promise<TurnResult>((resolve, reject) => { pending = { resolve, reject, items: [] }; turns.set(threadId, pending); });
     void completed.catch(() => {});
