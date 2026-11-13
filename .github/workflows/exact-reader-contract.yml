@@ -34,7 +34,6 @@ jobs:
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6
       - uses: ./.github/actions/checkout-plugin-examples
       - name: Verify qualified HEAD routing and stream detail
-        shell: bash
         run: |
           set -o pipefail
           cargo test --locked --lib archive::routing_tests::qualified_cas_reads_preserve_backend_tenant_and_stream_integrity -- --exact 2>&1 | tee /tmp/head-test.log
@@ -58,7 +57,6 @@ jobs:
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6
       - uses: ./.github/actions/checkout-plugin-examples
       - name: Verify relocated raw publication and binding
-        shell: bash
         run: |
           set -o pipefail
           cargo test --locked --lib relocated_raw_root_replays_and_binds_published_body_without_retired_copy 2>&1 | tee /tmp/raw-publish-test.log
@@ -114,7 +112,6 @@ jobs:
           done
           exit 1
       - name: Verify staging identity, routing and real RustFS
-        shell: bash
         env:
           MTC_RUSTFS_TEST_ENDPOINT: http://127.0.0.1:19000
           MTC_RUSTFS_TEST_BUCKET: conversation-contract-test
@@ -165,7 +162,6 @@ jobs:
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6
       - uses: ./.github/actions/checkout-plugin-examples
       - name: Run exact release contracts
-        shell: bash
         run: |
           set -o pipefail
           run_exact() {
