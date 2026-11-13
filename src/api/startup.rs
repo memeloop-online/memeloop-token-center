@@ -249,7 +249,7 @@ mod tests {
         );
         assert_eq!(call(&app, "GET", "/livez").await.status(), StatusCode::OK);
         assert_eq!(call(&app, "GET", "/readyz").await.status(), StatusCode::OK);
-        database.pool.close().await;
+        database.close().await;
         assert_eq!(
             call(&app, "GET", "/startupz").await.status(),
             StatusCode::OK
