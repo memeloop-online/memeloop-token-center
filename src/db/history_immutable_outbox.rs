@@ -708,7 +708,9 @@ mod tests {
         wrong_payload.filter_cost_micros = Some(0);
         db.history_acknowledge(&[wrong_payload]).await.unwrap();
         assert_eq!(db.history_pending_count().await.unwrap(), 2);
-        db.history_acknowledge(&[first.clone()]).await.unwrap();
+        db.history_acknowledge(std::slice::from_ref(&first))
+            .await
+            .unwrap();
         db.history_acknowledge(&[first]).await.unwrap();
         assert_eq!(db.history_pending_count().await.unwrap(), 1);
         db.pool.close().await;
