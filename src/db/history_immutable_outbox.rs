@@ -24,7 +24,7 @@ fn original_row(row: &AnyRow) -> Result<Value, AppError> {
 
 // Each event owns its original row under its own revision fence. Parent
 // envelopes must not include the append-only collection of sibling events.
-async fn original_event_in_transaction(
+pub(super) async fn original_event_in_transaction(
     transaction: &mut Transaction<'_, Any>,
     event_id: Uuid,
 ) -> Result<Value, AppError> {
@@ -614,6 +614,13 @@ impl Database {
                     {
                         payload["supplier_error"] = serde_json::to_value(summary)?;
                     }
+                }
+                if identity.source == "event" {
+                    read_model = crate::request_history::event_original::read_model(
+                        &identity,
+                        payload.as_ref().unwrap_or(&Value::Null),
+                        &envelope["originals"]["event"],
+                    )?;
                 }
                 serde_json::to_string(&HistorySnapshot {
                     identity,

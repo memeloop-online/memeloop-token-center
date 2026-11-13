@@ -630,13 +630,25 @@ impl Database {
                 .await?
                 .map(|event| serde_json::to_value(&event))
                 .transpose()?;
+            let mut transaction = self.pool.begin().await?;
+            let original = super::history_immutable_outbox::original_event_in_transaction(
+                &mut transaction,
+                identity.request_id,
+            )
+            .await?;
+            transaction.commit().await?;
+            let read_model = crate::request_history::event_original::read_model(
+                &identity,
+                payload.as_ref().unwrap_or(&Value::Null),
+                &original,
+            )?;
             return Ok(HistorySnapshot {
                 identity,
                 revision,
                 payload,
                 filter_cost_micros: None,
                 statistics: None,
-                read_model: Value::Null,
+                read_model,
             });
         }
         let payload = self
