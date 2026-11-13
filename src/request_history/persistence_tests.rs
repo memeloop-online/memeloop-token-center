@@ -257,6 +257,16 @@ async fn request_history_real_services_acceptance() {
     let page = client.list(&query).await.unwrap();
     assert_eq!(page.requests.len(), 1);
     assert!(page.requests[0]["credential_identity"].is_null());
+    assert_eq!(page.requests[0]["archive_state"], serde_json::json!("gap"));
+    let stored = client.snapshots(&query).await.unwrap();
+    assert_eq!(
+        stored[0].read_model["archive"]["view"]["archive_state"],
+        serde_json::json!("gap")
+    );
+    assert_eq!(
+        stored[0].read_model["archive"]["request_archive_state"],
+        serde_json::json!("pending")
+    );
     let stats = client.statistics(&query).await.unwrap();
     assert_eq!(stats.summary.total_requests, 1);
     assert_eq!(stats.summary.successful_requests, 1);
