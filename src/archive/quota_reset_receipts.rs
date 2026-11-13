@@ -3,7 +3,7 @@ use super::ArchiveStore;
 use crate::error::AppError;
 use bytes::Bytes;
 use futures_util::StreamExt;
-use object_store::{PutMode, PutOptions, PutPayload};
+use object_store::{ObjectStoreExt, PutMode, PutOptions, PutPayload};
 
 pub(crate) const PREFIX: &str = "quota-reset-results/v1/";
 impl ArchiveStore {
@@ -64,7 +64,6 @@ impl ArchiveStore {
         identity: &str,
         key: &str,
     ) -> Result<Bytes, AppError> {
-        use object_store::ObjectStoreExt;
         let store = self.quota_reset_store(identity)?;
         let path = object_store::path::Path::from(key);
         if store.head(&path).await?.size > 4096 {
