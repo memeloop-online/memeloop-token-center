@@ -1639,15 +1639,22 @@ async fn proxy_with_cancellation_guard(
             || independent_probe::TARGET.try_with(|_| ()).is_ok();
         let result = attempt_budget
             .send(
-                send_proxy_route(
-                    &state,
-                    &headers,
-                    protocol,
-                    request_id,
-                    &active_route,
-                    selected_candidate_rank,
-                    outbound_attempt,
-                    &mut h2_recovery_available,
+                routing::codex::RESPONSE_ARCHIVE_IDENTITY.scope(
+                    crate::db::ArchiveSpoolIdentity {
+                        request_id,
+                        tenant_id: buffered_request.tenant_id,
+                        reservation_id: buffered_request.reservation.id,
+                    },
+                    send_proxy_route(
+                        &state,
+                        &headers,
+                        protocol,
+                        request_id,
+                        &active_route,
+                        selected_candidate_rank,
+                        outbound_attempt,
+                        &mut h2_recovery_available,
+                    ),
                 ),
                 active_route.wait_for_compaction,
             )

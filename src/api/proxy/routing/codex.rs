@@ -15,6 +15,10 @@ mod wire_contract_tests;
 use retry::{AttemptControl, CodexRetryState, observe_bad_request_disposition};
 pub(in crate::api::proxy) use retry::{CodexRetryTerminal, CodexRetryTerminalGuard};
 
+tokio::task_local! {
+    pub(in crate::api::proxy) static RESPONSE_ARCHIVE_IDENTITY: crate::db::ArchiveSpoolIdentity;
+}
+
 #[derive(Clone, Copy, Debug)]
 pub(in crate::api::proxy) struct CodexRuntimeTransportPolicy {
     pub(in crate::api::proxy) connect_attempts: usize,
@@ -221,6 +225,12 @@ pub(super) async fn send_proxy_route(
             }
         };
         if response.status() == StatusCode::BAD_REQUEST {
+            // The classifier consumes only a bounded preview. Capture the wire
+            // before that read, so Drop drains any unread tail to its raw owner.
+            let response = match RESPONSE_ARCHIVE_IDENTITY.try_with(Clone::clone) {
+                Ok(identity) => response.with_original_archive_capture(state, identity),
+                Err(_) => response,
+            };
             let (disposition, details) =
                 codex_transport::classify_bad_request_with_details(response, request_id).await;
             observe_bad_request_disposition(&state.metrics, disposition);
