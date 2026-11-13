@@ -112,30 +112,32 @@ export function UpstreamQuotaReset({ accountId, accountName, tenant, token, snap
     prepareIdempotencyKey.current ??= `quota-prepare-${crypto.randomUUID()}`;
     const controller = new AbortController();
     prepareRequest.current = controller;
+    const ownsRequest = () => current() && !controller.signal.aborted && prepareRequest.current === controller;
     try {
       const result = await api<{ operation: QuotaResetOperation; confirmation_token: string; idempotency_replayed: boolean }>(path('prepare'), token, { method: 'POST', headers: { 'Idempotency-Key': prepareIdempotencyKey.current }, signal: controller.signal });
-      if (!current()) return;
+      if (!ownsRequest()) return;
       if (!valid(result.operation) || result.operation.effect !== 'supplier_defined_codex_rate_limits' || result.operation.consumes_credits !== 1) throw new Error('Invalid reset contract');
       if (result.operation.state === 'expired') { prepareIdempotencyKey.current = null; throw new Error('Reset preparation expired'); }
       if (result.operation.state !== 'prepared') throw new Error('Invalid reset state');
       setOperation(result.operation);
       secret.current = result.confirmation_token;
       const accepted = await confirm(t('quota.resetConfirm', { account: accountName, id: accountId, expiry: new Date(result.operation.expires_at).toLocaleString(locale) }));
-      if (!current()) return;
+      if (!ownsRequest()) return;
       const confirmationToken = secret.current;
       if (!accepted || !confirmationToken || result.operation.expires_at <= Date.now()) return;
       // The durable idempotency key makes an exact user-requested retry safe;
       // this component never retries a credit-consuming request automatically.
       try { await dispatchPrepared(result.operation, confirmationToken); }
-      catch { if (current()) setError('dispatch-unknown'); }
+      catch { if (ownsRequest()) setError('dispatch-unknown'); }
     } catch (reason) {
       // Preparation never dispatches the supplier credit-consuming request.
       // An interrupted request may still have created the same idempotent prepared record,
       // so keep the key and let this exact button safely recover it.
-      if (current()) setError(reason instanceof ApiError && reason.status === 409 ? 'prepare-rejected' : 'prepare-unavailable');
+      if (ownsRequest()) setError(reason instanceof ApiError && reason.status === 409 ? 'prepare-rejected' : 'prepare-unavailable');
     } finally {
+      const owned = ownsRequest();
       if (prepareRequest.current === controller) prepareRequest.current = null;
-      if (current()) { working.current = false; setBusy(false); }
+      if (owned) { working.current = false; setBusy(false); }
     }
   }
   async function recover() {
