@@ -850,3 +850,63 @@ async fn request_history_real_services_acceptance() {
         .await
         .unwrap();
 }
+
+#[tokio::test]
+#[ignore = "existing CI supplies the real PostgreSQL service"]
+async fn request_history_real_services_acceptance_start_nowait_rolls_back_partial_locks() {
+    let postgres = std::env::var("MTC_TEST_POSTGRES_URL").expect("PostgreSQL acceptance URL");
+    let admin = sqlx::PgPool::connect(&postgres).await.unwrap();
+    let schema = format!("history_start_{}", Uuid::now_v7().simple());
+    sqlx::query(sqlx::AssertSqlSafe(format!("CREATE SCHEMA {schema}")))
+        .execute(&admin)
+        .await
+        .unwrap();
+    let mut isolated = url::Url::parse(&postgres).unwrap();
+    isolated
+        .query_pairs_mut()
+        .append_pair("options", &format!("-csearch_path={schema}"));
+    let database = Database::connect_with_max(isolated.as_str(), 2)
+        .await
+        .unwrap();
+    database.migrate().await.unwrap();
+    let mut writer = database.pool.begin().await.unwrap();
+    sqlx::query("LOCK TABLE request_records IN ROW EXCLUSIVE MODE")
+        .execute(&mut *writer)
+        .await
+        .unwrap();
+    let error = tokio::time::timeout(std::time::Duration::from_secs(3), database.history_start())
+        .await
+        .expect("NOWAIT must not queue behind a business writer")
+        .unwrap_err();
+    let HistoryError::Sql(error) = error else {
+        panic!("unexpected history start error");
+    };
+    assert_eq!(
+        error.as_database_error().unwrap().code().as_deref(),
+        Some("55P03")
+    );
+    assert_eq!(database.history_mode().await.unwrap(), "off");
+    let installed: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM pg_trigger t JOIN pg_class c ON c.oid=t.tgrelid JOIN pg_proc p ON p.oid=t.tgfoid WHERE c.relnamespace=to_regnamespace(current_schema()) AND NOT t.tgisinternal AND p.proname LIKE 'history_%' AND position('request_history_export' in p.prosrc)>0")
+        .fetch_one(&database.pool).await.unwrap();
+    assert_eq!(installed, 0);
+    let writer_alive: i32 = sqlx::query_scalar("SELECT 1")
+        .fetch_one(&mut *writer)
+        .await
+        .unwrap();
+    assert_eq!(
+        writer_alive, 1,
+        "maintenance must not abort the business transaction"
+    );
+    writer.rollback().await.unwrap();
+    tokio::time::timeout(std::time::Duration::from_secs(5), database.history_start())
+        .await
+        .expect("failed installation must release every acquired table lock")
+        .unwrap();
+    assert_eq!(database.history_mode().await.unwrap(), "shadow");
+    database.pool.close().await;
+    sqlx::query(sqlx::AssertSqlSafe(format!("DROP SCHEMA {schema} CASCADE")))
+        .execute(&admin)
+        .await
+        .unwrap();
+    admin.close().await;
+}
