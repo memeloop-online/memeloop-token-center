@@ -32,6 +32,7 @@ impl Drop for DispatchCompletion {
         let archive = self.archive.clone();
         let receipt = super::reset_receipt::Receipt {
             version: 1,
+            backend_identity: self.archive.quota_reset_backend_identity(),
             tenant: self.tenant,
             account: self.account,
             operation: Uuid::parse_str(&self.operation).expect("database operation UUID"),
@@ -47,12 +48,18 @@ impl Drop for DispatchCompletion {
                     // retirement so a late PUT can never resurrect a deleted receipt.
                     let (published, finished) =
                         tokio::join!(receipt.publish(&archive), receipt.finish(&db));
-                    if matches!(finished, Ok(true)) {
-                        // Failed PUT may have lost its ACK: a shared worker will
-                        // discover and retire any object that actually committed.
-                        if published.is_err() || receipt.retire(&archive).await.is_ok() {
-                            return;
-                        }
+                    // Failed PUT may have lost its ACK: a shared worker will
+                    // discover and retire any object that actually committed.
+                    if matches!(finished, Ok(true))
+                        && (published.is_err() || receipt.retire(&archive).await.is_ok())
+                    {
+                        return;
+                    }
+                    if matches!(finished, Ok(false)) {
+                        tracing::warn!(
+                            "quota reset receipt owner or outcome conflict; local retry ended"
+                        );
+                        return;
                     }
                     tracing::warn!("quota reset outcome persistence deferred without redispatch");
                     tokio::time::sleep(delay).await;
@@ -632,6 +639,7 @@ async fn confirm_guarded(
     let claim_actor = actor.to_owned();
     let claim_guard = guard.cloned();
     let (claim, mut completion) = tokio::spawn(async move {
+        let commit_started = std::sync::atomic::AtomicBool::new(false);
         let mut completion = DispatchCompletion {
             db: db.clone(),
             archive,
@@ -641,10 +649,10 @@ async fn confirm_guarded(
             owner: Uuid::now_v7(),
             accepted: false,
             error: Some("reset_dispatch_owner_ended".into()),
-            finished: false,
+            finished: true,
         };
         let claim = db
-            .claim_quota_reset_owned(
+            .claim_quota_reset_owned_tracked(
                 &claim_account,
                 &claim_operation,
                 &claim_actor,
@@ -652,8 +660,14 @@ async fn confirm_guarded(
                 &confirm_idempotency_hash,
                 claim_guard.as_ref(),
                 Some(completion.owner),
+                Some(&commit_started),
             )
-            .await?;
+            .await;
+        // Only the COMMIT boundary can create an uncertain durable claim.
+        // Validation, expiry and pre-COMMIT SQL failures cannot dispatch and
+        // must not create permanent orphan outcomes.
+        completion.finished = !commit_started.load(std::sync::atomic::Ordering::Acquire);
+        let claim = claim?;
         if matches!(claim, QuotaResetClaim::Replayed(_)) {
             completion.finished = true;
         }
@@ -693,6 +707,7 @@ async fn confirm_guarded(
     // awaits DB completion. It cannot manufacture a second unknown outcome.
     let receipt = super::reset_receipt::Receipt {
         version: 1,
+        backend_identity: state.archive.quota_reset_backend_identity(),
         tenant: account.tenant_id,
         account: account.id,
         operation: Uuid::parse_str(operation)
@@ -710,10 +725,14 @@ async fn confirm_guarded(
                 receipt.publish(&receipt_archive),
                 receipt.finish(&receipt_db)
             );
-            if matches!(finished, Ok(true)) {
-                if published.is_err() || receipt.retire(&receipt_archive).await.is_ok() {
-                    break;
-                }
+            if matches!(finished, Ok(true))
+                && (published.is_err() || receipt.retire(&receipt_archive).await.is_ok())
+            {
+                break;
+            }
+            if matches!(finished, Ok(false)) {
+                tracing::warn!("quota reset receipt owner or outcome conflict; local retry ended");
+                break;
             }
             tokio::time::sleep(delay).await;
             delay = (delay * 2).min(Duration::from_secs(30));
@@ -957,12 +976,13 @@ mod tests {
             .mount(&supplier)
             .await;
         let directory = tempfile::tempdir().unwrap();
-        let state = AppState::initialize(crate::config::Config::for_test(format!(
+        let mut state = AppState::initialize(crate::config::Config::for_test(format!(
             "sqlite://{}?mode=rwc",
             directory.path().join("reset-recovery.db").display()
         )))
         .await
         .unwrap();
+        state.archive = crate::archive::ArchiveStore::training_memory_for_test();
         let tenant = "reset-recovery-fixture";
         let credential = UpstreamCredential::OAuth {
             access_token: "fixture-only".into(),
@@ -1037,6 +1057,7 @@ mod tests {
         .unwrap();
         let receipt = super::super::reset_receipt::Receipt {
             version: 1,
+            backend_identity: state.archive.quota_reset_backend_identity(),
             tenant: account.tenant_id,
             account: account.id,
             operation: Uuid::parse_str(&operation.id).unwrap(),

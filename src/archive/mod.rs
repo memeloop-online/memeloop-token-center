@@ -31,6 +31,7 @@ mod durable_roots;
 mod multipart;
 mod objects;
 mod path;
+mod quota_reset_receipts;
 mod raw_cache;
 mod raw_capture;
 #[cfg(test)]
@@ -101,5 +102,3 @@ impl Default for ReadinessCache {
 mod compressed_tests;
 #[cfg(test)]
 mod tests;
-
-mod quota_reset_receipts;

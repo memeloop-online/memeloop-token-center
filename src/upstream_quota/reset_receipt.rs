@@ -7,6 +7,7 @@ use uuid::Uuid;
 #[serde(deny_unknown_fields)]
 pub(super) struct Receipt {
     pub version: u8,
+    pub backend_identity: String,
     pub tenant: Uuid,
     pub account: Uuid,
     pub operation: Uuid,
@@ -17,12 +18,13 @@ pub(super) struct Receipt {
 impl Receipt {
     fn key(&self) -> String {
         format!(
-            "quota-reset-results/v1/{}/{}/{}/{}.json",
-            self.tenant, self.account, self.operation, self.owner
+            "quota-reset-results/v1/{}/{}/{}/{}/{}.json",
+            self.backend_identity, self.tenant, self.account, self.operation, self.owner
         )
     }
     fn valid(&self) -> bool {
         self.version == 1
+            && self.backend_identity.len() == 64
             && if self.accepted {
                 self.error.is_none()
             } else {
@@ -49,6 +51,7 @@ impl Receipt {
         }
         archive
             .publish_quota_reset_receipt(
+                &self.backend_identity,
                 &self.key(),
                 serde_json::to_vec(self)
                     .map_err(|_| AppError::internal("quota_reset_receipt_encode"))?
@@ -68,7 +71,9 @@ impl Receipt {
         .await
     }
     pub(super) async fn retire(&self, archive: &ArchiveStore) -> Result<(), AppError> {
-        archive.delete(&self.key()).await
+        archive
+            .delete_quota_reset_receipt(&self.backend_identity, &self.key())
+            .await
     }
 }
 pub(crate) async fn recover(state: &crate::AppState) {
@@ -90,15 +95,21 @@ pub(crate) async fn recover(state: &crate::AppState) {
     };
     for key in keys {
         let result = async {
-            let bytes = state.archive.get_bounded(&key, 4096).await?;
+            let bytes = state
+                .archive
+                .read_quota_reset_receipt(&state.archive.quota_reset_backend_identity(), &key)
+                .await?;
             let receipt: Receipt = serde_json::from_slice(&bytes)
                 .map_err(|_| AppError::storage("quota_reset_receipt_invalid"))?;
             if !receipt.valid() || receipt.key() != key {
                 return Err(AppError::storage("quota_reset_receipt_invalid"));
             }
-            if receipt.finish(&state.db).await? {
-                receipt.retire(&state.archive).await?;
+            if !receipt.finish(&state.db).await? {
+                return Err(AppError::storage(
+                    "quota_reset_receipt_binding_or_outcome_conflict",
+                ));
             }
+            receipt.retire(&state.archive).await?;
             Ok::<_, AppError>(())
         }
         .await;
@@ -113,9 +124,10 @@ mod tests {
     use super::*;
     #[tokio::test]
     async fn immutable_outcomes_accept_duplicate_and_reject_conflict() {
-        let archive = ArchiveStore::memory_for_test();
+        let archive = ArchiveStore::training_memory_for_test();
         let receipt = Receipt {
             version: 1,
+            backend_identity: archive.quota_reset_backend_identity(),
             tenant: Uuid::now_v7(),
             account: Uuid::now_v7(),
             operation: Uuid::now_v7(),
@@ -125,13 +137,24 @@ mod tests {
         };
         receipt.publish(&archive).await.unwrap();
         receipt.publish(&archive).await.unwrap();
+        assert!(
+            archive.get_bounded(&receipt.key(), 4096).await.is_err(),
+            "legacy backend must remain untouched"
+        );
+        let mut wrong_backend = receipt.clone();
+        wrong_backend.backend_identity = "b".repeat(64);
+        assert!(wrong_backend.publish(&archive).await.is_err());
         let mut conflict = receipt.clone();
         conflict.accepted = true;
         conflict.error = None;
         assert!(conflict.publish(&archive).await.is_err());
-        let stored: Receipt =
-            serde_json::from_slice(&archive.get_bounded(&receipt.key(), 4096).await.unwrap())
-                .unwrap();
+        let stored: Receipt = serde_json::from_slice(
+            &archive
+                .read_quota_reset_receipt(&receipt.backend_identity, &receipt.key())
+                .await
+                .unwrap(),
+        )
+        .unwrap();
         assert!(!stored.accepted);
         let mut invalid = receipt.clone();
         invalid.error = Some("https://supplier.invalid/private-response".into());

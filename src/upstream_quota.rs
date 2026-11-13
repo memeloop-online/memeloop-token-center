@@ -8,6 +8,7 @@ mod proxy;
 #[cfg(test)]
 mod r2_tests;
 pub(crate) mod reset;
+pub(crate) mod reset_receipt;
 mod retry;
 
 use std::{collections::HashMap, sync::Arc, time::Duration};
@@ -1864,5 +1865,3 @@ mod tests {
         tokio::time::resume();
     }
 }
-
-pub(crate) mod reset_receipt;
