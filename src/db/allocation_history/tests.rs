@@ -482,7 +482,18 @@ async fn allocation_history_real_services_acceptance() {
     correction.revision = 10_000;
     correction.read_model["fact"]["upstream_account_id"] = json!(b);
     client.append(&[correction.clone()]).await.unwrap();
+    // Model a successfully exported durable receipt. An arbitrary snapshot
+    // absent from both queues must not mutate allocation ACK state.
+    sqlx::query("INSERT INTO request_history_export (revision,source,request_id,tenant_id,key_id,created_at,snapshot) VALUES ($1,$2,$3,$4,$5,$6,$7)")
+        .bind(correction.revision).bind(&correction.identity.source)
+        .bind(correction.identity.request_id.to_string()).bind(correction.identity.tenant_id.to_string())
+        .bind(correction.identity.key_id.to_string()).bind(correction.identity.created_at)
+        .bind(serde_json::to_string(&correction).unwrap()).execute(&db.pool).await.unwrap();
     db.history_acknowledge(&[correction.clone()]).await.unwrap();
+    let correction_pending: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM request_history_export WHERE revision=$1 AND source=$2 AND request_id=$3")
+        .bind(correction.revision).bind(&correction.identity.source).bind(correction.identity.request_id.to_string())
+        .fetch_one(&db.pool).await.unwrap();
+    assert_eq!(correction_pending, 0);
     client.append(&[values[0].clone()]).await.unwrap();
     db.history_acknowledge(&[values[0].clone()]).await.unwrap();
     db.close().await;
