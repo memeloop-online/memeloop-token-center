@@ -105,6 +105,9 @@ pub(in crate::api) fn prepare_owned(
         .ok_or_else(|| AppError::BadRequest("model is required".into()))?
         .to_owned();
     let (tools, identities) = collect_tools(&request)?;
+    // The translated declarations now own the necessary schema values.
+    // The canonical caller input is separate; this working copy is consumed.
+    drop(take_field(&mut request, "tools"));
     let context = Context {
         model: public_model,
         tools: identities,
@@ -543,6 +546,7 @@ fn convert_input(
                         }
                         parsed
                     };
+                    drop(call);
                     let mut block = json!({"type":"tool_use","id":call_id,"name":wire_name});
                     block["input"] = arguments;
                     calls.push(block);
