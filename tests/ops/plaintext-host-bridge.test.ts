@@ -1,3 +1,4 @@
+import { spawn } from 'node:child_process';
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import fs from 'node:fs/promises';
@@ -164,3 +165,44 @@ test('persistent bridge cancellation interrupts its owned turn and does not exec
     assert.deepEqual(calls.find(call => call.method === 'turn/interrupt').params, { threadId: 'owned-parent', turnId: 'owned-turn' });
   } finally { await fs.rm(root, { recursive: true, force: true }); }
 });
+
+
+for (const terminal of [undefined, 'completed', 'failed', 'interrupted']) {
+  test(`actual serve CLI consumes pre-piped EOF and drains children: ${terminal ?? 'normal'}`, async () => {
+    const root = await fs.mkdtemp(path.join(os.tmpdir(), 'mtc-host-cli-'));
+    const directory = path.join(root, 'workspace'); await fs.mkdir(directory);
+    const receipt = path.join(root, 'session.ndjson');
+    const script = fileURLToPath(new URL('../../scripts/maintenance/plaintext-host-bridge.ts', import.meta.url));
+    const peer = fileURLToPath(new URL('./fixtures/plaintext-host-session-peer.ts', import.meta.url));
+    const child = spawn(process.execPath, [script, '--serve'], { env: { ...process.env, MTC_BASE_URL: 'https://example.invalid/v1', MTC_API_KEY: 'private-key', MTC_TASK_DIRECTORY: directory, MTC_TASK_ARCHIVE: receipt, MTC_CODEX_BINARY: peer, ...(terminal ? { MTC_FAKE_PARENT_TERMINAL: terminal } : {}) }, stdio: ['pipe', 'pipe', 'pipe'] });
+    let stdout = '', stderr = '';
+    child.stdout.on('data', chunk => { stdout += chunk; });
+    child.stderr.on('data', chunk => { stderr += chunk; });
+    const exited = new Promise<number | null>((resolve, reject) => { child.once('error', reject); child.once('exit', resolve); });
+    // Both lines and EOF exist before realpath/open/initialize can finish.
+    child.stdin.end(JSON.stringify({ id: 'first', task: 'First full task α' }) + '\n' + JSON.stringify({ id: 'second', task: 'Second full task β' }) + '\n');
+    try {
+      const code = await exited;
+      const failed = terminal === 'failed' || terminal === 'interrupted';
+      assert.equal(code, failed ? 1 : 0, stderr);
+      const results = stdout.trim().split('\n').map(line => JSON.parse(line));
+      assert.equal(results.length, failed ? 1 : 2);
+      assert.equal(results[0].id, 'first');
+      if (!failed) assert(results.every(result => result.completed));
+      const text = await fs.readFile(receipt, 'utf8');
+      const events = text.trim().split('\n').map(line => JSON.parse(line));
+      assert(!text.includes('private-key'));
+      assert.equal(events.at(-1).type, 'session_end');
+      for (const result of results) {
+        const end = events.findIndex(event => event.type === 'task_end' && event.id === result.id);
+        const returns = events.map((event, i) => ({ event, i })).filter(({ event }) => event.type === 'call_return' && event.taskId === result.id);
+        assert.equal(returns.length, 1);
+        assert(returns.every(({ i }) => i < end));
+        for (const event of events.filter(event => ['thread', 'turn', 'result', 'call_return'].includes(event.type))) {
+          if (event.threadId === result.delegations?.[0]?.childThreadId || event.childThreadId === result.delegations?.[0]?.childThreadId) assert.equal(event.taskId, result.id);
+        }
+      }
+      if (failed) assert.equal(events.filter(event => event.type === 'task').length, 1);
+    } finally { child.kill(); await fs.rm(root, { recursive: true, force: true }); }
+  });
+}

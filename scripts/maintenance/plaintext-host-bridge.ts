@@ -12,6 +12,7 @@ export const delegateSpec = { type: 'function', name: delegateTool, description:
 export class AppServer {
   process;
   nextId = 0;
+  stopped = false;
   pending = new Map<number, { resolve: (value: any) => void; reject: (error: Error) => void }>();
   notification: (message: any) => void = () => {};
   disconnected: (error: Error) => void = () => {};
@@ -37,9 +38,10 @@ export class AppServer {
     this.process.once('error', () => this.fail(new Error('App-server could not start')));
     this.process.once('exit', () => this.fail(new Error('App-server exited')));
   }
-  fail(error: Error) { for (const pending of this.pending.values()) pending.reject(error); this.pending.clear(); this.disconnected(error); }
-  send(message: unknown) { this.process.stdin.write(JSON.stringify(message) + '\n'); }
+  fail(error: Error) { this.stopped = true; for (const pending of this.pending.values()) pending.reject(error); this.pending.clear(); this.disconnected(error); }
+  send(message: unknown) { if (this.stopped) return; this.process.stdin.write(JSON.stringify(message) + '\n'); }
   call(method: string, params: unknown): Promise<any> {
+    if (this.stopped) return Promise.reject(new Error('App-server is closed'));
     const id = ++this.nextId;
     return new Promise((resolve, reject) => { this.pending.set(id, { resolve, reject }); this.send({ id, method, params }); });
   }
@@ -136,6 +138,8 @@ export async function serve(
   connect = (binary: string, args: string[], env: NodeJS.ProcessEnv) => new AppServer(binary, args, env),
   signal?: AbortSignal,
 ) {
+  // Subscribe before filesystem setup can yield and a pre-piped stdin reaches EOF.
+  const iterator = commands[Symbol.asyncIterator]();
   const cwd = await fs.realpath(options.directory);
   const receipt = path.resolve(options.receipt);
   const parent = await fs.realpath(path.dirname(receipt));
@@ -154,7 +158,6 @@ export async function serve(
   let server: AppServer;
   try { server = connect(options.binary, args, { ...process.env, MTC_BRIDGE_API_KEY: options.apiKey }); }
   catch (error) { await journal.close(); throw error; }
-  const iterator = commands[Symbol.asyncIterator]();
   let stopReading!: (result: IteratorResult<string>) => void;
   const stopped = new Promise<IteratorResult<string>>(resolve => { stopReading = resolve; });
   const turns = new Map<string, { id?: string; resolve: (result: TurnResult) => void; reject: (error: Error) => void; items: { id: string; text: string }[] }>();
@@ -189,13 +192,14 @@ export async function serve(
       pending.resolve({ id: p.turn.id, status: p.turn.status, error: p.turn.error, visibleMessages: pending.items });
     }
   };
-  const start = async (model: string, tools?: unknown[]) => {
+  const start = async (taskId: string, model: string, tools?: unknown[]) => {
+    if (uncertain || signal?.aborted || disconnected) throw disconnected ?? new Error('Bridge session ended');
     const result = await server.call('thread/start', { cwd, model, modelProvider: provider, approvalPolicy: 'never', sandbox: 'read-only', ephemeral: true, ...(tools ? { dynamicTools: tools } : {}) });
     const id = result.thread.id;
-    await save({ type: 'thread', taskId: active?.id, threadId: id, model, kind: tools ? 'parent' : 'child' });
+    await save({ type: 'thread', taskId, threadId: id, model, kind: tools ? 'parent' : 'child' });
     return id as string;
   };
-  const turn = async (threadId: string, task: string, kind: string) => {
+  const turn = async (taskId: string, threadId: string, task: string, kind: string) => {
     if (signal?.aborted || disconnected) throw disconnected ?? new Error('Bridge session interrupted');
     let pending!: { id?: string; resolve: (result: TurnResult) => void; reject: (error: Error) => void; items: { id: string; text: string }[] };
     const completed = new Promise<TurnResult>((resolve, reject) => { pending = { resolve, reject, items: [] }; turns.set(threadId, pending); });
@@ -203,10 +207,10 @@ export async function serve(
     try {
       const started = await server.call('turn/start', { threadId, input: [{ type: 'text', text: task }] });
       pending.id = started.turn.id;
-      await save({ type: 'turn', taskId: active?.id, threadId, turnId: pending.id, kind });
+      await save({ type: 'turn', taskId, threadId, turnId: pending.id, kind });
       const result = await completed;
       if (result.id !== pending.id) throw new Error('App-server turn identity mismatch');
-      await save({ type: 'result', taskId: active?.id, threadId, ...result });
+      await save({ type: 'result', taskId, threadId, ...result });
       return result;
     } finally { turns.delete(threadId); }
   };
@@ -226,8 +230,8 @@ export async function serve(
       task.children.push(child);
       await save({ type: 'delegation', taskId: task.id, parentThreadId, parentTurnId: p.turnId, callId: p.callId, ...(p.arguments.task === task.task ? { taskRef: task.id } : { task: p.arguments.task }) });
       try {
-        child.childThreadId = await start(options.kimiModel);
-        const result = await turn(child.childThreadId, p.arguments.task, 'child');
+        child.childThreadId = await start(task.id, options.kimiModel);
+        const result = await turn(task.id, child.childThreadId, p.arguments.task, 'child');
         child.status = result.status;
         await save({ type: 'call_return', taskId: task.id, callId: p.callId, childThreadId: child.childThreadId, childTurnId: result.id, status: result.status });
         return { success: result.status === 'completed', contentItems: [{ type: 'inputText', text: JSON.stringify(safe({ threadId: child.childThreadId, result })) }] };
@@ -259,18 +263,28 @@ export async function serve(
       }
       ids.add(command.id);
       active = { id: command.id, task: command.task, calls: new Map(), children: [] };
-      await save({ type: 'task', id: active.id, task: active.task });
+      const task = active;
+      const settleCalls = async () => { await Promise.allSettled([...task.calls.values()].map(call => call.result)); };
+      await save({ type: 'task', id: task.id, task: task.task });
       try {
-        parentThreadId ??= await start(options.parentModel, [delegateSpec]);
-        const result = await turn(parentThreadId, `Use ${delegateTool} to ask Kimi to perform the following complete task, then report its actual result. Do not use collaboration spawn_agent or opaque handoff.\n\n${active.task}`, 'parent');
-        const completed = result.status === 'completed' && active.children.length > 0 && active.children.every(child => child.status === 'completed');
-        const summary = { id: active.id, completed, parentThreadId, parentTurnId: result.id, result, delegations: active.children, receipt };
+        parentThreadId ??= await start(task.id, options.parentModel, [delegateSpec]);
+        const result = await turn(task.id, parentThreadId, `Use ${delegateTool} to ask Kimi to perform the following complete task, then report its actual result. Do not use collaboration spawn_agent or opaque handoff.\n\n${task.task}`, 'parent');
+        // A failed parent cannot leave child callbacks writing into the next task.
+        // Closing this owned process rejects pending child RPCs/turns; drain their
+        // receipt writes before task_end or journal close. No uncertain replay.
+        if (result.status !== 'completed') { uncertain = true; await server.close(); }
+        await settleCalls();
+        const completed = result.status === 'completed' && task.children.length > 0 && task.children.every(child => child.status === 'completed');
+        const summary = { id: task.id, completed, parentThreadId, parentTurnId: result.id, result, delegations: task.children, receipt };
         // Results already exist once in the journal; the final event references
         // them instead of rewriting all earlier task texts and visible output.
-        await save({ type: 'task_end', id: active.id, completed, parentThreadId, parentTurnId: result.id, delegations: active.children });
+        await save({ type: 'task_end', id: task.id, completed, parentThreadId, parentTurnId: result.id, delegations: task.children });
         output(safe(summary));
       } catch (error) {
-        const failure = safe({ id: active.id, completed: false, status: signal?.aborted ? 'interrupted' : 'failed', outcome: 'unknown', error: error instanceof Error ? error.message : 'bridge_failed', receipt });
+        uncertain = true;
+        await server.close();
+        await settleCalls();
+        const failure = safe({ id: task.id, completed: false, status: signal?.aborted ? 'interrupted' : 'failed', outcome: 'unknown', error: error instanceof Error ? error.message : 'bridge_failed', receipt });
         await save({ type: 'task_end', ...failure }); output(failure);
         break; // No second task is started after an uncertain transport outcome.
       } finally { active = undefined; }
