@@ -1,3 +1,5 @@
+use std::sync::Arc;
+
 use futures_util::{StreamExt, TryStreamExt, stream};
 use object_store::{ObjectStore, ObjectStoreExt, path::Path};
 
@@ -21,13 +23,18 @@ pub trait ArchiveStagingObjectStore: Send + Sync {
 
 impl ArchiveStore {
     pub async fn delete_prefix(&self, prefix: &str) -> Result<(), AppError> {
+        if prefix.starts_with(super::routing::PREFIX)
+            || prefix.starts_with(super::routing::STAGING_PREFIX)
+        {
+            return Err(AppError::storage("archive_cas_objects_are_immutable"));
+        }
         if super::path::may_include_v1_cas_location(prefix) {
             return Err(AppError::BadRequest(
                 "archive CAS objects are immutable".into(),
             ));
         }
         let prefix = archive_path(prefix)?;
-        self.delete_segment_prefix(prefix).await
+        Self::delete_segment_prefix(&self.inner, prefix).await
     }
 
     /// Deletes exactly one typed staging segment, including an object whose key
@@ -37,8 +44,21 @@ impl ArchiveStore {
         &self,
         key: ArchiveStagingKey,
     ) -> Result<(), AppError> {
-        self.delete_segment_prefix(archive_path(&key.canonical_prefix())?)
-            .await
+        let locator = key.canonical_prefix();
+        let (store, prefix) = self.resolve(&locator)?;
+        Self::delete_segment_prefix(store, prefix).await
+    }
+
+    /// Deletes only the owned object, never other objects in the typed segment.
+    pub(crate) async fn delete_archive_staging_object(
+        &self,
+        key: ArchiveStagingKey,
+        locator: &str,
+    ) -> Result<(), AppError> {
+        crate::archive_staging::validate_bound_locator(key, locator)?;
+        let (store, path) = self.resolve(locator)?;
+        store.delete(&path).await?;
+        Ok(())
     }
 
     /// Verifies that the exact typed segment is empty. As with deletion, S3's
@@ -47,14 +67,15 @@ impl ArchiveStore {
         &self,
         key: ArchiveStagingKey,
     ) -> Result<bool, AppError> {
-        let prefix = archive_path(&key.canonical_prefix())?;
-        match self.inner.head(&prefix).await {
+        let locator = key.canonical_prefix();
+        let (store, prefix) = self.resolve(&locator)?;
+        match store.head(&prefix).await {
             Ok(_) => return Ok(false),
             Err(object_store::Error::NotFound { .. }) => {}
             Err(error) => return Err(error.into()),
         }
 
-        let mut objects = self.inner.list(Some(&prefix));
+        let mut objects = store.list(Some(&prefix));
         while let Some(metadata) = objects.next().await {
             let metadata = metadata?;
             if metadata.location.prefix_matches(&prefix) {
@@ -64,21 +85,23 @@ impl ArchiveStore {
         Ok(true)
     }
 
-    async fn delete_segment_prefix(&self, prefix: Path) -> Result<(), AppError> {
+    async fn delete_segment_prefix(
+        store: &Arc<dyn ObjectStore>,
+        prefix: Path,
+    ) -> Result<(), AppError> {
         // ObjectStore::list is allowed to use a raw lexical prefix (notably on
         // S3), so `staging/x` can also return `staging/x2`. Filter every result
         // with Path's segment-aware matcher before allowing bulk deletion.
         // `list` normally omits an object whose key exactly equals the prefix;
         // HEAD it separately because callers also use this method to clean an
         // exact staged object locator.
-        let exact = match self.inner.head(&prefix).await {
+        let exact = match store.head(&prefix).await {
             Ok(_) => Some(Ok(prefix.clone())),
             Err(object_store::Error::NotFound { .. }) => None,
             Err(error) => return Err(error.into()),
         };
         let listed_prefix = prefix.clone();
-        let descendants = self
-            .inner
+        let descendants = store
             .list(Some(&prefix))
             .try_filter(move |metadata| {
                 futures_util::future::ready(
@@ -90,7 +113,7 @@ impl ArchiveStore {
             .map_ok(|metadata| metadata.location)
             .boxed();
         let locations = stream::iter(exact).chain(descendants).boxed();
-        self.inner
+        store
             .delete_stream(locations)
             .try_for_each(|_| futures_util::future::ready(Ok(())))
             .await?;

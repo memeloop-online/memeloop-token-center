@@ -808,6 +808,21 @@ pub(crate) const SQLITE_MIGRATIONS: &[Migration] = &[
         name: "group allocation usage projection",
         sql: include_str!("../../../migrations/common/0152_group_allocation_usage.sql"),
     },
+    Migration {
+        version: 153,
+        name: "semantic payload immutable object references",
+        sql: include_str!("../../../migrations/sqlite/0153_semantic_payload_object_reference.sql"),
+    },
+    Migration {
+        version: 154,
+        name: "allocation history export coverage",
+        sql: include_str!("../../../migrations/common/0154_allocation_history_coverage.sql"),
+    },
+    Migration {
+        version: 155,
+        name: "archive staging durable backend identity",
+        sql: include_str!("../../../migrations/common/0155_archive_staging_backend_identity.sql"),
+    },
 ];
 
 pub(crate) const POSTGRES_MIGRATIONS: &[Migration] = &[
@@ -1588,6 +1603,23 @@ pub(crate) const POSTGRES_MIGRATIONS: &[Migration] = &[
         version: 152,
         name: "group allocation usage projection",
         sql: include_str!("../../../migrations/common/0152_group_allocation_usage.sql"),
+    },
+    Migration {
+        version: 153,
+        name: "semantic payload immutable object references",
+        sql: include_str!(
+            "../../../migrations/postgres/0153_semantic_payload_object_reference.sql"
+        ),
+    },
+    Migration {
+        version: 154,
+        name: "allocation history export coverage",
+        sql: include_str!("../../../migrations/common/0154_allocation_history_coverage.sql"),
+    },
+    Migration {
+        version: 155,
+        name: "archive staging durable backend identity",
+        sql: include_str!("../../../migrations/common/0155_archive_staging_backend_identity.sql"),
     },
 ];
 

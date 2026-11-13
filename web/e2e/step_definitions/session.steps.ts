@@ -451,6 +451,10 @@ Then('实际轮换后的新凭据保留旧会话历史而旧凭据和其他身�
   });
   assert.ok(before.sessions.length > 0, 'rotation continuity needs an existing session');
   const oldCredential = seed.clientCredential;
+  // End the browser session before rotating its key through the service API.
+  // The old-key rejection below remains a separate, explicit HTTP assertion.
+  await page.getByRole('button', { name: '清空凭据', exact: true }).click();
+  await visible(page.locator('input[type="password"]'));
   const rotated = await requestJson<{ key: string }>(`/internal/v1/keys/${seed.clientKeyId}/rotate`, {
     method: 'POST',
     credential: seed.serviceCredential,
@@ -479,7 +483,6 @@ Then('实际轮换后的新凭据保留旧会话历史而旧凭据和其他身�
   assert.equal(forbiddenDetail.status, 404);
 
   seed.clientCredential = rotated.key;
-  await page.getByRole('button', { name: '清空凭据', exact: true }).click();
   await page.locator('input[type="password"]').fill(rotated.key);
   await page.getByRole('button', { name: '进入', exact: true }).click();
   await openAppRoute(page, 'portal', 'sessions');

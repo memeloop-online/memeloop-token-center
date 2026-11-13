@@ -411,7 +411,7 @@ impl ProviderCatalog {
                     "default": "public",
                     "description": "Private destinations require a global operator credential."
                 },
-                "timeout_seconds": {"type": "integer", "minimum": 1, "description": "Optional explicit end-to-end request timeout in seconds. When omitted, no application deadline is imposed."},
+                "timeout_seconds": {"type": "integer", "minimum": 1, "description": "Legacy compatibility value. Inference waits for completion or caller cancellation; this value does not limit the request or response duration."},
                 "reservation_token_bounds": {
                     "type": "object",
                     "propertyNames": {"minLength": 1, "maxLength": 500},
@@ -465,8 +465,8 @@ impl ProviderCatalog {
                 "video_api": {
                     "title": "Video generation API",
                     "type": "string",
-                    "enum": ["siliconflow-v1", "wasu-wan-v1"],
-                    "description": "Explicit asynchronous video contract: SiliconFlow submit/status or Wasu Wan video-synthesis/tasks. Wasu Wan supports only the verified wan3.0-video reference-image profile."
+                    "enum": ["siliconflow-v1", "wasu-wan-v1", "tkmarket-seedance-v1"],
+                    "description": "Explicit asynchronous video contract: SiliconFlow submit/status or Wasu Wan video-synthesis/tasks. Wasu Wan supports only the verified wan3.0-video reference-image profile. tkmarket Seedance supports the exact seedance-2.0-idle-ts and seedance-2.5-idle-ts text-only 720p/5s profile."
                 },
                 "video_models": {
                     "title": "Video generation models",
@@ -903,7 +903,7 @@ impl ProviderCatalog {
         kimi.config_schema["properties"]["timeout_seconds"] = json!({
             "type": "integer",
             "minimum": 1,
-            "description": "Optional explicit request timeout in seconds, including the complete response stream. When omitted, no application deadline is imposed."
+            "description": "Legacy compatibility value. Inference waits for completion or caller cancellation; this value does not limit the request or response duration."
         });
         kimi.oauth_adapter = Some(OAuthAdapterContribution {
             api_version: "oauth-adapter-v1".to_owned(),

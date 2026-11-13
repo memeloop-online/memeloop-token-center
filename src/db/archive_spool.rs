@@ -116,72 +116,6 @@ pub(crate) async fn insert_request_archive_gap_in_transaction(
 }
 
 impl Database {
-    pub(crate) async fn deferred_archive_is_captured(
-        &self,
-        identity: ArchiveSpoolIdentity,
-        purpose: BufferedArchivePurpose,
-        body: &[u8],
-    ) -> Result<bool, AppError> {
-        let count: i64 = sqlx::query_scalar(sqlx::AssertSqlSafe(spool_sql(
-            purpose,
-            "SELECT COUNT(*) FROM response_archive_spools
-             WHERE request_id = $1 AND tenant_id = $2 AND reservation_id = $3
-               AND byte_count = $4 AND body_blake3 = $5
-               AND state IN ('pending', 'uploading', 'bound')",
-        )))
-        .bind(identity.request_id.to_string())
-        .bind(identity.tenant_id.to_string())
-        .bind(identity.reservation_id.to_string())
-        .bind(i64::try_from(body.len()).map_err(|_| AppError::internal("archive_body_length"))?)
-        .bind(blake3::hash(body).to_hex().to_string())
-        .fetch_one(&self.pool)
-        .await?;
-        Ok(count == 1)
-    }
-
-    pub(crate) async fn capture_deferred_archive(
-        &self,
-        archive: &crate::response_archive_spool::BufferedArchive<'_>,
-    ) -> Result<bool, AppError> {
-        let prepared = archive.prepare_first_batch().await?;
-        let reservation = self.reserve_buffered_archive_capacity(archive).await?;
-        let Some(reservation) = reservation else {
-            return Ok(false);
-        };
-        let result = async {
-            let (mut transaction, now, hold) = self
-                .reserved_spool_transaction(&reservation, "deferred_capture")
-                .await?;
-            let captured = self
-                .capture_reserved_buffered_archive_body_in_transaction(
-                    &mut transaction,
-                    now,
-                    archive,
-                    Some(prepared),
-                    Some(&reservation),
-                )
-                .await?;
-            if captured {
-                sqlx::query(sqlx::AssertSqlSafe(spool_sql(
-                    archive.purpose(),
-                    "UPDATE response_archive_spools SET body_blake3 = $1
-                     WHERE request_id = $2 AND tenant_id = $3 AND reservation_id = $4",
-                )))
-                .bind(blake3::hash(archive.body()).to_hex().to_string())
-                .bind(archive.identity().request_id.to_string())
-                .bind(archive.identity().tenant_id.to_string())
-                .bind(archive.identity().reservation_id.to_string())
-                .execute(&mut *transaction)
-                .await?;
-            }
-            BudgetHold::commit_optional(transaction, Some(hold)).await?;
-            Ok(captured)
-        }
-        .await;
-        reservation.release().await;
-        result
-    }
-
     /// Atomic buffered capture: no partially captured row is ever visible.
     /// The global budget serializes admission for both archive purposes.
     #[cfg(test)]
@@ -515,6 +449,7 @@ impl Database {
         Ok(true)
     }
 
+    #[cfg(test)]
     pub(crate) async fn begin_response_archive_spool(
         &self,
         identity: ArchiveSpoolIdentity,
@@ -644,6 +579,7 @@ impl Database {
         .await
     }
 
+    #[cfg(test)]
     pub(crate) async fn append_response_archive_spool_batch_with<F>(
         &self,
         identity: ArchiveSpoolIdentity,
@@ -798,6 +734,7 @@ impl Database {
         Ok(true)
     }
 
+    #[cfg(test)]
     pub(crate) async fn seal_response_archive_spool(
         &self,
         identity: ArchiveSpoolIdentity,
@@ -844,6 +781,7 @@ impl Database {
         Ok(true)
     }
 
+    #[cfg(test)]
     pub(crate) async fn fail_response_archive_spool(
         &self,
         identity: ArchiveSpoolIdentity,
@@ -1339,6 +1277,17 @@ impl Database {
         let Some(row) = row else { return Ok(None) };
         let id: String = row.try_get("request_id")?;
         let now: i64 = row.try_get("db_now")?;
+        let retained: i64 = sqlx::query_scalar(sqlx::AssertSqlSafe(spool_sql(
+            purpose,
+            "SELECT COUNT(*) FROM response_archive_spool_chunks WHERE request_id = $1",
+        )))
+        .bind(&id)
+        .fetch_one(&mut *tx)
+        .await?;
+        if retained != 0 {
+            tx.commit().await?;
+            return Ok(None);
+        }
         let chunk_sql = match self.backend {
             DatabaseBackend::PostgreSql => {
                 "SELECT seq, CAST(OCTET_LENGTH(ciphertext) AS BIGINT) AS cipher_len FROM response_archive_spool_chunks WHERE request_id = $1 ORDER BY seq LIMIT $2"
@@ -1699,6 +1648,7 @@ fn spool_sql(purpose: BufferedArchivePurpose, sql: &str) -> String {
     }
 }
 
+#[cfg(test)]
 fn spool_write_rejected(
     identity: ArchiveSpoolIdentity,
     operation: &'static str,

@@ -6,9 +6,10 @@ use std::{
     time::Duration,
 };
 
+use super::request_pool::RequestPool as AnyPool;
 #[cfg(test)]
 use bytes::Bytes;
-use sqlx::{AnyPool, Row, any::AnyPoolOptions};
+use sqlx::{Row, any::AnyPoolOptions};
 use tokio::sync::OwnedSemaphorePermit;
 use tokio::sync::Semaphore;
 
@@ -52,17 +53,28 @@ pub(super) struct GatewayPersistence {
 
 impl GatewayPersistence {
     pub(super) fn new(url: &str, backend: DatabaseBackend) -> Result<Self, sqlx::Error> {
-        let acquire_timeout = Duration::from_millis(250);
+        let acquire_timeout = match backend {
+            DatabaseBackend::PostgreSql => Duration::from_secs(30),
+            DatabaseBackend::Sqlite => Duration::from_millis(250),
+        };
         #[cfg(test)]
         let acquire_timeout = TEST_SOURCE_POOL_TIMEOUT
             .try_with(|timeout| *timeout)
             .unwrap_or(acquire_timeout);
+        let application_name = super::postgres_application_name("mtc-gateway-archive");
         let pool = AnyPoolOptions::new()
             .max_connections(1)
+            .test_before_acquire(matches!(backend, DatabaseBackend::Sqlite))
             .min_connections(0)
             .acquire_timeout(acquire_timeout)
             .idle_timeout(Some(Duration::from_secs(60)))
+            .after_release(move |connection, _metadata| {
+                Box::pin(
+                    async move { Ok(super::request_connection::can_reuse(connection, backend)) },
+                )
+            })
             .after_connect(move |connection, _| {
+                let application_name = application_name.clone();
                 Box::pin(async move {
                     match backend {
                         DatabaseBackend::Sqlite => {
@@ -71,19 +83,19 @@ impl GatewayPersistence {
                                 .await?;
                         }
                         DatabaseBackend::PostgreSql => {
-                            for statement in [
-                                "SET statement_timeout = '250ms'",
-                                "SET lock_timeout = '100ms'",
-                                "SET idle_in_transaction_session_timeout = '1s'",
-                            ] {
-                                sqlx::query(statement).execute(&mut *connection).await?;
-                            }
+                            super::initialize_postgres_connection(
+                                connection,
+                                &application_name,
+                                super::ConnectionProfile::Serve,
+                            )
+                            .await?;
                         }
                     }
                     Ok(())
                 })
             })
-            .connect_lazy(url)?;
+            .connect_lazy(url)?
+            .into();
         Ok(Self {
             pool,
             slots: Arc::new(Semaphore::new(TASK_LIMIT)),
@@ -99,7 +111,7 @@ impl GatewayPersistence {
             #[cfg(test)]
             source_timeout: TEST_SOURCE_POOL_TIMEOUT
                 .try_with(|timeout| *timeout)
-                .unwrap_or(Duration::from_secs(2)),
+                .unwrap_or(acquire_timeout),
         })
     }
 
@@ -217,14 +229,97 @@ impl Database {
         digest: [u8; 32],
         success: bool,
     ) {
+        if success {
+            self.publish_request_source(identity, locator, length, digest)
+                .await;
+        }
+        self.complete_request_source_state(identity, locator, length, digest, success, false)
+            .await;
+    }
+
+    /// A successful object-store Put is independent of the staging write lease.
+    /// Recover its metadata without granting a fenced writer a new write lease.
+    pub(crate) async fn complete_uploaded_request_source(
+        &self,
+        identity: ArchiveSpoolIdentity,
+        locator: &str,
+        length: usize,
+        digest: [u8; 32],
+    ) {
+        self.complete_request_source_state(identity, locator, length, digest, true, true)
+            .await;
+    }
+
+    async fn complete_request_source_state(
+        &self,
+        identity: ArchiveSpoolIdentity,
+        locator: &str,
+        length: usize,
+        digest: [u8; 32],
+        success: bool,
+        recovery: bool,
+    ) {
         loop {
             if self
-                .persist_request_source(identity, locator, length, digest, Some(success))
+                .persist_request_source(identity, locator, length, digest, Some(success), recovery)
                 .await
                 .is_some()
             {
                 return;
             }
+            tokio::time::sleep(Duration::from_millis(250)).await;
+        }
+    }
+
+    /// The immutable root must not depend on optional SQL metadata capacity.
+    pub(crate) async fn publish_request_source(
+        &self,
+        identity: ArchiveSpoolIdentity,
+        locator: &str,
+        length: usize,
+        digest: [u8; 32],
+    ) {
+        loop {
+            let persisted: Result<(), AppError> = async {
+                let archive = self.body_archive()?;
+                let expected_digest = blake3::Hash::from_bytes(digest).to_hex().to_string();
+                if let Some(existing) = archive
+                    .raw_capture_reference(identity.tenant_id, identity.request_id, "request")
+                    .await?
+                {
+                    if existing.size_bytes != length as u64
+                        || existing.blake3_digest != expected_digest
+                    {
+                        return Err(AppError::storage("request_source_root_conflict"));
+                    }
+                    archive
+                        .verify_tenant_content(identity.tenant_id, &existing)
+                        .await?;
+                    return Ok(());
+                }
+                let staged = crate::archive::StagedArchiveObject {
+                    object_locator: locator.to_owned(),
+                    size_bytes: length as u64,
+                    blake3_digest: expected_digest,
+                };
+                let object = archive
+                    .promote_staged_text_to_cas(identity.tenant_id, &staged)
+                    .await?;
+                archive
+                    .publish_raw_capture(
+                        identity.tenant_id,
+                        identity.request_id,
+                        "request",
+                        &object,
+                    )
+                    .await?;
+                Ok(())
+            }
+            .await;
+            if persisted.is_ok() {
+                break;
+            }
+            tracing::warn!(request_id = %identity.request_id, "request object publication retained for retry");
             tokio::time::sleep(Duration::from_millis(250)).await;
         }
     }
@@ -241,10 +336,19 @@ impl Database {
             if let Some(success) = *outcome.borrow_and_update() {
                 return Some(success);
             }
-            let delay = match self
-                .persist_request_source(identity, locator, length, digest, None)
-                .await
-            {
+            // Upload completion must interrupt a metadata write waiting for the
+            // archive pool; otherwise a durable object can retain raw memory
+            // behind an unrelated database wait.
+            let persisted = tokio::select! {
+                biased;
+                changed = outcome.changed() => {
+                    if changed.is_err() { return None; }
+                    if let Some(success) = *outcome.borrow_and_update() { return Some(success); }
+                    continue;
+                }
+                result = self.persist_request_source(identity, locator, length, digest, None, false) => result,
+            };
+            let delay = match persisted {
                 Some(false) => return None,
                 Some(true) => Duration::from_millis(
                     crate::archive_staging::ARCHIVE_STAGING_WRITE_HEARTBEAT_MILLIS as u64,
@@ -272,31 +376,36 @@ impl Database {
         length: usize,
         digest: [u8; 32],
         success: Option<bool>,
+        recovery: bool,
     ) -> Option<bool> {
         let mut database = self.clone();
         database.pool = self.gateway_persistence.pool.clone();
         database.pool_role = "gateway_archive";
         #[cfg(not(test))]
-        let timeout = Duration::from_secs(2);
+        let timeout = database.pool.options().get_acquire_timeout();
         #[cfg(test)]
         let timeout = self.gateway_persistence.source_timeout;
         let deadline = tokio::time::Instant::now() + timeout;
-        let result = tokio::time::timeout_at(
-            deadline,
-            ARCHIVE_DEADLINE.scope(
+        // SQLx acquisition and the session statement/lock timeouts bound DB
+        // work. Do not cancel the entire background transaction after two
+        // seconds (including time queued for this single connection): that
+        // discards useful progress and races rollback/COMMIT acknowledgements.
+        // The task-local deadline only bounds SQLite's busy-BEGIN retry.
+        let result = ARCHIVE_DEADLINE
+            .scope(
                 (self.gateway_persistence.clone(), deadline),
-                database
-                    .record_request_source_state(identity, locator, length, digest, success, false),
-            ),
-        )
-        .await;
+                database.record_request_source_state(
+                    identity, locator, length, digest, success, recovery,
+                ),
+            )
+            .await;
         match result {
-            Ok(Ok(owned)) => Some(owned),
-            _ => {
+            Ok(owned) => Some(owned),
+            Err(error) => {
                 self.gateway_persistence
                     .failed
                     .fetch_add(1, Ordering::Relaxed);
-                tracing::warn!(request_id = %identity.request_id, "request source metadata retained for retry");
+                tracing::warn!(request_id = %identity.request_id, error_category = error.diagnostic_category(), "request source metadata retained for retry");
                 None
             }
         }
@@ -336,23 +445,26 @@ impl Database {
         digest: [u8; 32],
         success: bool,
     ) {
-        let Some(permit) = self.try_request_source_completion() else {
-            return;
-        };
         let database = self.clone();
         tokio::spawn(async move {
-            let _permit = permit;
-            let (_outcome, receiver) = tokio::sync::watch::channel(Some(success));
-            if database
-                .wait_request_source_upload(identity, &locator, length, digest, receiver)
-                .await
-                .is_none()
-            {
-                return;
+            if success {
+                database
+                    .publish_request_source(identity, &locator, length, digest)
+                    .await;
             }
-            database
-                .complete_request_source(identity, &locator, length, digest, success)
-                .await;
+            let Some(_permit) = database.try_request_source_completion() else {
+                // Raw roots are independently discoverable by the body worker.
+                return;
+            };
+            if success {
+                database
+                    .complete_uploaded_request_source(identity, &locator, length, digest)
+                    .await;
+            } else {
+                database
+                    .complete_request_source(identity, &locator, length, digest, false)
+                    .await;
+            }
         });
     }
 
@@ -378,7 +490,7 @@ impl Database {
             .await
     }
 
-    async fn record_request_source_state(
+    pub(super) async fn record_request_source_state(
         &self,
         identity: ArchiveSpoolIdentity,
         locator: &str,
@@ -387,11 +499,10 @@ impl Database {
         success: Option<bool>,
         recovery: bool,
     ) -> Result<bool, AppError> {
-        if crate::gateway_body::request_spool::source_request_id(locator)
-            != Some(identity.request_id)
-        {
-            return Err(AppError::internal("gateway_request_source_identity"));
-        }
+        let source_key = crate::gateway_body::request_spool::request_body_staging_key(locator)
+            .filter(|key| key.owner.id() == identity.request_id)
+            .ok_or_else(|| AppError::internal("gateway_request_source_identity"))?;
+        let backend_identity = source_key.backend_identity_text();
         let mut transaction = self.begin_write_transaction().await?;
         let owned = sqlx::query("UPDATE request_records SET request_object = request_object WHERE id = $1 AND tenant_id = $2 AND reservation_id = $3 AND request_object = $4 RETURNING key_id")
             .bind(identity.request_id.to_string()).bind(identity.tenant_id.to_string()).bind(identity.reservation_id.to_string()).bind(locator)
@@ -412,19 +523,24 @@ impl Database {
             .await?;
         let expires_at =
             now.saturating_add(crate::archive_staging::ARCHIVE_STAGING_WRITE_LEASE_MILLIS);
-        let inserted = sqlx::query("INSERT INTO archive_staging_attempts (attempt_id, owner_kind, owner_id, purpose, intent_digest, state, writer_owner, writer_token, lease_owner, lease_token, lease_expires_at, next_cleanup_at, created_at, updated_at) VALUES ($1, 'proxy_request', $1, 'request', $2, 'writing', 'gateway-source', $1, 'gateway-source', $1, $3, NULL, $4, $4) ON CONFLICT(attempt_id) DO NOTHING")
+        let inserted = sqlx::query("INSERT INTO archive_staging_attempts (attempt_id, owner_kind, owner_id, purpose, intent_digest, state, writer_owner, writer_token, lease_owner, lease_token, lease_expires_at, next_cleanup_at, created_at, updated_at, backend_identity) VALUES ($1, 'proxy_request', $1, 'request', $2, 'writing', 'gateway-source', $1, 'gateway-source', $1, $3, NULL, $4, $4, $5) ON CONFLICT(attempt_id) DO NOTHING")
             .bind(identity.request_id.to_string()).bind(blake3::Hash::from_bytes(digest).to_hex().to_string())
-            .bind(expires_at).bind(now)
+            .bind(expires_at).bind(now).bind(&backend_identity)
             .execute(&mut *transaction).await?;
         if recovery && success == Some(false) && inserted.rows_affected() == 1 {
             transaction.commit().await?;
             return Ok(false);
         }
-        let stage = sqlx::query("UPDATE archive_staging_attempts SET updated_at = updated_at WHERE attempt_id = $1 AND owner_kind = 'proxy_request' AND owner_id = $1 AND purpose = 'request' AND writer_owner = 'gateway-source' AND writer_token = $1 RETURNING state, lease_owner, lease_token, lease_expires_at")
+        let stage = sqlx::query("UPDATE archive_staging_attempts SET updated_at = updated_at WHERE attempt_id = $1 AND owner_kind = 'proxy_request' AND owner_id = $1 AND purpose = 'request' AND writer_owner = 'gateway-source' AND writer_token = $1 RETURNING state, lease_owner, lease_token, lease_expires_at, backend_identity")
             .bind(identity.request_id.to_string()).fetch_optional(&mut *transaction).await?;
         let Some(stage) = stage else {
             return Ok(false);
         };
+        if stage.try_get::<Option<String>, _>("backend_identity")? != backend_identity {
+            return Err(AppError::Conflict(
+                "request source staging backend changed".into(),
+            ));
+        }
         let writing = stage.try_get::<String, _>("state")? == "writing";
         let live = writing
             && stage
@@ -450,7 +566,12 @@ impl Database {
                     .try_get::<Option<String>, _>("lease_token")?
                     .is_none_or(|token| token != identity.request_id.to_string())
             {
-                return Ok(false);
+                // Request ownership was checked above, including tenant,
+                // reservation and exact locator. A reaper fencing staging is
+                // not permission to cancel the only remaining original body.
+                // Do not renew or mutate the fenced stage. Once the Put is
+                // durable, its explicit recovery path can bind the metadata.
+                return Ok(!writing && success.is_none());
             }
         }
         if success.is_some() {
@@ -558,7 +679,7 @@ impl Database {
     #[cfg(test)]
     pub(crate) async fn hold_gateway_archive_connection_for_test(
         &self,
-    ) -> sqlx::pool::PoolConnection<sqlx::Any> {
+    ) -> super::request_connection::RequestConnection {
         self.gateway_persistence.pool.acquire().await.unwrap()
     }
 
@@ -647,24 +768,21 @@ impl Database {
                 if let Err(error) = database.publish_proxy_started_event(identity).await {
                     tracing::warn!(%request_id, reason = error.diagnostic_category(), "request started event omitted");
                 }
-                let retained =
-                    crate::api::proxy::archive_retention::prepare_json_body_if_valid(&body);
-                let body = retained.as_ref().map_or_else(
-                    || body.clone(),
-                    |retained| {
-                        crate::api::proxy::archive_retention::encode_json_body(&body, retained)
-                    },
-                );
-                drop(retained);
                 database
                     .capture_deferred_request_archive(identity, &body, &pepper, compression_enabled)
                     .await
             };
-            let result = tokio::time::timeout_at(
-                deadline,
-                ARCHIVE_DEADLINE.scope((database.gateway_persistence.clone(), deadline), capture),
-            )
-            .await;
+            let result = match database.backend {
+                DatabaseBackend::PostgreSql => Ok(capture.await),
+                DatabaseBackend::Sqlite => {
+                    tokio::time::timeout_at(
+                        deadline,
+                        ARCHIVE_DEADLINE
+                            .scope((database.gateway_persistence.clone(), deadline), capture),
+                    )
+                    .await
+                }
+            };
             match result {
                 Ok(Ok(())) => {}
                 Ok(Err(error)) => {

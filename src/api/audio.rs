@@ -106,7 +106,8 @@ pub(super) async fn create_audio_transcription(
         .map_err(|_| AppError::BadRequest("plugin-rewritten audio request is invalid".into()))?;
     validate_audio_metadata(&metadata)?;
 
-    let request_id = Uuid::now_v7();
+    let context = super::proxy_diagnostics::Context::current();
+    let request_id = resources.request_id;
     let route = crate::generation::group_routing::prepare_route_for_protocol(
         &mut state,
         &key,
@@ -142,15 +143,7 @@ pub(super) async fn create_audio_transcription(
             "audio transcription price must use second billing".into(),
         ));
     }
-    let request_object = metadata_only_locator(json!({
-        "kind": "audio_transcription",
-        "media_archived": false,
-        "media_bytes": form.file.bytes.len(),
-        "duration_ms": audio.duration_ms,
-        "sample_rate_hz": audio.sample_rate_hz,
-        "channels": audio.channels,
-        "response_format": metadata.response_format.as_str(),
-    }))?;
+    let request_object = format!("gap://{request_id}/request");
     let upstream_form = upstream_form(form.file, &metadata, &route.upstream_model)?;
     let outbound_http = network::client_for_config_url_no_retry(
         &state.http,
@@ -179,8 +172,20 @@ pub(super) async fn create_audio_transcription(
             model_route_id: Some(route.route_id),
         })
         .await?;
-    let deadline = tokio::time::Instant::now() + SYNCHRONOUS_AUDIO_DEADLINE;
-    let worker = tokio::spawn(async move {
+    let identity = crate::db::ArchiveSpoolIdentity {
+        request_id,
+        tenant_id: key.tenant_id,
+        reservation_id: reservation.reservation.id,
+    };
+    super::proxy::persistence::capture(
+        &state,
+        identity,
+        crate::response_archive_spool::BufferedArchivePurpose::Request,
+        resources.raw_request.clone(),
+        resources.memory.clone(),
+    );
+    super::early_request::mark_admitted();
+    let operation = async move {
         let _resource_owners = (&resources.lifecycle, &resources.memory);
         let result = async move {
             let started = Instant::now();
@@ -194,59 +199,42 @@ pub(super) async fn create_audio_transcription(
             {
                 Ok(attempt) => attempt,
                 Err(error) => {
+                    super::proxy::persistence::record_capture_failure(&state, identity);
                     finish_audio_request(
-                    &state,
-                    &reservation,
-                    request_id,
-                    key.tenant_id,
-                    audio,
-                    started,
-                    StatusCode::BAD_GATEWAY,
-                    0,
-                    Some("audio_upstream_unavailable"),
-                    json!({"kind":"audio_transcription","media_archived":false,"succeeded":false}),
-                )
-                .await?;
+                        &state,
+                        &reservation,
+                        request_id,
+                        key.tenant_id,
+                        audio,
+                        started,
+                        StatusCode::BAD_GATEWAY,
+                        0,
+                        Some("audio_upstream_unavailable"),
+                    )
+                    .await?;
                     return Err(error);
                 }
             };
             let _activity = state.metrics.active_upstream(&route.driver, "audio");
-            let upstream_result = tokio::time::timeout_at(deadline, request.send()).await;
+            let upstream_result = request.send().await;
             let upstream = match upstream_result {
-                Ok(Ok(response)) => response,
-                Ok(Err(_error)) => {
+                Ok(response) => response,
+                Err(_error) => {
+                    super::proxy::persistence::record_capture_failure(&state, identity);
                     attempt.complete(audio_transport_failure()).await;
                     finish_audio_request(
-                &state,
-                &reservation,
-                request_id,
-                key.tenant_id,
-                audio,
-                started,
-                StatusCode::BAD_GATEWAY,
-                0,
-                Some("audio_upstream_transport"),
-                json!({"kind":"audio_transcription","media_archived":false,"succeeded":false}),
-            )
-            .await?;
+                        &state,
+                        &reservation,
+                        request_id,
+                        key.tenant_id,
+                        audio,
+                        started,
+                        StatusCode::BAD_GATEWAY,
+                        0,
+                        Some("audio_upstream_transport"),
+                    )
+                    .await?;
                     return Err(AppError::upstream("audio_upstream_transport_failed"));
-                }
-                Err(_) => {
-                    attempt.complete(audio_transport_failure()).await;
-                    finish_audio_request(
-                &state,
-                &reservation,
-                request_id,
-                key.tenant_id,
-                audio,
-                started,
-                StatusCode::BAD_GATEWAY,
-                0,
-                Some("audio_upstream_timeout"),
-                json!({"kind":"audio_transcription","media_archived":false,"succeeded":false}),
-            )
-            .await?;
-                    return Err(AppError::upstream("audio_upstream_timed_out"));
                 }
             };
             state.metrics.observe_upstream(
@@ -256,27 +244,13 @@ pub(super) async fn create_audio_transcription(
                 started.elapsed(),
             );
             let upstream_status = upstream.status();
+            // Parsing, rate-limit observation and safe delivery may stop early.
+            // The same original-body reader owns the bounded archive and drains
+            // the remaining supplier bytes independently of safe delivery.
+            let upstream = super::proxy::upstream_response::UpstreamResponse::from(upstream)
+                .with_original_archive_capture(&state, identity);
             if upstream_status == StatusCode::TOO_MANY_REQUESTS {
-                let kind =
-                    match tokio::time::timeout_at(deadline, classify_media_rate_limit(upstream))
-                        .await
-                    {
-                        Ok(kind) => kind,
-                        Err(_) => {
-                            attempt.complete(audio_transport_failure()).await;
-                            finish_audio_failure(
-                                &state,
-                                &reservation,
-                                request_id,
-                                key.tenant_id,
-                                audio,
-                                started,
-                                "audio_upstream_timeout",
-                            )
-                            .await?;
-                            return Err(AppError::upstream("audio_upstream_timed_out"));
-                        }
-                    };
+                let kind = super::proxy::classify_archived_media_rate_limit(upstream).await;
                 attempt
                     .complete(MediaAttemptTerminal::Failed {
                         kind,
@@ -332,7 +306,7 @@ pub(super) async fn create_audio_transcription(
                     crate::error::ErrorFacts::new().stage("audio_upstream"),
                 ));
             }
-            let upstream_body = match read_audio_response_bounded(upstream, deadline).await {
+            let upstream_body = match read_audio_response_bounded(upstream).await {
                 Ok(body) => body,
                 Err(error) => {
                     attempt.complete(error.terminal()).await;
@@ -375,10 +349,6 @@ pub(super) async fn create_audio_transcription(
                     return Err(error);
                 }
             };
-            let segment_count = normalized
-                .get("segments")
-                .and_then(Value::as_array)
-                .map_or(0, Vec::len);
             finish_audio_request(
                 &state,
                 &reservation,
@@ -389,13 +359,6 @@ pub(super) async fn create_audio_transcription(
                 StatusCode::OK,
                 audio.billed_seconds,
                 None,
-                json!({
-                    "kind":"audio_transcription",
-                    "media_archived":false,
-                    "succeeded":true,
-                    "duration_ms":audio.duration_ms,
-                    "segment_count":segment_count,
-                }),
             )
             .await?;
             attempt
@@ -413,7 +376,8 @@ pub(super) async fn create_audio_transcription(
         }
         .await;
         result.map(|response| super::auth::hold_response_body_permit(response, resources))
-    });
+    };
+    let worker = tokio::spawn(super::proxy_diagnostics::CONTEXT.scope(context, operation));
     match worker.await {
         Ok(result) => result,
         Err(error) => {
@@ -717,7 +681,6 @@ fn upstream_form(
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum AudioResponseReadError {
-    Timeout,
     TooLarge,
     Transport,
 }
@@ -725,7 +688,6 @@ enum AudioResponseReadError {
 impl AudioResponseReadError {
     fn code(self) -> &'static str {
         match self {
-            Self::Timeout => "audio_upstream_timeout",
             Self::TooLarge => "audio_upstream_response_too_large",
             Self::Transport => "audio_upstream_response_stream",
         }
@@ -733,7 +695,7 @@ impl AudioResponseReadError {
 
     fn terminal(self) -> MediaAttemptTerminal {
         match self {
-            Self::Timeout | Self::Transport => audio_transport_failure(),
+            Self::Transport => audio_transport_failure(),
             Self::TooLarge => MediaAttemptTerminal::invalid_response(),
         }
     }
@@ -748,8 +710,7 @@ fn audio_transport_failure() -> MediaAttemptTerminal {
 }
 
 async fn read_audio_response_bounded(
-    response: reqwest::Response,
-    deadline: tokio::time::Instant,
+    response: super::proxy::upstream_response::UpstreamResponse,
 ) -> Result<Bytes, AudioResponseReadError> {
     if response
         .content_length()
@@ -757,22 +718,17 @@ async fn read_audio_response_bounded(
     {
         return Err(AudioResponseReadError::TooLarge);
     }
-    collect_audio_response_stream(response.bytes_stream(), deadline).await
+    collect_audio_response_stream(response.bytes_stream()).await
 }
 
-async fn collect_audio_response_stream<S, E>(
-    stream: S,
-    deadline: tokio::time::Instant,
-) -> Result<Bytes, AudioResponseReadError>
+async fn collect_audio_response_stream<S, E>(stream: S) -> Result<Bytes, AudioResponseReadError>
 where
     S: futures_util::Stream<Item = Result<Bytes, E>>,
 {
     futures_util::pin_mut!(stream);
     let mut body = Vec::new();
     loop {
-        let next = tokio::time::timeout_at(deadline, stream.next())
-            .await
-            .map_err(|_| AudioResponseReadError::Timeout)?;
+        let next = stream.next().await;
         let Some(chunk) = next else {
             break;
         };
@@ -928,14 +884,6 @@ fn finite_non_negative(value: Option<&Value>, _field: &str) -> Result<f64, AppEr
         .ok_or_else(|| AppError::upstream("audio_segment_is_invalid"))
 }
 
-fn metadata_only_locator(metadata: Value) -> Result<String, AppError> {
-    Ok(format!(
-        "metadata-only-json:{}",
-        serde_json::to_string(&metadata)
-            .map_err(|_| AppError::internal("audio_metadata_only_locator_1"))?
-    ))
-}
-
 async fn finish_audio_failure(
     state: &AppState,
     reservation: &crate::model::MeteredUsageReservation,
@@ -955,7 +903,6 @@ async fn finish_audio_failure(
         StatusCode::BAD_GATEWAY,
         0,
         Some(error_code),
-        json!({"kind":"audio_transcription","media_archived":false,"succeeded":false}),
     )
     .await
 }
@@ -971,9 +918,10 @@ async fn finish_audio_request(
     status: StatusCode,
     billed_seconds: i64,
     error_code: Option<&str>,
-    response_metadata: Value,
 ) -> Result<(), AppError> {
-    let response_object = metadata_only_locator(response_metadata)?;
+    // Financial completion is independent of object-store availability. The
+    // owned writer/root resolver binds a completed raw response separately.
+    let response_object = format!("gap://{request_id}/response");
     state
         .db
         .finish_metered_synchronous_request(FinishMeteredSynchronousRequest {
@@ -1086,43 +1034,38 @@ mod tests {
         }
     }
 
-    #[tokio::test]
-    async fn upstream_body_reader_enforces_the_original_absolute_deadline() {
-        let stream = futures_util::stream::pending::<Result<Bytes, std::io::Error>>();
-        let error = collect_audio_response_stream(
-            stream,
-            tokio::time::Instant::now() + Duration::from_millis(10),
-        )
-        .await
-        .unwrap_err();
-        assert_eq!(error, AudioResponseReadError::Timeout);
-        assert!(matches!(
-            error.terminal(),
-            MediaAttemptTerminal::Failed {
-                kind: crate::db::UpstreamFailureKind::Connection,
-                reason: crate::metrics::UpstreamHealthReason::Connection,
-                ..
-            }
-        ));
+    #[tokio::test(start_paused = true)]
+    async fn upstream_body_reader_waits_for_audio_after_ten_minutes() {
+        let stream = futures_util::stream::once(async {
+            tokio::time::sleep(Duration::from_secs(11 * 60)).await;
+            Ok::<_, std::io::Error>(Bytes::from_static(br#"{"text":"complete"}"#))
+        });
+        let body = collect_audio_response_stream(stream).await.unwrap();
+        assert_eq!(body, br#"{"text":"complete"}"#[..]);
     }
 
     #[tokio::test]
-    async fn transcription_routes_bills_measured_wav_seconds_and_archives_only_metadata() {
+    async fn transcription_routes_bills_measured_wav_seconds_and_archives_full_original_bodies() {
         let upstream = MockServer::start().await;
+        let original_response = serde_json::to_vec(&json!({
+            "text":"sensitive transcript",
+            "duration":999,
+            "task":"transcribe",
+            "language":"en",
+            "segments":[{
+                "id":9,"seek":12,"start":0,"end":1.4,"text":"sensitive transcript",
+                "tokens":[1,2],"temperature":0.2,"avg_logprob":-0.3,
+                "compression_ratio":1.1,"no_speech_prob":0.01
+            }],
+            "words":[{"word":"sensitive","start":0,"end":0.7}]
+        }))
+        .unwrap();
         Mock::given(method("POST"))
             .and(path("/v1/audio/transcriptions"))
-            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
-                "text":"sensitive transcript",
-                "duration":999,
-                "task":"transcribe",
-                "language":"en",
-                "segments":[{
-                    "id":9,"seek":12,"start":0,"end":1.4,"text":"sensitive transcript",
-                    "tokens":[1,2],"temperature":0.2,"avg_logprob":-0.3,
-                    "compression_ratio":1.1,"no_speech_prob":0.01
-                }],
-                "words":[{"word":"sensitive","start":0,"end":0.7}]
-            })))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_body_raw(original_response.clone(), "application/json"),
+            )
             .expect(1)
             .mount(&upstream)
             .await;
@@ -1193,7 +1136,7 @@ mod tests {
                         header::CONTENT_TYPE,
                         format!("multipart/form-data; boundary={boundary}"),
                     )
-                    .body(Body::from(multipart))
+                    .body(Body::from(multipart.clone()))
                     .unwrap(),
             )
             .await
@@ -1249,6 +1192,16 @@ mod tests {
                 .any(|window| window == b"0.3")
         );
 
+        state.persistence.drain_for_test().await;
+        let _writers = tokio::time::timeout(
+            Duration::from_secs(5),
+            state
+                .proxy_archive_stream_permits
+                .acquire_many(crate::PROXY_ARCHIVE_STREAM_CONCURRENCY as u32),
+        )
+        .await
+        .unwrap()
+        .unwrap();
         let refs = state
             .db
             .request_archive_refs(issued.key_id, request_id)
@@ -1265,7 +1218,7 @@ mod tests {
         );
         assert_eq!(
             refs.view.archive_state,
-            crate::model::RequestArchiveState::MetadataOnly
+            crate::model::RequestArchiveState::Bound
         );
         let authenticated = state
             .db
@@ -1315,7 +1268,25 @@ mod tests {
                 .as_deref(),
             Some("second")
         );
-        assert!(refs.request_object.starts_with("metadata-only-json:"));
+        assert!(refs.request_object.starts_with("tenants/"));
+        assert_eq!(
+            state
+                .archive
+                .get(&refs.request_object)
+                .await
+                .unwrap()
+                .as_ref(),
+            multipart.as_slice()
+        );
+        assert_eq!(
+            state
+                .archive
+                .get(refs.response_object.as_deref().unwrap())
+                .await
+                .unwrap()
+                .as_ref(),
+            original_response.as_slice()
+        );
         assert!(!refs.request_object.contains("sensitive prompt"));
         assert!(!refs.request_object.contains("private-name"));
         assert!(

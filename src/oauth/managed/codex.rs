@@ -6,7 +6,7 @@ use std::time::Duration;
 
 #[cfg(test)]
 use crate::network::OutboundScope;
-use crate::oauth::OAuthRefreshRequestGuard;
+use crate::oauth::{OAuthRefreshFailure, OAuthRefreshFailureKind, OAuthRefreshRequestGuard};
 use crate::{error::AppError, network, provider::UpstreamCredential};
 
 pub const TOKEN_ENDPOINT: &str = "https://auth.openai.com/oauth/token";
@@ -72,7 +72,7 @@ async fn refresh_at(
         allow_test_loopback,
     )
     .await
-    .map_err(|_| refresh_failed())?;
+    .map_err(|_| refresh_failure(OAuthRefreshFailureKind::Configuration, None))?;
     let form = url::form_urlencoded::Serializer::new(String::new())
         .append_pair("grant_type", "refresh_token")
         .append_pair("client_id", CLIENT_ID)
@@ -88,20 +88,14 @@ async fn refresh_at(
         )
         .body(form)
         .build()
-        .map_err(|_| refresh_failed())?;
-    request_guard.mark_request_started().await?;
-    let operation = async {
-        let response = client
-            .execute(request)
-            .await
-            .map_err(|_| refresh_failed())?;
-        if !response.status().is_success() {
-            return Err(refresh_failed());
-        }
-        bounded_body(response).await
-    };
-    let body = operation.await?;
-    let response: TokenResponse = serde_json::from_slice(&body).map_err(|_| refresh_failed())?;
+        .map_err(|_| refresh_failure(OAuthRefreshFailureKind::Configuration, None))?;
+    let (status, body) =
+        super::super::refresh_exchange::execute(&client, request, request_guard).await?;
+    if !(200..300).contains(&status) {
+        return Err(super::super::refresh_exchange::rejected(status, &body));
+    }
+    let response: TokenResponse = serde_json::from_slice(&body)
+        .map_err(|_| refresh_failure(OAuthRefreshFailureKind::ResponseDecode, Some(status)))?;
     super::bearer_token(&response.access_token, "OpenAI Codex").map_err(|_| refresh_failed())?;
     if response.refresh_token.as_deref().is_some_and(str::is_empty) {
         return Err(refresh_failed());
@@ -194,16 +188,12 @@ fn invalid_adapter_state() -> AppError {
     AppError::BadRequest("OpenAI Codex OAuth credential has invalid adapter state".into())
 }
 
-async fn bounded_body(response: reqwest::Response) -> Result<Vec<u8>, AppError> {
-    response
-        .bytes()
-        .await
-        .map(|bytes| bytes.to_vec())
-        .map_err(|_| refresh_failed())
+fn refresh_failure(kind: OAuthRefreshFailureKind, status: Option<u16>) -> AppError {
+    AppError::OAuthRefresh(OAuthRefreshFailure::new(kind, status))
 }
 
 fn refresh_failed() -> AppError {
-    AppError::upstream("openai_codex_oauth_refresh_failed")
+    refresh_failure(OAuthRefreshFailureKind::ResponseValidation, Some(200))
 }
 
 #[cfg(test)]
@@ -439,10 +429,7 @@ mod tests {
             .await
             .unwrap_err();
             let rendered = format!("{error:?} {error}");
-            assert_eq!(
-                error.to_string(),
-                "configured upstream is unavailable: openai_codex_oauth_refresh_failed"
-            );
+            assert!(matches!(error, AppError::OAuthRefresh(_)));
             for secret in [
                 "response-body-secret",
                 "delayed-response-secret",

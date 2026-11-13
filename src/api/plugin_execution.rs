@@ -1,4 +1,4 @@
-//! Host-owned diagnostics for bounded component invocation, not delivery or retry authority.
+//! Host-owned component scheduling and diagnostics, not delivery or retry authority.
 use std::{
     sync::{Arc, LazyLock},
     time::Duration,
@@ -59,17 +59,10 @@ where
     T: Send + 'static,
     F: FnOnce() -> Result<T, AppError> + Send + 'static,
 {
-    run_with_limits(
-        phase,
-        work,
-        PERMITS.clone(),
-        Duration::from_secs(1),
-        Duration::from_secs(35),
-        move |event| {
-            metrics.observe_plugin_execution(event.phase, event.outcome);
-            emit_event(event);
-        },
-    )
+    run_with_limits(phase, work, PERMITS.clone(), None, None, move |event| {
+        metrics.observe_plugin_execution(event.phase, event.outcome);
+        emit_event(event);
+    })
     .await
 }
 
@@ -84,8 +77,8 @@ where
         phase,
         work,
         PERMITS.clone(),
-        Duration::from_millis(25),
-        Duration::from_millis(150),
+        Some(Duration::from_millis(25)),
+        Some(Duration::from_millis(150)),
         move |event| {
             metrics.observe_plugin_execution(event.phase, event.outcome);
             emit_event(event);
@@ -98,8 +91,8 @@ async fn run_with_limits<T, F, O>(
     phase: Phase,
     work: F,
     permits: Arc<Semaphore>,
-    capacity_timeout: Duration,
-    execution_timeout: Duration,
+    capacity_timeout: Option<Duration>,
+    execution_timeout: Option<Duration>,
     report: O,
 ) -> Result<T, AppError>
 where
@@ -114,7 +107,7 @@ where
         outcome: Outcome::CallerCancelled,
         report: Some(report),
     };
-    let permit = match tokio::time::timeout(capacity_timeout, permits.acquire_owned()).await {
+    let permit = match wait_for_optional_deadline(capacity_timeout, permits.acquire_owned()).await {
         Err(_) => {
             observation.outcome = Outcome::CapacityTimeout;
             return Err(AppError::upstream_with(
@@ -136,7 +129,7 @@ where
         let _permit = permit;
         tracing::dispatcher::with_default(&dispatch, || span.in_scope(work))
     });
-    match tokio::time::timeout(execution_timeout, task).await {
+    match wait_for_optional_deadline(execution_timeout, task).await {
         Err(_) => {
             observation.outcome = Outcome::ExecutionTimeout;
             Err(AppError::upstream("plugin_execution_timed_out"))
@@ -156,10 +149,58 @@ where
     }
 }
 
+// Request hooks wait for their actual result or caller cancellation. Scheduling
+// hints may still use a deadline because their caller has a built-in fallback.
+async fn wait_for_optional_deadline<F: std::future::Future>(
+    deadline: Option<Duration>,
+    future: F,
+) -> Result<F::Output, tokio::time::error::Elapsed> {
+    match deadline {
+        Some(deadline) => tokio::time::timeout(deadline, future).await,
+        None => Ok(future.await),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use tokio::sync::oneshot;
+
+    #[tokio::test(start_paused = true)]
+    async fn request_hook_waits_past_old_capacity_and_execution_deadlines() {
+        let permits = Arc::new(Semaphore::new(1));
+        let held = permits.clone().acquire_owned().await.unwrap();
+        let (started_tx, started_rx) = oneshot::channel();
+        let (release_tx, release_rx) = std::sync::mpsc::channel();
+        let task = tokio::spawn(run_with_limits(
+            Phase::Prepare,
+            move || {
+                let _ = started_tx.send(());
+                release_rx
+                    .recv_timeout(Duration::from_secs(5))
+                    .expect("test releases blocked hook");
+                Ok(42)
+            },
+            permits.clone(),
+            None,
+            None,
+            |_| {},
+        ));
+        tokio::task::yield_now().await;
+        tokio::time::advance(Duration::from_secs(2)).await;
+        assert!(!task.is_finished(), "capacity contention must wait");
+        drop(held);
+        started_rx.await.unwrap();
+        tokio::time::advance(Duration::from_secs(36)).await;
+        assert!(
+            !task.is_finished(),
+            "an executing hook must retain its result"
+        );
+        assert_eq!(permits.available_permits(), 0);
+        release_tx.send(()).unwrap();
+        assert_eq!(task.await.unwrap().unwrap(), 42);
+        assert_eq!(permits.available_permits(), 1);
+    }
 
     #[tokio::test]
     async fn hook_error_keeps_control_flow_but_reports_only_a_closed_outcome() {
@@ -168,8 +209,8 @@ mod tests {
             Phase::Prepare,
             || Err(AppError::upstream("private_fixture_payload")),
             Arc::new(Semaphore::new(1)),
-            Duration::from_secs(1),
-            Duration::from_secs(35),
+            None,
+            None,
             move |event| {
                 let _ = send.send(event);
             },
@@ -189,8 +230,8 @@ mod tests {
             Phase::PostAuth,
             || -> Result<(), AppError> { panic!("capacity denied hook must not execute") },
             Arc::new(Semaphore::new(0)),
-            Duration::from_secs(1),
-            Duration::from_secs(35),
+            Some(Duration::from_secs(1)),
+            Some(Duration::from_secs(35)),
             move |event| {
                 let _ = send.send(event);
             },
@@ -216,8 +257,8 @@ mod tests {
                 Ok(())
             },
             permits.clone(),
-            Duration::from_secs(1),
-            Duration::from_secs(35),
+            None,
+            None,
             move |event| {
                 let _ = event_tx.send(event);
             },
@@ -244,8 +285,8 @@ mod tests {
             Phase::PostAuth,
             || Ok(false),
             permits.clone(),
-            Duration::from_secs(1),
-            Duration::from_secs(35),
+            None,
+            None,
             move |event| {
                 let _ = send.send(event);
             },
@@ -276,8 +317,8 @@ mod tests {
                 Ok(())
             },
             permits.clone(),
-            Duration::from_secs(1),
-            Duration::ZERO,
+            Some(Duration::from_secs(1)),
+            Some(Duration::ZERO),
             move |event| {
                 let _ = event_tx.send(event);
             },
@@ -310,8 +351,8 @@ mod tests {
             Phase::PostAuth,
             || -> Result<(), AppError> { panic!("closed capacity must not execute") },
             permits,
-            Duration::from_secs(1),
-            Duration::from_secs(35),
+            None,
+            None,
             move |event| {
                 let _ = send.send(event);
             },

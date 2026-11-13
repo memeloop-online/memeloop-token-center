@@ -177,7 +177,7 @@ Then('请求列表的完整筛选和错误下钻均可用', async function (this
   const requestDrawer = page.getByRole('dialog');
   await assertContains(requestDrawer, '429');
   await requestDrawer.getByRole('button', { name: '技术详情', exact: true }).click();
-  await assertContains(requestDrawer, 'upstream rejected the request');
+  await assertContains(requestDrawer, 'mock observable rate limit');
   await requestDrawer.getByRole('button', { name: '关闭', exact: true }).click();
 
   await builder.getByRole('button', { name: '清除', exact: true }).click();
@@ -248,7 +248,8 @@ When('管理员维护统一上游和模型路由', async function (this: Dogfood
   await assertVisible(providerWorkspace);
   assert.equal(await page.locator('.provider-list').isVisible(), false);
   await providerWorkspace.getByRole('button', { name: '近期可用性', exact: true }).click();
-  await providerWorkspace.getByRole('button', { name: '账号设置与授权操作', exact: true }).click();
+  const accountSettings = providerWorkspace.getByRole('region', { name: '账号设置与授权操作', exact: true });
+  await assertVisible(accountSettings);
   const healthPath = `/internal/v1/upstreams/${seed.upstreamId}/health`;
   let manualHealthPosts = 0;
   await page.route((url) => url.pathname === healthPath, async (route) => {
@@ -266,7 +267,7 @@ When('管理员维护统一上游和模型路由', async function (this: Dogfood
       }),
     });
   });
-  await providerWorkspace.getByRole('button', { name: '运行主动健康检查', exact: true }).click();
+  await accountSettings.getByRole('button', { name: '运行主动健康检查', exact: true }).click();
   assert.equal(manualHealthPosts, 1);
   const manualHealth = providerWorkspace.locator('.provider-manual-health');
   await assertContains(manualHealth, '上游限流中');

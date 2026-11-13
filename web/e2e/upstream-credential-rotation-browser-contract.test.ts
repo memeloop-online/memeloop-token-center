@@ -60,7 +60,7 @@ test('rotation explains replacement, uses Fluent controls, restores its parent a
       });
       await page.goto(`${origin}/e2e/fixtures/authorization-code.html?full-page`);
       await page.getByRole('button', { name: copy.details, exact: true }).click();
-      await page.getByRole('button', { name: copy.manage, exact: true }).click();
+      await page.getByRole('region', { name: copy.manage, exact: true }).waitFor();
       const trigger = page.getByRole('button', { name: copy.rotate, exact: true });
       await trigger.focus(); await page.keyboard.press('Enter');
       const form = page.locator('.upstream-credential-rotation');
@@ -77,7 +77,7 @@ test('rotation explains replacement, uses Fluent controls, restores its parent a
         const buttonHeights = await form.locator('.journey-heading .fui-Button, .journey-actions .fui-Button').evaluateAll(buttons => buttons.map(button => button.getBoundingClientRect().height));
         assert.equal(new Set(buttonHeights).size, 1, `heights=${buttonHeights.join(',')} at width=${width}`);
         assert.ok(buttonHeights[0] >= (width <= 600 ? 44 : 40), `rotation close and action buttons share the journey touch target: heights=${buttonHeights.join(',')} at width=${width}`);
-        assert.equal(await form.locator('input[type="password"]').first().inputValue(), '', 'review screenshots contain no entered secret');
+        assert.equal(await form.locator('.secret-input input').first().inputValue(), '', 'review screenshots contain no entered secret');
         const screenshotRoot = fileURLToPath(new URL('../e2e-artifacts/ui-system/account-workspace', import.meta.url));
         await mkdir(screenshotRoot, { recursive: true });
         await page.screenshot({ path: `${screenshotRoot}/credential-rotation-${locale}-${width}.png`, fullPage: true });
@@ -85,13 +85,13 @@ test('rotation explains replacement, uses Fluent controls, restores its parent a
       const selector = form.getByRole('combobox');
       await selector.selectOption({ label: copy.oauth });
       await form.getByLabel(copy.token, { exact: false }).first().waitFor();
-      assert.equal(await form.locator('input[type="password"]').count(), 2);
+      assert.equal(await form.locator('.secret-input input').count(), 2);
       await form.getByLabel(copy.token, { exact: false }).first().fill('synthetic-stale-access-token');
       const expiry = form.getByLabel(copy.expiry, { exact: false });
       assert.equal(await expiry.evaluate(input => input.closest('.fui-Input') !== null && input.getAttribute('type') === 'number'), true, 'expiry uses the shared Fluent number input');
       await expiry.fill('1893456000000');
       await selector.selectOption({ index: 1 });
-      const secret = form.locator('input[type="password"]').first();
+      const secret = form.locator('.secret-input input').first();
       await secret.press('Enter');
       await form.getByRole('alert').filter({ hasText: copy.invalid }).waitFor();
       assert.equal(writes.length, 0);
@@ -129,7 +129,7 @@ test('rotation explains replacement, uses Fluent controls, restores its parent a
       assert.equal(await trigger.isVisible(), true);
       assert.equal(await trigger.evaluate(element => element === document.activeElement), true);
       await trigger.click();
-      assert.equal(await form.locator('input[type="password"]').first().inputValue(), '', 'reopening never retains a submitted secret');
+      assert.equal(await form.locator('.secret-input input').first().inputValue(), '', 'reopening never retains a submitted secret');
       await form.getByRole('button', { name: copy.close }).click();
       assert.equal(await trigger.isVisible(), true);
       await editProviderAccount(page, 'rotation-fixture');

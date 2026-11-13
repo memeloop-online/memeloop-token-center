@@ -1,5 +1,6 @@
 import { createContext, useContext, useEffect, useId, useLayoutEffect, useRef, useState, type ReactNode, type RefObject } from 'react';
-import { Button, Field, FormSection, Input, Label, LoadingProgress, LoadingState, Select } from '../design-system';
+import { Button, DetailTooltip, Field, FormSection, Input, Label, LoadingProgress, LoadingState, Select } from '../design-system';
+import { DrawerFrame } from '../components';
 import { useI18n } from '../i18n';
 import type { UpstreamAccount } from '../types';
 import { useConfirmDialog } from '../useConfirmDialog';
@@ -77,19 +78,6 @@ export function TransportProxyGroups(props: Props & { children: ReactNode; onNav
   </ProxyGroupContext.Provider>;
 }
 
-export function TransportProxyGroupAction({ accountId, disabled = false }: { accountId?: string; disabled?: boolean }) {
-  const context = useContext(ProxyGroupContext);
-  const { locale } = useI18n();
-  const copy = transportProxyGroupCopy(locale);
-  const description = useId();
-  if (!context || !accountId) return null;
-  return <div className="row-actions transport-proxy-management-action">
-    <Button appearance="secondary" type="button" disabled={disabled || !context.allowed} aria-describedby={context.reason ? description : undefined} onClick={() => context.open(accountId)}>{copy.chooseGroup}</Button>
-    {context.reason && <span id={description} className="muted" role="status">{context.reason}</span>}
-    {context.retry && <Button appearance="secondary" type="button" onClick={context.reload}>{copy.retry}</Button>}
-  </div>;
-}
-
 export function TransportProxyGroupFields({ groups, groupId, initialMember, onGroupChange, onMemberChange, disabled = false, emptyLabel }: {
   groups: TransportProxyGroup[]; groupId: string; initialMember: string;
   onGroupChange: (value: string) => void; onMemberChange: (value: string) => void;
@@ -152,7 +140,10 @@ export function ProxyGroupWorkspace({ token, tenant, onChanged, closeRequest }: 
   });
 
   useLayoutEffect(() => {
-    if (busy || error || message) feedback.current?.focus({ preventScroll: true });
+    if (busy || error || message) {
+      feedback.current?.focus({ preventScroll: true });
+      if (editing !== undefined && (error || message)) feedback.current?.scrollIntoView({ block: 'nearest' });
+    }
   }, [busy, error, message]);
 
   useEffect(() => {
@@ -218,7 +209,7 @@ export function ProxyGroupWorkspace({ token, tenant, onChanged, closeRequest }: 
   function editGroup(group: TransportProxyGroup | null) {
     setEditing(group); setName(group?.name ?? ''); setProbeUrl(group?.probe_url ?? ''); setProbeAttempts(String(group?.probe_attempts ?? 2)); setError(''); setMessage('');
     setMembers(group ? group.members.map(member => {
-      const address = member.has_auth ? '' : egressAddress(member, locale);
+      const address = member.proxy_url ?? (member.has_auth ? '' : egressAddress(member, locale));
       return { key: member.id, id: member.id, label: member.label, proxyUrl: address, originalProxyUrl: address };
     }) : [newMember()]);
   }
@@ -228,7 +219,13 @@ export function ProxyGroupWorkspace({ token, tenant, onChanged, closeRequest }: 
   }
 
   async function saveGroup() {
-    if (editing === undefined || !name.trim() || !validMembers || !validProbe) return;
+    if (editing === undefined) return;
+    if (!name.trim() || !validMembers || !validProbe) {
+      setError(copy.errors.invalid);
+      feedback.current?.focus({ preventScroll: true });
+      feedback.current?.scrollIntoView({ block: 'nearest' });
+      return;
+    }
     const body = {
       tenant_external_id: tenant, name: name.trim(),
       ...(editing ? { expected_version: editing.version } : {}),
@@ -256,11 +253,11 @@ export function ProxyGroupWorkspace({ token, tenant, onChanged, closeRequest }: 
         setMessage(''); void refresh();
       }}>{busy ? t('common.loading') : copy.refresh}</Button>
     </div>
-    <div ref={feedback} tabIndex={-1} aria-label={copy.operationStatus}>
+    {editing === undefined && <div ref={feedback} tabIndex={-1} aria-label={copy.operationStatus}>
       <LoadingProgress active={busy} label={t('common.loading')} level={ready ? 'section' : 'page'} />
       {error && <p className="notice error" role="alert">{error}</p>}
       {message && <p className="notice success" role="status">{message}</p>}
-    </div>
+    </div>}
     <fieldset disabled={!ready || busy} style={{ border: 0, padding: 0, minWidth: 0 }}>
       <FormSection title={copy.title} description={copy.groupsHint}>
         <div className="proxy-group-list">
@@ -270,6 +267,8 @@ export function ProxyGroupWorkspace({ token, tenant, onChanged, closeRequest }: 
           <span>{copy.groupSummary(group.name, group.members.length, group.bound_account_count)}</span>
           <ul className="proxy-group-addresses">{group.members.map(member => <li key={member.id}>{member.label} · {egressAddress(member, locale)}</li>)}</ul>
           <Button type="button" disabled={editing !== undefined} onClick={() => editGroup(group)}>{copy.edit(group.name)}</Button>
+          <DetailTooltip content={group.bound_account_count > 0 ? copy.errors.inUse : copy.confirmDelete(group.name)}>
+          <span tabIndex={group.bound_account_count > 0 ? 0 : undefined}>
           <Button type="button" disabled={editing !== undefined || group.bound_account_count > 0} onClick={async () => {
             if (!await confirm(copy.confirmDelete(group.name))) return;
             void mutate(async () => {
@@ -277,22 +276,34 @@ export function ProxyGroupWorkspace({ token, tenant, onChanged, closeRequest }: 
               if (alive.current) setGroups(current => current.filter(value => value.id !== group.id));
             }, copy.deleted);
           }}>{t('common.remove')}</Button>
+          </span></DetailTooltip>
         </div>)}
         </div>
         <Button type="button" disabled={editing !== undefined} onClick={() => editGroup(null)}>{copy.create}</Button>
       </FormSection>
-      {editing !== undefined && <form onSubmit={event => { event.preventDefault(); void saveGroup(); }}>
+    </fieldset>
+      {editing !== undefined && <DrawerFrame title={editing ? copy.edit(editing.name) : copy.create} eyebrow={copy.title}
+        onClose={() => { void requestClose().then(closed => { if (closed) setEditing(undefined); }); }}>
+        <form onSubmit={event => { event.preventDefault(); void saveGroup(); }}>
+        <div ref={feedback} tabIndex={-1} aria-label={copy.operationStatus}>
+        <LoadingProgress active={busy} label={t('common.loading')} level="section" />
+        {error && <p className="notice error" role="alert">{error}</p>}
+        {message && <p className="notice success" role="status">{message}</p>}
+        </div>
+        {!ready && <Button type="button" disabled={busy} onClick={async () => {
+          if (await confirm(copy.refreshDraft)) void refresh();
+        }}>{copy.refresh}</Button>}
+        <fieldset disabled={busy || !ready} style={{ border: 0, padding: 0, minWidth: 0 }}>
         <FormSection title={editing ? copy.edit(editing.name) : copy.create}>
           <Field label={copy.name} required><Input required maxLength={64} value={name} onChange={(_, data) => setName(data.value)} /></Field>
           {members.map((member, index) => {
-            const savedMember = editing?.members.find(saved => saved.id === member.id);
             return <FormSection key={member.key} title={copy.candidate(index + 1)}>
             <Field label={copy.memberName} required><Input required maxLength={64} value={member.label} onChange={(_, data) => updateMember(member.key, { label: data.value })} /></Field>
             <div className="proxy-address-field">
-              <Label htmlFor={`${inputPrefix}-${member.key}`}>{savedMember?.has_auth ? copy.replaceAddress : member.id ? copy.address : copy.requiredAddress}</Label>
+              <Label htmlFor={`${inputPrefix}-${member.key}`}>{member.id ? copy.address : copy.requiredAddress}</Label>
               <ProxyAddressInput id={`${inputPrefix}-${member.key}`} value={member.proxyUrl} disabled={busy || !ready} required={!member.id}
                 onChange={value => updateMember(member.key, { proxyUrl: value })}
-                placeholder={savedMember ? egressAddress(savedMember, locale) : 'socks5h://mihomo.egress.svc:1080'} />
+                placeholder="socks5h://mihomo.egress.svc:1080" />
             </div>
             <div className="button-row">
               <Button type="button" disabled={index === 0} onClick={() => setMembers(current => { const next = [...current]; [next[index - 1], next[index]] = [next[index], next[index - 1]]; return next; })}>{t('common.moveUp')}</Button>
@@ -308,12 +319,12 @@ export function ProxyGroupWorkspace({ token, tenant, onChanged, closeRequest }: 
           <p>{copy.probeHint}</p>
           {editing && editing.last_probe_checked_at ? <p>{copy.lastProbe(editing.last_probe_status ?? '', new Date(editing.last_probe_checked_at).toLocaleString(locale))}</p> : null}
           <div className="button-row">
-            <Button type="submit" appearance="primary" disabled={!name.trim() || !validMembers || !validProbe}>{copy.save}</Button>
+            <Button type="submit" appearance="primary">{copy.save}</Button>
             {editing?.id ? <Button type="button" disabled={busy || !editing?.probe_url} onClick={() => { const groupId = editing?.id; if (!groupId) return; void mutate(async () => { await request(`${transportProxyGroupsPath}/${encodeURIComponent(groupId)}/probe${query}`, { method: 'POST' }); }, copy.probeQueued); }}>{copy.probeNow}</Button> : null}
             <Button type="button" onClick={async () => { if (await confirm(copy.discardEdit)) { setEditing(undefined); setMembers([]); setName(''); setProbeUrl(''); setProbeAttempts('2'); } }}>{copy.cancelEdit}</Button>
           </div>
         </FormSection>
-      </form>}
-    </fieldset>
+        </fieldset>
+      </form></DrawerFrame>}
   </div>;
 }

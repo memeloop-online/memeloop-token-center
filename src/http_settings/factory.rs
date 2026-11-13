@@ -7,6 +7,11 @@ use std::{
 
 use super::{HttpPurpose, HttpSettingsDocument, ValueSource};
 
+#[cfg(test)]
+mod inference_policy_tests;
+#[cfg(all(test, target_os = "linux"))]
+mod tcp_policy_tests;
+
 #[derive(Default)]
 pub struct ClientOptions<'a> {
     pub purpose: Option<HttpPurpose>,
@@ -14,6 +19,8 @@ pub struct ClientOptions<'a> {
     pub proxy_auth: Option<(&'a str, &'a str)>,
     pub pins: &'a [(&'a str, &'a [SocketAddr])],
     pub no_retry: bool,
+    /// Inference lasts until completion, caller cancellation or a transport error.
+    pub inference: bool,
 }
 
 #[derive(Eq, PartialEq)]
@@ -23,6 +30,7 @@ struct ClientKey {
     proxy_auth: Option<(String, String)>,
     pins: Vec<(String, Vec<SocketAddr>)>,
     no_retry: bool,
+    inference: bool,
 }
 
 pub(crate) struct HttpSnapshot {
@@ -47,6 +55,16 @@ impl HttpSnapshot {
         purpose: HttpPurpose,
         connect_timeout_ms: Option<u64>,
         read_timeout_ms: Option<u64>,
+    ) -> reqwest::ClientBuilder {
+        self.builder_for_request(purpose, connect_timeout_ms, read_timeout_ms, false)
+    }
+
+    fn builder_for_request(
+        &self,
+        purpose: HttpPurpose,
+        connect_timeout_ms: Option<u64>,
+        read_timeout_ms: Option<u64>,
+        inference: bool,
     ) -> reqwest::ClientBuilder {
         crate::simple_http::install_ring_provider();
         let effective = self.document.settings.effective(purpose);
@@ -76,13 +94,22 @@ impl HttpSnapshot {
             .tcp_keepalive(codex.then_some(Duration::from_secs(60)))
             .tcp_keepalive_interval(codex.then_some(Duration::from_secs(30)))
             .tcp_keepalive_retries(codex.then_some(3));
+        // Reqwest 0.13.4 otherwise installs TCP_USER_TIMEOUT=30s on Linux.
+        // Let the OS handle unacknowledged TCP data rather than silently
+        // shortening the operator's HTTP deadline during a network outage.
+        // Explicit HTTP deadlines, caller cancellation and Codex keepalive
+        // still reclaim requests/connections; None does not disable OS retries.
+        #[cfg(any(target_os = "android", target_os = "fuchsia", target_os = "linux"))]
+        {
+            builder = builder.tcp_user_timeout(None);
+        }
         if let Some(timeout) = connect_timeout_ms {
             builder = builder.connect_timeout(Duration::from_millis(timeout));
         }
         if let Some(timeout) = read_timeout_ms {
             builder = builder.read_timeout(Duration::from_millis(timeout));
         }
-        if let Some(timeout) = effective.request_timeout_ms.value {
+        if !inference && let Some(timeout) = effective.request_timeout_ms.value {
             builder = builder.timeout(Duration::from_millis(timeout));
         }
         builder
@@ -113,6 +140,7 @@ impl HttpSnapshot {
                 .map(|(user, password)| (user.to_owned(), password.to_owned())),
             pins,
             no_retry: options.no_retry,
+            inference: options.inference,
         };
         let mut clients = self
             .clients
@@ -124,7 +152,7 @@ impl HttpSnapshot {
             clients.push_back(entry);
             return Ok(client);
         }
-        let mut builder = self.builder(purpose);
+        let mut builder = self.builder_for_request(purpose, None, None, options.inference);
         if options.no_retry {
             builder = builder.retry(reqwest::retry::never());
         }
@@ -209,7 +237,7 @@ impl HttpClientSource for HttpClient {
 
 impl HttpClientSource for reqwest::Client {
     fn http_client(&self, options: ClientOptions<'_>) -> Result<reqwest::Client, reqwest::Error> {
-        if options.proxy_url.is_none() && options.pins.is_empty() {
+        if options.proxy_url.is_none() && options.pins.is_empty() && !options.inference {
             return Ok(self.clone());
         }
         HttpClient::default().http_client(options)
@@ -232,6 +260,24 @@ impl HttpClientSource for ScopedClient<'_> {
     ) -> Result<reqwest::Client, reqwest::Error> {
         options.purpose = Some(self.purpose);
         self.source.http_client(options)
+    }
+}
+
+/// Override only the total lifetime, while preserving endpoint validation,
+/// purpose, proxy, DNS pins, connection/read policy and the no-retry contract.
+pub(crate) struct InferenceClient<'a>(&'a dyn HttpClientSource);
+
+pub(crate) fn inference(source: &dyn HttpClientSource) -> InferenceClient<'_> {
+    InferenceClient(source)
+}
+
+impl HttpClientSource for InferenceClient<'_> {
+    fn http_client(
+        &self,
+        mut options: ClientOptions<'_>,
+    ) -> Result<reqwest::Client, reqwest::Error> {
+        options.inference = true;
+        self.0.http_client(options)
     }
 }
 

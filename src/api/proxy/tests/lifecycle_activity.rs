@@ -50,7 +50,6 @@ async fn sixty_five_small_streams_keep_activity_and_settle_once() {
         )
         .await
         .unwrap();
-    assert_eq!(fixture.state.config.proxy_lifecycle_concurrency, 64);
     let mut streams = Vec::new();
     for expected in 1..=65 {
         let response = tokio::time::timeout(
@@ -66,6 +65,19 @@ async fn sixty_five_small_streams_keep_activity_and_settle_once() {
         streams.push((response.into_body(), receivers.recv().await.unwrap()));
         assert_eq!(fixture.state.proxy_lifecycles.active(), expected);
     }
+    assert_eq!(
+        fixture
+            .state
+            .proxy_archive_stream_permits
+            .available_permits(),
+        crate::PROXY_ARCHIVE_STREAM_CONCURRENCY,
+        "silent response headers must not occupy body writers"
+    );
+    assert_eq!(
+        fixture.state.persistence.pending_archives_for_test(),
+        65,
+        "every accepted response must remain owned before its first body chunk"
+    );
     let (used, limit, _, _) = fixture.state.proxy_memory_budget.snapshot();
     assert!(used < limit);
     let service = fixture

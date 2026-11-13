@@ -85,7 +85,7 @@ export interface RequestListResponse {
 }
 
 export type TypedFilterField = 'created_at' | 'key_id' | 'model' | 'protocol' | 'status' | 'error_code'
-  | 'upstream_account_id' | 'route_id' | 'duration_ms' | 'cost_micros' | 'key_alias' | 'principal' | 'session_association';
+  | 'upstream_account_id' | 'route_id' | 'duration_ms' | 'cost_micros' | 'key_alias' | 'principal' | 'session_association' | 'session_id' | 'client_session_id';
 export type TypedFilterOperator = 'equals' | 'not_equals' | 'contains' | 'greater_than'
   | 'greater_than_or_equal' | 'less_than' | 'less_than_or_equal' | 'between';
 export type TypedFilterValue =
@@ -126,7 +126,7 @@ export interface RequestDetail extends RequestView {
   request_body: unknown;
   response_body: unknown;
   archive_complete: boolean;
-  archive?: Record<'request' | 'response', { state: RequestArchiveState; complete: boolean; reason: string | null }>;
+  archive?: Record<'request' | 'response', { state: RequestArchiveState; complete: boolean; reason: string | null; preview?: { kind: 'stream'; bytes: number } }>;
   provenance?: {
     source: string;
     disposition: 'exact' | 'unlinked';
@@ -1106,6 +1106,7 @@ export interface PluginConfiguration {
 }
 
 export interface UpstreamAccount {
+  oauth_refresh?: import('./operator/providerAccountState.js').OAuthRefreshStatus | null;
   can_update_transport_proxy?: boolean;
   has_proxy?: boolean;
   proxy_scheme?: 'socks5' | 'socks5h' | null;

@@ -7,7 +7,7 @@ pub(super) mod quota;
 #[path = "codex/retry.rs"]
 mod retry;
 #[path = "codex/send_diagnostics.rs"]
-mod send_diagnostics;
+pub(in crate::api::proxy) mod send_diagnostics;
 #[cfg(test)]
 #[path = "codex/wire_contract_tests.rs"]
 mod wire_contract_tests;
@@ -243,6 +243,7 @@ pub(super) async fn send_proxy_route(
         }
         if !response.status().is_success() {
             return Ok(ProxyRouteResponse {
+                preoutput_quota: None,
                 egress_selection,
                 response,
                 upstream_activity,
@@ -259,7 +260,18 @@ pub(super) async fn send_proxy_route(
         .await
         {
             Ok(response) => {
+                let (response, preoutput_quota) = if route.inspect_stream_rejection {
+                    super::classify_stream_quota(
+                        response,
+                        transport_policy.sse_framing_limits,
+                        &state.proxy_memory_budget,
+                    )
+                    .await
+                } else {
+                    (response, None)
+                };
                 return Ok(ProxyRouteResponse {
+                    preoutput_quota,
                     egress_selection,
                     response,
                     upstream_activity,

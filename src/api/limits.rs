@@ -42,8 +42,6 @@ pub(super) const MAX_SSE_METADATA_ITEMS_PER_NETWORK_CHUNK: usize = 16 * 1024;
 #[cfg(test)]
 pub(super) const MAX_RESPONSES_SSE_TERMINAL_HOLD_BYTES: usize =
     crate::provider::SseFramingLimits::DEFAULT_TERMINAL_HOLD_BYTES;
-pub(super) const SYNCHRONOUS_IMAGE_DEADLINE: Duration = Duration::from_secs(12 * 60);
-pub(super) const SYNCHRONOUS_AUDIO_DEADLINE: Duration = Duration::from_secs(10 * 60);
 pub(super) const CLOUD_WEBHOOK_BODY_READ_DEADLINE: Duration = Duration::from_secs(10);
 pub(super) const MAX_CLOUD_WEBHOOK_BODY: usize = 64 * 1024;
 pub(super) const CONTROL_IN_FLIGHT_REQUESTS: usize = 16;

@@ -9,13 +9,23 @@ pub(in crate::api::proxy) enum FailoverDisposition {
     ConnectionNotDelivered,
     RateLimitRejected,
     QuotaRejected,
+    ModelRejected,
     Stop,
 }
 
 impl FailoverDisposition {
+    pub(in crate::api::proxy) fn is_definite_rejection(&self) -> bool {
+        matches!(
+            self,
+            Self::RateLimitRejected | Self::QuotaRejected | Self::ModelRejected
+        )
+    }
+
     pub(in crate::api::proxy) fn reason(&self) -> Option<UpstreamHealthReason> {
         match self {
-            Self::CandidateNotDispatched => Some(UpstreamHealthReason::Unavailable),
+            Self::CandidateNotDispatched | Self::ModelRejected => {
+                Some(UpstreamHealthReason::Unavailable)
+            }
             Self::ConnectionNotDelivered => Some(UpstreamHealthReason::Connection),
             Self::RateLimitRejected | Self::QuotaRejected => {
                 Some(UpstreamHealthReason::RateLimited)
@@ -30,6 +40,7 @@ impl FailoverDisposition {
             Self::ConnectionNotDelivered => "connection_not_delivered",
             Self::RateLimitRejected => "rate_limit_rejected",
             Self::QuotaRejected => "quota_rejected",
+            Self::ModelRejected => "model_rejected_before_execution",
             Self::Stop => "no_replay_evidence",
         }
     }
@@ -49,17 +60,24 @@ pub(in crate::api::proxy) fn failover_disposition(
             FailoverDisposition::ConnectionNotDelivered
         }
         (Some(StatusCode::TOO_MANY_REQUESTS), None) => FailoverDisposition::RateLimitRejected,
-        (Some(StatusCode::FORBIDDEN), None)
-            if matches!(
-                quota_failure,
-                Some(UpstreamFailureKind::RateLimitedUntil {
-                    exhausted: true,
-                    ..
-                })
-            ) =>
-        {
-            FailoverDisposition::QuotaRejected
-        }
+        (Some(status), None) if status.is_success() => match quota_failure {
+            Some(UpstreamFailureKind::RateLimitedUntil {
+                exhausted: true, ..
+            }) => FailoverDisposition::QuotaRejected,
+            Some(
+                UpstreamFailureKind::RateLimited | UpstreamFailureKind::RateLimitedUntil { .. },
+            ) => FailoverDisposition::RateLimitRejected,
+            _ => FailoverDisposition::Stop,
+        },
+        (Some(StatusCode::FORBIDDEN), None) => match quota_failure {
+            Some(UpstreamFailureKind::RateLimitedUntil {
+                exhausted: true, ..
+            }) => FailoverDisposition::QuotaRejected,
+            Some(
+                UpstreamFailureKind::RateLimited | UpstreamFailureKind::RateLimitedUntil { .. },
+            ) => FailoverDisposition::RateLimitRejected,
+            _ => FailoverDisposition::Stop,
+        },
         _ => FailoverDisposition::Stop,
     }
 }
@@ -121,13 +139,15 @@ fn classify_response_failure(
     rate_limit: Option<UpstreamFailureKind>,
 ) -> Option<(UpstreamFailureKind, UpstreamHealthReason)> {
     match status {
+        status if status.is_success() => {
+            rate_limit.map(|kind| (kind, UpstreamHealthReason::RateLimited))
+        }
         StatusCode::FORBIDDEN
             if matches!(
                 rate_limit,
-                Some(UpstreamFailureKind::RateLimitedUntil {
-                    exhausted: true,
-                    ..
-                })
+                Some(
+                    UpstreamFailureKind::RateLimited | UpstreamFailureKind::RateLimitedUntil { .. }
+                )
             ) =>
         {
             Some((rate_limit.unwrap(), UpstreamHealthReason::RateLimited))
@@ -153,6 +173,33 @@ mod tests {
     use super::*;
 
     #[test]
+    fn stream_quota_evidence_is_distinct_from_http_success_and_authentication() {
+        for (kind, expected) in [
+            (None, FailoverDisposition::Stop),
+            (
+                Some(UpstreamFailureKind::Authentication),
+                FailoverDisposition::Stop,
+            ),
+            (
+                Some(UpstreamFailureKind::RateLimited),
+                FailoverDisposition::RateLimitRejected,
+            ),
+            (
+                Some(UpstreamFailureKind::RateLimitedUntil {
+                    exhausted: true,
+                    until: 0,
+                }),
+                FailoverDisposition::QuotaRejected,
+            ),
+        ] {
+            assert_eq!(
+                failover_disposition(Some(StatusCode::OK), None, kind),
+                expected
+            );
+        }
+    }
+
+    #[test]
     fn authentication_is_hard_health_evidence_but_never_replay_permission() {
         for status in [StatusCode::UNAUTHORIZED, StatusCode::FORBIDDEN] {
             assert!(matches!(
@@ -172,7 +219,7 @@ mod tests {
     }
 
     #[test]
-    fn only_classified403_quota_rejection_grants_quota_failover() {
+    fn only_classified403_capacity_rejection_grants_failover() {
         let kind = UpstreamFailureKind::RateLimitedUntil {
             exhausted: true,
             until: 0,
@@ -186,11 +233,7 @@ mod tests {
             failover_disposition(Some(StatusCode::FORBIDDEN), None, quota),
             FailoverDisposition::QuotaRejected
         );
-        for status in [
-            StatusCode::OK,
-            StatusCode::UNAUTHORIZED,
-            StatusCode::SERVICE_UNAVAILABLE,
-        ] {
+        for status in [StatusCode::UNAUTHORIZED, StatusCode::SERVICE_UNAVAILABLE] {
             assert_eq!(
                 failover_disposition(Some(status), None, quota),
                 FailoverDisposition::Stop
@@ -205,7 +248,17 @@ mod tests {
                     until: i64::MAX
                 }),
             ),
-            FailoverDisposition::Stop
+            FailoverDisposition::RateLimitRejected
+        );
+        assert_eq!(
+            classify_response_failure(
+                StatusCode::FORBIDDEN,
+                Some(UpstreamFailureKind::RateLimited)
+            ),
+            Some((
+                UpstreamFailureKind::RateLimited,
+                UpstreamHealthReason::RateLimited
+            ))
         );
     }
 

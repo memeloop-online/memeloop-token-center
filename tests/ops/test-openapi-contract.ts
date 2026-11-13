@@ -612,3 +612,19 @@ test("request execution completion remains distinct from unknown financial settl
   assert.deepEqual(diagnostic.properties.stage.enum,
     ["pre_admission", ...terminal.properties.stage.enum]);
 });
+
+
+test("operator Responses declares SSE without relaxing other inference transports", () => {
+  const document = cloneDocument();
+  const responses = document.paths["/internal/v1/inference/responses"].post;
+  assert.deepEqual(responses.requestBody.content["application/json"].schema.properties.request.properties.stream, { type: "boolean" });
+  assert.ok(responses.responses["200"].content["application/json"]);
+  assert.deepEqual(responses.responses["200"].content["text/event-stream"].schema, { type: "string" });
+  assert.deepEqual(responses.security, [{ serviceBearer: [] }]);
+  assert.equal(responses["x-required-scope"], "keys:write");
+  for (const path of ["/internal/v1/inference/chat/completions", "/internal/v1/inference/messages"]) {
+    const operation = document.paths[path].post;
+    assert.deepEqual(operation.requestBody.content["application/json"].schema.properties.request.properties.stream, { type: "boolean", const: false });
+    assert.equal(operation.responses["200"].content["text/event-stream"], undefined);
+  }
+});

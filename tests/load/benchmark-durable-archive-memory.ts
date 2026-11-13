@@ -70,21 +70,45 @@ export function assertUnknownFinancialEvidence(row: Record<string, unknown>, rec
   for (const [field, column] of Object.entries({ status_code: "operational_status", error_code: "operational_error", completed_at: "operational_completed", stage: "operational_stage", response_object: "operational_response_object" })) {
     assert(operational[field] === row[column], `operational ACK must match owned receipt: ${field}`);
   }
-  assert(receipt.response_object === `inline-json:${SAFE_UPSTREAM_ERROR}` && operational.response_object === receipt.response_object, "failed response archive must contain only the safe local error");
+  assert(receipt.response_object === `gap://${row.request_id}/response`
+    && operational.response_object === receipt.response_object,
+    "unknown receipt must retain its raw response handoff without fabricating a local error body");
   return 0;
 }
 
 export function assertUnknownArchiveEvidence(row: Record<string, unknown>, archive: string): Record<string, unknown> {
-  assert(typeof row.request_id === "string" && /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/u.test(row.request_id), "request source must have a canonical request identity");
-  const locator = `staging/proxy/${row.request_id}/request/${row.request_id}/body.json`;
-  assert(row.spool_state === "bound" && row.request_object === locator && row.bound_locator === locator, "unknown request archive must remain durable at its exact request-bound source locator");
+  const uuid = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/u;
+  assert(typeof row.request_id === "string" && uuid.test(row.request_id), "request source must have a canonical request identity");
+  assert(typeof row.tenant_id === "string" && uuid.test(row.tenant_id), "request source must have a canonical tenant identity");
+  const staged = `staging/proxy/${row.request_id}/request/${row.request_id}/body.json`;
+  assert(row.spool_state === "bound" && row.bound_locator === staged,
+    "unknown request source must remain durable with its exact request-bound source locator");
   assert(row.body_byte_count === 512, "durable request source must retain its exact 512 byte length");
-  assert(typeof row.body_blake3 === "string" && /^[0-9a-f]{64}$/u.test(row.body_blake3) && row.body_blake3 !== "0".repeat(64) && row.body_blake3 === row.source_intent_digest, "durable request source must retain its staging digest");
-  assert(row.spool_cipher_bytes === 0 && row.spool_plain_bytes === 0 && row.chunk_count === 0, "bound request source must have zero encrypted spool accounting");
-  const body = readFileSync(join(archive, locator));
-  const sha256 = createHash("sha256").update(body).digest("hex");
-  assert(body.length === 512 && sha256 === planHash(inputPlan(512)), "durable source object must contain the exact original request bytes/hash");
-  return { locator, bytes: body.length, blake3: row.body_blake3, sha256 };
+  assert(typeof row.body_blake3 === "string" && /^[0-9a-f]{64}$/u.test(row.body_blake3)
+    && row.body_blake3 !== "0".repeat(64) && row.body_blake3 === row.source_intent_digest,
+    "durable request source must retain its staging digest");
+  assert(row.spool_cipher_bytes === 0 && row.spool_plain_bytes === 0 && row.chunk_count === 0,
+    "bound request source must have zero encrypted spool accounting");
+  const original = (side: "request" | "response", expected: Buffer) => {
+    const root = JSON.parse(readFileSync(join(archive, `tenants/${row.tenant_id}/raw/v1/${row.request_id}/${side}.json`), "utf8"));
+    assert(typeof root.blake3_digest === "string" && /^[0-9a-f]{64}$/u.test(root.blake3_digest), "raw root requires a valid digest");
+    const locator = `tenants/${row.tenant_id}/cas/v1/blake3/${root.blake3_digest.slice(0, 2)}/${root.blake3_digest}`;
+    assert(root.object_locator === locator, "raw root must reference exact tenant CAS");
+    const body = readFileSync(join(archive, locator));
+    const sha256 = createHash("sha256").update(body).digest("hex");
+    assert(root.size_bytes === body.length && body.equals(expected), `raw ${side} CAS must contain exact original ${side} bytes/hash`);
+    return { locator, bytes: body.length, blake3: root.blake3_digest, sha256 };
+  };
+  const request = inputPlan(512);
+  const body = Buffer.concat([...pieces(request)]);
+  const captured = original("request", body);
+  assert(row.request_object === captured.locator && captured.blake3 === row.body_blake3,
+    "unknown request must retain its exact CAS locator and source digest");
+  // This fixture deliberately declares 16 bytes for a larger supplier JSON.
+  // Preserve only the bytes HTTP actually exposed. Keep this incomplete
+  // supplier document distinct from the safe local delivery error.
+  const response = original("response", Buffer.concat([...pieces(outputPlan(512))]).subarray(0, 16));
+  return { ...captured, response, complete_training_fidelity_certified: false };
 }
 
 export function assertUnknownSemanticEvidence(row: Record<string, unknown>, previous?: Record<string, unknown>): Record<string, unknown> {
@@ -393,12 +417,32 @@ export async function run(binary: string, output: string): Promise<boolean> {
   let underdeclaredResponse = false;
   let responseGate: ReturnType<typeof gate> | undefined;
   let upstreamCalls = 0;
+  const upstreamBodies: { bytes: number; sha256: string; input_value_sha256?: string; input_value_bytes?: number; fields_valid?: boolean }[] = [];
+  let inspectLargeInput = false;
   const mock = createServer(async (req, res) => {
     try {
       if (req.method === "GET") { res.end("{}"); return; }
       if (!["/v1/chat/completions", "/v1/responses"].includes(req.url ?? "")) { res.writeHead(404); res.end(); return; }
       upstreamCalls += 1;
-      for await (const _ of req) { /* real upstream consumes the forwarded body */ }
+      const inspectInput = inspectLargeInput;
+      // Only the mock (excluded from service RSS) parses the large test input.
+      const chunks: Buffer[] = [];
+      const requestHash = createHash("sha256");
+      let requestBytes = 0;
+      for await (const chunk of req) {
+        if (inspectInput) chunks.push(chunk);
+        requestBytes += chunk.length;
+        requestHash.update(chunk);
+      }
+      const parsed = inspectInput ? JSON.parse(Buffer.concat(chunks).toString("utf8")) : undefined;
+      upstreamBodies.push({
+        bytes: requestBytes, sha256: requestHash.digest("hex"),
+        ...(inspectInput ? {
+          input_value_sha256: typeof parsed.input === "string" ? createHash("sha256").update(parsed.input).digest("hex") : "",
+          input_value_bytes: typeof parsed.input === "string" ? Buffer.byteLength(parsed.input) : -1,
+          fields_valid: Object.keys(parsed).sort().join(",") === "input,max_output_tokens,model,stream" && parsed.model === "benchmark-text" && parsed.max_output_tokens === 1 && parsed.stream === false,
+        } : {}),
+      });
       if (responseGate) await responseGate.promise;
       if (underdeclaredResponse) {
         // Real HTTP framing exposes only the declared JSON prefix to reqwest;
@@ -435,7 +479,7 @@ export async function run(binary: string, output: string): Promise<boolean> {
       MTC_ARCHIVE_BACKEND: "filesystem", MTC_ARCHIVE_PATH: archive,
       MTC_RESPONSES_REQUEST_SPOOL_PATH: requestSpool,
       MTC_ALLOW_OAUTH_LOOPBACK: "true", MTC_RUN_MIGRATIONS_ON_START: "false",
-      MTC_PROXY_MEMORY_BUDGET_BYTES: String(256 * MIB), MTC_RESPONSES_BODY_MAX_BYTES: String(16 * MIB),
+      MTC_PROXY_MEMORY_BUDGET_BYTES: String(256 * MIB),
       MTC_PRICING_MODELS_DEV_URL: `${mockUrl}/catalog`, MTC_PRICING_LITELLM_URL: `${mockUrl}/catalog`,
       MTC_PRICING_OPENROUTER_URL: `${mockUrl}/catalog`, RUST_LOG: "warn",
     });
@@ -649,10 +693,11 @@ export async function run(binary: string, output: string): Promise<boolean> {
       try { await deadline(Promise.all(clients.map((client) => client.uploaded)), 30_000, "concurrent upload boundaries"); }
       finally { responseGate.release(); responseGate = undefined; }
       const results = await Promise.all(clients.map((client) => client.result));
-      assert(results.every((item) => item.status === 200 || (item.status === 503 && Number(item.retryAfter) >= 1)), "pressure may fail closed only with 503 and Retry-After");
+      // Preserve actual statuses and byte hashes even if the assertion fails.
+      report.phases.at(-1).result = { results };
+      assert(results.every((item) => item.status === 200 && item.bytes === current.bytes && item.sha256 === planHash(current)), "all four concurrent 16MiB requests must complete with exact response bytes/hash");
       assert(upstreamCalls - callsBefore === results.filter((item) => item.status === 200).length, "rejected pressure requests must not dispatch upstream");
-      // Admission winners depend on scheduling; even an all-503 pressure batch
-      // is valid. Require deterministic real work after every owner drains.
+      // Require deterministic real work after every owner drains.
       await drain();
       const recovery = await send(base, key, responsesInputPlan(16 * MIB)).result;
       assert(recovery.status === 200 && recovery.bytes === current.bytes && recovery.sha256 === planHash(current), "single 16MiB recovery must succeed with exact response bytes");
@@ -666,13 +711,27 @@ export async function run(binary: string, output: string): Promise<boolean> {
       chunkedResponse = false;
       return result;
     });
-    await phase("64MiB-input-default-policy-rejection", async () => {
-      current = outputPlan(512);
+    await phase("64MiB-input-local-spool-complete", async () => {
+      current = responsesOutputPlan(512);
       const before = upstreamCalls;
-      const result = await send(base, key, responsesInputPlan(64 * MIB), { expectContinue: true }).result;
-      assert([413, 503].includes(result.status) && upstreamCalls === before, "default 16MiB ingress boundary must reject 64MiB before upstream");
-      if (result.status === 503) assert(Number(result.retryAfter) >= 1, "503 requires Retry-After");
-      return result;
+      const observedBefore = upstreamBodies.length;
+      const input = responsesInputPlan(64 * MIB);
+      const inputHash = createHash("sha256");
+      const fill = Buffer.alloc(64 * 1024, "x");
+      for (let remaining = input.fillBytes; remaining > 0; remaining -= Math.min(remaining, fill.length)) {
+        inputHash.update(fill.subarray(0, Math.min(remaining, fill.length)));
+      }
+      const expectedInputHash = inputHash.digest("hex");
+      inspectLargeInput = true;
+      const result = await send(base, key, input).result.finally(() => { inspectLargeInput = false; });
+      const observations = upstreamBodies.slice(observedBefore);
+      const evidence = { ...result, expected_input_value_sha256: expectedInputHash, upstream_bodies: observations };
+      report.phases.at(-1).result = evidence;
+      assert(result.status === 200 && result.bytes === current.bytes && result.sha256 === planHash(current), "64MiB spooled input must complete with exact response bytes/hash");
+      const observed = observations[0];
+      assert(upstreamCalls === before + 1 && observations.length === 1 && observed !== undefined && observed.bytes === input.bytes, "64MiB input must reach upstream completely and exactly once");
+      assert(observed.fields_valid && observed.input_value_bytes === input.fillBytes && observed.input_value_sha256 === expectedInputHash, "64MiB upstream input content and metadata must match exactly, independent of JSON field order");
+      return evidence;
     });
     await phase("encoded-body-rejected-without-dispatch", async () => {
       const before = upstreamCalls;
@@ -746,7 +805,7 @@ export async function run(binary: string, output: string): Promise<boolean> {
     await stop(service);
     const replayLog = `${output}.replay.log`;
     writeFileSync(replayLog, "");
-    service = spawn(binary, ["serve", "--role", "all"], { env, stdio: ["ignore", "pipe", "pipe"] });
+    service = spawn(binary, ["serve", "--role", "all"], { env: { ...env, RUST_LOG: "warn,memeloop_token_center::proxy_lifecycle::pending_terminal=info" }, stdio: ["ignore", "pipe", "pipe"] });
     service.once("error", (error) => { sampleFailure = error; });
     service.stdout?.on("data", (chunk: Buffer) => writeFileSync(replayLog, chunk, { flag: "a" }));
     service.stderr?.on("data", (chunk: Buffer) => writeFileSync(replayLog, chunk, { flag: "a" }));
@@ -755,7 +814,10 @@ export async function run(binary: string, output: string): Promise<boolean> {
         assert(!sampleFailure && service!.exitCode === null, "service exited during unknown receipt replay");
         const replayed = readFileSync(replayLog, "utf8").split("\n").some((line) => {
           let entry; try { entry = JSON.parse(line); } catch { return false; }
-          return entry.fields?.message === "terminal lacks authoritative provider usage; receipt retained without zero-usage settlement"
+          // This structured transition is emitted by a real settlement attempt
+          // in this new process, not merely by finding an existing receipt.
+          return entry.target === "memeloop_token_center::proxy_lifecycle::pending_terminal"
+            && entry.fields?.financial_state === "awaiting_evidence"
             && entry.fields?.request_id === beforeReplay.request_id && entry.fields?.receipt_id === beforeReplay.receipt_id;
         });
         if (replayed) break;

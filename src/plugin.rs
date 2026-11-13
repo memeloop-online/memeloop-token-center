@@ -562,7 +562,7 @@ pub struct PreparedProviderRequest {
     pub body: Vec<u8>,
 }
 
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Debug)]
 pub struct NormalizedProviderResponse {
     pub status: u16,
     pub headers: BTreeMap<String, String>,
@@ -570,6 +570,9 @@ pub struct NormalizedProviderResponse {
     pub input_tokens: u64,
     pub output_tokens: u64,
     pub estimated: bool,
+    // Gateway-owned envelope, retained across blocking-task completion and
+    // transferred back without releasing/reacquiring global capacity.
+    pub(crate) input_memory: Option<crate::gateway_body::memory::BufferedResponsePermit>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -1615,6 +1618,7 @@ impl PluginRuntime {
             input_tokens: envelope.usage.input_tokens,
             output_tokens: envelope.usage.output_tokens,
             estimated: envelope.usage.estimated,
+            input_memory: None,
         }))
     }
 

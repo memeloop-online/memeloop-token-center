@@ -48,6 +48,11 @@ struct Cli {
 
 #[derive(Debug, Subcommand)]
 enum Command {
+    /// Publish or reclaim disposable RustFS cache copies without opening SQL.
+    ArchiveCache {
+        #[command(subcommand)]
+        command: memeloop_token_center::archive::cache_command::CacheCommand,
+    },
     Serve {
         #[arg(long, value_enum, default_value_t)]
         role: RuntimeRole,
@@ -107,6 +112,9 @@ enum Command {
         /// Reader roles validate the file without creating it.
         #[arg(long)]
         read_only: bool,
+        /// Leave optional inventory recovery to the running application.
+        #[arg(long)]
+        allow_unavailable: bool,
     },
     /// Internal release-package check for the installer, runtime library path,
     /// and Cosign companion. It performs no registry or database access.
@@ -147,13 +155,19 @@ async fn main() -> ExitCode {
 
 async fn run() -> Result<(), &'static str> {
     let cli = Cli::parse();
+    if let Command::ArchiveCache { command } = cli.command {
+        return memeloop_token_center::archive::cache_command::run(command)
+            .await
+            .map_err(|_| "archive_cache_operation_failed");
+    }
     #[cfg(feature = "experimental-plugin-revisions")]
     if let Command::PreparePluginInventory {
         directory,
         read_only,
+        allow_unavailable,
     } = &cli.command
     {
-        return if *read_only {
+        let prepared = if *read_only {
             memeloop_token_center::plugin::application::prepare::check_inventory_directory(
                 directory,
             )
@@ -161,8 +175,12 @@ async fn run() -> Result<(), &'static str> {
             memeloop_token_center::plugin::application::prepare::prepare_inventory_directory(
                 directory,
             )
+        };
+        if prepared.is_err() && *allow_unavailable {
+            eprintln!("plugin inventory unavailable; application will report status and retry");
+            return Ok(());
         }
-        .map_err(|_| "plugin_inventory_preparation_failed");
+        return prepared.map_err(|_| "plugin_inventory_preparation_failed");
     }
     #[cfg(all(
         feature = "experimental-plugin-revisions",
@@ -176,6 +194,7 @@ async fn run() -> Result<(), &'static str> {
     let config = Config::from_env().map_err(|_| "configuration_invalid")?;
 
     match cli.command {
+        Command::ArchiveCache { .. } => unreachable!("handled before database configuration"),
         Command::RequestHistory { command } => {
             let result =
                 memeloop_token_center::request_history::migration::command(&config, command)

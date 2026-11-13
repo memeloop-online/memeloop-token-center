@@ -43,6 +43,8 @@ mod cloud_entitlements;
 mod logical_sessions;
 #[path = "steps/security_acceptance.rs"]
 mod security_acceptance;
+#[path = "steps/tkmarket_seedance.rs"]
+mod tkmarket_seedance;
 #[path = "steps/wasu_wan.rs"]
 mod wasu_wan;
 
@@ -282,60 +284,41 @@ async fn wait_for_bound_proxy_archives(world: &TokenCenterWorld, request_ids: &[
         !request_ids.is_empty(),
         "archive barrier requires a request"
     );
-    let response = world
-        .client
-        .get(format!(
-            "{}/internal/v1/request-events?after_event_at=0",
-            world.service_url
-        ))
-        .bearer_auth("test-service-token")
-        .send()
-        .await
-        .expect("proxy archive event stream");
-    assert_eq!(response.status(), StatusCode::OK);
-
-    let mut pending = request_ids.to_vec();
-    let mut stream = response.bytes_stream();
+    let token = if world.matrix_global_service_token.is_empty() {
+        "test-service-token"
+    } else {
+        &world.matrix_global_service_token
+    };
+    // A raw root may bind before terminal completion, so its archive event can
+    // precede the finished event. Verify durable completed references through
+    // the authorized detail API rather than depending on event arrival order.
     tokio::time::timeout(Duration::from_secs(5), async {
-        let mut buffered = String::new();
-        while let Some(chunk) = stream.next().await {
-            buffered.push_str(&String::from_utf8_lossy(
-                &chunk.expect("proxy archive SSE chunk"),
-            ));
-            while let Some(end) = buffered.find("\n\n") {
-                let frame = buffered[..end].to_owned();
-                buffered.drain(..end + 2);
-                let Some(data) = frame
-                    .lines()
-                    .find_map(|line| line.strip_prefix("data:").map(str::trim_start))
-                else {
-                    continue;
-                };
-                let Ok(event) = serde_json::from_str::<Value>(data) else {
-                    continue;
-                };
-                if event["event_kind"] != "archive_bound" || event["archive_state"] != "bound" {
-                    continue;
-                }
-                let Some(request_id) = event["request_id"]
-                    .as_str()
-                    .and_then(|value| Uuid::parse_str(value).ok())
-                else {
-                    continue;
-                };
-                pending.retain(|candidate| *candidate != request_id);
-                if pending.is_empty() {
-                    return;
+        let mut pending = request_ids.to_vec();
+        while !pending.is_empty() {
+            let mut remaining = Vec::new();
+            for request_id in pending {
+                let response = world
+                    .client
+                    .get(format!(
+                        "{}/internal/v1/requests/{request_id}",
+                        world.service_url
+                    ))
+                    .bearer_auth(token)
+                    .send()
+                    .await
+                    .expect("proxy archive detail");
+                assert_eq!(response.status(), StatusCode::OK);
+                let detail: Value = response.json().await.expect("proxy archive detail JSON");
+                if detail["archive_complete"] != true {
+                    remaining.push(request_id);
                 }
             }
+            pending = remaining;
+            tokio::task::yield_now().await;
         }
     })
     .await
-    .expect("proxy archives reached a terminal bound event");
-    assert!(
-        pending.is_empty(),
-        "missing bound archive events: {pending:?}"
-    );
+    .expect("proxy originals reached durable completed references");
 }
 
 fn panic_message(panic: Box<dyn Any + Send>) -> String {
@@ -3722,11 +3705,15 @@ async fn openai_image_is_archived_and_metered(world: &mut TokenCenterWorld) {
             .json()
             .await
             .expect("image stats JSON");
-        if stats["summary"]["total_requests"] == 1 {
+        // The deliberately mismatched replay is a separate non-billable
+        // admission failure; it does not replace the paid image operation.
+        if stats["summary"]["total_requests"] == 2 {
+            assert_eq!(stats["summary"]["successful_requests"], 1);
+            assert_eq!(stats["summary"]["failed_requests"], 1);
             assert_eq!(stats["summary"]["total_cost"], "0.3");
             let requests: Value = world
                 .client
-                .get(format!("{}/self/v1/requests?limit=1", world.service_url))
+                .get(format!("{}/self/v1/requests?limit=10", world.service_url))
                 .bearer_auth(&world.current_key)
                 .send()
                 .await
@@ -3734,7 +3721,22 @@ async fn openai_image_is_archived_and_metered(world: &mut TokenCenterWorld) {
                 .json()
                 .await
                 .expect("image request history JSON");
-            assert_eq!(requests[0]["protocol"], "openai-image");
+            let records = requests.as_array().expect("image history records");
+            assert_eq!(records.len(), 2);
+            let paid = records
+                .iter()
+                .find(|record| record["request_id"] == expected_request_id)
+                .expect("original paid image operation remains visible");
+            assert_eq!(paid["protocol"], "openai-image");
+            assert_eq!(paid["status_code"], 200);
+            assert_eq!(paid["cost"], "0.3");
+            let rejected = records
+                .iter()
+                .find(|record| record["request_id"] != expected_request_id)
+                .expect("mismatched replay has its own diagnostic identity");
+            assert_eq!(rejected["status_code"], 400);
+            assert_eq!(rejected["terminal_cause_code"], "gateway_pre_admission");
+            assert_eq!(rejected["billing"]["billable"], false);
             let other = world
                 .client
                 .post(format!("{}/internal/v1/keys", world.service_url))
@@ -7363,10 +7365,7 @@ async fn realtime_stream_contains_request_lifecycle(world: &mut TokenCenterWorld
         .await
         .expect("authenticate test key");
     let cas_prefix = format!("tenants/{}/cas/v1/blake3/", key.tenant_id);
-    assert_eq!(
-        refs.request_object,
-        format!("staging/proxy/{request_uuid}/request/{request_uuid}/body.json")
-    );
+    assert!(refs.request_object.starts_with(&cas_prefix));
     let original_request = state
         .archive
         .get(&refs.request_object)
@@ -7384,6 +7383,10 @@ async fn realtime_stream_contains_request_lifecycle(world: &mut TokenCenterWorld
         "messages": [{"role": "user", "content": "hi"}]
     }))
     .expect("original request JSON bytes");
+    assert!(
+        refs.request_object
+            .ends_with(&blake3::hash(&original_body).to_hex().to_string())
+    );
     assert_eq!(original_request.as_ref(), original_body.as_slice());
     assert_eq!(
         upstream_requests
@@ -7973,7 +7976,7 @@ async fn mock_streaming_responses_invalid_usage(world: &mut TokenCenterWorld) {
                     concat!(
                     "data: {\"type\":\"response.created\",\"response\":{\"id\":\"resp-invalid-usage\"}}\n\n",
                     "data: {\"type\":\"response.output_text.delta\",\"delta\":\"delivered output\"}\n\n",
-                    "data: {\"type\":\"response.completed\",\"response\":{\"id\":\"resp-invalid-usage\",\"usage\":{\"input_tokens\":1,\"output_tokens\":999}}}\n\n",
+                    "data: {\"type\":\"response.completed\",\"response\":{\"id\":\"resp-invalid-usage\",\"usage\":{\"input_tokens\":1,\"output_tokens\":-1}}}\n\n",
                     "data: [DONE]\n\n"
                     ),
                     "text/event-stream",

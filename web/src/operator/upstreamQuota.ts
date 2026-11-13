@@ -151,6 +151,17 @@ export function quotaHighestUsageWindow(windows: UpstreamQuotaSnapshot['windows'
   }, undefined);
 }
 
+/** Display preferences never change admission or the supplier's other limits. */
+export function quotaSummaryWindow(snapshot: UpstreamQuotaSnapshot, preferredId?: string | null) {
+  const preferred = preferredId ? snapshot.windows.find(window => window.id === preferredId) : undefined;
+  if (preferred) return preferred;
+  if (snapshot.provider === 'kimi-oauth') {
+    const weekly = snapshot.windows.find(window => window.period_seconds === 604_800);
+    if (weekly) return weekly;
+  }
+  return quotaHighestUsageWindow(snapshot.windows);
+}
+
 /** Unitless normalized amounts are not evidence of absolute quota units. */
 export function quotaRemaining(window: UpstreamQuotaSnapshot['windows'][number]):
   { kind: 'percent'; percent: number } | { kind: 'amount'; amount: number; limit: number | null; unit: string } | null {
@@ -275,14 +286,14 @@ export interface QuotaSummaryPresentation {
   usedPercent: number | null;
 }
 
-export function quotaSummaryPresentation(snapshot: UpstreamQuotaSnapshot | undefined, now = Date.now(), refreshFailed = false): QuotaSummaryPresentation {
+export function quotaSummaryPresentation(snapshot: UpstreamQuotaSnapshot | undefined, now = Date.now(), refreshFailed = false, preferredWindowId?: string | null): QuotaSummaryPresentation {
   if (!snapshot) return { key: refreshFailed ? 'providerDirectory.readFailed' : 'providerDirectory.notChecked', usedPercent: null };
   if (snapshot.status === 'unsupported') return { key: 'providerDirectory.unsupported', usedPercent: null };
   const observation = quotaObservationState(snapshot, now, refreshFailed);
   const readFailed = refreshFailed || snapshot.status === 'error' || Boolean(snapshot.error_code);
   if (observation === 'unobserved') return { key: readFailed ? 'providerDirectory.readFailed' : 'providerDirectory.usageUnavailable', usedPercent: null };
-  const percents = snapshot.windows.map(quotaUsedPercent).filter((percent): percent is number => percent !== null);
-  const usedPercent = percents.length ? Math.max(...percents) : null;
+  const window = quotaSummaryWindow(snapshot, preferredWindowId);
+  const usedPercent = window ? quotaUsedPercent(window) : null;
   if (readFailed) return { key: usedPercent === null ? 'providerDirectory.refreshFailedRetained' : 'providerDirectory.refreshFailedUsed', usedPercent };
   if (observation === 'historical') return { key: usedPercent === null ? 'providerDirectory.lastObservedUnavailable' : 'providerDirectory.lastObservedUsed', usedPercent };
   return { key: usedPercent === null ? 'providerDirectory.usageUnavailable' : 'providerDirectory.used', usedPercent };

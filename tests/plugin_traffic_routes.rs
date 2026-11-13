@@ -928,17 +928,19 @@ async fn deny_policy_covers_text_images_seedance_and_comfyui_before_any_upstream
                 .await
                 .unwrap()
                 .summary;
-            if summary.total_requests == 1 {
+            // Text and synchronous image denials both have early records;
+            // asynchronous generation handlers retain their job-owned terminals.
+            if summary.total_requests == 2 {
                 break summary;
             }
             tokio::time::sleep(std::time::Duration::from_millis(10)).await;
         }
     })
     .await
-    .expect("authenticated text rejection projects one failure");
-    assert_eq!(summary.total_requests, 1);
+    .expect("authenticated text and image rejections each project one failure");
+    assert_eq!(summary.total_requests, 2);
     assert_eq!(summary.successful_requests, 0);
-    assert_eq!(summary.failed_requests, 1);
+    assert_eq!(summary.failed_requests, 2);
     assert_eq!(summary.input_tokens, 0);
     assert_eq!(summary.output_tokens, 0);
     assert_eq!(
@@ -946,15 +948,17 @@ async fn deny_policy_covers_text_images_seedance_and_comfyui_before_any_upstream
         Decimal::ZERO
     );
     let records = state.db.list_requests(key.key_id, 10).await.unwrap();
-    assert_eq!(records.len(), 1);
-    assert_eq!(records[0].status_code, Some(403));
-    assert_eq!(
-        records[0].terminal_cause_code.as_deref(),
-        Some("gateway_pre_admission")
-    );
-    assert!(!records[0].billing.billable);
-    assert!(records[0].upstream_account_id.is_none());
-    assert!(records[0].route_id.is_none());
+    assert_eq!(records.len(), 2);
+    for record in &records {
+        assert_eq!(record.status_code, Some(403));
+        assert_eq!(
+            record.terminal_cause_code.as_deref(),
+            Some("gateway_pre_admission")
+        );
+        assert!(!record.billing.billable);
+        assert!(record.upstream_account_id.is_none());
+        assert!(record.route_id.is_none());
+    }
     let pool = sqlx::AnyPool::connect(&state.config.database_url)
         .await
         .unwrap();

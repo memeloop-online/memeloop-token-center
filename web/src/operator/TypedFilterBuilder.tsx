@@ -38,6 +38,8 @@ const fields: FieldDefinition[] = [
   { id: 'key_alias', type: 'text', usage: true },
   { id: 'principal', type: 'text', usage: false },
   { id: 'session_association', type: 'text', usage: false },
+  { id: 'session_id', type: 'text', usage: false },
+  { id: 'client_session_id', type: 'text', usage: false },
 ];
 
 const numericOperators: TypedFilterOperator[] = [
@@ -87,7 +89,7 @@ function blankCondition(scope: BuilderScope): TypedFilterCondition {
 
 function operatorsFor(field: FieldDefinition, scope: BuilderScope): TypedFilterOperator[] {
   if (scope === 'usage') return field.id === 'created_at' ? ['between'] : ['equals'];
-  if (field.id === 'session_association') return exactOperators;
+  if (field.id === 'session_association' || field.id === 'session_id' || field.id === 'client_session_id') return exactOperators;
   if (field.type === 'timestamp' || field.type === 'integer' || field.type === 'money_micros') return numericOperators;
   if (field.type === 'text' || field.type === 'model') return textOperators;
   return exactOperators;

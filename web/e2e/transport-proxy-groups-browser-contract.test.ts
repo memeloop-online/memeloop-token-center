@@ -28,6 +28,7 @@ interface ProxyGroupFixture {
   policies: boolean[];
   proxies: NetworkProxy[];
   selection: NetworkProxySelection;
+  effective?: Record<string, unknown>;
 }
 
 declare global {
@@ -115,6 +116,7 @@ async function installFixture(page: Page, allowed = true, locale = 'zh-CN', tab:
         const parsed = body.proxy_url ? new URL(body.proxy_url) : undefined;
         const saved: NetworkProxy = {
           id: id!, tenant_external_id: 'fixture', name: body.name, version: (old?.version ?? 0) + 1,
+          proxy_url: body.proxy_url ?? old?.proxy_url,
           address: {
             scheme: parsed?.protocol.slice(0, -1) ?? old?.address.scheme ?? 'socks5h',
             host: parsed?.hostname ?? old?.address.host ?? '10.20.30.40', port: parsed ? Number(parsed.port) : old?.address.port ?? 1080,
@@ -125,6 +127,17 @@ async function installFixture(page: Page, allowed = true, locale = 'zh-CN', tab:
         };
         state.proxies = [...state.proxies.filter(proxy => proxy.id !== id), saved];
         return new Response(JSON.stringify(saved), { status: method === 'POST' ? 201 : 200 });
+      }
+      if (url.pathname.endsWith('/transport-proxy') && method === 'GET') {
+        const selection = state.selection;
+        return new Response(JSON.stringify({ account_id: selection.account_id,
+          updated_at: selection.account_updated_at, credential_generation: selection.credential_generation,
+          source: ['manual', 'auto', 'plugin'].includes(selection.desired.mode) ? selection.desired.mode : 'credential',
+          proxy_id: selection.desired.proxy_id, group_id: selection.desired.group_id, selected_member_id: null,
+          configuration_state: selection.desired.mode === 'credential' ? 'credential' : 'pending',
+          proxy_url: 'socks5h://10.20.30.40:1080',
+          ...state.effective,
+        }));
       }
       if (!url.pathname.includes('transport-proxy-group')) return previousFetch(input, init);
       state.policies.push(init?.cache === 'no-store' && init?.credentials === 'omit' && init?.referrerPolicy === 'no-referrer');
@@ -189,6 +202,7 @@ async function installFixture(page: Page, allowed = true, locale = 'zh-CN', tab:
             const address = member.proxy_url ? new URL(member.proxy_url) : undefined;
             return {
               id: member.id ?? (old ? `raw-member-id-${old.version + 1}-${index}` : `raw-member-id-${index}`),
+              proxy_url: member.proxy_url ?? saved?.proxy_url,
               label: member.label, scheme: 'socks5h', host: address?.hostname ?? saved?.host ?? '10.20.30.40',
               port: address ? Number(address.port) : saved?.port ?? 1080, remote_dns: true,
               has_auth: address ? Boolean(address.username || address.password) : saved?.has_auth ?? false,
@@ -219,7 +233,7 @@ async function installFixture(page: Page, allowed = true, locale = 'zh-CN', tab:
   if (allowed) {
     const tabName = tab === 'groups' ? copy.title : tab === 'policies' ? networkCopy.policiesTab : networkCopy.proxiesTab;
     await page.getByRole('tab', { name: tabName, exact: true }).click();
-    if (tab === 'policies') await page.getByLabel(fieldLabel(networkCopy.account)).waitFor();
+    if (tab === 'policies') await page.getByRole('button', { name: '研发订阅', exact: true }).waitFor();
     else await page.getByRole('button', { name: tab === 'groups' ? copy.create : networkCopy.create, exact: true }).waitFor();
   }
   else await page.getByText(copy.denied, { exact: true }).waitFor();
@@ -345,6 +359,7 @@ test('transport proxy groups: CRUD, policies, validation, CAS, secrets, permissi
         assert.ok(headingBox && backBox && backBox.x < headingBox.x, 'back navigation stays at the upper left');
         assert.equal(await page.locator('.proxy-groups-page').evaluate(element => getComputedStyle(element).borderTopWidth), '0px');
         await page.getByRole('button', { name: copy.edit('Research exits'), exact: true }).click();
+        await page.getByRole('dialog', { name: copy.edit('Research exits'), exact: true }).waitFor();
         assert.equal(await page.getByLabel(copy.replaceAddress, { exact: true }).getAttribute('placeholder'), 'socks5h://10.20.30.40:1080');
         await captureNavigationIdentity(page, 'proxy-groups', 'edit-address', locale);
         await page.getByRole('button', { name: copy.cancelEdit, exact: true }).click();
@@ -409,18 +424,19 @@ test('transport proxy groups: CRUD, policies, validation, CAS, secrets, permissi
       await workspace.getByRole('button', { name: '新建代理组', exact: true }).waitFor();
       await enterDraft(page);
       await page.goBack();
-      await page.getByRole('dialog').waitFor();
+      await page.locator('.app-confirm-dialog').waitFor();
       await page.keyboard.press('Escape');
       await page.waitForFunction(() => new URL(location.href).searchParams.get('view') === 'proxy-groups');
       assert.equal(await workspace.getByRole('textbox', { name: /^代理组名称\s*\*?$/ }).inputValue(), '研发出口组');
-      await page.getByRole('button', { name: '返回上游账号', exact: true }).click();
-      await page.getByRole('dialog').waitFor();
+      await page.getByRole('button', { name: '关闭', exact: true }).click();
+      await page.locator('.app-confirm-dialog').waitFor();
       await page.keyboard.press('Escape');
       assert.equal(await workspace.getByRole('textbox', { name: /^代理组名称\s*\*?$/ }).inputValue(), '研发出口组');
-      assert.equal(await page.getByRole('dialog').count(), 0);
+      assert.equal(await page.getByRole('dialog').count(), 1);
       assert.equal(await page.evaluate(() => window.proxyGroupFixture.writes.length), 0);
-      await page.getByRole('button', { name: '返回上游账号', exact: true }).click();
+      await page.getByRole('button', { name: '关闭', exact: true }).click();
       await confirm(page);
+      await page.getByRole('button', { name: '返回上游账号', exact: true }).click();
       await page.locator('.provider-directory-row').waitFor();
       assert.equal(await workspace.count(), 0);
       await page.close();
@@ -440,35 +456,25 @@ test('transport proxy groups: CRUD, policies, validation, CAS, secrets, permissi
       await page.close();
     });
 
-    await context.test('account choice deep-links to the unified policy workspace and restores scoped policy after refresh', async () => {
+    await context.test('account settings edit the same policy without a competing URL or group-binding action', async () => {
       const page = await prepare();
       await page.getByRole('button', { name: '返回上游账号', exact: true }).click();
       const row = page.locator('.provider-directory-row');
       await row.waitFor();
-      assert.equal(await page.getByRole('button', { name: '管理代理组', exact: true }).count(), 0);
       await row.locator('[data-manage-account-trigger]').click();
-      await page.locator('.provider-detail-workspace .upstream-connection').getByRole('button', { name: '选择代理组', exact: true }).click();
-      const workspace = page.locator('.transport-proxy-workspace');
-      await workspace.getByText(/沿用旧版绑定，尚未设置新策略/).waitFor();
+      const workspace = page.locator('.provider-detail-workspace .network-proxy-policy-workspace');
+      await workspace.getByText(networkProxyCopy('zh-CN').policyLegacy, { exact: true }).first().waitFor();
       assert.equal(await workspace.count(), 1);
-      assert.equal(await workspace.getByLabel(fieldLabel('账号')).inputValue(), 'account-native');
-      assert.match(page.url(), /view=proxy-groups/);
-      const url = new URL(page.url());
-      assert.equal(url.searchParams.get('account'), 'account-native');
-      assert.equal(url.searchParams.get('tenant'), 'fixture');
+      assert.equal(await page.getByRole('button', { name: '选择代理组', exact: true }).count(), 0);
+      assert.equal(await page.locator('.provider-detail-workspace .upstream-proxy-editor').count(), 0);
+      await workspace.getByLabel(fieldLabel(networkProxyCopy('zh-CN').targetProxy)).selectOption({ label: 'CSIL' });
+      await workspace.getByRole('button', { name: networkProxyCopy('zh-CN').savePolicy, exact: true }).click();
+      await workspace.getByText(networkProxyCopy('zh-CN').policySaved, { exact: true }).waitFor();
+      const writes = await page.evaluate(() => window.proxyGroupFixture.writes);
+      assert.equal(writes.length, 1);
+      assert.ok(writes[0].path.endsWith('/transport-proxy-selection'));
+      assert.equal(writes[0].body.mode, 'manual');
       assert.equal(await page.getByRole('dialog').count(), 0);
-      assert.equal(await page.evaluate(() => window.proxyGroupFixture.writes.length), 0);
-      await page.reload();
-      await page.getByText(transportProxyGroupCopy('zh-CN').denied, { exact: true }).waitFor();
-      await installFixture(page, true, 'zh-CN', 'policies');
-      await workspace.getByText(/沿用旧版绑定，尚未设置新策略/).waitFor();
-      assert.equal(await workspace.getByLabel(fieldLabel('账号')).inputValue(), 'account-native');
-      await page.goBack();
-      await row.waitFor();
-      assert.equal(await workspace.count(), 0);
-      await page.goForward();
-      await workspace.getByText(/沿用旧版绑定，尚未设置新策略/).waitFor();
-      assert.equal(await workspace.getByLabel(fieldLabel('账号')).inputValue(), 'account-native');
       await page.close();
     });
 
@@ -535,6 +541,11 @@ test('transport proxy groups: CRUD, policies, validation, CAS, secrets, permissi
       await page.getByRole('button', { name: copy.refresh, exact: true }).click();
       const edit = page.getByRole('button', { name: copy.edit('CSIL'), exact: true });
       await edit.click();
+      const editor = page.getByRole('dialog', { name: copy.edit('CSIL'), exact: true });
+      await editor.waitFor();
+      await page.setViewportSize({ width: 390, height: 1000 });
+      const editorBounds = await editor.boundingBox();
+      assert.ok(editorBounds && editorBounds.x >= -1 && editorBounds.x + editorBounds.width <= 391);
       const address = page.getByLabel(copy.address, { exact: true });
       assert.equal(await address.first().inputValue(), 'socks5h://100.64.0.16:1080');
       assert.equal(await address.first().getAttribute('type'), 'text');
@@ -638,18 +649,54 @@ test('transport proxy groups: CRUD, policies, validation, CAS, secrets, permissi
       }
     });
 
+    await context.test('current exit follows the actual selected member and pending never claims direct or desired egress', async () => {
+      const page = await prepare(true, 'zh-CN', 'policies');
+      const copy = networkProxyCopy('zh-CN');
+      await page.evaluate(() => {
+        const state = window.proxyGroupFixture;
+        state.proxies.push({ ...state.proxies[0], id: 'selected-backup', name: '实际备用出口' });
+        state.selection.desired = { ...state.selection.desired, mode: 'manual', proxy_id: state.proxies[0].id };
+        state.effective = { source: 'manual', configuration_state: 'applied', proxy_id: state.proxies[0].id, selected_member_id: 'selected-backup', proxy_url: 'socks5h://10.20.30.41:1080' };
+      });
+      const policies = page.locator('.network-proxy-policy-workspace');
+      await policies.getByRole('button', { name: copy.refresh, exact: true }).click();
+      await policies.getByRole('button', { name: '研发订阅', exact: true }).click();
+      const exit = policies.getByText(copy.effectiveExit, { exact: true }).locator('..').locator('dd');
+      await exit.getByText('实际备用出口', { exact: true }).waitFor();
+      assert.equal(await exit.textContent(), '实际备用出口');
+      await page.evaluate(() => { window.proxyGroupFixture.effective = { source: 'manual', configuration_state: 'pending', proxy_id: window.proxyGroupFixture.proxies[0].id, selected_member_id: null, proxy_url: null }; });
+      await policies.getByRole('button', { name: copy.refresh, exact: true }).click();
+      await exit.getByText(copy.appliedPending, { exact: true }).waitFor();
+      assert.equal(await exit.textContent(), copy.appliedPending);
+      assert.notEqual(await exit.textContent(), copy.directExit);
+      await page.close();
+    });
+
     await context.test('entity address edits and manual, automatic and plugin policies save and reload through existing APIs', async () => {
       const page = await prepare(true, 'zh-CN', 'proxies');
       const copy = networkProxyCopy('zh-CN');
       const workspace = page.locator('.network-proxy-workspace');
       await workspace.getByRole('button', { name: copy.edit('CSIL'), exact: true }).click();
+      await page.getByRole('dialog', { name: copy.edit('CSIL'), exact: true }).waitFor();
+      await page.setViewportSize({ width: 390, height: 640 });
+      await workspace.locator('.proxy-address-input').fill('http://invalid-proxy');
+      assert.equal(await workspace.getByRole('button', { name: copy.save, exact: true }).isEnabled(), true);
+      await workspace.getByRole('button', { name: copy.save, exact: true }).click();
+      await page.getByRole('dialog').getByText(copy.errors.invalid, { exact: true }).waitFor();
+      const invalidBounds = await page.getByRole('dialog').getByText(copy.errors.invalid, { exact: true }).boundingBox();
+      assert.ok(invalidBounds && invalidBounds.y >= 0 && invalidBounds.y + invalidBounds.height <= 640);
+      await workspace.getByRole('button', { name: copy.save, exact: true }).click();
+      const repeatedInvalidBounds = await page.getByRole('dialog').getByText(copy.errors.invalid, { exact: true }).boundingBox();
+      assert.ok(repeatedInvalidBounds && repeatedInvalidBounds.y >= 0 && repeatedInvalidBounds.y + repeatedInvalidBounds.height <= 640);
+      assert.equal(await page.evaluate(() => window.proxyGroupFixture.writes.length), 0);
+      await workspace.locator('.proxy-address-input').fill('socks5h://100.64.0.16:1080');
       await workspace.getByRole('textbox', { name: /^出口名称\s*\*?$/ }).fill('CSIL 主出口');
       await workspace.getByRole('button', { name: copy.save, exact: true }).click();
       await workspace.getByText(copy.saved, { exact: true }).waitFor();
       let writes = await page.evaluate(() => window.proxyGroupFixture.writes);
       assert.equal(writes.length, 1);
       assert.equal(writes[0].method, 'PUT');
-      assert.equal(Object.hasOwn(writes[0].body, 'proxy_url'), false, 'unchanged redacted address preserves stored authentication');
+      assert.equal(Object.hasOwn(writes[0].body, 'proxy_url'), false, 'unchanged address is omitted instead of replacing stored authentication');
       assert.equal(writes[0].body.expected_version, 1);
 
       await workspace.getByRole('button', { name: copy.create, exact: true }).click();
@@ -659,7 +706,7 @@ test('transport proxy groups: CRUD, policies, validation, CAS, secrets, permissi
       await workspace.getByRole('button', { name: copy.edit('研发备用'), exact: true }).waitFor();
       await workspace.getByRole('button', { name: copy.edit('研发备用'), exact: true }).click();
       const replacement = workspace.locator('.proxy-address-input');
-      assert.equal(await replacement.inputValue(), 'socks5h://10.20.30.40:1080');
+      assert.equal(await replacement.inputValue(), privateProxySecret, 'saved authenticated address remains directly editable');
       await replacement.fill('socks5h://10.20.30.41:1080');
       await workspace.getByRole('button', { name: copy.save, exact: true }).click();
       await workspace.getByText(copy.saved, { exact: true }).waitFor();
@@ -678,9 +725,9 @@ test('transport proxy groups: CRUD, policies, validation, CAS, secrets, permissi
       }]; });
       await page.getByRole('tab', { name: copy.policiesTab, exact: true }).click();
       const policies = page.locator('.network-proxy-policy-workspace');
-      await policies.getByLabel(fieldLabel(copy.account)).selectOption('account-native');
+      await policies.getByRole('button', { name: '研发订阅', exact: true }).click();
       await policies.getByText(new RegExp(copy.policyLegacy)).waitFor();
-      await policies.getByLabel(fieldLabel(copy.targetProxy)).selectOption({ label: 'CSIL 主出口' });
+      await policies.getByLabel(fieldLabel(copy.targetProxy)).selectOption({ label: 'CSIL' });
       await policies.getByRole('button', { name: copy.savePolicy, exact: true }).click();
       await policies.getByText(copy.policySaved, { exact: true }).waitFor();
       await captureNavigationIdentity(page, 'proxy-groups', 'account-policy-manual', 'zh-CN');
@@ -712,7 +759,7 @@ test('transport proxy groups: CRUD, policies, validation, CAS, secrets, permissi
 
       await page.getByRole('tab', { name: '代理组', exact: true }).click();
       await page.getByRole('tab', { name: copy.policiesTab, exact: true }).click();
-      await policies.getByLabel(fieldLabel(copy.account)).selectOption('account-native');
+      await policies.getByRole('button', { name: '研发订阅', exact: true }).click();
       await policies.getByLabel(fieldLabel(copy.mode)).waitFor();
       assert.equal(await policies.getByLabel(fieldLabel(copy.mode)).inputValue(), 'plugin');
       assert.equal(await policies.getByLabel(fieldLabel(copy.strategy)).inputValue(), 'fixture-latency\0' + '2');
@@ -775,8 +822,9 @@ test('transport proxy groups: CRUD, policies, validation, CAS, secrets, permissi
       await page.evaluate(() => { window.proxyGroupFixture.holdNext = true; window.proxyGroupFixture.release = undefined; });
       await page.getByRole('button', { name: '保存代理组', exact: true }).click();
       await page.waitForFunction(() => Boolean(window.proxyGroupFixture.release));
-      await page.getByRole('button', { name: '返回上游账号', exact: true }).click();
+      await page.getByRole('button', { name: '关闭', exact: true }).click();
       await page.getByText(/关闭页面后保存仍会完成/).waitFor(); await confirm(page);
+      await page.getByRole('button', { name: '返回上游账号', exact: true }).click();
       await assertAccountDirectoryReturn(page);
       await page.evaluate(() => window.proxyGroupFixture.release?.());
       await openManager(page);

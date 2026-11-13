@@ -65,7 +65,8 @@ async fn single_checkout_price_snapshot(database: &Database) {
                 Ok(true)
             })
         })
-        .connect_lazy_with(database.pool.connect_options().as_ref().clone());
+        .connect_lazy_with(database.pool.connect_options().as_ref().clone())
+        .into();
     let mut warmed = observed.pool.acquire().await.unwrap();
     warmed.return_to_pool().await;
     checkouts.store(0, Ordering::SeqCst);

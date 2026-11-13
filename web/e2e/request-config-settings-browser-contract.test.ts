@@ -152,7 +152,7 @@ test('HTTP settings save full documents, preserve inheritance and drafts, and ex
     await page.evaluate(() => { const fixture = (window as FixtureWindow).requestConfigFixture; fixture.failLoad = false; fixture.unavailable = true; });
     await card.getByRole('button', { name: '重试', exact: true }).click();
     await card.getByText('此部署尚未提供请求配置，现有请求行为不变。').waitFor();
-    await page.getByText('尚未选择筛选助手模型。').waitFor();
+    await page.getByText('尚未选择系统 AI 模型。').waitFor();
   } finally {
     await browser.close();
     await server.close();

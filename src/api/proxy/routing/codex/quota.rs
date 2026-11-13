@@ -63,6 +63,30 @@ fn exhausted_error(error: &Value) -> bool {
     ) && reason == Some(SafeReason::InsufficientQuota)
 }
 
+// Kimi reuses access_terminated_error for a transient concurrency refusal.
+// The type alone is also compatible with authorization loss, so only the
+// observed, complete error-only envelope proves this request was rejected.
+fn concurrency_rejected_before_execution(body: &[u8]) -> bool {
+    let Ok(value) = crate::api::sse::parse_unique_json(body) else {
+        return false;
+    };
+    let Some(root) = value.as_object().filter(|root| root.len() == 1) else {
+        return false;
+    };
+    let Some(error) = root.get("error").and_then(Value::as_object) else {
+        return false;
+    };
+    error
+        .keys()
+        .all(|key| matches!(key.as_str(), "type" | "message" | "code"))
+        && error.get("code").is_none_or(Value::is_null)
+        && error.get("type").and_then(Value::as_str) == Some("access_terminated_error")
+        && error.get("message").and_then(Value::as_str)
+            == Some(
+                "You've reached your concurrent request limit. Please wait for your ongoing requests to finish and try again.",
+            )
+}
+
 pub(in crate::api::proxy) fn quota_evidence(
     headers: &HeaderMap,
     body: Option<&[u8]>,
@@ -112,6 +136,196 @@ pub(in crate::api::proxy) async fn classify_rate_limit(
 ) -> (UpstreamResponse, UpstreamFailureKind) {
     let (response, kind, _) = classify_supplier_quota(response).await;
     (response, kind)
+}
+
+pub(in crate::api::proxy) async fn classify_stream_quota(
+    response: UpstreamResponse,
+    limits: crate::provider::SseFramingLimits,
+    memory: &crate::gateway_body::memory::ProxyMemoryBudget,
+) -> (
+    UpstreamResponse,
+    Option<(UpstreamFailureKind, SupplierQuotaEvidence)>,
+) {
+    let is_sse = response
+        .headers()
+        .get(header::CONTENT_TYPE)
+        .and_then(|value| value.to_str().ok())
+        .and_then(|value| value.split(';').next())
+        .is_some_and(|value| value.trim().eq_ignore_ascii_case("text/event-stream"));
+    if !response.status().is_success()
+        || !is_sse
+        || response
+            .headers()
+            .get_all(header::CONTENT_ENCODING)
+            .iter()
+            .any(|encoding| !encoding.as_bytes().eq_ignore_ascii_case(b"identity"))
+    {
+        return (response, None);
+    }
+    let Ok(reservation) = memory.temporary(MAX_BODY * 8) else {
+        return (response, None);
+    };
+    let mut parts = response.into_parts();
+    let mut framer = crate::api::sse::BoundedSseFramer::with_limits(limits);
+    let mut identity = crate::api::sse::ResponseIdentityGate::default();
+    let mut prefix = Vec::new();
+    let mut inspected = 0_usize;
+    let rejection = 'read: loop {
+        if prefix.len() >= MAX_CHUNKS {
+            break None;
+        }
+        if !prefix.is_empty() && prefix.len().is_multiple_of(16) {
+            tokio::task::yield_now().await;
+        }
+        let Some(chunk) = parts.stream.next().await else {
+            break None;
+        };
+        let batch = match &chunk {
+            Ok(bytes) if bytes.len() <= MAX_BODY.saturating_sub(inspected) => {
+                inspected += bytes.len();
+                Some(framer.push(bytes))
+            }
+            _ => None,
+        };
+        prefix.push(chunk);
+        let Some(batch) = batch else {
+            break None;
+        };
+        if batch.rejection.is_some() {
+            break None;
+        }
+        if let Some(event) = batch.events.into_iter().next() {
+            let Ok((name, data)) = crate::api::sse::parse_sse_event(&event) else {
+                break 'read None;
+            };
+            let Some(data) = data else {
+                break 'read None;
+            };
+            let Ok(value) = crate::api::sse::parse_unique_json(&data) else {
+                break 'read None;
+            };
+            let payload_name = value.get("type").and_then(Value::as_str);
+            if name
+                .as_deref()
+                .is_some_and(|name| payload_name.is_some_and(|payload| name != payload))
+                || has_execution_evidence(&value)
+                || value.get("response").is_some_and(has_execution_evidence)
+            {
+                break 'read None;
+            }
+            let event_name = payload_name.or(name.as_deref());
+            if let Some(event_name) = event_name
+                && identity.observe(event_name, &value).is_err()
+            {
+                break 'read None;
+            }
+            match event_name {
+                Some("error" | "response.failed" | "response.error") | None => {
+                    let error = if event_name.is_some_and(|name| name.starts_with("response.")) {
+                        value.pointer("/response/error")
+                    } else {
+                        value
+                            .get("error")
+                            .or_else(|| (event_name == Some("error")).then_some(&value))
+                    };
+                    break 'read error
+                        .filter(|error| error.is_object())
+                        .and_then(|error| stream_quota_evidence(&parts.headers, error));
+                }
+                _ => break 'read None,
+            }
+        }
+    };
+    let response = UpstreamResponse::Prefetched {
+        status: parts.status,
+        headers: parts.headers,
+        version: parts.version,
+        content_length: parts.content_length,
+        stream: Box::pin(
+            stream::iter(prefix)
+                .map(move |chunk| {
+                    let _retained = &reservation;
+                    chunk
+                })
+                .chain(parts.stream),
+        ),
+    };
+    (response, rejection)
+}
+
+fn has_execution_evidence(value: &Value) -> bool {
+    [
+        "usage",
+        "output",
+        "choices",
+        "content",
+        "delta",
+        "item",
+        "tool_calls",
+    ]
+    .into_iter()
+    .any(|field| {
+        value
+            .get(field)
+            .is_some_and(|value| !value.is_null() && !value.as_array().is_some_and(Vec::is_empty))
+    })
+}
+
+fn stream_quota_evidence(
+    headers: &HeaderMap,
+    error: &Value,
+) -> Option<(UpstreamFailureKind, SupplierQuotaEvidence)> {
+    use crate::supplier_error::SafeReason;
+    let field = |name| match error.get(name) {
+        None | Some(Value::Null) => Some(None),
+        Some(Value::String(value)) => Some(Some(value.as_str())),
+        _ => None,
+    };
+    let code = field("code")?;
+    let kind = field("type")?;
+    let reason_for = |value| match value {
+        "rate_limit_error" => Some(SafeReason::RateLimited),
+        "usage_limit_reached" => Some(SafeReason::InsufficientQuota),
+        "authentication_error" | "permission_error" => Some(SafeReason::AuthenticationInvalid),
+        _ => SafeReason::from_supplier(Some(value), None),
+    };
+    let reason = reason_for(code.or(kind)?)?;
+    if !matches!(
+        reason,
+        SafeReason::RateLimited | SafeReason::InsufficientQuota
+    ) || [code, kind]
+        .into_iter()
+        .flatten()
+        .filter_map(reason_for)
+        .any(|other| other != reason)
+        || [code, kind]
+            .into_iter()
+            .flatten()
+            .any(|value| matches!(value, "overloaded_error" | "api_error"))
+    {
+        return None;
+    }
+    let message = match (error.get("message"), error.get("msg")) {
+        (Some(_), Some(_)) => return None,
+        (Some(message), None) | (None, Some(message)) => Some(message.as_str()?),
+        _ => None,
+    };
+    if SafeReason::from_supplier(None, message).is_some_and(|other| other != reason) {
+        return None;
+    }
+    let body = serde_json::to_vec(error).ok()?;
+    let now = unix_millis();
+    let mut evidence = quota_evidence(headers, Some(&body), now);
+    evidence.exhausted = reason == SafeReason::InsufficientQuota;
+    let failure = if evidence.exhausted || evidence.reset_at.is_some() {
+        UpstreamFailureKind::RateLimitedUntil {
+            exhausted: evidence.exhausted,
+            until: evidence.reset_at.unwrap_or(0),
+        }
+    } else {
+        UpstreamFailureKind::RateLimited
+    };
+    Some((failure, evidence))
 }
 
 pub(in crate::api::proxy) async fn classify_supplier_quota(
@@ -184,7 +398,13 @@ pub(in crate::api::proxy) async fn classify_supplier_quota(
     };
     let now = unix_millis();
     let evidence = quota_evidence(&parts.headers, complete.then_some(body.as_slice()), now);
-    let kind = if forbidden && !evidence.exhausted {
+    let concurrency_rejected = forbidden
+        && complete
+        && parts
+            .content_length
+            .is_none_or(|length| length == body.len() as u64)
+        && concurrency_rejected_before_execution(&body);
+    let kind = if forbidden && !evidence.exhausted && !concurrency_rejected {
         UpstreamFailureKind::Authentication
     } else {
         classify(&parts.headers, complete.then_some(body.as_slice()), now)
@@ -204,6 +424,276 @@ mod tests {
     use super::*;
 
     const NOW: i64 = 1_700_000_000_000;
+
+    const CONCURRENCY_MESSAGE: &str = "You've reached your concurrent request limit. Please wait for your ongoing requests to finish and try again.";
+
+    #[tokio::test]
+    async fn concurrency403_requires_complete_error_only_evidence_and_preserves_wire() {
+        let rejection =
+            json!({"error":{"type":"access_terminated_error","message":CONCURRENCY_MESSAGE}});
+        let mut extra_root = rejection.clone();
+        extra_root["usage"] = json!({"total_tokens":1});
+        let mut output = rejection.clone();
+        output["error"]["output"] = json!(["already executed"]);
+        let mut revoked = rejection.clone();
+        revoked["error"]["code"] = json!("invalid_api_key");
+        let bodies = [
+            (serde_json::to_vec(&rejection).unwrap(), true),
+            (serde_json::to_vec(&extra_root).unwrap(), false),
+            (serde_json::to_vec(&output).unwrap(), false),
+            (serde_json::to_vec(&revoked).unwrap(), false),
+            (serde_json::to_vec(&json!({"error":{"type":"access_terminated_error","message":"Your access has been revoked."}})).unwrap(), false),
+            (format!(r#"{{"error":{{"type":"access_terminated_error","type":"authentication_error","message":{}}}}}"#, serde_json::to_string(CONCURRENCY_MESSAGE).unwrap()).into_bytes(), false),
+        ];
+        for (body, expected) in bodies {
+            for length_matches in [true, false] {
+                let mut headers = HeaderMap::new();
+                headers.insert(
+                    header::CONTENT_TYPE,
+                    HeaderValue::from_static("application/json"),
+                );
+                headers.insert(header::RETRY_AFTER, HeaderValue::from_static("30"));
+                let chunks = vec![
+                    Ok(Bytes::copy_from_slice(&body[..body.len() / 2])),
+                    Ok(Bytes::copy_from_slice(&body[body.len() / 2..])),
+                ];
+                let response = UpstreamResponse::Prefetched {
+                    status: StatusCode::FORBIDDEN,
+                    headers,
+                    version: http::Version::HTTP_2,
+                    content_length: Some(body.len() as u64 + u64::from(!length_matches)),
+                    stream: Box::pin(stream::iter(chunks.clone())),
+                };
+                let (response, kind, evidence) = classify_supplier_quota(response).await;
+                assert!(!evidence.exhausted);
+                if expected && length_matches {
+                    assert!(matches!(
+                        kind,
+                        UpstreamFailureKind::RateLimitedUntil {
+                            exhausted: false,
+                            ..
+                        }
+                    ));
+                } else {
+                    assert_eq!(kind, UpstreamFailureKind::Authentication);
+                }
+                assert_eq!(response.bytes_stream().collect::<Vec<_>>().await, chunks);
+            }
+        }
+        // A syntactically complete prefix followed by transport failure is
+        // still incomplete response evidence and cannot authorize replay.
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            header::CONTENT_TYPE,
+            HeaderValue::from_static("application/json"),
+        );
+        let chunks = vec![
+            Ok(Bytes::from(serde_json::to_vec(&rejection).unwrap())),
+            Err("body interrupted"),
+        ];
+        let response = UpstreamResponse::Prefetched {
+            status: StatusCode::FORBIDDEN,
+            headers,
+            version: http::Version::HTTP_2,
+            content_length: None,
+            stream: Box::pin(stream::iter(chunks.clone())),
+        };
+        let (response, kind, _) = classify_supplier_quota(response).await;
+        assert_eq!(kind, UpstreamFailureKind::Authentication);
+        assert_eq!(response.bytes_stream().collect::<Vec<_>>().await, chunks);
+    }
+
+    #[tokio::test]
+    async fn stream_quota_requires_complete_preoutput_evidence_and_preserves_wire() {
+        for (body, rejected) in [
+            (
+                "data: {\"error\":{\"code\":\"insufficient_quota\"}}\n\n",
+                true,
+            ),
+            (
+                "event: error\ndata: {\"type\":\"error\",\"code\":\"rate_limit_exceeded\"}\n\n",
+                true,
+            ),
+            (
+                "data: {\"type\":\"response.failed\",\"response\":{\"error\":{\"type\":\"usage_limit_reached\"}}}\n\n",
+                true,
+            ),
+            (
+                "data: {\"type\":\"response.created\",\"response\":{\"id\":\"resp-a\",\"output\":[],\"usage\":null}}\n\ndata: {\"type\":\"response.failed\",\"response\":{\"id\":\"resp-a\",\"error\":{\"code\":\"insufficient_quota\"}}}\n\n",
+                false,
+            ),
+            (
+                "event: error\ndata: {\"type\":\"error\",\"error\":{\"type\":\"rate_limit_error\",\"message\":\"retry after plan window\"}}\n\n",
+                true,
+            ),
+            (
+                "data: {\"error\":{\"code\":null,\"type\":\"usage_limit_reached\"}}\n\n",
+                true,
+            ),
+            (
+                "data: {\"error\":{\"code\":\"insufficient_quota\",\"type\":\"rate_limit_error\"}}\n\n",
+                false,
+            ),
+            (
+                "data: {\"error\":{\"code\":\"invalid_api_key\",\"type\":\"usage_limit_reached\"}}\n\n",
+                false,
+            ),
+            (
+                "data: {\"error\":{\"code\":123,\"type\":\"usage_limit_reached\"}}\n\n",
+                false,
+            ),
+            (
+                "data: {\"error\":{\"type\":\"overloaded_error\"}}\n\n",
+                false,
+            ),
+            (
+                ": heartbeat\n\ndata: {\"error\":{\"type\":\"rate_limit_error\"}}\n\n",
+                false,
+            ),
+            (
+                "data: {\"error\":{\"code\":\"invalid_api_key\"}}\n\n",
+                false,
+            ),
+            (
+                "data: {\"error\":{\"message\":\"Insufficient quota\"}}\n\n",
+                false,
+            ),
+            (
+                "data: {\"error\":{\"code\":\"rate_limit_exceeded\",\"message\":\"Invalid API key\"}}\n\n",
+                false,
+            ),
+            (
+                "data: {\"error\":{\"code\":\"insufficient_quota\",\"code\":\"invalid_api_key\"}}\n\n",
+                false,
+            ),
+            (
+                "event: response.completed\ndata: {\"type\":\"response.failed\",\"response\":{\"error\":{\"code\":\"insufficient_quota\"}}}\n\n",
+                false,
+            ),
+            (
+                "data: {\"choices\":[{\"delta\":{\"tool_calls\":[{\"id\":\"call-a\"}]}}]}\n\ndata: {\"error\":{\"code\":\"insufficient_quota\"}}\n\n",
+                false,
+            ),
+            (
+                "data: {\"type\":\"response.failed\",\"response\":{\"usage\":{\"input_tokens\":4},\"error\":{\"code\":\"insufficient_quota\"}}}\n\n",
+                false,
+            ),
+            (
+                "data: {\"type\":\"response.failed\",\"response\":{\"output\":[{\"type\":\"function_call\"}],\"error\":{\"code\":\"insufficient_quota\"}}}\n\n",
+                false,
+            ),
+            (
+                "data: {\"type\":\"response.created\",\"response\":{\"id\":\"resp-a\"}}\n\ndata: {\"type\":\"response.failed\",\"response\":{\"id\":\"resp-b\",\"error\":{\"code\":\"insufficient_quota\"}}}\n\n",
+                false,
+            ),
+            (
+                "data: {\"error\":{\"code\":\"insufficient_quota\"}}\n",
+                false,
+            ),
+        ] {
+            for split in [1, body.len() / 2, body.len()] {
+                let chunks = body
+                    .as_bytes()
+                    .chunks(split)
+                    .map(|chunk| Ok(Bytes::copy_from_slice(chunk)))
+                    .collect::<Vec<_>>();
+                let mut headers = HeaderMap::new();
+                headers.insert(
+                    header::CONTENT_TYPE,
+                    HeaderValue::from_static("text/event-stream"),
+                );
+                let memory = crate::gateway_body::memory::ProxyMemoryBudget::new(4 * 1024 * 1024);
+                let response = UpstreamResponse::Prefetched {
+                    status: StatusCode::OK,
+                    headers,
+                    version: http::Version::HTTP_2,
+                    content_length: None,
+                    stream: Box::pin(stream::iter(chunks.clone())),
+                };
+                let (response, evidence) = classify_stream_quota(
+                    response,
+                    crate::provider::SseFramingLimits::default(),
+                    &memory,
+                )
+                .await;
+                assert_eq!(evidence.is_some(), rejected, "{body} split={split}");
+                assert_eq!(response.status(), StatusCode::OK);
+                assert_eq!(response.bytes_stream().collect::<Vec<_>>().await, chunks);
+                assert_eq!(memory.snapshot().0, 0);
+            }
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn stream_quota_uses_transport_timeout_and_cancellation_without_private_deadline() {
+        for interrupted in [false, true] {
+            let mut headers = HeaderMap::new();
+            headers.insert(
+                header::CONTENT_TYPE,
+                HeaderValue::from_static("text/event-stream"),
+            );
+            let memory = crate::gateway_body::memory::ProxyMemoryBudget::new(4 * 1024 * 1024);
+            let body =
+                Bytes::from_static(b"data: {\"error\":{\"code\":\"insufficient_quota\"}}\n\n");
+            let response = UpstreamResponse::Prefetched {
+                status: StatusCode::OK,
+                headers,
+                version: http::Version::HTTP_2,
+                content_length: None,
+                stream: Box::pin(stream::once(async move {
+                    tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+                    if interrupted {
+                        Err(upstream_response::UPSTREAM_READ_TIMEOUT)
+                    } else {
+                        Ok(body)
+                    }
+                })),
+            };
+            let (response, evidence) = classify_stream_quota(
+                response,
+                crate::provider::SseFramingLimits::default(),
+                &memory,
+            )
+            .await;
+            assert_eq!(evidence.is_some(), !interrupted);
+            let chunks = response.bytes_stream().collect::<Vec<_>>().await;
+            if interrupted {
+                assert_eq!(chunks, vec![Err(upstream_response::UPSTREAM_READ_TIMEOUT)]);
+            }
+            assert_eq!(memory.snapshot().0, 0);
+        }
+        let memory = crate::gateway_body::memory::ProxyMemoryBudget::new(4 * 1024 * 1024);
+        let (sender, receiver) = tokio::sync::oneshot::channel::<()>();
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            header::CONTENT_TYPE,
+            HeaderValue::from_static("text/event-stream"),
+        );
+        let response = UpstreamResponse::Prefetched {
+            status: StatusCode::OK,
+            headers,
+            version: http::Version::HTTP_2,
+            content_length: None,
+            stream: Box::pin(stream::once(async move {
+                let _sender = sender;
+                std::future::pending::<Result<Bytes, &'static str>>().await
+            })),
+        };
+        assert!(
+            tokio::time::timeout(
+                std::time::Duration::from_secs(1),
+                classify_stream_quota(
+                    response,
+                    crate::provider::SseFramingLimits::default(),
+                    &memory
+                ),
+            )
+            .await
+            .is_err()
+        );
+        assert!(receiver.await.is_err());
+        assert_eq!(memory.snapshot().0, 0);
+    }
 
     #[test]
     fn structured_quota_codes_reuse_safe_supplier_classification_not_message_substrings() {

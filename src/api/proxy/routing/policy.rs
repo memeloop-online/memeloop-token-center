@@ -1,8 +1,10 @@
-//! Request-local policy snapshot. Standbys cannot increase the original budget.
+//! Request-local transport attempt policy.
 use super::*;
 
 pub(crate) struct RequestAttemptBudget {
     max_attempts: usize,
+    rejected_attempts: usize,
+    count_rejections: bool,
     pub(in crate::api::proxy) version: u32,
 }
 
@@ -24,6 +26,8 @@ impl RequestAttemptBudget {
         if !codex_transport::is_driver(&route.driver) {
             let budget = Self {
                 max_attempts: PROXY_ROUTING_POLICY.max_attempts(),
+                rejected_attempts: 0,
+                count_rejections: false,
                 version: 1,
             };
             budget.record_snapshot(route, request_id, "host_default");
@@ -34,6 +38,11 @@ impl RequestAttemptBudget {
                 .map_err(|_| AppError::BadRequest("invalid Codex transport policy".into()))?;
         let budget = Self {
             max_attempts: policy.candidate_attempts,
+            rejected_attempts: 0,
+            count_rejections: route
+                .config
+                .pointer("/transport_policy/candidate_attempts")
+                .is_some(),
             version: policy.version,
         };
         budget.record_snapshot(
@@ -66,10 +75,16 @@ impl RequestAttemptBudget {
     }
 
     pub(in crate::api::proxy) fn terminal_reason(&self, attempts: usize) -> Option<&'static str> {
-        if attempts >= self.max_attempts {
+        if attempts.saturating_sub(self.rejected_attempts) >= self.max_attempts {
             Some("upstream_attempts_exhausted")
         } else {
             None
+        }
+    }
+
+    pub(in crate::api::proxy) fn note_definite_rejection(&mut self) {
+        if !self.count_rejections {
+            self.rejected_attempts += 1;
         }
     }
 
@@ -124,6 +139,28 @@ mod tests {
                 header: "authorization".into(),
                 prefix: "Bearer ".into(),
             },
+        }
+    }
+
+    #[test]
+    fn definite_rejections_do_not_spend_default_transport_budget_but_honor_explicit_policy() {
+        for (policy, exhausted) in [
+            (None, false),
+            (Some(json!({"candidate_attempts": 3})), true),
+        ] {
+            let mut budget = RequestAttemptBudget::from_primary(
+                &route(codex_transport::DRIVER, policy),
+                Uuid::from_u128(3),
+            )
+            .unwrap();
+            for _ in 0..3 {
+                budget.note_definite_rejection();
+            }
+            assert_eq!(budget.terminal_reason(3).is_some(), exhausted);
+            assert_eq!(
+                budget.terminal_reason(6),
+                Some("upstream_attempts_exhausted")
+            );
         }
     }
 
@@ -199,6 +236,8 @@ mod tests {
         health.probe_lease_millis = 200;
         let budget = RequestAttemptBudget {
             max_attempts: 2,
+            rejected_attempts: 0,
+            count_rejections: true,
             version: 1,
         };
         assert_eq!(
@@ -211,6 +250,8 @@ mod tests {
     async fn elapsed_time_does_not_reset_or_exhaust_attempt_limit() {
         let budget = RequestAttemptBudget {
             max_attempts: 2,
+            rejected_attempts: 0,
+            count_rejections: true,
             version: 1,
         };
         assert_eq!(budget.terminal_reason(1), None);

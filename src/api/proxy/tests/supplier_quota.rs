@@ -1,6 +1,7 @@
 use super::*;
 
 mod forbidden;
+mod stream;
 
 #[tokio::test]
 async fn provider429_publishes_exact_model_and_next_request_uses_alternate_without_probe_post() {
@@ -40,6 +41,11 @@ async fn provider429_publishes_exact_model_and_next_request_uses_alternate_witho
             .unwrap();
         fixture.state.routing_persistence.drain_for_test().await;
     }
+    // The rejection reader may hand the remaining original to capture after
+    // its inspection budget. Wait for that owner to reach EOF before draining
+    // the body-derived observation it submits to routing persistence.
+    fixture.state.persistence.drain_for_test().await;
+    fixture.state.routing_persistence.drain_for_test().await;
     let evidence = sqlx::query(
         "SELECT upstream_model, failure_kind, reset_source, reset_at
          FROM upstream_supplier_availability WHERE upstream_account_id = $1",
@@ -223,22 +229,16 @@ async fn default_probe_skips_unusable_cheaper_models_and_explicit_alias_stays_sk
         )
         .await
         .unwrap();
-    fixture
-        .state
-        .db
-        .plugin_kv_put(
-            "typed-filter",
-            &format!(
-                "settings/{}",
-                &blake3::hash(tenant.as_bytes()).to_hex()[..32]
-            ),
-            &serde_json::to_vec(
-                &json!({"model_route_id":route_id,"billing_key_id":fixture.key_id,"updated_at":1}),
-            )
-            .unwrap(),
-        )
-        .await
-        .unwrap();
+    let save_probe = |model: Option<&str>| {
+        let db = fixture.state.db.clone();
+        let value = serde_json::to_vec(&json!({"enabled":true,"billing_key_id":fixture.key_id,"interval_seconds":3600,"model":model,"prompt":"Reply with ok."})).unwrap();
+        async move {
+            db.plugin_kv_put("upstream-health-probe", &account.to_string(), &value)
+                .await
+                .unwrap()
+        }
+    };
+    save_probe(None).await;
     let invoke = || {
         router_for_role(fixture.state.clone(), RuntimeRole::Control).oneshot(
             Request::post(format!("/internal/v1/upstreams/{account}/health"))
@@ -265,7 +265,7 @@ async fn default_probe_skips_unusable_cheaper_models_and_explicit_alias_stays_sk
     assert_eq!(result["trigger"], "manual");
     assert!(result["request_id"].as_str().is_some());
     let mut config = context.config;
-    config["probe_model"] = json!("cheap-alias");
+    save_probe(Some("cheap-alias")).await;
     sqlx::query("UPDATE upstream_accounts SET config_json=$2 WHERE id=$1")
         .bind(account.to_string())
         .bind(config.to_string())
@@ -317,9 +317,9 @@ async fn default_probe_skips_unusable_cheaper_models_and_explicit_alias_stays_sk
     assert_eq!(reloaded["error_code"], "probe_route_unavailable");
     assert_eq!(reloaded["last_result"]["checked_at"], result["checked_at"]);
     assert_eq!(reloaded["last_result"]["actual_model"], "upstream-0");
-    // A local preparation timeout is not a dispatched probe and cannot
-    // overwrite the real result, even though it is a connection-class error.
-    config["probe_model"] = json!("upstream-0");
+    // A local preparation failure is not a dispatched probe and cannot
+    // overwrite the real result. No artificial request deadline is required.
+    save_probe(Some("upstream-0")).await;
     config["timeout_seconds"] = json!(1);
     sqlx::query("UPDATE upstream_accounts SET config_json=$2 WHERE id=$1")
         .bind(account.to_string())
@@ -327,7 +327,7 @@ async fn default_probe_skips_unusable_cheaper_models_and_explicit_alias_stays_sk
         .execute(&pool)
         .await
         .unwrap();
-    let response = routing::with_stalled_probe_preparation(invoke())
+    let response = routing::with_failed_probe_preparation(invoke())
         .await
         .unwrap();
     let undispatched: Value = serde_json::from_slice(
@@ -455,7 +455,7 @@ async fn default_probe_skips_unusable_cheaper_models_and_explicit_alias_stays_sk
     assert_eq!(timed_out["actual_model"], "upstream-0");
     assert!(timed_out["upstream_status"].is_null());
     assert_eq!(upstream.received_requests().await.unwrap().len(), 1);
-    config["probe_model"] = json!("cny-only");
+    save_probe(Some("cny-only")).await;
     sqlx::query("UPDATE upstream_accounts SET config_json=$2 WHERE id=$1")
         .bind(account.to_string())
         .bind(config.to_string())

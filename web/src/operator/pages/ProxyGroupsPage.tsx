@@ -62,7 +62,7 @@ export function ProxyGroupsPage({ token, tenant, initialAccountId, onBack }: {
       <p className="notice error" role="alert">{accessError}</p>
       <Button appearance="secondary" type="button" onClick={() => void access.reload()}>{copy.retry}</Button>
     </div> : !allowed ? <LoadingState label={copy.checking} variant="compact" /> : <>
-      <TabList selectedValue={tab} aria-label={copy.pageTitle} onTabSelect={(_, data) => {
+      <TabList className="network-proxy-tabs" size="large" selectedValue={tab} aria-label={copy.pageTitle} onTabSelect={(_, data) => {
         if (data.value === 'proxies' || data.value === 'groups' || data.value === 'policies') void selectTab(data.value);
       }}>
         <Tab id={`${prefix}-proxies`} value="proxies" aria-controls={`${prefix}-panel`}>{networkCopy.proxiesTab}</Tab>

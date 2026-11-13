@@ -45,6 +45,9 @@ impl MultipartUpload for TestMultipartUpload {
 pub(super) fn memory_store() -> ArchiveStore {
     ArchiveStore {
         inner: Arc::new(InMemory::new()),
+        training: None,
+        training_cas_writes: false,
+        training_staging_writes: false,
         readiness: Arc::new(tokio::sync::Mutex::new(ReadinessCache::default())),
         readiness_path: path::archive_path("readiness/archive-tests.bin").expect("readiness path"),
         readiness_deadline: Duration::from_secs(5),
@@ -57,6 +60,7 @@ fn test_writer(aborts: Arc<AtomicUsize>, fail_parts: bool) -> ArchiveWriter {
     ArchiveWriter {
         store: Arc::new(InMemory::new()),
         staging: Path::from("staging/test/response.bin"),
+        staging_locator: "staging/test/response.bin".into(),
         inner: Some(object_store::WriteMultipart::new_with_chunk_size(
             Box::new(upload),
             1,

@@ -108,3 +108,32 @@
     min-width: 0;
   }
 }
+
+.network-proxy-tabs {
+  display: flex;
+  gap: 6px;
+  padding: 6px;
+  border: 1px solid var(--colorNeutralStroke1);
+  border-radius: 10px;
+  background: var(--colorNeutralBackground3);
+}
+.network-proxy-tabs [role="tab"] {
+  flex: 1 1 auto;
+  min-height: 48px;
+  justify-content: center;
+  border-radius: 6px;
+  font-weight: 600;
+}
+.network-proxy-tabs [role="tab"][aria-selected="true"] {
+  background: var(--colorBrandBackground);
+  color: var(--colorNeutralForegroundOnBrand);
+  box-shadow: var(--shadow4);
+}
+.network-proxy-tabs [role="tab"][aria-selected="true"] > span { color: inherit; }
+.network-proxy-tabs [role="tab"]:focus-visible { outline: 2px solid var(--colorStrokeFocus2); outline-offset: 2px; }
+.network-proxy-account-list { display: flex; flex-wrap: wrap; gap: 8px; margin-block: 12px 20px; }
+.network-proxy-account-list > button { min-height: 44px; }
+.network-proxy-policy-summary { display: grid; grid-template-columns: repeat(auto-fit, minmax(min(100%, 180px), 1fr)); gap: 12px; margin-block: 12px 20px; }
+.network-proxy-policy-summary > div { min-width: 0; }
+.network-proxy-policy-summary dt { color: var(--colorNeutralForeground2); font-size: 12px; }
+.network-proxy-policy-summary dd { margin: 4px 0 0; overflow-wrap: anywhere; }

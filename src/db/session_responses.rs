@@ -119,19 +119,26 @@ impl Database {
         } else {
             "unavailable"
         };
+        let archived_answer = match answer {
+            Some(answer) => {
+                let encoded = encode_session_response(&answer)
+                    .map_err(|_| AppError::internal("session_response_body_encode"))?;
+                drop(answer);
+                let digest = blake3::hash(encoded.as_bytes()).to_hex().to_string();
+                Some((
+                    digest,
+                    self.store_body_reference(task.tenant_id, encoded).await?,
+                ))
+            }
+            None => None,
+        };
         let mut tx = self.begin_write_transaction().await?;
         let valid: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM session_response_summaries WHERE tenant_id = $1 AND key_id = $2 AND request_id = $3 AND lease_owner = $4 AND lease_until > $5")
             .bind(task.tenant_id.to_string()).bind(task.key_id.to_string()).bind(task.request_id.to_string()).bind(task.owner.to_string()).bind(now).fetch_one(&mut *tx).await?;
         if valid != 1 {
             return Ok(());
         }
-        let atom = if let Some(answer) = answer {
-            let encoded = encode_session_response(&answer)
-                .map_err(|_| AppError::internal("session_responses_finish_session_response_1"))?;
-            // The worker transfers ownership so only the encoded text remains
-            // while SQL creates its driver/native binding buffers.
-            drop(answer);
-            let digest = blake3::hash(encoded.as_bytes()).to_hex().to_string();
+        let atom = if let Some((digest, encoded)) = archived_answer {
             sqlx::query("INSERT INTO semantic_atoms (tenant_id, content_hash, instance_hash, role, kind, content_json, created_at) VALUES ($1, $2, $2, 'assistant', 'response_summary', $3, $4) ON CONFLICT(tenant_id, content_hash) DO NOTHING")
                 .bind(task.tenant_id.to_string()).bind(&digest).bind(encoded).bind(now).execute(&mut *tx).await?;
             Some(digest)
@@ -153,29 +160,29 @@ impl Database {
         atom: &str,
         offset: i64,
     ) -> Result<(String, i64), AppError> {
-        let start = i32::try_from(offset.checked_add(1).ok_or(AppError::NotFound)?)
-            .map_err(|_| AppError::NotFound)?;
-        if start < 1 {
+        if offset < 0 {
             return Err(AppError::NotFound);
         }
-        let text = match self.backend {
-            DatabaseBackend::PostgreSql => "a.content_json::jsonb ->> 'content'",
-            DatabaseBackend::Sqlite => "json_extract(a.content_json, '$.content')",
-        };
-        let sql = format!(
-            "SELECT SUBSTR({text}, $5, 16384) AS text, CAST(LENGTH({text}) AS BIGINT) AS total FROM session_response_summaries r JOIN semantic_atoms a ON a.tenant_id = r.tenant_id AND a.content_hash = r.atom_hash WHERE r.tenant_id = $1 AND r.key_id = $2 AND r.request_id = $3 AND r.atom_hash = $4 AND r.state = 'ready' AND r.session_id = $6"
-        );
-        let row = sqlx::query(sqlx::AssertSqlSafe(sql))
+        let row = sqlx::query(
+            "SELECT a.content_json FROM session_response_summaries r JOIN semantic_atoms a ON a.tenant_id = r.tenant_id AND a.content_hash = r.atom_hash WHERE r.tenant_id = $1 AND r.key_id = $2 AND r.request_id = $3 AND r.atom_hash = $4 AND r.state = 'ready' AND r.session_id = $5"
+        )
             .bind(scope.tenant_id.to_string())
             .bind(scope.key_id.to_string())
             .bind(scope.request_id.to_string())
             .bind(atom)
-            .bind(start)
             .bind(scope.session_id.to_string())
             .fetch_optional(&self.pool)
             .await?
             .ok_or(AppError::NotFound)?;
-        Ok((row.try_get("text")?, row.try_get("total")?))
+        let encoded: String = row.try_get("content_json")?;
+        let body = self.read_body_reference(scope.tenant_id, &encoded).await?;
+        let document: Value = serde_json::from_str(&body)
+            .map_err(|_| AppError::storage("conversation_response_body_invalid"))?;
+        let text = document
+            .get("content")
+            .and_then(Value::as_str)
+            .ok_or_else(|| AppError::storage("conversation_response_text_missing"))?;
+        super::object_bodies::text_slice(text, offset, 16384)
     }
 }
 

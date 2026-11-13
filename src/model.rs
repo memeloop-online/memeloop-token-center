@@ -1146,7 +1146,15 @@ pub struct RequestTransportDiagnosticView {
 }
 
 #[derive(Clone, Debug, Serialize, PartialEq, Eq)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum RequestArchivePreviewView {
+    Stream { bytes: u64 },
+}
+
+#[derive(Clone, Debug, Serialize, PartialEq, Eq)]
 pub struct RequestArchiveSideView {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub preview: Option<RequestArchivePreviewView>,
     pub state: RequestArchiveState,
     pub complete: bool,
     pub reason: Option<String>,
@@ -1714,7 +1722,14 @@ impl GenerationPrice {
         Some(ModelPrice {
             id: self.id,
             input_micros_per_million: 0,
-            output_micros_per_million: self.micros_per_unit.checked_mul(1_000_000)?,
+            output_micros_per_million: if matches!(
+                self.billing_unit.as_str(),
+                "megapixel" | "million_tokens"
+            ) {
+                self.micros_per_unit
+            } else {
+                self.micros_per_unit.checked_mul(1_000_000)?
+            },
             tiers: Vec::new(),
         })
     }
@@ -1779,6 +1794,19 @@ pub enum GenerationAssetSource {
 pub struct GenerationAssetDownload {
     pub view: GenerationAssetView,
     pub source: GenerationAssetSource,
+}
+
+/// Terminal supplier evidence, independent of the customer's settlement.
+/// Missing fields mean unknown, never zero. No signed asset URLs are stored here.
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct GenerationProviderReceipt {
+    pub task_id: String,
+    pub status: String,
+    pub total_tokens: Option<i64>,
+    pub quota: Option<i64>,
+    pub supplier_usd_micros: Option<i64>,
+    pub provider_model_name: Option<String>,
 }
 
 #[derive(Clone, Debug, Serialize)]

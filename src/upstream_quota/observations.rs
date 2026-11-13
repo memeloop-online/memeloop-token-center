@@ -199,6 +199,7 @@ pub(crate) async fn run(state: AppState, mut shutdown: tokio::sync::watch::Recei
         state.config.quota_observation_interval_millis.into(),
     ));
     ticks.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+    let mut last_history_cleanup = 0_i64;
     loop {
         let tick = tokio::select! { biased;
             _ = crate::worker::wait_for_shutdown(&mut shutdown) => return,
@@ -206,9 +207,22 @@ pub(crate) async fn run(state: AppState, mut shutdown: tokio::sync::watch::Recei
         };
         let elapsed = i64::try_from(tick.elapsed().as_millis()).unwrap_or(i64::MAX);
         let tick_at = crate::db::unix_millis().saturating_sub(elapsed);
+        let cleanup_due = tick_at.saturating_sub(last_history_cleanup) >= 60_000;
+        if cleanup_due {
+            last_history_cleanup = tick_at;
+        }
         tokio::select! { biased;
             _ = crate::worker::wait_for_shutdown(&mut shutdown) => return,
-            result = refresh_batch(&state, tick_at) => if let Err(error) = result {
+            result = async {
+                let cleanup = async {
+                    if cleanup_due {
+                        let _ = tokio::time::timeout(Duration::from_millis(100),
+                            state.db.prune_allocation_history(tick_at)).await;
+                    }
+                };
+                let (result, ()) = tokio::join!(refresh_batch(&state, tick_at), cleanup);
+                result
+            } => if let Err(error) = result {
                 tracing::warn!(%error, "quota observation batch failed");
             }
         }
@@ -254,14 +268,21 @@ async fn refresh_batch(state: &AppState, tick_at: i64) -> Result<(), AppError> {
         )
         .await?;
     select_allocation_refreshes(&mut targets);
-    let results = stream::iter(targets)
+    let history_targets = targets
+        .iter()
+        .filter(|target| target.allocation_history)
+        .map(|target| (target.tenant_id, target.account_id))
+        .collect::<Vec<_>>();
+    // History I/O proceeds alongside quota publication with its own bounded background budget.
+    let history = stream::iter(
+        history_targets
+            .into_iter()
+            .map(|(tenant, account)| refresh_history_target(state.clone(), tenant, account)),
+    )
+    .buffer_unordered(2)
+    .collect::<Vec<()>>();
+    let observations = stream::iter(targets)
         .map(|target| async move {
-            if target.allocation_history {
-                let _ = tokio::time::timeout(
-                    Duration::from_millis(100),
-                    state.db.refresh_allocation_usage(target.tenant_id, target.account_id, crate::db::unix_millis()),
-                ).await;
-            }
             let Ok((account, credential)) = state
                 .db
                 .upstream_account_with_credential(
@@ -351,12 +372,29 @@ async fn refresh_batch(state: &AppState, tick_at: i64) -> Result<(), AppError> {
                 .await
         })
         .buffer_unordered(4)
-        .collect::<Vec<Result<(), AppError>>>()
-        .await;
+        .collect::<Vec<Result<(), AppError>>>();
+    let (_, results) = tokio::join!(history, observations);
     for result in results {
         result?;
     }
     Ok(())
+}
+
+async fn refresh_history_target(state: AppState, tenant: Uuid, account: Uuid) {
+    match tokio::time::timeout(
+        Duration::from_secs(2),
+        state
+            .db
+            .refresh_allocation_history(tenant, account, crate::db::unix_millis()),
+    )
+    .await
+    {
+        Ok(Ok(())) => {}
+        _ => tracing::warn!(
+            operation = "allocation_history_refresh",
+            "allocation history refresh deferred"
+        ),
+    }
 }
 
 pub(crate) async fn routing_observations(

@@ -79,7 +79,8 @@ async fn pool_timeout_diagnostics_distinguish_roles_without_exposing_connection_
             .options()
             .clone()
             .acquire_timeout(Duration::from_millis(20))
-            .connect_lazy_with(database.pool.connect_options().as_ref().clone());
+            .connect_lazy_with(database.pool.connect_options().as_ref().clone())
+            .into();
         let mut held = Vec::new();
         for _connection in 0..pool_max {
             held.push(database.pool.acquire().await.unwrap());
@@ -148,15 +149,20 @@ async fn postgres_timeout(database: &Database, setting: &str) -> String {
 }
 
 #[tokio::test]
-async fn postgres_serve_and_migration_pools_have_bounded_session_timeouts() {
+async fn postgres_serve_waits_without_statement_or_lock_deadlines_and_migration_keeps_its_profile()
+{
     let Ok(database_url) = std::env::var("MTC_TEST_POSTGRES_URL") else {
         eprintln!("MTC_TEST_POSTGRES_URL is unset; skipping PostgreSQL pool timeout contract");
         return;
     };
 
     let serve = Database::connect_with_max(&database_url, 1).await.unwrap();
-    assert_eq!(postgres_timeout(&serve, "statement_timeout").await, "30s");
-    assert_eq!(postgres_timeout(&serve, "lock_timeout").await, "10s");
+    assert_eq!(postgres_timeout(&serve, "statement_timeout").await, "0");
+    assert_eq!(postgres_timeout(&serve, "lock_timeout").await, "0");
+    assert_eq!(
+        postgres_timeout(&serve, "client_connection_check_interval").await,
+        "1s"
+    );
     assert_eq!(
         postgres_timeout(&serve, "idle_in_transaction_session_timeout").await,
         "30s"
@@ -170,8 +176,8 @@ async fn postgres_serve_and_migration_pools_have_bounded_session_timeouts() {
     )
     .await
     .expect("persistence must not acquire from the occupied forwarding pool");
-    assert_eq!(timeout, "30s");
-    assert_eq!(postgres_timeout(&persistence, "lock_timeout").await, "10s");
+    assert_eq!(timeout, "0");
+    assert_eq!(postgres_timeout(&persistence, "lock_timeout").await, "0");
     drop(held);
     persistence.close().await;
 
@@ -376,4 +382,180 @@ async fn two_connection_pool_keeps_all_control_pages_bounded_under_concurrent_re
             .into_iter()
             .all(|page| page.expect("control page read succeeds") == 100)
     );
+}
+
+#[tokio::test]
+async fn auxiliary_pool_limit_keeps_independent_pools_and_survives_refresh() {
+    let directory = tempfile::tempdir().unwrap();
+    let database_url = format!(
+        "sqlite://{}?mode=rwc",
+        directory.path().join("auxiliary-pools.db").display()
+    );
+    let database = Database::connect_with_max(&database_url, 2)
+        .await
+        .unwrap()
+        .with_auxiliary_pool_max_connections(1);
+    let mut first = database.independent_persistence_pool_for("raw-persistence");
+    let second = database.independent_persistence_pool_for("routing-persistence");
+    assert_eq!(first.pool.diagnostics().label, "raw-persistence");
+    assert_eq!(second.pool.diagnostics().label, "routing-persistence");
+    assert_eq!(first.pool.options().get_max_connections(), 1);
+    let held = first.pool.acquire().await.unwrap();
+    let other = tokio::time::timeout(Duration::from_secs(1), second.pool.acquire())
+        .await
+        .unwrap()
+        .unwrap();
+    drop(held);
+    drop(other);
+    first.close().await;
+    first.refresh_closed_persistence_pool();
+    assert_eq!(first.pool.diagnostics().label, "raw-persistence");
+    assert_eq!(first.pool.options().get_max_connections(), 1);
+    first.pool.acquire().await.unwrap();
+}
+
+#[tokio::test]
+async fn request_pool_wait_survives_timeout_and_cancels_cleanly() {
+    let directory = tempfile::tempdir().unwrap();
+    let database_url = format!(
+        "sqlite://{}?mode=rwc",
+        directory.path().join("request-pool-wait.db").display()
+    );
+    let mut database = Database::connect_with_max(&database_url, 1).await.unwrap();
+    database.pool = database
+        .pool
+        .options()
+        .clone()
+        .acquire_timeout(Duration::from_millis(20))
+        .connect_lazy_with(database.pool.connect_options().as_ref().clone())
+        .into();
+    // Exercise the PostgreSQL retry policy with a local held connection;
+    // the helper only acquires a slot and does not execute backend SQL.
+    database.backend = super::super::DatabaseBackend::PostgreSql;
+    let held = database.pool.acquire().await.unwrap();
+    assert!(
+        tokio::time::timeout(
+            Duration::from_millis(70),
+            database.acquire_request_connection("test"),
+        )
+        .await
+        .is_err()
+    );
+    drop(held);
+    let connection = tokio::time::timeout(
+        Duration::from_secs(1),
+        database.acquire_request_connection("test"),
+    )
+    .await
+    .unwrap()
+    .unwrap();
+    drop(connection);
+    database.pool.close().await;
+    assert!(matches!(
+        database.acquire_request_connection("test").await,
+        Err(sqlx::Error::PoolClosed)
+    ));
+}
+
+#[tokio::test]
+async fn startup_waits_through_delayed_pool_availability_and_remains_cancellable() {
+    let directory = tempfile::tempdir().unwrap();
+    let database_url = format!(
+        "sqlite://{}?mode=rwc",
+        directory.path().join("startup-wait.db").display()
+    );
+    let database = Database::connect_with_max(&database_url, 1).await.unwrap();
+    let pool: super::super::AnyPool = database
+        .pool
+        .options()
+        .clone()
+        .acquire_timeout(Duration::from_millis(20))
+        .connect_lazy_with(database.pool.connect_options().as_ref().clone())
+        .into();
+    let held = pool.acquire().await.unwrap();
+    assert!(
+        tokio::time::timeout(
+            Duration::from_millis(70),
+            super::super::wait_for_initial_postgres_connection(&pool),
+        )
+        .await
+        .is_err()
+    );
+    let release = tokio::spawn(async move {
+        tokio::time::sleep(Duration::from_millis(70)).await;
+        drop(held);
+    });
+    tokio::time::timeout(
+        Duration::from_secs(1),
+        super::super::wait_for_initial_postgres_connection(&pool),
+    )
+    .await
+    .unwrap()
+    .unwrap();
+    release.await.unwrap();
+    pool.close().await;
+    assert!(matches!(
+        super::super::wait_for_initial_postgres_connection(&pool).await,
+        Err(sqlx::Error::PoolClosed)
+    ));
+}
+
+#[tokio::test]
+async fn postgres_request_lock_wait_exceeds_ten_seconds_and_can_be_cancelled() {
+    let Ok(database_url) = std::env::var("MTC_TEST_POSTGRES_URL") else {
+        return;
+    };
+    let database = Database::connect_with_max(&database_url, 3).await.unwrap();
+    let mut holder = database.pool.acquire().await.unwrap();
+    let mut waiter_connection = database.pool.acquire().await.unwrap();
+    let lock_id = super::super::unix_millis();
+    sqlx::query("SELECT pg_advisory_lock($1)")
+        .bind(lock_id)
+        .execute(&mut *holder)
+        .await
+        .unwrap();
+    let waiter_pid: i32 = sqlx::query_scalar("SELECT pg_backend_pid()")
+        .fetch_one(&mut *waiter_connection)
+        .await
+        .unwrap();
+    let mut waiting = tokio::spawn(async move {
+        let mut connection = waiter_connection;
+        let result = sqlx::query("SELECT pg_advisory_lock($1)")
+            .bind(lock_id)
+            .execute(&mut *connection)
+            .await;
+        connection.finish();
+        result
+    });
+    assert!(
+        tokio::time::timeout(Duration::from_secs(11), &mut waiting)
+            .await
+            .is_err(),
+        "valid remote lock waits must outlive the former ten-second deadline"
+    );
+    waiting.abort();
+    assert!(waiting.await.unwrap_err().is_cancelled());
+    // No pg_cancel_backend intervention: production cancellation closes the
+    // original socket, and the server checks disconnects during the lock wait.
+    tokio::time::timeout(Duration::from_secs(5), async {
+        loop {
+            let present: bool =
+                sqlx::query_scalar("SELECT EXISTS (SELECT 1 FROM pg_stat_activity WHERE pid = $1)")
+                    .bind(waiter_pid)
+                    .fetch_one(&database.pool)
+                    .await
+                    .unwrap();
+            if !present {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    })
+    .await
+    .expect("cancelled read backend must exit while its lock remains held");
+    sqlx::query("SELECT pg_advisory_unlock($1)")
+        .bind(lock_id)
+        .execute(&mut *holder)
+        .await
+        .unwrap();
 }

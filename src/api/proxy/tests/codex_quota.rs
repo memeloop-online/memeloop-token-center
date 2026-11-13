@@ -65,7 +65,7 @@ async fn codex_explicit_quota_rejection_fails_over_and_is_observed_without_admis
 }
 
 #[tokio::test]
-async fn codex_sse_quota_error_with_unknown_consumption_is_never_replayed() {
+async fn codex_sse_quota_after_output_keeps_unknown_consumption_without_replay() {
     let fixture = codex_route_fixture("quota-sse-unknown").await;
     codex_output_limits::enable_provider_default_limits(&fixture).await;
     let upstream = MockServer::start().await;
@@ -75,6 +75,7 @@ async fn codex_sse_quota_error_with_unknown_consumption_is_never_replayed() {
         .respond_with(ResponseTemplate::new(200).set_body_raw(
             concat!(
                 "data: {\"type\":\"response.created\",\"response\":{\"id\":\"quota-unknown\"}}\n\n",
+                "data: {\"type\":\"response.output_text.delta\",\"delta\":\"already generated\"}\n\n",
                 "data: {\"type\":\"response.failed\",\"response\":{\"id\":\"quota-unknown\",\"error\":{\"type\":\"usage_limit_reached\",\"message\":\"fixture private quota\"}}}\n\n"
             ), "text/event-stream"))
         .expect(1).mount(&upstream).await;
@@ -98,7 +99,10 @@ async fn codex_sse_quota_error_with_unknown_consumption_is_never_replayed() {
     )
     .await;
     if let Ok(body) = to_bytes(response.into_body(), MAX_PROXY_RESPONSE_BODY).await {
+        assert!(String::from_utf8_lossy(&body).contains("already generated"));
         assert!(!String::from_utf8_lossy(&body).contains("must not replay"));
     }
+    cancellation::assert_single_unknown_receipt(&fixture, 502, Some("upstream_failed_response"))
+        .await;
     upstream.verify().await;
 }

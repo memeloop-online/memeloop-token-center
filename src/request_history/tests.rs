@@ -3,6 +3,35 @@ use serde_json::json;
 use uuid::Uuid;
 
 #[test]
+fn client_session_filter_reads_request_metadata_and_keeps_tenant_scope() {
+    let tenant_id = Uuid::new_v4();
+    let query = HistoryQuery {
+        scope: HistoryScope::Tenant(tenant_id),
+        from_created_at: Some(1),
+        to_created_at: Some(100),
+        cursor: None,
+        limit: 10,
+        predicates: vec![HistoryPredicate {
+            dimension: Dimension::ClientSessionId,
+            comparison: Comparison::Equals,
+            value: PredicateValue::Text("client-thread' OR 1=1".into()),
+        }],
+    };
+    let sql = query.list_sql().unwrap();
+    assert!(sql.sql.contains("FINAL WHERE tenant_id"));
+    assert!(
+        sql.sql
+            .contains("JSONExtractString(snapshot, 'read_model', 'structure', 'session_id')")
+    );
+    assert!(!sql.sql.contains("OR 1=1"));
+    assert!(
+        sql.parameters
+            .iter()
+            .any(|(_, value)| value == "client-thread' OR 1=1")
+    );
+}
+
+#[test]
 fn latest_state_filters_follow_version_replacement_and_bind_values() {
     let query = HistoryQuery {
         scope: HistoryScope::Key {

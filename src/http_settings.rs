@@ -7,7 +7,7 @@ use std::collections::BTreeMap;
 use serde::{Deserialize, Deserializer, Serialize};
 
 pub use factory::{ClientOptions, HttpClient, HttpClientFactory, HttpClientSource};
-pub(crate) use factory::{HttpSnapshot, scoped};
+pub(crate) use factory::{HttpSnapshot, inference, scoped};
 
 pub(crate) const MAX_SAFE_INTEGER: u64 = 9_007_199_254_740_991;
 

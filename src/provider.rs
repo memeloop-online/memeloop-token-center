@@ -20,11 +20,13 @@ pub(crate) use catalog::{
 };
 pub(crate) use catalog::{ManagedOAuthAdapterBackend, ResolvedManagedOAuthAdapter};
 pub(crate) use codex_agent_profile::CODEX_GENERIC_AGENT_INSTRUCTIONS_V1;
+#[cfg(test)]
+pub(crate) use credential::seal_envelope;
 pub use credential::{
     UpstreamCredential, open_credential, seal_credential, validate_adapter_state, validate_config,
 };
 pub(crate) use credential::{
-    open_envelope, seal_envelope, seal_envelope_with_nonce, validate_codex_proxy_url,
+    open_envelope, seal_envelope_with_nonce, validate_codex_proxy_url,
     validate_oauth_remote_dns_proxy_url, validate_provider_adapter_secret_patch,
     validate_proxy_url,
 };
