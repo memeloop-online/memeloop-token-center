@@ -153,9 +153,12 @@ async fn dense_small_response_is_delivered_once_and_client_body_retains_its_leas
 
 #[tokio::test]
 async fn source_json_memory_counter_has_no_fabricated_ingress_or_route_label() {
-    let fixture = codex_route_fixture("ingress-memory-metrics").await;
-    let held = fixture.state.proxy_memory_budget.reservation();
-    assert!(held.try_grow(fixture.state.config.proxy_memory_budget_bytes as usize, 1));
+    let mut fixture = codex_route_fixture("ingress-memory-metrics").await;
+    // Temporary competition now waits for its owner to release memory. Use an
+    // actually unfulfillable envelope to exercise the JSON rejection metric,
+    // rather than holding every permit forever in this waiting test itself.
+    fixture.state.proxy_memory_budget =
+        std::sync::Arc::new(crate::gateway_body::memory::ProxyMemoryBudget::new(0));
     let request = Request::post("/v1/responses")
         .header(header::AUTHORIZATION, format!("Bearer {}", fixture.key))
         .header(header::CONTENT_TYPE, "application/json")
