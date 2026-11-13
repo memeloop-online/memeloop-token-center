@@ -195,7 +195,7 @@ export function RequestsPage({ token, tenant, writeTenant = tenant, liveEvents, 
     const request = ++sequence.current;
     const currentScope = { token, tenant, filters: nextFilters };
     if (!older) {
-      loadedHistoryIds.current.clear();
+      if (!refresh) loadedHistoryIds.current.clear();
       setFilteredResultsStale(false);
       if (!refresh) { setRequests([]); setHasOlder(false); closeRequestDetail(); }
     }
@@ -208,9 +208,9 @@ export function RequestsPage({ token, tenant, writeTenant = tenant, liveEvents, 
       });
       const latest = scope.current;
       if (controller.signal.aborted || request !== sequence.current || latest.token !== currentScope.token || latest.tenant !== currentScope.tenant || latest.filters !== currentScope.filters) return;
-      const observed = next.requests.map(row => mergeRequestObservations(row, refresh ? requestsRef.current.find(previous => previous.request_id === row.request_id) : undefined));
+      const observed = refresh ? mergeRefreshedRequestPage(requestsRef.current, next, loadedHistoryIds.current.size > 0) : next.requests;
       if (!older && !typedFiltersActive(nextFilters)) {
-        const page = mergeBatchedRequestPage(observed, new Map(liveEventsRef.current), next.next_cursor !== null);
+        const page = mergeBatchedRequestPage(observed, new Map(liveEventsRef.current), next.next_cursor !== null, loadedHistoryIds.current);
         setRequests(page.requests); setHasOlder(page.hasOlder);
       } else {
         if (older) for (const request of next.requests) loadedHistoryIds.current.add(request.request_id);
@@ -467,7 +467,7 @@ export function RequestsPage({ token, tenant, writeTenant = tenant, liveEvents, 
       onApply={(next) => { setFilters(next); scope.current = { token, tenant, filters: next }; void load(next); }}
       onClear={() => { setFilters(emptyTypedFilterAst); scope.current = { token, tenant, filters: emptyTypedFilterAst }; void load(emptyTypedFilterAst); }}
       onLoadOlder={() => void load(filters, true)} onRefreshFilteredResults={() => void load(filters, false, true)} onSelect={selectRequest} onOpenSessions={onOpenSessions} onOpenSession={openSession} onOpenGenerations={onOpenGenerations} />
-    {detail && <RequestDrawer token={token} tenant={tenant} detail={detail} upstreamName={upstreams.find((account) => account.id === detail.upstream_account_id)?.name} accountNames={new Map(upstreams.map(account => [account.id, account.name]))} onOpenSession={openSession} onClose={closeRequestDetail} />}
+    {detail && <RequestDrawer token={token} tenant={tenant} detail={detail} upstreamName={upstreams.find((account) => account.id === detail.upstream_account_id)?.name} accountNames={new Map(upstreams.map(account => [account.id, account.name]))} onOpenSession={openSession} onRefresh={() => void load(filters, false, true)} refreshing={loading} onClose={closeRequestDetail} />}
   </PageLoadingRegion>;
 }
 
@@ -527,12 +527,13 @@ function RequestsPanel({ requests, upstreams, filters, loading, hasOlder, stream
   </article>;
 }
 
-function RequestDrawer({ token, tenant, detail, upstreamName, accountNames, onOpenSession, onClose }: { token: string; tenant: string; detail: RequestDetail; upstreamName?: string; accountNames: ReadonlyMap<string, string>; onOpenSession: (sessionId: string, keyId?: string, requestId?: string) => void; onClose: () => void }) {
+function RequestDrawer({ token, tenant, detail, upstreamName, accountNames, onOpenSession, onRefresh, refreshing, onClose }: { token: string; tenant: string; detail: RequestDetail; upstreamName?: string; accountNames: ReadonlyMap<string, string>; onOpenSession: (sessionId: string, keyId?: string, requestId?: string) => void; onRefresh: () => void; refreshing: boolean; onClose: () => void }) {
   const { locale, t } = useI18n();
   const [technicalOpen, setTechnicalOpen] = useState(false);
   const technicalId = useId();
   const parent = useSessionParentLabel(tenant, token, detail.credential_identity?.key_id, detail.session_context?.association === 'confirmed' ? detail.session_context.session_id : null, session => session.session_name?.trim() || unnamedSessionName(t, locale, session.last_activity_at, credentialDisplayName(session.key_alias, t), true));
   return <DrawerFrame title={detail.model} eyebrow={t('request.operatorDiagnosis')} onClose={onClose}>
+    <Button appearance="secondary" disabled={refreshing} onClick={onRefresh}>{t('usage.refresh')}</Button>
     <RequestDiagnostics request={detail} onOpenSession={onOpenSession} upstreamName={upstreamName} sessionParent={parent ? { label: parent.label, sessionId: parent.identity.session_id, keyId: parent.identity.key_id } : undefined} />
     <RequestEgressDetails attempts={detail.egress_attempts} accountNames={accountNames} />
     <div className="request-diagnostics request-detail-surface request-archive-diagnostics">

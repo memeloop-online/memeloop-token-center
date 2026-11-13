@@ -617,7 +617,7 @@ test('manual refresh updates the selected drawer and row from the same observati
     await page.locator('.drawer').waitFor();
     const detailCalls = await page.evaluate(() => window.requestLifecycleFixture.detailCalls);
     await page.evaluate(() => window.requestLifecycleFixture.observe());
-    await page.locator('.traffic-heading-actions').getByRole('button', { name: 'Refresh', exact: true }).click();
+    await page.locator('.drawer').getByRole('button', { name: 'Refresh', exact: true }).click();
     await row.getByText('Late recorded session', { exact: true }).waitFor();
     await page.locator('.drawer').getByText('Late recorded session', { exact: true }).waitFor();
     assert.equal(await page.locator('.drawer').count(), 1);
