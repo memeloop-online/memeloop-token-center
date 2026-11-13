@@ -48,6 +48,40 @@ impl RequestPool {
             .map(|connection| RequestConnection::new(connection, self.backend))
     }
 
+    // Pool timeout means no application SQL was sent. Direct Executor callers
+    // need the same cancellable PostgreSQL wait as auth/write acquisition;
+    // retrying an executing query here would risk duplicate financial writes.
+    async fn acquire_for_executor(&self) -> Result<RequestConnection, sqlx::Error> {
+        let started = tokio::time::Instant::now();
+        let mut timeouts = 0_u64;
+        loop {
+            match self.acquire().await {
+                Err(sqlx::Error::PoolTimedOut)
+                    if matches!(self.backend, DatabaseBackend::PostgreSql) =>
+                {
+                    timeouts += 1;
+                    if timeouts == 1 || timeouts.is_multiple_of(6) {
+                        tracing::warn!(
+                            operation = "executor_acquire",
+                            request_id = crate::api::current_proxy_request_id()
+                                .map(|id| id.to_string())
+                                .as_deref()
+                                .unwrap_or("absent"),
+                            phase = "acquire",
+                            error_kind = "pool_timeout",
+                            elapsed_ms = started.elapsed().as_millis() as u64,
+                            pool_max = self.options().get_max_connections(),
+                            pool_size = self.size(),
+                            pool_idle = self.num_idle(),
+                            "waiting for PostgreSQL executor connection before sending SQL"
+                        );
+                    }
+                }
+                result => return result,
+            }
+        }
+    }
+
     pub(crate) async fn begin(&self) -> Result<Transaction<'static, Any>, sqlx::Error> {
         Transaction::begin(self.acquire().await?.into_pool(), None).await
     }
@@ -100,7 +134,7 @@ impl<'pool> Executor<'pool> for &'pool RequestPool {
         let (sender, mut receiver) = tokio::sync::mpsc::channel(1);
         let mut producer = Some(Box::pin(async move {
             let result = async {
-                let mut connection = self.acquire().await?;
+                let mut connection = self.acquire_for_executor().await?;
                 {
                     let mut rows = (&mut *connection).fetch_many(query);
                     while let Some(row) = rows.try_next().await? {
@@ -136,7 +170,7 @@ impl<'pool> Executor<'pool> for &'pool RequestPool {
         E: 'q + Execute<'q, Any>,
     {
         Box::pin(async move {
-            let mut connection = self.acquire().await?;
+            let mut connection = self.acquire_for_executor().await?;
             let row = (&mut *connection).fetch_optional(query).await?;
             connection.finish();
             Ok(row)
@@ -152,10 +186,134 @@ impl<'pool> Executor<'pool> for &'pool RequestPool {
         'pool: 'e,
     {
         Box::pin(async move {
-            let mut connection = self.acquire().await?;
+            let mut connection = self.acquire_for_executor().await?;
             let statement = (&mut *connection).prepare_with(sql, parameters).await?;
             connection.finish();
             Ok(statement)
         })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use sqlx::Row;
+    use std::time::Duration;
+
+    async fn held_test_pool() -> (RequestPool, RequestConnection) {
+        sqlx::any::install_default_drivers();
+        let inner = AnyPoolOptions::new()
+            .max_connections(1)
+            .acquire_timeout(Duration::from_millis(20))
+            .connect("sqlite::memory:")
+            .await
+            .unwrap();
+        let mut pool = RequestPool::from(inner);
+        sqlx::query("CREATE TABLE executions (n BIGINT NOT NULL)")
+            .execute(&pool)
+            .await
+            .unwrap();
+        sqlx::query("INSERT INTO executions VALUES (0)")
+            .execute(&pool)
+            .await
+            .unwrap();
+        // Exercise only the PostgreSQL pre-SQL waiting policy on a real held
+        // pool slot; SQL itself stays portable and no PostgreSQL is simulated.
+        pool.backend = DatabaseBackend::PostgreSql;
+        let held = pool.acquire().await.unwrap();
+        (pool, held)
+    }
+
+    #[tokio::test]
+    async fn executor_waits_past_acquire_timeouts_then_executes_only_once() {
+        for operation in ["many", "optional", "prepare"] {
+            let (pool, mut held) = held_test_pool().await;
+            let client = pool.clone();
+            let mut pending = tokio::spawn(async move {
+                match operation {
+                    "many" => {
+                        let rows = sqlx::query("UPDATE executions SET n = n + 1 RETURNING n")
+                            .fetch_all(&client)
+                            .await
+                            .unwrap();
+                        assert_eq!(rows.len(), 1);
+                        assert_eq!(rows[0].get::<i64, _>("n"), 1);
+                    }
+                    "optional" => {
+                        let row = sqlx::query("UPDATE executions SET n = n + 1 RETURNING n")
+                            .fetch_optional(&client)
+                            .await
+                            .unwrap()
+                            .unwrap();
+                        assert_eq!(row.get::<i64, _>("n"), 1);
+                    }
+                    _ => {
+                        client.prepare("SELECT n FROM executions").await.unwrap();
+                    }
+                }
+            });
+            assert!(
+                tokio::time::timeout(Duration::from_millis(70), &mut pending)
+                    .await
+                    .is_err()
+            );
+            assert_eq!(
+                sqlx::query_scalar::<_, i64>("SELECT n FROM executions")
+                    .fetch_one(&mut *held)
+                    .await
+                    .unwrap(),
+                0
+            );
+            held.return_to_pool().await;
+            tokio::time::timeout(Duration::from_secs(2), pending)
+                .await
+                .unwrap()
+                .unwrap();
+            let actual: i64 = sqlx::query_scalar("SELECT n FROM executions")
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+            assert_eq!(actual, if operation == "prepare" { 0 } else { 1 });
+            pool.close().await;
+        }
+    }
+
+    #[tokio::test]
+    async fn cancelled_executor_wait_sends_no_sql_and_closed_pool_is_not_retried() {
+        let (pool, mut held) = held_test_pool().await;
+        let client = pool.clone();
+        let mut pending = tokio::spawn(async move {
+            sqlx::query("UPDATE executions SET n = n + 1")
+                .execute(&client)
+                .await
+        });
+        assert!(
+            tokio::time::timeout(Duration::from_millis(70), &mut pending)
+                .await
+                .is_err()
+        );
+        pending.abort();
+        assert!(pending.await.unwrap_err().is_cancelled());
+        assert_eq!(
+            sqlx::query_scalar::<_, i64>("SELECT n FROM executions")
+                .fetch_one(&mut *held)
+                .await
+                .unwrap(),
+            0
+        );
+        held.return_to_pool().await;
+        assert!(matches!(
+            sqlx::query("SELECT nonexistent FROM executions")
+                .fetch_optional(&pool)
+                .await,
+            Err(sqlx::Error::Database(_))
+        ));
+        pool.close().await;
+        assert!(matches!(
+            sqlx::query("SELECT n FROM executions")
+                .fetch_optional(&pool)
+                .await,
+            Err(sqlx::Error::PoolClosed)
+        ));
     }
 }
