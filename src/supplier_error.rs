@@ -1,6 +1,5 @@
 use serde::{Deserialize, Serialize};
 
-const MAX_INLINE_JSON_BYTES: usize = 128 * 1024;
 mod reason;
 pub(crate) use reason::SafeReason;
 
@@ -18,6 +17,8 @@ pub struct SupplierError {
     pub provider_code: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub provider_message: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub provider_details: Option<serde_json::Value>,
 }
 
 #[derive(Deserialize)]
@@ -38,6 +39,8 @@ struct InlineError<'a> {
     mtc_provider_code: Option<&'a str>,
     #[serde(default)]
     mtc_provider_message: Option<&'a str>,
+    #[serde(default)]
+    mtc_provider_details: Option<serde_json::Value>,
 }
 
 impl SafeReason {
@@ -77,6 +80,7 @@ impl SafeReason {
             action: self.action().to_owned(),
             provider_code: None,
             provider_message: None,
+            provider_details: None,
         }
     }
 }
@@ -99,9 +103,6 @@ pub(crate) fn supplier_error_from_record(
 
 pub fn supplier_error_from_inline_json(value: Option<&str>) -> Option<SupplierError> {
     let value = value?;
-    if value.len() > MAX_INLINE_JSON_BYTES {
-        return None;
-    }
     let raw = value.strip_prefix("inline-json:")?;
     let envelope: InlineEnvelope<'_> = serde_json::from_str(raw).ok()?;
     let error = envelope.error;
@@ -119,9 +120,11 @@ pub fn supplier_error_from_inline_json(value: Option<&str>) -> Option<SupplierEr
             action: "inspect_upstream_error".to_owned(),
             provider_code: None,
             provider_message: None,
+            provider_details: None,
         });
     supplier.provider_code = error.mtc_provider_code.map(str::to_owned);
     supplier.provider_message = error.mtc_provider_message.map(str::to_owned);
+    supplier.provider_details = error.mtc_provider_details;
     Some(supplier)
 }
 
@@ -173,6 +176,7 @@ pub(crate) fn upstream_error_value(value: &serde_json::Value) -> serde_json::Val
         "code": reason.map(SafeReason::client_code).or(code.as_deref()).unwrap_or("upstream_rejected"),
         "message": message,
         "mtc_provider_message": message,
+        "mtc_provider_details": value,
     });
     if let Some(code) = code {
         projected["mtc_provider_code"] = json!(code);
@@ -187,6 +191,19 @@ pub(crate) fn upstream_error_value(value: &serde_json::Value) -> serde_json::Val
 mod tests {
     use super::*;
     use serde_json::json;
+
+    #[test]
+    fn record_details_above_old_inline_limit_preserve_unknown_fields() {
+        let raw = json!({"error":{"code":"provider_future_code","message":"complete", "param":"input", "extension":"x".repeat(140_000)}});
+        let projected = upstream_error_value(&raw);
+        let stored = format!("inline-json:{}", json!({"error":projected}));
+        let supplier = supplier_error_from_inline_json(Some(&stored)).unwrap();
+        assert_eq!(supplier.provider_details, Some(raw));
+        assert_eq!(
+            supplier.provider_code.as_deref(),
+            Some("provider_future_code")
+        );
+    }
 
     #[test]
     fn known_and_unknown_details_survive_http_stream_and_record_projection() {

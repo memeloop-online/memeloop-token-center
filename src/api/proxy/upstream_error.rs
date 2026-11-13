@@ -187,18 +187,31 @@ pub(super) async fn read_rejection(response: UpstreamResponse) -> Rejection {
                 .then_some(RequestTerminalCause::UpstreamHttpStatus),
         };
     }
-    let mut stream = response.bytes_stream();
+    read_response_diagnostic_preserving(response).await.0
+}
+
+/// Diagnostic preview only. Return every consumed byte and the unread tail for
+/// the existing raw archive owner; preview bounds never bound the archive.
+pub(super) async fn read_response_diagnostic_preserving(
+    response: UpstreamResponse,
+) -> (Rejection, UpstreamResponse) {
+    let status = response.status();
+    let mut parts = response.into_parts();
+    parts.stream = Box::pin(parts.stream.fuse());
+    let mut prefetched = Vec::new();
     let mut body = Vec::new();
     let read = async {
         loop {
-            match stream.next().await {
+            match parts.stream.next().await {
                 Some(Ok(chunk)) if chunk.len() <= MAX_ERROR_BYTES.saturating_sub(body.len()) => {
+                    prefetched.push(Ok(chunk.clone()));
                     body.extend_from_slice(&chunk);
                     if chunk.is_empty() {
                         tokio::task::yield_now().await;
                     }
                 }
                 Some(Ok(chunk)) => {
+                    prefetched.push(Ok(chunk.clone()));
                     body.extend_from_slice(&chunk[..MAX_ERROR_BYTES.saturating_sub(body.len())]);
                     body.extend_from_slice(
                         b"\n[MTC: upstream error body truncated at 16384 bytes]",
@@ -206,6 +219,7 @@ pub(super) async fn read_rejection(response: UpstreamResponse) -> Rejection {
                     return (safe_error_body(&body), None);
                 }
                 Some(Err(error)) => {
+                    prefetched.push(Err(error));
                     return (
                         safe_error_body(&body),
                         super::upstream_response::terminal_cause_from_stream_error(error),
@@ -223,10 +237,18 @@ pub(super) async fn read_rejection(response: UpstreamResponse) -> Rejection {
             );
             (safe_error_body(&body), None)
         });
-    Rejection {
+    let rejection = Rejection {
         body,
         terminal_cause: terminal_cause.or(Some(RequestTerminalCause::UpstreamHttpStatus)),
-    }
+    };
+    let original = UpstreamResponse::Prefetched {
+        status: parts.status,
+        headers: parts.headers,
+        version: parts.version,
+        content_length: parts.content_length,
+        stream: Box::pin(futures_util::stream::iter(prefetched).chain(parts.stream)),
+    };
+    (rejection, original)
 }
 
 impl Rejection {
@@ -261,6 +283,25 @@ mod tests {
             );
             assert!(!String::from_utf8_lossy(&rejection.body).contains("private"));
         }
+    }
+
+    #[tokio::test]
+    async fn diagnostic_preview_preserves_full_original_chunks_and_repeated_eof() {
+        let first = Bytes::from(vec![b'x'; MAX_ERROR_BYTES + 1]);
+        let tail = Bytes::from_static(b"complete-provider-tail");
+        let (preview, original) = read_response_diagnostic_preserving(response(
+            StatusCode::BAD_GATEWAY,
+            "text/plain",
+            None,
+            Box::pin(stream::iter([Ok(first.clone()), Ok(tail.clone())])),
+        ))
+        .await;
+        assert!(String::from_utf8_lossy(&preview.body).contains("truncated"));
+        let mut original = original.bytes_stream();
+        assert_eq!(original.next().await, Some(Ok(first)));
+        assert_eq!(original.next().await, Some(Ok(tail)));
+        assert_eq!(original.next().await, None);
+        assert_eq!(original.next().await, None);
     }
 
     #[test]
