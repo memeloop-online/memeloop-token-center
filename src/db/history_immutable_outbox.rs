@@ -488,7 +488,15 @@ impl Database {
             return Ok(());
         }
         let mut transaction = self.pool.begin().await?;
-        let rows=sqlx::query("SELECT revision,source,request_id,tenant_id,key_id,created_at FROM request_history_export WHERE snapshot IS NULL ORDER BY revision LIMIT $1")
+        let lock = if matches!(self.backend, DatabaseBackend::PostgreSql) {
+            " FOR UPDATE SKIP LOCKED"
+        } else {
+            ""
+        };
+        // Source writers update their source row before their AFTER trigger
+        // advances this journal. Hold its revision fence while reading source
+        // rows with plain MVCC SELECTs; never reverse it with source FOR UPDATE.
+        let rows=sqlx::query(sqlx::AssertSqlSafe(format!("SELECT revision,source,request_id,tenant_id,key_id,created_at FROM request_history_export WHERE snapshot IS NULL ORDER BY revision LIMIT $1{lock}")))
             .bind(page_size.clamp(1, 64)).fetch_all(&mut *transaction).await?;
         for row in rows {
             let revision: i64 = row.try_get("revision")?;
@@ -548,11 +556,12 @@ impl Database {
     pub(crate) async fn history_immutable_pending(
         &self,
         page_size: i64,
+        ceiling: Option<i64>,
     ) -> Result<Vec<crate::request_history::HistorySnapshot>, crate::request_history::HistoryError>
     {
         use crate::request_history::{HistoryError, HistoryIdentity, HistorySnapshot};
-        let rows = sqlx::query("SELECT revision,source,request_id,tenant_id,key_id,created_at,snapshot,delivery_snapshot FROM request_history_immutable_outbox ORDER BY revision LIMIT $1")
-            .bind(page_size).fetch_all(&self.pool).await?;
+        let rows = sqlx::query("SELECT revision,source,request_id,tenant_id,key_id,created_at,snapshot,delivery_snapshot FROM request_history_immutable_outbox WHERE revision <= COALESCE($2,9223372036854775807) ORDER BY revision LIMIT $1")
+            .bind(page_size).bind(ceiling).fetch_all(&self.pool).await?;
         let mut snapshots = Vec::with_capacity(rows.len());
         for row in rows {
             let revision: i64 = row.try_get("revision")?;

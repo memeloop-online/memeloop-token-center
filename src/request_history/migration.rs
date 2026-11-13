@@ -15,6 +15,18 @@ use crate::{
 #[derive(Debug, Subcommand)]
 pub enum HistoryCommand {
     Start,
+    /// Cap subsequent delivery revisions; capture continues, quiescence is not proved.
+    FenceDelivery {
+        #[arg(long)]
+        owner: uuid::Uuid,
+    },
+    /// Resume exactly the inspected maintenance fence, preserving all queued work.
+    ResumeDelivery {
+        #[arg(long)]
+        owner: uuid::Uuid,
+        #[arg(long)]
+        epoch: i64,
+    },
     /// Install only free source tables while capture remains off; retry pending tables later.
     Bootstrap,
     /// Validate every installed definition, then atomically enable capture without DDL.
@@ -49,7 +61,18 @@ pub async fn command(config: &Config, command: HistoryCommand) -> Result<Value, 
             "pending": database.history_pending_count().await?,
             "backfill_done": database.history_backfill_done().await?,
             "revision": database.history_revision().await?,
+            "delivery_fence": database.history_delivery_status().await?,
         }));
+    }
+    match &command {
+        HistoryCommand::FenceDelivery { owner } => {
+            return database.history_fence_delivery(*owner).await;
+        }
+        HistoryCommand::ResumeDelivery { owner, epoch } => {
+            database.history_resume_delivery(*owner, *epoch).await?;
+            return database.history_delivery_status().await;
+        }
+        _ => {}
     }
     let database = if matches!(
         &command,
@@ -102,9 +125,18 @@ pub async fn command(config: &Config, command: HistoryCommand) -> Result<Value, 
             database.history_refresh().await?;
         }
         HistoryCommand::Backfill { page_size } => {
+            let lease_database = database
+                .clone()
+                .with_auxiliary_pool_max_connections(1)
+                .independent_persistence_pool();
             while !database.history_backfill_done().await? {
                 database.history_backfill_page(page_size).await?;
-                export_page(&database, &client, page_size).await?;
+                if export_page_with_lease(&database, &lease_database, &client, page_size).await?
+                    == 0
+                    && !database.history_delivery_status().await?["ceiling"].is_null()
+                {
+                    return Err(HistoryError::Changed);
+                }
             }
             drain(&database, &client, page_size).await?;
         }
@@ -114,7 +146,10 @@ pub async fn command(config: &Config, command: HistoryCommand) -> Result<Value, 
             verify(&database, &client).await?;
             database.history_switch(true).await?;
         }
-        HistoryCommand::Rollback | HistoryCommand::Status => unreachable!(),
+        HistoryCommand::Rollback
+        | HistoryCommand::Status
+        | HistoryCommand::FenceDelivery { .. }
+        | HistoryCommand::ResumeDelivery { .. } => unreachable!(),
     }
     Ok(
         json!({"mode": database.history_mode().await?, "pending": database.history_pending_count().await?}),
@@ -126,9 +161,31 @@ pub async fn export_page(
     client: &ClickHouse,
     page_size: i64,
 ) -> Result<usize, HistoryError> {
-    let snapshots = database.history_pending(page_size).await?;
+    let lease_database = database
+        .clone()
+        .with_auxiliary_pool_max_connections(1)
+        .independent_persistence_pool();
+    export_page_with_lease(database, &lease_database, client, page_size).await
+}
+
+async fn export_page_with_lease(
+    database: &Database,
+    lease_database: &Database,
+    client: &ClickHouse,
+    page_size: i64,
+) -> Result<usize, HistoryError> {
+    let (mut lease, ceiling) = lease_database.history_delivery_lease().await?;
+    let snapshots = database.history_pending_through(page_size, ceiling).await?;
+    // If the control socket died before selection, a new fence may have been
+    // installed. Validate it after selection and before sending any CH bytes.
+    if let Some(lease) = lease.as_mut() {
+        sqlx::query("SELECT 1").execute(&mut **lease).await?;
+    }
     client.append(&snapshots).await?;
     database.history_acknowledge(&snapshots).await?;
+    if let Some(lease) = lease {
+        lease.rollback().await?;
+    }
     Ok(snapshots.len())
 }
 
@@ -137,8 +194,16 @@ pub async fn drain(
     client: &ClickHouse,
     page_size: i64,
 ) -> Result<(), HistoryError> {
+    let lease_database = database
+        .clone()
+        .with_auxiliary_pool_max_connections(1)
+        .independent_persistence_pool();
     while database.history_pending_count().await? != 0 {
-        export_page(database, client, page_size).await?;
+        if export_page_with_lease(database, &lease_database, client, page_size).await? == 0 {
+            // A durable fence may leave newer work intentionally undelivered.
+            // Never busy-spin or claim that the complete queue was drained.
+            return Err(HistoryError::Changed);
+        }
     }
     Ok(())
 }
@@ -153,6 +218,10 @@ pub(crate) async fn run_worker(state: AppState, mut shutdown: watch::Receiver<bo
         }
     };
     let database = state.db.independent_persistence_pool();
+    let lease_database = database
+        .clone()
+        .with_auxiliary_pool_max_connections(1)
+        .independent_persistence_pool();
     loop {
         if *shutdown.borrow() {
             return;
@@ -165,7 +234,7 @@ pub(crate) async fn run_worker(state: AppState, mut shutdown: watch::Receiver<bo
                         if database.history_mode().await? == "off" {
                             return Ok::<_, HistoryError>(());
                         }
-                        export_page(&database, client, 500).await?;
+                        export_page_with_lease(&database, &lease_database, client, 500).await?;
                         Ok(())
                     }.await;
                     if result.is_err() {

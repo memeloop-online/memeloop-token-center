@@ -404,6 +404,13 @@ impl Database {
             ));
         }
         let mut transaction = self.pool.begin().await?;
+        if matches!(self.backend, DatabaseBackend::PostgreSql) {
+            // Backfill also allocates global revisions and must participate in
+            // the same commit barrier as source triggers.
+            sqlx::query("SELECT id FROM request_history_state WHERE id=1 FOR SHARE")
+                .execute(&mut *transaction)
+                .await?;
+        }
         let lock = if matches!(self.backend, DatabaseBackend::PostgreSql) {
             " FOR UPDATE"
         } else {
@@ -464,13 +471,21 @@ impl Database {
         &self,
         page_size: i64,
     ) -> Result<Vec<HistorySnapshot>, HistoryError> {
+        self.history_pending_through(page_size, None).await
+    }
+
+    pub(crate) async fn history_pending_through(
+        &self,
+        page_size: i64,
+        ceiling: Option<i64>,
+    ) -> Result<Vec<HistorySnapshot>, HistoryError> {
         self.history_capture_pending(page_size).await?;
-        let immutable = self.history_immutable_pending(page_size).await?;
+        let immutable = self.history_immutable_pending(page_size, ceiling).await?;
         if !immutable.is_empty() {
             return Ok(immutable);
         }
-        let rows = sqlx::query("SELECT revision, source, request_id, tenant_id, key_id, created_at, snapshot FROM request_history_export ORDER BY revision LIMIT $1")
-            .bind(page_size).fetch_all(&self.pool).await?;
+        let rows = sqlx::query("SELECT revision, source, request_id, tenant_id, key_id, created_at, snapshot FROM request_history_export WHERE revision <= COALESCE($2,9223372036854775807) ORDER BY revision LIMIT $1")
+            .bind(page_size).bind(ceiling).fetch_all(&self.pool).await?;
         let mut snapshots = Vec::new();
         for row in rows {
             let revision: i64 = row.try_get("revision")?;

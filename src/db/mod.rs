@@ -68,6 +68,7 @@ mod filter_assistant;
 mod generation;
 mod group_routing;
 mod groups;
+mod history_delivery;
 mod http_settings;
 mod migrations;
 mod monitoring_snapshot;
