@@ -442,6 +442,7 @@ impl Database {
         snapshots: &[HistorySnapshot],
     ) -> Result<(), HistoryError> {
         let mut transaction = self.pool.begin().await?;
+        let mut acknowledged = Vec::new();
         const ACK: &str = "DELETE FROM request_history_export WHERE revision = $1 AND source = $2 AND request_id = $3 AND snapshot = $4";
         for snapshot in snapshots {
             let frozen = serde_json::to_string(snapshot)?;
@@ -451,7 +452,7 @@ impl Database {
             sqlx::query("UPDATE request_history_export SET snapshot=COALESCE(snapshot,$1) WHERE revision=$2 AND source=$3 AND request_id=$4 AND tenant_id=$5 AND key_id=$6 AND EXISTS (SELECT 1 FROM request_history_immutable_outbox i WHERE i.revision=$2 AND i.source=$3 AND i.request_id=$4 AND i.tenant_id=$5 AND i.key_id=$6 AND i.delivery_snapshot=$1)")
                 .bind(&frozen).bind(snapshot.revision).bind(&snapshot.identity.source).bind(snapshot.identity.request_id.to_string()).bind(snapshot.identity.tenant_id.to_string()).bind(snapshot.identity.key_id.to_string())
                 .execute(&mut *transaction).await?;
-            sqlx::query("DELETE FROM request_history_immutable_outbox WHERE revision=$1 AND source=$2 AND request_id=$3 AND tenant_id=$4 AND key_id=$5 AND delivery_snapshot=$6")
+            let immutable_deleted = sqlx::query("DELETE FROM request_history_immutable_outbox WHERE revision=$1 AND source=$2 AND request_id=$3 AND tenant_id=$4 AND key_id=$5 AND delivery_snapshot=$6")
                 .bind(snapshot.revision).bind(&snapshot.identity.source).bind(snapshot.identity.request_id.to_string()).bind(snapshot.identity.tenant_id.to_string()).bind(snapshot.identity.key_id.to_string()).bind(&frozen)
                 .execute(&mut *transaction).await?;
             let deleted = sqlx::query(ACK)
@@ -461,7 +462,9 @@ impl Database {
                 .bind(serde_json::to_string(snapshot)?)
                 .execute(&mut *transaction)
                 .await?;
+            let mut did_ack = immutable_deleted.rows_affected() != 0;
             if deleted.rows_affected() != 0 {
+                acknowledged.push(snapshot.clone());
                 continue;
             }
             // Older frozen JSON may omit a newly defaulted read-model field.
@@ -475,17 +478,21 @@ impl Database {
                 if crate::request_history::canonical_hash(&decoded)?
                     == crate::request_history::canonical_hash(snapshot)?
                 {
-                    sqlx::query(ACK)
+                    let compatible_deleted = sqlx::query(ACK)
                         .bind(snapshot.revision)
                         .bind(&snapshot.identity.source)
                         .bind(snapshot.identity.request_id.to_string())
                         .bind(frozen)
                         .execute(&mut *transaction)
                         .await?;
+                    did_ack |= compatible_deleted.rows_affected() != 0;
                 }
             }
+            if did_ack {
+                acknowledged.push(snapshot.clone());
+            }
         }
-        self.allocation_history_acknowledged(&mut transaction, snapshots)
+        self.allocation_history_acknowledged(&mut transaction, &acknowledged)
             .await?;
         transaction.commit().await?;
         Ok(())

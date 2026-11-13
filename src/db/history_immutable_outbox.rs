@@ -616,7 +616,11 @@ impl Database {
             let stored: Option<String> = sqlx::query_scalar("UPDATE request_history_immutable_outbox SET delivery_snapshot=COALESCE(delivery_snapshot,$1) WHERE revision=$2 AND snapshot=$3 RETURNING delivery_snapshot")
                 .bind(&frozen).bind(revision).bind(&original).fetch_optional(&self.pool).await?;
             if let Some(stored) = stored {
-                snapshots.push(serde_json::from_str(&stored)?);
+                let snapshot: HistorySnapshot = serde_json::from_str(&stored)?;
+                if snapshot.identity != stored_identity || snapshot.revision != revision {
+                    return Err(HistoryError::Invalid("immutable frozen delivery identity"));
+                }
+                snapshots.push(snapshot);
             }
         }
         Ok(snapshots)
@@ -661,10 +665,17 @@ mod tests {
                 .bind(snapshot.revision).bind(&identity.source).bind(identity.request_id.to_string()).bind(identity.tenant_id.to_string()).bind(identity.key_id.to_string()).bind(identity.created_at).bind(serde_json::to_string(snapshot).unwrap())
                 .execute(&db.pool).await.unwrap();
         }
-        // No original request, key or source journal is present.
+        sqlx::query("INSERT INTO request_history_export (revision,source,request_id,tenant_id,key_id,created_at,snapshot) VALUES ($1,$2,$3,$4,$5,$6,$7)")
+            .bind(first.revision).bind(&identity.source).bind(identity.request_id.to_string()).bind(identity.tenant_id.to_string()).bind(identity.key_id.to_string()).bind(identity.created_at).bind(serde_json::to_string(&first).unwrap()).execute(&db.pool).await.unwrap();
+        // The mixed queues count the same global revision only once. No
+        // original request or key exists to reconstruct either delivery.
+        assert_eq!(db.history_pending_count().await.unwrap(), 2);
         let pending = db.history_pending(1).await.unwrap();
         assert_eq!(pending.len(), 1);
         assert_eq!(pending[0].revision, 1);
+        let mut wrong_tenant = first.clone();
+        wrong_tenant.identity.tenant_id = Uuid::now_v7();
+        db.history_acknowledge(&[wrong_tenant]).await.unwrap();
         let mut wrong_key = first.clone();
         wrong_key.identity.key_id = Uuid::now_v7();
         db.history_acknowledge(&[wrong_key]).await.unwrap();

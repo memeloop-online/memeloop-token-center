@@ -850,3 +850,68 @@ async fn request_history_real_services_acceptance() {
         .await
         .unwrap();
 }
+
+#[tokio::test]
+async fn sqlite_immutable_history_late_conversation_revision_survives_stale_ack() {
+    let directory = tempfile::tempdir().unwrap();
+    let database = Database::connect(&format!(
+        "sqlite://{}?mode=rwc",
+        directory.path().join("late-history.db").display()
+    ))
+    .await
+    .unwrap();
+    database.migrate().await.unwrap();
+    database.history_start().await.unwrap();
+    let (key, request_id, _) = seed(&database).await;
+    let initial = database.history_pending(500).await.unwrap();
+    let initial_revision = initial
+        .iter()
+        .filter(|snapshot| snapshot.identity.source == "native")
+        .map(|snapshot| snapshot.revision)
+        .max()
+        .unwrap();
+    database.history_acknowledge(&initial).await.unwrap();
+    assert_eq!(database.history_pending_count().await.unwrap(), 0);
+    let cluster = database
+        .record_conversation_observation(
+            &key,
+            request_id,
+            &serde_json::json!({"messages":[{"role":"user","content":"fixture"}]}),
+            &crate::conversation::ConversationHints {
+                session_id: Some("late-immutable-session".into()),
+                session_name: Some("late immutable name".into()),
+                compaction: true,
+                ..Default::default()
+            },
+            None,
+        )
+        .await
+        .unwrap();
+    let corrected = database.history_pending(500).await.unwrap();
+    let native = corrected
+        .iter()
+        .find(|snapshot| snapshot.identity.source == "native")
+        .unwrap();
+    assert!(native.revision > initial_revision);
+    assert_eq!(
+        native.payload.as_ref().unwrap()["session_context"]["session_id"],
+        cluster.to_string()
+    );
+    assert_eq!(
+        native.payload.as_ref().unwrap()["session_context"]["compaction"],
+        true
+    );
+    let corrected_hash = crate::request_history::canonical_hash(native).unwrap();
+    database.history_acknowledge(&initial).await.unwrap();
+    let replay = database.history_pending(500).await.unwrap();
+    let native_replay = replay
+        .iter()
+        .find(|snapshot| snapshot.identity.source == "native")
+        .unwrap();
+    assert_eq!(
+        crate::request_history::canonical_hash(native_replay).unwrap(),
+        corrected_hash
+    );
+    database.history_acknowledge(&replay).await.unwrap();
+    assert_eq!(database.history_pending_count().await.unwrap(), 0);
+}
