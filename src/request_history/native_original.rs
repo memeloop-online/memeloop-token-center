@@ -156,8 +156,8 @@ fn validate(
     Ok(())
 }
 
-/// Only scalar business differences are stored. Field names preserve the exact
-/// source shape (including future NULL columns), not another canonical payload.
+/// Encode only business differences. The async materializer selects inline
+/// metadata or rooted CAS; both preserve exact future columns and NULL values.
 pub(crate) fn read_model(
     identity: &HistoryIdentity,
     payload: &Value,
@@ -186,18 +186,6 @@ pub(crate) fn read_model(
             .filter(|(name, value)| base.get(*name) != Some(*value))
             .map(|(name, value)| (name.clone(), value.clone()))
             .collect();
-        // Opaque bodies must use the existing CAS/reference path. Refusing an
-        // unrepresented large value preserves the queue/source instead of
-        // silently duplicating it inside the permanent CH snapshot.
-        if delta.values().any(|value| {
-            value.as_str().is_some_and(|value| value.len() > 4096)
-                || value.is_object()
-                || value.is_array()
-        }) {
-            return Err(HistoryError::Invalid(
-                "native original large value requires archive reference",
-            ));
-        }
         rows.insert(name.into(), json!({"columns":original.keys().collect::<Vec<_>>(), "sha256":canonical_hash(original)?, "delta":delta}));
     }
     let fidelity = json!({"version":1,"rows":rows});
@@ -208,6 +196,97 @@ pub(crate) fn read_model(
         }
     }
     Ok(fidelity)
+}
+
+/// Materialization-only: large provenance is kept once in tenant CAS, with
+/// an independently discoverable owner published before delivery can be ACKed.
+/// The threshold selects representation; it never rejects a history value.
+pub(crate) async fn read_model_with_archive(
+    versioned_identity: (&HistoryIdentity, i64),
+    payload: &Value,
+    statistics: Option<&HistoryStatistics>,
+    model: &Value,
+    originals: &Value,
+    archive: Option<&crate::archive::ArchiveStore>,
+) -> Result<Value, HistoryError> {
+    let (identity, revision) = versioned_identity;
+    let fidelity = read_model(identity, payload, statistics, model, originals)?;
+    let encoded = serde_json::to_vec(&fidelity)?;
+    if encoded.len() <= 4096 {
+        return Ok(fidelity);
+    }
+    let archive = archive.ok_or(HistoryError::Unavailable)?;
+    let object = archive
+        .put_tenant_content(identity.tenant_id, bytes::Bytes::from(encoded))
+        .await?;
+    let root = crate::archive::HistoryArchiveRoot {
+        version: 1,
+        tenant_id: identity.tenant_id,
+        key_id: identity.key_id,
+        source: identity.source.clone(),
+        request_id: identity.request_id,
+        created_at: identity.created_at,
+        revision,
+        object,
+    };
+    let location = archive.publish_history_root(&root).await?;
+    let encoded = json!({"version":2,"root_location":location,"root":root});
+    let restored = reconstruct_with_archive(
+        (identity, revision),
+        payload,
+        statistics,
+        model,
+        &encoded,
+        archive,
+    )
+    .await?;
+    for (name, terminal) in [("request", false), ("terminal", true)] {
+        if restored[name] != business_row(&originals[name], terminal)? {
+            return Err(HistoryError::Mismatch);
+        }
+    }
+    Ok(encoded)
+}
+
+pub(crate) async fn reconstruct_with_archive(
+    versioned_identity: (&HistoryIdentity, i64),
+    payload: &Value,
+    statistics: Option<&HistoryStatistics>,
+    model: &Value,
+    fidelity: &Value,
+    archive: &crate::archive::ArchiveStore,
+) -> Result<Value, HistoryError> {
+    let (identity, revision) = versioned_identity;
+    if fidelity["version"].as_i64() == Some(1) {
+        return reconstruct(identity, payload, statistics, model, fidelity);
+    }
+    if fidelity["version"].as_i64() != Some(2) {
+        return Err(HistoryError::Mismatch);
+    }
+    let root: crate::archive::HistoryArchiveRoot =
+        serde_json::from_value(fidelity["root"].clone())?;
+    if root.tenant_id != identity.tenant_id
+        || root.key_id != identity.key_id
+        || root.source != identity.source
+        || root.request_id != identity.request_id
+        || root.created_at != identity.created_at
+        || root.revision != revision
+        || fidelity["root_location"].as_str() != Some(root.location()?.as_str())
+    {
+        return Err(HistoryError::Mismatch);
+    }
+    let location = root.location()?;
+    let expected = serde_json::to_vec(&root)?;
+    let actual = archive.get_bounded(&location, expected.len()).await?;
+    if crate::archive::ArchiveStore::read_history_root_bytes(&location, &actual)? != root {
+        return Err(HistoryError::Mismatch);
+    }
+    let maximum = usize::try_from(root.object.size_bytes).map_err(|_| HistoryError::Mismatch)?;
+    let bytes = archive
+        .get_tenant_content(identity.tenant_id, &root.object, maximum)
+        .await?;
+    let decoded = serde_json::from_slice(&bytes)?;
+    reconstruct(identity, payload, statistics, model, &decoded)
 }
 
 pub(crate) fn reconstruct(
@@ -271,6 +350,68 @@ mod tests {
     use super::*;
     use uuid::Uuid;
 
+    #[tokio::test]
+    async fn request_history_native_large_delta_uses_durable_cas_without_a_value_limit() {
+        let identity = HistoryIdentity {
+            source: "native".into(),
+            request_id: Uuid::now_v7(),
+            tenant_id: Uuid::now_v7(),
+            key_id: Uuid::now_v7(),
+            created_at: 42,
+        };
+        let payload = json!({"model":"fixture","status_code":200});
+        let model = json!({"archive":{}});
+        let originals = json!({"request":{"id":identity.request_id,"tenant_id":identity.tenant_id,
+            "key_id":identity.key_id,"created_at":42,"status_code":202,
+            "future":{"nested":[null,0,"x".repeat(16384)]}},"terminal":null});
+        let archive = crate::archive::ArchiveStore::memory_for_test();
+        assert!(
+            read_model_with_archive((&identity, 7), &payload, None, &model, &originals, None)
+                .await
+                .is_err()
+        );
+        let encoded = read_model_with_archive(
+            (&identity, 7),
+            &payload,
+            None,
+            &model,
+            &originals,
+            Some(&archive),
+        )
+        .await
+        .unwrap();
+        assert_eq!(encoded["version"], 2);
+        let replay = read_model_with_archive(
+            (&identity, 7),
+            &payload,
+            None,
+            &model,
+            &originals,
+            Some(&archive),
+        )
+        .await
+        .unwrap();
+        assert_eq!(encoded, replay);
+        assert_eq!(
+            reconstruct_with_archive((&identity, 7), &payload, None, &model, &encoded, &archive)
+                .await
+                .unwrap(),
+            originals
+        );
+        assert!(
+            reconstruct_with_archive((&identity, 8), &payload, None, &model, &encoded, &archive)
+                .await
+                .is_err()
+        );
+        let mut wrong = identity.clone();
+        wrong.key_id = Uuid::now_v7();
+        assert!(
+            reconstruct_with_archive((&wrong, 7), &payload, None, &model, &encoded, &archive)
+                .await
+                .is_err()
+        );
+    }
+
     #[test]
     fn request_history_native_business_delta_preserves_raw_money_status_and_unknown() {
         let identity = HistoryIdentity {
@@ -318,6 +459,10 @@ mod tests {
         assert!(reconstruct(&wrong_identity, &payload, None, &model, &encoded).is_err());
         let mut large = originals.clone();
         large["request"]["future_blob"] = json!("x".repeat(4097));
-        assert!(read_model(&identity, &payload, None, &model, &large).is_err());
+        let large_encoded = read_model(&identity, &payload, None, &model, &large).unwrap();
+        assert_eq!(
+            reconstruct(&identity, &payload, None, &model, &large_encoded).unwrap()["request"]["future_blob"],
+            large["request"]["future_blob"]
+        );
     }
 }

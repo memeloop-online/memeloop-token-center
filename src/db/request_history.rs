@@ -774,13 +774,15 @@ impl Database {
             && let Some(payload) = &payload
         {
             let originals = self.history_native_business_originals(&identity).await?;
-            let fidelity = crate::request_history::native_original::read_model(
-                &identity,
+            let fidelity = crate::request_history::native_original::read_model_with_archive(
+                (&identity, revision),
                 payload,
                 statistics.as_ref(),
                 &read_model,
                 &originals,
-            )?;
+                self.archive.as_ref(),
+            )
+            .await?;
             read_model["native_original"] = fidelity;
         }
         Ok(HistorySnapshot {
