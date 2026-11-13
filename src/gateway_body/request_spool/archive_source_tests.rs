@@ -316,3 +316,65 @@ async fn archive_source_keys_match_the_existing_typed_cleanup_prefix() {
         Bytes::from_static(b"{}")
     );
 }
+
+#[tokio::test]
+async fn qualified_request_source_streams_to_training_and_cleans_only_its_object() {
+    let directory = tempfile::tempdir().unwrap();
+    let archive = crate::archive::ArchiveStore::training_staging_memory_for_test();
+    let admission =
+        RequestSpoolAdmission::new(directory.path().to_owned()).with_archive(archive.clone());
+    let budget = ProxyMemoryBudget::new(512 * 1024);
+    let memory = budget.reservation();
+    let request_id = uuid::Uuid::now_v7();
+    let body = Bytes::from(vec![b'x'; 128 * 1024]);
+    let source = admission
+        .capture_with_memory(
+            Body::from(body.clone()),
+            body.len(),
+            Some(body.len()),
+            Some(&memory),
+            0,
+            Some(&request_id.to_string()),
+        )
+        .await
+        .unwrap();
+    let locator = source.object_locator().unwrap().to_owned();
+    assert!(locator.starts_with(&format!("stores/staging/{}/", "a".repeat(64))));
+    assert_eq!(source_request_id(&locator), Some(request_id));
+    assert!(source.upload_outcome().await);
+    assert_eq!(archive.get(&locator).await.unwrap(), body);
+    let bare = request_body_object_key(&request_id.to_string()).unwrap();
+    assert!(archive.get(&bare).await.is_err(), "no legacy source copy");
+    source.release_retained();
+    assert_eq!(source.read_all().await.unwrap(), body);
+    let typed = request_body_staging_key(&locator).unwrap();
+    let neighbour = format!("{}/neighbour.json", typed.canonical_prefix());
+    archive
+        .put(&neighbour, Bytes::from_static(b"keep"))
+        .await
+        .unwrap();
+    drop(source);
+    tokio::time::timeout(Duration::from_secs(5), async {
+        while archive.source_object_exists(&locator).await.unwrap() {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .unwrap();
+    assert_eq!(
+        archive.get(&neighbour).await.unwrap(),
+        Bytes::from_static(b"keep")
+    );
+}
+
+#[test]
+fn request_source_identity_accepts_only_the_exact_legacy_or_qualified_body() {
+    let request_id = uuid::Uuid::now_v7();
+    let bare = request_body_object_key(&request_id.to_string()).unwrap();
+    let qualified = format!("stores/staging/{}/{bare}", "a".repeat(64));
+    assert_eq!(source_request_id(&bare), Some(request_id));
+    assert_eq!(source_request_id(&qualified), Some(request_id));
+    assert!(source_request_id(&format!("stores/staging/z/{bare}")).is_none());
+    assert!(source_request_id(&format!("stores/staging/{}/{qualified}", "a".repeat(64))).is_none());
+    assert!(source_request_id(&qualified.replace("body.json", "other.json")).is_none());
+}
