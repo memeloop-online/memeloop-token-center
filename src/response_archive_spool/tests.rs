@@ -8,6 +8,62 @@ use crate::{AppState, config::Config, db::ArchiveSpoolIdentity};
 const PEPPER: &[u8] = b"existing-test-pepper-over-thirty-two-bytes";
 
 #[tokio::test]
+async fn original_stream_capture_uses_selected_backend_without_legacy_body_copy() {
+    for training in [false, true] {
+        let (_directory, mut state, pool, identity) = fixture().await;
+        if training {
+            state.archive = crate::archive::ArchiveStore::training_staging_memory_for_test();
+            state.db = state.db.clone().with_archive(state.archive.clone());
+            state.persistence_db = state
+                .persistence_db
+                .clone()
+                .with_archive(state.archive.clone());
+        }
+        let body = Bytes::from(vec![b'x'; super::CHUNK_BYTES + 17]);
+        let mut producer = ResponseArchiveProducer::begin_original(&state, identity)
+            .await
+            .unwrap();
+        assert!(producer.append_with_backpressure(body.clone()).await);
+        producer.seal().unwrap().wait().await;
+        let object = state
+            .archive
+            .raw_capture_reference(identity.tenant_id, identity.request_id, "response")
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            object.object_locator.starts_with("stores/training/"),
+            training
+        );
+        assert_eq!(object.size_bytes, body.len() as u64);
+        assert_eq!(
+            object.blake3_digest,
+            blake3::hash(&body).to_hex().to_string()
+        );
+        assert_eq!(
+            state
+                .archive
+                .get_tenant_content(identity.tenant_id, &object, body.len())
+                .await
+                .unwrap(),
+            body
+        );
+        if training {
+            let bare = object.object_locator.splitn(4, '/').nth(3).unwrap();
+            assert!(state.archive.head_size(bare).await.is_err());
+        }
+        let chunks: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM response_archive_spool_chunks")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        assert_eq!(
+            chunks, 0,
+            "raw stream must not duplicate the body into SQL chunks"
+        );
+    }
+}
+
+#[tokio::test]
 async fn object_capture_recovers_a_completed_request_without_a_response_locator() {
     let capture_directory = tempfile::tempdir().unwrap();
     let configured = capture_directory
