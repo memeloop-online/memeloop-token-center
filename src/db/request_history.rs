@@ -727,7 +727,7 @@ impl Database {
         } else {
             None
         };
-        let read_model = if let Some(payload) = &payload {
+        let mut read_model = if let Some(payload) = &payload {
             let mut archive = self
                 .source_request_archive_refs(identity.key_id, identity.request_id)
                 .await?;
@@ -770,6 +770,19 @@ impl Database {
         } else {
             Value::Null
         };
+        if identity.source == "native"
+            && let Some(payload) = &payload
+        {
+            let originals = self.history_native_business_originals(&identity).await?;
+            let fidelity = crate::request_history::native_original::read_model(
+                &identity,
+                payload,
+                statistics.as_ref(),
+                &read_model,
+                &originals,
+            )?;
+            read_model["native_original"] = fidelity;
+        }
         Ok(HistorySnapshot {
             identity,
             revision,

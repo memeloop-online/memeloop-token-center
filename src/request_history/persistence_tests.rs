@@ -1436,3 +1436,160 @@ async fn request_history_real_services_acceptance_event_original_survives_ack_an
         .unwrap();
     admin.close().await;
 }
+
+#[tokio::test]
+#[ignore = "existing CI supplies real PostgreSQL and ClickHouse services"]
+async fn request_history_real_services_acceptance_native_original_survives_ack_and_source_removal()
+{
+    let postgres = std::env::var("MTC_TEST_POSTGRES_URL").unwrap();
+    let endpoint = std::env::var("MTC_TEST_CLICKHOUSE_URL").unwrap();
+    let admin = sqlx::PgPool::connect(&postgres).await.unwrap();
+    for terminal_case in [false, true] {
+        let schema = format!("history_native_original_{}", Uuid::now_v7().simple());
+        sqlx::query(sqlx::AssertSqlSafe(format!("CREATE SCHEMA {schema}")))
+            .execute(&admin)
+            .await
+            .unwrap();
+        let mut isolated = url::Url::parse(&postgres).unwrap();
+        isolated
+            .query_pairs_mut()
+            .append_pair("options", &format!("-csearch_path={schema}"));
+        let database = Database::connect(isolated.as_str()).await.unwrap();
+        database.migrate().await.unwrap();
+        database.history_start().await.unwrap();
+        let (_, request_id, _) = seed(&database).await;
+        if terminal_case {
+            finish(&database, request_id).await;
+            // A real non-null terminal row exercises every business column of the
+            // deployed schema, including raw values that differ from request view.
+            sqlx::query("INSERT INTO terminal_projection_outbox (request_id,reservation_id,tenant_id,key_id,account_id,created_at,completed_at,model,protocol,status_code,error_code,upstream_account_id,model_route_id,duration_ms,input_tokens,output_tokens,cached_input_tokens,cache_write_tokens,cache_known_read_tokens,cache_known_input_tokens,generation_units,billing_unit,service_tier,currency,cost_micros,usage_basis,session_id,terminal_cause_code,response_object,account_projected_at) SELECT id,reservation_id,tenant_id,key_id,$1,created_at,completed_at,model,protocol,202,'raw-terminal',COALESCE(upstream_account_id,''),COALESCE(model_route_id,''),21,0,5,0,0,0,0,0,'','default','EUR',19,'provider_reported','raw-session','normal_stop',response_object,999 FROM request_records WHERE id=$2")
+            .bind(Uuid::now_v7().to_string()).bind(request_id.to_string()).execute(&database.pool).await.unwrap();
+        }
+        let snapshots = native_pending(&database).await;
+        if !terminal_case {
+            assert_eq!(snapshots.len(), 1);
+        }
+        let native = snapshots
+            .iter()
+            .max_by_key(|snapshot| snapshot.revision)
+            .unwrap()
+            .clone();
+        let mut expected = database
+            .history_native_business_originals(&native.identity)
+            .await
+            .unwrap();
+        assert_eq!(expected["terminal"].is_object(), terminal_case);
+        for field in ["proxy_owner_token", "proxy_owner_expires_at"] {
+            expected["request"].as_object_mut().unwrap().remove(field);
+        }
+        if let Some(terminal) = expected["terminal"].as_object_mut() {
+            for field in [
+                "lease_owner",
+                "lease_expires_at",
+                "attempts",
+                "projected_at",
+                "account_projected_at",
+                "statistics_outcome",
+            ] {
+                terminal.remove(field);
+            }
+        }
+        reqwest::Client::new()
+            .post(&endpoint)
+            .body(format!("CREATE DATABASE {schema}"))
+            .send()
+            .await
+            .unwrap()
+            .error_for_status()
+            .unwrap();
+        let client = ClickHouse::new(
+            database
+                .http_clients
+                .handle(crate::http_settings::HttpPurpose::General),
+            &endpoint,
+            schema.clone(),
+            "default".into(),
+            String::new(),
+        )
+        .unwrap();
+        client.initialize().await.unwrap();
+        client.append(&snapshots).await.unwrap();
+        client.append(&snapshots).await.unwrap();
+        database.history_acknowledge(&snapshots).await.unwrap();
+        let pending: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM request_history_immutable_outbox WHERE source='native' AND request_id=$1")
+        .bind(request_id.to_string()).fetch_one(&database.pool).await.unwrap();
+        assert_eq!(pending, 0);
+        sqlx::query("UPDATE request_history_state SET mode='off' WHERE id=1")
+            .execute(&database.pool)
+            .await
+            .unwrap();
+        sqlx::query("DELETE FROM terminal_projection_outbox WHERE request_id=$1")
+            .bind(request_id.to_string())
+            .execute(&database.pool)
+            .await
+            .unwrap();
+        let terminal_remaining: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM terminal_projection_outbox WHERE request_id=$1",
+        )
+        .bind(request_id.to_string())
+        .fetch_one(&database.pool)
+        .await
+        .unwrap();
+        assert_eq!(terminal_remaining, 0);
+        sqlx::query("DELETE FROM request_records WHERE id=$1")
+            .bind(request_id.to_string())
+            .execute(&database.pool)
+            .await
+            .unwrap();
+        let remaining: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM request_records WHERE id=$1")
+            .bind(request_id.to_string())
+            .fetch_one(&database.pool)
+            .await
+            .unwrap();
+        assert_eq!(remaining, 0);
+        let stored = client
+            .baseline_snapshot(&native.identity)
+            .await
+            .unwrap()
+            .unwrap();
+        let original = crate::request_history::native_original::reconstruct(
+            &stored.identity,
+            stored.payload.as_ref().unwrap(),
+            stored.statistics.as_ref(),
+            &stored.read_model,
+            &stored.read_model["native_original"],
+        )
+        .unwrap();
+        assert_eq!(original, expected);
+        if terminal_case {
+            assert!(original["terminal"].is_object());
+            assert_eq!(original["terminal"]["status_code"], 202);
+            assert_eq!(original["terminal"]["cost_micros"], 19);
+            assert_eq!(original["terminal"]["currency"], "EUR");
+            assert_eq!(original["terminal"]["input_tokens"], 0);
+            assert_eq!(stored.payload.as_ref().unwrap()["status_code"], 200);
+            assert_eq!(stored.payload.as_ref().unwrap()["input_tokens"], 10);
+        } else {
+            assert_eq!(original["request"]["input_tokens"], 0);
+            assert!(stored.payload.as_ref().unwrap()["input_tokens"].is_null());
+        }
+        assert_eq!(
+            crate::request_history::canonical_hash(&original).unwrap(),
+            crate::request_history::canonical_hash(&expected).unwrap()
+        );
+        database.close().await;
+        reqwest::Client::new()
+            .post(&endpoint)
+            .body(format!("DROP DATABASE {schema}"))
+            .send()
+            .await
+            .unwrap()
+            .error_for_status()
+            .unwrap();
+        sqlx::query(sqlx::AssertSqlSafe(format!("DROP SCHEMA {schema} CASCADE")))
+            .execute(&admin)
+            .await
+            .unwrap();
+    }
+    admin.close().await;
+}

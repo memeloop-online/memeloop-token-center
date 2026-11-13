@@ -517,6 +517,22 @@ async fn insert_envelope_in_transaction(
 }
 
 impl Database {
+    pub(crate) async fn history_native_business_originals(
+        &self,
+        identity: &crate::request_history::HistoryIdentity,
+    ) -> Result<Value, AppError> {
+        let mut transaction = self.pool.begin().await?;
+        let request = sqlx::query("SELECT * FROM request_records WHERE id=$1 AND tenant_id=$2 AND key_id=$3 AND created_at=$4")
+            .bind(identity.request_id.to_string()).bind(identity.tenant_id.to_string()).bind(identity.key_id.to_string()).bind(identity.created_at)
+            .fetch_one(&mut *transaction).await?;
+        let terminal = sqlx::query("SELECT * FROM terminal_projection_outbox WHERE request_id=$1 AND tenant_id=$2 AND key_id=$3 AND created_at=$4")
+            .bind(identity.request_id.to_string()).bind(identity.tenant_id.to_string()).bind(identity.key_id.to_string()).bind(identity.created_at)
+            .fetch_optional(&mut *transaction).await?;
+        let originals = serde_json::json!({"request": original_row(&request)?, "terminal":terminal.as_ref().map(original_row).transpose()?.unwrap_or(Value::Null)});
+        transaction.rollback().await?;
+        Ok(originals)
+    }
+
     /// Materialize stable archive metadata after SQL snapshot capture. This
     /// shared path keeps baseline and ordinary delivery byte/hash compatible.
     pub(crate) async fn history_materialize_envelope(
@@ -528,6 +544,8 @@ impl Database {
         use crate::request_history::{HistoryError, HistorySnapshot};
         let mut payload: Option<Value> = serde_json::from_value(envelope["payload"].clone())?;
         let mut read_model = envelope["read_model"].clone();
+        let statistics: Option<crate::request_history::HistoryStatistics> =
+            serde_json::from_value(envelope["statistics"].clone())?;
         if identity.source != "event" && payload.is_some() {
             let mut archive: crate::model::RequestArchiveRefs =
                 serde_json::from_value(read_model["archive"].clone())?;
@@ -577,13 +595,25 @@ impl Database {
                 &envelope["originals"]["event"],
             )?;
         }
+        if identity.source == "native"
+            && let Some(payload) = &payload
+        {
+            let fidelity = crate::request_history::native_original::read_model(
+                &identity,
+                payload,
+                statistics.as_ref(),
+                &read_model,
+                &envelope["originals"],
+            )?;
+            read_model["native_original"] = fidelity;
+        }
         Ok(HistorySnapshot {
             identity,
             revision,
             payload,
             read_model,
             filter_cost_micros: serde_json::from_value(envelope["filter_cost_micros"].clone())?,
-            statistics: serde_json::from_value(envelope["statistics"].clone())?,
+            statistics,
         })
     }
 
