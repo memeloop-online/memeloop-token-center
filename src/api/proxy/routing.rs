@@ -10,7 +10,7 @@ mod compact_file;
 pub(super) mod diagnostics;
 mod http;
 #[cfg(test)]
-pub(super) use http::with_stalled_probe_preparation;
+pub(super) use http::with_failed_probe_preparation;
 #[cfg(test)]
 mod component_workspace_tests;
 pub(super) mod kimi;
