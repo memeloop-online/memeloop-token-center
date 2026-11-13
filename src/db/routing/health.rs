@@ -1,4 +1,4 @@
-use sqlx::Row;
+use sqlx::{Any, Row, Transaction};
 use uuid::Uuid;
 
 use super::super::{AppError, Database, unix_millis};
@@ -445,6 +445,44 @@ impl Database {
         )
         .bind(request_id.to_string())
         .fetch_all(&self.pool)
+        .await?;
+        rows.into_iter()
+            .map(|row| {
+                Ok(crate::model::RequestTransportDiagnosticView {
+                    route_id: Uuid::parse_str(&row.try_get::<String, _>("route_id")?).map_err(
+                        |_| AppError::storage("transport_diagnostic_route_is_malformed"),
+                    )?,
+                    upstream_account_id: Uuid::parse_str(
+                        &row.try_get::<String, _>("upstream_account_id")?,
+                    )
+                    .map_err(|_| AppError::storage("transport_diagnostic_account_is_malformed"))?,
+                    credential_generation: row.try_get("credential_generation")?,
+                    transport_revision: row.try_get("transport_revision")?,
+                    failure_kind: row.try_get("failure_kind")?,
+                    failure_stage: row.try_get("failure_stage")?,
+                    gateway_pod: row.try_get("gateway_pod")?,
+                    gateway_node: row.try_get("gateway_node")?,
+                    failure_domain: row.try_get("failure_domain")?,
+                    observed_at: row.try_get("observed_at")?,
+                })
+            })
+            .collect()
+    }
+
+    pub(crate) async fn history_transport_in_transaction(
+        transaction: &mut Transaction<'_, Any>,
+        request_id: Uuid,
+    ) -> Result<Vec<crate::model::RequestTransportDiagnosticView>, AppError> {
+        let rows = sqlx::query(
+            "SELECT route_id, upstream_account_id, credential_generation,
+                    transport_revision, failure_kind, failure_stage,
+                    gateway_pod, gateway_node, failure_domain, observed_at
+               FROM request_upstream_transport_diagnostics
+              WHERE request_id = $1
+              ORDER BY observed_at, route_id, upstream_account_id",
+        )
+        .bind(request_id.to_string())
+        .fetch_all(&mut **transaction)
         .await?;
         rows.into_iter()
             .map(|row| {

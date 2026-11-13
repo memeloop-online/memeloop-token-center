@@ -1934,6 +1934,11 @@ impl Database {
             )
             .await?;
         }
+        super::super::history_immutable_outbox::capture_request_in_transaction(
+            transaction,
+            &request_id,
+        )
+        .await?;
         Ok(cluster_id)
     }
 
@@ -1948,6 +1953,11 @@ impl Database {
             self.backend,
             request_id,
             upstream_response_id,
+        )
+        .await?;
+        super::super::history_immutable_outbox::capture_request_in_transaction(
+            &mut transaction,
+            &request_id.to_string(),
         )
         .await?;
         transaction.commit().await?;
@@ -2281,7 +2291,7 @@ async fn emit_conversation_projected_event_in_transaction(
     )
     .bind(event.event_id)
     .bind(event.event_at)
-    .bind(request_id)
+    .bind(&request_id)
     .bind(tenant_id)
     .bind(key_id)
     .execute(&mut **transaction)
@@ -2291,6 +2301,11 @@ async fn emit_conversation_projected_event_in_transaction(
             "conversations_emit_conversation_projected_event_in_transaction_1",
         ));
     }
+    super::super::history_immutable_outbox::capture_request_in_transaction(
+        transaction,
+        &request_id,
+    )
+    .await?;
     Ok(())
 }
 

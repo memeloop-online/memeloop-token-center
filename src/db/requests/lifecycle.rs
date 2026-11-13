@@ -2470,7 +2470,12 @@ pub(crate) async fn record_request_started_in_transaction(
     now: i64,
 ) -> Result<(), AppError> {
     insert_request_started_record_in_transaction(transaction, request, now).await?;
-    insert_request_started_event_in_transaction(transaction, request, now).await
+    insert_request_started_event_in_transaction(transaction, request, now).await?;
+    super::super::history_immutable_outbox::capture_native_in_transaction(
+        transaction,
+        &request.request_id.to_string(),
+    )
+    .await
 }
 
 async fn insert_request_started_record_in_transaction(
@@ -2668,6 +2673,8 @@ async fn record_request_finished_with_basis_and_metering_in_transaction(
     };
     let Some(project_aggregates) = project_aggregates.filter(|_| bridged == 0) else {
         super::terminal_projection::enqueue_terminal_projection_in_transaction(tx, &request_id)
+            .await?;
+        super::super::history_immutable_outbox::capture_native_in_transaction(tx, &request_id)
             .await?;
         return Ok(true);
     };
@@ -2874,5 +2881,6 @@ async fn record_request_finished_with_basis_and_metering_in_transaction(
     if inserted.rows_affected() != 1 {
         return Err(AppError::internal("lifecycle_site_8"));
     }
+    super::super::history_immutable_outbox::capture_native_in_transaction(tx, &request_id).await?;
     Ok(true)
 }
