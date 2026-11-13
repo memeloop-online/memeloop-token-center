@@ -833,6 +833,11 @@ pub(crate) const SQLITE_MIGRATIONS: &[Migration] = &[
         name: "compact history identity and delivery receipts",
         sql: include_str!("../../../migrations/common/0157_history_identity_receipts.sql"),
     },
+    Migration {
+        version: 158,
+        name: "history delivery watermark fence",
+        sql: include_str!("../../../migrations/common/0158_history_delivery_ceiling.sql"),
+    },
 ];
 
 pub(crate) const POSTGRES_MIGRATIONS: &[Migration] = &[
@@ -1640,6 +1645,11 @@ pub(crate) const POSTGRES_MIGRATIONS: &[Migration] = &[
         version: 157,
         name: "compact history identity and delivery receipts",
         sql: include_str!("../../../migrations/common/0157_history_identity_receipts.sql"),
+    },
+    Migration {
+        version: 158,
+        name: "history delivery watermark fence",
+        sql: include_str!("../../../migrations/common/0158_history_delivery_ceiling.sql"),
     },
 ];
 
