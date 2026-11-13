@@ -676,14 +676,23 @@ async fn identity_page_scheduler_contract(database_url: String) {
     assert_eq!(count(fixture.request_id).await, 1);
     assert_eq!(count(live).await, 1);
     if matches!(db.backend, DatabaseBackend::PostgreSql) {
+        let mut transaction = db.pool.begin().await.unwrap();
+        // Tiny test databases may prefer a sequential scan. This checks the
+        // bounded PK range is available, not the production optimizer choice
+        // (which is recorded separately from read-only production EXPLAIN).
+        sqlx::query("SET LOCAL enable_seqscan = off")
+            .execute(&mut *transaction)
+            .await
+            .unwrap();
         let plan: Vec<String> = sqlx::query_scalar("EXPLAIN (COSTS OFF) SELECT request_id FROM conversation_projection_outbox WHERE request_id > $1 ORDER BY request_id ASC LIMIT $2")
-            .bind(id(40).to_string()).bind(4_i64).fetch_all(&db.pool).await.unwrap();
+            .bind(id(40).to_string()).bind(4_i64).fetch_all(&mut *transaction).await.unwrap();
         let plan = plan.join("\n");
         assert!(
             plan.contains("Limit") && plan.contains("conversation_projection_outbox_pkey"),
-            "ID page must use the PK range: {plan}"
+            "ID page must support the PK range: {plan}"
         );
         assert!(!plan.contains("Join") && !plan.contains("conversation_observations"));
+        transaction.rollback().await.unwrap();
     }
 }
 
