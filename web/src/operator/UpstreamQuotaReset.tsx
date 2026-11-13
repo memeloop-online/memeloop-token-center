@@ -3,7 +3,7 @@ import { api, ApiError } from '../api';
 import { formatCountdown } from '../format';
 import { useI18n } from '../i18n';
 import { useConfirmDialog } from '../useConfirmDialog';
-import type { UpstreamQuotaSnapshot } from './upstreamQuota';
+import { UPSTREAM_QUOTA_READ_TIMEOUT_MILLIS, type UpstreamQuotaSnapshot } from './upstreamQuota';
 import { useQuotaClock } from './useQuotaClock';
 import { Button, Disclosure } from '../design-system';
 
