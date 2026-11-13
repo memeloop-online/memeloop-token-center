@@ -118,10 +118,12 @@ async fn capture_replay(database: &Database) {
         serde_json::to_value(&modern_replay[0]).unwrap(),
         serde_json::to_value(&current[0]).unwrap()
     );
-    // A pre-156 frozen record has no immutable mirror. Keep this upgrade
-    // fixture on the legacy consumer rather than replaying the modern copy.
-    sqlx::query("DELETE FROM request_history_immutable_outbox WHERE revision=$1")
-        .bind(current[0].revision)
+    // A pre-156 journal has no immutable queue, including sibling events.
+    // Preserve every already frozen delivery in its legacy journal first;
+    // otherwise event-only immutable priority correctly defers this native row.
+    sqlx::query("UPDATE request_history_export SET snapshot=(SELECT i.delivery_snapshot FROM request_history_immutable_outbox i WHERE i.revision=request_history_export.revision) WHERE snapshot IS NULL AND EXISTS (SELECT 1 FROM request_history_immutable_outbox i WHERE i.revision=request_history_export.revision AND i.delivery_snapshot IS NOT NULL)")
+        .execute(&database.pool).await.unwrap();
+    sqlx::query("DELETE FROM request_history_immutable_outbox")
         .execute(&database.pool)
         .await
         .unwrap();
@@ -931,10 +933,14 @@ async fn sqlite_immutable_request_history_projection_and_event_only_revisions() 
     use crate::db::requests::conversations::{
         ConversationProjectionEnqueueInput, enqueue_conversation_projection_in_transaction,
     };
-    let database = Database::connect("sqlite::memory:")
-        .await
-        .unwrap()
-        .with_archive(crate::archive::ArchiveStore::memory_for_test());
+    let directory = tempfile::tempdir().unwrap();
+    let database = Database::connect(&format!(
+        "sqlite://{}?mode=rwc",
+        directory.path().join("projection.sqlite").display()
+    ))
+    .await
+    .unwrap()
+    .with_archive(crate::archive::ArchiveStore::memory_for_test());
     database.migrate().await.unwrap();
     database.history_start().await.unwrap();
     let (key, request_id, _) = seed(&database).await;
@@ -1136,7 +1142,13 @@ async fn immutable_history_asset_revision_fence(database: &Database) {
 
 #[tokio::test]
 async fn sqlite_immutable_request_history_asset_insert_move_delete_revisions() {
-    let database = Database::connect("sqlite::memory:").await.unwrap();
+    let directory = tempfile::tempdir().unwrap();
+    let database = Database::connect(&format!(
+        "sqlite://{}?mode=rwc",
+        directory.path().join("assets.sqlite").display()
+    ))
+    .await
+    .unwrap();
     immutable_history_asset_revision_fence(&database).await;
 }
 
