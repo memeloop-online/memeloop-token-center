@@ -91,11 +91,11 @@ impl Database {
         let definitions = self.history_capture_definitions()?;
         let mut transaction = self.pool.begin().await?;
         Self::history_bootstrap_maintenance_lock(&mut transaction).await?;
-        let mode: String = sqlx::query_scalar(
-            "SELECT mode FROM request_history_state WHERE id=1 FOR UPDATE NOWAIT",
-        )
-        .fetch_one(&mut *transaction)
-        .await?;
+        // The maintenance mutex, not the business state barrier, protects the
+        // catalog validation phase from another bootstrap/atomic installer.
+        let mode: String = sqlx::query_scalar("SELECT mode FROM request_history_state WHERE id=1")
+            .fetch_one(&mut *transaction)
+            .await?;
         if mode != "off" {
             return Err(HistoryError::Changed);
         }
@@ -113,6 +113,16 @@ impl Database {
             return Err(HistoryError::Verification(
                 "unexpected capture catalog definitions",
             ));
+        }
+        // Only the final mode recheck/update runs under the business barrier.
+        // No per-definition catalog queries remain after this NOWAIT lock.
+        let mode: String = sqlx::query_scalar(
+            "SELECT mode FROM request_history_state WHERE id=1 FOR UPDATE NOWAIT",
+        )
+        .fetch_one(&mut *transaction)
+        .await?;
+        if mode != "off" {
+            return Err(HistoryError::Changed);
         }
         // Off-mode triggers already participate in this shared state barrier.
         // No source/DDL/network operation occurs under the exclusive flip.
@@ -196,7 +206,7 @@ mod tests {
                 .unwrap(),
             1
         );
-        writer.rollback().await.unwrap();
+        writer.commit().await.unwrap();
         // Persisted partial catalogs survive a CLI/pool restart, without reset.
         let resumed = Database::connect_with_max(isolated.as_str(), 1)
             .await
