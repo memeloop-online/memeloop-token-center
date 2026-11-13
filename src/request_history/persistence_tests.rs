@@ -925,3 +925,236 @@ async fn sqlite_immutable_history_late_conversation_revision_survives_stale_ack(
     database.history_acknowledge(&replay).await.unwrap();
     assert_eq!(database.history_pending_count().await.unwrap(), 0);
 }
+
+#[tokio::test]
+async fn sqlite_immutable_request_history_projection_and_event_only_revisions() {
+    use crate::db::requests::conversations::{
+        ConversationProjectionEnqueueInput, enqueue_conversation_projection_in_transaction,
+    };
+    let database = Database::connect("sqlite::memory:")
+        .await
+        .unwrap()
+        .with_archive(crate::archive::ArchiveStore::memory_for_test());
+    database.migrate().await.unwrap();
+    database.history_start().await.unwrap();
+    let (key, request_id, _) = seed(&database).await;
+    finish(&database, request_id).await;
+    let body = serde_json::json!({"messages":[{"role":"user","content":"event-fence fixture"}]});
+    let hints = crate::conversation::ConversationHints {
+        session_id: Some("immutable-projector-session".into()),
+        ..Default::default()
+    };
+    let mut transaction = database.begin_write_transaction().await.unwrap();
+    enqueue_conversation_projection_in_transaction(
+        &mut transaction,
+        ConversationProjectionEnqueueInput {
+            request_id,
+            key: &key,
+            hints: &hints,
+            client_name: None,
+            upstream_response_id: None,
+            observed_at: unix_millis(),
+        },
+    )
+    .await
+    .unwrap();
+    transaction.commit().await.unwrap();
+    let owner = Uuid::now_v7();
+    assert_eq!(
+        database
+            .claim_conversation_projection_tasks(owner, 1)
+            .await
+            .unwrap()[0]
+            .request_id,
+        request_id
+    );
+    let atoms = crate::conversation::extract_atoms(&body);
+    let nodes = crate::conversation::build_prefix(&atoms);
+    assert!(
+        database
+            .prepare_session_body_archive(owner, request_id, atoms, &nodes, &[])
+            .await
+            .unwrap()
+    );
+    // The actual projector captures its observation and then emits the event
+    // in the same transaction. Neither capture may conflict at the parent revision.
+    assert!(
+        database
+            .project_claimed_conversation_projection_task(owner, request_id)
+            .await
+            .unwrap()
+    );
+    let projected: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM request_events WHERE request_id=$1 AND event_kind='conversation_projected'")
+        .bind(request_id.to_string()).fetch_one(&database.pool).await.unwrap();
+    assert_eq!(projected, 1);
+    let mut transaction = database.begin_write_transaction().await.unwrap();
+    super::super::history_immutable_outbox::capture_request_in_transaction(
+        &mut transaction,
+        &request_id.to_string(),
+    )
+    .await
+    .unwrap();
+    let parent_revision: i64 = sqlx::query_scalar(
+        "SELECT revision FROM request_history_export WHERE source='native' AND request_id=$1",
+    )
+    .bind(request_id.to_string())
+    .fetch_one(&mut *transaction)
+    .await
+    .unwrap();
+    let event_id = Uuid::now_v7();
+    sqlx::query("INSERT INTO request_events (tenant_id,event_id,request_id,event_at,event_kind,key_id,protocol,model,status_code,duration_ms,input_tokens,output_tokens,cost_micros,error_code) SELECT tenant_id,$1,id,$2,'event_fence_fixture',key_id,protocol,model,202,duration_ms,input_tokens,output_tokens,cost_micros,error_code FROM request_records WHERE id=$3")
+        .bind(event_id.to_string()).bind(unix_millis()).bind(request_id.to_string()).execute(&mut *transaction).await.unwrap();
+    super::super::history_immutable_outbox::capture_request_in_transaction(
+        &mut transaction,
+        &request_id.to_string(),
+    )
+    .await
+    .unwrap();
+    let same_parent_revision: i64 = sqlx::query_scalar(
+        "SELECT revision FROM request_history_export WHERE source='native' AND request_id=$1",
+    )
+    .bind(request_id.to_string())
+    .fetch_one(&mut *transaction)
+    .await
+    .unwrap();
+    assert_eq!(parent_revision, same_parent_revision);
+    transaction.commit().await.unwrap();
+    // Repeated journal capture must preserve the parent and each event's bytes.
+    database.history_capture_pending(64).await.unwrap();
+    database.history_capture_pending(64).await.unwrap();
+    let raw: String = sqlx::query_scalar("SELECT snapshot FROM request_history_immutable_outbox WHERE source='event' AND request_id=$1")
+        .bind(event_id.to_string()).fetch_one(&database.pool).await.unwrap();
+    let envelope: Value = serde_json::from_str(&raw).unwrap();
+    assert_eq!(envelope["originals"]["event"]["status_code"], 202);
+    assert_eq!(
+        envelope["originals"]["event"]["event_kind"],
+        "event_fence_fixture"
+    );
+    assert_eq!(envelope["payload"]["status_code"], 200);
+    let pending = database.history_pending(500).await.unwrap();
+    let replay = database.history_pending(500).await.unwrap();
+    assert_eq!(
+        serde_json::to_value(&pending).unwrap(),
+        serde_json::to_value(&replay).unwrap()
+    );
+    database.history_acknowledge(&pending).await.unwrap();
+    assert_eq!(database.history_pending_count().await.unwrap(), 0);
+}
+
+async fn immutable_history_asset_revision_fence(database: &Database) {
+    database.migrate().await.unwrap();
+    database.history_start().await.unwrap();
+    let (key, _, _) = seed(database).await;
+    let first = Uuid::now_v7();
+    let second = Uuid::now_v7();
+    for job in [first, second] {
+        sqlx::query("INSERT INTO generation_jobs (id,tenant_id,key_id,upstream_account_id,reservation_id,public_model,upstream_model,driver,status,request_object,estimated_units,next_attempt_at,created_at,updated_at) VALUES ($1,$2,$3,$4,$5,'asset-model','asset-model','http-json','queued','gap://fixture/generation',1,1,1,1)")
+            .bind(job.to_string()).bind(key.tenant_id.to_string()).bind(key.key_id.to_string())
+            .bind(Uuid::now_v7().to_string()).bind(Uuid::now_v7().to_string()).execute(&database.pool).await.unwrap();
+    }
+    database.history_capture_pending(64).await.unwrap();
+    async fn revision(database: &Database, job: Uuid) -> i64 {
+        sqlx::query_scalar("SELECT revision FROM request_history_export WHERE source='generation' AND request_id=$1")
+            .bind(job.to_string()).fetch_one(&database.pool).await.unwrap()
+    }
+    async fn raw(database: &Database, revision: i64) -> String {
+        sqlx::query_scalar(
+            "SELECT snapshot FROM request_history_immutable_outbox WHERE revision=$1",
+        )
+        .bind(revision)
+        .fetch_one(&database.pool)
+        .await
+        .unwrap()
+    }
+    let initial_first = revision(database, first).await;
+    let initial_second = revision(database, second).await;
+    let initial_raw = raw(database, initial_first).await;
+    let ledger_before: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM ledger_entries")
+        .fetch_one(&database.pool)
+        .await
+        .unwrap();
+    let asset = Uuid::now_v7();
+    sqlx::query("INSERT INTO generation_assets (id,job_id,asset_index,object_locator,mime_type,size_bytes,filename,created_at) VALUES ($1,$2,0,'gap://fixture/asset','image/png',0,'fixture.png',1)")
+        .bind(asset.to_string()).bind(first.to_string()).execute(&database.pool).await.unwrap();
+    database.history_capture_pending(64).await.unwrap();
+    let inserted_first = revision(database, first).await;
+    assert!(inserted_first > initial_first);
+    assert_eq!(revision(database, second).await, initial_second);
+    let inserted: Value = serde_json::from_str(&raw(database, inserted_first).await).unwrap();
+    assert_eq!(inserted["originals"]["assets"].as_array().unwrap().len(), 1);
+    // Moving a metadata row must invalidate both its OLD and NEW parent.
+    sqlx::query("UPDATE generation_assets SET job_id=$1 WHERE id=$2")
+        .bind(second.to_string())
+        .bind(asset.to_string())
+        .execute(&database.pool)
+        .await
+        .unwrap();
+    database.history_capture_pending(64).await.unwrap();
+    let moved_first = revision(database, first).await;
+    let moved_second = revision(database, second).await;
+    assert!(moved_first > inserted_first);
+    assert!(moved_second > initial_second);
+    let old_parent: Value = serde_json::from_str(&raw(database, moved_first).await).unwrap();
+    let new_parent: Value = serde_json::from_str(&raw(database, moved_second).await).unwrap();
+    assert!(
+        old_parent["originals"]["assets"]
+            .as_array()
+            .unwrap()
+            .is_empty()
+    );
+    assert_eq!(
+        new_parent["originals"]["assets"].as_array().unwrap().len(),
+        1
+    );
+    sqlx::query("DELETE FROM generation_assets WHERE id=$1")
+        .bind(asset.to_string())
+        .execute(&database.pool)
+        .await
+        .unwrap();
+    database.history_capture_pending(64).await.unwrap();
+    let deleted_second = revision(database, second).await;
+    assert!(deleted_second > moved_second);
+    let deleted: Value = serde_json::from_str(&raw(database, deleted_second).await).unwrap();
+    assert!(
+        deleted["originals"]["assets"]
+            .as_array()
+            .unwrap()
+            .is_empty()
+    );
+    assert_eq!(raw(database, initial_first).await, initial_raw);
+    let ledger_after: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM ledger_entries")
+        .fetch_one(&database.pool)
+        .await
+        .unwrap();
+    assert_eq!(ledger_before, ledger_after);
+}
+
+#[tokio::test]
+async fn sqlite_immutable_request_history_asset_insert_move_delete_revisions() {
+    let database = Database::connect("sqlite::memory:").await.unwrap();
+    immutable_history_asset_revision_fence(&database).await;
+}
+
+#[tokio::test]
+#[ignore = "existing CI supplies the real PostgreSQL service"]
+async fn request_history_real_services_acceptance_asset_insert_move_delete_revisions() {
+    let postgres = std::env::var("MTC_TEST_POSTGRES_URL").expect("PostgreSQL acceptance URL");
+    let admin = sqlx::PgPool::connect(&postgres).await.unwrap();
+    let schema = format!("history_assets_{}", Uuid::now_v7().simple());
+    sqlx::query(sqlx::AssertSqlSafe(format!("CREATE SCHEMA {schema}")))
+        .execute(&admin)
+        .await
+        .unwrap();
+    let mut isolated = url::Url::parse(&postgres).unwrap();
+    isolated
+        .query_pairs_mut()
+        .append_pair("options", &format!("-csearch_path={schema}"));
+    let database = Database::connect(isolated.as_str()).await.unwrap();
+    immutable_history_asset_revision_fence(&database).await;
+    database.close().await;
+    sqlx::query(sqlx::AssertSqlSafe(format!("DROP SCHEMA {schema} CASCADE")))
+        .execute(&admin)
+        .await
+        .unwrap();
+    admin.close().await;
+}

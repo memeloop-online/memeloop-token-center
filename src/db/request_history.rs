@@ -1,4 +1,6 @@
 use super::*;
+
+const PENDING_COUNT_SQL: &str = "SELECT (SELECT COUNT(*) FROM request_history_export) + (SELECT COUNT(*) FROM request_history_immutable_outbox i WHERE NOT EXISTS (SELECT 1 FROM request_history_export e WHERE e.revision=i.revision))";
 use crate::request_history::{
     HistoryError, HistoryIdentity, HistoryScope, HistorySnapshot, HistoryStatistics,
 };
@@ -174,6 +176,7 @@ impl Database {
             ("request_egress_attempts", None),
             ("request_upstream_transport_diagnostics", None),
             ("generation_stats_facts", None),
+            ("generation_assets", None),
             ("request_stats_facts", None),
             ("terminal_projection_outbox", None),
             ("upstream_accounts", None),
@@ -193,7 +196,7 @@ impl Database {
                         "session_archive_correlations" => format!(
                             "source = 'archive' AND request_id IN (SELECT archive_request_id FROM session_archive_unlinked_requests WHERE tenant_id = {record}.tenant_id AND source = {record}.source AND external_request_id = {record}.external_request_id)"
                         ),
-                        "generation_stats_facts" => {
+                        "generation_stats_facts" | "generation_assets" => {
                             format!("source = 'generation' AND request_id = {record}.job_id")
                         }
                         "upstream_accounts" => format!(
@@ -227,7 +230,9 @@ impl Database {
                         "request_records" | "generation_jobs" => {
                             format!("request_id = {record}.id")
                         }
-                        "generation_stats_facts" => format!("request_id = {record}.job_id"),
+                        "generation_stats_facts" | "generation_assets" => {
+                            format!("request_id = {record}.job_id")
+                        }
                         "key_records" => format!("key_id = {record}.id"),
                         "tenants" => format!("tenant_id = {record}.id"),
                         "principals" => format!(
@@ -293,7 +298,7 @@ impl Database {
     pub async fn history_refresh(&self) -> Result<(), HistoryError> {
         let mut tx = self.begin_write_transaction().await?;
         sqlx::query("UPDATE request_history_state SET mode = 'shadow', verified_revision = NULL, verification_json = NULL WHERE id = 1").execute(&mut *tx).await?;
-        let pending: i64 = sqlx::query_scalar("SELECT (SELECT COUNT(*) FROM request_history_export) + (SELECT COUNT(*) FROM request_history_immutable_outbox i WHERE NOT EXISTS (SELECT 1 FROM request_history_export e WHERE e.revision=i.revision))")
+        let pending: i64 = sqlx::query_scalar(PENDING_COUNT_SQL)
             .fetch_one(&mut *tx)
             .await?;
         if pending != 0 {
@@ -499,11 +504,9 @@ impl Database {
     }
 
     pub async fn history_pending_count(&self) -> Result<i64, HistoryError> {
-        Ok(
-            sqlx::query_scalar("SELECT COUNT(*) FROM request_history_export")
-                .fetch_one(&self.pool)
-                .await?,
-        )
+        Ok(sqlx::query_scalar(PENDING_COUNT_SQL)
+            .fetch_one(&self.pool)
+            .await?)
     }
 
     pub async fn history_revision(&self) -> Result<i64, HistoryError> {
@@ -567,7 +570,7 @@ impl Database {
             let current: i64 = sqlx::query_scalar(revision_sql)
                 .fetch_one(&mut *transaction)
                 .await?;
-            let pending: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM request_history_export")
+            let pending: i64 = sqlx::query_scalar(PENDING_COUNT_SQL)
                 .fetch_one(&mut *transaction)
                 .await?;
             let backfill: i64 =

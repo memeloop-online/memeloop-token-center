@@ -22,6 +22,23 @@ fn original_row(row: &AnyRow) -> Result<Value, AppError> {
     Ok(Value::Object(result))
 }
 
+// Each event owns its original row under its own revision fence. Parent
+// envelopes must not include the append-only collection of sibling events.
+async fn original_event_in_transaction(
+    transaction: &mut Transaction<'_, Any>,
+    event_id: Uuid,
+) -> Result<Value, AppError> {
+    let row = sqlx::query("SELECT * FROM request_events WHERE event_id=$1")
+        .bind(event_id.to_string())
+        .fetch_optional(&mut **transaction)
+        .await?;
+    Ok(row
+        .as_ref()
+        .map(original_row)
+        .transpose()?
+        .unwrap_or(Value::Null))
+}
+
 pub(super) async fn capture_native_in_transaction(
     transaction: &mut Transaction<'_, Any>,
     request_id: &str,
@@ -65,10 +82,6 @@ pub(super) async fn capture_native_in_transaction(
     }
     originals.insert("terminal".into(), terminal_original);
     for (name, sql) in [
-        (
-            "events",
-            "SELECT * FROM request_events WHERE request_id=$1 ORDER BY event_at,event_id",
-        ),
         (
             "statistics",
             "SELECT * FROM request_stats_facts WHERE request_id=$1",
@@ -175,7 +188,8 @@ pub(super) async fn capture_native_in_transaction(
         let event_revision: i64 = event.try_get("revision")?;
         let payload =
             Database::history_original_event_in_transaction(transaction, event_id).await?;
-        let envelope = serde_json::json!({"version":1,"source":"event","revision":event_revision,"tenant_id":tenant,"key_id":key,"request_id":event_id,"created_at":event_identity.created_at,"payload":payload,"filter_cost_micros":null,"statistics":null,"read_model":null,"archive_identity":{"tenant_id":tenant,"request_id":request_id,"source":"native"}});
+        let original_event = original_event_in_transaction(transaction, event_id).await?;
+        let envelope = serde_json::json!({"originals":{"event":original_event},"version":1,"source":"event","revision":event_revision,"tenant_id":tenant,"key_id":key,"request_id":event_id,"created_at":event_identity.created_at,"payload":payload,"filter_cost_micros":null,"statistics":null,"read_model":null,"archive_identity":{"tenant_id":tenant,"request_id":request_id,"source":"native"}});
         insert_envelope_in_transaction(transaction, &event_identity, event_revision, &envelope)
             .await?;
     }
@@ -204,10 +218,6 @@ pub(super) async fn capture_generation_in_transaction(
     let mut originals = serde_json::Map::new();
     originals.insert("request".into(), original_row(&request)?);
     for (name, sql) in [
-        (
-            "events",
-            "SELECT * FROM request_events WHERE request_id=$1 ORDER BY event_at,event_id",
-        ),
         (
             "statistics",
             "SELECT * FROM generation_stats_facts WHERE job_id=$1",
@@ -322,7 +332,8 @@ pub(super) async fn capture_generation_in_transaction(
         let event_revision: i64 = event.try_get("revision")?;
         let payload =
             Database::history_original_event_in_transaction(transaction, event_id).await?;
-        let envelope = serde_json::json!({"version":1,"source":"event","revision":event_revision,"tenant_id":tenant,"key_id":key,"request_id":event_id,"created_at":event_identity.created_at,"payload":payload,"filter_cost_micros":null,"statistics":null,"read_model":null,"archive_identity":{"tenant_id":tenant,"request_id":request_id,"source":"generation"}});
+        let original_event = original_event_in_transaction(transaction, event_id).await?;
+        let envelope = serde_json::json!({"originals":{"event":original_event},"version":1,"source":"event","revision":event_revision,"tenant_id":tenant,"key_id":key,"request_id":event_id,"created_at":event_identity.created_at,"payload":payload,"filter_cost_micros":null,"statistics":null,"read_model":null,"archive_identity":{"tenant_id":tenant,"request_id":request_id,"source":"generation"}});
         insert_envelope_in_transaction(transaction, &event_identity, event_revision, &envelope)
             .await?;
     }
@@ -487,7 +498,9 @@ impl Database {
                 let archive_identity=sqlx::query("SELECT e.request_id,CASE WHEN EXISTS(SELECT 1 FROM generation_jobs g WHERE g.id=e.request_id AND g.tenant_id=e.tenant_id AND g.key_id=e.key_id) THEN 'generation' ELSE 'native' END AS source FROM request_events e WHERE e.event_id=$1 AND e.tenant_id=$2 AND e.key_id=$3")
                     .bind(&request_id).bind(identity.tenant_id.to_string()).bind(identity.key_id.to_string()).fetch_optional(&mut *transaction).await?;
                 let archive_identity=archive_identity.map(|row| -> Result<Value,AppError> {Ok(serde_json::json!({"tenant_id":identity.tenant_id,"request_id":row.try_get::<String,_>("request_id")?,"source":row.try_get::<String,_>("source")?}))}).transpose()?;
-                let envelope = serde_json::json!({"version":1,"source":"event","revision":revision,"request_id":identity.request_id,"tenant_id":identity.tenant_id,"key_id":identity.key_id,"created_at":identity.created_at,"payload":payload,"read_model":null,"statistics":null,"filter_cost_micros":null,"archive_identity":archive_identity});
+                let original_event =
+                    original_event_in_transaction(&mut transaction, identity.request_id).await?;
+                let envelope = serde_json::json!({"originals":{"event":original_event},"version":1,"source":"event","revision":revision,"request_id":identity.request_id,"tenant_id":identity.tenant_id,"key_id":identity.key_id,"created_at":identity.created_at,"payload":payload,"read_model":null,"statistics":null,"filter_cost_micros":null,"archive_identity":archive_identity});
                 insert_envelope_in_transaction(&mut transaction, &identity, revision, &envelope)
                     .await?;
                 continue;
@@ -693,7 +706,56 @@ mod tests {
         assert_eq!(pending[0].revision, 2);
         assert_eq!(pending[0].identity, identity);
         assert_eq!(pending[0].filter_cost_micros, None);
-        reopened.history_acknowledge(&pending).await.unwrap();
+        // Only immutable revision 2 remains. All completion gates must see it.
+        sqlx::query("UPDATE request_history_backfill SET done=1")
+            .execute(&reopened.pool)
+            .await
+            .unwrap();
+        reopened.history_save_verification(
+            reopened.history_revision().await.unwrap(),
+            &serde_json::json!({"read_model_version":crate::request_history::READ_MODEL_VERSION}),
+        ).await.unwrap();
+        assert!(reopened.history_refresh().await.is_err());
+        assert!(reopened.history_switch(true).await.is_err());
+        let writes = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let observed = writes.clone();
+        let router = axum::Router::new().route(
+            "/",
+            axum::routing::post(move |body: axum::body::Bytes| {
+                let observed = observed.clone();
+                async move {
+                    let row: Value = serde_json::from_slice(&body).unwrap();
+                    assert_eq!(row["revision"], 2);
+                    observed.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                    ""
+                }
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let endpoint = format!("http://{}", listener.local_addr().unwrap());
+        let server = tokio::spawn(async move {
+            axum::serve(listener, router).await.unwrap();
+        });
+        let client = crate::request_history::ClickHouse::new(
+            reopened
+                .http_clients
+                .handle(crate::http_settings::HttpPurpose::General),
+            &endpoint,
+            "default".into(),
+            "default".into(),
+            String::new(),
+        )
+        .unwrap();
+        assert!(matches!(
+            crate::request_history::migration::verify(&reopened, &client).await,
+            Err(crate::request_history::HistoryError::Changed)
+        ));
+        assert_eq!(writes.load(std::sync::atomic::Ordering::SeqCst), 0);
+        crate::request_history::migration::drain(&reopened, &client, 1)
+            .await
+            .unwrap();
+        assert_eq!(writes.load(std::sync::atomic::Ordering::SeqCst), 1);
         assert_eq!(reopened.history_pending_count().await.unwrap(), 0);
+        server.abort();
     }
 }
