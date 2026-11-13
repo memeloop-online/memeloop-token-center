@@ -760,6 +760,9 @@ pub(in crate::api) fn convert_owned_with_dialect(
         ));
     }
     let registry = ToolRegistry::from_request(&request);
+    // The registry owns translated declarations; discard their consumed
+    // working source instead of retaining a second complete schema tree.
+    drop(take_field(&mut request, "tools"));
     let mut output = json!({"stream":request["stream"].as_bool().unwrap_or(false)});
     output["model"] = take_field(&mut request, "model");
     let mut messages = Vec::<Value>::new();
