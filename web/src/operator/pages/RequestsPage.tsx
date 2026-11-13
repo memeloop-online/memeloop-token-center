@@ -82,7 +82,7 @@ export function RequestsPage({ token, tenant, writeTenant = tenant, liveEvents, 
   }
   const loadAbort = useRef<AbortController | null>(null);
   const operationalAbort = useRef<AbortController | null>(null);
-  const reconciledOperationalEvents = useRef(new Map<string, string>());
+  const reconciledOperationalEvents = useRef(new Map<string, { eventId: string; eventAt: number }>());
   const upstreamSequence = useRef(0);
   const detailSequence = useRef(0);
   const detailAbort = useRef<AbortController | null>(null);
@@ -330,18 +330,19 @@ export function RequestsPage({ token, tenant, writeTenant = tenant, liveEvents, 
     }
     for (const request of requestsRef.current) {
       const event = liveEventsRef.current.get(request.request_id);
+      const reconciled = reconciledOperationalEvents.current.get(request.request_id);
       const completedAt = event?.completed_at;
       const retainedTerminal = typeof completedAt === 'number' && Number.isFinite(completedAt) && completedAt >= request.created_at;
       if (!request.operational_terminal
         || !event || (event.event_kind !== 'finished' && event.event_kind !== 'projected' && !retainedTerminal)
-        || reconciledOperationalEvents.current.get(request.request_id) === event.event_id) continue;
+        || reconciled?.eventId === event.event_id || (reconciled !== undefined && event.event_at < reconciled.eventAt)) continue;
       void api<RequestDetail>(`/internal/v1/requests/${request.request_id}${queryForTenant(tenant)}`, token, { signal: controller.signal })
         .then(next => {
           const latest = scope.current;
           if (controller.signal.aborted || paused.current || loadingRef.current || sequence.current !== requestSequence
             || latest.token !== currentScope.token || latest.tenant !== currentScope.tenant || latest.filters !== currentScope.filters
             || next.request_id !== request.request_id || !next.operational_terminal) return;
-          reconciledOperationalEvents.current.set(request.request_id, event.event_id);
+          reconciledOperationalEvents.current.set(request.request_id, { eventId: event.event_id, eventAt: event.event_at });
           setRequests(current => current.map(row => {
             if (row.request_id !== request.request_id) return row;
             // Financial finality does not imply that late transport/session

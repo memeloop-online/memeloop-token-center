@@ -73,7 +73,7 @@ test('filtered views stay stable: published batches only mark them stale for a m
   assert.match(overflowEffect, /if \(typedFiltersActive\(filters\) \|\| loadedHistoryIds\.current\.size\) return;/,
     'new overflow revisions do not auto-queue reconciliation while explicit history is loaded');
 
-  const loadStart = source.indexOf('async function load(nextFilters: TypedFilterAst, older = false)');
+  const loadStart = source.indexOf('async function load(nextFilters: TypedFilterAst, older = false');
   const loadEnd = source.indexOf('\n  useEffect(() => {', loadStart);
   const load = source.slice(loadStart, loadEnd);
   assert.match(load, /const refreshWasActive = older && \(overflowRefresh\.current\?\.needsReconcile \?\? false\)/);
@@ -81,7 +81,7 @@ test('filtered views stay stable: published batches only mark them stale for a m
     'pagination restores the sticky first-page reconciliation which it interrupted');
 
   const refreshStart = source.indexOf('async function refreshOverflowFirstPage(ticket: number)');
-  const refreshEnd = source.indexOf('async function load(nextFilters: TypedFilterAst, older = false)', refreshStart);
+  const refreshEnd = source.indexOf('async function load(nextFilters: TypedFilterAst, older = false', refreshStart);
   const refresh = source.slice(refreshStart, refreshEnd);
   assert.doesNotMatch(refresh, /\|\| loadedHistoryIds\.current\.size/,
     'the explicit post-pagination compensation may reconcile the first page without dropping history');
