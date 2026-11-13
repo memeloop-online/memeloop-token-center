@@ -1,0 +1,48 @@
+name: domestic-report-build
+on:
+  workflow_dispatch:
+permissions:
+  contents: read
+  packages: write
+jobs:
+  build:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+    steps:
+      - name: Fetch exact private website revision
+        env:
+          REPORT_USER: ${{ secrets.REPORT_FORGEJO_USER }}
+          REPORT_PASSWORD: ${{ secrets.REPORT_FORGEJO_PASSWORD }}
+        run: |
+          set -euo pipefail
+          test -n "$REPORT_USER" && test -n "$REPORT_PASSWORD"
+          auth=$(printf '%s:%s' "$REPORT_USER" "$REPORT_PASSWORD" | base64 -w0)
+          echo "::add-mask::$auth"
+          export GIT_CONFIG_COUNT=1 GIT_CONFIG_KEY_0=http.extraHeader
+          export GIT_CONFIG_VALUE_0="Authorization: Basic $auth"
+          git init website-source
+          git -C website-source remote add origin https://git.k3s.onetwo.website/website/domestic-model-report.git
+          git -C website-source fetch --depth=1 origin 69006304f110e1d3f255998bb49c024b44068184
+          git -C website-source checkout --detach FETCH_HEAD
+          test "$(git -C website-source rev-parse HEAD)" = 69006304f110e1d3f255998bb49c024b44068184
+          unset GIT_CONFIG_VALUE_0 auth REPORT_USER REPORT_PASSWORD
+      - uses: docker/setup-buildx-action@8d2750c68a42422c14e847fe6c8ac0403b4cbd6f
+      - uses: docker/login-action@c94ce9fb468520275223c153574b00df6fe4bcc9
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+      - name: Build and push exact website Dockerfile
+        id: build
+        uses: docker/build-push-action@10e90e3645eae34f1e60eeb005ba3a3d33f178e8
+        with:
+          context: website-source
+          file: website-source/Dockerfile
+          push: true
+          tags: ghcr.io/memeloop-online/domestic-model-report:source-69006304f110e1d3f255998bb49c024b44068184
+      - name: Record immutable digest
+        env:
+          IMAGE_DIGEST: ${{ steps.build.outputs.digest }}
+        run: |
+          [[ "$IMAGE_DIGEST" =~ ^sha256:[0-9a-f]{64}$ ]]
+          echo "source=69006304f110e1d3f255998bb49c024b44068184 image=ghcr.io/memeloop-online/domestic-model-report@$IMAGE_DIGEST" >> "$GITHUB_STEP_SUMMARY"
