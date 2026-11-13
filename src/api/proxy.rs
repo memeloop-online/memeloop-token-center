@@ -1944,7 +1944,6 @@ async fn proxy_with_cancellation_guard(
                     .ok()
                     .as_ref()
                     .and_then(crate::supplier_error::reason_from_value);
-                let stored_response = format!("inline-json:{}", String::from_utf8_lossy(&body));
                 upstream_attempt
                     .complete(UpstreamAttemptTerminal::Inconclusive)
                     .await;
@@ -1960,7 +1959,6 @@ async fn proxy_with_cancellation_guard(
                     Some(reason.map_or("http_400", |reason| reason.code()).to_owned()),
                     BufferedFinishPolicy {
                         upstream_attribution: ProxyRequestUpstreamAttribution::KeepSelected,
-                        response_storage: BufferedResponseStorage::InlineLocalJson(stored_response),
                         terminal_cause: Some(
                             crate::model::RequestTerminalCause::UpstreamHttpStatus,
                         ),
@@ -2218,7 +2216,6 @@ async fn proxy_with_cancellation_guard(
                 buffer_phase.finish(error_code, None, None);
                 tracing::warn!(%request_id, stage = error_code, "Codex upstream response failed");
                 if let Some(body) = error_details {
-                    let stored = format!("inline-json:{}", String::from_utf8_lossy(&body));
                     let result =
                         finish_buffered_request_with_upstream_attribution_and_response_object(
                             &buffered_request,
@@ -2232,7 +2229,6 @@ async fn proxy_with_cancellation_guard(
                             Some(error_code.to_owned()),
                             BufferedFinishPolicy {
                                 upstream_attribution: ProxyRequestUpstreamAttribution::KeepSelected,
-                                response_storage: BufferedResponseStorage::InlineLocalJson(stored),
                                 terminal_cause: None,
                             },
                         )

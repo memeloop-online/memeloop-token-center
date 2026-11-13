@@ -281,7 +281,7 @@ mod tests {
                 rejection.reason(),
                 Some(SafeReason::MisalignmentPolicyViolation)
             );
-            assert!(!String::from_utf8_lossy(&rejection.body).contains("private"));
+            assert!(String::from_utf8_lossy(&rejection.body).contains("private prompt"));
         }
     }
 
