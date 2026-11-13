@@ -32,6 +32,7 @@ mod history_roots;
 mod multipart;
 mod objects;
 mod path;
+mod quota_reset_receipts;
 mod raw_cache;
 mod raw_capture;
 #[cfg(test)]

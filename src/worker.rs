@@ -295,6 +295,7 @@ pub async fn run_until_shutdown_with_oauth_stop(
                     tracing::error!(%error, "worker failed to delete expired budget rollup detail");
                 }
             }
+            crate::upstream_quota::reset_receipt::recover(state).await;
             let cleanup_deadline = tokio::time::Instant::now() + Duration::from_secs(5);
             let mut deleted_total = 0_u64;
             loop {
