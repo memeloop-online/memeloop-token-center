@@ -272,6 +272,7 @@ jobs:
           MTC_REQUEST_HISTORY_URL: http://127.0.0.1:8123
         run: |
           cargo test --locked --all-features --lib request_history -- --nocapture
+          cargo test --locked --all-features --test request_history_cli -- --nocapture
           cargo test --locked --all-features --lib request_history_real_services_acceptance -- --ignored --nocapture
           cargo test --locked --all-features --lib allocation_history_real_services_acceptance -- --ignored --nocapture
           curl --fail --silent --show-error "$MTC_TEST_CLICKHOUSE_URL" --data-binary 'CREATE DATABASE IF NOT EXISTS session_tasks'
