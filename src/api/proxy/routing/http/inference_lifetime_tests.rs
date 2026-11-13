@@ -194,7 +194,9 @@ async fn inference_caller_cancellation_closes_headers_and_body_sockets_without_r
             0,
             "cancellation closes the actual outbound socket"
         );
-        assert!(futures_util::poll!(listener.accept()).is_pending());
+        let next_connection = listener.accept();
+        tokio::pin!(next_connection);
+        assert!(futures_util::poll!(next_connection.as_mut()).is_pending());
     }
 }
 
@@ -223,5 +225,7 @@ async fn inference_real_truncated_body_is_still_an_error_and_never_replayed() {
     drop(peer);
     let response = request.await.unwrap().unwrap();
     assert!(read_body(response.response).await.is_err());
-    assert!(futures_util::poll!(listener.accept()).is_pending());
+    let next_connection = listener.accept();
+    tokio::pin!(next_connection);
+    assert!(futures_util::poll!(next_connection.as_mut()).is_pending());
 }
