@@ -248,7 +248,10 @@ mod tests {
                         assert_eq!(row.get::<i64, _>("n"), 1);
                     }
                     _ => {
-                        client.prepare("SELECT n FROM executions").await.unwrap();
+                        client
+                            .prepare(sqlx::AssertSqlSafe("SELECT n FROM executions").into_sql_str())
+                            .await
+                            .unwrap();
                     }
                 }
             });
