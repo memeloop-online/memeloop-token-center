@@ -894,7 +894,7 @@ pub(in crate::api) fn convert_owned_with_dialect(
                     message["reasoning_content"] = Value::String(std::mem::take(&mut reasoning));
                 }
                 if output_ids.contains(&id) {
-                    awaiting.insert(id.into());
+                    awaiting.insert(id);
                 }
             }
             "function_call_output" | "custom_tool_call_output" => {
