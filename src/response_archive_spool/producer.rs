@@ -1222,12 +1222,15 @@ async fn run_response_archive_writer(
     );
     #[cfg(test)]
     pause_begin_for_test(&state).await;
-    let staging = format!(
-        "raw-capture-staging/{}/{}/{}",
-        identity.tenant_id,
-        identity.request_id,
-        uuid::Uuid::now_v7()
-    );
+    let staging_key =
+        state
+            .archive
+            .select_staging_key(crate::archive_staging::ArchiveStagingKey::new(
+                crate::archive_staging::ArchiveStagingOwner::ProxyRequest(identity.request_id),
+                crate::archive_staging::ArchiveStagingPurpose::Response,
+                uuid::Uuid::now_v7(),
+            )?)?;
+    let staging = format!("{}/body", staging_key.canonical_prefix());
     let mut writer = loop {
         if !active.load(Ordering::Acquire) {
             return Ok(writer_interrupted(
@@ -1294,7 +1297,11 @@ async fn run_response_archive_writer(
             Err(error) => return Err(error),
         }
     }
-    if let Err(error) = state.archive.delete(&staged.object_locator).await {
+    if let Err(error) = state
+        .archive
+        .delete_archive_staging_segment(staging_key)
+        .await
+    {
         tracing::warn!(request_id = %identity.request_id, error_category = error.diagnostic_category(),
             "complete original retains its temporary staging object for cleanup");
     }

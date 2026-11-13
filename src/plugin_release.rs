@@ -195,6 +195,7 @@ async fn request_release(
             proxy_auth: proxy.and_then(|proxy| proxy.username.zip(proxy.password)),
             pins: if proxy.is_none() { &pins } else { &[] },
             no_retry: true,
+            inference: false,
         })
         .map_err(|_| download_failure(PluginReleaseDownloadFailure::Client))?;
     let response = client
