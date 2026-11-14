@@ -353,55 +353,53 @@ impl BodyCarrier {
                                     (source, end, None),
                                 ));
                             };
-                            match archive.open_stream(&reference.object_locator, None).await {
-                                Ok(download) => {
-                                    let memory = source.clone();
-                                    remote = Some(Box::pin(
-                                        download
-                                            .stream
-                                            .map(move |result| {
-                                                let memory = memory.clone();
-                                                Box::pin(stream::try_unfold(
-                                                    (result, 0usize),
-                                                    move |(result, offset)| {
-                                                        let memory = memory.clone();
-                                                        async move {
-                                                            let bytes = result.map_err(|_| {
-                                                                AppError::storage(
-                                                                    "carrier_object_read_failed",
-                                                                )
-                                                            })?;
-                                                            if offset == bytes.len() {
-                                                                return Ok(None);
-                                                            }
-                                                            let count = (bytes.len() - offset)
-                                                                .min(64 * 1024);
-                                                            let lease = memory
-                                                                .reserve_workspace(count)
-                                                                .await?;
-                                                            let owned = Bytes::copy_from_slice(
-                                                                &bytes[offset..offset + count],
-                                                            );
-                                                            let owned = memory
-                                                                .leased_bytes(owned, lease, None);
-                                                            let next = offset + count;
-                                                            let state = if next == bytes.len() {
-                                                                drop(bytes);
-                                                                (Ok(Bytes::new()), 0)
-                                                            } else {
-                                                                (Ok(bytes), next)
-                                                            };
-                                                            Ok(Some((owned, state)))
-                                                        }
-                                                    },
-                                                ))
-                                                    as CarrierStream
-                                            })
-                                            .flatten(),
-                                    ))
-                                }
-                                Err(error) => return Some((Err(error), (source, index, None))),
-                            }
+                            let _ = archive;
+                            let reference = reference.clone();
+                            remote = Some(Box::pin(stream::try_unfold(
+                                (source.clone(), reference, 0u64),
+                                |(source, reference, offset)| async move {
+                                    if offset == reference.size_bytes {
+                                        return Ok(None);
+                                    }
+                                    let count =
+                                        (reference.size_bytes - offset).min(64 * 1024) as usize;
+                                    // Reserve application destination before receiving the SDK
+                                    // frame. Each HTTP range is bounded independently; no slow
+                                    // consumer retains the backing of an entire object stream.
+                                    let lease = source.reserve_workspace(count).await?;
+                                    let archive = source.archive.as_ref().ok_or_else(|| {
+                                        AppError::storage("carrier_backend_missing")
+                                    })?;
+                                    let mut download = archive
+                                        .open_stream(
+                                            &reference.object_locator,
+                                            Some(offset..offset + count as u64),
+                                        )
+                                        .await?
+                                        .stream;
+                                    let mut output = Vec::with_capacity(count);
+                                    while let Some(chunk) = download.next().await {
+                                        let chunk = chunk.map_err(|_| {
+                                            AppError::storage("carrier_object_read_failed")
+                                        })?;
+                                        if chunk.len() > count.saturating_sub(output.len()) {
+                                            return Err(AppError::storage(
+                                                "carrier_object_read_failed",
+                                            ));
+                                        }
+                                        output.extend_from_slice(&chunk);
+                                    }
+                                    if output.len() != count {
+                                        return Err(AppError::storage(
+                                            "carrier_object_read_failed",
+                                        ));
+                                    }
+                                    drop(download);
+                                    let owned =
+                                        source.leased_bytes(Bytes::from(output), lease, None);
+                                    Ok(Some((owned, (source, reference, offset + count as u64))))
+                                },
+                            )));
                         }
                     }
                 }
