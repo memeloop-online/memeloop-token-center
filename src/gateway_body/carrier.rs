@@ -407,6 +407,27 @@ impl BodyCarrier {
         ))
     }
 
+    /// Bounded independently-owned replay output; its lease follows Bytes
+    /// clones/slices rather than the caller's next poll.
+    pub(crate) async fn read_leased_chunk(
+        self: &Arc<Self>,
+        offset: u64,
+        maximum: usize,
+    ) -> Result<Bytes, AppError> {
+        let remaining = self
+            .length
+            .checked_sub(offset)
+            .ok_or_else(|| AppError::internal("carrier_range_invalid"))?;
+        let count = remaining.min(maximum.min(64 * 1024) as u64) as usize;
+        if count == 0 {
+            return Ok(Bytes::new());
+        }
+        let lease = self.reserve_workspace(count).await?;
+        let mut output = vec![0; count];
+        self.read_into(offset, &mut output).await?;
+        Ok(self.leased_bytes(Bytes::from(output), lease, None))
+    }
+
     pub(crate) async fn read_range(
         self: &Arc<Self>,
         offset: u64,
