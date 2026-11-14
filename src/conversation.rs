@@ -1960,6 +1960,7 @@ mod tests {
                             call_id: Some("original-call".into()),
                             tool_call_id: Some("original-tool-call".into()),
                             media_bytes: Some(b"png-bytes".to_vec()),
+                            ..empty_part()
                         },
                         SessionBodyPart {
                             part_index: 8,
