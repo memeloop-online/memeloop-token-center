@@ -86,6 +86,9 @@ jobs:
       - run: cargo test --locked --lib api::proxy::buffered_upstream
       - run: cargo test --locked --lib api::proxy::tests::memory_metrics
       - run: cargo test --locked --lib gateway_body
+      - run: cargo test --locked --lib json_source
+      - run: cargo test --locked --lib api::proxy::routing::compact_file
+      - run: cargo test --locked --lib api::proxy::routing::http::tests::compact
       - run: cargo test --locked --lib api::proxy::tests::early_terminal
       - run: cargo test --locked --lib archive::conversation
       - run: cargo test --locked --lib archive::session_projection -- --test-threads=1
