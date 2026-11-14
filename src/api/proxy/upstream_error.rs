@@ -23,6 +23,11 @@ pub(in crate::api) async fn with_media_rejection(
     response: axum::response::Response,
     rejection: Bytes,
 ) -> Result<axum::response::Response, crate::error::AppError> {
+    // A concurrent terminal replay can already be successful. Do not attach
+    // a later attempt's diagnostic to that authoritative success payload.
+    if response.status().is_success() && response.status() != StatusCode::ACCEPTED {
+        return Ok(response);
+    }
     let (mut parts, body) = response.into_parts();
     let original = axum::body::to_bytes(body, usize::MAX)
         .await
@@ -285,6 +290,22 @@ mod tests {
     use super::*;
     use futures_util::stream;
     use http::{HeaderMap, HeaderValue, Version};
+
+    #[tokio::test]
+    async fn media_diagnostic_does_not_change_successful_terminal_replay() {
+        let response =
+            axum::response::Response::new(axum::body::Body::from("completed image payload"));
+        let response = with_media_rejection(response, safe_error_body(b"later attempt failed"))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(
+            axum::body::to_bytes(response.into_body(), usize::MAX)
+                .await
+                .unwrap(),
+            "completed image payload"
+        );
+    }
 
     #[tokio::test]
     async fn media_diagnostic_keeps_uncertain_terminal_and_provider_fields() {
