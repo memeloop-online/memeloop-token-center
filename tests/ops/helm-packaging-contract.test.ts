@@ -114,6 +114,16 @@ test('Helm chart packaging, security, ingress, and schema contracts', () => {
         '--set-string', 'plugins.ociInstaller.cosignPublicKeysSecret.keys[0]=cosign.pub',
         '--set-string', 'plugins.ociInstaller.registryAuthSecret.name=plugin-registry-auth',
       ]),
+      runtimeGatewayCacheOci: render('runtime-gateway-cache-oci', [
+        ...runtimeFlags, '--set-string', 'plugins.runtimeInventory.gatewayCachePath=/var/lib/memeloop-token-center/gateway-plugin-cache',
+        '--set', 'plugins.enabled=true', '--set', 'plugins.ociInstaller.enabled=true',
+        '--set-string', `plugins.ociInstaller.image.digest=${installer}`,
+        '--set-string', `plugins.ociInstaller.artifacts[0].reference=ghcr.io/example/plugin@${artifact}`,
+        '--set-string', 'plugins.ociInstaller.artifacts[0].allowedSource=ghcr.io/example/plugin',
+        '--set-string', 'plugins.ociInstaller.cosignPublicKeysSecret.name=plugin-cosign-keys',
+        '--set-string', 'plugins.ociInstaller.cosignPublicKeysSecret.keys[0]=cosign.pub',
+        '--set-string', 'plugins.ociInstaller.registryAuthSecret.name=plugin-registry-auth',
+      ]),
       migration: render('migration', ['--show-only', 'templates/migration-job.yaml', '--set', 'imagePullSecrets[0].name=registry-credentials']),
       webhook: render('webhook', ['--set', 'config.memeloopCloudWebhookSecret.name=memeloop-cloud-integration', '--set', 'config.memeloopCloudWebhookSecret.key=webhook-secret']),
       gateway: render('gateway', ['--show-only', 'templates/ingress.yaml', '--set', 'ingress.gateway.enabled=true', '--set', 'ingress.gateway.className=public-gateway', '--set', 'ingress.gateway.sourceRanges[0]=100.64.0.2/32', '--set-string', 'ingress.gateway.annotations.marker=gateway-only', '--set', 'ingress.gateway.host=gateway.example.test', '--set', 'ingress.gateway.tlsSecretName=gateway-tls']),
@@ -155,7 +165,7 @@ test('Helm chart packaging, security, ingress, and schema contracts', () => {
     count('runtime', 'name: MTC_PLUGIN_INVENTORY_FILE', 3);
     count('runtime', 'name: MTC_PLUGIN_INSTALL_POLICY_FILE', 1);
     count('runtimeReaders', 'name: MTC_PLUGIN_INSTALL_POLICY_FILE', 0);
-    for (const deployment of parseAllDocuments(output.runtimeGatewayCache!).map(document => document.toJSON() as RuntimeDeployment).filter(document => document?.kind === 'Deployment')) {
+    for (const deployment of [output.runtimeGatewayCache!, output.runtimeGatewayCacheOci!].flatMap(value => parseAllDocuments(value)).map(document => document.toJSON() as RuntimeDeployment).filter(document => document?.kind === 'Deployment')) {
       const role = deployment.spec.template.metadata.labels['app.kubernetes.io/component'];
       const pod = deployment.spec.template.spec;
       const volume = pod.volumes.find(item => item.name === 'plugin-runtime-inventory')!;

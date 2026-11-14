@@ -98,7 +98,7 @@ spec:
       {{- end }}
       {{- if or $.Values.plugins.ociInstaller.enabled (and $.Values.plugins.runtimeInventory.enabled (not $gatewayCache)) }}
       initContainers:
-        {{- if $.Values.plugins.runtimeInventory.enabled }}
+        {{- if and $.Values.plugins.runtimeInventory.enabled (not $gatewayCache) }}
         - name: prepare-plugin-inventory
           image: {{ include "memeloop-token-center.roleImage" (dict "root" $ "role" $role) | quote }}
           imagePullPolicy: {{ $.Values.image.pullPolicy }}
