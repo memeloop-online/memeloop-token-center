@@ -149,7 +149,9 @@ impl ArchiveStore {
                     return Err(AppError::storage("semantic_instance_prefix_mismatch"));
                 }
                 let node = self.get_semantic_prefix_node(manifest, head).await?;
-                if node.atom_hash != instance.atom_hash || node.depth != instance.ordinal + 1 {
+                if node.atom_hash != instance.atom_hash
+                    || Some(node.depth) != instance.ordinal.checked_add(1)
+                {
                     return Err(AppError::storage("semantic_instance_prefix_mismatch"));
                 }
                 expected_node = node.parent_hash.map(|node_hash| super::SemanticHead {
