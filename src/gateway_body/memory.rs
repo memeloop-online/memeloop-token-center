@@ -685,9 +685,10 @@ impl ProxyMemoryReservation {
         if reserved == 0 || units > reserved / UNIT_BYTES {
             return None;
         }
+        let transferred = units.checked_mul(UNIT_BYTES)?;
+        let remaining = held.0.checked_sub(transferred)?;
         let lease = held.1.as_mut()?.split(units)?;
-        let transferred = units * UNIT_BYTES;
-        held.0 = held.0.checked_sub(transferred)?;
+        held.0 = remaining;
         self.json_reserved_bytes
             .store(reserved - transferred, Ordering::Release);
         Some(lease)
