@@ -227,6 +227,12 @@ impl Drop for SseStreamingMemory {
 }
 
 impl ProxyMemoryReservation {
+    // Existing request-source ingress uses the same global allocation permits.
+    pub(crate) fn try_reserve_ingress_bytes(&self, bytes: usize) -> Option<OwnedSemaphorePermit> {
+        let units = u32::try_from(bytes.div_ceil(UNIT_BYTES)).ok()?;
+        self.permits.clone().try_acquire_many_owned(units).ok()
+    }
+
     pub(crate) fn covers_json_shape(&self, bytes: usize, nodes: usize) -> bool {
         self.request_json_reserved_bytes() > 0
             && bytes <= self.json_body_ceiling.load(Ordering::Acquire)
