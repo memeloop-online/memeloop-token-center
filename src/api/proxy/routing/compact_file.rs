@@ -736,6 +736,73 @@ mod tests {
     use crate::api::new_api_transport::{compact_to_responses, responses_to_sse};
     use serde_json::{Value, json};
 
+    #[tokio::test]
+    async fn carrier_translation_preserves_large_legacy_text_and_cancellation() {
+        use crate::archive_staging::{
+            ArchiveStagingKey, ArchiveStagingOwner, ArchiveStagingPurpose,
+        };
+        use crate::gateway_body::{
+            carrier::{BodyCarrier, CarrierCapture},
+            memory::ProxyMemoryBudget,
+        };
+        let text = "😀text\n".repeat(CHUNK);
+        let fixture = json!({"id":"carrier-large","output":[{"type":"message","content":text}]});
+        let encoded = serde_json::to_vec(&fixture).unwrap();
+        let chunks: Vec<_> = encoded
+            .chunks(CHUNK - 3)
+            .map(|chunk| Ok::<_, std::io::Error>(bytes::Bytes::copy_from_slice(chunk)))
+            .collect();
+        let id = uuid::Uuid::new_v4();
+        let body = BodyCarrier::capture(
+            futures_util::stream::iter(chunks),
+            CarrierCapture::new(
+                Arc::new(ProxyMemoryBudget::new(32 * 1024 * 1024)),
+                None,
+                ArchiveStagingKey::new(
+                    ArchiveStagingOwner::ProxyRequest(id),
+                    ArchiveStagingPurpose::Response,
+                    id,
+                )
+                .unwrap(),
+            ),
+        )
+        .await
+        .unwrap();
+        let runtime = tokio::runtime::Handle::current();
+        let source = body.clone();
+        let handle = runtime.clone();
+        let translated = tokio::task::spawn_blocking(move || {
+            translate_carrier(
+                source,
+                Cursor::new(Vec::new()),
+                false,
+                Arc::new(AtomicBool::new(false)),
+                handle,
+            )
+        })
+        .await
+        .unwrap()
+        .unwrap();
+        let response: Value = serde_json::from_slice(translated.file.get_ref()).unwrap();
+        assert_eq!(response, compact_to_responses(&fixture).unwrap());
+        assert_eq!(
+            translated.evidence.expected_body_bytes(),
+            translated.file.get_ref().len() as u64
+        );
+        let cancelled = tokio::task::spawn_blocking(move || {
+            translate_carrier(
+                body,
+                Cursor::new(Vec::new()),
+                false,
+                Arc::new(AtomicBool::new(true)),
+                runtime,
+            )
+        })
+        .await
+        .unwrap();
+        assert!(matches!(cancelled, Err("compact_cancelled")));
+    }
+
     #[test]
     fn metadata_keys_and_many_output_items_use_disk_cursors() {
         let long_key = "k".repeat(CHUNK * 2);
