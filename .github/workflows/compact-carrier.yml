@@ -38,5 +38,7 @@ jobs:
         run: cargo test --locked --lib api::proxy::routing::compact_file
       - name: Compact HTTP capture and replay contracts
         run: cargo test --locked --lib api::proxy::routing::http::tests::compact
+      - name: Source-aware replay under full RAM pressure
+        run: cargo test --locked --lib derived_plan_replay_releases_its_own_ram_before_reading_ancestor
       - name: Default HTTP TLS compact and cancellation contract
         run: cargo test --locked --lib native_tls_socks_h1_h2_stream_tool_cancel_and_compact_contract
