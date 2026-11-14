@@ -43,14 +43,15 @@ test('upstream themes and mock-only quota demand, consent and reconciliation con
     await page.keyboard.press('Enter');
     await page.getByLabel('Connect attempts', { exact: true }).waitFor();
     assert.equal(await advanced.getAttribute('aria-expanded'), 'true');
-    await page.getByRole('button', { name: 'Configure network proxy', exact: true }).click();
-    const proxy = page.locator('.upstream-proxy-editor input');
-    await proxy.fill('socks5://100.64.0.16:1080');
-    assert.equal(await proxy.getAttribute('aria-invalid'), 'true');
-    await proxy.fill('socks5h://100.64.0.16:1080');
-    assert.equal(await page.getByRole('button', { name: 'Save network proxy', exact: true }).isEnabled(), true);
-    // Do not save or activate any quota operation in this no-network fixture.
-    await page.getByRole('button', { name: 'Cancel', exact: true }).click();
+    const policy = page.locator('.network-proxy-policy-workspace');
+    const proxy = policy.getByLabel(/^Fixed exit\s*\*?$/);
+    await proxy.selectOption('');
+    assert.equal(await policy.getByRole('button', { name: 'Save account policy', exact: true }).isEnabled(), false);
+    await proxy.selectOption('static-exit-2');
+    assert.equal(await policy.getByRole('button', { name: 'Save account policy', exact: true }).isEnabled(), true);
+    // Discard this local selection. The fixture rejects every write.
+    await policy.getByRole('button', { name: 'Cancel changes', exact: true }).click();
+    assert.equal(await proxy.inputValue(), 'static-exit-1');
     await page.getByText('Historical snapshot', { exact: true }).waitFor();
     assert.equal(await page.getByRole('meter').count(), 1, 'unknown usage never renders a zero/full meter');
     assert.equal(await page.getByRole('button', { name: 'Reset upstream quota', exact: true }).isEnabled(), false);
@@ -76,7 +77,17 @@ test('upstream themes and mock-only quota demand, consent and reconciliation con
       assert.equal(focus.style, 'solid');
       assert.notEqual(focus.color, 'rgba(0, 0, 0, 0)');
         await page.setViewportSize({ width, height: 900 });
-        assert.ok(await page.evaluate(() => document.documentElement.scrollWidth <= document.documentElement.clientWidth));
+        const overflow = await page.evaluate(() => ({
+          viewport: document.documentElement.clientWidth,
+          width: document.documentElement.scrollWidth,
+          elements: Array.from(document.body.querySelectorAll<HTMLElement>('*')).flatMap(element => {
+            const rect = element.getBoundingClientRect();
+            return rect.width > 0 && (rect.left < 0 || rect.right > document.documentElement.clientWidth)
+              ? [{ tag: element.tagName, className: element.className, left: rect.left, right: rect.right, width: rect.width }]
+              : [];
+          }).slice(0, 12),
+        }));
+        assert.ok(overflow.width <= overflow.viewport, `upstream layout overflow ${theme}/${width}: ${JSON.stringify(overflow)}`);
         await page.screenshot({ path: join(artifacts, `upstream-quota-${theme}-${width}.png`), fullPage: true });
     }
     // Exercise the real UpstreamQuota, with fetch replaced by the strict local fixture.
@@ -86,7 +97,7 @@ test('upstream themes and mock-only quota demand, consent and reconciliation con
     await view.waitFor();
     assert.deepEqual(await page.evaluate(() => [window.quotaReads, window.quotaWrites]), [0, 0]);
     await view.click();
-    await page.getByText('Codex usage · 5-hour limit', { exact: true }).waitFor();
+    await page.locator('.upstream-quota-windows').getByText('Codex usage · 5-hour limit', { exact: true }).waitFor();
     assert.equal(await page.getByRole('region', { name: 'Quota reset', exact: true }).count(), 1, 'one flat reset section owns explanation and action');
     const reset = page.getByRole('button', { name: 'Reset upstream quota', exact: true });
     await page.waitForFunction(() => window.quotaCurrents === 1 && !document.querySelector<HTMLButtonElement>('.upstream-quota-reset-action button')?.disabled);
@@ -127,6 +138,7 @@ test('upstream themes and mock-only quota demand, consent and reconciliation con
     await view.click();
     await page.getByRole('button', { name: 'Check operation status', exact: true }).click();
     await page.waitForFunction(() => window.quotaCurrents === 2);
+    await page.waitForFunction(() => !document.querySelector<HTMLButtonElement>('.upstream-quota-reset-action button')?.disabled);
     assert.equal(await reset.isEnabled(), true);
     await page.goto(`${base}/e2e/fixtures/upstream-quota.html?mode=reset-settled`);
     await view.click();
@@ -183,7 +195,7 @@ test('upstream themes and mock-only quota demand, consent and reconciliation con
       await view.click();
       await page.getByRole('alert').getByText(message, { exact: true }).waitFor();
       if (mode !== 'permission') {
-        await page.getByText('Codex usage · 5-hour limit', { exact: true }).waitFor();
+        await page.locator('.upstream-quota-windows').getByText('Codex usage · 5-hour limit', { exact: true }).waitFor();
         await page.getByText(/This refresh failed\. The values below are the last successful observation from .+ and may be outdated\. Retry manually for current quota\./).waitFor();
         assert.equal(await page.getByRole('meter').count(), 1);
       }

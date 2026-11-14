@@ -366,7 +366,7 @@ async fn executed_response_rejects_memory_without_waiting_or_replaying_upstream(
 }
 
 #[tokio::test]
-async fn exhausted_memory_rejects_chunked_request_before_upstream_and_recovers() {
+async fn exhausted_memory_waits_before_upstream_and_recovers_chunked_request() {
     let fixture = codex_route_fixture("memory-admission-capacity").await;
     let held = fixture.state.proxy_memory_budget.reservation();
     assert!(held.try_grow(fixture.state.config.proxy_memory_budget_bytes as usize, 1));
@@ -397,26 +397,35 @@ async fn exhausted_memory_rejects_chunked_request_before_upstream_and_recovers()
         .body(Body::from_stream(futures_util::stream::iter(chunks)))
         .unwrap();
     assert!(!request.headers().contains_key(header::CONTENT_LENGTH));
-    let rejected = codex_transport::with_test_endpoint(
+    let mut waiting = Box::pin(codex_transport::with_test_endpoint(
         upstream.uri(),
         router_for_role(fixture.state.clone(), RuntimeRole::Gateway).oneshot(request),
-    )
-    .await
-    .unwrap();
-    assert_eq!(rejected.status(), StatusCode::SERVICE_UNAVAILABLE);
-    assert!(rejected.headers().contains_key(header::RETRY_AFTER));
-    assert!(upstream.received_requests().await.unwrap().is_empty());
-    assert_only_early_request_failures(&fixture).await;
-
-    drop(rejected);
-    drop(held);
-    let response = send_codex_route(
-        &fixture,
-        &upstream,
-        "/v1/responses",
-        serde_json::from_slice(&payload).unwrap(),
-    )
+    ));
+    futures_util::future::poll_fn(|context| {
+        assert!(std::future::Future::poll(waiting.as_mut(), context).is_pending());
+        if fixture.state.proxy_lifecycles.active() == 1 {
+            std::task::Poll::Ready(())
+        } else {
+            std::task::Poll::Pending
+        }
+    })
     .await;
+    assert!(upstream.received_requests().await.unwrap().is_empty());
+    let pool = sqlx::AnyPool::connect(&fixture.database_url).await.unwrap();
+    let reservations: i64 =
+        sqlx::query_scalar("SELECT COUNT(*) FROM usage_reservations WHERE key_id = $1")
+            .bind(fixture.key_id.to_string())
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+    assert_eq!(reservations, 0, "budget wait cannot reserve or dispatch");
+    assert_eq!(
+        fixture.state.proxy_memory_budget.snapshot().0,
+        fixture.state.config.proxy_memory_budget_bytes as usize
+    );
+    pool.close().await;
+    drop(held);
+    let response = waiting.await.unwrap();
     assert_eq!(response.status(), StatusCode::OK);
     let delivered = to_bytes(response.into_body(), MAX_PROXY_RESPONSE_BODY)
         .await
@@ -428,11 +437,7 @@ async fn exhausted_memory_rejects_chunked_request_before_upstream_and_recovers()
         .list_requests(fixture.key_id, 10)
         .await
         .unwrap();
-    assert_eq!(rows.len(), 2);
-    assert_eq!(
-        rows[1].terminal_cause_code.as_deref(),
-        Some("gateway_pre_admission")
-    );
+    assert_eq!(rows.len(), 1, "waiting is not an early request failure");
     let refs = fixture
         .state
         .db
@@ -450,7 +455,12 @@ async fn exhausted_memory_rejects_chunked_request_before_upstream_and_recovers()
             .get(refs.response_object.as_deref().unwrap())
             .await
             .unwrap(),
-        delivered
+        Bytes::from(completed_codex_sse("capacity recovered"))
+    );
+    let delivered: Value = serde_json::from_slice(&delivered).unwrap();
+    assert_eq!(
+        delivered["output"][0]["content"][0]["text"],
+        "capacity recovered"
     );
     assert_exactly_once_side_effects(&fixture, rows[0].request_id, Some("resp-codex")).await;
     upstream.verify().await;

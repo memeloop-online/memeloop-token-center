@@ -18,6 +18,7 @@ const ARCHIVE_MULTIPART_MAX_IN_FLIGHT_PARTS: usize = 1;
 pub struct ArchiveWriter {
     pub(super) store: Arc<dyn ObjectStore>,
     pub(super) staging: Path,
+    pub(super) staging_locator: String,
     pub(super) inner: Option<object_store::WriteMultipart>,
     pub(super) multipart_part_bytes: usize,
     pub(super) hasher: blake3::Hasher,
@@ -35,16 +36,22 @@ pub struct StagedArchiveObject {
 
 impl ArchiveStore {
     pub async fn start_writer(&self, location: &str) -> Result<ArchiveWriter, AppError> {
-        if super::path::is_any_v1_cas_location(location) {
+        if location.starts_with(super::routing::PREFIX) {
+            return Err(AppError::storage("archive_training_requires_immutable_cas"));
+        }
+        if super::path::is_any_v1_cas_location(location)
+            || super::path::is_durable_root_location(location)
+        {
             return Err(AppError::BadRequest(
                 "archive CAS objects are immutable".into(),
             ));
         }
-        let staging = archive_path(location)?;
-        let upload = self.inner.put_multipart(&staging).await?;
+        let (store, staging) = self.resolve(location)?;
+        let upload = store.put_multipart(&staging).await?;
         Ok(ArchiveWriter {
-            store: self.inner.clone(),
+            store: store.clone(),
             staging,
+            staging_locator: location.to_owned(),
             inner: Some(object_store::WriteMultipart::new_with_chunk_size(
                 upload,
                 ARCHIVE_MULTIPART_PART_BYTES,
@@ -86,9 +93,6 @@ impl ArchiveWriter {
             .ok_or_else(|| AppError::storage("archive_object_size_overflow"))?;
         if self.inner.is_none() {
             return Err(AppError::storage("archive_writer_is_already_closed"));
-        }
-        if self.compressed && next_size > super::compressed::MAX_PLAIN {
-            return Err(AppError::storage("local_storage_failed"));
         }
         self.hasher.update(&bytes);
         self.size_bytes = next_size;
@@ -155,8 +159,12 @@ impl ArchiveWriter {
         // Shared CAS locators end in an exact 64-hex digest. Versioned text
         // objects currently bind only request-owned staged locators; do not
         // publish a suffix-bearing CAS locator that other readers reject.
-        if self.compressed {
-            return Err(AppError::storage("local_storage_failed"));
+        if self.compressed
+            || self
+                .staging_locator
+                .starts_with(super::routing::STAGING_PREFIX)
+        {
+            return Err(AppError::storage("archive_writer_requires_staged_finish"));
         }
         self.finish_multipart().await?;
         let location = content_location(
@@ -178,7 +186,7 @@ impl ArchiveWriter {
     pub async fn finish_staged(mut self) -> Result<StagedArchiveObject, AppError> {
         self.finish_multipart().await?;
         Ok(StagedArchiveObject {
-            object_locator: self.staging.to_string(),
+            object_locator: self.staging_locator.clone(),
             blake3_digest: std::mem::replace(&mut self.hasher, blake3::Hasher::new())
                 .finalize()
                 .to_hex()

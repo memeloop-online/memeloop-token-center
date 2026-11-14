@@ -253,7 +253,7 @@ impl TransportProxyGroups {
             return;
         }
         body["runtime"]["configuration_state"] = Value::String(
-            if stamp.group_id.is_some() {
+            if entry.entry.is_some() {
                 "applied"
             } else {
                 "unbound"

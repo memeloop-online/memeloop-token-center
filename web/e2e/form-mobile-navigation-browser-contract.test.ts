@@ -33,7 +33,7 @@ test('mobile navigation closes before editing and uses an opaque surface', { tim
     assert.equal(await page.getByRole('heading', { name: '编辑 研发订阅', exact: true }).count(), 1);
     assert.equal(await page.locator('.create-journey input:not([type="hidden"])').evaluateAll(elements => elements.filter(element => (element as HTMLInputElement).value.includes('chatgpt.com')).length), 0);
     assert.equal(await page.locator('.create-journey code').filter({ hasText: 'https://chatgpt.com/backend-api/codex' }).count(), 1);
-    await page.getByRole('button', { name: '配置网络代理', exact: true }).click({ trial: true });
+    await page.getByLabel(/^固定出口\s*\*?$/).click({ trial: true });
     assert.equal(await page.locator('.provider-edit-workspace legend').filter({ hasText: '1. 上游身份与认证' }).count(), 0);
     assert.equal(await page.locator('.provider-edit-workspace .upstream-connection').evaluate(element => getComputedStyle(element).borderTopWidth), '0px');
     assert.equal(await page.locator('.provider-edit-workspace .inline-editor').evaluate(element => getComputedStyle(element).backgroundColor), 'rgba(0, 0, 0, 0)');
@@ -49,20 +49,20 @@ test('mobile navigation closes before editing and uses an opaque surface', { tim
     assert.ok(layout.skipBottom <= 0, 'unfocused skip link remains outside viewport');
     assert.ok(layout.focusTop >= 64, 'focused editor input is below the sticky header');
     await page.screenshot({ path: `${artifacts}/provider-edit-desktop-viewport.png`, fullPage: false });
-    await page.getByRole('button', { name: '配置网络代理', exact: true }).click();
+    await page.getByLabel(/^固定出口\s*\*?$/).selectOption('exit-10');
     const providerSave = page.locator('.provider-edit-workspace .rjsf > button[type="submit"]');
     const closeEditor = page.locator('.create-journey [data-workspace-toggle]');
     assert.equal(await providerSave.isEnabled(), false, 'upstream save cannot discard a separately edited proxy');
     assert.equal(await closeEditor.isEnabled(), false, 'closing cannot discard an active proxy edit');
     await page.getByRole('status').filter({ hasText: '网络代理需要单独保存' }).waitFor();
-    const proxy = page.locator('.upstream-proxy-editor input');
-    await proxy.fill('socks5://10.0.0.10:1080');
-    assert.equal(await page.getByRole('button', { name: '保存网络代理', exact: true }).isEnabled(), false);
+    const proxy = page.getByLabel(/^固定出口\s*\*?$/);
+    await proxy.selectOption('');
+    assert.equal(await page.getByRole('button', { name: '保存账号策略', exact: true }).isEnabled(), false);
     assert.equal(await providerSave.isEnabled(), false, 'invalid proxy drafts cannot be bypassed by the upstream save');
     await page.locator('.provider-edit-workspace .rjsf').evaluate(element => (element as HTMLFormElement).requestSubmit());
     assert.equal(await page.evaluate(() => window.formJourneyWrites), 0, 'form submission also guards against discarding proxy drafts');
-    await proxy.fill('socks5h://10.0.0.10:1080');
-    assert.equal(await page.getByRole('button', { name: '保存网络代理', exact: true }).isEnabled(), true);
+    await proxy.selectOption('exit-10');
+    assert.equal(await page.getByRole('button', { name: '保存账号策略', exact: true }).isEnabled(), true);
     // Only inspect the draft. Never activate either proxy or provider save.
     for (const width of [320, 1440]) {
       await page.setViewportSize({ width, height: 1000 });
@@ -71,7 +71,7 @@ test('mobile navigation closes before editing and uses an opaque surface', { tim
       await page.screenshot({ path: `${artifacts}/provider-proxy-dark-${width}.png`, fullPage: true });
     }
     console.log('desktop viewport geometry', layout);
-    await page.getByLabel('服务地址与网络出口', { exact: true }).getByRole('button', { name: '取消', exact: true }).click();
+    await page.locator('.network-proxy-policy-workspace').getByRole('button', { name: '取消修改', exact: true }).click();
     assert.equal(await providerSave.isEnabled(), true, 'explicit cancellation restores the independent upstream save');
     assert.equal(await closeEditor.isEnabled(), true);
     assert.equal(await page.evaluate(() => window.formJourneyWrites), 0);

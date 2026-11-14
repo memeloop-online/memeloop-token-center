@@ -146,3 +146,58 @@ test('tenant detection prefers specific paths and rejects equal-rank templates b
     }), /path is ambiguous/);
   } finally { globalThis.fetch = originalFetch; }
 });
+
+test('stream bridge shares tenant/auth validation and preserves native backpressure and cancellation', async () => {
+  const originalFetch = globalThis.fetch;
+  const controller = new AbortController();
+  let pulls = 0;
+  let cancelled: unknown;
+  const nativeBody = new ReadableStream<Uint8Array>({
+    pull(c) { pulls++; c.enqueue(new TextEncoder().encode('data: {"type":"response.created"}\n\n')); },
+    cancel(reason) { cancelled = reason; },
+  }, { highWaterMark: 0 });
+  let observed: { path: string; init: RequestInit } | undefined;
+  globalThis.fetch = async (path, init) => {
+    if (String(path) === '/internal/v1/api-schema') return new Response(JSON.stringify({ paths: {
+      '/internal/v1/inference/responses': { post: {} },
+    } }));
+    observed = { path: String(path), init: init! };
+    return new Response(nativeBody, { headers: { 'content-type': 'text/event-stream; charset=utf-8', 'x-mtc-request-id': '00000000-0000-4000-8000-000000000001' } });
+  };
+  try {
+    const api = createOperatorApiBridge('host-secret', 'selected');
+    const result = await api.requestApiStream({ path: '/internal/v1/inference/responses?tenant_external_id=other', method: 'POST', body: { key_id: 'chosen', request: { stream: true } }, signal: controller.signal });
+    assert.equal(result.body, nativeBody);
+    assert.equal(pulls, 0, 'bridge must not eagerly read or buffer the stream');
+    assert.equal(result.requestId, '00000000-0000-4000-8000-000000000001');
+    assert.equal(observed!.path, '/internal/v1/inference/responses?tenant_external_id=selected');
+    assert.equal((observed!.init.headers as Record<string, string>).Authorization, 'Bearer host-secret');
+    assert.equal(observed!.init.signal, controller.signal);
+    assert.equal(observed!.init.redirect, 'error');
+    assert.equal(observed!.init.credentials, 'same-origin');
+    const reader = result.body.getReader();
+    await reader.read();
+    assert.equal(pulls, 1);
+    await reader.cancel('page-unmounted');
+    reader.releaseLock();
+    assert.equal(cancelled, 'page-unmounted');
+    await assert.rejects(api.requestApiStream({ path: 'https://evil.invalid/v1/responses' }), /API path/);
+    await assert.rejects(api.requestApiStream({ path: '/internal/v1/undocumented', method: 'POST' }), /absent from/);
+  } finally { globalThis.fetch = originalFetch; }
+});
+
+test('stream bridge preserves RBAC errors, aborts and rejects JSON success without buffering it', async () => {
+  const originalFetch = globalThis.fetch;
+  try {
+    const request = createOperatorApiBridge('host-secret', 'selected').requestApiStream;
+    globalThis.fetch = async () => new Response(JSON.stringify({ error: { code: 'forbidden', message: 'Forbidden' } }), { status: 403 });
+    await assert.rejects(request({ path: '/internal/v1/resources' }), (e: unknown) => e instanceof Error && 'status' in e && e.status === 403);
+    let cancelled = false;
+    globalThis.fetch = async () => new Response(new ReadableStream({ cancel() { cancelled = true; } }), { headers: { 'content-type': 'application/json' } });
+    await assert.rejects(request({ path: '/internal/v1/resources' }), /did not return an event stream/);
+    assert.equal(cancelled, true);
+    const controller = new AbortController(); controller.abort();
+    globalThis.fetch = async (_path, init) => { init!.signal!.throwIfAborted(); throw new Error('unexpected'); };
+    await assert.rejects(request({ path: '/internal/v1/resources', signal: controller.signal }), (e: unknown) => e instanceof DOMException && e.name === 'AbortError');
+  } finally { globalThis.fetch = originalFetch; }
+});

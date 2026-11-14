@@ -1,5 +1,7 @@
 use std::time::Duration;
 
+mod allocation_history;
+mod history_immutable_outbox;
 mod quota_observations;
 
 use chrono::{Days, Utc};
@@ -8,7 +10,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use sha2::{Digest, Sha256};
 use sqlx::{
-    Any, AnyConnection, AnyPool, Row, Transaction,
+    Any, AnyConnection, Row, Transaction,
     any::{AnyPoolOptions, AnyQueryResult, AnyRow},
 };
 use uuid::Uuid;
@@ -51,8 +53,11 @@ use crate::{
 mod archive_spool;
 mod archive_staging;
 mod gateway_persistence;
+mod request_connection;
+mod request_pool;
 pub(crate) use archive_spool::ArchiveSpoolChunk;
 pub(crate) use archive_spool::{ArchiveSpoolIdentity, ArchiveSpoolTask};
+use request_pool::RequestPool as AnyPool;
 pub(crate) mod allocation;
 mod billing;
 mod constants;
@@ -63,6 +68,8 @@ mod filter_assistant;
 mod generation;
 mod group_routing;
 mod groups;
+mod history_delivery;
+mod history_source_snapshot;
 mod http_settings;
 mod migrations;
 mod monitoring_snapshot;
@@ -93,6 +100,7 @@ pub(crate) use requests::{PendingProxyOperationalTerminal, PendingProxyOperation
 mod rotation;
 mod routing;
 pub use routing::egress;
+mod object_bodies;
 mod rows;
 mod session_analytics;
 mod session_reading;
@@ -143,14 +151,41 @@ pub use time::unix_millis;
 pub(crate) use upstream_quota_reset::{PrepareQuotaReset, QuotaResetClaim, QuotaResetOperation};
 use validation::*;
 
-const POSTGRES_SERVE_STATEMENT_TIMEOUT: &str = "SET statement_timeout = 30000";
-const POSTGRES_SERVE_LOCK_TIMEOUT: &str = "SET lock_timeout = 10000";
-const POSTGRES_SERVE_IDLE_TRANSACTION_TIMEOUT: &str =
-    "SET idle_in_transaction_session_timeout = 30000";
-const POSTGRES_MIGRATION_STATEMENT_TIMEOUT: &str = "SET statement_timeout = 900000";
-const POSTGRES_MIGRATION_LOCK_TIMEOUT: &str = "SET lock_timeout = 60000";
-const POSTGRES_MIGRATION_IDLE_TRANSACTION_TIMEOUT: &str =
-    "SET idle_in_transaction_session_timeout = 300000";
+// One startup round trip per new socket. Session settings are not re-applied
+// on request checkout; transaction-local overrides retain their original scope.
+async fn initialize_postgres_connection(
+    connection: &mut sqlx::AnyConnection,
+    application_name: &str,
+    profile: ConnectionProfile,
+) -> Result<(), sqlx::Error> {
+    let (statement, lock, idle) = match profile {
+        ConnectionProfile::Serve => ("0", "0", "30000"),
+        ConnectionProfile::Migration => ("900000", "60000", "300000"),
+    };
+    sqlx::query("SELECT set_config('application_name', CASE WHEN current_setting('application_name') = '' THEN $1 ELSE current_setting('application_name') END, false), set_config('statement_timeout', $2, false), set_config('lock_timeout', $3, false), set_config('idle_in_transaction_session_timeout', $4, false), set_config('client_connection_check_interval', '1000', false)")
+        .bind(application_name).bind(statement).bind(lock).bind(idle)
+        .execute(connection).await?;
+    Ok(())
+}
+
+async fn wait_for_initial_postgres_connection(pool: &AnyPool) -> Result<(), sqlx::Error> {
+    let mut timeouts = 0_u64;
+    loop {
+        match pool.acquire().await {
+            Ok(connection) => {
+                connection.finish();
+                return Ok(());
+            }
+            Err(sqlx::Error::PoolTimedOut) => {
+                timeouts += 1;
+                if timeouts == 1 || timeouts.is_multiple_of(6) {
+                    tracing::warn!(timeouts, "waiting for initial PostgreSQL connection");
+                }
+            }
+            Err(error) => return Err(error),
+        }
+    }
+}
 
 #[derive(Clone, Copy)]
 enum ConnectionProfile {
@@ -257,11 +292,27 @@ pub use usage_analysis::{
     UsageAnalysisFilter, UsageAnalysisProjection, UsageAnalysisUpstreamFilter,
 };
 
+fn postgres_application_name(role: &str) -> String {
+    let hostname = std::env::var("HOSTNAME").unwrap_or_default();
+    let suffix: String = hostname
+        .chars()
+        .rev()
+        .take(32)
+        .collect::<String>()
+        .chars()
+        .rev()
+        .collect();
+    format!("{role}/{suffix}")
+}
+
 #[derive(Clone)]
 pub struct Database {
     pub(crate) http_clients: std::sync::Arc<crate::http_settings::HttpClientFactory>,
     pool: AnyPool,
+    archive: Option<crate::archive::ArchiveStore>,
     pool_role: &'static str,
+    auxiliary_pool_max_connections: u32,
+    connection_profile: ConnectionProfile,
     backend: DatabaseBackend,
     terminal_projection_enabled: bool,
     gateway_persistence: std::sync::Arc<gateway_persistence::GatewayPersistence>,
@@ -464,7 +515,7 @@ impl Database {
         &self,
         progress: &DatabaseReadinessProgress,
         stage: DatabaseReadinessStage,
-    ) -> Result<sqlx::pool::PoolConnection<Any>, sqlx::Error> {
+    ) -> Result<request_connection::RequestConnection, sqlx::Error> {
         progress.enter(stage, DatabaseReadinessPhase::Acquire).await;
         let started = tokio::time::Instant::now();
         let connection = self.pool.acquire().await.inspect_err(|error| {
@@ -482,21 +533,26 @@ impl Database {
             .acquire_readiness_connection(progress, DatabaseReadinessStage::Ping)
             .await
             .map_err(AppError::from)?;
-        sqlx::query("SELECT 1")
-            .execute(&mut *connection)
-            .await
-            .map_err(AppError::from)?;
-        let schema = self
-            .schema_status(&mut connection, progress)
-            .await
-            .map_err(AppError::from)?;
-        if !schema.is_ready() {
-            return Err(DatabaseReadinessError::SchemaOutdated(schema));
+        let result = async {
+            sqlx::query("SELECT 1")
+                .execute(&mut *connection)
+                .await
+                .map_err(AppError::from)?;
+            let schema = self
+                .schema_status(&mut connection, progress)
+                .await
+                .map_err(AppError::from)?;
+            if !schema.is_ready() {
+                return Err(DatabaseReadinessError::SchemaOutdated(schema));
+            }
+            self.archive_staging_readiness_check(&mut connection, progress)
+                .await
+                .map_err(AppError::from)?;
+            Ok(())
         }
-        self.archive_staging_readiness_check(&mut connection, progress)
-            .await
-            .map_err(AppError::from)?;
-        Ok(())
+        .await;
+        connection.finish();
+        result
     }
 
     pub async fn list_tenants(&self) -> Result<Vec<TenantView>, AppError> {
@@ -608,7 +664,10 @@ impl Database {
             .max_connections(maximum_connections.clamp(1, 32))
             .acquire_timeout(Duration::from_secs(10))
             .idle_timeout(Some(Duration::from_secs(5 * 60)))
-            .max_lifetime(Some(Duration::from_secs(30 * 60)));
+            .max_lifetime(Some(Duration::from_secs(30 * 60)))
+            .after_release(move |connection, _metadata| {
+                Box::pin(async move { Ok(request_connection::can_reuse(connection, backend)) })
+            });
         if matches!(backend, DatabaseBackend::Sqlite) {
             // SQLite is a supported lightweight/test backend and can have a
             // background worker and an HTTP handler contend for its single
@@ -626,28 +685,12 @@ impl Database {
                 })
             });
         } else {
+            pool_options = pool_options.test_before_acquire(false);
+            let application_name = postgres_application_name("mtc-serve");
             pool_options = pool_options.after_connect(move |connection, _metadata| {
+                let application_name = application_name.clone();
                 Box::pin(async move {
-                    let (statement_timeout, lock_timeout, idle_transaction_timeout) = match profile
-                    {
-                        ConnectionProfile::Serve => (
-                            POSTGRES_SERVE_STATEMENT_TIMEOUT,
-                            POSTGRES_SERVE_LOCK_TIMEOUT,
-                            POSTGRES_SERVE_IDLE_TRANSACTION_TIMEOUT,
-                        ),
-                        ConnectionProfile::Migration => (
-                            POSTGRES_MIGRATION_STATEMENT_TIMEOUT,
-                            POSTGRES_MIGRATION_LOCK_TIMEOUT,
-                            POSTGRES_MIGRATION_IDLE_TRANSACTION_TIMEOUT,
-                        ),
-                    };
-                    sqlx::query(statement_timeout)
-                        .execute(&mut *connection)
-                        .await?;
-                    sqlx::query(lock_timeout).execute(&mut *connection).await?;
-                    sqlx::query(idle_transaction_timeout)
-                        .execute(&mut *connection)
-                        .await?;
+                    initialize_postgres_connection(connection, &application_name, profile).await?;
                     Ok(())
                 })
             });
@@ -655,7 +698,13 @@ impl Database {
         // Windows test paths use `\`. SQLite's URL parser treats that as an
         // invalid URL, so the same `sqlite://...` fixtures never open a file.
         let database_url = Self::normalized_sqlite_url(database_url);
-        let pool = pool_options.connect(database_url.as_ref()).await?;
+        let pool = if matches!(backend, DatabaseBackend::PostgreSql) {
+            let pool: AnyPool = pool_options.connect_lazy(database_url.as_ref())?.into();
+            wait_for_initial_postgres_connection(&pool).await?;
+            pool
+        } else {
+            AnyPool::from(pool_options.connect(database_url.as_ref()).await?)
+        };
         if matches!(backend, DatabaseBackend::Sqlite) {
             // The control, gateway, and worker roles may be separate processes
             // over the same lightweight/test database. WAL keeps readers on a
@@ -668,6 +717,10 @@ impl Database {
                 .await?;
         }
         Ok(Self {
+            #[cfg(test)]
+            archive: Some(crate::archive::ArchiveStore::memory_for_test()),
+            #[cfg(not(test))]
+            archive: None,
             http_clients: std::sync::Arc::default(),
             gateway_persistence: std::sync::Arc::new(gateway_persistence::GatewayPersistence::new(
                 database_url.as_ref(),
@@ -680,6 +733,8 @@ impl Database {
             },
             backend,
             terminal_projection_enabled: false,
+            auxiliary_pool_max_connections: 2,
+            connection_profile: profile,
             #[cfg(test)]
             oauth_refresh_write_phase_seam: std::sync::Arc::new(tokio::sync::Mutex::new(None)),
         })
@@ -690,7 +745,7 @@ impl Database {
     async fn acquire_request_connection(
         &self,
         operation: &'static str,
-    ) -> Result<sqlx::pool::PoolConnection<Any>, sqlx::Error> {
+    ) -> Result<request_connection::RequestConnection, sqlx::Error> {
         let started = tokio::time::Instant::now();
         let mut timeouts = 0_u64;
         loop {
@@ -738,7 +793,7 @@ impl Database {
             DatabaseBackend::Sqlite => "BEGIN IMMEDIATE",
         };
         Box::pin(Transaction::begin(
-            connection,
+            connection.into_pool(),
             Some(sqlx::SqlStr::from_static(statement)),
         ))
         .await
@@ -753,9 +808,19 @@ impl Database {
         if matches!(error, sqlx::Error::PoolTimedOut) {
             let pool_size = self.pool.size();
             let pool_idle = self.pool.num_idle();
+            let diagnostics = self.pool.diagnostics();
+            let (waiters, initializing, cancelled, failed, returned, discarded) =
+                diagnostics.snapshot();
             tracing::warn!(
                 operation,
                 pool_role = self.pool_role,
+                pool_label = diagnostics.label,
+                pool_acquire_waiters = waiters,
+                pool_session_initializing = initializing,
+                pool_session_initialization_cancelled = cancelled,
+                pool_session_initialization_failed = failed,
+                pool_return_callbacks = returned,
+                pool_protocol_discards = discarded,
                 phase = "acquire",
                 error_kind = "pool_timeout",
                 elapsed_ms = started.elapsed().as_millis() as u64,
@@ -769,20 +834,73 @@ impl Database {
         }
     }
 
+    pub(crate) fn with_auxiliary_pool_max_connections(mut self, maximum: u32) -> Self {
+        self.auxiliary_pool_max_connections = maximum.clamp(1, 2);
+        self
+    }
+
     pub(crate) fn independent_persistence_pool(&self) -> Self {
+        self.independent_persistence_pool_for("independent-persistence")
+    }
+
+    pub(crate) fn independent_persistence_pool_for(&self, label: &'static str) -> Self {
         Self {
+            archive: self.archive.clone(),
             http_clients: self.http_clients.clone(),
             gateway_persistence: self.gateway_persistence.clone(),
             pool_role: "independent_persistence",
-            pool: self
-                .pool
-                .options()
-                .clone()
-                .min_connections(0)
-                .max_connections(2)
-                .connect_lazy_with(self.pool.connect_options().as_ref().clone()),
+            pool: {
+                let backend = self.backend;
+                let profile = self.connection_profile;
+                let application_name = postgres_application_name(&format!("mtc-{label}"));
+                let diagnostics = request_pool::PoolDiagnostics::new(label);
+                let initialization_diagnostics = diagnostics.clone();
+                let release_diagnostics = diagnostics.clone();
+                let pool: sqlx::AnyPool = self
+                    .pool
+                    .options()
+                    .clone()
+                    .min_connections(0)
+                    .max_connections(self.auxiliary_pool_max_connections)
+                    .after_connect(move |connection, _| {
+                        let application_name = application_name.clone();
+                        let mut initialization = initialization_diagnostics.initializing();
+                        Box::pin(async move {
+                            let result = async {
+                                match backend {
+                                    DatabaseBackend::Sqlite => {
+                                        sqlx::query("PRAGMA busy_timeout = 10000")
+                                            .execute(&mut *connection)
+                                            .await?;
+                                    }
+                                    DatabaseBackend::PostgreSql => {
+                                        initialize_postgres_connection(
+                                            connection,
+                                            &application_name,
+                                            profile,
+                                        )
+                                        .await?;
+                                    }
+                                }
+                                Ok(())
+                            }
+                            .await;
+                            initialization.finish(result.is_ok());
+                            result
+                        })
+                    })
+                    .after_release(move |connection, _| {
+                        let reusable = request_connection::can_reuse(connection, backend);
+                        release_diagnostics.released(reusable);
+                        Box::pin(async move { Ok(reusable) })
+                    })
+                    .connect_lazy_with(self.pool.connect_options().as_ref().clone());
+                request_pool::RequestPool::from(pool).with_diagnostics(diagnostics)
+            },
             backend: self.backend,
             terminal_projection_enabled: self.terminal_projection_enabled,
+            auxiliary_pool_max_connections: self.auxiliary_pool_max_connections,
+            connection_profile: self.connection_profile,
             #[cfg(test)]
             oauth_refresh_write_phase_seam: std::sync::Arc::new(tokio::sync::Mutex::new(None)),
         }
@@ -790,7 +908,7 @@ impl Database {
 
     pub(crate) fn refresh_closed_persistence_pool(&mut self) {
         if self.pool_role == "independent_persistence" && self.pool.is_closed() {
-            *self = self.independent_persistence_pool();
+            *self = self.independent_persistence_pool_for(self.pool.diagnostics().label);
         }
     }
 

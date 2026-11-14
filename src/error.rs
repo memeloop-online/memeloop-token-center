@@ -573,8 +573,8 @@ pub(crate) fn render_bilingual(code: &str, facts: ErrorFacts) -> (String, String
 pub(crate) fn public_error_sentences(code: &str) -> Option<(&'static str, &'static str)> {
     Some(match code {
         "proxy_memory_ingress" => (
-            "网关内存装不下这次请求体，也没有写入对象存储",
-            "gateway memory budget could not hold the request body, and the body was not written to object storage",
+            "网关当前没有足够内存接收请求体，请稍后重试",
+            "gateway memory is currently insufficient to receive the request body; retry later",
         ),
         "proxy_memory_json" => (
             "网关内存装不下解析后的 JSON 请求体",
@@ -785,6 +785,18 @@ pub(crate) fn public_error_sentences(code: &str) -> Option<(&'static str, &'stat
             "the upstream response reported invalid usage",
         ),
         "upstream_invalid_response" => ("上游响应无效", "the upstream response was invalid"),
+        "upstream_compact_spool_unavailable" => (
+            "压缩响应的临时存储暂不可用",
+            "temporary storage for the compact response is unavailable",
+        ),
+        "upstream_compact_spool_write_failed" => (
+            "压缩响应写入临时存储失败",
+            "writing the compact response to temporary storage failed",
+        ),
+        "upstream_compact_spool_read_failed" => (
+            "压缩响应的临时文件读取不完整",
+            "the compact response temporary file could not be read completely",
+        ),
         "upstream_failed_response" => ("上游响应失败", "the upstream response failed"),
         "upstream_credential_invalid" => ("上游凭据无效", "the upstream credential is invalid"),
         "upstream_credential_unavailable" => {
@@ -837,6 +849,34 @@ pub(crate) fn public_error_sentences(code: &str) -> Option<(&'static str, &'stat
         ),
         "upstream_unavailable" => ("配置的上游不可用", "the configured upstream is unavailable"),
         "upstream_rejected" => ("上游拒绝了这次请求", "the upstream rejected the request"),
+        "context_length_exceeded" => (
+            "请求超过模型的上下文窗口，需要压缩或缩短上下文",
+            "the input exceeds the model context window; compact or shorten the context",
+        ),
+        "usage_not_included" => (
+            "当前上游套餐不包含此次请求的用量",
+            "the upstream plan does not include this usage",
+        ),
+        "invalid_prompt" => (
+            "上游判定请求内容无效，需要调整请求",
+            "the upstream rejected the prompt as invalid; adjust the request",
+        ),
+        "misalignment_policy_violation" => (
+            "上游安全系统因潜在的非预期活动拒绝了此次请求",
+            "the upstream safety system blocked this request for potentially unintended activity",
+        ),
+        "cyber_policy" => (
+            "上游安全系统因网络安全风险拒绝了此次请求",
+            "the upstream safety system blocked this request for cybersecurity risk",
+        ),
+        "bio_policy" => (
+            "上游安全系统因生物安全风险拒绝了此次请求",
+            "the upstream safety system blocked this request for biological safety risk",
+        ),
+        "server_is_overloaded" | "slow_down" => (
+            "上游服务当前过载",
+            "the upstream service is currently overloaded",
+        ),
         "idempotency_claim_lost" => (
             "图片幂等声明在发给上游之前丢失了",
             "the image idempotency claim was lost before the upstream request was sent",

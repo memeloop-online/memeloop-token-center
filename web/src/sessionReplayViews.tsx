@@ -53,10 +53,10 @@ function archiveRevision(request: RequestView) {
 
 function canTryFullArchive(snapshot: RequestDetail | undefined, side: 'request' | 'response') {
   const archive = snapshot?.archive?.[side];
-  // The snapshot currently maps an object-store size-limit rejection to
-  // object_unavailable too. A bound object can be tried explicitly; the range
-  // endpoint, not this hint, decides whether its bytes are actually available.
-  return archive?.reason === 'archive_payload_invalid'
+  // A bounded preview can be omitted while the authenticated archive reader
+  // remains available. Retain legacy hints for older server snapshots.
+  return archive?.preview?.kind === 'stream'
+    || archive?.reason === 'archive_payload_invalid'
     || (archive?.state === 'bound' && archive.reason === 'archive_object_unavailable');
 }
 

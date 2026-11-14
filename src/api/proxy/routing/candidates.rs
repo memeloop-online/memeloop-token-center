@@ -83,6 +83,7 @@ pub(in crate::api::proxy) fn prepared_input_reservation_bound(
         .unwrap_or_default();
     let request_body_ceiling = original_body_length
         .max(prepared.forwarded_body.len())
+        .max(prepared.component_input_bytes)
         .max(prepared_body_length);
     input_reservation_bound(&prepared.route, request_body_ceiling)
 }
@@ -376,6 +377,7 @@ mod tests {
         const PREPARED_BODY_LENGTH: usize = 8_192;
 
         let prepared = PreparedProxyRoute {
+            request_workspace: None,
             inspect_stream_rejection: false,
             route: ResolvedUpstream {
                 route_id: Uuid::nil(),
@@ -389,6 +391,7 @@ mod tests {
                 credential: UpstreamCredential::None,
             },
             forwarded_body: Bytes::from_static(b"{}"),
+            component_input_bytes: 0,
             upstream_stream: false,
             codex_downstream_stream: false,
             codex_store_disabled: false,

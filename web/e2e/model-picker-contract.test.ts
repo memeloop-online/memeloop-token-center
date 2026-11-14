@@ -24,8 +24,8 @@ test('assistant accepts text-capable multimodal providers without inferring capa
     item('embedding-only', 'friendly-helper', 'friendly-helper', ['embedding']),
     item('custom-name', 'custom-chat-name', 'custom-chat-name', ['text'], 'never_observed', false),
   ]);
-  assert.deepEqual(catalog.options.map((option) => option.value), ['legal-text-alias', 'multimodal-text'], 'text support is additive and model aliases are not capability evidence');
-  assert.deepEqual(catalog.unverifiedRoutes.map((route) => route.value), ['image-only', 'embedding-only', 'custom-name']);
+  assert.deepEqual(catalog.options.map((option) => option.value), ['legal-text-alias', 'multimodal-text', 'custom-name'], 'text support is additive and model aliases are not capability evidence');
+  assert.deepEqual(catalog.unverifiedRoutes.map((route) => route.value), ['image-only', 'embedding-only']);
   assert.ok(catalog.options.every((option) => option.health === 'unknown'), 'catalog reads do not claim to probe upstream health');
 
   const unavailable = item('unavailable', 'Unavailable', 'opaque-model-id', ['image', 'text']);
@@ -81,4 +81,16 @@ test('filter-assistant choice exposes configuration availability without probing
   assert.match(settings, /assistantTextUnavailable/);
   assert.match(settings, /describedBy="filter-assistant-route-hint"/);
   assert.doesNotMatch(settings, /\/health|\/models\/sync|filter-assistant\/plan/);
+});
+
+test('probe settings expose a per-upstream opt-in and independent billing', async () => {
+  const component = await readFile(new URL('../src/operator/HealthProbeSettings.tsx', import.meta.url), 'utf8');
+  assert.match(component, /type="checkbox" checked=\{value\.enabled\}/);
+  assert.match(component, /health-probe-settings/);
+  assert.match(component, /billing_key_id/);
+  assert.match(component, /interval_seconds/);
+  assert.match(component, /value\.prompt/);
+  assert.match(component, /value\.model/);
+  const page = await readFile(new URL('../src/operator/pages/ManagementPages.tsx', import.meta.url), 'utf8');
+  assert.match(page, /<HealthProbeSettings/);
 });

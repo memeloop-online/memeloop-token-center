@@ -27,11 +27,14 @@ use crate::{
 
 #[path = "codex_transport/bad_request.rs"]
 mod bad_request;
+#[path = "codex_transport/chat_digest.rs"]
+mod chat_digest;
 #[path = "codex_transport/chat_request.rs"]
 mod chat_request;
 #[cfg(test)]
 #[path = "codex_transport/chat_tests.rs"]
 mod chat_tests;
+use chat_digest::EmittedText;
 #[path = "codex_transport/chat_tools.rs"]
 mod chat_tools;
 #[cfg(test)]
@@ -65,7 +68,6 @@ const MAX_OUTPUT_ITEMS: usize = 16_384;
 // health. Keep the exceptional definite-rejection inspection deliberately
 // small: it happens before any downstream bytes are delivered and its body is
 // never retained, archived, logged, or returned.
-const MISSING_CONTENT_TYPE_SNIFF_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(15);
 
 pub(super) fn is_driver(driver: &str) -> bool {
     driver == DRIVER
@@ -331,6 +333,19 @@ where
     TEST_ENDPOINT.scope(endpoint, future).await
 }
 
+#[cfg(test)]
+pub(in crate::api) fn inherit_test_endpoint<F: Future>(
+    future: F,
+) -> impl Future<Output = F::Output> {
+    let endpoint = TEST_ENDPOINT.try_with(Clone::clone).ok();
+    async move {
+        match endpoint {
+            Some(endpoint) => TEST_ENDPOINT.scope(endpoint, future).await,
+            None => future.await,
+        }
+    }
+}
+
 /// Rewrite only the upstream wire document. The original downstream body is
 /// archived by `proxy()` before this document is sent.
 #[cfg(test)]
@@ -367,6 +382,8 @@ pub(super) fn prepare_request_with_id(
     let chat_controls = matches!(protocol, Protocol::OpenAiChat)
         .then(|| translate_chat_request(request, transport_policy.chat_controls))
         .transpose()?;
+    // Codex reserves collaboration tools and requires their configured schemas.
+    // Rewriting encrypted message fields makes the native provider reject tools.
     let object = request
         .as_object_mut()
         .ok_or_else(|| AppError::BadRequest("request body must be a JSON object".into()))?;
@@ -1208,14 +1225,13 @@ pub(super) async fn admit_event_stream_response(
     }
 
     let mut parts = response.into_parts();
-    let deadline = tokio::time::Instant::now() + MISSING_CONTENT_TYPE_SNIFF_TIMEOUT;
     let mut prefetched = Vec::new();
     let mut inspected = Vec::new();
     let mut sanitizer = ResponsesStreamingSanitizer::with_limits(sse_framing_limits);
     loop {
-        let next = tokio::time::timeout_at(deadline, parts.stream.next())
-            .await
-            .map_err(|_| ResponseAdmissionError::Ambiguous("upstream_timeout"))?;
+        // Admission shares the upstream body's timeout/cancellation policy.
+        // Missing Content-Type must not introduce a separate response deadline.
+        let next = parts.stream.next().await;
         let Some(next) = next else {
             return Err(ResponseAdmissionError::Invalid(
                 "upstream_invalid_content_type",
@@ -1401,12 +1417,12 @@ pub(super) struct CodexChatStreamTranslator {
     model: String,
     created: i64,
     output_kind: Option<ChatOutputKind>,
-    refusal_delta: String,
-    refusal_done: Option<String>,
+    refusal_delta: EmittedText,
+    refusal_done: Option<EmittedText>,
     started: bool,
     terminal: bool,
     include_usage: bool,
-    text_delta: String,
+    text_delta: EmittedText,
     tools: BTreeMap<usize, chat_tools::StreamingTool>,
     completed_items: BTreeMap<usize, Value>,
     retained_bytes: usize,
@@ -1435,12 +1451,12 @@ impl CodexChatStreamTranslator {
             model,
             created: crate::db::unix_millis() / 1_000,
             output_kind: None,
-            refusal_delta: String::new(),
+            refusal_delta: EmittedText::default(),
             refusal_done: None,
             started: false,
             terminal: false,
             include_usage,
-            text_delta: String::new(),
+            text_delta: EmittedText::default(),
             tools: BTreeMap::new(),
             completed_items: BTreeMap::new(),
             retained_bytes: 0,
@@ -1477,8 +1493,7 @@ impl CodexChatStreamTranslator {
                     .and_then(Value::as_str)
                     .ok_or("upstream_invalid_response")?;
                 self.observe_output_kind(ChatOutputKind::Text)?;
-                self.retain_bytes(delta.len())?;
-                self.text_delta.push_str(delta);
+                self.text_delta.observe(delta)?;
                 Ok(Some(self.text_delta_chunk(delta)?))
             }
             "response.refusal.delta" => {
@@ -1491,8 +1506,7 @@ impl CodexChatStreamTranslator {
                     .filter(|delta| !delta.is_empty())
                     .ok_or("upstream_invalid_response")?;
                 self.observe_output_kind(ChatOutputKind::Refusal)?;
-                self.retain_bytes(delta.len())?;
-                self.refusal_delta.push_str(delta);
+                self.refusal_delta.observe(delta)?;
                 Ok(Some(self.refusal_delta_chunk(delta)?))
             }
             "response.refusal.done" => {
@@ -1505,7 +1519,7 @@ impl CodexChatStreamTranslator {
                     .and_then(Value::as_str)
                     .filter(|refusal| !refusal.is_empty())
                     .ok_or("upstream_invalid_response")?;
-                self.refusal_done = Some(refusal.to_owned());
+                self.refusal_done = Some(EmittedText::from_text(refusal));
                 Ok(None)
             }
             "response.output_item.added" | "response.output_item.done" => {
@@ -1648,13 +1662,13 @@ impl CodexChatStreamTranslator {
             }
             ChatResponseContent::Refusal(completed) => {
                 self.observe_output_kind(ChatOutputKind::Refusal)?;
-                if !self.refusal_delta.is_empty() && self.refusal_delta != completed {
+                if !self.refusal_delta.is_empty() && !self.refusal_delta.matches(&completed) {
                     return Err("upstream_invalid_response");
                 }
                 if self
                     .refusal_done
-                    .as_deref()
-                    .is_some_and(|refusal| refusal != completed)
+                    .as_ref()
+                    .is_some_and(|refusal| !refusal.matches(&completed))
                 {
                     return Err("upstream_invalid_response");
                 }
@@ -1705,8 +1719,9 @@ impl CodexChatStreamTranslator {
     }
 
     fn complete_text(&mut self, completed: &str, output: &mut Vec<u8>) -> Result<(), &'static str> {
-        let remaining = completed
-            .strip_prefix(&self.text_delta)
+        let remaining = self
+            .text_delta
+            .remaining(completed)
             .ok_or("upstream_invalid_response")?;
         if !remaining.is_empty() || !self.started {
             output.extend_from_slice(&self.text_delta_chunk(remaining)?);
@@ -2430,6 +2445,63 @@ mod tests {
         assert!(!codex_transient_error(&json!({
             "error": {"type": "invalid_request_error"}
         })));
+    }
+
+    #[test]
+    fn native_parent_preserves_reserved_collaboration_schema_and_native_history() {
+        let mut request = json!({
+            "tools": [{"type":"namespace","name":"collaboration","tools":[
+                {"type":"function","name":"spawn_agent","parameters":{"type":"object",
+                    "properties":{"message":{"type":"string","encrypted":true,"description":"task"}}}}
+            ]}, {"type":"function","name":"unrelated","parameters":{"type":"object",
+                "properties":{"message":{"type":"string","encrypted":true}}}}],
+            "input": [{"type":"agent_message","content":[
+                {"type":"encrypted_content","encrypted_content":"opaque-history"}
+            ]}, {"type":"additional_tools","tools":[
+                {"type":"namespace","name":"collaboration","tools":[
+                    {"type":"function","name":"send_message","parameters":{"type":"object",
+                        "properties":{"message":{"type":"string","encrypted":true}}}}
+                ]}
+            ]}]
+        });
+        let native_history = request["input"][0].clone();
+        let native_tools = request["tools"].clone();
+        let late_tools = request["input"][1].clone();
+        prepare_request(&mut request, "gpt-codex", &config("gpt-codex", 10)).unwrap();
+        assert_eq!(
+            request.pointer("/tools/0/tools/0/parameters/properties/message/encrypted"),
+            Some(&json!(true))
+        );
+        assert_eq!(
+            request.pointer("/input/1/tools/0/tools/0/parameters/properties/message/encrypted"),
+            Some(&json!(true))
+        );
+        assert_eq!(
+            request["tools"][1]["parameters"]["properties"]["message"]["encrypted"],
+            true
+        );
+        assert_eq!(request["input"][0], native_history);
+        let mut expected_tools = native_tools;
+        expected_tools
+            .as_array_mut()
+            .unwrap()
+            .push(json!({"type":"image_generation", "output_format":"png"}));
+        assert_eq!(request["tools"], expected_tools);
+        assert_eq!(request["input"][1], late_tools);
+        assert_eq!(
+            request["tools"][0]["tools"][0]["parameters"]["properties"]["message"]["description"],
+            "task"
+        );
+
+        let task =
+            "Review PR757. Preserve usage and never retry OAuth.\nReport the exact findings.";
+        let mut child = json!({"input":[{"type":"agent_message","content":[
+            {"type":"input_text","text":task}
+        ]}]});
+        crate::api::request_normalization::normalize_codex_multi_agent_v2(&mut child, true)
+            .unwrap();
+        assert_eq!(child["input"][0]["role"], "user");
+        assert_eq!(child["input"][0]["content"][0]["text"], task);
     }
 
     fn config(model: &str, limit: i64) -> Value {

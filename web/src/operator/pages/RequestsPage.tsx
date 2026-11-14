@@ -6,7 +6,6 @@ import { DrawerFrame, RequestDiagnostics, RequestTable } from '../../components'
 import { formatCurrencyDisplay, formatDurationDisplay, formatMetricDisplay, formatPercent } from '../../format';
 import { LocalSettlementNotice, localSettlementLabel } from '../../LocalSettlementNotice';
 import { AnalyticsMetric } from '../AnalyticsMetric';
-import { ImageGenerationQuarantine } from '../ImageGenerationQuarantine';
 import { displayTimeZone } from '../../charts/displayTimeZone';
 import { useI18n } from '../../i18n';
 import { useSessionParentLabel } from '../sessionTasks';
@@ -23,7 +22,7 @@ import { RequestRefreshControl } from '../traffic/RequestRefreshControl';
 import { mergeBatchedRequestPage } from '../traffic/requestRefresh';
 import { RequestOverflowReconciliation } from '../traffic/requestOverflowReconciliation';
 import {
-  emptyTypedFilterAst, mergeRefreshedRequestPage, mergeSessionContext, requestViewFromEvent,
+  emptyTypedFilterAst, mergeRefreshedRequestPage, mergeRequestObservations, requestViewFromEvent,
   summarizeVisibleRequests, typedFiltersActive, typedRequestQueryBody, visibleRequestMetricSeries,
 } from '../traffic/requestTraffic';
 
@@ -59,7 +58,6 @@ export function RequestsPage({ token, tenant, writeTenant = tenant, liveEvents, 
   const [upstreamError, setUpstreamError] = useState('');
   const [upstreamDenied, setUpstreamDenied] = useState(false);
   const [filteredResultsStale, setFilteredResultsStale] = useState(false);
-  const [imageReviewOpen, setImageReviewOpen] = useState(false);
   const sequence = useRef(0);
   const errorSource = useRef<'detail' | 'load' | 'refresh' | undefined>(undefined);
   const loadedHistoryIds = useRef(new Set<string>());
@@ -84,7 +82,7 @@ export function RequestsPage({ token, tenant, writeTenant = tenant, liveEvents, 
   }
   const loadAbort = useRef<AbortController | null>(null);
   const operationalAbort = useRef<AbortController | null>(null);
-  const reconciledOperationalEvents = useRef(new Map<string, string>());
+  const reconciledOperationalEvents = useRef(new Map<string, { eventId: string; eventAt: number }>());
   const upstreamSequence = useRef(0);
   const detailSequence = useRef(0);
   const detailAbort = useRef<AbortController | null>(null);
@@ -96,8 +94,15 @@ export function RequestsPage({ token, tenant, writeTenant = tenant, liveEvents, 
   const refreshedTerminalEvent = useRef<string | undefined>(undefined);
   // Gate during render: effects must not expose a previous credential/tenant's
   // detail for even the first commit after a scope change.
-  const detail = detailResult?.token === token && detailResult.tenant === tenant
+  const scopedDetail = detailResult?.token === token && detailResult.tenant === tenant
     && detailResult.requestId === selectedRequestId.current ? detailResult.value : undefined;
+  // The drawer retains its loaded body and selection, while sharing the row's
+  // latest observations after either a manual refresh or terminal hydration.
+  const visibleDetailRow = scopedDetail && requests.find(row => row.request_id === scopedDetail.request_id);
+  const detailObservations = scopedDetail && mergeRequestObservations(visibleDetailRow ?? scopedDetail, scopedDetail);
+  const detail = scopedDetail && detailObservations ? {
+    ...scopedDetail, egress: detailObservations.egress, session_context: detailObservations.session_context,
+  } : undefined;
   // The initial snapshot and the live stream resolve independently. Keep the
   // latest event map available to an in-flight snapshot so an event received
   // before the snapshot completes cannot be overwritten by that stale result.
@@ -167,7 +172,7 @@ export function RequestsPage({ token, tenant, writeTenant = tenant, liveEvents, 
   }
   startOverflowRefresh.current = ticket => { void refreshOverflowFirstPage(ticket); };
 
-  async function load(nextFilters: TypedFilterAst, older = false) {
+  async function load(nextFilters: TypedFilterAst, older = false, refresh = false) {
     if (!token || !tenant) return;
     const last = requests.at(-1);
     const before = last ? { before_created_at: last.created_at, before_id: last.request_id } : undefined;
@@ -190,9 +195,9 @@ export function RequestsPage({ token, tenant, writeTenant = tenant, liveEvents, 
     const request = ++sequence.current;
     const currentScope = { token, tenant, filters: nextFilters };
     if (!older) {
-      loadedHistoryIds.current.clear();
+      if (!refresh) loadedHistoryIds.current.clear();
       setFilteredResultsStale(false);
-      setRequests([]); setHasOlder(false); closeRequestDetail();
+      if (!refresh) { setRequests([]); setHasOlder(false); closeRequestDetail(); }
     }
     loadingRef.current = true;
     errorSource.current = undefined;
@@ -203,20 +208,21 @@ export function RequestsPage({ token, tenant, writeTenant = tenant, liveEvents, 
       });
       const latest = scope.current;
       if (controller.signal.aborted || request !== sequence.current || latest.token !== currentScope.token || latest.tenant !== currentScope.tenant || latest.filters !== currentScope.filters) return;
+      const observed = refresh ? mergeRefreshedRequestPage(requestsRef.current, next, loadedHistoryIds.current.size > 0) : next.requests;
       if (!older && !typedFiltersActive(nextFilters)) {
-        const page = mergeBatchedRequestPage(next.requests, new Map(liveEventsRef.current), next.next_cursor !== null);
+        const page = mergeBatchedRequestPage(observed, new Map(liveEventsRef.current), next.next_cursor !== null, loadedHistoryIds.current);
         setRequests(page.requests); setHasOlder(page.hasOlder);
       } else {
         if (older) for (const request of next.requests) loadedHistoryIds.current.add(request.request_id);
         setRequests((current) => older
           ? [...current, ...next.requests.filter((value) => !current.some((existing) => existing.request_id === value.request_id))]
-          : next.requests);
+          : observed);
         setHasOlder(next.next_cursor !== null);
       }
       setSnapshotRevision(value => value + 1);
     } catch (reason) {
       if (request === sequence.current && !controller.signal.aborted) {
-        if (!older) { setRequests([]); setHasOlder(false); }
+        if (!older && !refresh) { setRequests([]); setHasOlder(false); }
         errorSource.current = 'load';
         setError(apiDiagnosticMessage(reason, t('common.requestFailed'), diagnosticLabels));
       }
@@ -248,7 +254,7 @@ export function RequestsPage({ token, tenant, writeTenant = tenant, liveEvents, 
     loadAbort.current?.abort(); loadAbort.current = null;
     errorSource.current = undefined;
     loadingRef.current = false;
-    sequence.current += 1; setFilters(emptyTypedFilterAst); setRequests([]); setDetail(undefined); setHasOlder(false); setLoading(false); setFilteredResultsStale(false); setImageReviewOpen(false); setError(''); setUpstreamError(''); setUpstreamDenied(false);
+    sequence.current += 1; setFilters(emptyTypedFilterAst); setRequests([]); setDetail(undefined); setHasOlder(false); setLoading(false); setFilteredResultsStale(false); setError(''); setUpstreamError(''); setUpstreamDenied(false);
     if (!token || !tenant) { setUpstreams([]); return () => { cancelOverflowRefresh(); loadAbort.current?.abort(); }; }
     const upstreamRequest = ++upstreamSequence.current;
     void api<UpstreamAccount[]>(`/internal/v1/upstreams${queryForTenant(tenant)}`, token)
@@ -324,22 +330,28 @@ export function RequestsPage({ token, tenant, writeTenant = tenant, liveEvents, 
     }
     for (const request of requestsRef.current) {
       const event = liveEventsRef.current.get(request.request_id);
+      const reconciled = reconciledOperationalEvents.current.get(request.request_id);
       const completedAt = event?.completed_at;
       const retainedTerminal = typeof completedAt === 'number' && Number.isFinite(completedAt) && completedAt >= request.created_at;
-      if (!request.operational_terminal || request.operational_terminal.financial_state === 'applied'
+      if (!request.operational_terminal
         || !event || (event.event_kind !== 'finished' && event.event_kind !== 'projected' && !retainedTerminal)
-        || reconciledOperationalEvents.current.get(request.request_id) === event.event_id) continue;
+        || reconciled?.eventId === event.event_id || (reconciled !== undefined && event.event_at < reconciled.eventAt)) continue;
       void api<RequestDetail>(`/internal/v1/requests/${request.request_id}${queryForTenant(tenant)}`, token, { signal: controller.signal })
         .then(next => {
           const latest = scope.current;
           if (controller.signal.aborted || paused.current || loadingRef.current || sequence.current !== requestSequence
             || latest.token !== currentScope.token || latest.tenant !== currentScope.tenant || latest.filters !== currentScope.filters
             || next.request_id !== request.request_id || !next.operational_terminal) return;
-          reconciledOperationalEvents.current.set(request.request_id, event.event_id);
+          reconciledOperationalEvents.current.set(request.request_id, { eventId: event.event_id, eventAt: event.event_at });
           setRequests(current => current.map(row => {
-            if (row.request_id !== request.request_id || row.operational_terminal?.financial_state === 'applied') return row;
-            const hydrated = { ...next, egress: next.egress ?? row.egress,
-              session_context: mergeSessionContext(row.session_context, next) };
+            if (row.request_id !== request.request_id) return row;
+            // Financial finality does not imply that late transport/session
+            // observations have already reached the list projection.
+            if (row.operational_terminal?.financial_state === 'applied') {
+              const observed = mergeRequestObservations(next, row);
+              return { ...row, egress: observed.egress, session_context: observed.session_context };
+            }
+            const hydrated = mergeRequestObservations(next, row);
             const retained = liveEventsRef.current.get(row.request_id);
             return retained ? requestViewFromEvent(retained, hydrated) ?? hydrated : hydrated;
           }));
@@ -370,8 +382,7 @@ export function RequestsPage({ token, tenant, writeTenant = tenant, liveEvents, 
         const row = requestsRef.current.find(request => request.request_id === requestId);
         const previous = detailResult?.token === token && detailResult.tenant === tenant
           && detailResult.requestId === requestId ? detailResult.value : row;
-        const hydrated = { ...next, egress: next.egress ?? previous?.egress,
-          session_context: mergeSessionContext(previous?.session_context, next) };
+        const hydrated = mergeRequestObservations(next, previous);
         setDetail({ value: hydrated, token, tenant, requestId });
       }
     } catch (reason) {
@@ -453,18 +464,15 @@ export function RequestsPage({ token, tenant, writeTenant = tenant, liveEvents, 
     {upstreamError && <div className="notice error" role="alert">{t('request.upstreamSource')}: {upstreamError}</div>}
     {upstreamDenied && <div className="notice warning" role="status">{t('request.upstreamCatalogDenied')}</div>}
     {streamError && <div className="notice error" role="alert">{t('request.streamSource')}: {streamError}</div>}
-    <RequestsPanel requests={requests} upstreams={upstreams} filters={filters} loading={loading} hasOlder={hasOlder} streamState={streamState} token={token} tenant={tenant} filteredResultsStale={filteredResultsStale} requestRefresh={requestRefresh} refreshPaused={userPaused} onToggleRefreshPaused={() => setUserPaused((value) => !value)} historyLoaded={loadedHistoryIds.current.size > 0} imageReviewOpen={imageReviewOpen} onToggleImageReview={() => setImageReviewOpen((open) => !open)}
+    <RequestsPanel requests={requests} upstreams={upstreams} filters={filters} loading={loading} hasOlder={hasOlder} streamState={streamState} token={token} tenant={tenant} filteredResultsStale={filteredResultsStale} requestRefresh={requestRefresh} refreshPaused={userPaused} onToggleRefreshPaused={() => setUserPaused((value) => !value)} historyLoaded={loadedHistoryIds.current.size > 0}
       onApply={(next) => { setFilters(next); scope.current = { token, tenant, filters: next }; void load(next); }}
       onClear={() => { setFilters(emptyTypedFilterAst); scope.current = { token, tenant, filters: emptyTypedFilterAst }; void load(emptyTypedFilterAst); }}
-      onLoadOlder={() => void load(filters, true)} onRefreshFilteredResults={() => void load(filters)} onSelect={selectRequest} onOpenSessions={onOpenSessions} onOpenSession={openSession} onOpenGenerations={onOpenGenerations} />
-    {imageReviewOpen && <section className="request-image-review" aria-label={t('quarantine.title')}>
-      <ImageGenerationQuarantine token={token} tenant={tenant} writeTenant={writeTenant} />
-    </section>}
-    {detail && <RequestDrawer token={token} tenant={tenant} detail={detail} upstreamName={upstreams.find((account) => account.id === detail.upstream_account_id)?.name} accountNames={new Map(upstreams.map(account => [account.id, account.name]))} onOpenSession={openSession} onClose={closeRequestDetail} />}
+      onLoadOlder={() => void load(filters, true)} onRefreshFilteredResults={() => void load(filters, false, true)} onReturnToLatest={() => void load(filters)} onSelect={selectRequest} onOpenSessions={onOpenSessions} onOpenSession={openSession} onOpenGenerations={onOpenGenerations} />
+    {detail && <RequestDrawer token={token} tenant={tenant} detail={detail} upstreamName={upstreams.find((account) => account.id === detail.upstream_account_id)?.name} accountNames={new Map(upstreams.map(account => [account.id, account.name]))} onOpenSession={openSession} onRefresh={() => void load(filters, false, true)} refreshing={loading} onClose={closeRequestDetail} />}
   </PageLoadingRegion>;
 }
 
-function RequestsPanel({ requests, upstreams, filters, loading, hasOlder, streamState, token, tenant, filteredResultsStale, onApply, onClear, onLoadOlder, onRefreshFilteredResults, onSelect, onOpenSessions, onOpenSession, onOpenGenerations, requestRefresh, refreshPaused = false, onToggleRefreshPaused, historyLoaded, imageReviewOpen, onToggleImageReview }: {
+function RequestsPanel({ requests, upstreams, filters, loading, hasOlder, streamState, token, tenant, filteredResultsStale, onApply, onClear, onLoadOlder, onRefreshFilteredResults, onReturnToLatest, onSelect, onOpenSessions, onOpenSession, onOpenGenerations, requestRefresh, refreshPaused = false, onToggleRefreshPaused, historyLoaded }: {
   requests: RequestView[];
   upstreams: UpstreamAccount[];
   filters: TypedFilterAst;
@@ -475,12 +483,11 @@ function RequestsPanel({ requests, upstreams, filters, loading, hasOlder, stream
   tenant: string;
   filteredResultsStale: boolean;
   historyLoaded: boolean;
-  imageReviewOpen: boolean;
-  onToggleImageReview: () => void;
   onApply: (filters: TypedFilterAst) => void;
   onClear: () => void;
   onLoadOlder: () => void;
   onRefreshFilteredResults: () => void;
+  onReturnToLatest: () => void;
   onSelect: (request: RequestView) => Promise<void>;
   onOpenSessions: () => void;
   onOpenSession: (sessionId: string, keyId?: string, requestId?: string) => void;
@@ -496,7 +503,7 @@ function RequestsPanel({ requests, upstreams, filters, loading, hasOlder, stream
   const sampling = { timestamps: points.map(point => point.timestamp), timeZone: displayTimeZone() };
   const count = (value: number) => formatMetricDisplay(value, locale);
   const settlementCurrency = summary.localCosts.length === 1 ? summary.localCosts[0].currency : undefined;
-  return <article className="panel request-page-surface" aria-busy={loading}><div className="panel-title traffic-heading"><div><h2>{typedFiltersActive(filters) ? t('traffic.filtered') : t('traffic.live')}</h2><span>{typedFiltersActive(filters) ? t('traffic.filteredHint') : t('traffic.liveHint')}</span></div><div className="traffic-heading-actions"><Button appearance="secondary" aria-expanded={imageReviewOpen} onClick={onToggleImageReview}>{t('quarantine.menuItem')}</Button><div className={`request-live-state session-live-state ${streamState}`} role="status">{t(`sessions.live.${streamState}`)}</div><RequestWorkspaceTabs selected="requests" onRequests={() => undefined} onGenerations={onOpenGenerations ?? (() => undefined)} onSessions={onOpenSessions} /></div></div>
+  return <article className="panel request-page-surface" aria-busy={loading}><div className="panel-title traffic-heading"><div><h2>{typedFiltersActive(filters) ? t('traffic.filtered') : t('traffic.live')}</h2><span>{typedFiltersActive(filters) ? t('traffic.filteredHint') : t('traffic.liveHint')}</span></div><div className="traffic-heading-actions"><Button appearance="primary" disabled={loading || !token.trim() || !tenant} onClick={onRefreshFilteredResults}>{t('usage.refresh')}</Button><div className={`request-live-state session-live-state ${streamState}`} role="status">{t(`sessions.live.${streamState}`)}</div><RequestWorkspaceTabs selected="requests" onRequests={() => undefined} onGenerations={onOpenGenerations ?? (() => undefined)} onSessions={onOpenSessions} /></div></div>
     {requestRefresh && <div className="request-refresh-row">
       <RequestRefreshControl intervalMs={requestRefresh.intervalMs} onIntervalChange={requestRefresh.onIntervalChange}
         paused={requestRefresh.paused || refreshPaused}
@@ -506,7 +513,7 @@ function RequestsPanel({ requests, upstreams, filters, loading, hasOlder, stream
         <ToggleButton appearance="secondary" checked={refreshPaused} onClick={onToggleRefreshPaused}>{refreshPaused ? t('traffic.resumeUpdates') : t('traffic.pauseUpdates')}</ToggleButton>
       </span>}
     </div>}
-    {historyLoaded && !typedFiltersActive(filters) && <div className="request-refresh-control"><span>{locale === 'zh-CN' ? '正在浏览历史：已显示请求继续更新，新请求暂不插入。' : 'Browsing history: visible requests keep updating; new requests are not inserted.'}</span><Button appearance="subtle" disabled={loading} onClick={onRefreshFilteredResults}>{locale === 'zh-CN' ? '返回最新请求' : 'Return to latest requests'}</Button></div>}
+    {historyLoaded && !typedFiltersActive(filters) && <div className="request-refresh-control"><span>{locale === 'zh-CN' ? '正在浏览历史：已显示请求继续更新，新请求暂不插入。' : 'Browsing history: visible requests keep updating; new requests are not inserted.'}</span><Button appearance="subtle" disabled={loading} onClick={onReturnToLatest}>{locale === 'zh-CN' ? '返回最新请求' : 'Return to latest requests'}</Button></div>}
     <TypedFilterBuilder ast={filters} disabled={!token.trim()} onApply={onApply} onClear={onClear} scope="requests" token={token} tenant={tenant} upstreams={upstreams} />
     {filteredResultsStale && typedFiltersActive(filters) && <div className="notice warning" role="status">{t('traffic.filteredResultsStale')}<Button appearance="secondary" disabled={loading} onClick={onRefreshFilteredResults}>{t('traffic.refreshFilteredResults')}</Button></div>}
     {requests.length > 0 && <section className="metrics request-traffic-metrics" aria-label={t('monitoring.summary')}>
@@ -522,12 +529,13 @@ function RequestsPanel({ requests, upstreams, filters, loading, hasOlder, stream
   </article>;
 }
 
-function RequestDrawer({ token, tenant, detail, upstreamName, accountNames, onOpenSession, onClose }: { token: string; tenant: string; detail: RequestDetail; upstreamName?: string; accountNames: ReadonlyMap<string, string>; onOpenSession: (sessionId: string, keyId?: string, requestId?: string) => void; onClose: () => void }) {
+function RequestDrawer({ token, tenant, detail, upstreamName, accountNames, onOpenSession, onRefresh, refreshing, onClose }: { token: string; tenant: string; detail: RequestDetail; upstreamName?: string; accountNames: ReadonlyMap<string, string>; onOpenSession: (sessionId: string, keyId?: string, requestId?: string) => void; onRefresh: () => void; refreshing: boolean; onClose: () => void }) {
   const { locale, t } = useI18n();
   const [technicalOpen, setTechnicalOpen] = useState(false);
   const technicalId = useId();
   const parent = useSessionParentLabel(tenant, token, detail.credential_identity?.key_id, detail.session_context?.association === 'confirmed' ? detail.session_context.session_id : null, session => session.session_name?.trim() || unnamedSessionName(t, locale, session.last_activity_at, credentialDisplayName(session.key_alias, t), true));
   return <DrawerFrame title={detail.model} eyebrow={t('request.operatorDiagnosis')} onClose={onClose}>
+    <Button appearance="secondary" disabled={refreshing} onClick={onRefresh}>{t('usage.refresh')}</Button>
     <RequestDiagnostics request={detail} onOpenSession={onOpenSession} upstreamName={upstreamName} sessionParent={parent ? { label: parent.label, sessionId: parent.identity.session_id, keyId: parent.identity.key_id } : undefined} />
     <RequestEgressDetails attempts={detail.egress_attempts} accountNames={accountNames} />
     <div className="request-diagnostics request-detail-surface request-archive-diagnostics">

@@ -1,9 +1,13 @@
 use super::*;
 
 pub(in crate::api::proxy) struct PreparedProxyRoute {
+    pub(super) request_workspace: Option<crate::gateway_body::memory::RequestRouteWorkspace>,
     pub(in crate::api::proxy) inspect_stream_rejection: bool,
     pub(in crate::api::proxy) route: ResolvedUpstream,
     pub(super) forwarded_body: Bytes,
+    // Component dispatch keeps only the adapter body, but its input tree may
+    // already include protocol rewrites larger than the original ingress.
+    pub(super) component_input_bytes: usize,
     pub(in crate::api::proxy) upstream_stream: bool,
     pub(in crate::api::proxy) codex_downstream_stream: bool,
     pub(in crate::api::proxy) codex_store_disabled: bool,
@@ -18,6 +22,7 @@ pub(in crate::api::proxy) struct PreparedProxyRoute {
 }
 
 pub(in crate::api::proxy) struct PlannedProxyRoute {
+    pub(super) request_workspace: Option<crate::gateway_body::memory::RequestRouteWorkspace>,
     pub(in crate::api::proxy) route: ResolvedUpstream,
     pub(super) forwarded_json: Value,
     pub(in crate::api::proxy) output_token_ceiling: i64,
@@ -55,6 +60,7 @@ impl PlannedProxyRoute {
 impl PreparedProxyRoute {
     pub(in crate::api::proxy) fn release_request_buffers(&mut self) {
         self.forwarded_body = Bytes::new();
+        self.request_workspace.take();
         self.responses_chat = None;
         self.responses_anthropic = None;
     }
@@ -76,6 +82,8 @@ pub(in crate::api::proxy) struct ProxyRequestContext<'a> {
     pub(in crate::api::proxy) protocol: Protocol,
     pub(in crate::api::proxy) request_id: Uuid,
     pub(in crate::api::proxy) request_json: &'a Value,
+    pub(in crate::api::proxy) request_memory:
+        Option<&'a std::sync::Arc<crate::gateway_body::memory::ProxyMemoryReservation>>,
     /// Computed once after policy rewriting: official Codex client plus an
     /// actual MultiAgentV2 collaboration shape.
     pub(in crate::api::proxy) codex_multi_agent_v2_request: bool,

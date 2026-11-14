@@ -116,7 +116,7 @@
       ],
       "properties": {
         "enabled": { "type": "boolean" },
-        "schemaVersion": { "type": "integer", "const": 152 },
+        "schemaVersion": { "type": "integer", "const": 159 },
         "backoffLimit": { "type": "integer", "minimum": 0, "maximum": 20 },
         "activeDeadlineSeconds": { "type": "integer", "minimum": 30 },
         "ttlSecondsAfterFinished": { "type": "integer", "minimum": 0 },
@@ -170,7 +170,6 @@
       "additionalProperties": false,
       "required": [
         "databaseMaxConnections",
-        "proxyLifecycleConcurrency",
         "proxyMemoryBudgetBytes",
         "gatewayBodyReadConcurrency",
         "responsesBodyMaxBytes",
@@ -190,8 +189,8 @@
       ],
       "properties": {
         "databaseMaxConnections": { "type": "integer", "minimum": 1, "maximum": 64 },
+        "databaseAuxPoolMaxConnections": { "type": "integer", "minimum": 1, "maximum": 2 },
         "terminalProjectionEnabled": { "type": "boolean" },
-        "proxyLifecycleConcurrency": { "type": "integer", "minimum": 1, "maximum": 4096 },
         "proxyMemoryBudgetBytes": { "type": "integer", "minimum": 268435456 },
         "gatewayBodyReadConcurrency": { "type": "integer", "minimum": 1, "maximum": 8192 },
         "responsesBodyMaxBytes": { "type": "integer", "minimum": 4194304, "maximum": 67108864 },

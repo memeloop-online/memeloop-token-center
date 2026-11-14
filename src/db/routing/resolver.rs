@@ -226,7 +226,7 @@ impl Database {
         // Availability is read in the existing candidate snapshot, never by a
         // remote probe or a new per-attempt health query.
         let rows = sqlx::query(
-             "SELECT r.id AS route_id, r.priority, candidates.scheduling_weight,
+             "SELECT r.id AS route_id, r.priority, candidates.scheduling_weight, candidates.upstream_model,
                      a.id AS account_id, a.driver, a.updated_at AS transport_revision,
                      a.credential_generation,
                      CAST(CASE
@@ -336,6 +336,7 @@ impl Database {
                 route_id: candidate.route_id,
                 account_id: candidate.account_id,
                 driver: candidate.driver,
+                upstream_model: candidate.upstream_model,
                 transport_revision: candidate.transport_revision,
                 credential_generation: candidate.credential_generation,
             });
@@ -355,7 +356,7 @@ impl Database {
     ) -> Result<Vec<AnyRow>, AppError> {
         let limit = PROXY_ROUTING_POLICY.candidate_query_limit();
         let configured = sqlx::query(
-            "SELECT r.id AS route_id, r.priority, link.scheduling_weight,
+            "SELECT r.id AS route_id, r.priority, link.scheduling_weight, r.upstream_model,
                     a.id AS account_id, a.driver, a.updated_at AS transport_revision,
                     a.credential_generation,
                     CAST(CASE
@@ -426,7 +427,7 @@ impl Database {
             "no configured upstream was visible; selecting any active account on the route"
         );
         sqlx::query(
-            "SELECT r.id AS route_id, r.priority, 100 AS scheduling_weight,
+            "SELECT r.id AS route_id, r.priority, 100 AS scheduling_weight, r.upstream_model,
                     a.id AS account_id, a.driver, a.updated_at AS transport_revision,
                     a.credential_generation,
                     CAST(CASE
@@ -545,7 +546,11 @@ impl Database {
             driver: row.try_get("driver")?,
             base_url,
             config,
-            upstream_model: row.try_get("upstream_model")?,
+            upstream_model: if candidate.driver == crate::oauth::managed::kimi::PROVIDER_DRIVER {
+                candidate.upstream_model.clone()
+            } else {
+                row.try_get("upstream_model")?
+            },
             credential,
         }))
     }
@@ -684,6 +689,7 @@ struct RoutingCandidate {
     route_id: Uuid,
     account_id: Uuid,
     driver: String,
+    upstream_model: String,
     transport_revision: i64,
     credential_generation: i64,
     priority: i64,
@@ -705,6 +711,7 @@ impl RoutingCandidate {
             route_id: parse_uuid(row.try_get("route_id")?)?,
             account_id: parse_uuid(row.try_get("account_id")?)?,
             driver: row.try_get("driver")?,
+            upstream_model: row.try_get("upstream_model")?,
             transport_revision: row.try_get("transport_revision")?,
             credential_generation: row.try_get("credential_generation")?,
             priority: row.try_get("priority")?,
@@ -810,6 +817,7 @@ mod tests {
             route_id: Uuid::from_u128(1),
             account_id,
             driver: "http-json".to_owned(),
+            upstream_model: "fixture-model".into(),
             transport_revision: 1,
             credential_generation: 1,
             priority: 0,

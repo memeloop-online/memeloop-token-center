@@ -75,6 +75,26 @@ pub(super) async fn image_idempotency_replay_response(
     state: &AppState,
     replay: SynchronousImageIdempotencyClaim,
 ) -> Result<Response, AppError> {
+    let mut response = image_idempotency_replay_response_inner(state, replay).await?;
+    if let Some(request_id) = response
+        .headers()
+        .get(REQUEST_ID_HEADER)
+        .and_then(|value| value.to_str().ok())
+        .and_then(|value| Uuid::parse_str(value).ok())
+    {
+        response
+            .extensions_mut()
+            .insert(super::super::proxy_diagnostics::ReplayRequestIdentity(
+                request_id,
+            ));
+    }
+    Ok(response)
+}
+
+async fn image_idempotency_replay_response_inner(
+    state: &AppState,
+    replay: SynchronousImageIdempotencyClaim,
+) -> Result<Response, AppError> {
     match replay {
         SynchronousImageIdempotencyClaim::Completed {
             request_id,

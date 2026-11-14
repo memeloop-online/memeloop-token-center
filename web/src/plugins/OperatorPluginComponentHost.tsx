@@ -170,6 +170,7 @@ function PluginComponent({
         return api<PluginServiceDataResponse>(serviceDataPath(pluginId, endpointId, tenantExternalId), credential, { signal });
       },
       requestApi,
+      requestApiStream: requestApi.requestApiStream,
       discoverApi: (signal?: AbortSignal) => requestApi<Record<string, unknown>>({ path: '/internal/v1/api-schema', signal }),
       navigate: (route, context) => navigationRef.current(route, context),
     };

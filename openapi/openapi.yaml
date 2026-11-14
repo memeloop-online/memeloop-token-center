@@ -111,6 +111,25 @@ paths:
             application/json:
               schema: { $ref: '#/components/schemas/Health' }
 
+  /startupz:
+    get:
+      tags: [System]
+      operationId: getInitializationReadiness
+      summary: Report whether the application router has initialized
+      description: Returns 503 while the static shell is initializing or initialization failed, then 200 after AppState and the authenticated application router have been installed. This endpoint performs no recurring database or archive checks and remains 200 after installation during remote dependency degradation. Liveness and dependency diagnostics retain their separate endpoints.
+      security: []
+      responses:
+        '200':
+          description: The initialized application router is installed.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Health' }
+        '503':
+          description: Application initialization is still pending or failed.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Readiness' }
+
   /readyz:
     get:
       tags: [System]
@@ -334,8 +353,12 @@ paths:
         Optional conversation identifiers connect requests to the core session and
         usage records; the wrapper is consumed by the gateway. Request and response
         bodies use the normal core archive pipeline.
-        Requires an active key with a stored copyable credential. Only JSON
-        Responses are supported; stream=true is rejected.
+        Requires an active key with a stored copyable credential. Responses support
+        JSON (stream=false or omitted) and server-sent events (stream=true).
+        Streaming uses the normal gateway backpressure, cancellation, request/session
+        archive and usage settlement lifecycle. Consume response.completed before
+        declaring a completed turn. Cancellation leaves usage unknown until the
+        upstream reports its normal settlement.
       security: [{ serviceBearer: [] }]
       x-required-scope: keys:write
       parameters:
@@ -355,13 +378,16 @@ paths:
                   type: object
                   additionalProperties: true
                   properties:
-                    stream: { type: boolean, const: false }
+                    stream: { type: boolean }
       responses:
         '200':
           description: OpenAI Responses result including image generation output, billed to the selected key
           content:
             application/json:
               schema: { type: object, additionalProperties: true }
+            text/event-stream:
+              schema: { type: string }
+              example: "event: response.completed\ndata: {\"type\":\"response.completed\",\"response\":{\"status\":\"completed\",\"output\":[]}}\n\n"
         '400':
           description: Invalid JSON Responses request
           content:
@@ -529,10 +555,8 @@ paths:
     put:
       tags: [Client credentials]
       operationId: storeClientCredential
-      summary: Store an already-active client credential for direct authorized copying
-      description: |
-        Verifies the supplied credential against the active stable key and stores its original
-        value for Copy. The credential keeps its current generation.
+      summary: Read-back-safe replacement or restoration of a managed client credential
+      description: "With expected_credential_generation, atomically replace the active credential while preserving key, account and grant identities. An unchanged value preserves its generation; changed values revoke the old generation. Matching immediate retries return the current value without another rotation. Without the generation field, legacy original-value restoration keeps its existing semantics."
       security: [{ serviceBearer: [] }]
       x-required-scope: keys:write
       parameters: [{ $ref: '#/components/parameters/KeyId' }]
@@ -542,11 +566,17 @@ paths:
           application/json:
             schema: { $ref: '#/components/schemas/StoreClientCredentialRequest' }
       responses:
+        '200':
+          description: "Generation-fenced credential saved; no-store response contains the active value."
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/CopiedClientCredential' }
         '204': { description: Original credential stored; no secret is returned. }
         '400': { $ref: '#/components/responses/InvalidRequest' }
         '401': { $ref: '#/components/responses/Unauthorized' }
         '403': { $ref: '#/components/responses/Forbidden' }
         '404': { $ref: '#/components/responses/NotFound' }
+        '409': { $ref: '#/components/responses/Conflict' }
 
   /internal/v1/keys/{key_id}/copy:
     post:
@@ -2389,6 +2419,49 @@ paths:
           headers:
             Retry-After: { schema: { type: integer, minimum: 1 } }
 
+  /internal/v1/upstreams/{account_id}/health-probe-settings:
+    get:
+      tags: [Upstream providers]
+      operationId: getUpstreamHealthProbeSettings
+      summary: Read per-upstream scheduled probe settings
+      security: [{ serviceBearer: [] }]
+      x-required-scope: providers:read
+      parameters:
+        - $ref: '#/components/parameters/AccountId'
+        - $ref: '#/components/parameters/TenantFilter'
+      responses:
+        '200':
+          description: Scheduled probing is disabled by default.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/HealthProbeSettings' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+    put:
+      tags: [Upstream providers]
+      operationId: putUpstreamHealthProbeSettings
+      summary: Configure per-upstream scheduled probes
+      description: Requires providers:write and keys:write. The probe credential must differ from the system AI credential. Disabling scheduling leaves manual probes available.
+      security: [{ serviceBearer: [] }]
+      x-required-scope: providers:write
+      parameters:
+        - $ref: '#/components/parameters/AccountId'
+        - $ref: '#/components/parameters/TenantFilter'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/HealthProbeSettings' }
+      responses:
+        '200':
+          description: Saved settings.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/HealthProbeSettings' }
+        '400': { $ref: '#/components/responses/InvalidRequest' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+
   /internal/v1/upstreams/{account_id}/quota-reset/{operation_id}/recover:
     post:
       tags: [Upstream providers]
@@ -2831,7 +2904,7 @@ paths:
       description: |
         Requires the same global operator authority as editing private transport
         proxies and verifies the explicitly selected tenant owns the account.
-        Returns only credential-backed proxy settings and account CAS revisions,
+        Returns effective policy-backed proxy settings and account CAS revisions,
         including proxy username and password where configured. Never returns
         API keys, OAuth access/refresh tokens, adapter state or configuration.
         Works for supported OAuth and API-key proxy credentials. An unconfigured
@@ -2851,7 +2924,7 @@ paths:
               schema:
                 type: object
                 additionalProperties: false
-                required: [account_id, proxy_url, proxy_network_scope, updated_at, credential_generation, supported]
+                required: [account_id, proxy_url, proxy_network_scope, updated_at, credential_generation, supported, source, proxy_id, group_id, selected_member_id, configuration_state]
                 properties:
                   account_id: { type: string, format: uuid }
                   proxy_url: { type: [string, 'null'] }
@@ -2859,6 +2932,11 @@ paths:
                   updated_at: { type: integer, format: int64 }
                   credential_generation: { type: integer, format: int64 }
                   supported: { type: boolean, description: Whether this credential has an OAuth or proxied API-key container supported by the transport editor. }
+                  source: {"type":"string","enum":["credential","manual","auto","plugin"]}
+                  proxy_id: {"type":["string","null"],"format":"uuid"}
+                  group_id: {"type":["string","null"],"format":"uuid"}
+                  selected_member_id: {"type":["string","null"],"format":"uuid"}
+                  configuration_state: {"type":"string","enum":["credential","applied","pending"]}
         '400': { $ref: '#/components/responses/InvalidRequest' }
         '401': { $ref: '#/components/responses/Unauthorized' }
         '403': { $ref: '#/components/responses/Forbidden' }
@@ -3157,6 +3235,8 @@ paths:
         '403': { $ref: '#/components/responses/Forbidden' }
         '404': { $ref: '#/components/responses/NotFound' }
         '502': { $ref: '#/components/responses/UpstreamError' }
+
+  /internal/v1/upstreams/{account_id}/oauth/recover: {"post":{"tags":["Upstream providers"],"operationId":"recoverUpstreamOAuthCredential","summary":"Finalize an already saved OAuth refresh result without contacting the authorization server","security":[{"serviceBearer":[]}],"x-required-scope":"oauth:write","parameters":[{"$ref":"#/components/parameters/AccountId"}],"responses":{"200":{"description":"Recovered stable upstream identity.","content":{"application/json":{"schema":{"$ref":"#/components/schemas/UpstreamProvider"}}}},"401":{"$ref":"#/components/responses/Unauthorized"},"403":{"$ref":"#/components/responses/Forbidden"},"404":{"$ref":"#/components/responses/NotFound"},"409":{"description":"No saved result exists, or its generation/attempt no longer matches."}}}}
 
   /internal/v1/upstreams/{account_id}/oauth/disconnect:
     post:
@@ -5810,12 +5890,72 @@ paths:
         '404': { $ref: '#/components/responses/NotFound' }
         '409': { description: Retained prefix path is incomplete or inconsistent. }
 
+  /internal/v1/sessions/{session_id}/requests/{request_id}/training:
+    get:
+      tags: [Operator traffic]
+      operationId: getOperatorSessionTrainingArchive
+      summary: Export verified conversation events and durable raw and media references
+      description: Reads immutable tenant archive objects. Incomplete captures or missing media fail rather than being labelled complete training data. Raw JSON and SSE can be streamed separately without a document size limit.
+      security: [{ serviceBearer: [] }]
+      x-required-scope: requests:read
+      parameters:
+        - $ref: '#/components/parameters/ContextSessionId'
+        - $ref: '#/components/parameters/RequestIdPath'
+        - $ref: '#/components/parameters/TenantFilter'
+        - $ref: '#/components/parameters/ContextKeyId'
+      responses:
+        '200':
+          description: NDJSON manifest and event references with descending ordinals. Require the verified end record and EOF; a truncated stream is not a complete export.
+          content:
+            application/x-ndjson:
+              schema:
+                type: string
+        '400': {$ref: '#/components/responses/InvalidRequest'}
+        '401': {$ref: '#/components/responses/Unauthorized'}
+        '403': {$ref: '#/components/responses/Forbidden'}
+        '404': {$ref: '#/components/responses/NotFound'}
+        '503': {description: 'Archive is incomplete, inconsistent or unavailable.'}
+
+  /internal/v1/sessions/{session_id}/requests/{request_id}/training/raw/{side}:
+    get:
+      tags: [Operator traffic]
+      operationId: getOperatorSessionTrainingRaw
+      summary: Stream the exact retained raw request or response
+      description: Rechecks session ownership and streams the durable object with byte and BLAKE3 verification. Consumers must read to EOF and verify x-content-blake3 and x-content-bytes. This endpoint does not certify that a partial upstream response is a complete dialogue.
+      security: [{ serviceBearer: [] }]
+      x-required-scope: requests:read
+      parameters:
+        - $ref: '#/components/parameters/ContextSessionId'
+        - $ref: '#/components/parameters/RequestIdPath'
+        - $ref: '#/components/parameters/TenantFilter'
+        - $ref: '#/components/parameters/ContextKeyId'
+        - name: side
+          in: path
+          required: true
+          schema: {type: string, enum: [request, response]}
+      responses:
+        '200':
+          description: Exact JSON or SSE bytes, never an evictable cache reference.
+          headers:
+            x-content-blake3:
+              schema: {type: string}
+            x-content-bytes:
+              schema: {type: string}
+          content:
+            application/octet-stream:
+              schema: {type: string, format: binary}
+        '400': {$ref: '#/components/responses/InvalidRequest'}
+        '401': {$ref: '#/components/responses/Unauthorized'}
+        '403': {$ref: '#/components/responses/Forbidden'}
+        '404': {$ref: '#/components/responses/NotFound'}
+        '503': {description: Archive is inconsistent or unavailable.}
+
   /internal/v1/sessions/{session_id}/requests/{request_id}/dialogue:
     get:
       tags: [Operator traffic]
       operationId: getOperatorSessionDialogue
       summary: Read the cleaned session dialogue stored for this request
-      description: Returns the cleaned dialogue already stored in Postgres. It does not read the raw request JSON, the raw return JSON, or object storage, and it does not return object locators.
+      description: Returns cleaned dialogue from immutable archive bodies through tenant-scoped context metadata. This presentation is not the byte-exact raw training archive and does not return object locators.
       security: [{ serviceBearer: [] }]
       x-required-scope: requests:read
       parameters:
@@ -9475,7 +9615,7 @@ components:
         reason: { type: string, enum: [initial, reload, rollback] }
     UpstreamQuotaResetOperation:
       type: object
-      required: [id, upstream_account_id, state, credential_generation, available_credits, applicable_credits, observed_at, expires_at, prepared_by_service_id, confirmed_by_service_id, confirmed_at, created_at, updated_at, last_reconciled_at, reconciled_available_credits, reconciled_applicable_credits, settled_at, error_code, audit, effect, consumes_credits]
+      required: [id, upstream_account_id, state, credential_generation, available_credits, applicable_credits, observed_at, expires_at, prepared_by_service_id, confirmed_by_service_id, confirmed_at, created_at, updated_at, last_reconciled_at, reconciled_available_credits, reconciled_applicable_credits, settled_at, error_code, audit, dispatch_diagnostic, quota_refresh_status, effect, consumes_credits]
       properties:
         id: { type: string, format: uuid }
         upstream_account_id: { type: string, format: uuid }
@@ -9495,9 +9635,22 @@ components:
         reconciled_applicable_credits: { type: [integer, 'null'], format: int64 }
         settled_at: { type: [integer, 'null'], format: int64, description: Fresh observation time when an accepted balance changed or an operator explicitly released a completed unknown dispatch; not proof of supplier reset completion. }
         error_code: { type: [string, 'null'] }
+        dispatch_diagnostic:
+          type: [object, 'null']
+          additionalProperties: false
+          required: [stage, reason, supplier_http_status]
+          properties:
+            stage: { type: string, enum: [prepare, send, response] }
+            reason: { type: string, enum: [credential_invalid, connect_timeout, connect_failed, timeout, request_invalid, transport_failed, unavailable, supplier_http_status] }
+            supplier_http_status: { type: [integer, 'null'], minimum: 100, maximum: 599 }
+        quota_refresh_status:
+          type: string
+          enum: [not_attempted, pending, succeeded]
+          description: Ordinary fresh quota read after acceptance, not proof of supplier reset completion. Accepted legacy operations without readback evidence remain pending.
         audit:
           type: array
           maxItems: 32
+          description: Latest 32 durable audit events in chronological order. Readback evidence is derived from the full audit history.
           items:
             type: object
             additionalProperties: false
@@ -9706,7 +9859,12 @@ components:
           minLength: 16
           maxLength: 512
           writeOnly: true
-          description: Existing active credential supplied by an authorized source importer. It is never echoed.
+          description: "Actual credential value. A generation-fenced save returns the active value with Cache-Control: no-store."
+        expected_credential_generation:
+          type: integer
+          format: int64
+          minimum: 1
+          description: "Observed active generation required for editable-value replacement. Omit only for legacy original-value restoration."
     CopiedClientCredential:
       type: object
       additionalProperties: false
@@ -10283,6 +10441,7 @@ components:
       additionalProperties: false
       required: [id, tenant_id, tenant_external_id, name, notes, driver, auth_kind, connection_method, credential_generation, status, config, credential_expires_at, has_proxy, proxy_scheme, proxy_remote_dns, proxy_label, proxy_fingerprint, can_update_transport_proxy, import_source_identity_hash, import_source_document_sha256, can_refresh, can_rotate, can_reauthorize, route_count, created_at, updated_at]
       properties:
+        oauth_refresh: {"type":"object","properties":{"allowed_actions":{"type":"array","items":{"type":"string","enum":["refresh","resume_local","reauthorize"]}},"lease_expires_at":{"type":["integer","null"],"format":"int64"},"access_state":{"type":"string","enum":["valid","expired","revoked","unknown"]},"refresh_state":{"type":"string","enum":["not_observed","in_progress","pending_local","outcome_unknown","failed","reauthorization_required"]},"reauthorization_required":{"type":"boolean"},"automatic_refresh_paused":{"type":"boolean"}}}
         id: { type: string, format: uuid }
         tenant_id: { type: string, format: uuid }
         tenant_external_id: { type: [string, 'null'] }
@@ -12456,6 +12615,16 @@ components:
           description: Stable enabled MTC model-route reference; no credential material is returned.
         updated_at: { type: integer, format: int64 }
         billing_key_id: { type: [string, 'null'], format: uuid }
+    HealthProbeSettings:
+      type: object
+      additionalProperties: false
+      required: [enabled, billing_key_id, interval_seconds, model, prompt]
+      properties:
+        enabled: { type: boolean, default: false }
+        billing_key_id: { type: [string, 'null'], format: uuid }
+        interval_seconds: { type: integer, minimum: 3600, maximum: 2592000, default: 3600 }
+        model: { type: [string, 'null'], maxLength: 200 }
+        prompt: { type: string, minLength: 1, maxLength: 1024 }
     PutFilterAssistantSettingsRequest:
       type: object
       additionalProperties: false

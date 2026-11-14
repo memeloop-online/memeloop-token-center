@@ -137,7 +137,23 @@ impl Database {
         .bind(limit.clamp(1, 500))
         .fetch_all(&self.pool)
         .await?;
-        request_event_views(rows)
+        let tenants = rows
+            .iter()
+            .map(|row| parse_uuid(row.try_get("tenant_id")?))
+            .collect::<Result<Vec<_>, AppError>>()?;
+        let mut events = request_event_views(rows)?;
+        if let Some(archive) = &self.archive {
+            for (event, tenant) in events.iter_mut().zip(tenants) {
+                if event.protocol != "generation"
+                    && event.status_code.is_some_and(|status| status >= 400)
+                    && let Some(summary) =
+                        archive.supplier_summary(tenant, event.request_id).await?
+                {
+                    event.supplier_error = Some(summary);
+                }
+            }
+        }
+        Ok(events)
     }
 
     pub async fn all_request_events_after(
@@ -168,7 +184,23 @@ impl Database {
         .bind(limit.clamp(1, 500))
         .fetch_all(&self.pool)
         .await?;
-        request_event_views(rows)
+        let tenants = rows
+            .iter()
+            .map(|row| parse_uuid(row.try_get("tenant_id")?))
+            .collect::<Result<Vec<_>, AppError>>()?;
+        let mut events = request_event_views(rows)?;
+        if let Some(archive) = &self.archive {
+            for (event, tenant) in events.iter_mut().zip(tenants) {
+                if event.protocol != "generation"
+                    && event.status_code.is_some_and(|status| status >= 400)
+                    && let Some(summary) =
+                        archive.supplier_summary(tenant, event.request_id).await?
+                {
+                    event.supplier_error = Some(summary);
+                }
+            }
+        }
+        Ok(events)
     }
 
     pub(crate) async fn source_history_event(
@@ -195,6 +227,64 @@ impl Database {
                 created_at: row.try_get("created_at")?,
             };
             if let Some(view) = self.request_history_view(&identity).await? {
+                event.created_at = Some(view.created_at);
+                event.completed_at = view.completed_at;
+                event.lifecycle_state = view.lifecycle_state;
+                event.upstream_model = view.upstream_model;
+                event.upstream_account_id = view.upstream_account_id;
+                event.route_id = view.route_id;
+                event.status_code = view.status_code;
+                event.duration_ms = view.duration_ms;
+                event.first_output_ms = view.first_output_ms;
+                event.generation_duration_ms = view.generation_duration_ms;
+                event.usage_basis = view.usage_basis;
+                event.compaction = view.compaction;
+                event.input_tokens = view.input_tokens;
+                event.output_tokens = view.output_tokens;
+                event.cached_input_tokens = view.cached_input_tokens;
+                event.cache_write_tokens = view.cache_write_tokens;
+                event.currency = view.currency;
+                event.cost = view.cost;
+                event.usage = view.usage;
+                event.billing = view.billing;
+                event.error_code = view.error_code;
+                event.terminal_cause_code = view.terminal_cause_code;
+                event.in_flight_stage = view.in_flight_stage;
+                event.supplier_error = view.supplier_error;
+                event.archive_state = view.archive_state;
+                event.session_context = view.session_context;
+                event.credential_identity = view.credential_identity;
+            }
+        }
+        Ok(Some(event))
+    }
+
+    pub(crate) async fn history_original_event_in_transaction(
+        transaction: &mut Transaction<'_, Any>,
+        event_id: Uuid,
+    ) -> Result<Option<RequestEventView>, AppError> {
+        let rows = sqlx::query(sqlx::AssertSqlSafe(enriched_request_events_sql(
+            "SELECT e.* FROM request_events e WHERE e.event_id = $1",
+        )))
+        .bind(event_id.to_string())
+        .fetch_all(&mut **transaction)
+        .await?;
+        let Some(mut event) = request_event_views(rows)?.into_iter().next() else {
+            return Ok(None);
+        };
+        let row = sqlx::query("SELECT source, request_id, tenant_id, key_id, created_at FROM request_history_source_ids WHERE source IN ('native', 'generation') AND request_id = $1 AND key_id = $2 AND tenant_id = (SELECT tenant_id FROM request_events WHERE event_id = $3)")
+            .bind(event.request_id.to_string()).bind(event.key_id.to_string()).bind(event_id.to_string()).fetch_optional(&mut **transaction).await?;
+        if let Some(row) = row {
+            let identity = crate::request_history::HistoryIdentity {
+                source: row.try_get("source")?,
+                request_id: event.request_id,
+                tenant_id: parse_uuid(row.try_get("tenant_id")?)?,
+                key_id: event.key_id,
+                created_at: row.try_get("created_at")?,
+            };
+            if let Some(view) =
+                Self::history_original_view_in_transaction(transaction, &identity).await?
+            {
                 event.created_at = Some(view.created_at);
                 event.completed_at = view.completed_at;
                 event.lifecycle_state = view.lifecycle_state;
@@ -352,6 +442,17 @@ impl Database {
         for index in native_indices {
             let view = &mut views[index];
             view.egress = observations.remove(&view.request_id);
+            if view.status_code.is_some_and(|status| status >= 400)
+                && let Some(archive) = &self.archive
+                && let Some(locator) = self
+                    .request_record_locator(&view.request_id.to_string())
+                    .await?
+                && let Some(summary) = archive
+                    .supplier_summary(parse_uuid(locator.tenant_id)?, view.request_id)
+                    .await?
+            {
+                view.supplier_error = Some(summary);
+            }
         }
         Ok(views)
     }
@@ -369,6 +470,63 @@ impl Database {
             Some(identity),
         );
         Ok(self.fetch_request_list(query).await?.into_iter().next())
+    }
+
+    /// Capture the canonical SQL projection on the caller's commit connection.
+    /// Object-store enrichment and dynamic observations run after durable capture.
+    pub(crate) async fn history_original_view_in_transaction(
+        transaction: &mut Transaction<'_, Any>,
+        identity: &crate::request_history::HistoryIdentity,
+    ) -> Result<Option<RequestView>, AppError> {
+        let query = build_request_list_query_for_history(
+            RequestListScope::Global,
+            &RequestListFilter {
+                limit: 1,
+                ..RequestListFilter::default()
+            },
+            Some(identity),
+        );
+        let mut statement = sqlx::query(sqlx::AssertSqlSafe(query.statement));
+        for value in query.binds {
+            statement = match value {
+                RequestListBind::I64(value) => statement.bind(value),
+                RequestListBind::Text(value) => statement.bind(value),
+            };
+        }
+        let rows = statement.fetch_all(&mut **transaction).await?;
+        let native = rows
+            .first()
+            .map(|row| row.try_get::<i64, _>("native_terminal"))
+            .transpose()?
+            .unwrap_or(0)
+            == 1;
+        let mut view = request_views(rows)?.into_iter().next();
+        if native && let Some(view) = &mut view {
+            let mut observations = egress::request_list_egress_in_transaction(
+                transaction,
+                &[identity.request_id.to_string()],
+            )
+            .await?;
+            view.egress = observations.remove(&identity.request_id);
+        }
+        Ok(view)
+    }
+
+    /// Preserve archive locators and their                 "SELECT r.id, r.created_at, r.completed_at, op.completed_at AS operational_completed_at, op.stage AS operational_stage, CASE WHEN financial.state = 'applied' THEN 'applied' WHEN financial.unknown_reason IS NOT NULL THEN 'unknown' WHEN financial.state = 'pending' THEN 'pending' ELSE NULL END AS financial_state, CAST(NULL AS BIGINT) AS source_completed_at, r.protocol, r.model, r.upstream_model, (CASE WHEN op.request_id IS NOT NULL THEN op.upstream_account_id ELSE r.upstream_account_id END) AS upstream_account_id, (CASE WHEN op.request_id IS NOT NULL THEN op.model_route_id ELSE r.model_route_id END) AS route_id, (CASE WHEN op.request_id IS NOT NULL THEN op.status_code ELSE r.status_code END) AS status_code, CAST(NULL AS TEXT) AS generation_status, (CASE WHEN op.request_id IS NOT NULL THEN op.duration_ms ELSE r.duration_ms END) AS duration_ms, (CASE WHEN op.request_id IS NOT NULL THEN op.first_output_ms ELSE r.first_output_ms END) AS first_output_ms, (CASE WHEN op.request_id IS NOT NULL THEN op.generation_duration_ms ELSE r.generation_duration_ms END) AS generation_duration_ms, r.usage_basis, CASE WHEN r.completed_at IS NULL THEN NULL ELSE r.input_tokens END AS input_tokens, CASE WHEN r.completed_at IS NULL THEN NULL ELSE r.cached_input_tokens END AS cached_input_tokens, CASE WHEN r.completed_at IS NULL THEN NULL ELSE r.cache_write_tokens END AS cache_write_tokens, CASE WHEN r.completed_at IS NULL THEN NULL ELSE r.output_tokens END AS output_tokens, CASE WHEN r.completed_at IS NULL THEN NULL ELSE r.billed_units END AS billed_units, CASE WHEN r.completed_at IS NULL THEN NULL ELSE NULLIF(r.billing_unit, '') END AS billing_unit, CASE WHEN r.completed_at IS NULL THEN NULL ELSE r.cost_micros END AS cost_micros, CASE WHEN r.completed_at IS NULL THEN NULL ELSE NULLIF(r.currency, '') END AS currency, 1 AS billable, (CASE WHEN op.request_id IS NOT NULL THEN op.error_code ELSE r.error_code END) AS error_code, (CASE WHEN op.request_id IS NOT NULL THEN op.terminal_cause_code ELSE r.terminal_cause_code END) AS terminal_cause_code, r.in_flight_stage, CASE WHEN (r.completed_at IS NOT NULL OR op.request_id IS NOT NULL) AND (CASE WHEN op.request_id IS NOT NULL THEN op.status_code ELSE r.status_code END) >= 400 AND (CASE WHEN r.response_object IS NOT NULL AND r.response_object NOT LIKE 'gap://%' THEN r.response_object WHEN op.request_id IS NOT NULL THEN op.response_object ELSE r.response_object END) LIKE 'inline-json:%' AND LENGTH((CASE WHEN r.response_object IS NOT NULL AND r.response_object NOT LIKE 'gap://%' THEN r.response_object WHEN op.request_id IS NOT NULL THEN op.response_object ELSE r.response_object END)) <= 2048 THEN (CASE WHEN r.response_object IS NOT NULL AND r.response_object NOT LIKE 'gap://%' THEN r.response_object WHEN op.request_id IS NOT NULL THEN op.response_object ELSE r.response_object END) ELSE NULL END AS supplier_error_inline_json, CAST(1 AS BIGINT) AS native_terminal, CASE WHEN request_spool.state = 'uploading' OR spool.state = 'uploading' THEN 'uploading' WHEN request_spool.state = 'pending' OR spool.state = 'pending' THEN 'pending' WHEN request_spool.state = 'capturing' OR spool.state = 'capturing' OR (r.completed_at IS NULL AND op.request_id IS NULL) THEN 'capturing' WHEN request_spool.state IS NULL AND spool.state IS NULL AND r.request_object LIKE 'metadata-only-json:%' AND ((CASE WHEN r.response_object IS NOT NULL AND r.response_object NOT LIKE 'gap://%' THEN r.response_object WHEN op.request_id IS NOT NULL THEN op.response_object ELSE r.response_object END) LIKE 'metadata-only-json:%' OR (CASE WHEN r.response_object IS NOT NULL AND r.response_object NOT LIKE 'gap://%' THEN r.response_object WHEN op.request_id IS NOT NULL THEN op.response_object ELSE r.response_object END) LIKE 'provider-reference-json:%') THEN 'metadata_only' WHEN request_spool.state = 'gap' OR spool.state = 'gap' OR r.request_object LIKE 'gap://%' OR (CASE WHEN r.response_object IS NOT NULL AND r.response_object NOT LIKE 'gap://%' THEN r.response_object WHEN op.request_id IS NOT NULL THEN op.response_object ELSE r.response_object END) IS NULL OR (CASE WHEN r.response_object IS NOT NULL AND r.response_object NOT LIKE 'gap://%' THEN r.response_object WHEN op.request_id IS NOT NULL THEN op.response_object ELSE r.response_object END) LIKE 'gap://%' THEN 'gap' ELSE 'bound' END AS archive_state, CASE WHEN request_spool.state IN ('capturing', 'pending', 'uploading') OR spool.state IN ('capturing', 'pending', 'uploading') OR (r.completed_at IS NULL AND op.request_id IS NULL) THEN NULL WHEN request_spool.state = 'gap' THEN COALESCE(request_spool.gap_reason, request_spool.last_error_code, 'archive_object_unavailable') WHEN spool.state = 'gap' THEN COALESCE(spool.last_error_code, 'archive_object_unavailable') WHEN r.request_object LIKE 'gap://%' OR (CASE WHEN r.response_object IS NOT NULL AND r.response_object NOT LIKE 'gap://%' THEN r.response_object WHEN op.request_id IS NOT NULL THEN op.response_object ELSE r.response_object END) IS NULL OR (CASE WHEN r.response_object IS NOT NULL AND r.response_object NOT LIKE 'gap://%' THEN r.response_object WHEN op.request_id IS NOT NULL THEN op.response_object ELSE r.response_object END) LIKE 'gap://%' THEN 'archive_object_unavailable' ELSE NULL END AS archive_reason, request_spool.state AS request_spool_state, COALESCE(request_spool.gap_reason, request_spool.last_error_code) AS request_spool_reason, spool.state AS response_spool_state, spool.last_error_code AS response_spool_reason, r.request_object, (CASE WHEN r.response_object IS NOT NULL AND r.response_object NOT LIKE 'gap://%' THEN r.response_object WHEN op.request_id IS NOT NULL THEN op.response_object ELSE r.response_object END) AS response_object, r.conversation_cluster_id AS session_id, CASE WHEN r.conversation_cluster_id IS NULL THEN 'unlinked' ELSE 'confirmed' END AS session_association, observation.compaction, observation.session_name, observation.task_kind, observation.agent_id, observation.metadata_source AS semantics_source, CAST(NULL AS TEXT) AS tenant_external_id, CAST(NULL AS TEXT) AS credential_key_id, CAST(NULL AS TEXT) AS key_alias, CAST(NULL AS TEXT) AS principal_external_id FROM request_records r LEFT JOIN proxy_operational_terminals op ON op.request_id = r.id AND op.request_created_at = r.created_at AND op.tenant_id = r.tenant_id AND op.key_id = r.key_id AND op.reservation_id = r.reservation_id LEFT JOIN pending_proxy_settlements financial ON financial.request_id = r.id AND financial.tenant_id = r.tenant_id AND financial.key_id = r.key_id AND financial.reservation_id = r.reservation_id LEFT JOIN conversation_observations observation ON observation.request_id = r.id AND observation.key_id = r.key_id AND observation.cluster_id = r.conversation_cluster_id LEFT JOIN request_archive_spools request_spool ON request_spool.request_id = r.id AND request_spool.tenant_id = r.tenant_id AND request_spool.reservation_id = r.reservation_id LEFT JOIN response_archive_spools spool ON spool.request_id = r.id AND spool.tenant_id = r.tenant_id AND spool.reservation_id = r.reservation_id WHERE r.id = $1 AND r.created_at = $2 AND r.key_id = $3", state without consulting objects.
+    pub(crate) async fn history_native_archive_in_transaction(
+        transaction: &mut Transaction<'_, Any>,
+        identity: &crate::request_history::HistoryIdentity,
+    ) -> Result<RequestArchiveRefs, AppError> {
+        let row = sqlx::query(
+                "SELECT r.id, r.created_at, r.completed_at, op.completed_at AS operational_completed_at, op.stage AS operational_stage, CASE WHEN financial.state = 'applied' THEN 'applied' WHEN financial.unknown_reason IS NOT NULL THEN 'unknown' WHEN financial.state = 'pending' THEN 'pending' ELSE NULL END AS financial_state, CAST(NULL AS BIGINT) AS source_completed_at, r.protocol, r.model, r.upstream_model, (CASE WHEN op.request_id IS NOT NULL THEN op.upstream_account_id ELSE r.upstream_account_id END) AS upstream_account_id, (CASE WHEN op.request_id IS NOT NULL THEN op.model_route_id ELSE r.model_route_id END) AS route_id, (CASE WHEN op.request_id IS NOT NULL THEN op.status_code ELSE r.status_code END) AS status_code, CAST(NULL AS TEXT) AS generation_status, (CASE WHEN op.request_id IS NOT NULL THEN op.duration_ms ELSE r.duration_ms END) AS duration_ms, (CASE WHEN op.request_id IS NOT NULL THEN op.first_output_ms ELSE r.first_output_ms END) AS first_output_ms, (CASE WHEN op.request_id IS NOT NULL THEN op.generation_duration_ms ELSE r.generation_duration_ms END) AS generation_duration_ms, r.usage_basis, CASE WHEN r.completed_at IS NULL THEN NULL ELSE r.input_tokens END AS input_tokens, CASE WHEN r.completed_at IS NULL THEN NULL ELSE r.cached_input_tokens END AS cached_input_tokens, CASE WHEN r.completed_at IS NULL THEN NULL ELSE r.cache_write_tokens END AS cache_write_tokens, CASE WHEN r.completed_at IS NULL THEN NULL ELSE r.output_tokens END AS output_tokens, CASE WHEN r.completed_at IS NULL THEN NULL ELSE r.billed_units END AS billed_units, CASE WHEN r.completed_at IS NULL THEN NULL ELSE NULLIF(r.billing_unit, '') END AS billing_unit, CASE WHEN r.completed_at IS NULL THEN NULL ELSE r.cost_micros END AS cost_micros, CASE WHEN r.completed_at IS NULL THEN NULL ELSE NULLIF(r.currency, '') END AS currency, 1 AS billable, (CASE WHEN op.request_id IS NOT NULL THEN op.error_code ELSE r.error_code END) AS error_code, (CASE WHEN op.request_id IS NOT NULL THEN op.terminal_cause_code ELSE r.terminal_cause_code END) AS terminal_cause_code, r.in_flight_stage, CASE WHEN (r.completed_at IS NOT NULL OR op.request_id IS NOT NULL) AND (CASE WHEN op.request_id IS NOT NULL THEN op.status_code ELSE r.status_code END) >= 400 AND (CASE WHEN r.response_object IS NOT NULL AND r.response_object NOT LIKE 'gap://%' THEN r.response_object WHEN op.request_id IS NOT NULL THEN op.response_object ELSE r.response_object END) LIKE 'inline-json:%' AND LENGTH((CASE WHEN r.response_object IS NOT NULL AND r.response_object NOT LIKE 'gap://%' THEN r.response_object WHEN op.request_id IS NOT NULL THEN op.response_object ELSE r.response_object END)) <= 2048 THEN (CASE WHEN r.response_object IS NOT NULL AND r.response_object NOT LIKE 'gap://%' THEN r.response_object WHEN op.request_id IS NOT NULL THEN op.response_object ELSE r.response_object END) ELSE NULL END AS supplier_error_inline_json, CAST(1 AS BIGINT) AS native_terminal, CASE WHEN request_spool.state = 'uploading' OR spool.state = 'uploading' THEN 'uploading' WHEN request_spool.state = 'pending' OR spool.state = 'pending' THEN 'pending' WHEN request_spool.state = 'capturing' OR spool.state = 'capturing' OR (r.completed_at IS NULL AND op.request_id IS NULL) THEN 'capturing' WHEN request_spool.state IS NULL AND spool.state IS NULL AND r.request_object LIKE 'metadata-only-json:%' AND ((CASE WHEN r.response_object IS NOT NULL AND r.response_object NOT LIKE 'gap://%' THEN r.response_object WHEN op.request_id IS NOT NULL THEN op.response_object ELSE r.response_object END) LIKE 'metadata-only-json:%' OR (CASE WHEN r.response_object IS NOT NULL AND r.response_object NOT LIKE 'gap://%' THEN r.response_object WHEN op.request_id IS NOT NULL THEN op.response_object ELSE r.response_object END) LIKE 'provider-reference-json:%') THEN 'metadata_only' WHEN request_spool.state = 'gap' OR spool.state = 'gap' OR r.request_object LIKE 'gap://%' OR (CASE WHEN r.response_object IS NOT NULL AND r.response_object NOT LIKE 'gap://%' THEN r.response_object WHEN op.request_id IS NOT NULL THEN op.response_object ELSE r.response_object END) IS NULL OR (CASE WHEN r.response_object IS NOT NULL AND r.response_object NOT LIKE 'gap://%' THEN r.response_object WHEN op.request_id IS NOT NULL THEN op.response_object ELSE r.response_object END) LIKE 'gap://%' THEN 'gap' ELSE 'bound' END AS archive_state, CASE WHEN request_spool.state IN ('capturing', 'pending', 'uploading') OR spool.state IN ('capturing', 'pending', 'uploading') OR (r.completed_at IS NULL AND op.request_id IS NULL) THEN NULL WHEN request_spool.state = 'gap' THEN COALESCE(request_spool.gap_reason, request_spool.last_error_code, 'archive_object_unavailable') WHEN spool.state = 'gap' THEN COALESCE(spool.last_error_code, 'archive_object_unavailable') WHEN r.request_object LIKE 'gap://%' OR (CASE WHEN r.response_object IS NOT NULL AND r.response_object NOT LIKE 'gap://%' THEN r.response_object WHEN op.request_id IS NOT NULL THEN op.response_object ELSE r.response_object END) IS NULL OR (CASE WHEN r.response_object IS NOT NULL AND r.response_object NOT LIKE 'gap://%' THEN r.response_object WHEN op.request_id IS NOT NULL THEN op.response_object ELSE r.response_object END) LIKE 'gap://%' THEN 'archive_object_unavailable' ELSE NULL END AS archive_reason, request_spool.state AS request_spool_state, COALESCE(request_spool.gap_reason, request_spool.last_error_code) AS request_spool_reason, spool.state AS response_spool_state, spool.last_error_code AS response_spool_reason, r.request_object, (CASE WHEN r.response_object IS NOT NULL AND r.response_object NOT LIKE 'gap://%' THEN r.response_object WHEN op.request_id IS NOT NULL THEN op.response_object ELSE r.response_object END) AS response_object, r.conversation_cluster_id AS session_id, CASE WHEN r.conversation_cluster_id IS NULL THEN 'unlinked' ELSE 'confirmed' END AS session_association, observation.compaction, observation.session_name, observation.task_kind, observation.agent_id, observation.metadata_source AS semantics_source, CAST(NULL AS TEXT) AS tenant_external_id, CAST(NULL AS TEXT) AS credential_key_id, CAST(NULL AS TEXT) AS key_alias, CAST(NULL AS TEXT) AS principal_external_id FROM request_records r LEFT JOIN proxy_operational_terminals op ON op.request_id = r.id AND op.request_created_at = r.created_at AND op.tenant_id = r.tenant_id AND op.key_id = r.key_id AND op.reservation_id = r.reservation_id LEFT JOIN pending_proxy_settlements financial ON financial.request_id = r.id AND financial.tenant_id = r.tenant_id AND financial.key_id = r.key_id AND financial.reservation_id = r.reservation_id LEFT JOIN conversation_observations observation ON observation.request_id = r.id AND observation.key_id = r.key_id AND observation.cluster_id = r.conversation_cluster_id LEFT JOIN request_archive_spools request_spool ON request_spool.request_id = r.id AND request_spool.tenant_id = r.tenant_id AND request_spool.reservation_id = r.reservation_id LEFT JOIN response_archive_spools spool ON spool.request_id = r.id AND spool.tenant_id = r.tenant_id AND spool.reservation_id = r.reservation_id WHERE r.id = $1 AND r.created_at = $2 AND r.key_id = $3",
+        )
+        .bind(identity.request_id.to_string())
+        .bind(identity.created_at)
+        .bind(identity.key_id.to_string())
+        .fetch_optional(&mut **transaction)
+        .await?
+        .ok_or(AppError::NotFound)?;
+        request_archive_refs_from_row(row)
     }
 
     pub async fn request_archive_refs(
@@ -401,7 +559,11 @@ impl Database {
             .fetch_optional(&self.pool)
             .await?
             .ok_or(AppError::internal("queries_site_1"))?;
-            request_archive_refs_from_row(row)
+            self.resolve_raw_archive_roots(
+                parse_uuid(locator.tenant_id)?,
+                request_archive_refs_from_row(row)?,
+            )
+            .await
         } else {
             match self
                 .generation_archive_refs(key_id, parse_uuid(request_id.clone())?)
@@ -453,7 +615,12 @@ impl Database {
             .fetch_optional(&self.pool)
             .await?;
             if let Some(row) = row {
-                return request_archive_refs_from_row(row);
+                return self
+                    .resolve_raw_archive_roots(
+                        parse_uuid(locator.tenant_id)?,
+                        request_archive_refs_from_row(row)?,
+                    )
+                    .await;
             }
             let identity = self
                 .historical_credential_identity(
@@ -546,7 +713,12 @@ impl Database {
             .fetch_optional(&self.pool)
             .await?;
             if let Some(row) = row {
-                return request_archive_refs_from_row(row);
+                return self
+                    .resolve_raw_archive_roots(
+                        parse_uuid(locator.tenant_id)?,
+                        request_archive_refs_from_row(row)?,
+                    )
+                    .await;
             }
             let identity = self
                 .historical_credential_identity(&locator.tenant_id, &locator.key_id, None)
@@ -605,6 +777,22 @@ impl Database {
         .bind(request_id)
         .bind(key_id.to_string())
         .fetch_optional(&self.pool)
+        .await?
+        .ok_or(AppError::NotFound)?;
+        session_archive_unlinked_refs_from_row(row)
+    }
+
+    pub(crate) async fn history_archive_source_in_transaction(
+        transaction: &mut Transaction<'_, Any>,
+        key_id: Uuid,
+        request_id: &str,
+    ) -> Result<RequestArchiveRefs, AppError> {
+        let row = sqlx::query(
+            "SELECT u.archive_request_id AS id, u.source_started_at AS created_at, u.source_completed_at, u.protocol, u.model, u.status_code, u.duration_ms, CAST(NULL AS BIGINT) AS first_output_ms, CAST(NULL AS BIGINT) AS generation_duration_ms, CAST(NULL AS TEXT) AS usage_basis, NULLIF(u.input_tokens, 0) AS input_tokens, CAST(NULL AS BIGINT) AS cached_input_tokens, CAST(NULL AS BIGINT) AS cache_write_tokens, NULLIF(u.output_tokens, 0) AS output_tokens, u.error_code, u.request_object, u.response_object, u.source, u.external_request_id, c.proof_digest, u.conversation_cluster_id AS session_id, CASE WHEN u.conversation_cluster_id IS NULL THEN 'unlinked' ELSE 'confirmed' END AS session_association, observation.compaction, observation.session_name, observation.task_kind, observation.agent_id, observation.metadata_source AS semantics_source, CAST(NULL AS TEXT) AS tenant_external_id, CAST(NULL AS TEXT) AS credential_key_id, CAST(NULL AS TEXT) AS key_alias, CAST(NULL AS TEXT) AS principal_external_id FROM session_archive_unlinked_requests u JOIN session_archive_correlations c ON c.tenant_id = u.tenant_id AND c.source = u.source AND c.external_request_id = u.external_request_id AND c.disposition = 'unlinked' LEFT JOIN conversation_observations observation ON observation.request_id = u.archive_request_id AND observation.key_id = u.key_id AND observation.cluster_id = u.conversation_cluster_id WHERE u.archive_request_id = $1 AND u.key_id = $2",
+        )
+        .bind(request_id)
+        .bind(key_id.to_string())
+        .fetch_optional(&mut **transaction)
         .await?
         .ok_or(AppError::NotFound)?;
         session_archive_unlinked_refs_from_row(row)
@@ -746,6 +934,21 @@ impl Database {
         .bind(request_id.to_string())
         .bind(key_id.to_string())
         .fetch_optional(&self.pool)
+        .await?
+        .ok_or(AppError::NotFound)?;
+        generation_archive_refs_from_row(row)
+    }
+    pub(crate) async fn history_generation_archive_in_transaction(
+        transaction: &mut Transaction<'_, Any>,
+        key_id: Uuid,
+        request_id: Uuid,
+    ) -> Result<RequestArchiveRefs, AppError> {
+        let row = sqlx::query(
+            "SELECT g.id, g.created_at, g.completed_at, g.public_model, g.upstream_model, g.upstream_account_id, g.model_route_id AS route_id, g.status, g.error_code, g.request_object, g.result_json, facts.billed_units AS facts_billed_units, NULLIF(facts.billing_unit, '') AS facts_billing_unit, facts.cost_micros AS facts_cost_micros, NULLIF(facts.currency, '') AS facts_currency, CAST(NULL AS TEXT) AS tenant_external_id, CAST(NULL AS TEXT) AS credential_key_id, CAST(NULL AS TEXT) AS key_alias, CAST(NULL AS TEXT) AS principal_external_id FROM generation_jobs g LEFT JOIN generation_stats_facts facts ON facts.job_id = g.id AND facts.tenant_id = g.tenant_id AND facts.key_id = g.key_id WHERE g.id = $1 AND g.key_id = $2",
+        )
+        .bind(request_id.to_string())
+        .bind(key_id.to_string())
+        .fetch_optional(&mut **transaction)
         .await?
         .ok_or(AppError::NotFound)?;
         generation_archive_refs_from_row(row)

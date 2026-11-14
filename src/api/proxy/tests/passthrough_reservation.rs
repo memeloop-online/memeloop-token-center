@@ -393,7 +393,7 @@ async fn ordinary_missing_metadata_cancellation_before_headers_preserves_unknown
 }
 
 #[tokio::test]
-async fn ordinary_openai_preserves_each_explicit_wire_limit_and_financial_constraint() {
+async fn ordinary_openai_preserves_explicit_wire_limits_and_settles_reported_usage() {
     for (chat, field) in [
         (true, "max_tokens"),
         (true, "max_completion_tokens"),
@@ -416,27 +416,15 @@ async fn ordinary_openai_preserves_each_explicit_wire_limit_and_financial_constr
                 .mount(&upstream)
                 .await;
             let response = send_ordinary(&fixture, chat, &request).await;
-            assert_eq!(
-                response.status(),
-                if reported == 17 {
-                    StatusCode::OK
-                } else {
-                    StatusCode::BAD_GATEWAY
-                }
-            );
-            let _ = to_bytes(response.into_body(), MAX_PROXY_RESPONSE_BODY)
+            assert_eq!(response.status(), StatusCode::OK);
+            let body = to_bytes(response.into_body(), MAX_PROXY_RESPONSE_BODY)
                 .await
                 .unwrap();
-            if reported == 17 {
-                wait_for_request_settlement(&fixture, 1).await;
-            } else {
-                cancellation::assert_single_unknown_receipt(
-                    &fixture,
-                    502,
-                    Some("upstream_invalid_usage"),
-                )
-                .await;
-            }
+            assert_eq!(
+                serde_json::from_slice::<Value>(&body).unwrap(),
+                ordinary_response(chat, reported)
+            );
+            wait_for_request_settlement(&fixture, 1).await;
             let rows = fixture
                 .state
                 .db
@@ -444,20 +432,27 @@ async fn ordinary_openai_preserves_each_explicit_wire_limit_and_financial_constr
                 .await
                 .unwrap();
             assert_eq!(rows.len(), 1);
-            if reported == 17 {
-                assert_eq!(rows[0].output_tokens, 17);
-            } else {
-                assert!(rows[0].usage.tokens.is_none());
-                assert_eq!(rows[0].billing.cost, None);
-            }
+            assert_eq!(rows[0].status_code, Some(200));
+            assert_eq!((rows[0].input_tokens, rows[0].output_tokens), (3, reported));
             assert_eq!(
-                rows[0].error_code.as_deref(),
-                if reported == 17 {
+                rows[0].usage_basis,
+                Some(crate::model::RequestUsageBasis::ProviderReported)
+            );
+            assert_eq!(
+                rows[0].cost.parse::<Decimal>().unwrap(),
+                Decimal::new(3 + reported, 6)
+            );
+            assert_eq!(rows[0].error_code, None);
+            assert_exactly_once_side_effects(
+                &fixture,
+                rows[0].request_id,
+                if chat {
                     None
                 } else {
-                    Some("upstream_invalid_usage")
-                }
-            );
+                    Some("resp-usage-contract")
+                },
+            )
+            .await;
             upstream.verify().await;
         }
     }
@@ -597,7 +592,7 @@ async fn passthrough_reserves_trusted_bound_and_settles_actual_usage_above_4096(
 }
 
 #[tokio::test]
-async fn passthrough_explicit_limit_remains_a_settlement_constraint() {
+async fn passthrough_explicit_limit_is_forwarded_while_actual_usage_settles_once() {
     let upstream = MockServer::start().await;
     let completed = completed_response_with_usage(3, 5_000);
     Mock::given(method("POST"))
@@ -619,20 +614,23 @@ async fn passthrough_explicit_limit_remains_a_settlement_constraint() {
     let _body = to_bytes(response.into_body(), MAX_PROXY_RESPONSE_BODY)
         .await
         .unwrap();
-    cancellation::assert_single_unknown_receipt(&fixture, 502, Some("upstream_invalid_usage"))
-        .await;
+    wait_for_request_settlement(&fixture, 1).await;
     let rows = fixture
         .state
         .db
         .list_requests(fixture.key_id, 10)
         .await
         .unwrap();
-    assert_eq!(rows[0].status_code, Some(502));
+    assert_eq!(rows.len(), 1);
+    assert_eq!(rows[0].status_code, Some(200));
+    assert_eq!(rows[0].error_code, None);
+    assert_eq!((rows[0].input_tokens, rows[0].output_tokens), (3, 5_000));
     assert_eq!(
-        rows[0].error_code.as_deref(),
-        Some("upstream_invalid_usage")
+        rows[0].cost.parse::<Decimal>().unwrap(),
+        Decimal::new(5003, 6)
     );
-    assert!(rows[0].usage.tokens.is_none());
+    assert_exactly_once_side_effects(&fixture, rows[0].request_id, Some("resp-usage-contract"))
+        .await;
     upstream.verify().await;
 }
 

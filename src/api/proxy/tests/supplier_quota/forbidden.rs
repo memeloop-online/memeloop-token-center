@@ -1,6 +1,86 @@
 use super::*;
 
 #[tokio::test]
+async fn concurrency403_uses_authorized_alternate_without_invalidating_credentials() {
+    for (body, status, standby_requests, failure) in [
+        (
+            json!({"error":{"type":"access_terminated_error","message":"You've reached your concurrent request limit. Please wait for your ongoing requests to finish and try again."}}),
+            StatusCode::OK,
+            1,
+            "rate_limited",
+        ),
+        (
+            json!({"error":{"type":"access_terminated_error","message":"Your access has been revoked."}}),
+            StatusCode::FORBIDDEN,
+            0,
+            "authentication",
+        ),
+    ] {
+        let primary = MockServer::start().await;
+        let standby = MockServer::start().await;
+        let unauthorized = MockServer::start().await;
+        Mock::given(method("POST"))
+            .respond_with(ResponseTemplate::new(403).set_body_json(body))
+            .expect(1)
+            .mount(&primary)
+            .await;
+        Mock::given(method("POST"))
+            .respond_with(successful_chat_response())
+            .expect(standby_requests)
+            .mount(&standby)
+            .await;
+        Mock::given(method("POST"))
+            .respond_with(successful_chat_response())
+            .expect(0)
+            .mount(&unauthorized)
+            .await;
+        let fixture = resilient_route_fixture(
+            "concurrency403",
+            &[
+                (primary.uri(), 0),
+                (standby.uri(), 10),
+                (unauthorized.uri(), -10),
+            ],
+        )
+        .await;
+        let pool = sqlx::AnyPool::connect(&fixture.database_url).await.unwrap();
+        sqlx::query("DELETE FROM routing_grants WHERE key_id=$1 AND model_route_id IN (SELECT id FROM model_routes WHERE upstream_account_id=$2)")
+            .bind(fixture.key_id.to_string()).bind(fixture.accounts[2].to_string()).execute(&pool).await.unwrap();
+        let before = fixture
+            .state
+            .db
+            .probe_account_context(fixture.accounts[0])
+            .await
+            .unwrap();
+        let response = send_resilient_chat(&fixture, None, false).await;
+        assert_eq!(response.status(), status);
+        let bytes = to_bytes(response.into_body(), MAX_PROXY_RESPONSE_BODY)
+            .await
+            .unwrap();
+        if status == StatusCode::OK {
+            let body: Value = serde_json::from_slice(&bytes).unwrap();
+            assert_eq!(body["choices"][0]["message"]["content"], "ok");
+            assert_eq!(body["usage"]["total_tokens"], 3);
+        }
+        fixture.state.routing_persistence.drain_for_test().await;
+        let kind: String = sqlx::query_scalar("SELECT failure_kind FROM request_upstream_transport_diagnostics WHERE upstream_account_id=$1")
+            .bind(fixture.accounts[0].to_string()).fetch_one(&pool).await.unwrap();
+        assert_eq!(kind, failure);
+        let after = fixture
+            .state
+            .db
+            .probe_account_context(fixture.accounts[0])
+            .await
+            .unwrap();
+        assert_eq!(before.credential_generation, after.credential_generation);
+        primary.verify().await;
+        standby.verify().await;
+        unauthorized.verify().await;
+        pool.close().await;
+    }
+}
+
+#[tokio::test]
 async fn delayed_complete403_body_fails_over_only_for_definite_quota() {
     for (code, expected, standby_requests) in [
         ("insufficient_quota", StatusCode::OK, 1),
@@ -150,28 +230,10 @@ async fn assert_quota_failover_and_real_probe_recovery(
         )
         .await
         .unwrap();
-    let route_id: String =
-        sqlx::query_scalar("SELECT id FROM model_routes WHERE upstream_account_id=$1")
-            .bind(account.to_string())
-            .fetch_one(&pool)
-            .await
-            .unwrap();
-    fixture
-        .state
-        .db
-        .plugin_kv_put(
-            "typed-filter",
-            &format!(
-                "settings/{}",
-                &blake3::hash(tenant.as_bytes()).to_hex()[..32]
-            ),
-            &serde_json::to_vec(
-                &json!({"model_route_id":route_id,"billing_key_id":fixture.key_id,"updated_at":1}),
-            )
-            .unwrap(),
-        )
-        .await
-        .unwrap();
+    fixture.state.db.plugin_kv_put(
+        "upstream-health-probe", &account.to_string(),
+        &serde_json::to_vec(&json!({"enabled":true,"billing_key_id":fixture.key_id,"interval_seconds":3600,"model":null,"prompt":"Reply with ok."})).unwrap(),
+    ).await.unwrap();
     for _ in 0..2 {
         let response = send_resilient_chat(&fixture, None, false).await;
         assert_eq!(response.status(), StatusCode::OK);

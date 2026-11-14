@@ -4,7 +4,7 @@ use object_store::{ObjectStoreExt, PutPayload};
 
 use super::{
     ArchiveStore,
-    path::{archive_path, content_location, is_any_v1_cas_location},
+    path::{archive_path, content_location, is_any_v1_cas_location, is_durable_root_location},
 };
 use crate::error::AppError;
 
@@ -12,7 +12,8 @@ const DEFAULT_ARCHIVE_READ_LIMIT: usize = 16 * 1024 * 1024;
 
 impl ArchiveStore {
     pub(crate) async fn source_object_exists(&self, location: &str) -> Result<bool, AppError> {
-        match self.inner.head(&archive_path(location)?).await {
+        let (store, path) = self.resolve(location)?;
+        match store.head(&path).await {
             Ok(_) => Ok(true),
             Err(object_store::Error::NotFound { .. }) => Ok(false),
             Err(error) => Err(error.into()),
@@ -20,15 +21,16 @@ impl ArchiveStore {
     }
 
     pub async fn put(&self, location: &str, data: Bytes) -> Result<(), AppError> {
-        if is_any_v1_cas_location(location) {
+        if location.starts_with(super::routing::PREFIX) {
+            return Err(AppError::storage("archive_training_requires_immutable_cas"));
+        }
+        if is_any_v1_cas_location(location) || is_durable_root_location(location) {
             return Err(AppError::BadRequest(
                 "archive CAS objects are immutable".into(),
             ));
         }
-        let location = archive_path(location)?;
-        self.inner
-            .put(&location, PutPayload::from_bytes(data))
-            .await?;
+        let (store, location) = self.resolve(location)?;
+        store.put(&location, PutPayload::from_bytes(data)).await?;
         Ok(())
     }
 
@@ -39,7 +41,14 @@ impl ArchiveStore {
     }
 
     pub async fn delete(&self, location: &str) -> Result<(), AppError> {
-        if is_any_v1_cas_location(location) {
+        if location.starts_with(super::routing::PREFIX)
+            || location.starts_with(super::routing::STAGING_PREFIX)
+        {
+            return Err(AppError::storage(
+                "archive_typed_objects_require_cleanup_capability",
+            ));
+        }
+        if is_any_v1_cas_location(location) || is_durable_root_location(location) {
             return Err(AppError::BadRequest(
                 "archive CAS objects are immutable".into(),
             ));
@@ -66,8 +75,8 @@ impl ArchiveStore {
             }
             return Ok(body.freeze());
         }
-        let path = archive_path(location)?;
-        let metadata = self.inner.head(&path).await?;
+        let (store, path) = self.resolve(location)?;
+        let metadata = store.head(&path).await?;
         if metadata.size > maximum as u64 {
             return Err(AppError::storage("archive_object_exceeds_byte_read_limit"));
         }
@@ -75,7 +84,7 @@ impl ArchiveStore {
         let initial_capacity = usize::try_from(metadata.size)
             .map_err(|_| AppError::storage("archive_object_size_exceeds_this_platform"))?;
         let mut body = BytesMut::with_capacity(initial_capacity);
-        let mut stream = self.inner.get(&path).await?.into_stream();
+        let mut stream = store.get(&path).await?.into_stream();
         while let Some(chunk) = stream.next().await {
             let chunk = chunk?;
             if body.len().saturating_add(chunk.len()) > maximum {
@@ -94,6 +103,7 @@ impl ArchiveStore {
         if location.ends_with(super::compressed::SUFFIX) {
             return self.compressed_size(location).await;
         }
-        Ok(self.inner.head(&archive_path(location)?).await?.size)
+        let (store, path) = self.resolve(location)?;
+        Ok(store.head(&path).await?.size)
     }
 }

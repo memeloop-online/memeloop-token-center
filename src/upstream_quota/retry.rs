@@ -134,6 +134,7 @@ pub(super) struct ReadSession<'a> {
     pub(super) deadline: tokio::time::Instant,
     pub(super) budget: QuotaBudget,
     attempts: StdMutex<Vec<Attempt>>,
+    pub(super) unbounded: bool,
 }
 
 impl<'a> ReadSession<'a> {
@@ -152,7 +153,15 @@ impl<'a> ReadSession<'a> {
             deadline,
             budget,
             attempts: StdMutex::new(Vec::new()),
+            unbounded: false,
         }
+    }
+
+    /// Reset prechecks are cancelled by their caller, without an artificial total deadline.
+    pub(super) fn reset_precheck(state: &'a AppState, budget: QuotaBudget) -> Self {
+        let mut session = Self::new(Some(state), tokio::time::Instant::now(), budget);
+        session.unbounded = true;
+        session
     }
 
     pub(super) fn attempts(&self) -> Vec<Attempt> {
@@ -271,8 +280,8 @@ impl<'a> ReadSession<'a> {
         for attempt in 1..=self.budget.attempt_limit {
             let started = tokio::time::Instant::now();
             self.record(context, attempt, started, None, "started", None);
-            let result = tokio::time::timeout_at(self.deadline, async {
-                if tokio::time::Instant::now() >= self.deadline {
+            let read = async {
+                if !self.unbounded && tokio::time::Instant::now() >= self.deadline {
                     return Err(Failure::terminal("quota_timeout", "deadline"));
                 }
                 if let Some(state) = self.state {
@@ -299,13 +308,18 @@ impl<'a> ReadSession<'a> {
                         }
                     }
                 }
-                if tokio::time::Instant::now() >= self.deadline {
+                if !self.unbounded && tokio::time::Instant::now() >= self.deadline {
                     return Err(Failure::terminal("quota_timeout", "deadline"));
                 }
                 send().await
-            })
-            .await
-            .unwrap_or(Err(Failure::terminal("quota_timeout", "deadline")));
+            };
+            let result = if self.unbounded {
+                read.await
+            } else {
+                tokio::time::timeout_at(self.deadline, read)
+                    .await
+                    .unwrap_or(Err(Failure::terminal("quota_timeout", "deadline")))
+            };
             match result {
                 Ok(value) => {
                     self.record(context, attempt, started, None, "success", None);

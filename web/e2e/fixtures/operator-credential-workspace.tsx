@@ -56,6 +56,8 @@ let serviceEditState = {
 
 const pendingIssues: Array<(response: Response) => void> = [];
 const pendingRouting: Array<(response: Response) => void> = [];
+let clientCredentialValue = 'mtc_client_copied';
+let clientCredentialGeneration = 1;
 const routingResponse = { key_id: 'key-form', route_ids: [], route_group_ids: [], effective_route_ids: [], grant_revision: 1, updated_at: 1 };
 const pendingCredentialScopeA: Array<(response: Response) => void> = [];
 const pendingCredentialCursor: Array<(response: Response) => void> = [];
@@ -228,11 +230,18 @@ globalThis.fetch = async (input: RequestInfo | URL, init?: RequestInit) => {
     status: parameters.has('revoked') ? 'revoked' : parameters.has('suspended') ? 'suspended' : 'active',
     created_at: 1_700_000_000_000,
   }]);
+  if (scenario === 'client-copy' && url.pathname === '/internal/v1/keys/key-copy/routing') return json({ ...routingResponse, key_id: 'key-copy' });
   if (url.pathname === '/internal/v1/keys/key-copy/copy' && method === 'POST') {
-    return json({ key_id: 'key-copy', credential_generation: 1, key: 'mtc_client_copied' });
+    return json({ key_id: 'key-copy', credential_generation: clientCredentialGeneration, key: clientCredentialValue });
   }
   if (url.pathname === '/internal/v1/keys/key-copy/credential' && method === 'PUT') {
     const body = JSON.parse(String(init?.body));
+    if (body.expected_credential_generation !== undefined) {
+      if (body.expected_credential_generation !== clientCredentialGeneration) return json({ error: { message: 'fixture generation conflict' } }, 409);
+      if (body.key !== clientCredentialValue) clientCredentialGeneration += 1;
+      clientCredentialValue = body.key;
+      return json({ key_id: 'key-copy', credential_generation: clientCredentialGeneration, key: clientCredentialValue });
+    }
     return body.key === 'mtc_client_known_original' ? json({}) : json({ error: { message: 'fixture original did not match' } }, 400);
   }
   if (scenario === 'client-lifecycle' && url.pathname === '/internal/v1/keys/delete') {
@@ -331,6 +340,7 @@ globalThis.fetch = async (input: RequestInfo | URL, init?: RequestInit) => {
     const tenant = url.searchParams.get('tenant_external_id');
     if (scenario === 'client-copy') return json([{
       ...credential('Copyable client', 'tenant-a', 'key-copy'),
+      credential_generation: clientCredentialGeneration,
       status: parameters.has('revoked') ? 'revoked' : parameters.has('suspended') ? 'suspended' : 'active',
       policy: { ...credential('unused', 'tenant-a', 'unused').policy, enforcement_mode: 'metered_unlimited' },
       credential_copy_available: !parameters.has('missing-original'),

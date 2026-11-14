@@ -17,6 +17,7 @@ mod group_routing;
 pub mod http_settings;
 #[cfg(not(target_env = "msvc"))]
 mod jemalloc_control;
+mod json_source;
 pub mod metrics;
 pub mod model;
 #[cfg(unix)]
@@ -164,6 +165,9 @@ fn plugin_initialization_error(error: crate::error::AppError) -> InitializationE
 impl AppState {
     pub async fn drain_proxy_tasks(&self) {
         self.proxy_lifecycles.wait_for_idle().await;
+        // Header-only captures may still be waiting for their first body and
+        // writer admission. Let them progress before taking every writer slot.
+        self.persistence.drain().await;
         let _archives = self
             .proxy_archive_stream_permits
             .acquire_many(PROXY_ARCHIVE_STREAM_CONCURRENCY as u32)
@@ -209,7 +213,8 @@ impl AppState {
         let db = Database::connect_with_max(&config.database_url, config.database_max_connections)
             .await
             .map_err(|error| InitializationError::Database(error.into()))?
-            .with_terminal_projection_enabled(config.terminal_projection_enabled);
+            .with_terminal_projection_enabled(config.terminal_projection_enabled)
+            .with_auxiliary_pool_max_connections(config.database_aux_pool_max_connections);
         db.refresh_http_settings()
             .await
             .map_err(InitializationError::Database)?;
@@ -228,9 +233,10 @@ impl AppState {
         let archive = ArchiveStore::from_config(&config)
             .await
             .map_err(|_| InitializationError::Archive)?;
+        let db = db.with_archive(archive.clone());
         responses_request_spool = responses_request_spool.with_archive(archive.clone());
-        let persistence_db = db.independent_persistence_pool();
-        let routing_persistence_db = db.independent_persistence_pool();
+        let persistence_db = db.independent_persistence_pool_for("raw-persistence");
+        let routing_persistence_db = db.independent_persistence_pool_for("routing-persistence");
         let early_requests = early_request::Journal::new(
             std::path::Path::new(&config.responses_request_spool_path)
                 .join("early-terminals")
@@ -239,7 +245,7 @@ impl AppState {
                         .to_hex()
                         .as_str(),
                 ),
-            db.independent_persistence_pool(),
+            db.independent_persistence_pool_for("early-terminals"),
         );
         let pending_terminals = proxy_lifecycle::pending_terminal::Journal::with_archive(
             std::path::Path::new(&config.responses_request_spool_path)
@@ -249,7 +255,7 @@ impl AppState {
                         .to_hex()
                         .as_str(),
                 ),
-            db.independent_persistence_pool(),
+            db.independent_persistence_pool_for("pending-terminals"),
             archive.clone(),
         );
         let plugins = PluginRuntime::load(config.plugin_dir.as_deref(), db.clone())

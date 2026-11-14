@@ -25,8 +25,8 @@ async fn shutdown_drains_abandoned_request_upload_without_leaving_an_orphan() {
     let mut drain = Box::pin(admission.drain_uploads());
     assert!(futures_util::poll!(&mut drain).is_pending());
     drop(spool);
-    // The detached writer still owns metadata and a frame until it settles.
-    assert_eq!(budget.snapshot().0, 3 * REQUEST_SPOOL_CHUNK_BYTES);
+    // The detached writer owns the local file until it settles, not raw bytes.
+    assert_eq!(budget.snapshot().0, 0);
     assert!(futures_util::poll!(&mut drain).is_pending());
     release.send(()).unwrap();
     tokio::time::timeout(std::time::Duration::from_secs(5), drain)

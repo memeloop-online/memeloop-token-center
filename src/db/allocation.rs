@@ -216,6 +216,17 @@ impl Database {
                 .execute(&mut *tx)
                 .await?;
         }
+        let mode_sql = if matches!(self.backend, DatabaseBackend::PostgreSql) {
+            "SELECT mode FROM request_history_state WHERE id=1 FOR SHARE"
+        } else {
+            "SELECT mode FROM request_history_state WHERE id=1"
+        };
+        let mode: String = sqlx::query_scalar(sqlx::AssertSqlSafe(mode_sql))
+            .fetch_one(&mut *tx)
+            .await?;
+        if mode == "clickhouse" {
+            return Ok(());
+        }
         let inserted=sqlx::query("INSERT INTO group_allocation_revisions(tenant_id,revision,refreshed_at) VALUES($1,1,$2) ON CONFLICT(tenant_id) DO NOTHING")
             .bind(tenant.to_string()).bind(now).execute(&mut *tx).await?.rows_affected();
         if inserted == 0 {
