@@ -1,7 +1,8 @@
-//! Disk-backed JSON syntax and span indexing shared by protocol projections.
+//! Incremental JSON syntax and RAM span indexing shared by protocol projections.
 //! Callers retain their own protocol validation and terminal evidence.
 pub(crate) mod index;
 use sha2::{Digest, Sha256};
+#[cfg(test)]
 use std::fs::File;
 use std::io::{BufRead, BufReader, Read, Seek, SeekFrom, Write};
 use std::sync::{
@@ -13,7 +14,7 @@ pub(crate) const CHUNK: usize = 64 * 1024;
 pub(crate) type Result<T> = std::result::Result<T, &'static str>;
 
 /// Select a finite set of protocol fields to keep in memory. Array elements,
-/// raw fields and exact decoded-key equality are indexed on disk.
+/// raw fields and exact decoded-key equality are indexed in RAM.
 pub(crate) trait Projection: Copy {
     fn field(self, key: &str) -> Self;
     fn element(self) -> Self;
@@ -69,8 +70,49 @@ pub(crate) struct DiskNodes {
     pub(crate) count: usize,
 }
 
+pub(crate) trait SourceReader: Read + Seek + Send {}
+impl<T: Read + Seek + Send> SourceReader for T {}
+
+// Used only on the blocking translation worker. BufReader limits each remote
+// range to CHUNK; seeking does not fetch or materialize the body.
+struct CarrierReader {
+    body: Arc<crate::gateway_body::carrier::BodyCarrier>,
+    runtime: tokio::runtime::Handle,
+    offset: u64,
+}
+impl Read for CarrierReader {
+    fn read(&mut self, bytes: &mut [u8]) -> std::io::Result<usize> {
+        let count = self
+            .body
+            .len()
+            .saturating_sub(self.offset)
+            .min(bytes.len() as u64)
+            .min(CHUNK as u64) as usize;
+        if count == 0 {
+            return Ok(0);
+        }
+        self.runtime
+            .block_on(self.body.read_into(self.offset, &mut bytes[..count]))
+            .map_err(|_| std::io::Error::other("compact_carrier_read"))?;
+        self.offset += count as u64;
+        Ok(count)
+    }
+}
+impl Seek for CarrierReader {
+    fn seek(&mut self, position: SeekFrom) -> std::io::Result<u64> {
+        let next = match position {
+            SeekFrom::Start(at) => i128::from(at),
+            SeekFrom::End(delta) => i128::from(self.body.len()) + i128::from(delta),
+            SeekFrom::Current(delta) => i128::from(self.offset) + i128::from(delta),
+        };
+        self.offset =
+            u64::try_from(next).map_err(|_| std::io::Error::other("compact_carrier_seek"))?;
+        Ok(self.offset)
+    }
+}
+
 pub(crate) struct Scanner {
-    pub(crate) reader: BufReader<File>,
+    pub(crate) reader: BufReader<Box<dyn SourceReader>>,
     pub(crate) index: Option<index::Index>,
     pub(crate) position: u64,
     pub(crate) cancelled: Arc<AtomicBool>,
@@ -82,10 +124,30 @@ impl Scanner {
         Self::with_index(file, tempfile::tempfile().unwrap()).unwrap()
     }
 
-    pub(crate) fn with_index(file: File, index_file: File) -> Result<Self> {
+    #[cfg(test)]
+    pub(crate) fn with_index(file: File, _index_file: File) -> Result<Self> {
         Ok(Self {
-            reader: BufReader::with_capacity(CHUNK, file),
-            index: Some(index::Index::new(index_file)?),
+            reader: BufReader::with_capacity(CHUNK, Box::new(file) as Box<dyn SourceReader>),
+            index: Some(index::Index::memory()?),
+            position: 0,
+            cancelled: Arc::new(AtomicBool::new(false)),
+        })
+    }
+
+    pub(crate) fn from_carrier(
+        body: Arc<crate::gateway_body::carrier::BodyCarrier>,
+        runtime: tokio::runtime::Handle,
+    ) -> Result<Self> {
+        Ok(Self {
+            reader: BufReader::with_capacity(
+                CHUNK,
+                Box::new(CarrierReader {
+                    body,
+                    runtime,
+                    offset: 0,
+                }),
+            ),
+            index: Some(index::Index::memory()?),
             position: 0,
             cancelled: Arc::new(AtomicBool::new(false)),
         })

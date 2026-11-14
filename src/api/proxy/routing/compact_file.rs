@@ -1,7 +1,8 @@
-//! File-backed compact translation. Payload strings are never materialized in memory.
+//! Incremental carrier-backed compact translation with a RAM metadata index.
 use crate::json_source::{CHUNK, DiskNodes, Kind, Node, Result, Scanner, Span, index};
+#[cfg(test)]
 use std::fs::File;
-use std::io::{BufWriter, Read, Seek, SeekFrom, Write};
+use std::io::{BufWriter, Cursor, Read, Seek, SeekFrom, Write};
 use std::sync::{
     Arc,
     atomic::{AtomicBool, Ordering},
@@ -346,9 +347,9 @@ impl ValidatedCompact {
     }
 }
 
-pub(super) struct TranslatedCompact {
-    pub(super) file: File,
-    pub(super) pieces: File,
+pub(super) struct TranslatedCompact<T> {
+    pub(super) file: T,
+    pub(super) pieces: Cursor<Vec<u8>>,
     pub(super) physical_body_bytes: u64,
     pub(super) evidence: ValidatedCompact,
 }
@@ -362,11 +363,10 @@ fn response_pieces(
     layout: ResponseLayout,
     sse: bool,
     index: &mut index::Index,
-    mut plan: File,
     cancelled: &AtomicBool,
-) -> Result<(File, u64, u64)> {
+) -> Result<(Cursor<Vec<u8>>, u64, u64)> {
     use CompactPiece::{Bytes, Range};
-    plan.set_len(0).map_err(|_| "compact_file_io")?;
+    let mut plan = Cursor::new(Vec::new());
     plan.seek(SeekFrom::Start(0))
         .map_err(|_| "compact_file_io")?;
     let mut out = BufWriter::with_capacity(CHUNK, &mut plan);
@@ -601,7 +601,7 @@ fn usage_projection(scanner: &mut Scanner, node: &Node) -> Result<serde_json::Va
 
 /// The caller owns temporary-file lifecycle and async I/O. Returns a rewound output file.
 #[cfg(test)]
-fn translate(input: File, output: File, wrap_as_sse: bool) -> Result<TranslatedCompact> {
+fn translate(input: File, output: File, wrap_as_sse: bool) -> Result<TranslatedCompact<File>> {
     translate_cancellable(
         input,
         output,
@@ -611,14 +611,43 @@ fn translate(input: File, output: File, wrap_as_sse: bool) -> Result<TranslatedC
     )
 }
 
-pub(super) fn translate_cancellable(
+#[cfg(test)]
+fn translate_cancellable(
     input: File,
-    mut output: File,
+    output: File,
     index_file: File,
     wrap_as_sse: bool,
     cancelled: Arc<AtomicBool>,
-) -> Result<TranslatedCompact> {
-    let mut scanner = Scanner::with_index(input, index_file)?;
+) -> Result<TranslatedCompact<File>> {
+    translate_scanner(
+        Scanner::with_index(input, index_file)?,
+        output,
+        wrap_as_sse,
+        cancelled,
+    )
+}
+
+pub(super) fn translate_carrier<W: Write + Seek>(
+    input: Arc<crate::gateway_body::carrier::BodyCarrier>,
+    output: W,
+    wrap_as_sse: bool,
+    cancelled: Arc<AtomicBool>,
+    runtime: tokio::runtime::Handle,
+) -> Result<TranslatedCompact<W>> {
+    translate_scanner(
+        Scanner::from_carrier(input, runtime)?,
+        output,
+        wrap_as_sse,
+        cancelled,
+    )
+}
+
+fn translate_scanner<W: Write + Seek>(
+    mut scanner: Scanner,
+    mut output: W,
+    wrap_as_sse: bool,
+    cancelled: Arc<AtomicBool>,
+) -> Result<TranslatedCompact<W>> {
     scanner.index.as_mut().ok_or("compact_file_io")?.cancelled = cancelled.clone();
     scanner.cancelled = cancelled;
     scanner.seek(0)?;
@@ -669,7 +698,6 @@ pub(super) fn translate_cancellable(
     if wrap_as_sse && response_id.is_none() {
         return Err("upstream_invalid_response");
     }
-    output.set_len(0).map_err(|_| "compact_file_io")?;
     output
         .seek(SeekFrom::Start(0))
         .map_err(|_| "compact_file_io")?;
@@ -685,11 +713,9 @@ pub(super) fn translate_cancellable(
     let physical_body_bytes = layout.end;
     let mut index = scanner.index.take().ok_or("compact_file_io")?;
     let cancelled = scanner.cancelled.clone();
-    // Parsing and translation are complete: reuse the consumed input file for
-    // the small delivery plan and release the entire validation index.
-    let plan = scanner.reader.into_inner();
+    // Parsing and translation are complete; retain only the small replay plan.
     let (pieces, body_bytes, first_billable_byte_end) =
-        response_pieces(layout, wrap_as_sse, &mut index, plan, &cancelled)?;
+        response_pieces(layout, wrap_as_sse, &mut index, &cancelled)?;
     Ok(TranslatedCompact {
         file: output,
         pieces,
@@ -745,7 +771,9 @@ mod tests {
         assert_eq!(root.raw_fields.unwrap().count, 1026);
         let mut input = scanner.reader.into_inner();
         input.rewind().unwrap();
-        let translated = translate(input, tempfile::tempfile().unwrap(), false).unwrap();
+        let mut file = tempfile::tempfile().unwrap();
+        std::io::copy(&mut input, &mut file).unwrap();
+        let translated = translate(file, tempfile::tempfile().unwrap(), false).unwrap();
         let mut body = materialize(translated);
         body.rewind().unwrap();
         let actual: Value = serde_json::from_reader(body).unwrap();
@@ -837,7 +865,7 @@ mod tests {
         assert!(scanner.position < (CHUNK * 3) as u64);
     }
 
-    fn materialize(mut translated: TranslatedCompact) -> File {
+    fn materialize(mut translated: TranslatedCompact<File>) -> File {
         let mut output = tempfile::tempfile().unwrap();
         while let Some(piece) = read_piece(&mut translated.pieces).unwrap() {
             match piece {

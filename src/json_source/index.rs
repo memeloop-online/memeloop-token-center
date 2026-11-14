@@ -1,6 +1,6 @@
-//! Process-owned disk index for decoded JSON keys and output spans.
+//! Process-owned RAM index for decoded JSON keys and output spans.
 use super::{Result, Span};
-use std::fs::File;
+use std::io::Cursor;
 use std::io::{Read, Seek, SeekFrom, Write};
 use std::sync::{
     Arc,
@@ -8,15 +8,15 @@ use std::sync::{
 };
 
 pub(crate) struct Index {
-    file: File,
+    file: Cursor<Vec<u8>>,
     end: u64,
     pub(crate) cancelled: Arc<AtomicBool>,
 }
 
 // Zero is the null pointer; records start after a one-byte sentinel.
 impl Index {
-    pub(crate) fn new(mut file: File) -> Result<Self> {
-        file.set_len(0).map_err(|_| "compact_file_io")?;
+    pub(crate) fn memory() -> Result<Self> {
+        let mut file = Cursor::new(Vec::new());
         file.write_all(&[0]).map_err(|_| "compact_file_io")?;
         Ok(Self {
             file,
@@ -251,8 +251,8 @@ mod tests {
     use sha2::{Digest, Sha256};
 
     #[test]
-    fn disk_radix_preserves_all_keys_and_exact_digest_collision_comparison() {
-        let mut index = Index::new(tempfile::tempfile().unwrap()).unwrap();
+    fn ram_radix_preserves_all_keys_and_exact_digest_collision_comparison() {
+        let mut index = Index::memory().unwrap();
         let mut root = 0;
         for number in 0..2048u32 {
             let key = number.to_le_bytes();
