@@ -538,8 +538,7 @@ async fn translate_compact_carrier(
     let key = compact_staging(request_id)?;
     let scope = match scratch_database {
         Some(database) => {
-            crate::archive::scratch_scope::ScratchScope::begin(scratch_archive, database, key)
-                .await
+            crate::archive::scratch_scope::ScratchScope::new(scratch_archive, database, key)
                 .map_err(|_| ProxySendError::AmbiguousResponse("upstream_invalid_response"))?
         }
         #[cfg(test)]
@@ -561,6 +560,7 @@ async fn translate_compact_carrier(
         runtime.clone(),
         cancelled.clone(),
         wake.clone(),
+        input.clone(),
     )
     .map_err(|_| ProxySendError::AmbiguousResponse("upstream_invalid_response"))?;
     let worker = tokio::task::spawn_blocking(move || {
@@ -586,10 +586,6 @@ async fn translate_compact_carrier(
     let output =
         output.map_err(|_| ProxySendError::AmbiguousResponse("upstream_invalid_response"))?;
     // Stages never compete while retaining an unfinished sibling carrier.
-    output
-        .seal_to_objects()
-        .await
-        .map_err(|_| ProxySendError::AmbiguousResponse("upstream_invalid_response"))?;
     let plan_capture = CarrierCapture::derived_from(&output, compact_staging(request_id)?);
     let cancelled = cancellation.0.clone();
     let worker = tokio::task::spawn_blocking(move || {
@@ -611,10 +607,6 @@ async fn translate_compact_carrier(
         .map_err(|_| ProxySendError::AmbiguousResponse("upstream_invalid_response"))?;
     let pieces =
         pieces.map_err(|_| ProxySendError::AmbiguousResponse("upstream_invalid_response"))?;
-    pieces
-        .seal_to_objects()
-        .await
-        .map_err(|_| ProxySendError::AmbiguousResponse("upstream_invalid_response"))?;
     let content_type = if wrap_as_sse {
         HeaderValue::from_static("text/event-stream")
     } else {
@@ -696,8 +688,8 @@ fn compact_carrier_stream(
                 if let Some(range) = active.as_mut() {
                     let count =
                         (range.end - range.start).min(crate::json_source::CHUNK as u64) as usize;
-                    let bytes = output
-                        .read_leased_chunk(range.start, count)
+                    let bytes = pieces
+                        .read_leased_source_chunk(&output, range.start, count)
                         .await
                         .map_err(|_| "upstream_invalid_response")?;
                     range.start += count as u64;
@@ -948,6 +940,67 @@ mod tests {
     use super::*;
     use serde_json::json;
     use std::time::Duration;
+
+    #[tokio::test]
+    async fn compact_ram_metadata_growth_ignores_unavailable_database_and_object_store() {
+        use crate::gateway_body::memory::ProxyMemoryBudget;
+        let database = crate::db::Database::connect("sqlite::memory:")
+            .await
+            .unwrap();
+        database.close().await;
+        let (archive, store) =
+            crate::archive::ArchiveStore::memory_for_test().with_read_delay_for_test();
+        store.config_mut(|config| {
+            config.wait_get_per_call = Duration::from_secs(60);
+            config.wait_put_per_call = Duration::from_secs(60);
+        });
+        let memory = std::sync::Arc::new(ProxyMemoryBudget::new(4 * 1024 * 1024));
+        let unknown_key = "unknown".repeat(20_000);
+        let mut fixture =
+            json!({"id":"ram-only","output":[{"type":"compaction","encrypted_content":"opaque"}]});
+        fixture
+            .as_object_mut()
+            .unwrap()
+            .insert(unknown_key.clone(), json!("preserved"));
+        let response: reqwest::Response = http::Response::builder()
+            .status(200)
+            .body(reqwest::Body::from(serde_json::to_vec(&fixture).unwrap()))
+            .unwrap()
+            .into();
+        let request_id = Uuid::new_v4();
+        let translated = tokio::time::timeout(
+            Duration::from_secs(2),
+            translate_compact_carrier(
+                response.into(),
+                false,
+                request_id,
+                archive.clone(),
+                Some(database),
+                CarrierCapture::new(
+                    memory.clone(),
+                    Some(archive),
+                    compact_staging(request_id).unwrap(),
+                ),
+            ),
+        )
+        .await
+        .expect("RAM-only compact must not wait for PostgreSQL or S3")
+        .unwrap();
+        let mut stream = translated.bytes_stream();
+        let mut bytes = Vec::new();
+        tokio::time::timeout(Duration::from_secs(2), async {
+            while let Some(chunk) = stream.next().await {
+                bytes.extend_from_slice(&chunk.unwrap());
+            }
+        })
+        .await
+        .expect("RAM replay must not force object publication");
+        let value: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(value[&unknown_key], "preserved");
+        assert_eq!(value["output"][0]["encrypted_content"], "opaque");
+        drop(stream);
+        assert_eq!(memory.snapshot().0, 0);
+    }
 
     #[test]
     fn transport_timeout_evidence_distinguishes_local_deadline_from_io_without_error_text() {

@@ -17,68 +17,93 @@ pub(crate) struct ScratchScope {
     lease: Arc<tokio::sync::Mutex<Option<ArchiveStagingWriteLease>>>,
     fenced: Arc<AtomicBool>,
     uncertain: AtomicBool,
-    heartbeat: Option<tokio::task::JoinHandle<()>>,
+    heartbeat: std::sync::Mutex<Option<tokio::task::JoinHandle<()>>>,
+    begin_input: Option<BeginArchiveStagingInput>,
 }
 impl ScratchScope {
-    pub(crate) async fn begin(
+    pub(crate) fn new(
         archive: ArchiveStore,
         database: Database,
         key: ArchiveStagingKey,
     ) -> Result<Self, AppError> {
         let key = archive.select_staging_key(key)?;
-        let lease = match database
-            .begin_archive_staging_attempt(BeginArchiveStagingInput {
-                key,
-                intent_digest: ArchiveStagingIntentDigest::new(
-                    blake3::hash(b"compact-scratch-pages-v1")
-                        .to_hex()
-                        .to_string(),
-                )?,
-                lease_token: uuid::Uuid::new_v4(),
-                lease_owner: ArchiveStagingLeaseOwner::new(format!("compact:{}", key.attempt_id))?,
-            })
-            .await?
-        {
-            BeginArchiveStagingResult::Created(lease)
-            | BeginArchiveStagingResult::Replayed(lease) => lease,
-            BeginArchiveStagingResult::Existing(_) => {
-                return Err(AppError::storage("compact_scratch_owner_conflict"));
-            }
+        let begin_input = BeginArchiveStagingInput {
+            key,
+            intent_digest: ArchiveStagingIntentDigest::new(
+                blake3::hash(b"compact-scratch-pages-v1")
+                    .to_hex()
+                    .to_string(),
+            )?,
+            lease_token: uuid::Uuid::new_v4(),
+            lease_owner: ArchiveStagingLeaseOwner::new(format!("compact:{}", key.attempt_id))?,
         };
-        let key = lease.key;
-        let lease = Arc::new(tokio::sync::Mutex::new(Some(lease)));
-        let fenced = Arc::new(AtomicBool::new(false));
-        let heartbeat_lease = lease.clone();
-        let heartbeat_fenced = fenced.clone();
-        let db = database.clone();
-        let heartbeat = tokio::spawn(async move {
+        Ok(Self {
+            archive,
+            key,
+            database: Some(database),
+            lease: Arc::new(tokio::sync::Mutex::new(None)),
+            fenced: Arc::new(AtomicBool::new(false)),
+            uncertain: AtomicBool::new(false),
+            heartbeat: std::sync::Mutex::new(None),
+            begin_input: Some(begin_input),
+        })
+    }
+
+    async fn ensure_owner(&self) -> Result<(), AppError> {
+        let Some(database) = &self.database else {
+            return Ok(());
+        };
+        let mut guard = self.lease.lock().await;
+        if guard.is_some() {
+            return self.check();
+        }
+        // The bounded dirty page remains resident and charged while durable
+        // ownership is unavailable. Exact retries retain the original token.
+        loop {
+            match database
+                .begin_archive_staging_attempt(self.begin_input.as_ref().unwrap().clone())
+                .await
+            {
+                Ok(
+                    BeginArchiveStagingResult::Created(lease)
+                    | BeginArchiveStagingResult::Replayed(lease),
+                ) => {
+                    *guard = Some(lease);
+                    break;
+                }
+                _ => tokio::time::sleep(std::time::Duration::from_millis(250)).await,
+            }
+        }
+        let lease = self.lease.clone();
+        let fenced = self.fenced.clone();
+        let database = database.clone();
+        let task = tokio::spawn(async move {
             loop {
                 tokio::time::sleep(std::time::Duration::from_millis(
                     ARCHIVE_STAGING_WRITE_HEARTBEAT_MILLIS as u64,
                 ))
                 .await;
-                let mut guard = heartbeat_lease.lock().await;
-                let Some(lease) = guard.as_mut() else {
-                    return;
-                };
-                match db.heartbeat_archive_staging_write(lease).await {
-                    Ok(true) => {}
-                    _ => {
-                        heartbeat_fenced.store(true, Ordering::Release);
+                loop {
+                    let mut guard = lease.lock().await;
+                    let Some(lease) = guard.as_mut() else {
                         return;
+                    };
+                    match database.heartbeat_archive_staging_write(lease).await {
+                        Ok(true) => break,
+                        Ok(false) => {
+                            fenced.store(true, Ordering::Release);
+                            return;
+                        }
+                        Err(_) => {
+                            drop(guard);
+                            tokio::time::sleep(std::time::Duration::from_millis(250)).await;
+                        }
                     }
                 }
             }
         });
-        Ok(Self {
-            archive,
-            key,
-            database: Some(database),
-            lease,
-            fenced,
-            uncertain: AtomicBool::new(false),
-            heartbeat: Some(heartbeat),
-        })
+        *self.heartbeat.lock().unwrap() = Some(task);
+        Ok(())
     }
 
     #[cfg(test)]
@@ -90,7 +115,8 @@ impl ScratchScope {
             lease: Arc::new(tokio::sync::Mutex::new(None)),
             fenced: Arc::new(AtomicBool::new(false)),
             uncertain: AtomicBool::new(false),
-            heartbeat: None,
+            heartbeat: std::sync::Mutex::new(None),
+            begin_input: None,
         }
     }
 
@@ -128,6 +154,7 @@ impl ScratchScope {
         self.check()
     }
     pub(crate) async fn write_page(&self, page: u64, bytes: &[u8]) -> Result<(), AppError> {
+        self.ensure_owner().await?;
         self.check()?;
         if self.uncertain.load(Ordering::Acquire) {
             return Err(AppError::storage("compact_scratch_unknown_write"));
@@ -172,7 +199,7 @@ impl ScratchScope {
 }
 impl Drop for ScratchScope {
     fn drop(&mut self) {
-        if let Some(task) = self.heartbeat.take() {
+        if let Some(task) = self.heartbeat.get_mut().unwrap().take() {
             task.abort();
         }
         if self.uncertain.load(Ordering::Acquire) {

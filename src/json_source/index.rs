@@ -39,6 +39,7 @@ impl Index {
         runtime: tokio::runtime::Handle,
         cancelled: Arc<AtomicBool>,
         wake: Arc<tokio::sync::Notify>,
+        source: Arc<crate::gateway_body::carrier::BodyCarrier>,
     ) -> Result<Self> {
         let backend = ScratchBackend {
             scope,
@@ -46,6 +47,7 @@ impl Index {
             cancelled,
             wake,
             _lease: lease,
+            source,
         };
         Self::new(Box::new(super::pager::Pager::new(Box::new(backend))))
     }
@@ -264,6 +266,7 @@ impl Index {
 }
 
 struct ScratchBackend {
+    source: Arc<crate::gateway_body::carrier::BodyCarrier>,
     scope: crate::archive::scratch_scope::ScratchScope,
     runtime: tokio::runtime::Handle,
     cancelled: Arc<AtomicBool>,
@@ -291,6 +294,10 @@ impl ScratchBackend {
     }
 }
 impl super::pager::PageBackend for ScratchBackend {
+    fn try_reserve_page(&self) -> Option<tokio::sync::OwnedSemaphorePermit> {
+        self.source
+            .try_reserve_metadata_workspace(super::pager::ADDITIONAL_PAGE_BYTES)
+    }
     fn read_page(&mut self, number: u64, bytes: &mut [u8]) -> std::io::Result<()> {
         self.run(self.scope.read_page(number, bytes))
     }
@@ -322,7 +329,7 @@ mod tests {
             },
         };
         let archive = ArchiveStore::memory_for_test();
-        let memory = Arc::new(ProxyMemoryBudget::new(128 * 1024));
+        let memory = Arc::new(ProxyMemoryBudget::new(64 * 1024));
         let id = uuid::Uuid::new_v4();
         let key = ArchiveStagingKey::new(
             ArchiveStagingOwner::ProxyRequest(id),
@@ -349,6 +356,7 @@ mod tests {
                 runtime,
                 Arc::new(AtomicBool::new(false)),
                 Arc::new(tokio::sync::Notify::new()),
+                source,
             )
             .unwrap();
             let mut root = 0;

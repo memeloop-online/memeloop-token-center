@@ -1,14 +1,21 @@
-//! Fixed resident scratch pages. The backend owns the prepaid workspace and
-//! typed scratch scope; no page directory or payload grows in this cache.
+//! Charged resident scratch pages. Extra RAM pages and their directory capacity
+//! acquire global credit before allocation; only actual pressure spills pages.
+use std::collections::HashMap;
 use std::io::{self, Read, Seek, SeekFrom, Write};
 
 pub(crate) const PAGE_BYTES: usize = 16 * 1024;
 const RESIDENT_PAGES: usize = 2;
 // Two resident pages and one read/write publication workspace. Metadata fits
 // inside the remaining budget unit rather than borrowing provider body credit.
+// Includes worst-case simultaneous old/new Vec and HashMap capacity during
+// growth, per-entry metadata and the page itself. Semaphore units round up.
+pub(crate) const ADDITIONAL_PAGE_BYTES: usize = PAGE_BYTES + 4096;
 pub(crate) const WORKSPACE_BYTES: usize = PAGE_BYTES * (RESIDENT_PAGES + 2);
 
 pub(crate) trait PageBackend: Send {
+    fn try_reserve_page(&self) -> Option<tokio::sync::OwnedSemaphorePermit> {
+        None
+    }
     fn read_page(&mut self, number: u64, bytes: &mut [u8]) -> io::Result<()>;
     fn write_page(&mut self, number: u64, bytes: &[u8]) -> io::Result<()>;
 }
@@ -18,10 +25,12 @@ struct Frame {
     bytes: Vec<u8>,
     dirty: bool,
     used: u64,
+    _lease: Option<tokio::sync::OwnedSemaphorePermit>,
 }
 
 pub(crate) struct Pager {
-    frames: [Frame; RESIDENT_PAGES],
+    slots: HashMap<u64, usize>,
+    frames: Vec<Frame>,
     position: u64,
     length: u64,
     published_pages: u64,
@@ -35,12 +44,16 @@ impl Pager {
     pub(crate) fn new(backend: Box<dyn PageBackend>) -> Self {
         Self {
             backend,
-            frames: std::array::from_fn(|_| Frame {
-                number: None,
-                bytes: vec![0; PAGE_BYTES],
-                dirty: false,
-                used: 0,
-            }),
+            frames: (0..RESIDENT_PAGES)
+                .map(|_| Frame {
+                    number: None,
+                    bytes: vec![0; PAGE_BYTES],
+                    dirty: false,
+                    used: 0,
+                    _lease: None,
+                })
+                .collect(),
+            slots: HashMap::new(),
             position: 0,
             length: 0,
             published_pages: 0,
@@ -50,13 +63,20 @@ impl Pager {
 
     fn frame(&mut self, number: u64) -> io::Result<usize> {
         self.clock = self.clock.saturating_add(1);
-        if let Some(index) = self
-            .frames
-            .iter()
-            .position(|frame| frame.number == Some(number))
-        {
+        if let Some(&index) = self.slots.get(&number) {
             self.frames[index].used = self.clock;
             return Ok(index);
+        }
+        if self.frames.iter().all(|frame| frame.number.is_some()) {
+            if let Some(lease) = self.backend.try_reserve_page() {
+                self.frames.push(Frame {
+                    number: None,
+                    bytes: vec![0; PAGE_BYTES],
+                    dirty: false,
+                    used: 0,
+                    _lease: Some(lease),
+                });
+            }
         }
         let index = self
             .frames
@@ -79,13 +99,16 @@ impl Pager {
             self.published_pages = self.published_pages.max(frame.number.unwrap() + 1);
             frame.dirty = false;
         }
-        frame.number = None;
+        if let Some(old) = frame.number.take() {
+            self.slots.remove(&old);
+        }
         if number < self.published_pages {
             self.backend.read_page(number, &mut frame.bytes)?;
         } else {
             frame.bytes.fill(0);
         }
         frame.number = Some(number);
+        self.slots.insert(number, index);
         frame.used = self.clock;
         Ok(index)
     }
