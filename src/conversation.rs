@@ -1187,6 +1187,9 @@ fn push_owned_content_part(
         }
         return;
     }
+    if push_reasoning_part(parts, &item) {
+        return;
+    }
     if part_is_private_only(&item) {
         return;
     }
@@ -1415,6 +1418,9 @@ fn push_content_part(
         }
         _ => {}
     }
+    if push_reasoning_part(parts, &cleaned) {
+        return;
+    }
     if part_is_private_only(&cleaned) {
         return;
     }
@@ -1455,6 +1461,42 @@ fn push_content_part(
         tool_call_id,
         ..empty_part()
     });
+}
+
+fn push_reasoning_part(parts: &mut Vec<SessionBodyPart>, value: &Value) -> bool {
+    if !matches!(
+        value.get("type").and_then(Value::as_str),
+        Some("reasoning" | "thinking")
+    ) {
+        return false;
+    }
+    let mut texts = Vec::new();
+    for key in ["text", "thinking", "content", "summary"] {
+        match value.get(key) {
+            Some(Value::String(text)) if !text.is_empty() => texts.push(text.clone()),
+            Some(Value::Array(items)) => {
+                for item in items {
+                    if let Some(text) = item
+                        .get("text")
+                        .and_then(Value::as_str)
+                        .filter(|text| !text.is_empty())
+                    {
+                        texts.push(text.to_owned());
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+    for text in texts {
+        parts.push(SessionBodyPart {
+            part_index: parts.len() as u32,
+            kind: "reasoning".into(),
+            text: Some(text),
+            ..empty_part()
+        });
+    }
+    true
 }
 
 fn part_is_private_only(value: &Value) -> bool {
@@ -1665,26 +1707,20 @@ fn part_value(part: &SessionBodyPart, text: Option<String>) -> Value {
     Value::Object(map)
 }
 
-fn strip_private_provider_fields(value: Value) -> Value {
-    match value {
-        Value::Array(items) => Value::Array(
-            items
-                .into_iter()
-                .map(strip_private_provider_fields)
-                .collect(),
-        ),
-        Value::Object(map) => {
-            let mut cleaned = Map::new();
-            for (key, child) in map {
-                if PRIVATE_PROVIDER_KEYS.contains(&key.as_str()) {
-                    continue;
-                }
-                cleaned.insert(key, strip_private_provider_fields(child));
+fn strip_private_provider_fields(mut value: Value) -> Value {
+    // Provider-owned opaque fields are removed only from their protocol item.
+    // Tool arguments/results and user objects may legally use the same names.
+    if matches!(
+        value.get("type").and_then(Value::as_str),
+        Some("reasoning" | "compaction")
+    ) {
+        if let Some(map) = value.as_object_mut() {
+            for key in PRIVATE_PROVIDER_KEYS {
+                map.remove(*key);
             }
-            Value::Object(cleaned)
         }
-        other => other,
     }
+    value
 }
 
 #[cfg(test)]
