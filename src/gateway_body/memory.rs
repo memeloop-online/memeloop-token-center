@@ -671,6 +671,28 @@ impl ProxyMemoryReservation {
         self.release(self.json_reserved_bytes.swap(0, Ordering::AcqRel), 1);
     }
 
+    /// Called only after the parsed Value has been dropped. Transfer the
+    /// remaining prepaid JSON envelope into independently owned encoded bytes.
+    /// The caller subsequently uses release_unretained_json, never the legacy
+    /// length-based release path (which assumes no envelope transfer).
+    pub(crate) fn take_normalized_envelope(
+        &self,
+        encoded_len: usize,
+    ) -> Option<OwnedSemaphorePermit> {
+        let mut held = self.held.lock().ok()?;
+        let reserved = self.json_reserved_bytes.load(Ordering::Acquire);
+        let units = encoded_len.div_ceil(UNIT_BYTES);
+        if reserved == 0 || units > reserved / UNIT_BYTES {
+            return None;
+        }
+        let lease = held.1.as_mut()?.split(units)?;
+        let transferred = units * UNIT_BYTES;
+        held.0 = held.0.checked_sub(transferred)?;
+        self.json_reserved_bytes
+            .store(reserved - transferred, Ordering::Release);
+        Some(lease)
+    }
+
     pub(crate) fn request_json_reserved_bytes(&self) -> usize {
         self.json_reserved_bytes.load(Ordering::Acquire)
     }
