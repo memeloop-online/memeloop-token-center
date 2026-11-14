@@ -625,6 +625,30 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn adopted_normalized_bytes_keep_transferred_credit_until_last_reader() {
+        let memory = Arc::new(ProxyMemoryBudget::new(1024 * 1024));
+        let previous = memory.reservation();
+        let encoded = br#"{"input":"normalized"}"#.to_vec();
+        assert!(previous.try_reserve_json_shape(encoded.capacity(), 8));
+        let source = BodyCarrier::adopt_normalized(
+            encoded,
+            &previous,
+            CarrierCapture::new(memory.clone(), None, key()),
+        )
+        .unwrap();
+        previous.release_unretained_json();
+        let mut reader = source.open_stream();
+        drop(source);
+        let bytes = reader.next().await.unwrap().unwrap();
+        drop(reader);
+        assert!(memory.snapshot().0 > 0);
+        assert_eq!(bytes.as_ref(), br#"{"input":"normalized"}"#);
+        drop(bytes);
+        drop(previous);
+        assert_eq!(memory.snapshot().0, 0);
+    }
+
+    #[tokio::test]
     async fn range_slice_and_stream_keep_real_allocation_after_source_drop() {
         let memory = Arc::new(ProxyMemoryBudget::new(1024 * 1024));
         let source = BodyCarrier::capture(
