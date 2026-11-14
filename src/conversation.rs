@@ -626,6 +626,11 @@ impl ReturnDocumentAccumulator {
                         chat_message.insert("role".into(), role.clone());
                     }
                     append_stream_string(chat_message, "content", delta.get("content"));
+                    append_stream_string(
+                        chat_message,
+                        "reasoning_content",
+                        delta.get("reasoning_content"),
+                    );
                     if let Some(calls) = delta.get("tool_calls").and_then(Value::as_array) {
                         for call in calls {
                             let Some(index) = call.get("index").and_then(Value::as_u64) else {
@@ -1104,6 +1109,23 @@ fn turn_from_owned_entry(mut entry: Value, origin: &str) -> SessionBodyTurn {
     } else {
         turn_from_owned_content(role, origin, content, call_id, tool_call_id)
     };
+    if let Some(text) = entry
+        .get("reasoning_content")
+        .and_then(Value::as_str)
+        .filter(|text| !text.is_empty())
+    {
+        turn.parts.insert(
+            0,
+            SessionBodyPart {
+                kind: "reasoning".into(),
+                text: Some(text.to_owned()),
+                ..empty_part()
+            },
+        );
+        for (index, part) in turn.parts.iter_mut().enumerate() {
+            part.part_index = index as u32;
+        }
+    }
     if let Some(calls) = entry.get("tool_calls").and_then(Value::as_array) {
         for call in calls {
             turn.parts
@@ -1262,6 +1284,23 @@ fn turn_from_entry(entry: &Value, origin: &str) -> SessionBodyTurn {
     } else {
         turn_from_content(role, origin, &content, call_id, tool_call_id)
     };
+    if let Some(text) = entry
+        .get("reasoning_content")
+        .and_then(Value::as_str)
+        .filter(|text| !text.is_empty())
+    {
+        turn.parts.insert(
+            0,
+            SessionBodyPart {
+                kind: "reasoning".into(),
+                text: Some(text.to_owned()),
+                ..empty_part()
+            },
+        );
+        for (index, part) in turn.parts.iter_mut().enumerate() {
+            part.part_index = index as u32;
+        }
+    }
     if let Some(calls) = entry.get("tool_calls").and_then(Value::as_array) {
         for call in calls {
             let index = turn.parts.len() as u32;
