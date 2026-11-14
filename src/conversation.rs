@@ -488,6 +488,14 @@ pub struct SessionBodyPart {
     pub call_id: Option<String>,
     pub tool_call_id: Option<String>,
     pub media_bytes: Option<Vec<u8>>,
+    pub reasoning_source: Option<String>,
+    pub tool_name: Option<String>,
+    pub arguments: Option<Value>,
+    pub arguments_text: Option<String>,
+    pub arguments_encoding: Option<String>,
+    pub completeness: Option<String>,
+    pub result_content: Option<Value>,
+    pub result_status: Option<String>,
 }
 
 /// 一轮对话。同一个用户回合里的多个片段按 `part_index` 排在一起。
@@ -1177,6 +1185,15 @@ fn push_owned_content_part(
             parts.push(SessionBodyPart {
                 part_index: parts.len() as u32,
                 kind: "tool_result".into(),
+                result_content: item.get("content").cloned(),
+                result_status: Some(
+                    if item.get("is_error").and_then(Value::as_bool) == Some(true) {
+                        "error"
+                    } else {
+                        "observed"
+                    }
+                    .into(),
+                ),
                 text: item.get("content").map(value_text),
                 tool_call_id: item
                     .get("tool_use_id")
@@ -1270,6 +1287,11 @@ fn turn_from_entry(entry: &Value, origin: &str) -> SessionBodyTurn {
             parts: vec![SessionBodyPart {
                 part_index: 0,
                 kind: "tool_result".into(),
+                result_content: entry
+                    .get("output")
+                    .or_else(|| entry.get("content"))
+                    .cloned(),
+                result_status: Some("observed".into()),
                 text,
                 call_id,
                 tool_call_id,
@@ -1342,6 +1364,23 @@ fn tool_call_part(part_index: u32, call: &Value) -> SessionBodyPart {
         part_index,
         kind: "tool_call".into(),
         text: Some(format!("{name}\n{arguments}")),
+        tool_name: Some(name.to_owned()),
+        arguments: serde_json::from_str(&arguments).ok(),
+        arguments_text: Some(arguments.clone()),
+        arguments_encoding: Some(
+            if serde_json::from_str::<Value>(&arguments).is_ok() {
+                "json"
+            } else {
+                "text"
+            }
+            .into(),
+        ),
+        completeness: Some(
+            call.get("status")
+                .and_then(Value::as_str)
+                .unwrap_or("observed")
+                .to_owned(),
+        ),
         call_id,
         ..empty_part()
     }
@@ -1407,6 +1446,15 @@ fn push_content_part(
             parts.push(SessionBodyPart {
                 part_index: parts.len() as u32,
                 kind: "tool_result".into(),
+                result_content: cleaned.get("content").cloned(),
+                result_status: Some(
+                    if cleaned.get("is_error").and_then(Value::as_bool) == Some(true) {
+                        "error"
+                    } else {
+                        "observed"
+                    }
+                    .into(),
+                ),
                 text: cleaned.get("content").map(value_text),
                 tool_call_id: cleaned
                     .get("tool_use_id")
@@ -1623,6 +1671,14 @@ fn empty_part() -> SessionBodyPart {
         call_id: None,
         tool_call_id: None,
         media_bytes: None,
+        reasoning_source: None,
+        tool_name: None,
+        arguments: None,
+        arguments_text: None,
+        arguments_encoding: None,
+        completeness: None,
+        result_content: None,
+        result_status: None,
     }
 }
 
@@ -1703,6 +1759,30 @@ fn part_value(part: &SessionBodyPart, text: Option<String>) -> Value {
     }
     if let Some(tool_call_id) = &part.tool_call_id {
         map.insert("tool_call_id".into(), Value::String(tool_call_id.clone()));
+    }
+    if let Some(value) = &part.reasoning_source {
+        map.insert("reasoning_source".into(), Value::String(value.clone()));
+    }
+    if let Some(value) = &part.tool_name {
+        map.insert("tool_name".into(), Value::String(value.clone()));
+    }
+    if let Some(value) = &part.arguments {
+        map.insert("arguments".into(), value.clone());
+    }
+    if let Some(value) = &part.arguments_text {
+        map.insert("arguments_text".into(), Value::String(value.clone()));
+    }
+    if let Some(value) = &part.arguments_encoding {
+        map.insert("arguments_encoding".into(), Value::String(value.clone()));
+    }
+    if let Some(value) = &part.completeness {
+        map.insert("completeness".into(), Value::String(value.clone()));
+    }
+    if let Some(value) = &part.result_content {
+        map.insert("result_content".into(), value.clone());
+    }
+    if let Some(value) = &part.result_status {
+        map.insert("result_status".into(), Value::String(value.clone()));
     }
     Value::Object(map)
 }
