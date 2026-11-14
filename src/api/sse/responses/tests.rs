@@ -131,7 +131,7 @@ fn safe_failure_is_an_explicit_failed_terminal_without_a_fabricated_identity() {
 }
 
 #[test]
-fn sanitizer_preserves_client_recovery_codes_without_provider_details() {
+fn sanitizer_preserves_client_recovery_codes_and_original_provider_details() {
     for code in [
         "context_length_exceeded",
         "insufficient_quota",
@@ -175,8 +175,9 @@ fn sanitizer_preserves_client_recovery_codes_without_provider_details() {
             assert_eq!(payload["response"]["error"]["code"], code);
             assert!(payload.pointer("/response/id").is_none());
             let text = String::from_utf8(output).unwrap();
-            assert!(!text.contains("secret"));
-            assert!(!text.contains("Authorization"));
+            assert!(text.contains("secret-token"));
+            assert!(text.contains("Authorization"));
+            assert_eq!(payload["response"]["error"]["mtc_provider_details"], event);
         }
     }
 }

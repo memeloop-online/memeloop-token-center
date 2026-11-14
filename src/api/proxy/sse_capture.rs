@@ -362,10 +362,16 @@ impl ResponsesSseCapture {
     }
 
     fn delivery_event_bytes(&self, event: &crate::api::sse::BoundedSseEvent) -> Bytes {
-        if let Ok((_, Some(data))) = crate::api::sse::parse_sse_event(event)
+        if let Ok((name, Some(data))) = crate::api::sse::parse_sse_event(event)
             && let Some((_, body)) = Self::safe_supplier_failure(&data)
         {
-            return Bytes::from(format!("data: {}\n\n", String::from_utf8_lossy(&body)));
+            let prefix = name
+                .filter(|_| Self::strict_chat_safe_event_name(event).is_some())
+                .map_or_else(String::new, |name| format!("event: {name}\n"));
+            return Bytes::from(format!(
+                "{prefix}data: {}\n\n",
+                String::from_utf8_lossy(&body)
+            ));
         }
         let metadata_policy = if Self::event_name_matches_payload(event)
             || (self.chat_usage.is_some() && Self::strict_chat_safe_event_name(event).is_some())

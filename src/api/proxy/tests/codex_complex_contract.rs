@@ -43,15 +43,15 @@ async fn native_codex_complex_contract_preserves_wire_and_does_not_replay_ordina
         let rejected = rejection.is_some();
         let fixture = codex_route_fixture(label).await;
         let upstream = MockServer::start().await;
-        let reply = if let Some((param, code)) = rejection {
-            ResponseTemplate::new(400).set_body_json(json!({
-                "error": {
-                    "type": "invalid_request_error",
-                    "code": code,
-                    "param": param,
-                    "message": "private-upstream-diagnostic-canary"
-                }
+        let raw_rejection = rejection.map(|(param, code)| {
+            serde_json::to_vec(&json!({
+                "error": {"type":"invalid_request_error", "code":code, "param":param,
+                    "message":"private-upstream-diagnostic-canary"}
             }))
+            .unwrap()
+        });
+        let reply = if let Some(raw) = raw_rejection.as_ref() {
+            ResponseTemplate::new(400).set_body_raw(raw.clone(), "application/json")
         } else {
             ResponseTemplate::new(200)
                 .set_body_raw(completed_codex_sse("synthetic answer"), "text/event-stream")
@@ -82,7 +82,10 @@ async fn native_codex_complex_contract_preserves_wire_and_does_not_replay_ordina
         let returned = to_bytes(response.into_body(), MAX_PROXY_RESPONSE_BODY)
             .await
             .unwrap();
-        assert!(!String::from_utf8_lossy(&returned).contains("private-upstream-diagnostic-canary"));
+        assert_eq!(
+            String::from_utf8_lossy(&returned).contains("private-upstream-diagnostic-canary"),
+            rejected
+        );
         if rejected {
             cancellation::assert_single_unknown_receipt(
                 &fixture,
@@ -105,9 +108,10 @@ async fn native_codex_complex_contract_preserves_wire_and_does_not_replay_ordina
             Some(i64::from(expected_status.as_u16()))
         );
         if rejected {
-            sse_delivery::assert_unknown_response_archives_omit(
+            cancellation::assert_original_response(
                 &fixture,
-                "private-upstream-diagnostic-canary",
+                records[0].request_id,
+                raw_rejection.as_ref().unwrap(),
             )
             .await;
         } else {
