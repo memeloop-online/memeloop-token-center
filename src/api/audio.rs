@@ -290,7 +290,10 @@ pub(super) async fn create_audio_transcription(
                     MediaAttemptTerminal::Inconclusive
                 };
                 attempt.complete(terminal).await;
-                drop(upstream);
+                let rejection = crate::api::proxy::upstream_error::read_rejection(upstream).await;
+                let error_code = rejection
+                    .reason()
+                    .map_or("audio_upstream_rejected", |reason| reason.code());
                 finish_audio_failure(
                     &state,
                     &reservation,
@@ -298,13 +301,15 @@ pub(super) async fn create_audio_transcription(
                     key.tenant_id,
                     audio,
                     started,
-                    "audio_upstream_rejected",
+                    error_code,
                 )
                 .await?;
-                return Err(AppError::upstream_with(
-                    "upstream_unavailable",
-                    crate::error::ErrorFacts::new().stage("audio_upstream"),
-                ));
+                return Response::builder()
+                    .status(StatusCode::BAD_GATEWAY)
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .header(REQUEST_ID_HEADER, request_id.to_string())
+                    .body(Body::from(rejection.body))
+                    .map_err(|_| AppError::internal("audio_rejection_response"));
             }
             let upstream_body = match read_audio_response_bounded(upstream).await {
                 Ok(body) => body,

@@ -52,7 +52,7 @@ pub(crate) mod session_preferences;
 mod sse_capture;
 mod streaming;
 mod transport_protocol;
-mod upstream_error;
+pub(super) mod upstream_error;
 pub(in crate::api) mod upstream_response;
 
 #[cfg(test)]
@@ -108,7 +108,9 @@ async fn read_safe_proxy_rejection(
     if !upstream.status().is_success()
         && !protocol.is_anthropic()
         && !responses_anthropic_route
-        && (crate::provider::is_openai_compatible_http_driver(driver) || native_kimi)
+        && (crate::provider::is_openai_compatible_http_driver(driver)
+            || native_kimi
+            || codex_transport::is_driver(driver))
     {
         (None, Some(upstream_error::read_rejection(upstream).await))
     } else {
@@ -1637,15 +1639,22 @@ async fn proxy_with_cancellation_guard(
             || independent_probe::TARGET.try_with(|_| ()).is_ok();
         let result = attempt_budget
             .send(
-                send_proxy_route(
-                    &state,
-                    &headers,
-                    protocol,
-                    request_id,
-                    &active_route,
-                    selected_candidate_rank,
-                    outbound_attempt,
-                    &mut h2_recovery_available,
+                routing::codex::RESPONSE_ARCHIVE_IDENTITY.scope(
+                    crate::db::ArchiveSpoolIdentity {
+                        request_id,
+                        tenant_id: buffered_request.tenant_id,
+                        reservation_id: buffered_request.reservation.id,
+                    },
+                    send_proxy_route(
+                        &state,
+                        &headers,
+                        protocol,
+                        request_id,
+                        &active_route,
+                        selected_candidate_rank,
+                        outbound_attempt,
+                        &mut h2_recovery_available,
+                    ),
                 ),
                 active_route.wait_for_compaction,
             )
@@ -1933,22 +1942,35 @@ async fn proxy_with_cancellation_guard(
                 return finish_unavailable(&buffered_request, "upstream_rejected", last_dispatch)
                     .await;
             }
-            Err(ProxySendError::CodexBadRequest) => {
+            Err(error @ (ProxySendError::CodexBadRequest | ProxySendError::CodexRejection(_))) => {
+                buffered_request.original_response_capture = true;
+                let body = match error {
+                    ProxySendError::CodexRejection(body) => body,
+                    _ => upstream_error::fallback_body(),
+                };
+                let reason = serde_json::from_slice(&body)
+                    .ok()
+                    .as_ref()
+                    .and_then(crate::supplier_error::reason_from_value);
                 upstream_attempt
                     .complete(UpstreamAttemptTerminal::Inconclusive)
                     .await;
-                return finish_local_buffered_error(
+                return finish_buffered_request_with_upstream_attribution_and_response_object(
                     &buffered_request,
                     StatusCode::BAD_REQUEST,
-                    Bytes::from_static(
-                        b"{\"error\":{\"message\":\"upstream rejected the request\",\"type\":\"upstream_error\"}}",
-                    ),
+                    body,
                     "application/json",
                     (
                         TokenUsage::default(),
                         crate::model::RequestUsageBasis::NotObserved,
                     ),
-                    Some("http_400".to_owned()),
+                    Some(reason.map_or("http_400", |reason| reason.code()).to_owned()),
+                    BufferedFinishPolicy {
+                        upstream_attribution: ProxyRequestUpstreamAttribution::KeepSelected,
+                        terminal_cause: Some(
+                            crate::model::RequestTerminalCause::UpstreamHttpStatus,
+                        ),
+                    },
                 )
                 .await;
             }
@@ -2186,12 +2208,14 @@ async fn proxy_with_cancellation_guard(
             Some(active_route.route.account_id),
             Some(active_route.route.credential_generation),
         );
-        let buffered = match codex_transport::buffer_response(
+        let mut error_details = None;
+        let buffered = match codex_transport::buffer_response_with_details(
             upstream,
             &buffered_request.memory,
             buffered_request.memory_admission_wait,
             buffered_request.conversation.as_ref(),
             sse_framing_limits,
+            &mut error_details,
         )
         .await
         {
@@ -2199,6 +2223,30 @@ async fn proxy_with_cancellation_guard(
             Err(error_code) => {
                 buffer_phase.finish(error_code, None, None);
                 tracing::warn!(%request_id, stage = error_code, "Codex upstream response failed");
+                if let Some(body) = error_details {
+                    let result =
+                        finish_buffered_request_with_upstream_attribution_and_response_object(
+                            &buffered_request,
+                            StatusCode::BAD_GATEWAY,
+                            body,
+                            "application/json",
+                            (
+                                TokenUsage::default(),
+                                crate::model::RequestUsageBasis::NotObserved,
+                            ),
+                            Some(error_code.to_owned()),
+                            BufferedFinishPolicy {
+                                upstream_attribution: ProxyRequestUpstreamAttribution::KeepSelected,
+                                terminal_cause: None,
+                            },
+                        )
+                        .await;
+                    upstream_attempt
+                        .complete(UpstreamAttemptTerminal::Inconclusive)
+                        .await;
+                    codex_retry.complete(CodexRetryTerminal::Failed);
+                    return result;
+                }
                 let result = finish_proxy_failure_with_cause(
                     &buffered_request,
                     error_code,

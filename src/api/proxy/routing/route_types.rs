@@ -167,6 +167,7 @@ pub(in crate::api::proxy) enum ProxySendError {
     RetryableConnection(&'static str),
     RetryableCodexBadRequest,
     CodexBadRequest,
+    CodexRejection(bytes::Bytes),
     CandidateUnavailable,
     AmbiguousResponse(&'static str),
     NonRetryableTransport(TransportFailureKind),

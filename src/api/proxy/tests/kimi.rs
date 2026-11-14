@@ -3,7 +3,7 @@ use super::*;
 mod buffered_usage;
 
 #[tokio::test]
-async fn native_kimi_rejections_keep_safe_reasons_and_bounded_private_fallbacks() {
+async fn native_kimi_rejections_preserve_classification_and_original_explanation() {
     let canary = "kimi-upstream-token-prompt-canary";
     let cases = [
         (
@@ -323,6 +323,14 @@ async fn native_kimi_safe_rejection_keeps_other_response_paths_untouched() {
             driver,
         )
         .await;
+        if !status.is_success() && !protocol.is_anthropic() && !anthropic_bridge {
+            assert!(upstream.is_none());
+            let diagnostic = rejection.expect("compatible HTTP errors retain their explanation");
+            assert!(
+                String::from_utf8_lossy(&diagnostic.body).contains("unmodified provider response")
+            );
+            continue;
+        }
         assert!(rejection.is_none());
         let upstream = upstream.unwrap();
         assert_eq!(upstream.status(), status);
