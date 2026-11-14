@@ -19,6 +19,66 @@ pub struct SemanticPublication {
 }
 
 impl ArchiveStore {
+    /// Store exactly the existing relational prefix identity as recoverable
+    /// metadata, not another body/event tree. Conflicts are never overwritten.
+    pub async fn put_semantic_prefix_node(
+        &self,
+        manifest: &SemanticManifestV2,
+        node: &super::SemanticNode,
+    ) -> Result<(), AppError> {
+        use object_store::{ObjectStoreExt, PutMode, PutOptions, PutPayload};
+        manifest.validate(manifest.tenant_id)?;
+        node.validate(&super::SemanticHead {
+            node_hash: node.node_hash.clone(),
+            depth: node.depth,
+        })?;
+        let store = match manifest.backend_identity.as_deref() {
+            None => &self.inner,
+            Some(identity) => {
+                &self
+                    .training
+                    .as_ref()
+                    .filter(|training| training.identity == identity)
+                    .ok_or_else(|| AppError::storage("semantic_manifest_backend_mismatch"))?
+                    .store
+            }
+        };
+        let path = super::path::archive_path(&format!(
+            "tenants/{}/semantic/v2/nodes/{}.json",
+            manifest.tenant_id, node.node_hash,
+        ))?;
+        let bytes = Bytes::from(
+            serde_json::to_vec(node).map_err(|_| AppError::internal("semantic_prefix_encode"))?,
+        );
+        match store
+            .put_opts(
+                &path,
+                PutPayload::from_bytes(bytes),
+                PutOptions {
+                    mode: PutMode::Create,
+                    ..Default::default()
+                },
+            )
+            .await
+        {
+            Ok(_) | Err(object_store::Error::AlreadyExists { .. }) => {}
+            Err(error) => return Err(error.into()),
+        }
+        let read = self
+            .get_semantic_prefix_node(
+                manifest,
+                &super::SemanticHead {
+                    node_hash: node.node_hash.clone(),
+                    depth: node.depth,
+                },
+            )
+            .await?;
+        if read.atom_hash != node.atom_hash || read.parent_hash != node.parent_hash {
+            return Err(AppError::storage("semantic_prefix_identity_conflict"));
+        }
+        Ok(())
+    }
+
     /// Publish an immutable metadata page only after its referenced payloads
     /// are readable. This does not duplicate their bytes in the page.
     pub async fn put_semantic_instance_page(
@@ -64,6 +124,7 @@ impl ArchiveStore {
         manifest.validate(manifest.tenant_id)?;
         let mut page_ref = manifest.instances_head.clone();
         let mut expected_end = None;
+        let mut expected_node = manifest.semantic_head.clone();
         while let Some(reference) = page_ref {
             let page = self
                 .get_semantic_instance_page(manifest, &reference)
@@ -78,10 +139,28 @@ impl ArchiveStore {
             if page.previous.is_some() && page.first_ordinal == 0 {
                 return Err(AppError::storage("semantic_instance_sequence_invalid"));
             }
+            // Instance order and canonical prefix order must describe the same
+            // atoms. A valid CAS body or page alone is not coverage proof.
+            for instance in page.instances.iter().rev() {
+                let head = expected_node
+                    .as_ref()
+                    .ok_or_else(|| AppError::storage("semantic_instance_prefix_mismatch"))?;
+                if head.node_hash != instance.node_hash {
+                    return Err(AppError::storage("semantic_instance_prefix_mismatch"));
+                }
+                let node = self.get_semantic_prefix_node(manifest, head).await?;
+                if node.atom_hash != instance.atom_hash || node.depth != instance.ordinal + 1 {
+                    return Err(AppError::storage("semantic_instance_prefix_mismatch"));
+                }
+                expected_node = node.parent_hash.map(|node_hash| super::SemanticHead {
+                    node_hash,
+                    depth: node.depth - 1,
+                });
+            }
             expected_end = Some(page.first_ordinal);
             page_ref = page.previous;
         }
-        if expected_end.is_some_and(|first| first != 0) {
+        if expected_node.is_some() || expected_end.is_some_and(|first| first != 0) {
             return Err(AppError::storage("semantic_instance_sequence_invalid"));
         }
         if manifest.semantic_head.is_some() != manifest.instances_head.is_some() {
