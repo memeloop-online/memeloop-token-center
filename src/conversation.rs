@@ -2621,3 +2621,70 @@ mod semantic_reasoning_tool_contracts {
         assert_eq!(encoded_result["result_content"], result["content"]);
     }
 }
+
+#[cfg(test)]
+mod semantic_partial_stream_contracts {
+    use super::*;
+    use serde_json::json;
+
+    fn accumulate(events: Vec<Value>) -> Value {
+        let mut accumulator = ReturnDocumentAccumulator::default();
+        for event in events {
+            accumulator.push(event);
+        }
+        accumulator.finish().expect("observed stream is retained")
+    }
+
+    #[test]
+    fn interrupted_responses_preserve_ordered_tools_reasoning_and_text() {
+        let response = accumulate(vec![
+            json!({"type":"response.output_item.added","output_index":0,"item":{"type":"reasoning","id":"reason-1","summary":[]}}),
+            json!({"type":"response.reasoning_summary_text.delta","output_index":0,"summary_index":0,"delta":"visible "}),
+            json!({"type":"response.reasoning_summary_text.delta","output_index":0,"summary_index":0,"delta":"thought"}),
+            json!({"type":"response.output_item.added","output_index":1,"item":{"type":"function_call","id":"item-1","call_id":"call-1","name":"inspect","arguments":"","status":"in_progress"}}),
+            json!({"type":"response.output_item.added","output_index":2,"item":{"type":"function_call","id":"item-2","call_id":"call-2","name":"read","arguments":"","status":"in_progress"}}),
+            json!({"type":"response.function_call_arguments.delta","output_index":2,"delta":"{\"path\":\"b"}),
+            json!({"type":"response.function_call_arguments.delta","output_index":1,"delta":"{\"path\":\"a\"}"}),
+            json!({"type":"response.output_text.delta","output_index":3,"content_index":0,"delta":"partial answer"}),
+        ]);
+        assert_eq!(response["status"], "partial");
+        let body = session_body_from_documents(&json!({}), &response);
+        let parts: Vec<_> = body.turns.iter().flat_map(|turn| &turn.parts).collect();
+        assert_eq!(parts[0].kind, "reasoning");
+        assert_eq!(parts[0].text.as_deref(), Some("visible thought"));
+        assert_eq!(parts[1].call_id.as_deref(), Some("call-1"));
+        assert_eq!(parts[1].arguments.as_ref().unwrap()["path"], "a");
+        assert_eq!(parts[2].call_id.as_deref(), Some("call-2"));
+        assert_eq!(parts[2].arguments_text.as_deref(), Some("{\"path\":\"b"));
+        assert!(parts[2].arguments.is_none());
+        assert_eq!(parts[3].text.as_deref(), Some("partial answer"));
+    }
+
+    #[test]
+    fn completed_response_supersedes_observed_deltas_without_duplicates() {
+        let response = accumulate(vec![
+            json!({"type":"response.output_text.delta","output_index":0,"content_index":0,"delta":"old prefix"}),
+            json!({"type":"response.completed","response":{"output":[{"type":"message","role":"assistant","content":[{"type":"output_text","text":"final answer"}]}],"status":"completed"}}),
+        ]);
+        let body = session_body_from_documents(&json!({}), &response);
+        assert_eq!(body.turns.len(), 1);
+        assert_eq!(body.turns[0].parts.len(), 1);
+        assert_eq!(body.turns[0].parts[0].text.as_deref(), Some("final answer"));
+        assert_eq!(response["status"], "completed");
+    }
+
+    #[test]
+    fn interrupted_anthropic_tool_retains_invalid_json_fragment() {
+        let response = accumulate(vec![
+            json!({"type":"message_start","message":{"role":"assistant"}}),
+            json!({"type":"content_block_start","index":0,"content_block":{"type":"tool_use","id":"call-a","name":"inspect","input":{}}}),
+            json!({"type":"content_block_delta","index":0,"delta":{"type":"input_json_delta","partial_json":"{\"path\":"}}),
+        ]);
+        let body = session_body_from_documents(&json!({}), &response);
+        let part = &body.turns[0].parts[0];
+        assert_eq!(part.call_id.as_deref(), Some("call-a"));
+        assert_eq!(part.arguments_text.as_deref(), Some("{\"path\":"));
+        assert_eq!(part.completeness.as_deref(), Some("partial"));
+        assert!(part.arguments.is_none());
+    }
+}
