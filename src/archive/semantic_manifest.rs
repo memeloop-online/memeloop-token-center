@@ -1,5 +1,7 @@
 //! One semantic prefix is the permanent body authority. Instance pages contain
 //! identities and state only; they must never duplicate message/tool text.
+//! These are individual read primitives, not a manifest-anchored traversal or
+//! a proof of complete coverage. No HTTP materializer is provided here.
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
@@ -219,16 +221,41 @@ impl super::ArchiveStore {
         Ok(page)
     }
 
-    /// Exact object integrity is checked by the CAS stream. The semantic digest
-    /// excludes all per-occurrence metadata, retaining existing prefix identity.
-    pub async fn get_semantic_atom(
+    /// Streams the existing immutable body without building an unbudgeted JSON
+    /// tree. The caller owns incremental decoding and its allocation budget.
+    /// This checks physical CAS integrity, not whole-root semantic coverage.
+    #[allow(
+        dead_code,
+        reason = "Internal streaming foundation; consumer wiring follows separately."
+    )]
+    pub(crate) async fn open_semantic_atom(
+        &self,
+        tenant: Uuid,
+        instance: &SemanticTurnInstance,
+    ) -> Result<super::ArchiveDownload, AppError> {
+        if !digest(&instance.atom_hash) || !digest(&instance.node_hash) {
+            return Err(AppError::storage("semantic_atom_invalid"));
+        }
+        self.open_tenant_content(tenant, &instance.body).await
+    }
+
+    // Test-only reference decoder. Production detail/export must consume the
+    // stream above with an explicit decoder allocation owner, not materialize
+    // arbitrary JSON through this unbudgeted helper.
+    #[cfg(test)]
+    async fn get_semantic_atom(
         &self,
         tenant: Uuid,
         instance: &SemanticTurnInstance,
     ) -> Result<SemanticAtomBody, AppError> {
-        let mut value: serde_json::Value = self
-            .read_tenant_json_streamed(tenant, &instance.body)
-            .await?;
+        let mut source = self.open_semantic_atom(tenant, instance).await?.stream;
+        use futures_util::TryStreamExt;
+        let mut data = Vec::new();
+        while let Some(chunk) = source.try_next().await? {
+            data.extend_from_slice(&chunk);
+        }
+        let mut value: serde_json::Value = serde_json::from_slice(&data)
+            .map_err(|_| AppError::storage("semantic_atom_invalid"))?;
         // Existing v1 atom objects encoded origin despite excluding it from the
         // semantic hash. Reuse their bytes; instance metadata owns that field.
         if let Some(object) = value.as_object_mut() {
@@ -245,9 +272,16 @@ impl super::ArchiveStore {
         {
             return Err(AppError::storage("semantic_atom_invalid"));
         }
-        // Value supplies the same canonical object-key ordering as the parser.
-        let canonical =
-            serde_json::to_value(&body).map_err(|_| AppError::internal("semantic_atom_encode"))?;
+        // Borrow parts directly in canonical key order: no second body tree.
+        #[derive(Serialize)]
+        struct Canonical<'a> {
+            parts: &'a [serde_json::Value],
+            role: &'a str,
+        }
+        let canonical = Canonical {
+            parts: &body.parts,
+            role: &body.role,
+        };
         struct HashWriter(blake3::Hasher);
         impl std::io::Write for HashWriter {
             fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
