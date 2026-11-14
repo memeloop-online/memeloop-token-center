@@ -407,6 +407,21 @@ impl BodyCarrier {
         ))
     }
 
+    /// Release only confirmed offloaded allocation owners. Callers can cancel
+    /// this wait by dropping the future; failed writes retain the RAM source.
+    pub(crate) async fn seal_to_objects(self: &Arc<Self>) -> Result<(), AppError> {
+        if self.archive.is_none() {
+            return Err(AppError::internal("carrier_object_capability_missing"));
+        }
+        loop {
+            match self.offload_one().await {
+                Ok(true) => {}
+                Ok(false) => return Ok(()),
+                Err(_) => tokio::time::sleep(std::time::Duration::from_millis(250)).await,
+            }
+        }
+    }
+
     /// Bounded independently-owned replay output; its lease follows Bytes
     /// clones/slices rather than the caller's next poll.
     pub(crate) async fn read_leased_chunk(
