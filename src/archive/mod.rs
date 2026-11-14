@@ -19,6 +19,7 @@ use object_store::{ObjectStoreExt, PutPayload, memory::InMemory, path::Path};
 
 mod backend;
 pub mod cache_command;
+mod carrier_ownership;
 mod cas;
 mod compressed;
 mod conversation;
@@ -50,6 +51,7 @@ mod supplier_summary;
 mod terminal_receipts;
 mod text;
 
+pub(crate) use carrier_ownership::CarrierObjectOwner;
 pub use cas::CasArchiveObject;
 pub use conversation::{
     ConversationBodyReference, ConversationEvent, ConversationManifest, ConversationMedia,
