@@ -87,6 +87,42 @@ pub(crate) struct BodyCarrier {
 }
 
 impl BodyCarrier {
+    /// Adopt an encoding already covered by the old JSON envelope. The caller
+    /// must first drop the parsed Value and must use release_unretained_json
+    /// afterwards; length-based legacy release assumes no credit transfer.
+    pub(crate) fn adopt_normalized(
+        encoded: Vec<u8>,
+        previous: &super::memory::ProxyMemoryReservation,
+        capture: CarrierCapture,
+    ) -> Result<Arc<Self>, AppError> {
+        let lease = previous
+            .take_normalized_envelope(encoded.capacity())
+            .ok_or_else(|| AppError::internal("normalized_envelope_not_owned"))?;
+        let staging = match &capture.archive {
+            Some(archive) => archive.select_staging_key(capture.staging)?,
+            None => capture.staging,
+        };
+        let length = encoded.len() as u64;
+        let digest = blake3::hash(&encoded).to_hex().to_string();
+        let source = Self {
+            memory: capture.memory,
+            archive: capture.archive,
+            staging,
+            segments: Vec::new(),
+            offload: tokio::sync::Mutex::new(()),
+            sealed_reference: None,
+            parent: capture.parent,
+            allocations: Mutex::new(Vec::new()),
+            length,
+            digest,
+            owned_objects: Mutex::new(Vec::new()),
+        };
+        let owned = source.leased_bytes(Bytes::from(encoded), lease, None);
+        let mut source = source;
+        source.segments.push(Mutex::new(Segment::Ram(owned)));
+        Ok(Arc::new(source))
+    }
+
     /// The input is borrowed by this future: callers need not spawn or make it
     /// 'static. Bytes are never aggregated into a whole-body buffer.
     pub(crate) async fn capture<S, E>(
