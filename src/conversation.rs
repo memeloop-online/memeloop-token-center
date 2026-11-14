@@ -1078,6 +1078,14 @@ fn flush_owned_bare_parts(turns: &mut Vec<SessionBodyTurn>, parts: &mut Vec<Valu
 }
 
 fn turn_from_owned_entry(mut entry: Value, origin: &str) -> SessionBodyTurn {
+    let mut reasoning = Vec::new();
+    if push_reasoning_part(&mut reasoning, &entry) {
+        return SessionBodyTurn {
+            role: "assistant".into(),
+            origin: origin.to_owned(),
+            parts: reasoning,
+        };
+    }
     let kind = entry.get("type").and_then(Value::as_str).unwrap_or("");
     let role = entry
         .get("role")
@@ -1126,6 +1134,7 @@ fn turn_from_owned_entry(mut entry: Value, origin: &str) -> SessionBodyTurn {
             0,
             SessionBodyPart {
                 kind: "reasoning".into(),
+                reasoning_source: Some("chat.reasoning_content".into()),
                 text: Some(text.to_owned()),
                 ..empty_part()
             },
@@ -1194,7 +1203,7 @@ fn push_owned_content_part(
                     }
                     .into(),
                 ),
-                text: item.get("content").map(value_text),
+                text: None,
                 tool_call_id: item
                     .get("tool_use_id")
                     .and_then(Value::as_str)
@@ -1255,6 +1264,14 @@ fn push_owned_content_part(
 }
 
 fn turn_from_entry(entry: &Value, origin: &str) -> SessionBodyTurn {
+    let mut reasoning = Vec::new();
+    if push_reasoning_part(&mut reasoning, entry) {
+        return SessionBodyTurn {
+            role: "assistant".into(),
+            origin: origin.to_owned(),
+            parts: reasoning,
+        };
+    }
     let kind = entry.get("type").and_then(Value::as_str).unwrap_or("");
     let role = entry.get("role").and_then(Value::as_str).unwrap_or(
         if matches!(kind, "function_call" | "function_call_output") {
@@ -1277,10 +1294,6 @@ fn turn_from_entry(entry: &Value, origin: &str) -> SessionBodyTurn {
         return tool_call_turn(origin, entry, call_id);
     }
     if matches!(kind, "function_call_output") || role == "tool" {
-        let text = entry
-            .get("output")
-            .or_else(|| entry.get("content"))
-            .map(value_text);
         return SessionBodyTurn {
             role: "tool".into(),
             origin: origin.to_owned(),
@@ -1292,7 +1305,7 @@ fn turn_from_entry(entry: &Value, origin: &str) -> SessionBodyTurn {
                     .or_else(|| entry.get("content"))
                     .cloned(),
                 result_status: Some("observed".into()),
-                text,
+                text: None,
                 call_id,
                 tool_call_id,
                 ..empty_part()
@@ -1318,6 +1331,7 @@ fn turn_from_entry(entry: &Value, origin: &str) -> SessionBodyTurn {
             0,
             SessionBodyPart {
                 kind: "reasoning".into(),
+                reasoning_source: Some("chat.reasoning_content".into()),
                 text: Some(text.to_owned()),
                 ..empty_part()
             },
@@ -1363,10 +1377,12 @@ fn tool_call_part(part_index: u32, call: &Value) -> SessionBodyPart {
     SessionBodyPart {
         part_index,
         kind: "tool_call".into(),
-        text: Some(format!("{name}\n{arguments}")),
+        text: None,
         tool_name: Some(name.to_owned()),
         arguments: serde_json::from_str(&arguments).ok(),
-        arguments_text: Some(arguments.clone()),
+        arguments_text: serde_json::from_str::<Value>(&arguments)
+            .is_err()
+            .then(|| arguments.clone()),
         arguments_encoding: Some(
             if serde_json::from_str::<Value>(&arguments).is_ok() {
                 "json"
@@ -1455,7 +1471,7 @@ fn push_content_part(
                     }
                     .into(),
                 ),
-                text: cleaned.get("content").map(value_text),
+                text: None,
                 tool_call_id: cleaned
                     .get("tool_use_id")
                     .and_then(Value::as_str)
@@ -1540,6 +1556,14 @@ fn push_reasoning_part(parts: &mut Vec<SessionBodyPart>, value: &Value) -> bool 
         parts.push(SessionBodyPart {
             part_index: parts.len() as u32,
             kind: "reasoning".into(),
+            reasoning_source: Some(
+                if value.get("summary").is_some() {
+                    "responses.summary"
+                } else {
+                    "protocol.plaintext_reasoning"
+                }
+                .into(),
+            ),
             text: Some(text),
             ..empty_part()
         });
@@ -2455,6 +2479,32 @@ mod semantic_reasoning_tool_contracts {
     }
 
     #[test]
+    fn responses_summary_uses_real_document_owned_and_completed_stream_entries() {
+        let response = json!({"output":[{"type":"reasoning","encrypted_content":"opaque","summary":[{"type":"summary_text","text":"actual summary"}]}]});
+        let borrowed = session_body_from_documents(&json!({}), &response);
+        let mut owned = SessionBody::from_request_document(json!({}));
+        owned.append_return_document(response.clone());
+        let wire = format!(
+            "data: {}\n\ndata: [DONE]\n\n",
+            json!({"type":"response.completed","response":response})
+        );
+        let streamed = raw_return_document(wire.as_bytes()).unwrap();
+        let streamed = session_body_from_documents(&json!({}), &streamed);
+        for body in [borrowed, owned, streamed] {
+            assert_eq!(body.turns.len(), 1);
+            assert_eq!(body.turns[0].role, "assistant");
+            assert_eq!(
+                body.turns[0].parts[0].text.as_deref(),
+                Some("actual summary")
+            );
+            assert_eq!(
+                body.turns[0].parts[0].reasoning_source.as_deref(),
+                Some("responses.summary")
+            );
+        }
+    }
+
+    #[test]
     fn summary_is_readable_and_user_owned_encrypted_keys_survive() {
         let reasoning = json!({"type":"reasoning","encrypted_content":"opaque-provider","summary":[{"type":"summary_text","text":"visible summary"}]});
         let mut parts = Vec::new();
@@ -2482,5 +2532,10 @@ mod semantic_reasoning_tool_contracts {
         let encoded = part_value(&parts[1], parts[1].text.clone());
         assert_eq!(encoded["tool_name"], "inspect");
         assert!(encoded["arguments"].is_object());
+        assert!(encoded.get("text").is_none());
+        assert!(encoded.get("arguments_text").is_none());
+        let encoded_result = part_value(&parts[2], parts[2].text.clone());
+        assert!(encoded_result.get("text").is_none());
+        assert_eq!(encoded_result["result_content"], result["content"]);
     }
 }
