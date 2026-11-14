@@ -555,10 +555,8 @@ paths:
     put:
       tags: [Client credentials]
       operationId: storeClientCredential
-      summary: Store an already-active client credential for direct authorized copying
-      description: |
-        Verifies the supplied credential against the active stable key and stores its original
-        value for Copy. The credential keeps its current generation.
+      summary: Read-back-safe replacement or restoration of a managed client credential
+      description: "With expected_credential_generation, atomically replace the active credential while preserving key, account and grant identities. An unchanged value preserves its generation; changed values revoke the old generation. Matching immediate retries return the current value without another rotation. Without the generation field, legacy original-value restoration keeps its existing semantics."
       security: [{ serviceBearer: [] }]
       x-required-scope: keys:write
       parameters: [{ $ref: '#/components/parameters/KeyId' }]
@@ -568,11 +566,17 @@ paths:
           application/json:
             schema: { $ref: '#/components/schemas/StoreClientCredentialRequest' }
       responses:
+        '200':
+          description: "Generation-fenced credential saved; no-store response contains the active value."
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/CopiedClientCredential' }
         '204': { description: Original credential stored; no secret is returned. }
         '400': { $ref: '#/components/responses/InvalidRequest' }
         '401': { $ref: '#/components/responses/Unauthorized' }
         '403': { $ref: '#/components/responses/Forbidden' }
         '404': { $ref: '#/components/responses/NotFound' }
+        '409': { $ref: '#/components/responses/Conflict' }
 
   /internal/v1/keys/{key_id}/copy:
     post:
@@ -9855,7 +9859,12 @@ components:
           minLength: 16
           maxLength: 512
           writeOnly: true
-          description: Existing active credential supplied by an authorized source importer. It is never echoed.
+          description: "Actual credential value. A generation-fenced save returns the active value with Cache-Control: no-store."
+        expected_credential_generation:
+          type: integer
+          format: int64
+          minimum: 1
+          description: "Observed active generation required for editable-value replacement. Omit only for legacy original-value restoration."
     CopiedClientCredential:
       type: object
       additionalProperties: false
