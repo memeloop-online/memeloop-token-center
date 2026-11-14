@@ -1,5 +1,7 @@
 use super::*;
+use crate::gateway_body::carrier::{BodyCarrier, CarrierCapture};
 use bytes::Bytes;
+#[cfg(test)]
 use tokio::io::{AsyncReadExt, AsyncSeekExt, AsyncWriteExt};
 
 fn log_preparation_failure(
@@ -326,10 +328,17 @@ where
                 egress_recorder,
             );
             let response = if route.compact_v2_bridge {
-                translate_new_api_compact_v2(
+                translate_compact_carrier(
                     response,
                     route.wrap_compact_as_sse,
-                    std::path::Path::new(&state.config.responses_request_spool_path),
+                    request_id,
+                    state.archive.clone(),
+                    Some(state.db.clone()),
+                    CarrierCapture::new(
+                        state.proxy_memory_budget.clone(),
+                        Some(state.archive.clone()),
+                        compact_staging(request_id)?,
+                    ),
                 )
                 .await?
             } else {
@@ -468,10 +477,13 @@ fn classify_reqwest_send_error(error: reqwest::Error) -> ProxySendError {
     ProxySendError::NonRetryableTransport(kind)
 }
 
-async fn translate_new_api_compact_v2(
+async fn translate_compact_carrier(
     response: UpstreamResponse,
     wrap_as_sse: bool,
-    spool_path: &std::path::Path,
+    request_id: Uuid,
+    scratch_archive: crate::archive::ArchiveStore,
+    scratch_database: Option<crate::db::Database>,
+    capture: CarrierCapture,
 ) -> Result<UpstreamResponse, ProxySendError> {
     let status = response.status();
     // Only successful compact payloads require translation. Preserve an
@@ -482,37 +494,127 @@ async fn translate_new_api_compact_v2(
     }
     let version = response.version();
     let mut headers = response.headers().clone();
-    let file = capture_compact_body(response.bytes_stream(), spool_path).await?;
-    let output = new_compact_file(spool_path).await?;
-    let index = new_compact_file(spool_path).await?.into_std().await;
-    let output = output.into_std().await;
-    let file = file.into_std().await;
-    struct CancelTranslation(std::sync::Arc<std::sync::atomic::AtomicBool>);
+    let input = BodyCarrier::capture(
+        response
+            .bytes_stream()
+            .map(|chunk| chunk.map_err(|_| AppError::internal("compact_capture"))),
+        capture,
+    )
+    .await
+    .map_err(|_| ProxySendError::AmbiguousResponse("upstream_invalid_response"))?;
+    let runtime = tokio::runtime::Handle::current();
+    let staging = compact_staging(request_id)?;
+    let output_capture = CarrierCapture::derived_from(&input, staging);
+    let (plan_sender, plan_receiver) = tokio::sync::mpsc::channel::<Bytes>(2);
+    let plan_stream = futures_util::stream::unfold(plan_receiver, |mut receiver| async move {
+        receiver
+            .recv()
+            .await
+            .map(|bytes| (Ok::<_, AppError>(bytes), receiver))
+    });
+    let (sender, receiver) = tokio::sync::mpsc::channel::<Bytes>(2);
+    let output_stream = futures_util::stream::unfold(receiver, |mut receiver| async move {
+        receiver
+            .recv()
+            .await
+            .map(|bytes| (Ok::<_, AppError>(bytes), receiver))
+    });
+    struct CancelTranslation(
+        std::sync::Arc<std::sync::atomic::AtomicBool>,
+        std::sync::Arc<tokio::sync::Notify>,
+    );
     impl Drop for CancelTranslation {
         fn drop(&mut self) {
-            self.0.store(true, std::sync::atomic::Ordering::Relaxed);
+            self.0.store(true, std::sync::atomic::Ordering::Release);
+            self.1.notify_waiters();
         }
     }
-    let cancellation = CancelTranslation(std::sync::Arc::new(std::sync::atomic::AtomicBool::new(
-        false,
-    )));
+    let cancellation = CancelTranslation(
+        std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
+        std::sync::Arc::new(tokio::sync::Notify::new()),
+    );
     let cancelled = cancellation.0.clone();
-    let output = tokio::task::spawn_blocking(move || {
-        super::compact_file::translate_cancellable(file, output, index, wrap_as_sse, cancelled)
-    })
-    .await
-    .map_err(|_| ProxySendError::AmbiguousResponse("upstream_invalid_response"))?
-    .map_err(|error| {
-        ProxySendError::AmbiguousResponse(if error == "compact_file_io" {
-            "upstream_compact_spool_write_failed"
-        } else {
-            "upstream_invalid_response"
-        })
-    })?;
-    let evidence = output.evidence;
-    let pieces = output.pieces;
-    let physical_body_bytes = output.physical_body_bytes;
-    let output = output.file;
+    let wake = cancellation.1.clone();
+    let key = compact_staging(request_id)?;
+    let scope = match scratch_database {
+        Some(database) => {
+            crate::archive::scratch_scope::ScratchScope::begin(scratch_archive, database, key)
+                .await
+                .map_err(|_| ProxySendError::AmbiguousResponse("upstream_invalid_response"))?
+        }
+        #[cfg(test)]
+        None => crate::archive::scratch_scope::ScratchScope::for_test(scratch_archive, key),
+        #[cfg(not(test))]
+        None => {
+            return Err(ProxySendError::AmbiguousResponse(
+                "upstream_invalid_response",
+            ));
+        }
+    };
+    let lease = input
+        .reserve_metadata_workspace(crate::json_source::pager::WORKSPACE_BYTES)
+        .await
+        .map_err(|_| ProxySendError::AmbiguousResponse("upstream_invalid_response"))?;
+    let index = crate::json_source::index::Index::scratch(
+        scope,
+        lease,
+        runtime.clone(),
+        cancelled.clone(),
+        wake.clone(),
+    )
+    .map_err(|_| ProxySendError::AmbiguousResponse("upstream_invalid_response"))?;
+    let worker = tokio::task::spawn_blocking(move || {
+        let translated = super::compact_file::prepare_carrier(
+            input,
+            CompactWriter {
+                sender,
+                position: 0,
+            },
+            wrap_as_sse,
+            cancelled,
+            runtime,
+            wake,
+            index,
+        )?;
+        Ok::<_, &'static str>(translated.close_output())
+    });
+    let capture = BodyCarrier::capture(output_stream, output_capture);
+    let (prepared, output) = tokio::join!(worker, capture);
+    let prepared = prepared
+        .map_err(|_| ProxySendError::AmbiguousResponse("upstream_invalid_response"))?
+        .map_err(|_| ProxySendError::AmbiguousResponse("upstream_invalid_response"))?;
+    let output =
+        output.map_err(|_| ProxySendError::AmbiguousResponse("upstream_invalid_response"))?;
+    // Stages never compete while retaining an unfinished sibling carrier.
+    output
+        .seal_to_objects()
+        .await
+        .map_err(|_| ProxySendError::AmbiguousResponse("upstream_invalid_response"))?;
+    let plan_capture = CarrierCapture::derived_from(&output, compact_staging(request_id)?);
+    let cancelled = cancellation.0.clone();
+    let worker = tokio::task::spawn_blocking(move || {
+        let translated = prepared.finish(
+            CompactWriter {
+                sender: plan_sender,
+                position: 0,
+            },
+            wrap_as_sse,
+            &cancelled,
+        )?;
+        drop(translated.pieces);
+        Ok::<_, &'static str>((translated.evidence, translated.physical_body_bytes))
+    });
+    let (translated, pieces) =
+        tokio::join!(worker, BodyCarrier::capture(plan_stream, plan_capture));
+    let (evidence, physical_body_bytes) = translated
+        .map_err(|_| ProxySendError::AmbiguousResponse("upstream_invalid_response"))?
+        .map_err(|_| ProxySendError::AmbiguousResponse("upstream_invalid_response"))?;
+    let pieces =
+        pieces.map_err(|_| ProxySendError::AmbiguousResponse("upstream_invalid_response"))?;
+    pieces
+        .seal_to_objects()
+        .await
+        .map_err(|_| ProxySendError::AmbiguousResponse("upstream_invalid_response"))?;
     let content_type = if wrap_as_sse {
         HeaderValue::from_static("text/event-stream")
     } else {
@@ -521,7 +623,7 @@ async fn translate_new_api_compact_v2(
     headers.remove(header::CONTENT_LENGTH);
     headers.remove(header::CONTENT_ENCODING);
     headers.insert(header::CONTENT_TYPE, content_type);
-    let stream = compact_file_stream(
+    let stream = compact_carrier_stream(
         output,
         pieces,
         physical_body_bytes,
@@ -537,6 +639,156 @@ async fn translate_new_api_compact_v2(
     })
 }
 
+fn compact_staging(
+    request: Uuid,
+) -> Result<crate::archive_staging::ArchiveStagingKey, ProxySendError> {
+    use crate::archive_staging::*;
+    ArchiveStagingKey::new(
+        ArchiveStagingOwner::ProxyRequest(request),
+        ArchiveStagingPurpose::Response,
+        Uuid::new_v4(),
+    )
+    .map_err(|_| ProxySendError::AmbiguousResponse("upstream_invalid_response"))
+}
+
+struct CompactWriter {
+    sender: tokio::sync::mpsc::Sender<Bytes>,
+    position: u64,
+}
+impl std::io::Write for CompactWriter {
+    fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+        let count = bytes.len().min(crate::json_source::CHUNK);
+        if count == 0 {
+            return Ok(0);
+        }
+        self.sender
+            .blocking_send(Bytes::copy_from_slice(&bytes[..count]))
+            .map_err(|_| std::io::Error::other("compact_capture_closed"))?;
+        self.position += count as u64;
+        Ok(count)
+    }
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
+}
+impl std::io::Seek for CompactWriter {
+    fn seek(&mut self, offset: std::io::SeekFrom) -> std::io::Result<u64> {
+        match offset {
+            std::io::SeekFrom::Current(0) => Ok(self.position),
+            // Translation initializes and finally rewinds its output. The sealed
+            // carrier is replayed separately; neither operation changes bytes.
+            std::io::SeekFrom::Start(0) => Ok(0),
+            _ => Err(std::io::Error::other("compact_output_seek")),
+        }
+    }
+}
+
+fn compact_carrier_stream(
+    output: std::sync::Arc<BodyCarrier>,
+    pieces: std::sync::Arc<BodyCarrier>,
+    physical_bytes: u64,
+    expected_bytes: u64,
+) -> crate::api::proxy::upstream_response::UpstreamByteStream {
+    Box::pin(futures_util::stream::try_unfold(
+        (output, pieces, 0u64, None::<std::ops::Range<u64>>, 0u64),
+        move |(output, pieces, mut plan_at, mut active, mut delivered)| async move {
+            loop {
+                if let Some(range) = active.as_mut() {
+                    let count =
+                        (range.end - range.start).min(crate::json_source::CHUNK as u64) as usize;
+                    let bytes = output
+                        .read_leased_chunk(range.start, count)
+                        .await
+                        .map_err(|_| "upstream_invalid_response")?;
+                    range.start += count as u64;
+                    if range.start == range.end {
+                        active = None;
+                    }
+                    delivered += count as u64;
+                    if delivered > expected_bytes {
+                        return Err("upstream_invalid_response");
+                    }
+                    return Ok(Some((bytes, (output, pieces, plan_at, active, delivered))));
+                }
+                if plan_at == pieces.len() {
+                    if delivered != expected_bytes || output.len() != physical_bytes {
+                        return Err("upstream_invalid_response");
+                    }
+                    return Ok(None);
+                }
+                let mut header = [0; 9];
+                pieces
+                    .read_into(plan_at, &mut header)
+                    .await
+                    .map_err(|_| "upstream_invalid_response")?;
+                plan_at += 9;
+                let first = u64::from_le_bytes(header[1..].try_into().unwrap());
+                match header[0] {
+                    0 => {
+                        let mut word = [0; 8];
+                        pieces
+                            .read_into(plan_at, &mut word)
+                            .await
+                            .map_err(|_| "upstream_invalid_response")?;
+                        plan_at += 8;
+                        let end = u64::from_le_bytes(word);
+                        if first > end || end > physical_bytes {
+                            return Err("upstream_invalid_response");
+                        }
+                        if first != end {
+                            active = Some(first..end);
+                        }
+                    }
+                    1 => {
+                        if first > 256 {
+                            return Err("upstream_invalid_response");
+                        }
+                        if first == 0 {
+                            continue;
+                        }
+                        let bytes = pieces
+                            .read_leased_chunk(plan_at, first as usize)
+                            .await
+                            .map_err(|_| "upstream_invalid_response")?;
+                        plan_at += first;
+                        delivered += first;
+                        if delivered > expected_bytes {
+                            return Err("upstream_invalid_response");
+                        }
+                        return Ok(Some((bytes, (output, pieces, plan_at, active, delivered))));
+                    }
+                    _ => return Err("upstream_invalid_response"),
+                }
+            }
+        },
+    ))
+}
+
+#[cfg(test)]
+async fn translate_new_api_compact_v2(
+    response: UpstreamResponse,
+    sse: bool,
+    _path: &std::path::Path,
+) -> Result<UpstreamResponse, ProxySendError> {
+    let archive = crate::archive::ArchiveStore::memory_for_test();
+    translate_compact_carrier(
+        response,
+        sse,
+        Uuid::new_v4(),
+        archive.clone(),
+        None,
+        CarrierCapture::new(
+            std::sync::Arc::new(crate::gateway_body::memory::ProxyMemoryBudget::new(
+                256 * 1024 * 1024,
+            )),
+            Some(archive),
+            compact_staging(Uuid::new_v4())?,
+        ),
+    )
+    .await
+}
+
+#[cfg(test)]
 fn compact_file_stream(
     output: std::fs::File,
     pieces: std::fs::File,
@@ -658,6 +910,7 @@ fn compact_file_stream(
     ))
 }
 
+#[cfg(test)]
 async fn new_compact_file(spool_path: &std::path::Path) -> Result<tokio::fs::File, ProxySendError> {
     tokio::fs::create_dir_all(spool_path)
         .await
@@ -670,6 +923,7 @@ async fn new_compact_file(spool_path: &std::path::Path) -> Result<tokio::fs::Fil
     Ok(tokio::fs::File::from_std(file))
 }
 
+#[cfg(test)]
 async fn capture_compact_body<Error>(
     stream: impl futures_util::Stream<Item = Result<Bytes, Error>>,
     spool_path: &std::path::Path,

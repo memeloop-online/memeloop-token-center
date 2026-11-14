@@ -1,28 +1,53 @@
-//! Process-owned disk index for decoded JSON keys and output spans.
+//! Process-owned RAM index for decoded JSON keys and output spans.
 use super::{Result, Span};
-use std::fs::File;
+#[cfg(test)]
+use std::io::Cursor;
 use std::io::{Read, Seek, SeekFrom, Write};
 use std::sync::{
     Arc,
     atomic::{AtomicBool, Ordering},
 };
 
+trait IndexStorage: Read + Write + Seek + Send {}
+impl<T: Read + Write + Seek + Send> IndexStorage for T {}
+
 pub(crate) struct Index {
-    file: File,
+    file: Box<dyn IndexStorage>,
     end: u64,
     pub(crate) cancelled: Arc<AtomicBool>,
 }
 
 // Zero is the null pointer; records start after a one-byte sentinel.
 impl Index {
-    pub(crate) fn new(mut file: File) -> Result<Self> {
-        file.set_len(0).map_err(|_| "compact_file_io")?;
+    #[cfg(test)]
+    pub(crate) fn memory() -> Result<Self> {
+        Self::new(Box::new(Cursor::new(Vec::new())))
+    }
+
+    fn new(mut file: Box<dyn IndexStorage>) -> Result<Self> {
         file.write_all(&[0]).map_err(|_| "compact_file_io")?;
         Ok(Self {
             file,
             end: 1,
             cancelled: Arc::new(AtomicBool::new(false)),
         })
+    }
+
+    pub(crate) fn scratch(
+        scope: crate::archive::scratch_scope::ScratchScope,
+        lease: tokio::sync::OwnedSemaphorePermit,
+        runtime: tokio::runtime::Handle,
+        cancelled: Arc<AtomicBool>,
+        wake: Arc<tokio::sync::Notify>,
+    ) -> Result<Self> {
+        let backend = ScratchBackend {
+            scope,
+            runtime,
+            cancelled,
+            wake,
+            _lease: lease,
+        };
+        Self::new(Box::new(super::pager::Pager::new(Box::new(backend))))
     }
 
     pub(crate) fn end(&self) -> u64 {
@@ -238,6 +263,42 @@ impl Index {
     }
 }
 
+struct ScratchBackend {
+    scope: crate::archive::scratch_scope::ScratchScope,
+    runtime: tokio::runtime::Handle,
+    cancelled: Arc<AtomicBool>,
+    wake: Arc<tokio::sync::Notify>,
+    _lease: tokio::sync::OwnedSemaphorePermit,
+}
+impl ScratchBackend {
+    fn run<T>(
+        &self,
+        future: impl std::future::Future<Output = std::result::Result<T, crate::error::AppError>>,
+    ) -> std::io::Result<T> {
+        self.runtime.block_on(async {
+            let notified = self.wake.notified();
+            tokio::pin!(notified);
+            notified.as_mut().enable();
+            if self.cancelled.load(Ordering::Acquire) {
+                return Err(std::io::Error::other("compact_cancelled"));
+            }
+            tokio::select! {
+                biased;
+                _ = notified => Err(std::io::Error::other("compact_cancelled")),
+                result = future => result.map_err(|_| std::io::Error::other("compact_scratch_io")),
+            }
+        })
+    }
+}
+impl super::pager::PageBackend for ScratchBackend {
+    fn read_page(&mut self, number: u64, bytes: &mut [u8]) -> std::io::Result<()> {
+        self.run(self.scope.read_page(number, bytes))
+    }
+    fn write_page(&mut self, number: u64, bytes: &[u8]) -> std::io::Result<()> {
+        self.run(self.scope.write_page(number, bytes))
+    }
+}
+
 fn u64_at(record: &[u8], at: usize) -> u64 {
     u64::from_le_bytes(record[at..at + 8].try_into().unwrap())
 }
@@ -250,9 +311,87 @@ mod tests {
     use super::*;
     use sha2::{Digest, Sha256};
 
+    #[tokio::test]
+    async fn large_decoded_keys_spill_with_a_fixed_metadata_lease() {
+        use crate::{
+            archive::{ArchiveStore, scratch_scope::ScratchScope},
+            archive_staging::*,
+            gateway_body::{
+                carrier::{BodyCarrier, CarrierCapture},
+                memory::ProxyMemoryBudget,
+            },
+        };
+        let archive = ArchiveStore::memory_for_test();
+        let memory = Arc::new(ProxyMemoryBudget::new(128 * 1024));
+        let id = uuid::Uuid::new_v4();
+        let key = ArchiveStagingKey::new(
+            ArchiveStagingOwner::ProxyRequest(id),
+            ArchiveStagingPurpose::Response,
+            id,
+        )
+        .unwrap();
+        let source = BodyCarrier::capture(
+            futures_util::stream::empty::<std::result::Result<bytes::Bytes, std::io::Error>>(),
+            CarrierCapture::new(memory.clone(), Some(archive.clone()), key),
+        )
+        .await
+        .unwrap();
+        let lease = source
+            .reserve_metadata_workspace(super::super::pager::WORKSPACE_BYTES)
+            .await
+            .unwrap();
+        let runtime = tokio::runtime::Handle::current();
+        let tracked_memory = memory.clone();
+        tokio::task::spawn_blocking(move || {
+            let mut index = Index::scratch(
+                ScratchScope::for_test(archive, key),
+                lease,
+                runtime,
+                Arc::new(AtomicBool::new(false)),
+                Arc::new(tokio::sync::Notify::new()),
+            )
+            .unwrap();
+            let mut root = 0;
+            for number in 0..8u8 {
+                let key = vec![number; 128 * 1024];
+                let start = index.append(&key).unwrap();
+                index
+                    .insert_key(
+                        &mut root,
+                        Sha256::digest(&key).into(),
+                        Span {
+                            start,
+                            end: start + key.len() as u64,
+                        },
+                    )
+                    .unwrap();
+                assert_eq!(
+                    tracked_memory.snapshot().0,
+                    super::super::pager::WORKSPACE_BYTES
+                );
+            }
+            let key = vec![3; 128 * 1024];
+            let start = index.append(&key).unwrap();
+            assert_eq!(
+                index.insert_key(
+                    &mut root,
+                    Sha256::digest(&key).into(),
+                    Span {
+                        start,
+                        end: start + key.len() as u64
+                    }
+                ),
+                Err("duplicate_json_key")
+            );
+        })
+        .await
+        .unwrap();
+        assert_eq!(memory.snapshot().0, 0);
+    }
+
     #[test]
-    fn disk_radix_preserves_all_keys_and_exact_digest_collision_comparison() {
-        let mut index = Index::new(tempfile::tempfile().unwrap()).unwrap();
+    fn ram_radix_preserves_all_keys_and_exact_digest_collision_comparison() {
+        let mut index = Index::memory().unwrap();
         let mut root = 0;
         for number in 0..2048u32 {
             let key = number.to_le_bytes();

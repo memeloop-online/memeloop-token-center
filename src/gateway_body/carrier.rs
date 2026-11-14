@@ -317,6 +317,16 @@ impl BodyCarrier {
         }
     }
 
+    /// Reserve a fixed metadata workspace after releasing this source's own
+    /// offloadable allocations. The caller retains the permit through all
+    /// resident scratch pages and publication buffers.
+    pub(crate) async fn reserve_metadata_workspace(
+        self: &Arc<Self>,
+        bytes: usize,
+    ) -> Result<OwnedSemaphorePermit, AppError> {
+        self.reserve_workspace(bytes).await
+    }
+
     pub(crate) fn len(&self) -> u64 {
         self.length
     }
@@ -405,6 +415,42 @@ impl BodyCarrier {
                 }
             },
         ))
+    }
+
+    /// Release only confirmed offloaded allocation owners. Callers can cancel
+    /// this wait by dropping the future; failed writes retain the RAM source.
+    pub(crate) async fn seal_to_objects(self: &Arc<Self>) -> Result<(), AppError> {
+        if self.archive.is_none() {
+            return Err(AppError::internal("carrier_object_capability_missing"));
+        }
+        loop {
+            match self.offload_one().await {
+                Ok(true) => {}
+                Ok(false) => return Ok(()),
+                Err(_) => tokio::time::sleep(std::time::Duration::from_millis(250)).await,
+            }
+        }
+    }
+
+    /// Bounded independently-owned replay output; its lease follows Bytes
+    /// clones/slices rather than the caller's next poll.
+    pub(crate) async fn read_leased_chunk(
+        self: &Arc<Self>,
+        offset: u64,
+        maximum: usize,
+    ) -> Result<Bytes, AppError> {
+        let remaining = self
+            .length
+            .checked_sub(offset)
+            .ok_or_else(|| AppError::internal("carrier_range_invalid"))?;
+        let count = remaining.min(maximum.min(64 * 1024) as u64) as usize;
+        if count == 0 {
+            return Ok(Bytes::new());
+        }
+        let lease = self.reserve_workspace(count).await?;
+        let mut output = vec![0; count];
+        self.read_into(offset, &mut output).await?;
+        Ok(self.leased_bytes(Bytes::from(output), lease, None))
     }
 
     pub(crate) async fn read_range(
