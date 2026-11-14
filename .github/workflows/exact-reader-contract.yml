@@ -361,4 +361,4 @@ jobs:
         run: |
           set -o pipefail
           cargo test --locked --lib api::proxy::upstream_error::tests 2>&1 | tee /tmp/upstream-error-contract.log
-          grep -E '[1-9][0-9]* passed; 0 failed' /tmp/upstream-error-contract.log
+          grep -F '14 passed; 0 failed' /tmp/upstream-error-contract.log
