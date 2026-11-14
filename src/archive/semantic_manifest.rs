@@ -104,6 +104,79 @@ impl SemanticNode {
     }
 }
 
+/// Per-occurrence metadata. Message contents are held only by the atom object.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct SemanticTurnInstance {
+    pub instance_id: String,
+    pub request_id: Uuid,
+    pub attempt_id: Option<String>,
+    pub message_id: Option<String>,
+    pub turn_id: Option<String>,
+    pub branch_id: String,
+    pub parent_instance_id: Option<String>,
+    pub origin: String,
+    pub ordinal: u64,
+    pub atom_hash: String,
+    pub node_hash: String,
+    pub terminal_state: String,
+    pub body: CasArchiveObject,
+}
+
+/// Immutable bounded metadata chain, anchored by one exact manifest revision.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct SemanticInstancePage {
+    pub format_version: u32,
+    pub tenant_id: Uuid,
+    pub session_id: String,
+    pub branch_id: String,
+    pub first_ordinal: u64,
+    pub previous: Option<CasArchiveObject>,
+    pub instances: Vec<SemanticTurnInstance>,
+}
+
+impl SemanticInstancePage {
+    fn validate(&self, manifest: &SemanticManifestV2) -> Result<(), AppError> {
+        if self.format_version != 2
+            || self.tenant_id != manifest.tenant_id
+            || self.session_id != manifest.session_id
+            || self.branch_id != manifest.branch_id
+            || self.instances.is_empty()
+            || self.instances.len() > 64
+        {
+            return Err(AppError::storage("semantic_instance_page_invalid"));
+        }
+        if let Some(previous) = &self.previous {
+            previous.validate_tenant(self.tenant_id)?;
+        }
+        let mut ids = std::collections::HashSet::new();
+        for (offset, item) in self.instances.iter().enumerate() {
+            if item.instance_id.is_empty()
+                || !ids.insert(&item.instance_id)
+                || item.branch_id != self.branch_id
+                || item.origin.is_empty()
+                || item.terminal_state.is_empty()
+                || !digest(&item.atom_hash)
+                || !digest(&item.node_hash)
+                || self.first_ordinal.checked_add(offset as u64) != Some(item.ordinal)
+            {
+                return Err(AppError::storage("semantic_instance_page_invalid"));
+            }
+            item.body.validate_tenant(self.tenant_id)?;
+        }
+        Ok(())
+    }
+}
+
+/// Only semantic body fields are allowed; origin belongs to the instance.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct SemanticAtomBody {
+    pub role: String,
+    pub parts: Vec<serde_json::Value>,
+}
+
 fn digest(value: &str) -> bool {
     value.len() == 64
         && value
@@ -126,6 +199,72 @@ impl super::ArchiveStore {
             return Err(AppError::storage("semantic_manifest_backend_mismatch"));
         }
         Ok(manifest)
+    }
+
+    pub async fn get_semantic_instance_page(
+        &self,
+        manifest: &SemanticManifestV2,
+        object: &CasArchiveObject,
+    ) -> Result<SemanticInstancePage, AppError> {
+        manifest.validate(manifest.tenant_id)?;
+        let bytes = self
+            .get_tenant_content(manifest.tenant_id, object, 256 * 1024)
+            .await?;
+        let page: SemanticInstancePage = serde_json::from_slice(&bytes)
+            .map_err(|_| AppError::storage("semantic_instance_page_invalid"))?;
+        page.validate(manifest)?;
+        if page.previous.as_ref() == Some(object) {
+            return Err(AppError::storage("semantic_instance_page_cycle"));
+        }
+        Ok(page)
+    }
+
+    /// Exact object integrity is checked by the CAS stream. The semantic digest
+    /// excludes all per-occurrence metadata, retaining existing prefix identity.
+    pub async fn get_semantic_atom(
+        &self,
+        tenant: Uuid,
+        instance: &SemanticTurnInstance,
+    ) -> Result<SemanticAtomBody, AppError> {
+        let mut value: serde_json::Value = self
+            .read_tenant_json_streamed(tenant, &instance.body)
+            .await?;
+        // Existing v1 atom objects encoded origin despite excluding it from the
+        // semantic hash. Reuse their bytes; instance metadata owns that field.
+        if let Some(object) = value.as_object_mut() {
+            object.remove("origin");
+        }
+        let body: SemanticAtomBody = serde_json::from_value(value)
+            .map_err(|_| AppError::storage("semantic_atom_invalid"))?;
+        if body.role.is_empty()
+            || body.parts.iter().any(|part| {
+                part.get("kind")
+                    .and_then(serde_json::Value::as_str)
+                    .is_none()
+            })
+        {
+            return Err(AppError::storage("semantic_atom_invalid"));
+        }
+        // Value supplies the same canonical object-key ordering as the parser.
+        let canonical =
+            serde_json::to_value(&body).map_err(|_| AppError::internal("semantic_atom_encode"))?;
+        struct HashWriter(blake3::Hasher);
+        impl std::io::Write for HashWriter {
+            fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+                self.0.update(bytes);
+                Ok(bytes.len())
+            }
+            fn flush(&mut self) -> std::io::Result<()> {
+                Ok(())
+            }
+        }
+        let mut writer = HashWriter(blake3::Hasher::new());
+        serde_json::to_writer(&mut writer, &canonical)
+            .map_err(|_| AppError::internal("semantic_atom_encode"))?;
+        if writer.0.finalize().to_hex().as_str() != instance.atom_hash {
+            return Err(AppError::storage("semantic_atom_identity_mismatch"));
+        }
+        Ok(body)
     }
 
     /// Load precisely one existing prefix identity, never an event containing a

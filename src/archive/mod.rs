@@ -51,7 +51,7 @@ mod terminal_receipts;
 mod text;
 
 pub use cas::CasArchiveObject;
-pub use semantic_manifest::{SemanticManifestV2, SemanticCoverage, SemanticHead, SemanticNode, SemanticProjectionState};
+pub use semantic_manifest::{SemanticManifestV2, SemanticCoverage, SemanticHead, SemanticNode, SemanticProjectionState, SemanticTurnInstance, SemanticInstancePage, SemanticAtomBody};
 pub use conversation::{
     ConversationBodyReference, ConversationEvent, ConversationManifest, ConversationMedia,
     ConversationPrefix, RawConversationCapture, RawConversationFormat,
