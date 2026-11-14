@@ -1,6 +1,7 @@
 //! Incremental JSON syntax and RAM span indexing shared by protocol projections.
 //! Callers retain their own protocol validation and terminal evidence.
 pub(crate) mod index;
+pub(crate) mod pager;
 use sha2::{Digest, Sha256};
 #[cfg(test)]
 use std::fs::File;
@@ -79,6 +80,8 @@ struct CarrierReader {
     body: Arc<crate::gateway_body::carrier::BodyCarrier>,
     runtime: tokio::runtime::Handle,
     offset: u64,
+    cancelled: Arc<AtomicBool>,
+    wake: Arc<tokio::sync::Notify>,
 }
 impl Read for CarrierReader {
     fn read(&mut self, bytes: &mut [u8]) -> std::io::Result<usize> {
@@ -91,9 +94,20 @@ impl Read for CarrierReader {
         if count == 0 {
             return Ok(0);
         }
-        self.runtime
-            .block_on(self.body.read_into(self.offset, &mut bytes[..count]))
-            .map_err(|_| std::io::Error::other("compact_carrier_read"))?;
+        self.runtime.block_on(async {
+            let notified = self.wake.notified();
+            tokio::pin!(notified);
+            notified.as_mut().enable();
+            if self.cancelled.load(Ordering::Acquire) {
+                return Err(std::io::Error::other("compact_cancelled"));
+            }
+            tokio::select! {
+                biased;
+                _ = notified => Err(std::io::Error::other("compact_cancelled")),
+                result = self.body.read_into(self.offset, &mut bytes[..count]) =>
+                    result.map_err(|_| std::io::Error::other("compact_carrier_read")),
+            }
+        })?;
         self.offset += count as u64;
         Ok(count)
     }
@@ -137,6 +151,9 @@ impl Scanner {
     pub(crate) fn from_carrier(
         body: Arc<crate::gateway_body::carrier::BodyCarrier>,
         runtime: tokio::runtime::Handle,
+        cancelled: Arc<AtomicBool>,
+        wake: Arc<tokio::sync::Notify>,
+        index: index::Index,
     ) -> Result<Self> {
         Ok(Self {
             reader: BufReader::with_capacity(
@@ -145,9 +162,11 @@ impl Scanner {
                     body,
                     runtime,
                     offset: 0,
+                    cancelled: cancelled.clone(),
+                    wake,
                 }),
             ),
-            index: Some(index::Index::memory()?),
+            index: Some(index),
             position: 0,
             cancelled: Arc::new(AtomicBool::new(false)),
         })
@@ -513,7 +532,7 @@ impl Scanner {
         let end = self.position;
         self.seek(start)?;
         struct NumberReader<'a> {
-            source: std::io::Take<&'a mut BufReader<File>>,
+            source: std::io::Take<&'a mut BufReader<Box<dyn SourceReader>>>,
             cancelled: Arc<AtomicBool>,
         }
         impl Read for NumberReader<'_> {

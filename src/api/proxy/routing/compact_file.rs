@@ -347,11 +347,47 @@ impl ValidatedCompact {
     }
 }
 
-pub(super) struct TranslatedCompact<T> {
+pub(super) struct TranslatedCompact<T, P = Cursor<Vec<u8>>> {
     pub(super) file: T,
-    pub(super) pieces: Cursor<Vec<u8>>,
+    pub(super) pieces: P,
     pub(super) physical_body_bytes: u64,
     pub(super) evidence: ValidatedCompact,
+}
+
+pub(super) struct PreparedCompact<W> {
+    file: W,
+    index: index::Index,
+    layout: ResponseLayout,
+    evidence: ValidatedCompact,
+}
+impl<W> PreparedCompact<W> {
+    pub(super) fn close_output(self) -> PreparedCompact<()> {
+        drop(self.file);
+        PreparedCompact {
+            file: (),
+            index: self.index,
+            layout: self.layout,
+            evidence: self.evidence,
+        }
+    }
+    pub(super) fn finish<P: Write + Seek>(
+        mut self,
+        plan: P,
+        sse: bool,
+        cancelled: &AtomicBool,
+    ) -> Result<TranslatedCompact<W, P>> {
+        let physical_body_bytes = self.layout.end;
+        let (pieces, body_bytes, first_billable_byte_end) =
+            response_pieces(self.layout, sse, &mut self.index, cancelled, plan)?;
+        self.evidence.body_bytes = body_bytes;
+        self.evidence.first_billable_byte_end = first_billable_byte_end;
+        Ok(TranslatedCompact {
+            file: self.file,
+            pieces,
+            physical_body_bytes,
+            evidence: self.evidence,
+        })
+    }
 }
 
 pub(super) enum CompactPiece {
@@ -359,14 +395,14 @@ pub(super) enum CompactPiece {
     Bytes(Vec<u8>),
 }
 
-fn response_pieces(
+fn response_pieces<P: Write + Seek>(
     layout: ResponseLayout,
     sse: bool,
     index: &mut index::Index,
     cancelled: &AtomicBool,
-) -> Result<(Cursor<Vec<u8>>, u64, u64)> {
+    mut plan: P,
+) -> Result<(P, u64, u64)> {
     use CompactPiece::{Bytes, Range};
-    let mut plan = Cursor::new(Vec::new());
     plan.seek(SeekFrom::Start(0))
         .map_err(|_| "compact_file_io")?;
     let mut out = BufWriter::with_capacity(CHUNK, &mut plan);
@@ -622,32 +658,49 @@ fn translate_cancellable(
     translate_scanner(
         Scanner::with_index(input, index_file)?,
         output,
+        Cursor::new(Vec::new()),
         wrap_as_sse,
         cancelled,
     )
 }
 
-pub(super) fn translate_carrier<W: Write + Seek>(
+pub(super) fn prepare_carrier<W: Write + Seek>(
     input: Arc<crate::gateway_body::carrier::BodyCarrier>,
     output: W,
     wrap_as_sse: bool,
     cancelled: Arc<AtomicBool>,
     runtime: tokio::runtime::Handle,
-) -> Result<TranslatedCompact<W>> {
-    translate_scanner(
-        Scanner::from_carrier(input, runtime)?,
+    wake: Arc<tokio::sync::Notify>,
+    index: index::Index,
+) -> Result<PreparedCompact<W>> {
+    prepare_scanner(
+        Scanner::from_carrier(input, runtime, cancelled.clone(), wake, index)?,
         output,
         wrap_as_sse,
         cancelled,
     )
 }
 
-fn translate_scanner<W: Write + Seek>(
+fn translate_scanner<W: Write + Seek, P: Write + Seek>(
+    scanner: Scanner,
+    output: W,
+    plan: P,
+    wrap_as_sse: bool,
+    cancelled: Arc<AtomicBool>,
+) -> Result<TranslatedCompact<W, P>> {
+    prepare_scanner(scanner, output, wrap_as_sse, cancelled.clone())?.finish(
+        plan,
+        wrap_as_sse,
+        &cancelled,
+    )
+}
+
+fn prepare_scanner<W: Write + Seek>(
     mut scanner: Scanner,
     mut output: W,
     wrap_as_sse: bool,
     cancelled: Arc<AtomicBool>,
-) -> Result<TranslatedCompact<W>> {
+) -> Result<PreparedCompact<W>> {
     scanner.index.as_mut().ok_or("compact_file_io")?.cancelled = cancelled.clone();
     scanner.cancelled = cancelled;
     scanner.seek(0)?;
@@ -710,22 +763,17 @@ fn translate_scanner<W: Write + Seek>(
     output
         .seek(SeekFrom::Start(0))
         .map_err(|_| "compact_file_io")?;
-    let physical_body_bytes = layout.end;
-    let mut index = scanner.index.take().ok_or("compact_file_io")?;
-    let cancelled = scanner.cancelled.clone();
-    // Parsing and translation are complete; retain only the small replay plan.
-    let (pieces, body_bytes, first_billable_byte_end) =
-        response_pieces(layout, wrap_as_sse, &mut index, &cancelled)?;
-    Ok(TranslatedCompact {
+    let index = scanner.index.take().ok_or("compact_file_io")?;
+    Ok(PreparedCompact {
         file: output,
-        pieces,
-        physical_body_bytes,
+        index,
+        layout,
         evidence: ValidatedCompact {
             usage,
             usage_invalid,
             response_id,
-            body_bytes,
-            first_billable_byte_end,
+            body_bytes: 0,
+            first_billable_byte_end: 0,
         },
     })
 }
@@ -772,13 +820,16 @@ mod tests {
         let source = body.clone();
         let handle = runtime.clone();
         let translated = tokio::task::spawn_blocking(move || {
-            translate_carrier(
+            prepare_carrier(
                 source,
                 Cursor::new(Vec::new()),
                 false,
                 Arc::new(AtomicBool::new(false)),
                 handle,
-            )
+                Arc::new(tokio::sync::Notify::new()),
+                index::Index::memory().unwrap(),
+            )?
+            .finish(Cursor::new(Vec::new()), false, &AtomicBool::new(false))
         })
         .await
         .unwrap()
@@ -790,12 +841,14 @@ mod tests {
             translated.file.get_ref().len() as u64
         );
         let cancelled = tokio::task::spawn_blocking(move || {
-            translate_carrier(
+            prepare_carrier(
                 body,
                 Cursor::new(Vec::new()),
                 false,
                 Arc::new(AtomicBool::new(true)),
                 runtime,
+                Arc::new(tokio::sync::Notify::new()),
+                index::Index::memory().unwrap(),
             )
         })
         .await

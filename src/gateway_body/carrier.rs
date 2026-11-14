@@ -317,6 +317,16 @@ impl BodyCarrier {
         }
     }
 
+    /// Reserve a fixed metadata workspace after releasing this source's own
+    /// offloadable allocations. The caller retains the permit through all
+    /// resident scratch pages and publication buffers.
+    pub(crate) async fn reserve_metadata_workspace(
+        self: &Arc<Self>,
+        bytes: usize,
+    ) -> Result<OwnedSemaphorePermit, AppError> {
+        self.reserve_workspace(bytes).await
+    }
+
     pub(crate) fn len(&self) -> u64 {
         self.length
     }

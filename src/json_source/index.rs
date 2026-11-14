@@ -1,5 +1,6 @@
 //! Process-owned RAM index for decoded JSON keys and output spans.
 use super::{Result, Span};
+#[cfg(test)]
 use std::io::Cursor;
 use std::io::{Read, Seek, SeekFrom, Write};
 use std::sync::{
@@ -7,22 +8,46 @@ use std::sync::{
     atomic::{AtomicBool, Ordering},
 };
 
+trait IndexStorage: Read + Write + Seek + Send {}
+impl<T: Read + Write + Seek + Send> IndexStorage for T {}
+
 pub(crate) struct Index {
-    file: Cursor<Vec<u8>>,
+    file: Box<dyn IndexStorage>,
     end: u64,
     pub(crate) cancelled: Arc<AtomicBool>,
 }
 
 // Zero is the null pointer; records start after a one-byte sentinel.
 impl Index {
+    #[cfg(test)]
     pub(crate) fn memory() -> Result<Self> {
-        let mut file = Cursor::new(Vec::new());
+        Self::new(Box::new(Cursor::new(Vec::new())))
+    }
+
+    fn new(mut file: Box<dyn IndexStorage>) -> Result<Self> {
         file.write_all(&[0]).map_err(|_| "compact_file_io")?;
         Ok(Self {
             file,
             end: 1,
             cancelled: Arc::new(AtomicBool::new(false)),
         })
+    }
+
+    pub(crate) fn scratch(
+        scope: crate::archive::scratch_scope::ScratchScope,
+        lease: tokio::sync::OwnedSemaphorePermit,
+        runtime: tokio::runtime::Handle,
+        cancelled: Arc<AtomicBool>,
+        wake: Arc<tokio::sync::Notify>,
+    ) -> Result<Self> {
+        let backend = ScratchBackend {
+            scope,
+            runtime,
+            cancelled,
+            wake,
+            _lease: lease,
+        };
+        Self::new(Box::new(super::pager::Pager::new(Box::new(backend))))
     }
 
     pub(crate) fn end(&self) -> u64 {
@@ -235,6 +260,42 @@ impl Index {
             },
             u64_at(&record, 16),
         ))
+    }
+}
+
+struct ScratchBackend {
+    scope: crate::archive::scratch_scope::ScratchScope,
+    runtime: tokio::runtime::Handle,
+    cancelled: Arc<AtomicBool>,
+    wake: Arc<tokio::sync::Notify>,
+    _lease: tokio::sync::OwnedSemaphorePermit,
+}
+impl ScratchBackend {
+    fn run<T>(
+        &self,
+        future: impl std::future::Future<Output = std::result::Result<T, crate::error::AppError>>,
+    ) -> std::io::Result<T> {
+        self.runtime.block_on(async {
+            let notified = self.wake.notified();
+            tokio::pin!(notified);
+            notified.as_mut().enable();
+            if self.cancelled.load(Ordering::Acquire) {
+                return Err(std::io::Error::other("compact_cancelled"));
+            }
+            tokio::select! {
+                biased;
+                _ = notified => Err(std::io::Error::other("compact_cancelled")),
+                result = future => result.map_err(|_| std::io::Error::other("compact_scratch_io")),
+            }
+        })
+    }
+}
+impl super::pager::PageBackend for ScratchBackend {
+    fn read_page(&mut self, number: u64, bytes: &mut [u8]) -> std::io::Result<()> {
+        self.run(self.scope.read_page(number, bytes))
+    }
+    fn write_page(&mut self, number: u64, bytes: &[u8]) -> std::io::Result<()> {
+        self.run(self.scope.write_page(number, bytes))
     }
 }
 
