@@ -1943,6 +1943,7 @@ async fn proxy_with_cancellation_guard(
                     .await;
             }
             Err(error @ (ProxySendError::CodexBadRequest | ProxySendError::CodexRejection(_))) => {
+                buffered_request.original_response_capture = true;
                 let body = match error {
                     ProxySendError::CodexRejection(body) => body,
                     _ => upstream_error::fallback_body(),

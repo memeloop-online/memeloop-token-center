@@ -16,8 +16,31 @@ pub(in crate::api) struct Rejection {
     pub(super) terminal_cause: Option<RequestTerminalCause>,
 }
 
-pub(in crate::api) async fn read_reqwest_rejection(response: reqwest::Response) -> Rejection {
-    read_rejection(UpstreamResponse::Reqwest(response)).await
+// The terminal response owns submission/settlement semantics. Attach the
+// diagnostic without replacing an uncertain or replayed terminal response.
+// Only generated media terminal JSON is passed here, never the supplier stream.
+pub(in crate::api) async fn with_media_rejection(
+    response: axum::response::Response,
+    rejection: Bytes,
+) -> Result<axum::response::Response, crate::error::AppError> {
+    let (mut parts, body) = response.into_parts();
+    let original = axum::body::to_bytes(body, usize::MAX)
+        .await
+        .map_err(|_| crate::error::AppError::internal("media_terminal_body"))?;
+    let mut value: Value = serde_json::from_slice(&original)
+        .map_err(|_| crate::error::AppError::internal("media_terminal_json"))?;
+    let diagnostic: Value = serde_json::from_slice(&rejection)
+        .map_err(|_| crate::error::AppError::internal("media_rejection_json"))?;
+    if let Some(object) = value.as_object_mut() {
+        object.insert("provider_error".to_owned(), diagnostic);
+    }
+    let body = serde_json::to_vec(&value)
+        .map_err(|_| crate::error::AppError::internal("media_terminal_encode"))?;
+    parts.headers.remove(header::CONTENT_LENGTH);
+    Ok(axum::response::Response::from_parts(
+        parts,
+        axum::body::Body::from(body),
+    ))
 }
 
 pub(super) fn rejection_content_class(headers: &HeaderMap) -> &'static str {
@@ -177,7 +200,7 @@ pub(super) async fn inspect_model_rejection(
     )
 }
 
-pub(super) async fn read_rejection(response: UpstreamResponse) -> Rejection {
+pub(in crate::api) async fn read_rejection(response: UpstreamResponse) -> Rejection {
     let status = response.status();
     if status.is_success() {
         drop(response);
@@ -263,6 +286,38 @@ mod tests {
     use super::*;
     use futures_util::stream;
     use http::{HeaderMap, HeaderValue, Version};
+
+    #[tokio::test]
+    async fn media_diagnostic_keeps_uncertain_terminal_and_provider_fields() {
+        let response = axum::response::Response::builder()
+            .status(StatusCode::ACCEPTED)
+            .header("x-request-id", "media-request")
+            .body(axum::body::Body::from(
+                r#"{"error":{"code":"submission_unknown"},"retryable":false}"#,
+            ))
+            .unwrap();
+        let diagnostic = safe_error_body(br#"{"error":{"code":"vendor_new_code","message":"specific explanation","extra":{"field":7}}}"#);
+        let response = with_media_rejection(response, diagnostic).await.unwrap();
+        assert_eq!(response.status(), StatusCode::ACCEPTED);
+        assert_eq!(response.headers()["x-request-id"], "media-request");
+        let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let value: Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(value["error"]["code"], "submission_unknown");
+        assert_eq!(value["retryable"], false);
+        assert!(
+            value["provider_error"]
+                .to_string()
+                .contains("specific explanation")
+        );
+        assert!(
+            value["provider_error"]
+                .to_string()
+                .contains("vendor_new_code")
+        );
+        assert!(value["provider_error"].to_string().contains("field"));
+    }
 
     #[tokio::test]
     async fn delayed_json_rejection_preserves_policy_reason_including_502() {

@@ -134,3 +134,40 @@ async fn native_codex_complex_contract_preserves_wire_and_does_not_replay_ordina
         upstream.verify().await;
     }
 }
+
+#[tokio::test]
+async fn codex_large_bad_request_archives_complete_original_without_replay() {
+    let fixture = codex_route_fixture("large-error-original").await;
+    let upstream = MockServer::start().await;
+    let original = serde_json::to_vec(&json!({"error": {
+        "code": "vendor_unrecognized", "message": "original error",
+        "details": "x".repeat(64 * 1024), "tail": "complete-error-tail"
+    }}))
+    .unwrap();
+    Mock::given(method("POST"))
+        .and(path(codex_transport::RESPONSES_PATH))
+        .respond_with(ResponseTemplate::new(400).set_body_raw(original.clone(), "application/json"))
+        .expect(1)
+        .mount(&upstream)
+        .await;
+    let response = send_codex_route(
+        &fixture,
+        &upstream,
+        "/v1/responses",
+        complex_request(&fixture.model),
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    let _ = to_bytes(response.into_body(), MAX_PROXY_RESPONSE_BODY)
+        .await
+        .unwrap();
+    let rows = fixture
+        .state
+        .db
+        .list_requests(fixture.key_id, 10)
+        .await
+        .unwrap();
+    assert_eq!(rows.len(), 1);
+    cancellation::assert_original_response(&fixture, rows[0].request_id, &original).await;
+    upstream.verify().await;
+}
