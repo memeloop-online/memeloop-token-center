@@ -211,6 +211,11 @@ impl Database {
                 "quarantine changed during resolution".into(),
             ));
         }
+        super::super::history_immutable_outbox::capture_generation_in_transaction(
+            &mut transaction,
+            &input.job_id.to_string(),
+        )
+        .await?;
         transaction.commit().await?;
         Ok(result)
     }

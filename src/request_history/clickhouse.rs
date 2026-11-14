@@ -235,6 +235,44 @@ impl ClickHouse {
         Ok(())
     }
 
+    /// Maintenance proof lookup by the entire physical identity. Unlike public
+    /// request lookup this includes events and cannot conflate source variants.
+    pub(crate) async fn baseline_snapshot(
+        &self,
+        identity: &super::HistoryIdentity,
+    ) -> Result<Option<HistorySnapshot>, HistoryError> {
+        #[derive(serde::Deserialize)]
+        struct Stored {
+            snapshot: String,
+            snapshot_hash: String,
+        }
+        let mut query = BoundQuery::new("");
+        let tenant = query.bind(identity.tenant_id, "UUID");
+        let key = query.bind(identity.key_id, "UUID");
+        let request = query.bind(identity.request_id, "UUID");
+        let source = query.bind(&identity.source, "String");
+        let created = query.bind(identity.created_at, "Int64");
+        query.sql = format!(
+            "SELECT snapshot,snapshot_hash FROM request_history_v1 FINAL WHERE tenant_id={tenant} AND key_id={key} AND request_id={request} AND source={source} AND created_at={created} FORMAT JSONEachRow"
+        );
+        let rows = self.rows::<Stored>(query).await?;
+        if rows.len() > 1 {
+            return Err(HistoryError::Mismatch);
+        }
+        rows.into_iter()
+            .next()
+            .map(|row| {
+                let snapshot: HistorySnapshot = serde_json::from_str(&row.snapshot)?;
+                if snapshot.identity != *identity
+                    || super::canonical_hash(&snapshot)? != row.snapshot_hash
+                {
+                    return Err(HistoryError::Mismatch);
+                }
+                Ok(snapshot)
+            })
+            .transpose()
+    }
+
     pub async fn snapshots(
         &self,
         query: &HistoryQuery,

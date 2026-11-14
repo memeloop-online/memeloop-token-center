@@ -29,9 +29,11 @@ mod conversation_capture_tests;
 mod conversation_stream;
 mod download;
 mod durable_roots;
+mod history_roots;
 mod multipart;
 mod objects;
 mod path;
+mod quota_reset_receipts;
 mod raw_cache;
 mod raw_capture;
 #[cfg(test)]
@@ -42,6 +44,7 @@ mod routing;
 mod routing_tests;
 #[cfg(test)]
 mod rustfs_contract_tests;
+mod semantic_manifest;
 mod session_projection;
 mod staging;
 mod supplier_summary;
@@ -59,6 +62,7 @@ pub use conversation::{ConversationExport, ConversationReadLimits};
 pub use download::ArchiveDownload;
 #[cfg(test)]
 use download::{validate_download_range, verified_download_stream};
+pub use history_roots::HistoryArchiveRoot;
 pub(crate) use multipart::ARCHIVE_MULTIPART_PART_BYTES;
 pub use multipart::{ArchiveWriter, StagedArchiveObject};
 #[cfg(test)]
@@ -66,6 +70,10 @@ use path::content_location;
 pub(crate) use path::is_tenant_cas_location;
 pub use raw_cache::CacheFifoPass;
 pub use raw_capture::{RawResponseAttempt, RawResponseAttemptCapture};
+pub use semantic_manifest::{
+    SemanticAtomBody, SemanticCoverage, SemanticHead, SemanticInstancePage, SemanticManifestV2,
+    SemanticNode, SemanticProjectionState, SemanticTurnInstance,
+};
 pub(crate) use session_projection::PreparedSessionBody;
 pub use staging::ArchiveStagingObjectStore;
 

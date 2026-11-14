@@ -1,6 +1,7 @@
 use std::time::Duration;
 
 mod allocation_history;
+mod history_immutable_outbox;
 mod quota_observations;
 
 use chrono::{Days, Utc};
@@ -67,6 +68,8 @@ mod filter_assistant;
 mod generation;
 mod group_routing;
 mod groups;
+mod history_delivery;
+mod history_source_snapshot;
 mod http_settings;
 mod migrations;
 mod monitoring_snapshot;

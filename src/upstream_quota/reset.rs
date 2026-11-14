@@ -13,6 +13,9 @@ const CONSUME_URL: &str = "https://chatgpt.com/backend-api/wham/rate-limit-reset
 /// an operation in submitted after its owning future has actually ended.
 struct DispatchCompletion {
     db: crate::db::Database,
+    archive: crate::archive::ArchiveStore,
+    tenant: Uuid,
+    account: Uuid,
     operation: String,
     owner: Uuid,
     accepted: bool,
@@ -26,30 +29,39 @@ impl Drop for DispatchCompletion {
             return;
         }
         let db = self.db.clone();
-        let operation = self.operation.clone();
-        let owner = self.owner;
-        let accepted = self.accepted;
-        let error = self.error.clone();
+        let archive = self.archive.clone();
+        let receipt = super::reset_receipt::Receipt {
+            version: 1,
+            backend_identity: self.archive.quota_reset_backend_identity(),
+            tenant: self.tenant,
+            account: self.account,
+            operation: Uuid::parse_str(&self.operation).expect("database operation UUID"),
+            owner: self.owner,
+            accepted: self.accepted,
+            error: self.error.clone(),
+        };
         if let Ok(runtime) = tokio::runtime::Handle::try_current() {
             runtime.spawn(async move {
                 let mut delay = Duration::from_secs(1);
                 loop {
-                    match db
-                        .finish_quota_reset_owned(
-                            &operation,
-                            Some(owner),
-                            accepted,
-                            error.as_deref(),
-                        )
-                        .await
+                    // Both operations may progress independently. Await publication before
+                    // retirement so a late PUT can never resurrect a deleted receipt.
+                    let (published, finished) =
+                        tokio::join!(receipt.publish(&archive), receipt.finish(&db));
+                    // Failed PUT may have lost its ACK: a shared worker will
+                    // discover and retire any object that actually committed.
+                    if matches!(finished, Ok(true))
+                        && (published.is_err() || receipt.retire(&archive).await.is_ok())
                     {
-                        Ok(()) => return,
-                        Err(error) => tracing::error!(
-                            operation_id = %operation,
-                            error = %error,
-                            "quota reset outcome persistence will retry without redispatch"
-                        ),
+                        return;
                     }
+                    if matches!(finished, Ok(false)) {
+                        tracing::warn!(
+                            "quota reset receipt owner or outcome conflict; local retry ended"
+                        );
+                        return;
+                    }
+                    tracing::warn!("quota reset outcome persistence deferred without redispatch");
                     tokio::time::sleep(delay).await;
                     delay = (delay * 2).min(Duration::from_secs(30));
                 }
@@ -302,11 +314,7 @@ async fn fresh_snapshot(
     // The reset workflow's credit precheck uses one attempt. Consumption below
     // uses its own fixed transport after the fresh read completes.
     budget.attempt_limit = 1;
-    let session = retry::ReadSession::new(
-        Some(state),
-        tokio::time::Instant::now() + budget.total,
-        budget,
-    );
+    let session = retry::ReadSession::reset_precheck(state, budget);
     let observed_started_at = unix_millis();
     let account_header =
         crate::oauth::managed::codex::account_header_value(credential).map_err(|_| blocked())?;
@@ -329,22 +337,19 @@ async fn fresh_snapshot(
     let fixture_url = test_supplier_url(account, credits_url);
     #[cfg(test)]
     let credits_url = fixture_url.as_str();
-    let reset = match tokio::time::timeout(
-        budget.total,
-        get_codex_json(
-            &state.codex_clients,
-            policy,
-            auth,
-            credits_url,
-            QuotaRequestContext::for_account(account, "credits", QuotaReadTrigger::ResetWorkflow),
-            budget,
-            &session,
-        ),
+    let reset = match get_codex_json(
+        &state.codex_clients,
+        policy,
+        auth,
+        credits_url,
+        QuotaRequestContext::for_account(account, "credits", QuotaReadTrigger::ResetWorkflow),
+        budget,
+        &session,
     )
     .await
     {
-        Ok(Ok(reset)) => reset,
-        Ok(Err(error)) => {
+        Ok(reset) => reset,
+        Err(error) => {
             log_quota_read_completed(
                 account,
                 QuotaReadTrigger::ResetWorkflow,
@@ -353,16 +358,6 @@ async fn fresh_snapshot(
                 refresh_started,
             );
             return Err(temporarily_unavailable("quota_reset_read_failed"));
-        }
-        Err(_) => {
-            log_quota_read_completed(
-                account,
-                QuotaReadTrigger::ResetWorkflow,
-                "error",
-                "quota_timeout",
-                refresh_started,
-            );
-            return Err(temporarily_unavailable("quota_reset_timeout"));
         }
     };
     let observed_at = unix_millis();
@@ -638,21 +633,26 @@ async fn confirm_guarded(
     // while COMMIT is in flight cannot drop the only recovery owner before the
     // claim's database outcome is known. This task never sends to the supplier.
     let db = state.db.clone();
+    let archive = state.archive.clone();
     let claim_account = account.clone();
     let claim_operation = operation.to_owned();
     let claim_actor = actor.to_owned();
     let claim_guard = guard.cloned();
     let (claim, mut completion) = tokio::spawn(async move {
+        let commit_started = std::sync::atomic::AtomicBool::new(false);
         let mut completion = DispatchCompletion {
             db: db.clone(),
+            archive,
+            tenant: claim_account.tenant_id,
+            account: claim_account.id,
             operation: claim_operation.clone(),
             owner: Uuid::now_v7(),
             accepted: false,
             error: Some("reset_dispatch_owner_ended".into()),
-            finished: false,
+            finished: true,
         };
         let claim = db
-            .claim_quota_reset_owned(
+            .claim_quota_reset_owned_tracked(
                 &claim_account,
                 &claim_operation,
                 &claim_actor,
@@ -660,8 +660,14 @@ async fn confirm_guarded(
                 &confirm_idempotency_hash,
                 claim_guard.as_ref(),
                 Some(completion.owner),
+                Some(&commit_started),
             )
-            .await?;
+            .await;
+        // Only the COMMIT boundary can create an uncertain durable claim.
+        // Validation, expiry and pre-COMMIT SQL failures cannot dispatch and
+        // must not create permanent orphan outcomes.
+        completion.finished = !commit_started.load(std::sync::atomic::Ordering::Acquire);
+        let claim = claim?;
         if matches!(claim, QuotaResetClaim::Replayed(_)) {
             completion.finished = true;
         }
@@ -697,6 +703,42 @@ async fn confirm_guarded(
     let accepted = result.is_ok();
     completion.accepted = accepted;
     completion.error = result.err();
+    // A detached publisher owns this immutable outcome even while the caller
+    // awaits DB completion. It cannot manufacture a second unknown outcome.
+    let receipt = super::reset_receipt::Receipt {
+        version: 1,
+        backend_identity: state.archive.quota_reset_backend_identity(),
+        tenant: account.tenant_id,
+        account: account.id,
+        operation: Uuid::parse_str(operation)
+            .map_err(|_| AppError::internal("quota_reset_receipt_encode"))?,
+        owner: completion.owner,
+        accepted,
+        error: completion.error.clone(),
+    };
+    let receipt_archive = state.archive.clone();
+    let receipt_db = state.db.clone();
+    tokio::spawn(async move {
+        let mut delay = Duration::from_secs(1);
+        loop {
+            let (published, finished) = tokio::join!(
+                receipt.publish(&receipt_archive),
+                receipt.finish(&receipt_db)
+            );
+            if matches!(finished, Ok(true))
+                && (published.is_err() || receipt.retire(&receipt_archive).await.is_ok())
+            {
+                break;
+            }
+            if matches!(finished, Ok(false)) {
+                tracing::warn!("quota reset receipt owner or outcome conflict; local retry ended");
+                break;
+            }
+            tokio::time::sleep(delay).await;
+            delay = (delay * 2).min(Duration::from_secs(30));
+        }
+    });
+    completion.finished = true;
     state
         .db
         .finish_quota_reset_owned(
@@ -924,6 +966,154 @@ mod tests {
         matchers::{body_json, method, path},
     };
 
+    #[tokio::test]
+    async fn accepted_receipt_survives_database_outage_without_supplier_replay() {
+        let supplier = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/consume"))
+            .respond_with(ResponseTemplate::new(200))
+            .expect(1)
+            .mount(&supplier)
+            .await;
+        let directory = tempfile::tempdir().unwrap();
+        let mut state = AppState::initialize(crate::config::Config::for_test(format!(
+            "sqlite://{}?mode=rwc",
+            directory.path().join("reset-recovery.db").display()
+        )))
+        .await
+        .unwrap();
+        state.archive = crate::archive::ArchiveStore::training_memory_for_test();
+        let tenant = "reset-recovery-fixture";
+        let credential = UpstreamCredential::OAuth {
+            access_token: "fixture-only".into(),
+            refresh_token: None,
+            expires_at: None,
+            header: "authorization".into(),
+            prefix: "Bearer ".into(),
+            adapter_state: Some(json!({
+                "schema": "openai-codex-oauth-v1", "account_id": "fixture-account"
+            })),
+            proxy_url: None,
+            proxy_network_scope: None,
+        };
+        let account = state
+            .db
+            .create_upstream_account(
+                crate::db::CreateUpstreamAccountInput {
+                    tenant_external_id: tenant.into(),
+                    name: "reset recovery".into(),
+                    driver: "openai-codex".into(),
+                    config: json!({
+                        "base_url": "https://chatgpt.com",
+                        "reset_test_supplier_url": format!("{}/", supplier.uri())
+                    }),
+                    credential: credential.clone(),
+                    oauth_session_id: None,
+                    oauth_driver: None,
+                    oauth_refresh_url: None,
+                },
+                state.config.key_pepper.as_bytes(),
+            )
+            .await
+            .unwrap();
+        let operation = state
+            .db
+            .prepare_quota_reset(PrepareQuotaReset {
+                id: Uuid::now_v7(),
+                account: account.clone(),
+                actor: "fixture".into(),
+                confirmation_hash: "fixture".into(),
+                prepare_idempotency_hash: "fixture".into(),
+                available: 2,
+                applicable: 2,
+                observed_at: unix_millis() - 1_000,
+            })
+            .await
+            .unwrap()
+            .operation;
+        let owner = Uuid::now_v7();
+        state
+            .db
+            .claim_quota_reset_owned(
+                &account,
+                &operation.id,
+                "fixture",
+                "fixture",
+                "fixture",
+                None,
+                Some(owner),
+            )
+            .await
+            .unwrap();
+        let client = crate::build_no_retry_http_client(None, &[]).unwrap();
+        dispatch_once(
+            &client,
+            &credential,
+            reqwest::header::HeaderValue::from_static("fixture-account"),
+            &format!("{}/consume", supplier.uri()),
+            "fixture-redeem",
+        )
+        .await
+        .unwrap();
+        let receipt = super::super::reset_receipt::Receipt {
+            version: 1,
+            backend_identity: state.archive.quota_reset_backend_identity(),
+            tenant: account.tenant_id,
+            account: account.id,
+            operation: Uuid::parse_str(&operation.id).unwrap(),
+            owner,
+            accepted: true,
+            error: None,
+        };
+        let url = format!(
+            "sqlite://{}?mode=rwc",
+            directory.path().join("reset-recovery.db").display()
+        );
+        let pool = sqlx::AnyPool::connect(&url).await.unwrap();
+        sqlx::query("ALTER TABLE upstream_quota_reset_operations RENAME TO outage_operations")
+            .execute(&pool)
+            .await
+            .unwrap();
+        assert!(receipt.finish(&state.db).await.is_err());
+        receipt.publish(&state.archive).await.unwrap();
+        // A lost publication ACK is safe: immutable identical publication is idempotent.
+        receipt.publish(&state.archive).await.unwrap();
+        sqlx::query("ALTER TABLE outage_operations RENAME TO upstream_quota_reset_operations")
+            .execute(&pool)
+            .await
+            .unwrap();
+        // A separate application instance discovers the receipt from the shared store.
+        // The in-memory store is a fixture, not a production cross-Pod durability claim.
+        let mut recovering = AppState::initialize(crate::config::Config::for_test(url))
+            .await
+            .unwrap();
+        recovering.archive = state.archive.clone();
+        super::super::reset_receipt::recover(&recovering).await;
+        super::super::reset_receipt::recover(&recovering).await;
+        assert_eq!(
+            recovering
+                .db
+                .quota_reset_operation(
+                    &account.tenant_id.to_string(),
+                    &account.id.to_string(),
+                    &operation.id
+                )
+                .await
+                .unwrap()
+                .state,
+            "accepted"
+        );
+        assert!(
+            recovering
+                .archive
+                .quota_reset_receipts(None)
+                .await
+                .unwrap()
+                .is_empty()
+        );
+        assert!(receipt.finish(&recovering.db).await.unwrap());
+        supplier.verify().await;
+    }
     #[tokio::test]
     async fn explicit_unknown_recovery_only_reads_credits_and_never_consumes() {
         let supplier = MockServer::start().await;

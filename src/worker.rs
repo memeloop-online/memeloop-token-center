@@ -295,6 +295,7 @@ pub async fn run_until_shutdown_with_oauth_stop(
                     tracing::error!(%error, "worker failed to delete expired budget rollup detail");
                 }
             }
+            crate::upstream_quota::reset_receipt::recover(state).await;
             let cleanup_deadline = tokio::time::Instant::now() + Duration::from_secs(5);
             let mut deleted_total = 0_u64;
             loop {
@@ -426,6 +427,8 @@ pub async fn run_until_shutdown_with_oauth_stop(
         PROJECTION_INTERVAL,
         async |state: &AppState, _shutdown: &watch::Receiver<bool>| {
             let (live_after, history_before) = identity_projection_cursor.lock().unwrap().clone();
+            tracing::debug!(target: "mtc_identity_projection", stage = "tick_start",
+                ?live_after, ?history_before, "conversation identity progress");
             match state
                 .db
                 .project_declared_conversation_identity_pages(
@@ -435,8 +438,14 @@ pub async fn run_until_shutdown_with_oauth_stop(
                 )
                 .await
             {
-                Ok(next) => *identity_projection_cursor.lock().unwrap() = next,
+                Ok(next) => {
+                    *identity_projection_cursor.lock().unwrap() = next;
+                    tracing::debug!(target: "mtc_identity_projection", stage = "cursor_committed",
+                        "conversation identity progress");
+                }
                 Err(error) => {
+                    tracing::debug!(target: "mtc_identity_projection", stage = "tick_failed",
+                        "conversation identity progress");
                     tracing::error!(%error, "worker failed to publish declared conversation identities")
                 }
             }

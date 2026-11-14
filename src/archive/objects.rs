@@ -4,7 +4,7 @@ use object_store::{ObjectStoreExt, PutPayload};
 
 use super::{
     ArchiveStore,
-    path::{archive_path, content_location, is_any_v1_cas_location, is_conversation_root_location},
+    path::{archive_path, content_location, is_any_v1_cas_location, is_durable_root_location},
 };
 use crate::error::AppError;
 
@@ -24,7 +24,7 @@ impl ArchiveStore {
         if location.starts_with(super::routing::PREFIX) {
             return Err(AppError::storage("archive_training_requires_immutable_cas"));
         }
-        if is_any_v1_cas_location(location) || is_conversation_root_location(location) {
+        if is_any_v1_cas_location(location) || is_durable_root_location(location) {
             return Err(AppError::BadRequest(
                 "archive CAS objects are immutable".into(),
             ));
@@ -48,7 +48,7 @@ impl ArchiveStore {
                 "archive_typed_objects_require_cleanup_capability",
             ));
         }
-        if is_any_v1_cas_location(location) || is_conversation_root_location(location) {
+        if is_any_v1_cas_location(location) || is_durable_root_location(location) {
             return Err(AppError::BadRequest(
                 "archive CAS objects are immutable".into(),
             ));

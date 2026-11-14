@@ -297,6 +297,11 @@ impl Database {
         .bind(&input.public_model)
         .execute(&mut *transaction)
         .await?;
+        super::super::history_immutable_outbox::capture_generation_in_transaction(
+            &mut transaction,
+            &request_id,
+        )
+        .await?;
         transaction.commit().await?;
         Ok(CreateGenerationJobResult::Created(GenerationJobView {
             job_id: input.job_id,
@@ -712,6 +717,11 @@ impl Database {
         .bind(&input.public_model)
         .execute(&mut *transaction)
         .await?;
+        super::super::history_immutable_outbox::capture_generation_in_transaction(
+            &mut transaction,
+            &request_id,
+        )
+        .await?;
         transaction.commit().await?;
         Ok(CreateGenerationJobResult::Created(GenerationJobView {
             job_id: input.job_id,
@@ -872,6 +882,11 @@ impl Database {
         let status: String = row.try_get("status")?;
         if status == "cancelled" {
             publish_generation_terminal_effects(&mut transaction, &job_id.to_string(), now).await?;
+            super::super::history_immutable_outbox::capture_generation_in_transaction(
+                &mut transaction,
+                &job_id.to_string(),
+            )
+            .await?;
             transaction.commit().await?;
             return self.generation_job(key_id, job_id).await;
         }
@@ -996,6 +1011,11 @@ impl Database {
         .bind(public_model)
         .bind(now.saturating_sub(created_at))
         .execute(&mut *transaction)
+        .await?;
+        super::super::history_immutable_outbox::capture_generation_in_transaction(
+            &mut transaction,
+            &request_id,
+        )
         .await?;
         transaction.commit().await?;
         self.generation_job(key_id, job_id).await

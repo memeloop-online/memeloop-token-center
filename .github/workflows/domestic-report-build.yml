@@ -1,0 +1,64 @@
+name: domestic-report-build
+on:
+  workflow_dispatch:
+permissions:
+  contents: read
+  packages: write
+jobs:
+  build:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+    steps:
+      - name: Restore verified source from encrypted secrets
+        env:
+          REPORT_PART_00: ${{ secrets.RELEASE_REPORT_PART_00 }}
+          REPORT_PART_01: ${{ secrets.RELEASE_REPORT_PART_01 }}
+          REPORT_PART_02: ${{ secrets.RELEASE_REPORT_PART_02 }}
+          REPORT_PART_03: ${{ secrets.RELEASE_REPORT_PART_03 }}
+          REPORT_PART_04: ${{ secrets.RELEASE_REPORT_PART_04 }}
+          REPORT_PART_05: ${{ secrets.RELEASE_REPORT_PART_05 }}
+          REPORT_PART_06: ${{ secrets.RELEASE_REPORT_PART_06 }}
+          REPORT_PART_07: ${{ secrets.RELEASE_REPORT_PART_07 }}
+          REPORT_PART_08: ${{ secrets.RELEASE_REPORT_PART_08 }}
+          REPORT_PART_09: ${{ secrets.RELEASE_REPORT_PART_09 }}
+          REPORT_PART_10: ${{ secrets.RELEASE_REPORT_PART_10 }}
+          REPORT_PART_11: ${{ secrets.RELEASE_REPORT_PART_11 }}
+          REPORT_PART_12: ${{ secrets.RELEASE_REPORT_PART_12 }}
+          REPORT_PART_13: ${{ secrets.RELEASE_REPORT_PART_13 }}
+          REPORT_PART_14: ${{ secrets.RELEASE_REPORT_PART_14 }}
+          REPORT_PART_15: ${{ secrets.RELEASE_REPORT_PART_15 }}
+          REPORT_PART_16: ${{ secrets.RELEASE_REPORT_PART_16 }}
+          REPORT_PART_17: ${{ secrets.RELEASE_REPORT_PART_17 }}
+          REPORT_PART_18: ${{ secrets.RELEASE_REPORT_PART_18 }}
+        run: |
+          set -euo pipefail
+          umask 077
+          for i in $(seq -w 0 18); do
+            name="REPORT_PART_$i"
+            test -n "${!name}"
+            printf '%s' "${!name}"
+          done | base64 -d > "$RUNNER_TEMP/report-source.tar.gz"
+          echo '40e7d4a9bbd8000296c39c9f0fb4e3cb0f7f99be0ac3eb1c4811676120a0a488  '"$RUNNER_TEMP/report-source.tar.gz" | sha256sum --check
+          mkdir -p website-source
+          tar -xzf "$RUNNER_TEMP/report-source.tar.gz" --strip-components=1 -C website-source
+          rm -f "$RUNNER_TEMP/report-source.tar.gz"
+      - uses: docker/setup-buildx-action@8d2750c68a42422c14e847fe6c8ac0403b4cbd6f
+      - uses: docker/login-action@c94ce9fb468520275223c153574b00df6fe4bcc9
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+      - name: Build and push exact website Dockerfile
+        id: build
+        uses: docker/build-push-action@10e90e3645eae34f1e60eeb005ba3a3d33f178e8
+        with:
+          context: website-source
+          file: website-source/Dockerfile
+          push: true
+          tags: ghcr.io/memeloop-online/domestic-model-report:source-69006304f110e1d3f255998bb49c024b44068184
+      - name: Record immutable digest
+        env:
+          IMAGE_DIGEST: ${{ steps.build.outputs.digest }}
+        run: |
+          [[ "$IMAGE_DIGEST" =~ ^sha256:[0-9a-f]{64}$ ]]
+          echo "source=69006304f110e1d3f255998bb49c024b44068184 image=ghcr.io/memeloop-online/domestic-model-report@$IMAGE_DIGEST" >> "$GITHUB_STEP_SUMMARY"

@@ -823,6 +823,26 @@ pub(crate) const SQLITE_MIGRATIONS: &[Migration] = &[
         name: "archive staging durable backend identity",
         sql: include_str!("../../../migrations/common/0155_archive_staging_backend_identity.sql"),
     },
+    Migration {
+        version: 156,
+        name: "immutable history delivery envelope",
+        sql: include_str!("../../../migrations/common/0156_immutable_history_outbox.sql"),
+    },
+    Migration {
+        version: 157,
+        name: "compact history identity and delivery receipts",
+        sql: include_str!("../../../migrations/common/0157_history_identity_receipts.sql"),
+    },
+    Migration {
+        version: 158,
+        name: "history delivery watermark fence",
+        sql: include_str!("../../../migrations/common/0158_history_delivery_ceiling.sql"),
+    },
+    Migration {
+        version: 159,
+        name: "consistent history baseline receipts",
+        sql: include_str!("../../../migrations/common/0159_history_baseline_receipts.sql"),
+    },
 ];
 
 pub(crate) const POSTGRES_MIGRATIONS: &[Migration] = &[
@@ -1620,6 +1640,26 @@ pub(crate) const POSTGRES_MIGRATIONS: &[Migration] = &[
         version: 155,
         name: "archive staging durable backend identity",
         sql: include_str!("../../../migrations/common/0155_archive_staging_backend_identity.sql"),
+    },
+    Migration {
+        version: 156,
+        name: "immutable history delivery envelope",
+        sql: include_str!("../../../migrations/common/0156_immutable_history_outbox.sql"),
+    },
+    Migration {
+        version: 157,
+        name: "compact history identity and delivery receipts",
+        sql: include_str!("../../../migrations/common/0157_history_identity_receipts.sql"),
+    },
+    Migration {
+        version: 158,
+        name: "history delivery watermark fence",
+        sql: include_str!("../../../migrations/common/0158_history_delivery_ceiling.sql"),
+    },
+    Migration {
+        version: 159,
+        name: "consistent history baseline receipts",
+        sql: include_str!("../../../migrations/common/0159_history_baseline_receipts.sql"),
     },
 ];
 

@@ -40,7 +40,7 @@ impl ArchiveStore {
             return Err(AppError::storage("archive_training_requires_immutable_cas"));
         }
         if super::path::is_any_v1_cas_location(location)
-            || super::path::is_conversation_root_location(location)
+            || super::path::is_durable_root_location(location)
         {
             return Err(AppError::BadRequest(
                 "archive CAS objects are immutable".into(),

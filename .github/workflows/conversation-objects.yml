@@ -93,6 +93,7 @@ jobs:
       - run: cargo test --locked --lib db::archive_staging::backend_tests
       - run: cargo test --locked --lib gateway_body::carrier::tests
       - run: cargo test --locked --lib archive::carrier_ownership::tests
+      - run: cargo test --locked --lib archive::semantic_manifest::tests
       - run: cargo test --locked --lib archive::routing_tests
       - run: cargo test --locked --lib archive::compressed_tests
       - run: cargo test --locked --lib archive::text
