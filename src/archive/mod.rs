@@ -44,6 +44,8 @@ mod routing_tests;
 #[cfg(test)]
 mod rustfs_contract_tests;
 mod semantic_manifest;
+mod semantic_publication;
+pub use semantic_publication::SemanticPublication;
 mod session_projection;
 mod staging;
 mod supplier_summary;
