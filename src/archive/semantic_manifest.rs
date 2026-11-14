@@ -314,3 +314,112 @@ impl super::ArchiveStore {
         Ok(node)
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use bytes::Bytes;
+    use serde_json::json;
+
+    fn manifest(tenant: Uuid) -> SemanticManifestV2 {
+        SemanticManifestV2 {
+            format_version: 2,
+            projection_version: 2,
+            tenant_id: tenant,
+            session_id: "development-session".into(),
+            branch_id: "main".into(),
+            parent_branch_id: None,
+            parent_turn_id: None,
+            request_id: Uuid::now_v7(),
+            revision: 1,
+            backend_identity: None,
+            semantic_head: None,
+            instances_head: None,
+            coverage: SemanticCoverage {
+                observed_terminal: true,
+                projection_state: SemanticProjectionState::Complete,
+                omissions: Vec::new(),
+                gaps: Vec::new(),
+            },
+        }
+    }
+
+    #[tokio::test]
+    async fn existing_atom_bytes_are_reused_with_origin_in_occurrence_only() {
+        let archive = super::super::tests::memory_store();
+        let tenant = Uuid::now_v7();
+        let canonical = json!({"role":"assistant", "parts":[
+            {"part_index":0,"kind":"reasoning","text":"inspect the result"},
+            {"part_index":1,"kind":"tool_call","call_id":"call-1",
+             "tool_name":"read","arguments":{"path":"source.rs"}}
+        ]});
+        let atom_hash = blake3::hash(&serde_json::to_vec(&canonical).unwrap())
+            .to_hex()
+            .to_string();
+        let mut legacy = canonical.clone();
+        legacy["origin"] = json!("return");
+        let object = archive
+            .put_tenant_content(tenant, Bytes::from(serde_json::to_vec(&legacy).unwrap()))
+            .await
+            .unwrap();
+        let mut instance = SemanticTurnInstance {
+            instance_id: "one-occurrence".into(),
+            request_id: Uuid::now_v7(),
+            attempt_id: None,
+            message_id: None,
+            turn_id: None,
+            branch_id: "main".into(),
+            parent_instance_id: None,
+            origin: "return".into(),
+            ordinal: 0,
+            atom_hash,
+            node_hash: "a".repeat(64),
+            terminal_state: "completed".into(),
+            body: object.clone(),
+        };
+        let read = archive.get_semantic_atom(tenant, &instance).await.unwrap();
+        assert_eq!(serde_json::to_value(read).unwrap(), canonical);
+        instance.origin = "request".into();
+        assert!(archive.get_semantic_atom(tenant, &instance).await.is_ok());
+        // Reader reuse never rewrites the existing legacy physical object.
+        let stored = archive
+            .get_tenant_content(tenant, &object, 4096)
+            .await
+            .unwrap();
+        assert_eq!(
+            serde_json::from_slice::<serde_json::Value>(&stored).unwrap(),
+            legacy
+        );
+        instance.atom_hash = "b".repeat(64);
+        assert!(archive.get_semantic_atom(tenant, &instance).await.is_err());
+        assert!(
+            archive
+                .get_semantic_atom(Uuid::now_v7(), &instance)
+                .await
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn incomplete_prefix_and_false_complete_coverage_are_rejected() {
+        let atom = "c".repeat(64);
+        let mut node = SemanticNode {
+            node_hash: crate::conversation::digest_parts(None, &atom),
+            parent_hash: None,
+            atom_hash: atom,
+            depth: 1,
+        };
+        let expected = SemanticHead {
+            node_hash: node.node_hash.clone(),
+            depth: 1,
+        };
+        assert!(node.validate(&expected).is_ok());
+        node.depth = 2;
+        assert!(node.validate(&expected).is_err());
+        let mut manifest = manifest(Uuid::now_v7());
+        manifest.coverage.gaps.push("tool_result_missing".into());
+        assert!(manifest.validate(manifest.tenant_id).is_err());
+        manifest.coverage.projection_state = SemanticProjectionState::Partial;
+        assert!(manifest.validate(manifest.tenant_id).is_ok());
+    }
+}
