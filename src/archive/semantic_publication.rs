@@ -201,3 +201,65 @@ impl ArchiveStore {
         Ok(publication)
     }
 }
+
+/// An exact observation of the committed SQL handoff. Construction stays in
+/// Database; a caller cannot substitute an object-exists boolean for binding.
+#[derive(Serialize)]
+pub(crate) struct SemanticBindingProof {
+    pub(crate) tenant_id: Uuid,
+    pub(crate) request_id: Uuid,
+    pub(crate) node_hash: String,
+    pub(crate) projected_at: i64,
+}
+
+impl ArchiveStore {
+    pub(crate) async fn confirm_semantic_coverage(
+        &self,
+        publication: &SemanticPublication,
+        proof: &SemanticBindingProof,
+    ) -> Result<(), AppError> {
+        let manifest = self
+            .get_semantic_manifest_streamed(publication.tenant_id, &publication.manifest)
+            .await?;
+        if manifest.request_id != proof.request_id
+            || manifest.tenant_id != proof.tenant_id
+            || publication.request_id != proof.request_id
+            || publication.projection_version != manifest.projection_version
+            || publication.revision != manifest.revision
+            || manifest.coverage.projection_state != super::SemanticProjectionState::Complete
+            || !manifest.coverage.observed_terminal
+            || !manifest.coverage.gaps.is_empty()
+            || manifest
+                .semantic_head
+                .as_ref()
+                .map(|head| head.node_hash.as_str())
+                != Some(proof.node_hash.as_str())
+        {
+            return Err(AppError::storage("semantic_coverage_binding_mismatch"));
+        }
+        #[derive(Serialize)]
+        struct Receipt<'a> {
+            format_version: u32,
+            publication: &'a SemanticPublication,
+            binding: &'a SemanticBindingProof,
+            coverage: &'a super::SemanticCoverage,
+        }
+        let receipt = Receipt {
+            format_version: 2,
+            publication,
+            binding: proof,
+            coverage: &manifest.coverage,
+        };
+        self.restore_durable_root(
+            &format!(
+                "tenants/{}/semantic/v2/requests/{}/{}-coverage.json",
+                proof.tenant_id, proof.request_id, publication.revision,
+            ),
+            Bytes::from(
+                serde_json::to_vec(&receipt)
+                    .map_err(|_| AppError::internal("semantic_coverage_encode"))?,
+            ),
+        )
+        .await
+    }
+}

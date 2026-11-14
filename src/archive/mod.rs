@@ -45,6 +45,7 @@ mod routing_tests;
 mod rustfs_contract_tests;
 mod semantic_manifest;
 mod semantic_publication;
+pub(crate) use semantic_publication::SemanticBindingProof;
 pub use semantic_publication::SemanticPublication;
 mod session_projection;
 mod staging;
