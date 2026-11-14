@@ -2429,3 +2429,58 @@ mod tests {
         Ok(atoms)
     }
 }
+
+#[cfg(test)]
+mod semantic_reasoning_tool_contracts {
+    use super::*;
+    use serde_json::json;
+
+    #[test]
+    fn chat_stream_preserves_fragmented_plaintext_reasoning() {
+        let bytes = b"data: {\"choices\":[{\"index\":0,\"delta\":{\"role\":\"assistant\",\"reasoning_content\":\"first \"}}]}\n\ndata: {\"choices\":[{\"index\":0,\"delta\":{\"reasoning_content\":\"second\",\"content\":\"answer\"}}]}\n\ndata: [DONE]\n\n";
+        let response = raw_return_document(bytes).unwrap();
+        let body = session_body_from_documents(&json!({}), &response);
+        assert!(
+            body.turns
+                .iter()
+                .flat_map(|t| &t.parts)
+                .any(|p| p.kind == "reasoning" && p.text.as_deref() == Some("first second"))
+        );
+        assert!(
+            body.turns
+                .iter()
+                .flat_map(|t| &t.parts)
+                .any(|p| p.text.as_deref() == Some("answer"))
+        );
+    }
+
+    #[test]
+    fn summary_is_readable_and_user_owned_encrypted_keys_survive() {
+        let reasoning = json!({"type":"reasoning","encrypted_content":"opaque-provider","summary":[{"type":"summary_text","text":"visible summary"}]});
+        let mut parts = Vec::new();
+        push_content_part(&mut parts, &reasoning, None, None);
+        assert_eq!(parts.len(), 1);
+        assert_eq!(parts[0].kind, "reasoning");
+        assert_eq!(parts[0].text.as_deref(), Some("visible summary"));
+        let call = json!({"type":"tool_use","id":"call-1","name":"inspect","input":{"encrypted_content":"user value","nested":{"encrypted_reasoning":"ordinary data"}}});
+        push_content_part(&mut parts, &call, None, None);
+        assert_eq!(parts[1].tool_name.as_deref(), Some("inspect"));
+        assert_eq!(parts[1].call_id.as_deref(), Some("call-1"));
+        assert_eq!(
+            parts[1].arguments.as_ref().unwrap()["encrypted_content"],
+            "user value"
+        );
+        assert_eq!(
+            parts[1].arguments.as_ref().unwrap()["nested"]["encrypted_reasoning"],
+            "ordinary data"
+        );
+        let result = json!({"type":"tool_result","tool_use_id":"call-1","content":[{"type":"text","text":"tool reply"}],"is_error":false});
+        push_content_part(&mut parts, &result, None, None);
+        assert_eq!(parts[2].tool_call_id.as_deref(), Some("call-1"));
+        assert_eq!(parts[2].result_content.as_ref(), result.get("content"));
+        assert_eq!(parts[2].result_status.as_deref(), Some("observed"));
+        let encoded = part_value(&parts[1], parts[1].text.clone());
+        assert_eq!(encoded["tool_name"], "inspect");
+        assert!(encoded["arguments"].is_object());
+    }
+}
