@@ -111,12 +111,7 @@ impl BodyCarrier {
         let mut count = Count(0);
         serde_json::to_writer(&mut count, &value)
             .map_err(|_| AppError::internal("normalized_encode_failed"))?;
-        if count
-            .0
-            .checked_add(64 * 1024 - 1)
-            .map(|n| n / (64 * 1024))
-            .is_none_or(|units| units > previous.request_json_reserved_bytes() / (64 * 1024))
-        {
+        if !previous.try_extend_normalized_envelope(count.0) {
             return Ok(Err((value, capture)));
         }
         let mut encoded = Vec::with_capacity(count.0);
