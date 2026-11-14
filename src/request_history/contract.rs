@@ -26,6 +26,46 @@ pub enum HistoryError {
     Json(#[from] serde_json::Error),
 }
 
+impl HistoryError {
+    /// CLI diagnostics deliberately exclude SQL, URLs, payloads and dynamic
+    /// error messages. Preserve the actionable category and server SQLSTATE.
+    pub fn safe_diagnostic(&self) -> Value {
+        match self {
+            Self::Invalid(reason) => json!({"category":"invalid","reason":reason}),
+            Self::Verification(reason) => json!({"category":"verification","reason":reason}),
+            Self::Sql(error) => {
+                json!({"category":"sql","sql_state":error.as_database_error().and_then(|error| error.code()).map(|code| code.into_owned())})
+            }
+            Self::Rejected { status, code } => {
+                json!({"category":"clickhouse_rejected","status":status,"code":code})
+            }
+            Self::Unavailable => json!({"category":"unavailable"}),
+            Self::Changed => json!({"category":"changed"}),
+            Self::Mismatch => json!({"category":"mismatch"}),
+            Self::Database(_) => json!({"category":"database"}),
+            Self::Json(_) => json!({"category":"json"}),
+        }
+    }
+}
+
+#[cfg(test)]
+mod diagnostic_tests {
+    use super::*;
+
+    #[test]
+    fn request_history_cli_diagnostic_preserves_static_cause_without_dynamic_secrets() {
+        let error = HistoryError::Sql(sqlx::Error::Protocol("password=must-never-appear".into()));
+        assert_eq!(
+            error.safe_diagnostic(),
+            json!({"category":"sql","sql_state":null})
+        );
+        assert_eq!(
+            HistoryError::Verification("capture bootstrap incomplete or changed").safe_diagnostic(),
+            json!({"category":"verification","reason":"capture bootstrap incomplete or changed"})
+        );
+    }
+}
+
 impl From<crate::error::AppError> for HistoryError {
     fn from(error: crate::error::AppError) -> Self {
         Self::Database(Box::new(error))
