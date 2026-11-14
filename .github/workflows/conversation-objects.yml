@@ -91,6 +91,8 @@ jobs:
       - run: cargo test --locked --lib archive::session_projection -- --test-threads=1
       - run: cargo test --locked --lib conversation::return_stream_tests
       - run: cargo test --locked --lib db::archive_staging::backend_tests
+      - run: cargo test --locked --lib gateway_body::carrier::tests
+      - run: cargo test --locked --lib archive::carrier_ownership::tests
       - run: cargo test --locked --lib archive::routing_tests
       - run: cargo test --locked --lib archive::compressed_tests
       - run: cargo test --locked --lib archive::text
