@@ -645,15 +645,21 @@ mod tests {
         let memory = Arc::new(ProxyMemoryBudget::new(128 * 1024));
         let source = full_ram_source(memory.clone()).await;
         source.seal_to_objects().await.unwrap();
-        let plan = BodyCarrier::capture(
+        // Ingress retention credit intentionally offloads early when an object
+        // backend is present. Build the full-RAM fixture without that backend,
+        // then enable object pressure handling, as full_ram_source does.
+        let mut capture = CarrierCapture::derived_from(&source, key());
+        capture.archive = None;
+        let mut plan = BodyCarrier::capture(
             stream::iter([
                 Ok::<_, std::io::Error>(Bytes::from(vec![b'p'; 65536])),
                 Ok(Bytes::from(vec![b'q'; 65536])),
             ]),
-            CarrierCapture::derived_from(&source, key()),
+            capture,
         )
         .await
         .unwrap();
+        Arc::get_mut(&mut plan).unwrap().archive = source.archive.clone();
         assert_eq!(memory.snapshot().0, 128 * 1024);
         let bytes = tokio::time::timeout(
             std::time::Duration::from_secs(2),
