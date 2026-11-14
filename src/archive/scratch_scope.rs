@@ -195,3 +195,60 @@ impl Drop for ScratchScope {
         }
     }
 }
+
+#[cfg(test)]
+impl ArchiveStore {
+    pub(crate) fn with_read_delay_for_test(
+        mut self,
+    ) -> (
+        Self,
+        Arc<object_store::throttle::ThrottledStore<Arc<dyn object_store::ObjectStore>>>,
+    ) {
+        let store = Arc::new(object_store::throttle::ThrottledStore::new(
+            self.inner.clone(),
+            Default::default(),
+        ));
+        self.inner = store.clone();
+        (self, store)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    fn key() -> ArchiveStagingKey {
+        let id = uuid::Uuid::new_v4();
+        ArchiveStagingKey::new(
+            ArchiveStagingOwner::ProxyRequest(id),
+            ArchiveStagingPurpose::Response,
+            id,
+        )
+        .unwrap()
+    }
+    #[tokio::test]
+    async fn scratch_pages_use_conditional_replacement_and_cancelled_puts_remain_owned() {
+        let (archive, store) = ArchiveStore::memory_for_test().with_read_delay_for_test();
+        let scope = ScratchScope::for_test(archive.clone(), key());
+        scope.write_page(7, b"first").await.unwrap();
+        scope.write_page(7, b"later").await.unwrap();
+        let mut bytes = [0; 5];
+        scope.read_page(7, &mut bytes).await.unwrap();
+        assert_eq!(&bytes, b"later");
+        store.config_mut(|config| config.wait_put_per_call = std::time::Duration::from_secs(60));
+        assert!(
+            tokio::time::timeout(
+                std::time::Duration::from_millis(20),
+                scope.write_page(7, b"never")
+            )
+            .await
+            .is_err()
+        );
+        assert!(scope.uncertain.load(Ordering::Acquire));
+        assert!(scope.write_page(7, b"again").await.is_err());
+        let key = scope.key;
+        drop(scope);
+        // Unknown publication does not authorize immediate scope deletion.
+        assert!(!archive.archive_staging_segment_is_empty(key).await.unwrap());
+        store.config_mut(|config| config.wait_put_per_call = std::time::Duration::ZERO);
+    }
+}

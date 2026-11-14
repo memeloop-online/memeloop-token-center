@@ -32,6 +32,8 @@ jobs:
       - uses: ./.github/actions/checkout-plugin-examples
       - name: JSON indexing contracts
         run: cargo test --locked --lib json_source
+      - name: Typed scratch scope publication and cleanup contracts
+        run: cargo test --locked --lib archive::scratch_scope
       - name: Compact translation, large bodies, unknown fields and cancellation
         run: cargo test --locked --lib api::proxy::routing::compact_file
       - name: Compact HTTP capture and replay contracts

@@ -311,6 +311,84 @@ mod tests {
     use super::*;
     use sha2::{Digest, Sha256};
 
+    #[tokio::test]
+    async fn large_decoded_keys_spill_with_a_fixed_metadata_lease() {
+        use crate::{
+            archive::{ArchiveStore, scratch_scope::ScratchScope},
+            archive_staging::*,
+            gateway_body::{
+                carrier::{BodyCarrier, CarrierCapture},
+                memory::ProxyMemoryBudget,
+            },
+        };
+        let archive = ArchiveStore::memory_for_test();
+        let memory = Arc::new(ProxyMemoryBudget::new(128 * 1024));
+        let id = uuid::Uuid::new_v4();
+        let key = ArchiveStagingKey::new(
+            ArchiveStagingOwner::ProxyRequest(id),
+            ArchiveStagingPurpose::Response,
+            id,
+        )
+        .unwrap();
+        let source = BodyCarrier::capture(
+            futures_util::stream::empty::<std::result::Result<bytes::Bytes, std::io::Error>>(),
+            CarrierCapture::new(memory.clone(), Some(archive.clone()), key),
+        )
+        .await
+        .unwrap();
+        let lease = source
+            .reserve_metadata_workspace(super::super::pager::WORKSPACE_BYTES)
+            .await
+            .unwrap();
+        let runtime = tokio::runtime::Handle::current();
+        let tracked_memory = memory.clone();
+        tokio::task::spawn_blocking(move || {
+            let mut index = Index::scratch(
+                ScratchScope::for_test(archive, key),
+                lease,
+                runtime,
+                Arc::new(AtomicBool::new(false)),
+                Arc::new(tokio::sync::Notify::new()),
+            )
+            .unwrap();
+            let mut root = 0;
+            for number in 0..8u8 {
+                let key = vec![number; 128 * 1024];
+                let start = index.append(&key).unwrap();
+                index
+                    .insert_key(
+                        &mut root,
+                        Sha256::digest(&key).into(),
+                        Span {
+                            start,
+                            end: start + key.len() as u64,
+                        },
+                    )
+                    .unwrap();
+                assert_eq!(
+                    tracked_memory.snapshot().0,
+                    super::super::pager::WORKSPACE_BYTES
+                );
+            }
+            let key = vec![3; 128 * 1024];
+            let start = index.append(&key).unwrap();
+            assert_eq!(
+                index.insert_key(
+                    &mut root,
+                    Sha256::digest(&key).into(),
+                    Span {
+                        start,
+                        end: start + key.len() as u64
+                    }
+                ),
+                Err("duplicate_json_key")
+            );
+        })
+        .await
+        .unwrap();
+        assert_eq!(memory.snapshot().0, 0);
+    }
+
     #[test]
     fn ram_radix_preserves_all_keys_and_exact_digest_collision_comparison() {
         let mut index = Index::memory().unwrap();
