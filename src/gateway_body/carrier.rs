@@ -83,7 +83,7 @@ pub(crate) struct BodyCarrier {
     allocations: Mutex<Vec<Weak<Allocation>>>,
     length: u64,
     digest: String,
-    owned_objects: Mutex<Vec<CarrierObjectOwner>>,
+    owned_objects: Mutex<Vec<(CarrierObjectOwner, bool)>>,
 }
 
 impl BodyCarrier {
@@ -239,7 +239,10 @@ impl BodyCarrier {
         // Register exact ownership before any remote operation: a finish whose
         // acknowledgement is lost must not orphan an object outside cleanup.
         let owner = CarrierObjectOwner::new(self.staging, locator.clone(), &bytes)?;
-        self.owned_objects.lock().unwrap().push(owner.clone());
+        self.owned_objects
+            .lock()
+            .unwrap()
+            .push((owner.clone(), false));
         archive.begin_carrier_object(&owner).await?;
         let mut writer = archive.start_writer(&locator).await?;
         if let Err(error) = writer.write(bytes.clone()).await {
@@ -251,6 +254,18 @@ impl BodyCarrier {
             || staged.blake3_digest != blake3::hash(&bytes).to_hex().as_str()
         {
             return Err(AppError::storage("carrier_stage_identity_mismatch"));
+        }
+        // Only a confirmed Complete response plus exact identity authorizes
+        // release cleanup. Unknown/cancelled completions retain their durable
+        // active receipt: HEAD absence cannot prove no late completion.
+        if let Some((_, settled)) = self
+            .owned_objects
+            .lock()
+            .unwrap()
+            .iter_mut()
+            .find(|(candidate, _)| candidate == &owner)
+        {
+            *settled = true;
         }
         // A complete object, not an UploadPart ACK, is now replayable. Only
         // replacing this segment releases the unique RAM allocation lease.
@@ -369,10 +384,14 @@ impl BodyCarrier {
                                                             );
                                                             let owned = memory
                                                                 .leased_bytes(owned, lease, None);
-                                                            Ok(Some((
-                                                                owned,
-                                                                (Ok(bytes), offset + count),
-                                                            )))
+                                                            let next = offset + count;
+                                                            let state = if next == bytes.len() {
+                                                                drop(bytes);
+                                                                (Ok(Bytes::new()), 0)
+                                                            } else {
+                                                                (Ok(bytes), next)
+                                                            };
+                                                            Ok(Some((owned, state)))
                                                         }
                                                     },
                                                 ))
@@ -505,7 +524,10 @@ impl Drop for BodyCarrier {
         }
         if let Ok(runtime) = tokio::runtime::Handle::try_current() {
             runtime.spawn(async move {
-                for owner in objects {
+                for (owner, settled) in objects {
+                    if !settled {
+                        continue;
+                    }
                     if archive.release_carrier_object(&owner).await.is_err() {
                         tracing::warn!(
                             stage = "carrier_cleanup",
