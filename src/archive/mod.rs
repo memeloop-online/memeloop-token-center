@@ -43,6 +43,7 @@ mod routing;
 mod routing_tests;
 #[cfg(test)]
 mod rustfs_contract_tests;
+mod semantic_manifest;
 mod session_projection;
 mod staging;
 mod supplier_summary;
@@ -67,6 +68,10 @@ use path::content_location;
 pub(crate) use path::is_tenant_cas_location;
 pub use raw_cache::CacheFifoPass;
 pub use raw_capture::{RawResponseAttempt, RawResponseAttemptCapture};
+pub use semantic_manifest::{
+    SemanticAtomBody, SemanticCoverage, SemanticHead, SemanticInstancePage, SemanticManifestV2,
+    SemanticNode, SemanticProjectionState, SemanticTurnInstance,
+};
 pub(crate) use session_projection::PreparedSessionBody;
 pub use staging::ArchiveStagingObjectStore;
 

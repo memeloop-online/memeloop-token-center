@@ -61,7 +61,7 @@ fn line(value: serde_json::Value) -> Result<Bytes, AppError> {
 }
 
 impl ArchiveStore {
-    async fn read_tenant_json_streamed<T: DeserializeOwned + Send + 'static>(
+    pub(super) async fn read_tenant_json_streamed<T: DeserializeOwned + Send + 'static>(
         &self,
         tenant: Uuid,
         object: &CasArchiveObject,
