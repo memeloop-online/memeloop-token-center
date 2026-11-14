@@ -612,10 +612,38 @@ impl ReturnDocumentAccumulator {
         }) {
             if event.is_empty() || event == "response.completed" {
                 *completed = Some(response.clone());
-            } else if responses.is_empty() {
-                if let Some(items) = response.get("output").and_then(Value::as_array) {
-                    for (index, item) in items.iter().enumerate() {
-                        responses.insert(index as u64, item.clone());
+            } else if let Some(items) = response.get("output").and_then(Value::as_array) {
+                for (position, item) in items.iter().enumerate() {
+                    let index = item
+                        .get("id")
+                        .and_then(Value::as_str)
+                        .and_then(|id| {
+                            responses.iter().find_map(|(index, observed)| {
+                                (observed.get("id").and_then(Value::as_str) == Some(id))
+                                    .then_some(*index)
+                            })
+                        })
+                        .unwrap_or(position as u64);
+                    let target = responses
+                        .entry(index)
+                        .or_insert_with(|| Value::Object(Map::new()));
+                    if let (Some(target), Some(snapshot)) =
+                        (target.as_object_mut(), item.as_object())
+                    {
+                        for (key, value) in snapshot {
+                            let empty = value.is_null()
+                                || value.as_str().is_some_and(str::is_empty)
+                                || value.as_array().is_some_and(Vec::is_empty);
+                            if !empty || !target.contains_key(key) {
+                                target.insert(key.clone(), value.clone());
+                            }
+                            if !empty && matches!(key.as_str(), "content" | "summary") {
+                                let summary = key == "summary";
+                                response_parts.retain(|(output, is_summary, _), _| {
+                                    *output != index || *is_summary != summary
+                                });
+                            }
+                        }
                     }
                 }
             }
@@ -2688,6 +2716,27 @@ mod semantic_partial_stream_contracts {
         assert_eq!(parts[2].arguments_text.as_deref(), Some("{\"path\":\"b"));
         assert!(parts[2].arguments.is_none());
         assert_eq!(parts[3].text.as_deref(), Some("partial answer"));
+    }
+
+    #[test]
+    fn incomplete_snapshot_keeps_observed_items_and_adds_nonempty_terminal_content() {
+        let events = vec![
+            json!({"type":"response.output_item.added","output_index":0,"item":{"type":"message","id":"message-a","role":"assistant","content":[]}}),
+            json!({"type":"response.output_item.added","output_index":1,"item":{"type":"function_call","id":"item-tool","call_id":"call-kept","name":"inspect","arguments":"{\"x\":1}"}}),
+            json!({"type":"response.incomplete","response":{"status":"incomplete","output":[{"type":"message","id":"message-a","role":"assistant","content":[{"type":"output_text","text":"observed final fragment"}]}]}}),
+        ];
+        let wire = events
+            .into_iter()
+            .map(|event| format!("data: {event}\n\n"))
+            .collect::<String>();
+        let response = raw_return_document(wire.as_bytes()).unwrap();
+        let body = session_body_from_documents(&json!({}), &response);
+        let parts: Vec<_> = body.turns.iter().flat_map(|turn| &turn.parts).collect();
+        assert_eq!(parts.len(), 2);
+        assert_eq!(parts[0].text.as_deref(), Some("observed final fragment"));
+        assert_eq!(parts[1].call_id.as_deref(), Some("call-kept"));
+        assert_eq!(parts[1].arguments.as_ref().unwrap()["x"], 1);
+        assert_eq!(response["status"], "partial");
     }
 
     #[test]
