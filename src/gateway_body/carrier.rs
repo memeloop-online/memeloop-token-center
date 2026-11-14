@@ -84,6 +84,7 @@ pub(crate) struct BodyCarrier {
     length: u64,
     digest: String,
     owned_objects: Mutex<Vec<(CarrierObjectOwner, bool)>>,
+    _external_owner: Option<Arc<dyn Send + Sync>>,
 }
 
 impl BodyCarrier {
@@ -150,11 +151,51 @@ impl BodyCarrier {
             length,
             digest,
             owned_objects: Mutex::new(Vec::new()),
+            _external_owner: None,
         };
         let owned = source.leased_bytes(Bytes::from(encoded), lease, None);
         let mut source = source;
         source.segments.push(Mutex::new(Segment::Ram(owned)));
         Ok(Arc::new(source))
+    }
+
+    /// Adopt a completely sealed typed object without reading or uploading it
+    /// again. The creating scope remains responsible until the final reader is
+    /// gone; unknown multipart results must never be passed to this constructor.
+    pub(crate) fn from_owned_staged(
+        reference: StagedArchiveObject,
+        capture: CarrierCapture,
+        owner: Arc<dyn Send + Sync>,
+    ) -> Result<Arc<Self>, AppError> {
+        let archive = capture
+            .archive
+            .as_ref()
+            .ok_or_else(|| AppError::internal("carrier_staged_archive_missing"))?;
+        let staging = archive.select_staging_key(capture.staging)?;
+        let prefix = format!("{}/", staging.canonical_prefix());
+        if !reference.object_locator.starts_with(&prefix)
+            || reference.blake3_digest.len() != 64
+            || !reference
+                .blake3_digest
+                .bytes()
+                .all(|b| b.is_ascii_hexdigit() && !b.is_ascii_uppercase())
+        {
+            return Err(AppError::internal("carrier_staged_owner_mismatch"));
+        }
+        Ok(Arc::new(Self {
+            memory: capture.memory,
+            archive: capture.archive,
+            staging,
+            length: reference.size_bytes,
+            digest: reference.blake3_digest.clone(),
+            segments: vec![Mutex::new(Segment::Object(reference.clone()))],
+            offload: tokio::sync::Mutex::new(()),
+            sealed_reference: Some(reference),
+            parent: capture.parent,
+            allocations: Mutex::new(Vec::new()),
+            owned_objects: Mutex::new(Vec::new()),
+            _external_owner: Some(owner),
+        }))
     }
 
     /// The input is borrowed by this future: callers need not spawn or make it
@@ -184,6 +225,7 @@ impl BodyCarrier {
             length: 0,
             digest: String::new(),
             owned_objects: Mutex::new(Vec::new()),
+            _external_owner: None,
         };
         let mut hash = blake3::Hasher::new();
         futures_util::pin_mut!(input);
