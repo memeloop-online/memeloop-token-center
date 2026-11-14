@@ -44,12 +44,14 @@ mod routing_tests;
 #[cfg(test)]
 mod rustfs_contract_tests;
 mod session_projection;
+mod semantic_manifest;
 mod staging;
 mod supplier_summary;
 mod terminal_receipts;
 mod text;
 
 pub use cas::CasArchiveObject;
+pub use semantic_manifest::{SemanticManifestV2, SemanticCoverage, SemanticHead, SemanticNode, SemanticProjectionState};
 pub use conversation::{
     ConversationBodyReference, ConversationEvent, ConversationManifest, ConversationMedia,
     ConversationPrefix, RawConversationCapture, RawConversationFormat,
