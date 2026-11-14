@@ -12,7 +12,7 @@ use tokio::sync::OwnedSemaphorePermit;
 
 use super::memory::ProxyMemoryBudget;
 use crate::{
-    archive::{ArchiveStore, StagedArchiveObject},
+    archive::{ArchiveStore, CarrierObjectOwner, StagedArchiveObject},
     archive_staging::ArchiveStagingKey,
     error::AppError,
 };
@@ -83,7 +83,7 @@ pub(crate) struct BodyCarrier {
     allocations: Mutex<Vec<Weak<Allocation>>>,
     length: u64,
     digest: String,
-    owned_objects: Mutex<Vec<String>>,
+    owned_objects: Mutex<Vec<CarrierObjectOwner>>,
 }
 
 impl BodyCarrier {
@@ -238,7 +238,9 @@ impl BodyCarrier {
         );
         // Register exact ownership before any remote operation: a finish whose
         // acknowledgement is lost must not orphan an object outside cleanup.
-        self.owned_objects.lock().unwrap().push(locator.clone());
+        let owner = CarrierObjectOwner::new(self.staging, locator.clone(), &bytes)?;
+        self.owned_objects.lock().unwrap().push(owner.clone());
+        archive.begin_carrier_object(&owner).await?;
         let mut writer = archive.start_writer(&locator).await?;
         if let Err(error) = writer.write(bytes.clone()).await {
             let _ = writer.abort().await;
@@ -498,18 +500,13 @@ impl Drop for BodyCarrier {
             return;
         };
         let objects = std::mem::take(self.owned_objects.get_mut().unwrap());
-        let staging = self.staging;
         if objects.is_empty() {
             return;
         }
         if let Ok(runtime) = tokio::runtime::Handle::try_current() {
             runtime.spawn(async move {
-                for locator in objects {
-                    if archive
-                        .delete_archive_staging_object(staging, &locator)
-                        .await
-                        .is_err()
-                    {
+                for owner in objects {
+                    if archive.release_carrier_object(&owner).await.is_err() {
                         tracing::warn!(
                             stage = "carrier_cleanup",
                             "owned carrier object cleanup deferred"
