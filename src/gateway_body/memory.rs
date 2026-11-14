@@ -680,6 +680,27 @@ impl ProxyMemoryReservation {
         self.release(self.json_reserved_bytes.swap(0, Ordering::AcqRel), 1);
     }
 
+    /// Grow only when real global credit is immediately available; never wait
+    /// for a permit held by the old JSON tree itself.
+    pub(crate) fn try_extend_normalized_envelope(&self, bytes: usize) -> bool {
+        let Some(rounded) = bytes
+            .checked_add(UNIT_BYTES - 1)
+            .map(|value| value / UNIT_BYTES * UNIT_BYTES)
+        else {
+            return false;
+        };
+        let current = self.json_reserved_bytes.load(Ordering::Acquire);
+        if rounded <= current {
+            return true;
+        }
+        let extra = rounded - current;
+        if !self.try_grow(extra, 1) {
+            return false;
+        }
+        self.json_reserved_bytes.fetch_add(extra, Ordering::AcqRel);
+        true
+    }
+
     /// Called only after the parsed Value has been dropped. Transfer the
     /// remaining prepaid JSON envelope into independently owned encoded bytes.
     /// The caller subsequently uses release_unretained_json, never the legacy
