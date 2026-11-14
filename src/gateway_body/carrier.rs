@@ -87,6 +87,45 @@ pub(crate) struct BodyCarrier {
 }
 
 impl BodyCarrier {
+    /// Count first, then encode into an exactly preallocated destination while
+    /// the old JSON envelope still owns both IR and serialization workspace.
+    /// A non-fitting value is returned intact for the streaming object path.
+    pub(crate) fn encode_normalized_prepaid(
+        value: serde_json::Value,
+        previous: &super::memory::ProxyMemoryReservation,
+        capture: CarrierCapture,
+    ) -> Result<Result<Arc<Self>, (serde_json::Value, CarrierCapture)>, AppError> {
+        struct Count(usize);
+        impl std::io::Write for Count {
+            fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+                self.0 = self
+                    .0
+                    .checked_add(bytes.len())
+                    .ok_or_else(|| std::io::Error::other("normalized length overflow"))?;
+                Ok(bytes.len())
+            }
+            fn flush(&mut self) -> std::io::Result<()> {
+                Ok(())
+            }
+        }
+        let mut count = Count(0);
+        serde_json::to_writer(&mut count, &value)
+            .map_err(|_| AppError::internal("normalized_encode_failed"))?;
+        if count
+            .0
+            .checked_add(64 * 1024 - 1)
+            .map(|n| n / (64 * 1024))
+            .is_none_or(|units| units > previous.request_json_reserved_bytes() / (64 * 1024))
+        {
+            return Ok(Err((value, capture)));
+        }
+        let mut encoded = Vec::with_capacity(count.0);
+        serde_json::to_writer(&mut encoded, &value)
+            .map_err(|_| AppError::internal("normalized_encode_failed"))?;
+        drop(value);
+        Self::adopt_normalized(encoded, previous, capture).map(Ok)
+    }
+
     /// Adopt an encoding already covered by the old JSON envelope. The caller
     /// must first drop the parsed Value and must use release_unretained_json
     /// afterwards; length-based legacy release assumes no credit transfer.
