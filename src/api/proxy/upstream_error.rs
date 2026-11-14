@@ -218,7 +218,6 @@ pub(in crate::api) async fn read_rejection(response: UpstreamResponse) -> Reject
 pub(super) async fn read_response_diagnostic_preserving(
     response: UpstreamResponse,
 ) -> (Rejection, UpstreamResponse) {
-    let status = response.status();
     let mut parts = response.into_parts();
     parts.stream = Box::pin(parts.stream.fuse());
     let mut prefetched = Vec::new();
@@ -538,11 +537,11 @@ mod tests {
         );
         assert_eq!(rejection_content_class(&headers), "ambiguous");
     }
-    use http::Version;
 
     fn response(
         status: StatusCode,
         content_type: &str,
+        content_length: Option<u64>,
         stream: super::super::upstream_response::UpstreamByteStream,
     ) -> UpstreamResponse {
         let mut headers = HeaderMap::new();
@@ -551,7 +550,7 @@ mod tests {
             status,
             headers,
             version: Version::HTTP_11,
-            content_length: None,
+            content_length,
             stream,
         }
     }
@@ -567,6 +566,7 @@ mod tests {
                 let rejection = read_rejection(response(
                     status,
                     "application/json",
+                    None,
                     Box::pin(stream::once(async move {
                         tokio::time::sleep(Duration::from_millis(150)).await;
                         Ok(Bytes::from(raw))
@@ -594,6 +594,7 @@ mod tests {
             let rejection = read_rejection(response(
                 StatusCode::BAD_GATEWAY,
                 content_type,
+                None,
                 Box::pin(stream::iter([Ok(Bytes::from(raw))])),
             ))
             .await;
@@ -610,6 +611,7 @@ mod tests {
         let rejection = read_rejection(response(
             StatusCode::SERVICE_UNAVAILABLE,
             "text/plain",
+            None,
             Box::pin(chunks),
         ))
         .await;
@@ -629,6 +631,7 @@ mod tests {
         let rejection = read_rejection(response(
             StatusCode::BAD_GATEWAY,
             "text/plain",
+            None,
             Box::pin(stream::iter([Ok(Bytes::from(vec![
                 b'x';
                 MAX_ERROR_BYTES + 1
@@ -648,6 +651,7 @@ mod tests {
             response(
                 StatusCode::BAD_GATEWAY,
                 "text/plain",
+                None,
                 Box::pin(stream::pending()),
             )
             .with_body_timeouts(started + Duration::from_millis(20), Duration::from_secs(5)),
@@ -668,6 +672,7 @@ mod tests {
         let rejection = read_rejection(response(
             StatusCode::BAD_GATEWAY,
             "text/plain",
+            None,
             Box::pin(chunks),
         ))
         .await;

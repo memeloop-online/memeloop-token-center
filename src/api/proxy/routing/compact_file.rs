@@ -329,6 +329,7 @@ impl ValidatedCompact {
                 response_id: self.response_id.clone(),
             },
             supplier_rate_limited: false,
+            supplier_reason: None,
             usage: self.usage.clone(),
             usage_invalid: self.usage_invalid,
             observed_protocol_invalid: false,

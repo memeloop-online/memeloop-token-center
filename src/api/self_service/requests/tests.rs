@@ -390,6 +390,7 @@ async fn request_detail_serializes_the_shared_supplier_reason_at_the_top_level()
         action: "check_plan".to_owned(),
         provider_code: None,
         provider_message: None,
+        provider_details: None,
     });
     let response = request_detail_response(&state, refs).await.unwrap();
     let body = axum::body::to_bytes(response.into_body(), MAX_ARCHIVE_DETAIL_RESPONSE)
