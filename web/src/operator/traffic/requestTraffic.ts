@@ -145,10 +145,11 @@ export function typedRequestQueryBody(tenant: string, ast: TypedFilterAst, befor
  */
 export function mergeRefreshedRequestPage(current: readonly RequestView[], refreshed: RequestListResponse, preserveOlder = false) {
   const cursor = refreshed.next_cursor;
-  if (!cursor || !preserveOlder) return refreshed.requests;
+  const observed = refreshed.requests.map(request => mergeRequestObservations(request, current.find(row => row.request_id === request.request_id)));
+  if (!cursor || !preserveOlder) return observed;
   const older = current.filter((request) => request.created_at < cursor.before_created_at
     || (request.created_at === cursor.before_created_at && request.request_id < cursor.before_id));
-  const merged = new Map(refreshed.requests.map((request) => [request.request_id, request]));
+  const merged = new Map(observed.map((request) => [request.request_id, request]));
   for (const request of older) merged.set(request.request_id, request);
   return [...merged.values()].sort((left, right) => right.created_at - left.created_at
     || right.request_id.localeCompare(left.request_id));
@@ -235,6 +236,23 @@ export function mergeSessionContext(previous: RequestView['session_context'], ev
   }
   if (incoming?.association === 'confirmed') return incoming;
   return previous ?? incoming;
+}
+
+/** Transport and confirmed session observations may arrive after financial settlement.
+ * A sparse projection must not erase observations already displayed. */
+export function mergeRequestObservations<T extends RequestView>(incoming: T, previous?: RequestView): T {
+  const incomingEgress = incoming.egress;
+  const previousEgress = previous?.egress;
+  const egress = incomingEgress && previousEgress
+    && typeof incomingEgress.observed_at === 'number' && typeof previousEgress.observed_at === 'number'
+    && incomingEgress.observed_at < previousEgress.observed_at
+    ? previousEgress : incomingEgress ?? previousEgress;
+  const session = mergeSessionContext(previous?.session_context, incoming);
+  return {
+    ...incoming,
+    ...(egress !== undefined ? { egress } : {}),
+    ...(session !== undefined ? { session_context: session } : {}),
+  };
 }
 
 export function requestViewFromEvent(event: RequestEvent, previous?: RequestView): RequestView | undefined {

@@ -15,6 +15,38 @@ use crate::{
 #[derive(Debug, Subcommand)]
 pub enum HistoryCommand {
     Start,
+    /// Verify a consistent source baseline; this does not authorize cutover.
+    BaselineSource {
+        #[arg(long)]
+        owner: uuid::Uuid,
+        #[arg(long, default_value_t = 64, value_parser = clap::value_parser!(i64).range(1..=64))]
+        page_size: i64,
+        #[arg(long, default_value_t = 300, value_parser = clap::value_parser!(u64).range(1..=3600))]
+        max_seconds: u64,
+    },
+    /// Abort a lost source snapshot and release only its exact delivery fence.
+    AbortBaseline {
+        #[arg(long)]
+        owner: uuid::Uuid,
+        #[arg(long)]
+        epoch: i64,
+    },
+    /// Cap subsequent delivery revisions; capture continues, quiescence is not proved.
+    FenceDelivery {
+        #[arg(long)]
+        owner: uuid::Uuid,
+    },
+    /// Resume exactly the inspected maintenance fence, preserving all queued work.
+    ResumeDelivery {
+        #[arg(long)]
+        owner: uuid::Uuid,
+        #[arg(long)]
+        epoch: i64,
+    },
+    /// Install only free source tables while capture remains off; retry pending tables later.
+    Bootstrap,
+    /// Validate every installed definition, then atomically enable capture without DDL.
+    Activate,
     /// Re-export every retained source after upgrading the read-model contract.
     Refresh,
     Backfill {
@@ -45,11 +77,29 @@ pub async fn command(config: &Config, command: HistoryCommand) -> Result<Value, 
             "pending": database.history_pending_count().await?,
             "backfill_done": database.history_backfill_done().await?,
             "revision": database.history_revision().await?,
+            "delivery_fence": database.history_delivery_status().await?,
         }));
+    }
+    match &command {
+        HistoryCommand::AbortBaseline { owner, epoch } => {
+            database
+                .history_abort_source_snapshot(*owner, *epoch)
+                .await?;
+            return database.history_delivery_status().await;
+        }
+        HistoryCommand::FenceDelivery { owner } => {
+            return database.history_fence_delivery(*owner).await;
+        }
+        HistoryCommand::ResumeDelivery { owner, epoch } => {
+            database.history_resume_delivery(*owner, *epoch).await?;
+            return database.history_delivery_status().await;
+        }
+        _ => {}
     }
     let database = if matches!(
         &command,
         HistoryCommand::Backfill { .. }
+            | HistoryCommand::BaselineSource { .. }
             | HistoryCommand::Drain { .. }
             | HistoryCommand::Verify
             | HistoryCommand::Switch
@@ -62,7 +112,10 @@ pub async fn command(config: &Config, command: HistoryCommand) -> Result<Value, 
     database.refresh_http_settings().await?;
     database.start_http_settings_refresh();
     let role = match command {
-        HistoryCommand::Start | HistoryCommand::Refresh => "ADMIN",
+        HistoryCommand::Start
+        | HistoryCommand::Bootstrap
+        | HistoryCommand::Activate
+        | HistoryCommand::Refresh => "ADMIN",
         HistoryCommand::Verify | HistoryCommand::Switch => "READER",
         _ => "WRITER",
     };
@@ -74,9 +127,58 @@ pub async fn command(config: &Config, command: HistoryCommand) -> Result<Value, 
     )?
     .ok_or(HistoryError::Invalid("MTC_REQUEST_HISTORY_URL is required"))?;
     match command {
+        HistoryCommand::BaselineSource {
+            owner,
+            page_size,
+            max_seconds,
+        } => {
+            let reader = ClickHouse::reader_from_env(
+                database
+                    .http_clients
+                    .handle(crate::http_settings::HttpPurpose::General),
+            )?
+            .ok_or(HistoryError::Invalid("request history reader is required"))?;
+            let source_database = database
+                .clone()
+                .with_auxiliary_pool_max_connections(1)
+                .independent_persistence_pool();
+            let mut source = database
+                .history_begin_source_snapshot(&source_database, owner)
+                .await?;
+            let epoch = source.receipt["epoch"]
+                .as_i64()
+                .ok_or(HistoryError::Mismatch)?;
+            let result = tokio::time::timeout(std::time::Duration::from_secs(max_seconds), async {
+                while source
+                    .verify_next_page(&database, &client, &reader, page_size)
+                    .await?
+                    != 0
+                {}
+                source.finish(&database).await
+            })
+            .await
+            .unwrap_or(Err(HistoryError::Changed));
+            match result {
+                Ok(receipt) => return Ok(receipt),
+                Err(error) => {
+                    // No cursor is resumed with a replacement RR snapshot.
+                    // All queued delta survives this exact-epoch release.
+                    database.history_abort_source_snapshot(owner, epoch).await?;
+                    return Err(error);
+                }
+            }
+        }
         HistoryCommand::Start => {
             client.initialize().await?;
             database.history_start().await?;
+        }
+        HistoryCommand::Bootstrap => {
+            client.initialize().await?;
+            return database.history_bootstrap_capture().await;
+        }
+        HistoryCommand::Activate => {
+            client.initialize().await?;
+            database.history_activate_capture().await?;
         }
         HistoryCommand::Refresh => {
             client.initialize().await?;
@@ -87,9 +189,18 @@ pub async fn command(config: &Config, command: HistoryCommand) -> Result<Value, 
             database.history_refresh().await?;
         }
         HistoryCommand::Backfill { page_size } => {
+            let lease_database = database
+                .clone()
+                .with_auxiliary_pool_max_connections(1)
+                .independent_persistence_pool();
             while !database.history_backfill_done().await? {
                 database.history_backfill_page(page_size).await?;
-                export_page(&database, &client, page_size).await?;
+                if export_page_with_lease(&database, &lease_database, &client, page_size).await?
+                    == 0
+                    && !database.history_delivery_status().await?["ceiling"].is_null()
+                {
+                    return Err(HistoryError::Changed);
+                }
             }
             drain(&database, &client, page_size).await?;
         }
@@ -99,7 +210,11 @@ pub async fn command(config: &Config, command: HistoryCommand) -> Result<Value, 
             verify(&database, &client).await?;
             database.history_switch(true).await?;
         }
-        HistoryCommand::Rollback | HistoryCommand::Status => unreachable!(),
+        HistoryCommand::Rollback
+        | HistoryCommand::Status
+        | HistoryCommand::FenceDelivery { .. }
+        | HistoryCommand::ResumeDelivery { .. }
+        | HistoryCommand::AbortBaseline { .. } => unreachable!(),
     }
     Ok(
         json!({"mode": database.history_mode().await?, "pending": database.history_pending_count().await?}),
@@ -111,9 +226,31 @@ pub async fn export_page(
     client: &ClickHouse,
     page_size: i64,
 ) -> Result<usize, HistoryError> {
-    let snapshots = database.history_pending(page_size).await?;
+    let lease_database = database
+        .clone()
+        .with_auxiliary_pool_max_connections(1)
+        .independent_persistence_pool();
+    export_page_with_lease(database, &lease_database, client, page_size).await
+}
+
+async fn export_page_with_lease(
+    database: &Database,
+    lease_database: &Database,
+    client: &ClickHouse,
+    page_size: i64,
+) -> Result<usize, HistoryError> {
+    let (mut lease, ceiling) = lease_database.history_delivery_lease().await?;
+    let snapshots = database.history_pending_through(page_size, ceiling).await?;
+    // If the control socket died before selection, a new fence may have been
+    // installed. Validate it after selection and before sending any CH bytes.
+    if let Some(lease) = lease.as_mut() {
+        sqlx::query("SELECT 1").execute(&mut **lease).await?;
+    }
     client.append(&snapshots).await?;
     database.history_acknowledge(&snapshots).await?;
+    if let Some(lease) = lease {
+        lease.rollback().await?;
+    }
     Ok(snapshots.len())
 }
 
@@ -122,8 +259,16 @@ pub async fn drain(
     client: &ClickHouse,
     page_size: i64,
 ) -> Result<(), HistoryError> {
+    let lease_database = database
+        .clone()
+        .with_auxiliary_pool_max_connections(1)
+        .independent_persistence_pool();
     while database.history_pending_count().await? != 0 {
-        export_page(database, client, page_size).await?;
+        if export_page_with_lease(database, &lease_database, client, page_size).await? == 0 {
+            // A durable fence may leave newer work intentionally undelivered.
+            // Never busy-spin or claim that the complete queue was drained.
+            return Err(HistoryError::Changed);
+        }
     }
     Ok(())
 }
@@ -138,6 +283,10 @@ pub(crate) async fn run_worker(state: AppState, mut shutdown: watch::Receiver<bo
         }
     };
     let database = state.db.independent_persistence_pool();
+    let lease_database = database
+        .clone()
+        .with_auxiliary_pool_max_connections(1)
+        .independent_persistence_pool();
     loop {
         if *shutdown.borrow() {
             return;
@@ -150,7 +299,7 @@ pub(crate) async fn run_worker(state: AppState, mut shutdown: watch::Receiver<bo
                         if database.history_mode().await? == "off" {
                             return Ok::<_, HistoryError>(());
                         }
-                        export_page(&database, client, 500).await?;
+                        export_page_with_lease(&database, &lease_database, client, 500).await?;
                         Ok(())
                     }.await;
                     if result.is_err() {

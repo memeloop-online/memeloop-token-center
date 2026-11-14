@@ -13,7 +13,7 @@ import '../../src/styles/metrics.css';
 import '../../src/styles/request-table.css';
 import '../../src/operator/operator.css';
 
-declare global { interface Window { requestLifecycleFixture: { finish: () => void; settle: (cost: string, kind: 'finished' | 'projected' | 'archive_bound') => void; replay: () => void; hold: () => void; release: () => void; switchScope: () => void; filter: () => void; failQuery: () => void; held: boolean; queryHeld: boolean; queryCalls: number; detailCalls: number; scopeCommits: { scope: string; drawers: number }[] }; } }
+declare global { interface Window { requestLifecycleFixture: { observe: () => void; finish: () => void; settle: (cost: string, kind: 'finished' | 'projected' | 'archive_bound') => void; replay: () => void; hold: () => void; release: () => void; switchScope: () => void; filter: () => void; failQuery: () => void; held: boolean; queryHeld: boolean; queryCalls: number; detailCalls: number; scopeCommits: { scope: string; drawers: number }[] }; } }
 const base: RequestDetail = { request_id: 'request-a', created_at: 1000, completed_at: null, model: 'model-a', protocol: 'openai', status_code: null, duration_ms: null, input_tokens: 0, output_tokens: 0, cost: '0', error_code: null, request_body: null, response_body: null, archive_complete: false };
 const backgroundHelpVisible = !new URLSearchParams(location.search).has('quiet-background-help');
 const supplierFailure = new URLSearchParams(location.search).has('supplier-error')
@@ -98,6 +98,10 @@ function Fixture() {
     queryCalls: window.requestLifecycleFixture?.queryCalls ?? 0,
     scopeCommits: window.requestLifecycleFixture?.scopeCommits ?? [],
     queryHeld: window.requestLifecycleFixture?.queryHeld ?? false,
+    observe: () => { first = { ...first, session_context: {
+      association: 'confirmed', session_id: 'late-session', session_name: 'Late recorded session',
+      task_kind: 'coding', agent_id: null, semantics_source: 'declared',
+    } }; },
     filter: () => { holdQuery = true; setDrilldown({ ast: { logical_operator: 'and', conditions: [{ field: 'model', operator: 'equals', value: { type: 'model', value: 'different-model' } }] }, revision: 1 }); },
     failQuery: () => { failQuery?.(); },
     hold: () => { hold = true; }, release: () => { release?.(); }, switchScope: () => {

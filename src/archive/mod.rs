@@ -28,9 +28,11 @@ mod conversation_capture_tests;
 mod conversation_stream;
 mod download;
 mod durable_roots;
+mod history_roots;
 mod multipart;
 mod objects;
 mod path;
+mod quota_reset_receipts;
 mod raw_cache;
 mod raw_capture;
 #[cfg(test)]
@@ -57,6 +59,7 @@ pub use conversation::{ConversationExport, ConversationReadLimits};
 pub use download::ArchiveDownload;
 #[cfg(test)]
 use download::{validate_download_range, verified_download_stream};
+pub use history_roots::HistoryArchiveRoot;
 pub(crate) use multipart::ARCHIVE_MULTIPART_PART_BYTES;
 pub use multipart::{ArchiveWriter, StagedArchiveObject};
 #[cfg(test)]

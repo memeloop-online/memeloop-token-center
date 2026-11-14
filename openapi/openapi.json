@@ -957,6 +957,39 @@
         }
       }
     },
+    "/startupz": {
+      "get": {
+        "tags": [
+          "System"
+        ],
+        "operationId": "getInitializationReadiness",
+        "summary": "Report whether the application router has initialized",
+        "description": "Returns 503 while the static shell is initializing or initialization failed, then 200 after AppState and the authenticated application router have been installed. This endpoint performs no recurring database or archive checks and remains 200 after installation during remote dependency degradation. Liveness and dependency diagnostics retain their separate endpoints.",
+        "security": [],
+        "responses": {
+          "200": {
+            "description": "The initialized application router is installed.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Health"
+                }
+              }
+            }
+          },
+          "503": {
+            "description": "Application initialization is still pending or failed.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Readiness"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
     "/readyz": {
       "get": {
         "tags": [
@@ -1696,8 +1729,8 @@
           "Client credentials"
         ],
         "operationId": "storeClientCredential",
-        "summary": "Store an already-active client credential for direct authorized copying",
-        "description": "Verifies the supplied credential against the active stable key and stores its original\nvalue for Copy. The credential keeps its current generation.\n",
+        "summary": "Read-back-safe replacement or restoration of a managed client credential",
+        "description": "With expected_credential_generation, atomically replace the active credential while preserving key, account and grant identities. An unchanged value preserves its generation; changed values revoke the old generation. Matching immediate retries return the current value without another rotation. Without the generation field, legacy original-value restoration keeps its existing semantics.",
         "security": [
           {
             "serviceBearer": []
@@ -1720,6 +1753,16 @@
           }
         },
         "responses": {
+          "200": {
+            "description": "Generation-fenced credential saved; no-store response contains the active value.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/CopiedClientCredential"
+                }
+              }
+            }
+          },
           "204": {
             "description": "Original credential stored; no secret is returned."
           },
@@ -1734,6 +1777,9 @@
           },
           "404": {
             "$ref": "#/components/responses/NotFound"
+          },
+          "409": {
+            "$ref": "#/components/responses/Conflict"
           }
         }
       }
@@ -20862,7 +20908,13 @@
             "minLength": 16,
             "maxLength": 512,
             "writeOnly": true,
-            "description": "Existing active credential supplied by an authorized source importer. It is never echoed."
+            "description": "Actual credential value. A generation-fenced save returns the active value with Cache-Control: no-store."
+          },
+          "expected_credential_generation": {
+            "type": "integer",
+            "format": "int64",
+            "minimum": 1,
+            "description": "Observed active generation required for editable-value replacement. Omit only for legacy original-value restoration."
           }
         }
       },
