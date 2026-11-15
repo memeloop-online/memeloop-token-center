@@ -77,13 +77,16 @@ async fn page(
 ) -> Result<Response, AppError> {
     let revision = state.db.published_semantic_revision(&scope).await?;
     let Some(revision) = revision else {
-        return Ok(Json(serde_json::json!({
-            "status": "pending", "manifest_revision": null,
-            "coverage": {"observed_terminal": false, "projection_state": "partial",
-                         "gaps": ["semantic_publication_pending"], "omissions": []},
-            "instances": [], "next_cursor": null
-        }))
-        .into_response());
+        return Ok((
+            [(header::CACHE_CONTROL, "private, no-store")],
+            Json(serde_json::json!({
+                "status": "pending", "manifest_revision": null,
+                "coverage": {"observed_terminal": false, "projection_state": "partial",
+                             "gaps": ["semantic_publication_pending"], "omissions": []},
+                "instances": [], "next_cursor": null
+            })),
+        )
+            .into_response());
     };
     if query.cursor.is_some() && query.atom_cursor.is_some() {
         return Err(invalid());
@@ -231,4 +234,45 @@ pub(super) async fn self_semantic_view(
         )
         .await?;
     page(&state, scope, query).await
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn scope() -> SessionContextScope {
+        SessionContextScope {
+            tenant_id: Uuid::new_v4(),
+            key_id: Uuid::new_v4(),
+            session_id: Uuid::new_v4(),
+            request_id: Uuid::new_v4(),
+            leaf: None,
+        }
+    }
+
+    #[test]
+    fn semantic_cursor_cannot_cross_scope_or_be_tampered() {
+        let original = scope();
+        let value = Continuation {
+            tenant_id: original.tenant_id,
+            key_id: original.key_id,
+            session_id: original.session_id,
+            request_id: original.request_id,
+            revision: 7,
+            page: None,
+            instance_id: Some("occurrence-1".into()),
+        };
+        let token = encode(&value, b"test-pepper").unwrap();
+        assert_eq!(
+            decode(&token, &original, b"test-pepper").unwrap().revision,
+            7
+        );
+        assert!(decode(&token, &scope(), b"test-pepper").is_err());
+        assert!(decode(&token, &original, b"other-pepper").is_err());
+        let (payload, signature) = token.split_once('.').unwrap();
+        let mut changed = URL_SAFE_NO_PAD.decode(payload).unwrap();
+        changed.push(b' ');
+        let forged = format!("{}.{}", URL_SAFE_NO_PAD.encode(changed), signature);
+        assert!(decode(&forged, &original, b"test-pepper").is_err());
+    }
 }

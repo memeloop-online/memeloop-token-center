@@ -82,6 +82,7 @@ export async function exportSemanticContext(loader: SemanticViewLoader, request:
     let cursor: string | undefined;
     let revision: number | undefined;
     const positions = new Set<string>();
+    let found = false;
     do {
       signal.throwIfAborted();
       const page = await loader.page(request, cursor, signal);
@@ -89,13 +90,14 @@ export async function exportSemanticContext(loader: SemanticViewLoader, request:
       revision ??= page.manifest_revision;
       if (page.manifest_revision !== revision) throw new Error('Semantic revision changed; export cancelled');
       for (const instance of page.instances) {
-        if (!only || instance.instance_id === only.instance_id) await writeAtom(instance, revision);
+        if (!only || instance.instance_id === only.instance_id) { await writeAtom(instance, revision); found = true; }
       }
       if (only && page.instances.some(instance => instance.instance_id === only.instance_id)) break;
       cursor = page.next_cursor ?? undefined;
       if (cursor && positions.has(cursor)) throw new Error('Repeated semantic page');
       if (cursor) positions.add(cursor);
     } while (cursor);
+    if (only && !found) throw new Error('Semantic instance is no longer available');
     await file.close();
   } catch (reason) { await file.abort(reason); throw reason; }
 }

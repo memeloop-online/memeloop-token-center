@@ -56,6 +56,7 @@ export function SemanticSessionPanel({ detail, loader }: { detail: LogicalSessio
   const requests = detail.requests;
   const [requestId, setRequestId] = useState(requests.at(-1)?.request_id ?? '');
   const [page, setPage] = useState<SemanticViewPage>();
+  const [loadedScope, setLoadedScope] = useState<{ loader: SemanticViewLoader; request: string }>();
   const [instances, setInstances] = useState<SemanticViewInstance[]>([]);
   const [error, setError] = useState<Error | null>(null);
   const [loading, setLoading] = useState(false);
@@ -79,7 +80,7 @@ export function SemanticSessionPanel({ detail, loader }: { detail: LogicalSessio
       const next = await loader.page(requestId, cursor, controller.signal);
       controller.signal.throwIfAborted();
       if (cursor && page?.manifest_revision !== next.manifest_revision) throw new Error('Semantic revision changed; refresh');
-      setPage(next); setOpened(undefined);
+      setLoadedScope({ loader, request: requestId }); setPage(next); setOpened(undefined);
       // Replace the resident page. Older pages remain available through the signed cursor.
       setInstances(next.instances);
     } catch (reason) { if (!controller.signal.aborted) setError(reason instanceof Error ? reason : new Error(String(reason))); }
@@ -90,28 +91,30 @@ export function SemanticSessionPanel({ detail, loader }: { detail: LogicalSessio
     if (requestId) void read();
     return () => { active.current?.abort(); exportActive.current?.abort(); };
   }, [loader, requestId]);
-  const revision = String(page?.manifest_revision ?? 'pending');
-  const messages = useMemo<ConversationMessageListProjection[]>(() => instances.map(instance => ({
+  const visiblePage = loadedScope?.loader === loader && loadedScope.request === requestId ? page : undefined;
+  const visibleInstances = visiblePage ? instances : [];
+  const revision = String(visiblePage?.manifest_revision ?? 'pending');
+  const messages = useMemo<ConversationMessageListProjection[]>(() => visibleInstances.map(instance => ({
     messageId: semanticMessageId(revision, instance), turnId: instance.turn_id ?? instance.instance_id,
     conversationId: detail.session_id, originNodeId: instance.origin, originSequence: instance.ordinal,
     lamportClock: instance.ordinal, timestamp: requests.find(request => request.request_id === requestId)?.created_at ?? 0,
     role: 'agent', content: '', metadata: { instance_id: instance.instance_id, branch_id: instance.branch_id },
-  })), [instances, revision, detail.session_id, requestId, requests]);
+  })), [visibleInstances, revision, detail.session_id, requestId, requests]);
   return <section aria-label={zh ? '会话记录' : 'Conversation record'}>
     <label>{zh ? '请求上下文' : 'Request context'}<select value={requestId} onChange={event => setRequestId(event.target.value)}>
       {requests.map(request => <option key={request.request_id} value={request.request_id}>{new Date(request.created_at).toLocaleString(locale)} · {request.model}</option>)}
     </select></label>
     <Button appearance="secondary" disabled={loading} onClick={() => void read()}>{zh ? '刷新会话记录' : 'Refresh conversation'}</Button>
-    <Button appearance="secondary" disabled={exporting || page?.status !== 'published'} onClick={() => void exportContext()}>{zh ? '流式导出此上下文' : 'Stream context export'}</Button>
+    <Button appearance="secondary" disabled={exporting || visiblePage?.status !== 'published'} onClick={() => void exportContext()}>{zh ? '流式导出此上下文' : 'Stream context export'}</Button>
     {exporting && <Button appearance="secondary" onClick={() => exportActive.current?.abort()}>{zh ? '取消导出' : 'Cancel export'}</Button>}
-    <SemanticConversationViewer revision={revision} coverage={page?.coverage ?? pending}
+    <SemanticConversationViewer revision={revision} coverage={visiblePage?.coverage ?? pending}
       readOnlyMessage={zh ? '此视图只读' : 'This view is read-only'}
       incompleteMessage={zh ? '语义记录尚未完整发布。' : 'The semantic record is not fully published.'}
       adapter={{ conversationId: detail.session_id, messages, isRunning: false, isLoading: loading, error,
         residentMessageLimit: 32, residentContentByteLimit: previewBudget, residentRenderRowLimit: 32,
-        hasMoreBefore: !!page?.next_cursor, loadMoreBefore: signal => read(page?.next_cursor ?? undefined, signal) }}
+        hasMoreBefore: !!visiblePage?.next_cursor, loadMoreBefore: signal => read(visiblePage?.next_cursor ?? undefined, signal) }}
       renderMessageContent={message => {
-        const instance = instances.find(item => semanticMessageId(revision, item) === message.messageId);
+        const instance = visibleInstances.find(item => semanticMessageId(revision, item) === message.messageId);
         if (!instance) return null;
         return <><Button appearance="secondary" onClick={() => setOpened(message.messageId)}>{zh ? '读取消息' : 'Read message'} · {instance.ordinal}</Button>
           <Button appearance="secondary" disabled={exporting} onClick={() => void exportContext(instance)}>{zh ? '导出消息' : 'Export message'}</Button>
