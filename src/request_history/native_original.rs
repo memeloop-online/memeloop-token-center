@@ -11,8 +11,8 @@
 //! reservation/account/service-tier/routing/submission and future columns have
 //! no equivalent canonical value and remain explicit scalar deltas. Raw zero,
 //! NULL, empty string and original status/currency differences never collapse.
-//! This codec covers request/terminal business rows, not the other four native
-//! originals collections or ongoing operational/financial PG responsibilities.
+//! Four metadata collections share the rooted fidelity document. Ongoing
+//! operational/financial PG responsibilities are not retired by this codec.
 use rust_decimal::{Decimal, prelude::ToPrimitive};
 use serde_json::{Map, Value, json};
 
@@ -188,7 +188,17 @@ pub(crate) fn read_model(
             .collect();
         rows.insert(name.into(), json!({"columns":original.keys().collect::<Vec<_>>(), "sha256":canonical_hash(original)?, "delta":delta}));
     }
-    let fidelity = json!({"version":1,"rows":rows});
+    let collections: Map<String, Value> = super::native_collections::NAMES
+        .iter()
+        .map(|name| ((*name).into(), originals[*name].clone()))
+        .collect();
+    let collections = super::native_collections::encode(
+        identity,
+        statistics,
+        model,
+        &Value::Object(collections),
+    )?;
+    let fidelity = json!({"version":3,"rows":rows,"collections":collections});
     let restored = reconstruct(identity, payload, statistics, model, &fidelity)?;
     for (name, terminal) in [("request", false), ("terminal", true)] {
         if restored[name] != business_row(&originals[name], terminal)? {
@@ -257,7 +267,7 @@ pub(crate) async fn reconstruct_with_archive(
     archive: &crate::archive::ArchiveStore,
 ) -> Result<Value, HistoryError> {
     let (identity, revision) = versioned_identity;
-    if fidelity["version"].as_i64() == Some(1) {
+    if matches!(fidelity["version"].as_i64(), Some(1 | 3)) {
         return reconstruct(identity, payload, statistics, model, fidelity);
     }
     if fidelity["version"].as_i64() != Some(2) {
@@ -296,7 +306,7 @@ pub(crate) fn reconstruct(
     model: &Value,
     fidelity: &Value,
 ) -> Result<Value, HistoryError> {
-    if identity.source != "native" || fidelity["version"].as_i64() != Some(1) {
+    if identity.source != "native" || !matches!(fidelity["version"].as_i64(), Some(1 | 3)) {
         return Err(HistoryError::Mismatch);
     }
     let mut rows = Map::new();
@@ -342,6 +352,20 @@ pub(crate) fn reconstruct(
         }
         rows.insert(name.into(), Value::Object(original));
     }
+    if fidelity["version"] == 3 {
+        let collections = super::native_collections::reconstruct(
+            identity,
+            statistics,
+            model,
+            &fidelity["collections"],
+        )?;
+        rows.extend(
+            collections
+                .as_object()
+                .ok_or(HistoryError::Mismatch)?
+                .clone(),
+        );
+    }
     Ok(Value::Object(rows))
 }
 
@@ -363,7 +387,7 @@ mod tests {
         let model = json!({"archive":{}});
         let originals = json!({"request":{"id":identity.request_id,"tenant_id":identity.tenant_id,
             "key_id":identity.key_id,"created_at":42,"status_code":202,
-            "future":{"nested":[null,0,"x".repeat(16384)]}},"terminal":null});
+            "future":{"nested":[null,0,"x".repeat(16384)]}},"terminal":null,"statistics":[],"egress":[],"transport":[],"observations":[]});
         let archive = crate::archive::ArchiveStore::memory_for_test();
         assert!(
             read_model_with_archive((&identity, 7), &payload, None, &model, &originals, None)
@@ -423,7 +447,7 @@ mod tests {
         };
         let payload = json!({"request_id":identity.request_id,"created_at":42,"protocol":"openai","model":"fixture","status_code":200,"input_tokens":null,"output_tokens":2,"billing":{"cost":"0.000042","currency":"USD"}});
         let model = json!({"archive":{"request_object":"archive-object:v1:fixture-existing-reference","response_object":null}});
-        let originals = json!({"request":{"id":identity.request_id,"tenant_id":identity.tenant_id,"key_id":identity.key_id,"created_at":42,"protocol":"openai","model":"fixture","status_code":202,"input_tokens":0,"output_tokens":2,"cost_micros":17,"currency":"EUR","request_object":"archive-object:v1:fixture-existing-reference","future_column":null,"proxy_owner_token":"not-a-historical-fact","proxy_owner_expires_at":99},"terminal":{"request_id":identity.request_id,"tenant_id":identity.tenant_id,"key_id":identity.key_id,"created_at":42,"status_code":202,"account_projected_at":99}});
+        let originals = json!({"request":{"id":identity.request_id,"tenant_id":identity.tenant_id,"key_id":identity.key_id,"created_at":42,"protocol":"openai","model":"fixture","status_code":202,"input_tokens":0,"output_tokens":2,"cost_micros":17,"currency":"EUR","request_object":"archive-object:v1:fixture-existing-reference","future_column":null,"proxy_owner_token":"not-a-historical-fact","proxy_owner_expires_at":99},"terminal":{"request_id":identity.request_id,"tenant_id":identity.tenant_id,"key_id":identity.key_id,"created_at":42,"status_code":202,"account_projected_at":99},"statistics":[],"egress":[],"transport":[],"observations":[]});
         let encoded = read_model(&identity, &payload, None, &model, &originals).unwrap();
         let restored = reconstruct(&identity, &payload, None, &model, &encoded).unwrap();
         assert_eq!(restored["request"]["status_code"], 202);
