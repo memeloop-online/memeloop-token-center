@@ -482,6 +482,11 @@ impl Drop for ResponseArchiveWriter {
     }
 }
 
+struct CapturedResponse {
+    source: Arc<crate::gateway_body::carrier::BodyCarrier>,
+    staging: crate::archive_staging::ArchiveStagingKey,
+}
+
 struct CaptureChunk {
     bytes: Bytes,
     acknowledged: tokio::sync::oneshot::Sender<()>,
@@ -793,10 +798,14 @@ impl ResponseArchiveProducer {
         let captured = super::OwnedTask::spawn(
             async move {
                 let _source_owner = source_owner;
-                let key = crate::archive_staging::ArchiveStagingKey::new(
-                    crate::archive_staging::ArchiveStagingOwner::ProxyRequest(identity.request_id),
-                    crate::archive_staging::ArchiveStagingPurpose::Response,
-                    uuid::Uuid::now_v7(),
+                let key = capture_state.archive.select_staging_key(
+                    crate::archive_staging::ArchiveStagingKey::new(
+                        crate::archive_staging::ArchiveStagingOwner::ProxyRequest(
+                            identity.request_id,
+                        ),
+                        crate::archive_staging::ArchiveStagingPurpose::Response,
+                        uuid::Uuid::now_v7(),
+                    )?,
                 )?;
                 let capture = crate::gateway_body::carrier::CarrierCapture::new(
                     capture_state.proxy_memory_budget.clone(),
@@ -804,7 +813,7 @@ impl ResponseArchiveProducer {
                     key,
                 );
                 tokio::select! {
-                    result = crate::gateway_body::carrier::BodyCarrier::capture(carrier_capture_stream(source_receiver), capture) => result,
+                    result = crate::gateway_body::carrier::BodyCarrier::capture(carrier_capture_stream(source_receiver), capture) => result.map(|source| CapturedResponse { source, staging: key }),
                     () = capture_abandoned(capture_progress, capture_active) => Err(AppError::internal("response_capture_cancelled")),
                 }
             },
@@ -1129,11 +1138,11 @@ enum WriterOutcome {
 }
 
 async fn captured_source(
-    source: &mut super::OwnedTask<Arc<crate::gateway_body::carrier::BodyCarrier>>,
+    source: &mut super::OwnedTask<CapturedResponse>,
     identity: ArchiveSpoolIdentity,
     progress: tokio::sync::watch::Receiver<(u64, bool)>,
     active: Arc<AtomicBool>,
-) -> Result<Option<Arc<crate::gateway_body::carrier::BodyCarrier>>, AppError> {
+) -> Result<Option<CapturedResponse>, AppError> {
     tokio::select! {
         result = source.wait() => match result {
             Some(Ok(source)) if active.load(Ordering::Acquire) => Ok(Some(source)),
@@ -1163,10 +1172,61 @@ async fn capture_abandoned(
     }
 }
 
+/// The common carrier remains the complete retry source. A separate, already
+/// reserved upload envelope owns multipart copies instead of source-pool leases.
+async fn stage_captured_response(
+    state: &AppState,
+    source: &Arc<crate::gateway_body::carrier::BodyCarrier>,
+    staging: crate::archive_staging::ArchiveStagingKey,
+) -> Result<
+    (
+        crate::archive::StagedArchiveObject,
+        Option<crate::archive::CarrierObjectOwner>,
+    ),
+    AppError,
+> {
+    if let Some(staged) = source.sealed_staged_reference() {
+        return Ok((staged.clone(), None));
+    }
+    let locator = format!(
+        "{}/carrier-{}",
+        staging.canonical_prefix(),
+        uuid::Uuid::now_v7()
+    );
+    let owner = crate::archive::CarrierObjectOwner::from_identity(
+        staging,
+        locator.clone(),
+        source.len(),
+        source.digest().to_owned(),
+    )?;
+    // An unknown receipt acknowledgement must never authorize a body upload.
+    state.archive.begin_carrier_object(&owner).await?;
+    let mut writer = state.archive.start_writer(&locator).await?;
+    use futures_util::StreamExt;
+    let mut stream = source.open_stream();
+    while let Some(chunk) = stream.next().await {
+        let chunk = chunk?;
+        let upload = Bytes::copy_from_slice(&chunk);
+        drop(chunk);
+        if let Err(error) = writer.write(upload).await {
+            let _ = writer.abort().await;
+            return Err(error);
+        }
+    }
+    drop(stream);
+    let staged = writer.finish_staged().await?;
+    if staged.size_bytes != source.len() || staged.blake3_digest != source.digest() {
+        return Err(AppError::storage(
+            "response_carrier_stage_identity_mismatch",
+        ));
+    }
+    Ok((staged, Some(owner)))
+}
+
 async fn run_response_archive_writer(
     mut state: AppState,
     identity: ArchiveSpoolIdentity,
-    mut source_task: super::OwnedTask<Arc<crate::gateway_body::carrier::BodyCarrier>>,
+    mut source_task: super::OwnedTask<CapturedResponse>,
     progress: tokio::sync::watch::Receiver<(u64, bool)>,
     memory: Arc<CaptureQueueMemory>,
     active: Arc<AtomicBool>,
@@ -1206,52 +1266,25 @@ async fn run_response_archive_writer(
     );
     #[cfg(test)]
     pause_begin_for_test(&state).await;
-    let staging_key =
-        state
-            .archive
-            .select_staging_key(crate::archive_staging::ArchiveStagingKey::new(
-                crate::archive_staging::ArchiveStagingOwner::ProxyRequest(identity.request_id),
-                crate::archive_staging::ArchiveStagingPurpose::Response,
-                uuid::Uuid::now_v7(),
-            )?)?;
-    let staging = format!("{}/body", staging_key.canonical_prefix());
-    let mut writer = loop {
-        if !active.load(Ordering::Acquire) {
-            return Ok(writer_interrupted(
-                identity,
-                "abandoned_before_storage_admission",
-            ));
-        }
-        match state.archive.start_writer(&staging).await {
-            Ok(writer) => break writer,
+    #[cfg(test)]
+    pause_begin_ack_for_test(&state).await;
+    let Some(captured) =
+        captured_source(&mut source_task, identity, progress, active.clone()).await?
+    else {
+        return Ok(WriterOutcome::Abandoned);
+    };
+    let source = captured.source;
+    let (staged, staging_owner) = loop {
+        match stage_captured_response(&state, &source, captured.staging).await {
+            Ok(staged) => break staged,
             Err(error @ AppError::Storage { .. }) => {
                 tracing::warn!(request_id = %identity.request_id, error_category = error.diagnostic_category(),
-                    "accepted original awaits object storage admission");
+                    "complete carrier source awaits object storage publication");
                 tokio::time::sleep(std::time::Duration::from_millis(250)).await;
             }
             Err(error) => return Err(error),
         }
     };
-    #[cfg(test)]
-    pause_begin_ack_for_test(&state).await;
-    let Some(source) =
-        captured_source(&mut source_task, identity, progress, active.clone()).await?
-    else {
-        writer.abort().await?;
-        return Ok(WriterOutcome::Abandoned);
-    };
-    use futures_util::StreamExt;
-    let mut stream = source.open_stream();
-    while let Some(chunk) = stream.next().await {
-        let chunk = chunk?;
-        // Multipart retains a 5 MiB copy. Its independently reserved upload
-        // envelope owns this copy; do not retain a source-pool lease there.
-        let upload = Bytes::copy_from_slice(&chunk);
-        drop(chunk);
-        writer.write(upload).await?;
-    }
-    drop(stream);
-    let staged = writer.finish_staged().await?;
     let object = loop {
         match state
             .archive
@@ -1278,13 +1311,14 @@ async fn run_response_archive_writer(
             Err(error) => return Err(error),
         }
     }
-    if let Err(error) = state
-        .archive
-        .delete_archive_staging_segment(staging_key)
-        .await
+    // The CAS object and its immutable root are confirmed. Future reads can
+    // use that authority while old readers keep their original allocation leases.
+    source.handoff_verified_publication(state.archive.clone(), object.clone())?;
+    if let Some(owner) = staging_owner
+        && let Err(error) = state.archive.release_carrier_object(&owner).await
     {
         tracing::warn!(request_id = %identity.request_id, error_category = error.diagnostic_category(),
-            "complete original retains its temporary staging object for cleanup");
+            "complete original retains its exact staging cleanup receipt");
     }
     if matches!(target, CaptureTarget::DiscardedAttempt(_)) {
         return Ok(WriterOutcome::Sealed);

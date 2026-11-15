@@ -1084,7 +1084,7 @@ async fn terminal_tail_survives_observer_cancellation_without_waiting_for_databa
 }
 
 #[tokio::test]
-async fn empty_local_carrier_publishes_the_exact_empty_original() {
+async fn empty_shared_carrier_publishes_the_exact_empty_original() {
     let (_dir, state, _pool, identity) = fixture().await;
     let baseline = state.proxy_memory_budget.snapshot().0;
     let producer =
@@ -1126,22 +1126,79 @@ async fn empty_local_carrier_publishes_the_exact_empty_original() {
 }
 
 #[tokio::test]
-async fn local_open_failure_fences_without_acknowledging_a_partial_original() {
+async fn unavailable_local_directory_does_not_gate_complete_original() {
     let directory = tempfile::tempdir().unwrap();
     let path = directory.path().join("not-a-directory");
     std::fs::write(&path, b"blocked").unwrap();
     let (_fixture, state, _pool, identity) =
-        fixture_with_capture_directory(false, Some(path)).await;
+        fixture_with_capture_directory(false, Some(path.clone())).await;
+    let baseline = state.proxy_memory_budget.snapshot().0;
+    let expected = Bytes::from_static(b"complete supplier bytes");
+    let mut producer =
+        ResponseArchiveProducer::begin(&state, identity, state.proxy_memory_budget.reservation())
+            .unwrap();
+    assert!(producer.append_with_backpressure(expected.clone()).await);
+    tokio::time::timeout(
+        std::time::Duration::from_secs(5),
+        producer.seal().unwrap().wait(),
+    )
+    .await
+    .unwrap();
+    let reference = state
+        .archive
+        .raw_capture_reference(identity.tenant_id, identity.request_id, "response")
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(reference.size_bytes, expected.len() as u64);
+    assert_eq!(
+        reference.blake3_digest,
+        blake3::hash(&expected).to_hex().to_string()
+    );
+    assert_eq!(
+        state
+            .archive
+            .get_tenant_content(identity.tenant_id, &reference, expected.len())
+            .await
+            .unwrap(),
+        expected
+    );
+    assert!(
+        !state
+            .archive
+            .raw_capture_failed(identity.tenant_id, identity.request_id, "response")
+            .await
+            .unwrap()
+    );
+    assert_eq!(std::fs::read(path).unwrap(), b"blocked");
+    assert_eq!(state.proxy_memory_budget.snapshot().0, baseline);
+    assert_eq!(
+        state.proxy_archive_stream_permits.available_permits(),
+        crate::PROXY_ARCHIVE_STREAM_CONCURRENCY
+    );
+}
+
+#[tokio::test]
+async fn cancelled_unsealed_carrier_releases_owned_capture_without_acknowledging_original() {
+    let (_dir, state, _pool, identity) = fixture().await;
+    let (writer_entering, release_writer) = pause_next_begin_ack_for_test(&state);
     let baseline = state.proxy_memory_budget.snapshot().0;
     let mut producer =
         ResponseArchiveProducer::begin(&state, identity, state.proxy_memory_budget.reservation())
             .unwrap();
-    assert!(
-        !producer
-            .append_with_backpressure(Bytes::from_static(b"complete supplier bytes"))
-            .await
-    );
-    assert!(producer.seal().is_none());
+    writer_entering.await.unwrap();
+    let (entering, release_receipt) = producer.pause_local_write_for_test();
+    let mut append =
+        Box::pin(producer.append_with_backpressure(Bytes::from(vec![b'x'; super::CHUNK_BYTES])));
+    tokio::select! {
+        result = entering => result.unwrap(),
+        _ = &mut append => panic!("capture receipt must remain paused after owning the chunk"),
+    }
+    assert!(state.proxy_memory_budget.snapshot().0 > baseline);
+    drop(append);
+    drop(producer);
+    release_writer.send(()).unwrap();
+    // Do not release the receipt gate: cancellation must wake the capture owner.
     tokio::time::timeout(std::time::Duration::from_secs(5), async {
         loop {
             if state
@@ -1160,6 +1217,7 @@ async fn local_open_failure_fences_without_acknowledging_a_partial_original() {
     })
     .await
     .unwrap();
+    assert!(release_receipt.send(()).is_err());
     assert!(
         state
             .archive
@@ -1168,89 +1226,6 @@ async fn local_open_failure_fences_without_acknowledging_a_partial_original() {
             .unwrap()
             .is_none()
     );
-    assert_eq!(
-        state.proxy_archive_stream_permits.available_permits(),
-        crate::PROXY_ARCHIVE_STREAM_CONCURRENCY
-    );
-}
-
-#[tokio::test]
-async fn cancelled_or_timed_out_local_io_retains_admission_until_the_operation_exits() {
-    for deadline in [false, true] {
-        let (_dir, state, _pool, identity) = fixture().await;
-        let (writer_entering, release_writer) = pause_next_begin_ack_for_test(&state);
-        let baseline = state.proxy_memory_budget.snapshot().0;
-        let mut producer = ResponseArchiveProducer::begin(
-            &state,
-            identity,
-            state.proxy_memory_budget.reservation(),
-        )
-        .unwrap();
-        writer_entering.await.unwrap();
-        let (entering, release_io) = producer.pause_local_write_for_test();
-        let mut append = Box::pin(
-            producer.append_with_backpressure(Bytes::from(vec![b'x'; super::CHUNK_BYTES])),
-        );
-        tokio::select! {
-            result = entering => result.unwrap(),
-            _ = &mut append => panic!("write must remain inside the actual blocking IO task"),
-        }
-        if deadline {
-            tokio::time::pause();
-            tokio::time::advance(crate::proxy_lifecycle::MAX_DOWNSTREAM_SEND_WAIT).await;
-            tokio::time::resume();
-            assert!(
-                !append.as_mut().await,
-                "local IO deadline must fail open before physical IO finishes"
-            );
-        }
-        drop(append);
-        drop(producer);
-        release_writer.send(()).unwrap();
-        tokio::time::timeout(std::time::Duration::from_secs(5), async {
-            while !state
-                .archive
-                .raw_capture_failed(identity.tenant_id, identity.request_id, "response")
-                .await
-                .unwrap()
-            {
-                tokio::task::yield_now().await;
-            }
-        })
-        .await
-        .unwrap();
-        assert_eq!(
-            state.proxy_archive_stream_permits.available_permits(),
-            crate::PROXY_ARCHIVE_STREAM_CONCURRENCY - 1
-        );
-        assert_eq!(
-            state.proxy_memory_budget.snapshot().0 - baseline,
-            super::CAPTURE_MEMORY_BYTES * crate::gateway_body::memory::CAPTURE_MEMORY_WEIGHT
-        );
-        assert!(
-            state
-                .archive
-                .raw_capture_reference(identity.tenant_id, identity.request_id, "response")
-                .await
-                .unwrap()
-                .is_none()
-        );
-        release_io.send(()).unwrap();
-        tokio::time::timeout(std::time::Duration::from_secs(5), async {
-            while state.proxy_memory_budget.snapshot().0 != baseline
-                || state.proxy_archive_stream_permits.available_permits()
-                    != crate::PROXY_ARCHIVE_STREAM_CONCURRENCY
-            {
-                tokio::task::yield_now().await;
-            }
-        })
-        .await
-        .unwrap();
-        assert_eq!(
-            state.proxy_archive_stream_permits.available_permits(),
-            crate::PROXY_ARCHIVE_STREAM_CONCURRENCY
-        );
-    }
 }
 
 #[tokio::test]
