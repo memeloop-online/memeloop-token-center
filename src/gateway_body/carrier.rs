@@ -487,6 +487,10 @@ impl BodyCarrier {
     pub(crate) fn digest(&self) -> &str {
         &self.digest
     }
+    #[allow(
+        dead_code,
+        reason = "Sealed source handoff is consumed by the audio integration."
+    )]
     pub(crate) fn sealed_staged_reference(&self) -> Option<&StagedArchiveObject> {
         self.sealed_reference.as_ref()
     }
