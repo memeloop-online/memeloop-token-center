@@ -829,6 +829,7 @@ impl ResponseArchiveProducer {
         let writer = super::OwnedTask::spawn(
             async move {
                 let _queue_memory = writer_memory.clone();
+                let _source_owner = capture_owner;
                 match run_response_archive_writer(
                     writer_state.clone(),
                     identity,
@@ -837,7 +838,6 @@ impl ResponseArchiveProducer {
                     writer_memory,
                     writer_active,
                     target,
-                    capture_owner,
                 )
                 .await
                 {
@@ -1231,7 +1231,6 @@ async fn run_response_archive_writer(
     memory: Arc<CaptureQueueMemory>,
     active: Arc<AtomicBool>,
     target: CaptureTarget,
-    _source_owner: Arc<()>,
 ) -> Result<WriterOutcome, AppError> {
     // Upload concurrency and multipart memory belong to this background task,
     // never to admission of the supplier/client stream. Shared carrier capture
