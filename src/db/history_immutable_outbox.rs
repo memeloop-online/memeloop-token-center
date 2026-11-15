@@ -528,7 +528,32 @@ impl Database {
         let terminal = sqlx::query("SELECT * FROM terminal_projection_outbox WHERE request_id=$1 AND tenant_id=$2 AND key_id=$3 AND created_at=$4")
             .bind(identity.request_id.to_string()).bind(identity.tenant_id.to_string()).bind(identity.key_id.to_string()).bind(identity.created_at)
             .fetch_optional(&mut *transaction).await?;
-        let originals = serde_json::json!({"request": original_row(&request)?, "terminal":terminal.as_ref().map(original_row).transpose()?.unwrap_or(Value::Null)});
+        let mut originals = serde_json::json!({"request": original_row(&request)?, "terminal":terminal.as_ref().map(original_row).transpose()?.unwrap_or(Value::Null)});
+        for (name, sql) in [
+            (
+                "statistics",
+                "SELECT * FROM request_stats_facts WHERE request_id=$1",
+            ),
+            (
+                "egress",
+                "SELECT * FROM request_egress_attempts WHERE request_id=$1 ORDER BY observed_at,attempt_id",
+            ),
+            (
+                "transport",
+                "SELECT * FROM request_upstream_transport_diagnostics WHERE request_id=$1 ORDER BY observed_at,route_id,upstream_account_id",
+            ),
+            (
+                "observations",
+                "SELECT * FROM conversation_observations WHERE request_id=$1 ORDER BY cluster_id,key_id",
+            ),
+        ] {
+            let rows = sqlx::query(sqlx::AssertSqlSafe(sql))
+                .bind(identity.request_id.to_string())
+                .fetch_all(&mut *transaction)
+                .await?;
+            originals[name] =
+                Value::Array(rows.iter().map(original_row).collect::<Result<_, _>>()?);
+        }
         transaction.rollback().await?;
         Ok(originals)
     }

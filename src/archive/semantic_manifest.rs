@@ -110,6 +110,8 @@ impl SemanticNode {
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct SemanticTurnInstance {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub role: Option<String>,
     pub instance_id: String,
     pub request_id: Uuid,
     pub attempt_id: Option<String>,
@@ -139,7 +141,7 @@ pub struct SemanticInstancePage {
 }
 
 impl SemanticInstancePage {
-    fn validate(&self, manifest: &SemanticManifestV2) -> Result<(), AppError> {
+    pub(super) fn validate(&self, manifest: &SemanticManifestV2) -> Result<(), AppError> {
         if self.format_version != 2
             || self.tenant_id != manifest.tenant_id
             || self.session_id != manifest.session_id
@@ -401,6 +403,7 @@ mod tests {
             .await
             .unwrap();
         let mut instance = SemanticTurnInstance {
+            role: Some("user".into()),
             instance_id: "one-occurrence".into(),
             request_id: Uuid::now_v7(),
             attempt_id: None,

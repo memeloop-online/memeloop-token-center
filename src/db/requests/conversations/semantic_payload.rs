@@ -3,10 +3,16 @@ use super::*;
 /// Completed work needs an idempotency receipt, not another 1,024-hash copy
 /// of the already materialized prefix. Pending snapshots remain unchanged.
 pub(super) fn completed_receipt(snapshot: &str) -> String {
-    let receipt = serde_json::json!({
+    let mut receipt = serde_json::json!({
         "completed_snapshot_digest_v1": blake3::hash(snapshot.as_bytes()).to_hex().to_string()
-    })
-    .to_string();
+    });
+    if let Some(publication) = serde_json::from_str::<serde_json::Value>(snapshot)
+        .ok()
+        .and_then(|mut value| value.as_object_mut()?.remove("semantic_coverage_pending"))
+    {
+        receipt["semantic_coverage_pending"] = publication;
+    }
+    let receipt = receipt.to_string();
     if receipt.len() < snapshot.len() {
         receipt
     } else {

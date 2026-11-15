@@ -138,6 +138,36 @@ async fn capture_replay(database: &Database) {
     assert!(native_pending(database).await.is_empty());
 }
 
+// The post-activation source baseline is a separate proof from the ordinary
+// current-state verification, which must never bypass old snapshot coverage.
+async fn prove_activation_baseline(database: &Database, client: &ClickHouse) {
+    if database.history_activation_baseline_proved().await.unwrap() {
+        return;
+    }
+    let source = database
+        .clone()
+        .with_auxiliary_pool_max_connections(1)
+        .independent_persistence_pool();
+    let owner = Uuid::now_v7();
+    let mut snapshot = database
+        .history_begin_source_snapshot(&source, owner)
+        .await
+        .unwrap();
+    let epoch = snapshot.receipt["epoch"].as_i64().unwrap();
+    while snapshot
+        .verify_next_page(database, client, client, 64)
+        .await
+        .unwrap()
+        != 0
+    {}
+    snapshot.finish(database).await.unwrap();
+    database
+        .history_resume_delivery(owner, epoch)
+        .await
+        .unwrap();
+    source.close().await;
+}
+
 #[tokio::test]
 async fn sqlite_request_history_capture_freezes_retries_and_preserves_newer_corrections() {
     let directory = tempfile::tempdir().unwrap();
@@ -339,6 +369,7 @@ async fn request_history_real_services_acceptance() {
             actual.revision
         );
     }
+    prove_activation_baseline(&database, &client).await;
     let report = crate::request_history::migration::verify(&database, &client)
         .await
         .unwrap();
@@ -368,6 +399,7 @@ async fn request_history_real_services_acceptance() {
         pagination.cursor = Some(cursor);
     }
     assert_eq!(observed.len(), 3);
+    prove_activation_baseline(&database, &client).await;
     let report = crate::request_history::migration::verify(&database, &client)
         .await
         .unwrap();
@@ -872,6 +904,7 @@ async fn request_history_real_services_acceptance() {
     crate::request_history::migration::drain(&database, &client, 500)
         .await
         .unwrap();
+    prove_activation_baseline(&database, &client).await;
     crate::request_history::migration::verify(&database, &client)
         .await
         .unwrap();
@@ -883,6 +916,7 @@ async fn request_history_real_services_acceptance() {
         .await
         .unwrap();
     assert!(database.history_switch(true).await.is_err());
+    prove_activation_baseline(&database, &client).await;
     crate::request_history::migration::verify(&database, &client)
         .await
         .unwrap();
@@ -908,6 +942,7 @@ async fn request_history_real_services_acceptance() {
             .await
             .unwrap();
     }
+    prove_activation_baseline(&database, &client).await;
     crate::request_history::migration::verify(&database, &client)
         .await
         .unwrap();
@@ -1457,8 +1492,16 @@ async fn request_history_real_services_acceptance_native_original_survives_ack_a
             .append_pair("options", &format!("-csearch_path={schema}"));
         let database = Database::connect(isolated.as_str()).await.unwrap();
         database.migrate().await.unwrap();
+        // Define the future schema before any producer prepares SELECT *;
+        // changing its result shape mid-session invalidates PostgreSQL plans.
+        if cas_case {
+            sqlx::query("ALTER TABLE request_records ADD COLUMN future_provenance TEXT")
+                .execute(&database.pool)
+                .await
+                .unwrap();
+        }
         database.history_start().await.unwrap();
-        let (_, request_id, _) = seed(&database).await;
+        let (key, request_id, _) = seed(&database).await;
         if terminal_case {
             finish(&database, request_id).await;
             // A real non-null terminal row exercises every business column of the
@@ -1467,16 +1510,26 @@ async fn request_history_real_services_acceptance_native_original_survives_ack_a
             .bind(Uuid::now_v7().to_string()).bind(request_id.to_string()).execute(&database.pool).await.unwrap();
         }
         if cas_case {
-            sqlx::query("ALTER TABLE request_records ADD COLUMN future_provenance TEXT")
-                .execute(&database.pool)
-                .await
-                .unwrap();
             sqlx::query("UPDATE request_records SET future_provenance=$1 WHERE id=$2")
                 .bind("historical-business-fact".repeat(1024))
                 .bind(request_id.to_string())
                 .execute(&database.pool)
                 .await
                 .unwrap();
+        }
+        if cas_case {
+            database.record_conversation_observation(
+                &key, request_id,
+                &serde_json::json!({"messages":[{"role":"user","content":"collection fixture"}]}),
+                &crate::conversation::ConversationHints { session_id:Some("collection-session".into()), ..Default::default() },
+                None,
+            ).await.unwrap();
+            sqlx::query("INSERT INTO request_stats_facts (request_id,tenant_id,key_id,created_at,model,protocol,status_class,error_code,upstream_account_id,model_route_id,duration_ms,input_tokens,output_tokens,currency,cost_micros) SELECT id,tenant_id,key_id,created_at,model,protocol,'failure','raw-fact','','',0,0,0,'EUR',0 FROM request_records WHERE id=$1 ON CONFLICT(request_id) DO UPDATE SET currency='EUR',cost_micros=0,error_code='raw-fact'")
+                .bind(request_id.to_string()).execute(&database.pool).await.unwrap();
+            sqlx::query("INSERT INTO request_egress_attempts (request_id,attempt_id,outbound_attempt,connect_attempt,route_id,upstream_account_id,credential_generation,transport_revision,observed_at,snapshot_json,transport_json,connection_binding_json,request_payload_bytes,response_payload_bytes) VALUES ($1,$2,1,1,$3,$4,0,0,42,'{ \"kind\" : \"unknown\" }','{ \"raw\" : 0 }',NULL,0,NULL)")
+                .bind(request_id.to_string()).bind(Uuid::now_v7().to_string()).bind(Uuid::now_v7().to_string()).bind(Uuid::now_v7().to_string()).execute(&database.pool).await.unwrap();
+            sqlx::query("INSERT INTO request_upstream_transport_diagnostics (request_id,route_id,upstream_account_id,credential_generation,transport_revision,failure_kind,failure_stage,gateway_pod,gateway_node,failure_domain,observed_at) VALUES ($1,$2,$3,0,0,'connect','headers','fixture',NULL,'fixture',42)")
+                .bind(request_id.to_string()).bind(Uuid::now_v7().to_string()).bind(Uuid::now_v7().to_string()).execute(&database.pool).await.unwrap();
         }
         let snapshots = native_pending(&database).await;
         if !terminal_case {
@@ -1492,6 +1545,14 @@ async fn request_history_real_services_acceptance_native_original_survives_ack_a
             .await
             .unwrap();
         assert_eq!(expected["terminal"].is_object(), terminal_case);
+        if cas_case {
+            for name in ["statistics", "egress", "transport", "observations"] {
+                assert!(
+                    !expected[name].as_array().unwrap().is_empty(),
+                    "real {name} source required"
+                );
+            }
+        }
         for field in ["proxy_owner_token", "proxy_owner_expires_at"] {
             expected["request"].as_object_mut().unwrap().remove(field);
         }
@@ -1536,6 +1597,28 @@ async fn request_history_real_services_acceptance_native_original_survives_ack_a
             .execute(&database.pool)
             .await
             .unwrap();
+        for table in [
+            "request_stats_facts",
+            "request_egress_attempts",
+            "request_upstream_transport_diagnostics",
+            "conversation_observations",
+        ] {
+            sqlx::query(sqlx::AssertSqlSafe(format!(
+                "DELETE FROM {table} WHERE request_id=$1"
+            )))
+            .bind(request_id.to_string())
+            .execute(&database.pool)
+            .await
+            .unwrap();
+            let remaining: i64 = sqlx::query_scalar(sqlx::AssertSqlSafe(format!(
+                "SELECT COUNT(*) FROM {table} WHERE request_id=$1"
+            )))
+            .bind(request_id.to_string())
+            .fetch_one(&database.pool)
+            .await
+            .unwrap();
+            assert_eq!(remaining, 0);
+        }
         sqlx::query("DELETE FROM terminal_projection_outbox WHERE request_id=$1")
             .bind(request_id.to_string())
             .execute(&database.pool)

@@ -308,6 +308,96 @@ mod tests {
     use std::time::Duration;
 
     #[tokio::test]
+    async fn postgres_paused_returning_stream_retains_transaction_until_drop_but_execute_commits() {
+        let Ok(url) = std::env::var("MTC_TEST_POSTGRES_URL") else {
+            return;
+        };
+        sqlx::any::install_default_drivers();
+        let pool = RequestPool::from(
+            AnyPoolOptions::new()
+                .max_connections(1)
+                .connect(&url)
+                .await
+                .unwrap(),
+        );
+        let observer = AnyPoolOptions::new()
+            .max_connections(1)
+            .connect(&url)
+            .await
+            .unwrap();
+        let pid: i32 = sqlx::query_scalar("SELECT pg_backend_pid()")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        sqlx::raw_sql("CREATE TEMP TABLE executor_consume_probe(n BIGINT); CREATE FUNCTION pg_temp.executor_consume_trigger() RETURNS trigger LANGUAGE plpgsql AS $$ BEGIN PERFORM pg_advisory_xact_lock(NEW.n); RETURN NEW; END $$; CREATE TRIGGER executor_consume_trigger BEFORE INSERT ON executor_consume_probe FOR EACH ROW EXECUTE FUNCTION pg_temp.executor_consume_trigger();").execute(&pool).await.unwrap();
+        let key = (uuid::Uuid::now_v7().as_u128() & i64::MAX as u128) as i64;
+        let mut rows = sqlx::Executor::fetch_many(&pool, sqlx::query("INSERT INTO executor_consume_probe SELECT $1 FROM generate_series(1,256) RETURNING repeat('x',65536)").bind(key));
+        assert!(rows.try_next().await.unwrap().is_some());
+        let held: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM pg_locks WHERE pid=$1 AND locktype='advisory' AND granted",
+        )
+        .bind(pid)
+        .fetch_one(&observer)
+        .await
+        .unwrap();
+        assert!(
+            held > 0,
+            "paused consumer must expose the trigger transaction while its RETURNING output is not drained"
+        );
+        drop(rows);
+        tokio::time::timeout(Duration::from_secs(10), async {
+            loop {
+                let present: i64 =
+                    sqlx::query_scalar("SELECT COUNT(*) FROM pg_stat_activity WHERE pid=$1")
+                        .bind(pid)
+                        .fetch_one(&observer)
+                        .await
+                        .unwrap();
+                if present == 0 {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("cancelled stream closes its owned backend without replay");
+        // A fully consumed execute has a different boundary: ReadyForQuery must
+        // be consumed before the connection can be returned for reuse.
+        let committed_pid: i32 = sqlx::query_scalar("SELECT pg_backend_pid()")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        sqlx::raw_sql("CREATE TEMP TABLE executor_execute_probe(n BIGINT)")
+            .execute(&pool)
+            .await
+            .unwrap();
+        sqlx::query("INSERT INTO executor_execute_probe VALUES ($1)")
+            .bind(key)
+            .execute(&pool)
+            .await
+            .unwrap();
+        let state: String = sqlx::query_scalar("SELECT state FROM pg_stat_activity WHERE pid=$1")
+            .bind(committed_pid)
+            .fetch_one(&observer)
+            .await
+            .unwrap();
+        assert_eq!(
+            state, "idle",
+            "completed execute must not leave an idle transaction"
+        );
+        let count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM executor_execute_probe")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        assert_eq!(
+            count, 1,
+            "SQL executes once despite cancellation of the earlier stream"
+        );
+        pool.close().await;
+        observer.close().await;
+    }
+
+    #[tokio::test]
     async fn diagnostics_distinguish_cancelled_session_initialization_from_slot_waiting() {
         sqlx::any::install_default_drivers();
         let diagnostics = PoolDiagnostics::new("raw-persistence");

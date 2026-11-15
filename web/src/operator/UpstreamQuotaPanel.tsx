@@ -8,7 +8,7 @@ import { useQuotaClock } from './useQuotaClock';
 import type { QuotaReadState } from './useUpstreamQuotaReads';
 import './upstreamQuota.css';
 import { UpstreamQuotaReset } from './UpstreamQuotaReset';
-import { DetailTooltip, LoadingProgress, LoadingState } from '../design-system';
+import { Button, DataSurface, FormSection, DetailTooltip, LoadingProgress, LoadingState } from '../design-system';
 
 export function UpstreamQuotaDetails({ snapshot, refreshError, diagnostic }: { snapshot: UpstreamQuotaSnapshot; refreshError?: 'quota.readFailed' | 'quota.errorPermission'; diagnostic?: UpstreamQuotaDiagnostic }) {
   const { locale, t } = useI18n();
@@ -80,8 +80,8 @@ export function UpstreamQuotaResetSection({ accountId, accountName, tenant, toke
   const resetMessage = capability?.provider_supported == null ? 'quota.resetUnknown'
     : !capability.implementation_available ? 'quota.resetNotIntegrated' : 'quota.resetAvailable';
   const actionable = capability?.provider_supported === true && capability.implementation_available;
-  return <section className="upstream-quota-reset" aria-label={t('quota.resetCapability')}>
-    <div className="upstream-quota-reset-heading"><h3>{t('quota.resetCapability')}</h3>
+  return <section className="upstream-quota-reset" aria-label={t('quota.resetCapability')}><FormSection title={t('quota.resetCapability')}>
+    <div className="upstream-quota-reset-heading">
       {capability?.available_credits !== null && capability?.available_credits !== undefined && <span>{t('quota.resetCredits', { available: formatNumber(capability.available_credits, locale), applicable: capability.applicable_credits === null ? '—' : formatNumber(capability.applicable_credits, locale) })}</span>}
     </div>
     {snapshot ? <>
@@ -91,10 +91,10 @@ export function UpstreamQuotaResetSection({ accountId, accountName, tenant, toke
       {actionable && <UpstreamQuotaReset accountId={accountId} accountName={accountName} tenant={tenant} token={token} snapshot={snapshot} canRecover={canRecover} onQuotaChanged={onQuotaChanged} />}
     </> : <>
       <p role="status">{t(readFailed ? 'quota.resetDiscoveryFailed' : 'quota.resetDiscoveryPending')}</p>
-      <button type="button" className="danger" disabled>{t('quota.resetAction')}</button>
+      <Button type="button" appearance="secondary" disabled>{t('quota.resetAction')}</Button>
     </>}
     {resetSettings}
-  </section>;
+  </FormSection></section>;
 }
 
 /** User-triggered read: never starts one upstream request per card on page load. */
@@ -149,13 +149,13 @@ export function UpstreamQuota({ accountId, accountName = accountId, credentialGe
       if (scopeRef.current === scope && !controller.signal.aborted) setBusy(false);
     }
   }
-  return <section className="upstream-quota" aria-label={t('quota.title')} aria-busy={busy}>
-    <div className="upstream-quota-heading"><h3>{t('quota.title')}</h3><button type="button" className="secondary" disabled={busy || !tenant || refreshDisabled} onClick={() => void load()}>{t(busy ? 'common.loading' : snapshot ? 'quota.refresh' : 'quota.view')}</button></div>
+  return <DataSurface className="upstream-quota" aria-label={t('quota.title')} aria-busy={busy}>
+    <div className="upstream-quota-heading"><h3>{t('quota.title')}</h3><Button type="button" appearance="secondary" disabled={busy || !tenant || refreshDisabled} onClick={() => void load()}>{t(busy ? 'common.loading' : snapshot ? 'quota.refresh' : 'quota.view')}</Button></div>
     {(error || diagnostic?.error_code) && !snapshot && <div className="notice error" role="alert" data-quota-error-code={diagnostic?.error_code ?? undefined} data-quota-cache-hit={String(diagnostic?.cache_hit ?? false)} data-quota-attempt-count={diagnostic?.attempts.length ?? 0}><p>{t(diagnostic?.error_code && diagnostic.error_code !== 'quota_not_authorized' ? quotaReadErrorMessage(diagnostic.error_code) : error ?? quotaReadErrorMessage(diagnostic?.error_code))}</p></div>}
     <LoadingProgress active={busy && Boolean(snapshot)} label={t('common.loading')} />
     {!snapshot && busy && <LoadingState label={t('common.loading')} variant="compact" />}
     {!snapshot && !busy && !error && <p>{t(tenant ? 'quota.notLoaded' : 'quota.selectTenant')}</p>}
     {snapshot && <UpstreamQuotaDetails snapshot={snapshot} refreshError={error} diagnostic={diagnostic} />}
     <UpstreamQuotaResetSection key={scope} accountId={accountId} accountName={accountName} tenant={tenant} token={token} snapshot={snapshot} readFailed={Boolean(error || diagnostic?.error_code)} canRecover={canRecover} onQuotaChanged={() => setRefreshAfterReset(scope)} resetSettings={resetSettings?.(snapshot)} />
-  </section>;
+  </DataSurface>;
 }
