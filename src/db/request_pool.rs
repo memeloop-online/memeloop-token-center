@@ -331,7 +331,7 @@ mod tests {
             .unwrap();
         sqlx::raw_sql("CREATE TEMP TABLE executor_consume_probe(n BIGINT); CREATE FUNCTION pg_temp.executor_consume_trigger() RETURNS trigger LANGUAGE plpgsql AS $$ BEGIN PERFORM pg_advisory_xact_lock(NEW.n); RETURN NEW; END $$; CREATE TRIGGER executor_consume_trigger BEFORE INSERT ON executor_consume_probe FOR EACH ROW EXECUTE FUNCTION pg_temp.executor_consume_trigger();").execute(&pool).await.unwrap();
         let key = (uuid::Uuid::now_v7().as_u128() & i64::MAX as u128) as i64;
-        let mut rows = sqlx::query("INSERT INTO executor_consume_probe SELECT $1 FROM generate_series(1,256) RETURNING repeat('x',65536)").bind(key).fetch_many(&pool);
+        let mut rows = sqlx::Executor::fetch_many(&pool, sqlx::query("INSERT INTO executor_consume_probe SELECT $1 FROM generate_series(1,256) RETURNING repeat('x',65536)").bind(key));
         assert!(rows.try_next().await.unwrap().is_some());
         let held: i64 = sqlx::query_scalar(
             "SELECT COUNT(*) FROM pg_locks WHERE pid=$1 AND locktype='advisory' AND granted",
