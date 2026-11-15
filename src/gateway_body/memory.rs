@@ -227,6 +227,15 @@ impl Drop for SseStreamingMemory {
 }
 
 impl ProxyMemoryReservation {
+    /// A handle to the same admission pool, not a second budget or reservation.
+    pub(crate) fn shared_budget(&self) -> Arc<ProxyMemoryBudget> {
+        Arc::new(ProxyMemoryBudget {
+            capacity: self.capacity,
+            permits: self.permits.clone(),
+            retained_requests: self.retained_requests.clone(),
+        })
+    }
+
     // Existing request-source ingress uses the same global allocation permits.
     pub(crate) fn try_reserve_ingress_bytes(&self, bytes: usize) -> Option<OwnedSemaphorePermit> {
         let units = u32::try_from(bytes.div_ceil(UNIT_BYTES)).ok()?;
