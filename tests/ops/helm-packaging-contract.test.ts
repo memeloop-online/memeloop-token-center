@@ -85,6 +85,17 @@ test('Helm chart packaging, security, ingress, and schema contracts', () => {
     run(helm, ['lint', '--strict', chart]);
     run(helm, ['lint', '--strict', chart, '--values', join(chart, 'values-dev.yaml')]);
     const render = (name: string, flags: string[] = []): string => run(helm, ['template', `token-center-${name}`, chart, '--namespace', 'token-center', ...flags]);
+    // Runtime inventory and the legacy OCI installer are deliberately exclusive.
+    assert.throws(() => render('runtime-gateway-cache-oci', [
+        ...runtimeFlags, '--set-string', 'plugins.runtimeInventory.gatewayCachePath=/var/lib/memeloop-token-center/gateway-plugin-cache',
+        '--set', 'plugins.enabled=true', '--set', 'plugins.ociInstaller.enabled=true',
+        '--set-string', `plugins.ociInstaller.image.digest=${installer}`,
+        '--set-string', `plugins.ociInstaller.artifacts[0].reference=ghcr.io/example/plugin@${artifact}`,
+        '--set-string', 'plugins.ociInstaller.artifacts[0].allowedSource=ghcr.io/example/plugin',
+        '--set-string', 'plugins.ociInstaller.cosignPublicKeysSecret.name=plugin-cosign-keys',
+        '--set-string', 'plugins.ociInstaller.cosignPublicKeysSecret.keys[0]=cosign.pub',
+        '--set-string', 'plugins.ociInstaller.registryAuthSecret.name=plugin-registry-auth',
+      ]), /runtimeInventory cannot be combined/);
     const output: Record<string, string> = {
       default: render('default'),
       terminalProjectionDisabled: render('default', ['--set', 'config.terminalProjectionEnabled=false']),
@@ -106,16 +117,6 @@ test('Helm chart packaging, security, ingress, and schema contracts', () => {
       configmap: render('configmap-plugin', ['--set', 'plugins.enabled=true', '--set', 'plugins.existingConfigMap=token-center-plugins']),
       pvc: render('pvc-plugin', ['--set', 'plugins.enabled=true', '--set', 'plugins.existingClaim=token-center-plugins']),
       oci: render('oci-plugin', [
-        '--set', 'plugins.enabled=true', '--set', 'plugins.ociInstaller.enabled=true',
-        '--set-string', `plugins.ociInstaller.image.digest=${installer}`,
-        '--set-string', `plugins.ociInstaller.artifacts[0].reference=ghcr.io/example/plugin@${artifact}`,
-        '--set-string', 'plugins.ociInstaller.artifacts[0].allowedSource=ghcr.io/example/plugin',
-        '--set-string', 'plugins.ociInstaller.cosignPublicKeysSecret.name=plugin-cosign-keys',
-        '--set-string', 'plugins.ociInstaller.cosignPublicKeysSecret.keys[0]=cosign.pub',
-        '--set-string', 'plugins.ociInstaller.registryAuthSecret.name=plugin-registry-auth',
-      ]),
-      runtimeGatewayCacheOci: render('runtime-gateway-cache-oci', [
-        ...runtimeFlags, '--set-string', 'plugins.runtimeInventory.gatewayCachePath=/var/lib/memeloop-token-center/gateway-plugin-cache',
         '--set', 'plugins.enabled=true', '--set', 'plugins.ociInstaller.enabled=true',
         '--set-string', `plugins.ociInstaller.image.digest=${installer}`,
         '--set-string', `plugins.ociInstaller.artifacts[0].reference=ghcr.io/example/plugin@${artifact}`,
@@ -165,7 +166,7 @@ test('Helm chart packaging, security, ingress, and schema contracts', () => {
     count('runtime', 'name: MTC_PLUGIN_INVENTORY_FILE', 3);
     count('runtime', 'name: MTC_PLUGIN_INSTALL_POLICY_FILE', 1);
     count('runtimeReaders', 'name: MTC_PLUGIN_INSTALL_POLICY_FILE', 0);
-    for (const deployment of [output.runtimeGatewayCache!, output.runtimeGatewayCacheOci!].flatMap(value => parseAllDocuments(value)).map(document => document.toJSON() as RuntimeDeployment).filter(document => document?.kind === 'Deployment')) {
+    for (const deployment of parseAllDocuments(output.runtimeGatewayCache!).map(document => document.toJSON() as RuntimeDeployment).filter(document => document?.kind === 'Deployment')) {
       const role = deployment.spec.template.metadata.labels['app.kubernetes.io/component'];
       const pod = deployment.spec.template.spec;
       const volume = pod.volumes.find(item => item.name === 'plugin-runtime-inventory')!;
