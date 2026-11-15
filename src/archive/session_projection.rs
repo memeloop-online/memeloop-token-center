@@ -1323,6 +1323,7 @@ impl Context {
                 let reference: ConversationBodyReference =
                     serde_json::from_value(atom.content.clone()).map_err(|_| invalid())?;
                 instances.push(super::SemanticTurnInstance {
+                    role: Some(atom.role.clone()),
                     instance_id: format!("{request}:{ordinal}:{}", node.node_hash),
                     request_id: request,
                     attempt_id: None,
