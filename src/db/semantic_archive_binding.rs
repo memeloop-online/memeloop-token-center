@@ -2,7 +2,40 @@
 //! from object upload. No locator, receipt digest, claim or balance is changed.
 use super::*;
 
+#[cfg(test)]
+tokio::task_local! {
+    static COVERAGE_FAULT: std::cell::Cell<Option<&'static str>>;
+}
+
 impl Database {
+    #[cfg(test)]
+    pub(crate) async fn with_semantic_coverage_fault<T>(
+        stage: &'static str,
+        future: impl std::future::Future<Output = T>,
+    ) -> T {
+        COVERAGE_FAULT
+            .scope(std::cell::Cell::new(Some(stage)), future)
+            .await
+    }
+
+    #[cfg(test)]
+    pub(crate) fn semantic_coverage_test_boundary(stage: &'static str) -> Result<(), AppError> {
+        if COVERAGE_FAULT
+            .try_with(|fault| {
+                if fault.get() == Some(stage) {
+                    fault.set(None);
+                    true
+                } else {
+                    false
+                }
+            })
+            .unwrap_or(false)
+        {
+            return Err(AppError::storage("injected_semantic_coverage_boundary"));
+        }
+        Ok(())
+    }
+
     pub(crate) async fn retain_semantic_coverage_obligation(
         &self,
         owner: Uuid,
@@ -46,6 +79,11 @@ impl Database {
             let publication: crate::archive::SemanticPublication =
                 serde_json::from_value(value["semantic_coverage_pending"].clone())
                     .map_err(|_| AppError::storage("semantic_publication_invalid"))?;
+            if publication.tenant_id != parse_uuid(tenant.clone())?
+                || publication.request_id != parse_uuid(request.clone())?
+            {
+                return Err(AppError::storage("semantic_publication_owner_mismatch"));
+            }
             let manifest = archive
                 .get_semantic_manifest_streamed(publication.tenant_id, &publication.manifest)
                 .await?;

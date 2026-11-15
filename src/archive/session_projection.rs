@@ -1430,7 +1430,8 @@ mod tests {
         let (expected, nodes, _) =
             SessionBody::from_request_document(document).into_archive_parts();
         assert_eq!(prepared.nodes, nodes);
-        for (actual, expected) in prepared.atoms.iter().zip(expected) {
+        for (actual, mut expected) in prepared.atoms.iter().zip(expected) {
+            expected.content.as_object_mut().unwrap().remove("origin");
             assert_eq!(actual.content_hash, expected.content_hash);
             assert_eq!(
                 atom_document(&store, tenant, actual).await,
@@ -1525,24 +1526,20 @@ mod tests {
         let (expected, _, _) = expected.into_archive_parts();
         let returned: Vec<_> = prepared.atoms.iter().skip(1).collect();
         assert_eq!(returned.len(), expected.len());
-        for (actual, expected) in returned.into_iter().zip(expected) {
+        for (actual, mut expected) in returned.into_iter().zip(expected) {
+            expected.content.as_object_mut().unwrap().remove("origin");
             assert_eq!(actual.content_hash, expected.content_hash);
             assert_eq!(
                 atom_document(&store, tenant, actual).await,
                 expected.content
             );
         }
-        let reference = store
-            .request_conversation_reference(tenant, request)
+        let manifest = store
+            .get_semantic_manifest_streamed(tenant, &prepared.publication.manifest)
             .await
             .unwrap();
-        let mut export = store
-            .stream_conversation_export(tenant, &reference)
-            .await
-            .unwrap();
-        while let Some(chunk) = export.next().await {
-            chunk.unwrap();
-        }
+        assert!(manifest.coverage.observed_terminal);
+        assert!(manifest.instances_head.is_some());
     }
 
     #[tokio::test]
@@ -1585,40 +1582,77 @@ mod tests {
                 .as_ref(),
             bytes
         );
-        let root = store
-            .request_conversation_reference(tenant, request)
-            .await
-            .unwrap();
         let manifest = store
-            .get_conversation_manifest(tenant, &root, 1024 * 1024)
+            .get_semantic_manifest_streamed(tenant, &prepared.publication.manifest)
             .await
             .unwrap();
-        let mut head = manifest.head;
-        let mut found = false;
-        while let Some(prefix) = head {
-            let node: super::super::conversation::PrefixNode = store
-                .get_conversation_json(tenant, &prefix.object, 1024 * 1024)
-                .await
-                .unwrap();
-            let event: Value = store
-                .get_conversation_json(tenant, &node.event, 1024 * 1024)
-                .await
-                .unwrap();
-            if event["kind"] == "document" {
-                assert_eq!(event["document"], document);
-                assert!(
-                    event["gaps"]
-                        .as_array()
-                        .unwrap()
-                        .iter()
-                        .any(|gap| gap == "external_media_not_captured")
-                );
-                found = true;
-            }
-            head = node.parent;
-        }
-        assert!(found, "request event retains the media gap and exact URL");
+        assert!(!prepared.coverage_complete);
+        assert!(
+            manifest
+                .coverage
+                .gaps
+                .iter()
+                .any(|gap| gap == "external_media_not_captured")
+        );
+        assert!(!manifest.coverage.observed_terminal);
+        let atom = atom_document(&store, tenant, &prepared.atoms[0]).await;
+        assert!(atom.to_string().contains(&prepared.media[0].content_blake3));
+        // Uncaptured external media remains a gap; the exact original URL is
+        // retained in raw rather than claimed to be a captured atom payload.
         assert_eq!(store.get(&locator).await.unwrap(), original);
+    }
+
+    #[tokio::test]
+    async fn successful_transport_without_protocol_terminal_retains_partial_coverage() {
+        let store = ArchiveStore::memory_for_test();
+        let tenant = Uuid::now_v7();
+        for response in [
+            r#"{"status":"incomplete","output":[{"type":"message","role":"assistant","content":[{"type":"output_text","text":"partial"}]}]}"#,
+            "data: {\"choices\":[{\"index\":0,\"delta\":{\"role\":\"assistant\",\"content\":\"partial\"}}]}\n\n",
+        ] {
+            let request = Uuid::now_v7();
+            let input = store
+                .put_tenant_content(
+                    tenant,
+                    Bytes::from_static(br#"{"messages":[{"role":"user","content":"hello"}]}"#),
+                )
+                .await
+                .unwrap();
+            let output = store
+                .put_tenant_content(tenant, Bytes::copy_from_slice(response.as_bytes()))
+                .await
+                .unwrap();
+            let prepared = store
+                .prepare_session_body_streamed(
+                    tenant,
+                    request,
+                    ConversationHints::default(),
+                    input.object_locator,
+                    Some(output.object_locator),
+                    true,
+                )
+                .await
+                .unwrap()
+                .unwrap();
+            assert!(!prepared.coverage_complete);
+            let manifest = store
+                .get_semantic_manifest_streamed(tenant, &prepared.publication.manifest)
+                .await
+                .unwrap();
+            assert!(!manifest.coverage.observed_terminal);
+            assert_eq!(
+                manifest.coverage.projection_state,
+                super::super::SemanticProjectionState::Partial
+            );
+            assert!(
+                manifest
+                    .coverage
+                    .gaps
+                    .iter()
+                    .any(|gap| gap == "response_protocol_incomplete")
+            );
+            assert!(!prepared.atoms.is_empty());
+        }
     }
 
     #[tokio::test]
