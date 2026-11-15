@@ -1,6 +1,6 @@
 import assert from 'node:assert/strict';
 import test from 'node:test';
-import { exportSemanticContext, type SemanticViewLoader, type SemanticViewPage } from '../src/semanticViewReader.js';
+import { createSemanticViewLoader, exportSemanticContext, type SemanticViewLoader, type SemanticViewPage } from '../src/semanticViewReader.js';
 import { semanticMessageId } from '../src/semanticConversationIdentity.js';
 
 const instance = { instance_id: 'occurrence-a', request_id: 'request-a', branch_id: 'branch-a', ordinal: 1, atom_hash: 'same-atom', node_hash: 'node-a', atom_cursor: 'signed-a', origin: 'request', terminal_state: 'complete' };
@@ -47,4 +47,14 @@ test('pending semantic publication cannot be exported as a complete empty conver
     if (previousWindow) Object.defineProperty(globalThis, 'window', previousWindow);
     else Reflect.deleteProperty(globalThis, 'window');
   }
+});
+
+
+test('HTTP decimal u64 revision survives the actual loader without number rounding', async () => {
+  const old = globalThis.fetch;
+  globalThis.fetch = async () => new Response(JSON.stringify(page), { headers: { 'content-type': 'application/json' } });
+  try {
+    const result = await createSemanticViewLoader('fixture', () => '/semantic').page('request-a', undefined, new AbortController().signal);
+    assert.equal(result.manifest_revision, '18446744073709551615');
+  } finally { globalThis.fetch = old; }
 });

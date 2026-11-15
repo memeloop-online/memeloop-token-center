@@ -20,12 +20,12 @@ const loader: SemanticViewLoader = {
     return { status: 'published', manifest_revision: '18446744073709551615',
       coverage: { observed_terminal: true, projection_state: 'partial', gaps: ['tool_result_not_recorded'], omissions: [] },
       instances: [{ instance_id: cursor ? 'earlier' : 'latest', request_id: 'request-a', branch_id: 'branch-a', ordinal: cursor ? 1 : 2,
-        atom_hash: 'a'.repeat(64), node_hash: 'b'.repeat(64), atom_cursor: cursor ?? 'latest-atom', origin: 'return', terminal_state: 'complete' }],
+        role: cursor ? 'user' : 'assistant', atom_hash: 'a'.repeat(64), node_hash: 'b'.repeat(64), atom_cursor: cursor ?? 'latest-atom', origin: 'return', terminal_state: 'complete' }],
       next_cursor: cursor ? null : 'older-page' };
   },
   atom: async (_request, cursor) => {
     window.semanticAtomReads++;
-    return new Response(JSON.stringify({ role: 'assistant', parts: [
+    return new Response(JSON.stringify({ role: cursor === 'latest-atom' ? 'assistant' : 'user', parts: [
       { kind: 'text', text: cursor === 'latest-atom' ? 'Verified latest answer' : 'Verified earlier answer' },
       { kind: 'reasoning', text: 'Separate reasoning' },
       { kind: 'tool_call', tool_name: 'lookup', arguments: { query: 'structured' }, call_id: 'call-1' },

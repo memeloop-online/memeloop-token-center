@@ -4,6 +4,7 @@ import type { SemanticInstanceIdentity } from './semanticConversationIdentity.js
 
 export interface SemanticViewInstance extends SemanticInstanceIdentity {
   atom_cursor: string;
+  role?: string | null;
   origin: string;
   terminal_state: string;
   turn_id?: string | null;

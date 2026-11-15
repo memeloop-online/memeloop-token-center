@@ -70,6 +70,36 @@ fn decode(
     }
     Ok(value)
 }
+fn wire_page(
+    mut body: Value,
+    revision: u64,
+    cursor: Option<String>,
+    atom_tokens: Vec<String>,
+) -> Result<Value, AppError> {
+    let object = body
+        .as_object_mut()
+        .ok_or_else(|| AppError::internal("semantic_view_page_shape"))?;
+    object.remove("previous");
+    object.insert(
+        "manifest_revision".into(),
+        Value::String(revision.to_string()),
+    );
+    object.insert("status".into(), Value::String("published".into()));
+    if let Some(instances) = object.get_mut("instances").and_then(Value::as_array_mut) {
+        for (instance, token) in instances.iter_mut().zip(atom_tokens) {
+            if let Some(instance) = instance.as_object_mut() {
+                instance.remove("body");
+                instance.insert("atom_cursor".into(), Value::String(token));
+            }
+        }
+    }
+    object.insert(
+        "next_cursor".into(),
+        serde_json::to_value(cursor)
+            .map_err(|_| AppError::internal("semantic_view_cursor_shape"))?,
+    );
+    Ok(body)
+}
 async fn page(
     state: &AppState,
     scope: SessionContextScope,
@@ -181,30 +211,12 @@ async fn page(
             )
         })
         .collect::<Result<Vec<_>, _>>()?;
-    let mut body =
-        serde_json::to_value(page).map_err(|_| AppError::internal("semantic_view_page_encode"))?;
-    let object = body
-        .as_object_mut()
-        .ok_or_else(|| AppError::internal("semantic_view_page_shape"))?;
-    object.remove("previous");
-    object.insert(
-        "manifest_revision".into(),
-        Value::String(revision.to_string()),
-    );
-    object.insert("status".into(), Value::String("published".into()));
-    if let Some(instances) = object.get_mut("instances").and_then(Value::as_array_mut) {
-        for (instance, token) in instances.iter_mut().zip(atom_tokens) {
-            if let Some(instance) = instance.as_object_mut() {
-                instance.remove("body");
-                instance.insert("atom_cursor".into(), Value::String(token));
-            }
-        }
-    }
-    object.insert(
-        "next_cursor".into(),
-        serde_json::to_value(cursor)
-            .map_err(|_| AppError::internal("semantic_view_cursor_shape"))?,
-    );
+    let body = wire_page(
+        serde_json::to_value(page).map_err(|_| AppError::internal("semantic_view_page_encode"))?,
+        revision,
+        cursor,
+        atom_tokens,
+    )?;
     Ok(([(header::CACHE_CONTROL, "private, no-store")], Json(body)).into_response())
 }
 pub(super) async fn internal_semantic_view(
@@ -261,9 +273,19 @@ mod tests {
 
     #[test]
     fn semantic_revision_wire_string_preserves_full_u64() {
-        let value = Value::String(u64::MAX.to_string());
+        let value = wire_page(serde_json::json!({
+            "manifest_revision": u64::MAX,
+            "previous": {"object_locator": "private-page"},
+            "instances": [{"instance_id": "one", "role": "user", "body": {"object_locator": "private-atom"}}]
+        }), u64::MAX, Some("signed-page".into()), vec!["signed-atom".into()]).unwrap();
+        assert_eq!(value["manifest_revision"], "18446744073709551615");
+        assert_eq!(value["instances"][0]["role"], "user");
+        assert_eq!(value["instances"][0]["atom_cursor"], "signed-atom");
+        assert!(value.get("previous").is_none());
+        assert!(value["instances"][0].get("body").is_none());
         let encoded = serde_json::to_string(&value).unwrap();
-        assert_eq!(encoded, "\"18446744073709551615\"");
+        assert!(!encoded.contains("private-page"));
+        assert!(!encoded.contains("private-atom"));
     }
 
     #[test]

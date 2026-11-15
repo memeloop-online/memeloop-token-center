@@ -8,6 +8,9 @@ import { semanticMessageId } from './semanticConversationIdentity.js';
 import { exportSemanticContext, type SemanticViewInstance, type SemanticViewLoader, type SemanticViewPage } from './semanticViewReader.js';
 
 const previewBudget = 128 * 1024;
+function knownRole(value: unknown): value is ConversationMessageListProjection['role'] {
+  return value === 'user' || value === 'assistant' || value === 'tool' || value === 'agent' || value === 'error';
+}
 const pending: SemanticCoverage = { observed_terminal: false, projection_state: 'partial', gaps: ['semantic_publication_pending'], omissions: [] };
 
 function AtomContent({ loader, request, cursor }: { loader: SemanticViewLoader; request: string; cursor: string }) {
@@ -94,12 +97,15 @@ export function SemanticSessionPanel({ detail, loader }: { detail: LogicalSessio
   const visiblePage = loadedScope?.loader === loader && loadedScope.request === requestId ? page : undefined;
   const visibleInstances = visiblePage ? instances : [];
   const revision = String(visiblePage?.manifest_revision ?? 'pending');
-  const messages = useMemo<ConversationMessageListProjection[]>(() => visibleInstances.map(instance => ({
+  const messages = useMemo<ConversationMessageListProjection[]>(() => visibleInstances.flatMap(instance => {
+    const role = instance.role;
+    if (!knownRole(role)) return [];
+    return [{
     messageId: semanticMessageId(revision, instance), turnId: instance.turn_id ?? instance.instance_id,
     conversationId: detail.session_id, originNodeId: instance.origin, originSequence: instance.ordinal,
     lamportClock: instance.ordinal, timestamp: requests.find(request => request.request_id === requestId)?.created_at ?? 0,
-    role: 'agent', content: '', metadata: { instance_id: instance.instance_id, branch_id: instance.branch_id },
-  })), [visibleInstances, revision, detail.session_id, requestId, requests]);
+    role, content: '', metadata: { instance_id: instance.instance_id, branch_id: instance.branch_id },
+  }]; }), [visibleInstances, revision, detail.session_id, requestId, requests]);
   return <section aria-label={zh ? '会话记录' : 'Conversation record'}>
     <label>{zh ? '请求上下文' : 'Request context'}<select value={requestId} onChange={event => setRequestId(event.target.value)}>
       {requests.map(request => <option key={request.request_id} value={request.request_id}>{new Date(request.created_at).toLocaleString(locale)} · {request.model}</option>)}
@@ -108,6 +114,14 @@ export function SemanticSessionPanel({ detail, loader }: { detail: LogicalSessio
     {visiblePage?.next_cursor && <Button appearance="secondary" disabled={loading} onClick={() => void read(visiblePage.next_cursor ?? undefined)}>{zh ? '较早消息' : 'Earlier messages'}</Button>}
     <Button appearance="secondary" disabled={exporting || visiblePage?.status !== 'published'} onClick={() => void exportContext()}>{zh ? '流式导出此上下文' : 'Stream context export'}</Button>
     {exporting && <Button appearance="secondary" onClick={() => exportActive.current?.abort()}>{zh ? '取消导出' : 'Cancel export'}</Button>}
+    {visibleInstances.filter(instance => !knownRole(instance.role)).map(instance => {
+      const id = semanticMessageId(revision, instance);
+      return <section key={id} data-semantic-role="unrecorded">
+        <p>{zh ? '消息角色未记录，未归为用户或助手。' : 'Message role is unrecorded; it is not classified as user or assistant.'}</p>
+        <Button appearance="secondary" onClick={() => setOpened(id)}>{zh ? '读取消息' : 'Read message'} · {instance.ordinal}</Button>
+        {opened === id && <AtomContent key={instance.atom_cursor} loader={loader} request={requestId} cursor={instance.atom_cursor} />}
+      </section>;
+    })}
     <SemanticConversationViewer revision={revision} coverage={visiblePage?.coverage ?? pending}
       readOnlyMessage={zh ? '此视图只读' : 'This view is read-only'}
       incompleteMessage={zh ? '语义记录尚未完整发布。' : 'The semantic record is not fully published.'}
@@ -117,9 +131,9 @@ export function SemanticSessionPanel({ detail, loader }: { detail: LogicalSessio
       renderMessageContent={message => {
         const instance = visibleInstances.find(item => semanticMessageId(revision, item) === message.messageId);
         if (!instance) return null;
-        return <><Button appearance="secondary" onClick={() => setOpened(message.messageId)}>{zh ? '读取消息' : 'Read message'} · {instance.ordinal}</Button>
+        return <section data-semantic-role={message.role}><Button appearance="secondary" onClick={() => setOpened(message.messageId)}>{zh ? '读取消息' : 'Read message'} · {instance.ordinal}</Button>
           <Button appearance="secondary" disabled={exporting} onClick={() => void exportContext(instance)}>{zh ? '导出消息' : 'Export message'}</Button>
-          {opened === message.messageId && <AtomContent key={instance.atom_cursor} loader={loader} request={requestId} cursor={instance.atom_cursor} />}</>;
+          {opened === message.messageId && <AtomContent key={instance.atom_cursor} loader={loader} request={requestId} cursor={instance.atom_cursor} />}</section>;
       }} />
   </section>;
 }

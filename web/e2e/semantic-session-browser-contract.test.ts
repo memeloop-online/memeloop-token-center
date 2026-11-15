@@ -18,6 +18,8 @@ test('semantic viewer reads verified atoms lazily, preserves parts and pages wit
     await page.addInitScript(() => localStorage.setItem('mtc-locale', 'en'));
     await page.goto(`http://127.0.0.1:${address.port}/e2e/fixtures/semantic-session.html`);
     await page.getByRole('button', { name: 'Read message · 2', exact: true }).waitFor();
+    assert.equal(await page.locator('[data-semantic-role=assistant]').count(), 1);
+    assert.equal(await page.locator('[data-semantic-role=agent]').count(), 0);
     assert.equal(await page.evaluate(() => window.semanticAtomReads), 0);
     await page.getByText('tool_result_not_recorded', { exact: true }).waitFor();
     await page.getByRole('button', { name: 'Read message · 2', exact: true }).click();
@@ -28,6 +30,7 @@ test('semantic viewer reads verified atoms lazily, preserves parts and pages wit
     await page.getByRole('button', { name: 'Earlier messages', exact: true }).click();
     await page.getByRole('button', { name: 'Read message · 1', exact: true }).waitFor();
     assert.equal(await page.getByRole('button', { name: 'Read message · 2', exact: true }).count(), 0, 'old resident window is released');
+    assert.equal(await page.locator('[data-semantic-role=user]').count(), 1);
     await page.getByRole('button', { name: 'Read message · 1', exact: true }).click();
     await page.getByText('Verified earlier answer', { exact: true }).waitFor();
     assert.equal(await page.evaluate(() => window.semanticAtomReads), 2);
