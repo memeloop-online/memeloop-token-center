@@ -86,6 +86,7 @@ mod routes;
 mod routing;
 mod self_service;
 mod session_reading;
+mod semantic_session_view;
 mod session_tasks;
 mod session_titles;
 pub(crate) use session_titles::process_one as process_session_title;
@@ -149,6 +150,7 @@ use routes::{control_router, gateway_router};
 use routing::*;
 use self_service::*;
 use session_reading::*;
+use semantic_session_view::*;
 use session_titles::{generate_session_title, get_session_title};
 use sessions::*;
 use tenants::{

@@ -369,6 +369,10 @@ pub(in crate::api) fn control_router(state: AppState) -> Router<AppState> {
             get(get_session_title).post(generate_session_title),
         )
         .route(
+            "/internal/v1/sessions/{session_id}/requests/{request_id}/semantic-view",
+            get(internal_semantic_view),
+        )
+        .route(
             "/internal/v1/sessions/{session_id}/requests/{request_id}/context",
             get(internal_session_context),
         )
