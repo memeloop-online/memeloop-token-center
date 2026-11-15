@@ -5,7 +5,7 @@ use super::{
     memory::{ProxyMemoryBudget, ProxyMemoryReservation},
 };
 use crate::{
-    archive::{ArchiveStore, ScratchScope},
+    archive::{ArchiveStore, scratch_scope::ScratchScope},
     archive_staging::ArchiveStagingKey,
     db::Database,
     error::AppError,
