@@ -1032,6 +1032,8 @@ impl Context {
         );
         let mut body = crate::conversation::SessionBody::from_request_document(request_document);
         let mut response_valid = true;
+        let mut protocol_terminal = false;
+        let mut protocol_incomplete = false;
         if let Some(locator) = response_locator {
             let raw_response = self.source_object(request, "response", locator)?;
             let mut source = BufReader::with_capacity(CHUNK, self.content(&raw_response)?);
@@ -1057,6 +1059,24 @@ impl Context {
                 .document();
                 match parsed {
                     Ok(document) => {
+                        protocol_terminal = document.get("status").and_then(Value::as_str)
+                            == Some("completed")
+                            || document.get("stop_reason").is_some_and(|v| !v.is_null())
+                            || document
+                                .get("choices")
+                                .and_then(Value::as_array)
+                                .is_some_and(|choices| {
+                                    !choices.is_empty()
+                                        && choices.iter().all(|choice| {
+                                            choice
+                                                .get("finish_reason")
+                                                .is_some_and(|v| !v.is_null())
+                                        })
+                                });
+                        protocol_incomplete = matches!(
+                            document.get("status").and_then(Value::as_str),
+                            Some("incomplete" | "in_progress" | "failed")
+                        );
                         let (media, event_gaps) = self.media(&references, &document)?;
                         gaps.extend(event_gaps);
                         let mut document = document;
@@ -1088,6 +1108,7 @@ impl Context {
                         continue;
                     }
                     if prefix.starts_with(b"[DONE]") {
+                        protocol_terminal = true;
                         let mut suffix = [0_u8; 6];
                         frame.read_exact(&mut suffix).map_err(io_error)?;
                         while !frame.fill_buf().map_err(io_error)?.is_empty() {
@@ -1112,6 +1133,15 @@ impl Context {
                     let document = parser.document();
                     match document {
                         Ok(mut document) => {
+                            let event_type = document.get("type").and_then(Value::as_str);
+                            protocol_terminal |= matches!(
+                                event_type,
+                                Some("response.completed" | "response.done" | "message_stop")
+                            );
+                            protocol_incomplete |= matches!(
+                                event_type,
+                                Some("response.incomplete" | "response.failed" | "error")
+                            );
                             events = events.checked_add(1).ok_or_else(invalid)?;
                             let (media, event_gaps) = self.media(&references, &document)?;
                             gaps.extend(event_gaps);
@@ -1161,6 +1191,9 @@ impl Context {
             }
         } else if !gaps.iter().any(|gap| gap == "response_missing") {
             gaps.push("response_missing".into());
+        }
+        if !protocol_terminal || protocol_incomplete {
+            gaps.push("response_protocol_incomplete".into());
         }
         let pending = body.take_media_bytes();
         for (turn_index, part_index, bytes) in pending {
@@ -1223,7 +1256,11 @@ impl Context {
         if atoms.is_empty() {
             gaps.push("semantic_body_empty".into());
         }
-        let coverage_complete = response_complete && response_valid && gaps.is_empty();
+        let coverage_complete = response_complete
+            && protocol_terminal
+            && !protocol_incomplete
+            && response_valid
+            && gaps.is_empty();
         let backend_identity = atoms
             .first()
             .map(|atom| {
@@ -1256,7 +1293,7 @@ impl Context {
             }),
             instances_head: None,
             coverage: super::SemanticCoverage {
-                observed_terminal: response_complete,
+                observed_terminal: response_complete && protocol_terminal && !protocol_incomplete,
                 projection_state: if coverage_complete {
                     super::SemanticProjectionState::Complete
                 } else {
