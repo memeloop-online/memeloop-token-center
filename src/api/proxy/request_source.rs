@@ -217,7 +217,13 @@ mod tests {
                 .sealed_staged_reference()
                 .is_none()
         );
-        assert_eq!(source.read_all().await.unwrap(), body);
+        let mut replay = source.open_stream().await.unwrap().stream;
+        let mut replayed = Vec::new();
+        while let Some(chunk) = replay.next().await {
+            replayed.extend_from_slice(&chunk.unwrap());
+        }
+        assert_eq!(replayed, body);
+        drop(replay);
         drop(source);
         drop(memory);
         assert_eq!(budget.snapshot().0, 0);
