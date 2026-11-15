@@ -8,6 +8,68 @@ use crate::{AppState, config::Config, db::ArchiveSpoolIdentity};
 const PEPPER: &[u8] = b"existing-test-pepper-over-thirty-two-bytes";
 
 #[tokio::test]
+async fn shared_capture_reaches_eof_while_all_upload_slots_are_held() {
+    let (_directory, state, _pool, identity) = fixture().await;
+    let baseline = state.proxy_memory_budget.snapshot().0;
+    let slots = state.proxy_archive_stream_permits.clone();
+    let held = slots
+        .clone()
+        .acquire_many_owned(crate::PROXY_ARCHIVE_STREAM_CONCURRENCY as u32)
+        .await
+        .unwrap();
+    let expected = Bytes::from(vec![b's'; super::CHUNK_BYTES * 2 + 7]);
+    let mut producer = ResponseArchiveProducer::begin_original(&state, identity)
+        .await
+        .unwrap();
+    assert!(
+        tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            producer.append_with_backpressure(expected.clone())
+        )
+        .await
+        .unwrap()
+    );
+    let sealed = producer.seal().unwrap();
+    assert!(state.proxy_memory_budget.snapshot().0 > baseline);
+    assert!(
+        state
+            .archive
+            .raw_capture_reference(identity.tenant_id, identity.request_id, "response")
+            .await
+            .unwrap()
+            .is_none()
+    );
+    drop(held);
+    tokio::time::timeout(std::time::Duration::from_secs(5), sealed.wait())
+        .await
+        .unwrap();
+    let object = state
+        .archive
+        .raw_capture_reference(identity.tenant_id, identity.request_id, "response")
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(object.size_bytes, expected.len() as u64);
+    assert_eq!(
+        object.blake3_digest,
+        blake3::hash(&expected).to_hex().to_string()
+    );
+    assert_eq!(
+        state
+            .archive
+            .get_tenant_content(identity.tenant_id, &object, expected.len())
+            .await
+            .unwrap(),
+        expected
+    );
+    assert_eq!(state.proxy_memory_budget.snapshot().0, baseline);
+    assert_eq!(
+        slots.available_permits(),
+        crate::PROXY_ARCHIVE_STREAM_CONCURRENCY
+    );
+}
+
+#[tokio::test]
 async fn original_stream_capture_uses_selected_backend_without_legacy_body_copy() {
     for training in [false, true] {
         let (_directory, mut state, pool, identity) = fixture().await;
