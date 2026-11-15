@@ -84,9 +84,198 @@ pub(crate) struct BodyCarrier {
     length: u64,
     digest: String,
     owned_objects: Mutex<Vec<(CarrierObjectOwner, bool)>>,
+    _external_owner: Option<Arc<dyn Send + Sync>>,
+    published: Mutex<Option<Arc<BodyCarrier>>>,
+    readers: std::sync::atomic::AtomicUsize,
+}
+
+struct CarrierReadOwner(Arc<BodyCarrier>);
+impl Drop for CarrierReadOwner {
+    fn drop(&mut self) {
+        if self
+            .0
+            .readers
+            .fetch_sub(1, std::sync::atomic::Ordering::AcqRel)
+            == 1
+        {
+            self.0.release_published_ram();
+        }
+    }
 }
 
 impl BodyCarrier {
+    fn read_owner(self: &Arc<Self>) -> CarrierReadOwner {
+        self.readers
+            .fetch_add(1, std::sync::atomic::Ordering::AcqRel);
+        CarrierReadOwner(self.clone())
+    }
+
+    fn release_published_ram(&self) {
+        if self.readers.load(std::sync::atomic::Ordering::Acquire) != 0
+            || self.published.lock().unwrap().is_none()
+        {
+            return;
+        }
+        for segment in &self.segments {
+            let mut segment = segment.lock().unwrap();
+            if matches!(&*segment, Segment::Ram(_)) {
+                *segment = Segment::Ram(Bytes::new());
+            }
+        }
+    }
+
+    /// The caller has confirmed this exact content and registered its durable
+    /// publication owner. No upload or cleanup ownership is created here.
+    /// Readers already using RAM finish against the original segmentation;
+    /// later readers use the durable reference. External Bytes keep real leases.
+    pub(crate) fn handoff_verified_publication(
+        self: &Arc<Self>,
+        archive: ArchiveStore,
+        reference: crate::archive::CasArchiveObject,
+    ) -> Result<(), AppError> {
+        if reference.size_bytes != self.length || reference.blake3_digest != self.digest {
+            return Err(AppError::storage("carrier_publication_identity_mismatch"));
+        }
+        let staged = StagedArchiveObject {
+            object_locator: reference.object_locator,
+            size_bytes: reference.size_bytes,
+            blake3_digest: reference.blake3_digest,
+        };
+        let replacement = Arc::new(Self {
+            memory: self.memory.clone(),
+            archive: Some(archive),
+            staging: self.staging,
+            segments: vec![Mutex::new(Segment::Object(staged.clone()))],
+            offload: tokio::sync::Mutex::new(()),
+            sealed_reference: Some(staged),
+            parent: None,
+            allocations: Mutex::new(Vec::new()),
+            length: self.length,
+            digest: self.digest.clone(),
+            owned_objects: Mutex::new(Vec::new()),
+            _external_owner: None,
+            published: Mutex::new(None),
+            readers: std::sync::atomic::AtomicUsize::new(0),
+        });
+        *self.published.lock().unwrap() = Some(replacement);
+        self.release_published_ram();
+        Ok(())
+    }
+
+    /// Count first, then encode into an exactly preallocated destination while
+    /// the old JSON envelope still owns both IR and serialization workspace.
+    /// A non-fitting value is returned intact for the streaming object path.
+    pub(crate) fn encode_normalized_prepaid(
+        value: serde_json::Value,
+        previous: &super::memory::ProxyMemoryReservation,
+        capture: CarrierCapture,
+    ) -> Result<Result<Arc<Self>, (serde_json::Value, CarrierCapture)>, AppError> {
+        struct Count(usize);
+        impl std::io::Write for Count {
+            fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+                self.0 = self
+                    .0
+                    .checked_add(bytes.len())
+                    .ok_or_else(|| std::io::Error::other("normalized length overflow"))?;
+                Ok(bytes.len())
+            }
+            fn flush(&mut self) -> std::io::Result<()> {
+                Ok(())
+            }
+        }
+        let mut count = Count(0);
+        serde_json::to_writer(&mut count, &value)
+            .map_err(|_| AppError::internal("normalized_encode_failed"))?;
+        if !previous.try_extend_normalized_envelope(count.0) {
+            return Ok(Err((value, capture)));
+        }
+        let mut encoded = Vec::with_capacity(count.0);
+        serde_json::to_writer(&mut encoded, &value)
+            .map_err(|_| AppError::internal("normalized_encode_failed"))?;
+        drop(value);
+        Self::adopt_normalized(encoded, previous, capture).map(Ok)
+    }
+
+    /// Adopt an encoding already covered by the old JSON envelope. The caller
+    /// must first drop the parsed Value and must use release_unretained_json
+    /// afterwards; length-based legacy release assumes no credit transfer.
+    pub(crate) fn adopt_normalized(
+        encoded: Vec<u8>,
+        previous: &super::memory::ProxyMemoryReservation,
+        capture: CarrierCapture,
+    ) -> Result<Arc<Self>, AppError> {
+        let lease = previous
+            .take_normalized_envelope(encoded.capacity())
+            .ok_or_else(|| AppError::internal("normalized_envelope_not_owned"))?;
+        let staging = match &capture.archive {
+            Some(archive) => archive.select_staging_key(capture.staging)?,
+            None => capture.staging,
+        };
+        let length = encoded.len() as u64;
+        let digest = blake3::hash(&encoded).to_hex().to_string();
+        let source = Self {
+            memory: capture.memory,
+            archive: capture.archive,
+            staging,
+            segments: Vec::new(),
+            offload: tokio::sync::Mutex::new(()),
+            sealed_reference: None,
+            parent: capture.parent,
+            allocations: Mutex::new(Vec::new()),
+            length,
+            digest,
+            owned_objects: Mutex::new(Vec::new()),
+            _external_owner: None,
+            published: Mutex::new(None),
+            readers: std::sync::atomic::AtomicUsize::new(0),
+        };
+        let owned = source.leased_bytes(Bytes::from(encoded), lease, None);
+        let mut source = source;
+        source.segments.push(Mutex::new(Segment::Ram(owned)));
+        Ok(Arc::new(source))
+    }
+
+    /// Adopt a completely sealed typed object without reading or uploading it
+    /// again. The creating scope remains responsible until the final reader is
+    /// gone; unknown multipart results must never be passed to this constructor.
+    pub(crate) fn from_owned_staged(
+        reference: StagedArchiveObject,
+        capture: CarrierCapture,
+        owner: Arc<dyn Send + Sync>,
+    ) -> Result<Arc<Self>, AppError> {
+        let archive = capture
+            .archive
+            .as_ref()
+            .ok_or_else(|| AppError::internal("carrier_staged_archive_missing"))?;
+        let staging = archive.select_staging_key(capture.staging)?;
+        let prefix = format!("{}/", staging.canonical_prefix());
+        if !reference.object_locator.starts_with(&prefix)
+            || reference.blake3_digest.len() != 64
+            || !reference
+                .blake3_digest
+                .bytes()
+                .all(|b| b.is_ascii_hexdigit() && !b.is_ascii_uppercase())
+        {
+            return Err(AppError::internal("carrier_staged_owner_mismatch"));
+        }
+        Ok(Arc::new(Self {
+            memory: capture.memory,
+            archive: capture.archive,
+            staging,
+            length: reference.size_bytes,
+            digest: reference.blake3_digest.clone(),
+            segments: vec![Mutex::new(Segment::Object(reference.clone()))],
+            offload: tokio::sync::Mutex::new(()),
+            sealed_reference: Some(reference),
+            parent: capture.parent,
+            allocations: Mutex::new(Vec::new()),
+            owned_objects: Mutex::new(Vec::new()),
+            _external_owner: Some(owner),
+            published: Mutex::new(None),
+            readers: std::sync::atomic::AtomicUsize::new(0),
+        }))
+    }
+
     /// The input is borrowed by this future: callers need not spawn or make it
     /// 'static. Bytes are never aggregated into a whole-body buffer.
     pub(crate) async fn capture<S, E>(
@@ -114,6 +303,9 @@ impl BodyCarrier {
             length: 0,
             digest: String::new(),
             owned_objects: Mutex::new(Vec::new()),
+            _external_owner: None,
+            published: Mutex::new(None),
+            readers: std::sync::atomic::AtomicUsize::new(0),
         };
         let mut hash = blake3::Hasher::new();
         futures_util::pin_mut!(input);
@@ -221,11 +413,9 @@ impl BodyCarrier {
         let Some(archive) = &self.archive else {
             return Ok(false);
         };
-        let Some(index) = self
-            .segments
-            .iter()
-            .position(|segment| matches!(&*segment.lock().unwrap(), Segment::Ram(_)))
-        else {
+        let Some(index) = self.segments.iter().position(
+            |segment| matches!(&*segment.lock().unwrap(), Segment::Ram(bytes) if !bytes.is_empty()),
+        ) else {
             return Ok(false);
         };
         let Segment::Ram(bytes) = self.segments[index].lock().unwrap().clone() else {
@@ -375,19 +565,28 @@ impl BodyCarrier {
     pub(crate) fn digest(&self) -> &str {
         &self.digest
     }
+    #[allow(
+        dead_code,
+        reason = "Sealed source handoff is consumed by the audio integration."
+    )]
     pub(crate) fn sealed_staged_reference(&self) -> Option<&StagedArchiveObject> {
         self.sealed_reference.as_ref()
     }
 
     pub(crate) fn open_stream(self: &Arc<Self>) -> CarrierStream {
+        let reader = self.read_owner();
+        let published = self.published.lock().unwrap().clone();
+        if let Some(published) = published {
+            return published.open_stream();
+        }
         let source = self.clone();
         Box::pin(stream::unfold(
-            (source, 0usize, None::<CarrierStream>),
-            |(source, mut index, mut remote)| async move {
+            (source, 0usize, None::<CarrierStream>, reader),
+            |(source, mut index, mut remote, reader)| async move {
                 loop {
                     if let Some(stream) = &mut remote {
                         if let Some(chunk) = stream.next().await {
-                            return Some((chunk, (source, index, remote)));
+                            return Some((chunk, (source, index, remote, reader)));
                         }
                         remote = None;
                     }
@@ -395,14 +594,14 @@ impl BodyCarrier {
                     index += 1;
                     match &segment {
                         Segment::Ram(bytes) => {
-                            return Some((Ok(bytes.clone()), (source, index, remote)));
+                            return Some((Ok(bytes.clone()), (source, index, remote, reader)));
                         }
                         Segment::Object(reference) => {
                             let Some(archive) = &source.archive else {
                                 let end = source.segments.len();
                                 return Some((
                                     Err(AppError::storage("carrier_backend_missing")),
-                                    (source, end, None),
+                                    (source, end, None, reader),
                                 ));
                             };
                             let _ = archive;
@@ -462,6 +661,9 @@ impl BodyCarrier {
     /// Release only confirmed offloaded allocation owners. Callers can cancel
     /// this wait by dropping the future; failed writes retain the RAM source.
     pub(crate) async fn seal_to_objects(self: &Arc<Self>) -> Result<(), AppError> {
+        if self.published.lock().unwrap().is_some() {
+            return Ok(());
+        }
         if self.archive.is_none() {
             return Err(AppError::internal("carrier_object_capability_missing"));
         }
@@ -500,6 +702,11 @@ impl BodyCarrier {
         offset: u64,
         length: usize,
     ) -> Result<Bytes, AppError> {
+        let _reader = self.read_owner();
+        let published = self.published.lock().unwrap().clone();
+        if let Some(published) = published {
+            return Box::pin(published.read_range(offset, length)).await;
+        }
         let end = offset
             .checked_add(length as u64)
             .filter(|end| *end <= self.length)
@@ -539,6 +746,11 @@ impl BodyCarrier {
         offset: u64,
         output: &mut [u8],
     ) -> Result<(), AppError> {
+        let _reader = self.read_owner();
+        let published = self.published.lock().unwrap().clone();
+        if let Some(published) = published {
+            return Box::pin(published.read_into(offset, output)).await;
+        }
         let length = output.len();
         let end = offset
             .checked_add(length as u64)
@@ -638,6 +850,100 @@ mod tests {
             uuid::Uuid::now_v7(),
         )
         .unwrap()
+    }
+
+    #[tokio::test]
+    async fn published_handoff_preserves_old_readers_and_releases_only_real_ram_owners() {
+        let archive = ArchiveStore::memory_for_test();
+        let tenant = uuid::Uuid::now_v7();
+        let request = uuid::Uuid::now_v7();
+        let memory = Arc::new(ProxyMemoryBudget::new(256 * 1024));
+        let expected = Bytes::from(vec![b'x'; 128 * 1024]);
+        let source = BodyCarrier::capture(
+            stream::iter([Ok::<_, std::io::Error>(expected.clone())]),
+            CarrierCapture::new(memory.clone(), Some(archive.clone()), key()),
+        )
+        .await
+        .unwrap();
+        let mut old_reader = source.open_stream();
+        let first = old_reader.next().await.unwrap().unwrap();
+        let object = archive
+            .put_tenant_content(tenant, expected.clone())
+            .await
+            .unwrap();
+        archive
+            .publish_raw_capture(tenant, request, "request", &object)
+            .await
+            .unwrap();
+        let mut wrong = object.clone();
+        wrong.size_bytes += 1;
+        assert!(
+            source
+                .handoff_verified_publication(archive.clone(), wrong)
+                .is_err()
+        );
+        source
+            .handoff_verified_publication(archive.clone(), object.clone())
+            .unwrap();
+        assert_eq!(
+            memory.snapshot().0,
+            128 * 1024,
+            "old stream still owns the original source"
+        );
+        let mut old_bytes = first.to_vec();
+        while let Some(chunk) = old_reader.next().await {
+            old_bytes.extend_from_slice(&chunk.unwrap());
+        }
+        assert_eq!(old_bytes.as_slice(), expected.as_ref());
+        drop(old_reader);
+        assert_eq!(
+            memory.snapshot().0,
+            first.len(),
+            "only the escaped allocation remains charged"
+        );
+        drop(first);
+        assert_eq!(memory.snapshot().0, 0);
+        let mut fresh = source.open_stream();
+        let mut replay = Vec::new();
+        while let Some(chunk) = fresh.next().await {
+            replay.extend_from_slice(&chunk.unwrap());
+        }
+        assert_eq!(replay.as_slice(), expected.as_ref());
+        drop(fresh);
+        assert_eq!(memory.snapshot().0, 0);
+        assert_eq!(
+            archive
+                .raw_capture_reference(tenant, request, "request")
+                .await
+                .unwrap()
+                .unwrap()
+                .blake3_digest,
+            object.blake3_digest
+        );
+    }
+
+    #[tokio::test]
+    async fn adopted_normalized_bytes_keep_transferred_credit_until_last_reader() {
+        let memory = Arc::new(ProxyMemoryBudget::new(1024 * 1024));
+        let previous = memory.reservation();
+        let encoded = br#"{"input":"normalized"}"#.to_vec();
+        assert!(previous.try_reserve_json_shape(encoded.capacity(), 8));
+        let source = BodyCarrier::adopt_normalized(
+            encoded,
+            &previous,
+            CarrierCapture::new(memory.clone(), None, key()),
+        )
+        .unwrap();
+        previous.release_unretained_json();
+        let mut reader = source.open_stream();
+        drop(source);
+        let bytes = reader.next().await.unwrap().unwrap();
+        drop(reader);
+        assert!(memory.snapshot().0 > 0);
+        assert_eq!(bytes.as_ref(), br#"{"input":"normalized"}"#);
+        drop(bytes);
+        drop(previous);
+        assert_eq!(memory.snapshot().0, 0);
     }
 
     #[tokio::test]

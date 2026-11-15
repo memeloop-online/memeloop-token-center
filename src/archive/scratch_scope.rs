@@ -130,6 +130,30 @@ impl ScratchScope {
             Ok(())
         }
     }
+    /// Begin one dedicated body upload under this scope's existing typed
+    /// ownership. Keep the scope alive until the final body reader is dropped.
+    /// Cancellation or an unknown upload result must leave this unconfirmed.
+    pub(crate) async fn begin_body_write(
+        &self,
+    ) -> Result<(ArchiveStore, ArchiveStagingKey), AppError> {
+        self.ensure_owner().await?;
+        self.check()?;
+        self.uncertain
+            .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+            .map_err(|_| AppError::storage("compact_scratch_unknown_write"))?;
+        Ok((self.archive.clone(), self.key))
+    }
+
+    /// Call only after finish has succeeded and the actual staged digest and
+    /// byte length have both been verified. A fenced owner remains uncertain.
+    pub(crate) fn confirm_body_write(&self) -> Result<(), AppError> {
+        self.check()?;
+        self.uncertain
+            .compare_exchange(true, false, Ordering::AcqRel, Ordering::Acquire)
+            .map_err(|_| AppError::storage("compact_scratch_body_write_not_started"))?;
+        Ok(())
+    }
+
     pub(crate) async fn read_page(&self, page: u64, output: &mut [u8]) -> Result<(), AppError> {
         self.check()?;
         let locator = self.locator(page);
@@ -252,6 +276,22 @@ mod tests {
         )
         .unwrap()
     }
+    #[tokio::test]
+    async fn body_upload_confirmation_preserves_unknown_and_fenced_ownership() {
+        let scope = ScratchScope::for_test(ArchiveStore::memory_for_test(), key());
+        assert!(scope.confirm_body_write().is_err());
+        let (_, selected) = scope.begin_body_write().await.unwrap();
+        assert_eq!(selected, scope.key);
+        assert!(scope.uncertain.load(Ordering::Acquire));
+        assert!(scope.begin_body_write().await.is_err());
+        scope.fenced.store(true, Ordering::Release);
+        assert!(scope.confirm_body_write().is_err());
+        assert!(scope.uncertain.load(Ordering::Acquire));
+        scope.fenced.store(false, Ordering::Release);
+        scope.confirm_body_write().unwrap();
+        assert!(!scope.uncertain.load(Ordering::Acquire));
+    }
+
     #[tokio::test]
     async fn scratch_pages_use_conditional_replacement_and_cancelled_puts_remain_owned() {
         let (archive, store) = ArchiveStore::memory_for_test().with_read_delay_for_test();

@@ -201,6 +201,12 @@ pub(crate) struct ConversationProjectionPermit {
     _permit: OwnedSemaphorePermit,
 }
 
+impl ConversationProjectionPermit {
+    pub(crate) fn covers(&self, bytes: usize) -> bool {
+        bytes.div_ceil(UNIT_BYTES) <= self._permit.num_permits()
+    }
+}
+
 #[derive(Debug)]
 pub(crate) struct BufferedResponsePermit(OwnedSemaphorePermit);
 
@@ -227,6 +233,15 @@ impl Drop for SseStreamingMemory {
 }
 
 impl ProxyMemoryReservation {
+    /// A handle to the same admission pool, not a second budget or reservation.
+    pub(crate) fn shared_budget(&self) -> Arc<ProxyMemoryBudget> {
+        Arc::new(ProxyMemoryBudget {
+            capacity: self.capacity,
+            permits: self.permits.clone(),
+            retained_requests: self.retained_requests.clone(),
+        })
+    }
+
     // Existing request-source ingress uses the same global allocation permits.
     pub(crate) fn try_reserve_ingress_bytes(&self, bytes: usize) -> Option<OwnedSemaphorePermit> {
         let units = u32::try_from(bytes.div_ceil(UNIT_BYTES)).ok()?;
@@ -671,6 +686,50 @@ impl ProxyMemoryReservation {
         self.release(self.json_reserved_bytes.swap(0, Ordering::AcqRel), 1);
     }
 
+    /// Grow only when real global credit is immediately available; never wait
+    /// for a permit held by the old JSON tree itself.
+    pub(crate) fn try_extend_normalized_envelope(&self, bytes: usize) -> bool {
+        let Some(rounded) = bytes
+            .checked_add(UNIT_BYTES - 1)
+            .map(|value| value / UNIT_BYTES * UNIT_BYTES)
+        else {
+            return false;
+        };
+        let current = self.json_reserved_bytes.load(Ordering::Acquire);
+        if rounded <= current {
+            return true;
+        }
+        let extra = rounded - current;
+        if !self.try_grow(extra, 1) {
+            return false;
+        }
+        self.json_reserved_bytes.fetch_add(extra, Ordering::AcqRel);
+        true
+    }
+
+    /// Called only after the parsed Value has been dropped. Transfer the
+    /// remaining prepaid JSON envelope into independently owned encoded bytes.
+    /// The caller subsequently uses release_unretained_json, never the legacy
+    /// length-based release path (which assumes no envelope transfer).
+    pub(crate) fn take_normalized_envelope(
+        &self,
+        encoded_len: usize,
+    ) -> Option<OwnedSemaphorePermit> {
+        let mut held = self.held.lock().ok()?;
+        let reserved = self.json_reserved_bytes.load(Ordering::Acquire);
+        let units = encoded_len.div_ceil(UNIT_BYTES);
+        if reserved == 0 || units > reserved / UNIT_BYTES {
+            return None;
+        }
+        let transferred = units.checked_mul(UNIT_BYTES)?;
+        let remaining = held.0.checked_sub(transferred)?;
+        let lease = held.1.as_mut()?.split(units)?;
+        held.0 = remaining;
+        self.json_reserved_bytes
+            .store(reserved - transferred, Ordering::Release);
+        Some(lease)
+    }
+
     pub(crate) fn request_json_reserved_bytes(&self) -> usize {
         self.json_reserved_bytes.load(Ordering::Acquire)
     }
@@ -714,11 +773,24 @@ impl ProxyMemoryReservation {
         if total.div_ceil(UNIT_BYTES) > self.capacity / UNIT_BYTES {
             return None;
         }
-        while !self.try_grow(total, 1) {
+        loop {
+            if let Some(working) = self.try_reserve_source_json(bytes, nodes) {
+                return Some(working);
+            }
             reclaim();
-            // No parsed tree, raw read buffer, or partial JSON permit is held.
-            // Dropping the request cancels this wait without a detached task.
             tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+    }
+
+    pub(crate) fn try_reserve_source_json(
+        self: &Arc<Self>,
+        bytes: usize,
+        nodes: usize,
+    ) -> Option<ArchiveOutputMemory> {
+        let json = bytes.checked_mul(3)?.checked_add(nodes.checked_mul(256)?)?;
+        let working = 64 * 1024;
+        if !self.try_grow(json.checked_add(working)?, 1) {
+            return None;
         }
         self.json_body_ceiling.store(bytes, Ordering::Release);
         self.json_node_ceiling.store(nodes, Ordering::Release);

@@ -278,9 +278,9 @@ impl Database {
         locator: &str,
         length: usize,
         digest: [u8; 32],
-    ) {
+    ) -> crate::archive::CasArchiveObject {
         loop {
-            let persisted: Result<(), AppError> = async {
+            let persisted: Result<crate::archive::CasArchiveObject, AppError> = async {
                 let archive = self.body_archive()?;
                 let expected_digest = blake3::Hash::from_bytes(digest).to_hex().to_string();
                 if let Some(existing) = archive
@@ -295,7 +295,7 @@ impl Database {
                     archive
                         .verify_tenant_content(identity.tenant_id, &existing)
                         .await?;
-                    return Ok(());
+                    return Ok(existing);
                 }
                 let staged = crate::archive::StagedArchiveObject {
                     object_locator: locator.to_owned(),
@@ -313,11 +313,11 @@ impl Database {
                         &object,
                     )
                     .await?;
-                Ok(())
+                Ok(object)
             }
             .await;
-            if persisted.is_ok() {
-                break;
+            if let Ok(object) = persisted {
+                return object;
             }
             tracing::warn!(request_id = %identity.request_id, "request object publication retained for retry");
             tokio::time::sleep(Duration::from_millis(250)).await;

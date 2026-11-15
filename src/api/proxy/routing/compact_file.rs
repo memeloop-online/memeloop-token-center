@@ -349,6 +349,15 @@ impl ValidatedCompact {
 }
 
 pub(super) struct TranslatedCompact<T, P = Cursor<Vec<u8>>> {
+    // Production consumes only evidence and replay pieces; file fixtures also
+    // read the generic translated output directly. Keep its ownership intact.
+    #[cfg_attr(
+        not(test),
+        expect(
+            dead_code,
+            reason = "translated output is read by file-based test fixtures"
+        )
+    )]
     pub(super) file: T,
     pub(super) pieces: P,
     pub(super) physical_body_bytes: u64,
@@ -682,6 +691,7 @@ pub(super) fn prepare_carrier<W: Write + Seek>(
     )
 }
 
+#[cfg(test)]
 fn translate_scanner<W: Write + Seek, P: Write + Seek>(
     scanner: Scanner,
     output: W,

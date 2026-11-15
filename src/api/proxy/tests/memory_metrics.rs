@@ -154,15 +154,21 @@ async fn dense_small_response_is_delivered_once_and_client_body_retains_its_leas
 #[tokio::test]
 async fn source_json_memory_counter_has_no_fabricated_ingress_or_route_label() {
     let mut fixture = codex_route_fixture("ingress-memory-metrics").await;
-    // Temporary competition now waits for its owner to release memory. Use an
-    // actually unfulfillable envelope to exercise the JSON rejection metric,
-    // rather than holding every permit forever in this waiting test itself.
-    fixture.state.proxy_memory_budget =
-        std::sync::Arc::new(crate::gateway_body::memory::ProxyMemoryBudget::new(0));
+    // Give ingress a real RAM carrier and a healthy object backend. Dense JSON
+    // nodes, rather than an impossible zero-capacity capture, make only the IR
+    // workspace unrepresentable in this deliberately small test budget.
+    let capacity = 192 * 1024;
+    let body = format!(r#"{{"model":"test","input":[{}0]}}"#, "0,".repeat(1023));
+    let nodes = crate::gateway_body::memory::JsonMemoryScanner::default().observe(body.as_bytes());
+    assert!(body.len() < capacity);
+    assert!(body.len() * 3 + nodes * 256 + 64 * 1024 > capacity);
+    fixture.state.proxy_memory_budget = std::sync::Arc::new(
+        crate::gateway_body::memory::ProxyMemoryBudget::new(capacity as u64),
+    );
     let request = Request::post("/v1/responses")
         .header(header::AUTHORIZATION, format!("Bearer {}", fixture.key))
         .header(header::CONTENT_TYPE, "application/json")
-        .body(Body::from("{}"))
+        .body(Body::from(body))
         .unwrap();
     let response = router_for_role(fixture.state.clone(), RuntimeRole::Gateway)
         .oneshot(request)

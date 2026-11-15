@@ -17,6 +17,7 @@ use futures_util::StreamExt;
 pub(crate) mod carrier;
 pub(crate) mod local_body_file;
 pub(crate) mod memory;
+pub(crate) mod normalized_encoding;
 pub(crate) mod request_spool;
 
 #[derive(Clone)]

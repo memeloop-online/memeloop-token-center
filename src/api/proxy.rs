@@ -1130,17 +1130,10 @@ async fn proxy_with_cancellation_guard(
         );
         body = Bytes::new();
         drop(std::mem::take(&mut original_request_json));
-        let replay = request_source::spool_normalized(
+        request_json = request_source::parse_normalized(
             std::mem::take(&mut request_json),
-            std::path::PathBuf::from(&state.config.responses_request_spool_path),
-            &memory,
-        )
-        .await?;
-        memory.release_unretained_json();
-        // Only complete, independently readable local sources survive this
-        // cancellable admission. It has neither old JSON nor a partial permit.
-        request_json = request_source::parse_with_shape(
-            replay,
+            &state,
+            request_id,
             memory.clone(),
             required_bytes,
             required_nodes,
@@ -2622,7 +2615,10 @@ impl ConversationBody {
         }
     }
 
-    async fn read(&self) -> Result<Bytes, AppError> {
+    async fn read(
+        &self,
+        projection_memory: &crate::gateway_body::memory::ConversationProjectionPermit,
+    ) -> Result<Bytes, AppError> {
         match self {
             Self::InMemory(body) => Ok(body.clone()),
             #[cfg(test)]
@@ -2631,7 +2627,7 @@ impl ConversationBody {
                 .await
                 .map_err(|_| AppError::capacity_error("request_spool_read_failed")),
             Self::ProjectedSpool { spool, .. } => spool
-                .read_all()
+                .read_prepaid_projection(projection_memory)
                 .await
                 .map_err(|_| AppError::capacity_error("request_spool_read_failed")),
         }
@@ -2781,7 +2777,7 @@ impl ProxyConversation {
                 return Err(AppError::capacity_error("proxy_memory_projection"));
             }
         };
-        let request_body = self.request_body.read().await?;
+        let request_body = self.request_body.read(&projection_memory).await?;
         let request_json = serde_json::from_slice(&request_body)
             .map_err(|_| AppError::internal("proxy_project_2"))?;
         Ok(ProxyConversationProjection {
