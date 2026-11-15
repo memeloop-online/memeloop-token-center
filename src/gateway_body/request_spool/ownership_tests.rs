@@ -52,57 +52,58 @@ async fn admit(
     .await
 }
 
-async fn metadata_charge(path: &str, declared: Option<usize>) -> usize {
-    let directory = tempfile::tempdir().unwrap();
-    let spool = RequestSpoolAdmission::new(directory.path().to_owned());
-    let budget = ProxyMemoryBudget::new(BUDGET_BYTES);
-    // Empty on purpose: this measures the reservation taken before any body
-    // byte, not the bytes retained for the upload itself.
-    let body = Body::from(Vec::<u8>::new());
-    let admitted = admit(path, body, declared, &budget, &spool).await.unwrap();
-    let charged = budget.snapshot().0;
-    assert!(charged > REQUEST_SPOOL_CHUNK_BYTES);
-    assert_eq!(charged % REQUEST_SPOOL_CHUNK_BYTES, 0);
-    drop(admitted);
-    assert_eq!(budget.snapshot().0, 0);
-    assert_eq!(spool.snapshot().active_files, 0);
-    charged
+#[tokio::test]
+async fn empty_carrier_has_no_fabricated_body_credit() {
+    for path in ROUTES {
+        let directory = tempfile::tempdir().unwrap();
+        let spool = RequestSpoolAdmission::new(directory.path().join("unused-body-path"));
+        let budget = ProxyMemoryBudget::new(BUDGET_BYTES);
+        let admitted = admit(path, Body::empty(), None, &budget, &spool)
+            .await
+            .unwrap();
+        assert_eq!(budget.snapshot().0, 0);
+        drop(admitted);
+        assert_eq!(spool.snapshot().active_files, 0);
+        assert!(!directory.path().join("unused-body-path").exists());
+    }
 }
 
 #[tokio::test]
-async fn responses_metadata_one_unit_short_spills_without_claiming_durability() {
+async fn responses_ram_carrier_waits_for_actual_credit_without_claiming_durability() {
     for path in ROUTES {
-        let metadata = metadata_charge(path, Some(1)).await;
         let directory = tempfile::tempdir().unwrap();
-        let spool_path = directory.path().join("local-spill");
+        let spool_path = directory.path().join("unused-body-path");
         let spool = RequestSpoolAdmission::new(spool_path.clone());
-        let budget = ProxyMemoryBudget::new(BUDGET_BYTES);
+        let budget = Arc::new(ProxyMemoryBudget::new(BUDGET_BYTES));
         let held = budget.reservation();
-        let held_bytes = BUDGET_BYTES as usize - metadata + REQUEST_SPOOL_CHUNK_BYTES;
-        assert!(held.try_grow(held_bytes, 1));
-        let polls = Arc::new(AtomicUsize::new(0));
-        let observed = polls.clone();
+        assert!(held.try_grow(BUDGET_BYTES as usize, 1));
+        let (polled, first_poll) = tokio::sync::oneshot::channel();
         let body = Body::from_stream(stream::once(async move {
-            observed.fetch_add(1, Ordering::AcqRel);
+            let _ = polled.send(());
             Ok::<_, Infallible>(Bytes::from_static(b"x"))
         }));
-        let admitted = admit(path, body, Some(1), &budget, &spool).await.unwrap();
-        assert_eq!(polls.load(Ordering::Acquire), 1);
-        assert!(spool_path.is_dir());
-        assert_eq!(spool.snapshot().active_files, 1);
+        let active_budget = budget.clone();
+        let active_spool = spool.clone();
+        let capture =
+            tokio::spawn(
+                async move { admit(path, body, Some(1), &active_budget, &active_spool).await },
+            );
+        first_poll.await.unwrap();
+        assert!(!capture.is_finished());
+        assert_eq!(budget.snapshot().0, BUDGET_BYTES as usize);
+        drop(held);
+        let admitted = capture.await.unwrap().unwrap();
         let owner = admitted
             .extensions()
             .get::<Arc<super::RequestSpool>>()
             .unwrap();
         assert_eq!(owner.read_all().await.unwrap(), "x");
         assert!(!owner.upload_outcome().await);
-        assert_eq!(budget.snapshot().0, held_bytes);
+        assert!(budget.snapshot().0 >= 1);
+        assert!(!spool_path.exists());
         drop(admitted);
         assert_eq!(spool.snapshot().active_files, 0);
-        assert_eq!(std::fs::read_dir(&spool_path).unwrap().count(), 0);
         assert_eq!(spool.snapshot().used_bytes, 0);
-        assert_eq!(budget.snapshot().0, held_bytes);
-        drop(held);
         assert_eq!(budget.snapshot().0, 0);
     }
 }
@@ -113,13 +114,12 @@ async fn responses_transport_sized_first_frame_and_false_length_at_byte_boundary
         for frame_bytes in TRANSPORT_SIZED_FRAMES {
             assert!(frame_bytes <= REQUEST_SPOOL_CHUNK_BYTES);
             for declared in [None, Some(1), Some(frame_bytes)] {
-                let metadata = metadata_charge(path, declared).await;
                 for frame_allowance in [0, REQUEST_SPOOL_CHUNK_BYTES] {
                     let directory = tempfile::tempdir().unwrap();
                     let spool = RequestSpoolAdmission::new(directory.path().to_owned());
                     let budget = Arc::new(ProxyMemoryBudget::new(BUDGET_BYTES));
                     let held = budget.reservation();
-                    let held_bytes = BUDGET_BYTES as usize - metadata - frame_allowance;
+                    let held_bytes = BUDGET_BYTES as usize - frame_allowance;
                     assert!(held.try_grow(held_bytes, 1));
                     let observed = budget.clone();
                     let (polled, first_poll) = tokio::sync::oneshot::channel();
@@ -132,7 +132,7 @@ async fn responses_transport_sized_first_frame_and_false_length_at_byte_boundary
                     let capture = tokio::spawn(async move {
                         admit(path, body, declared, &active_budget, &active_spool).await
                     });
-                    assert_eq!(first_poll.await.unwrap(), held_bytes + metadata);
+                    assert_eq!(first_poll.await.unwrap(), held_bytes);
                     if declared == Some(1) {
                         assert!(matches!(
                             capture.await.unwrap(),
@@ -140,7 +140,13 @@ async fn responses_transport_sized_first_frame_and_false_length_at_byte_boundary
                                 if rejection.route_class == GatewayBodyRouteClass::Responses
                                     && rejection.reason == GatewayBodyRejectionReason::BodyLimitExceeded
                         ));
-                    } else if frame_allowance == 0 {
+                    } else {
+                        // With no object backend, only the competing owner's
+                        // actual release can make room for this frame.
+                        if frame_allowance == 0 {
+                            assert!(!capture.is_finished());
+                            held.release(held_bytes, 1);
+                        }
                         let admitted = capture.await.unwrap().unwrap();
                         let owner = admitted
                             .extensions()
@@ -151,15 +157,17 @@ async fn responses_transport_sized_first_frame_and_false_length_at_byte_boundary
                             Bytes::from(vec![b'x'; frame_bytes])
                         );
                         assert!(!owner.upload_outcome().await);
-                        assert_eq!(budget.snapshot().0, held_bytes);
+                        let competing = if frame_allowance == 0 { 0 } else { held_bytes };
+                        assert!(budget.snapshot().0 >= competing + frame_bytes);
                         assert_eq!(spool.snapshot().active_files, 1);
                         drop(admitted);
-                    } else {
-                        let admitted = capture.await.unwrap().unwrap();
-                        assert!(budget.snapshot().0 >= held_bytes + metadata + frame_bytes);
-                        drop(admitted);
                     }
-                    assert_eq!(budget.snapshot().0, held_bytes);
+                    let competing = if declared != Some(1) && frame_allowance == 0 {
+                        0
+                    } else {
+                        held_bytes
+                    };
+                    assert_eq!(budget.snapshot().0, competing);
                     assert_eq!(spool.snapshot().used_bytes, 0);
                     assert_eq!(spool.snapshot().active_files, 0);
                     assert_eq!(std::fs::read_dir(directory.path()).unwrap().count(), 0);
@@ -175,12 +183,11 @@ async fn responses_transport_sized_first_frame_and_false_length_at_byte_boundary
 async fn cancelled_capture_releases_memory_without_a_detached_write() {
     for path in ROUTES {
         for frame_bytes in TRANSPORT_SIZED_FRAMES {
-            let metadata = metadata_charge(path, Some(frame_bytes)).await;
             let directory = tempfile::tempdir().unwrap();
             let spool = RequestSpoolAdmission::new(directory.path().to_owned());
             let budget = Arc::new(ProxyMemoryBudget::new(BUDGET_BYTES));
             let held = budget.reservation();
-            let held_bytes = BUDGET_BYTES as usize - metadata - REQUEST_SPOOL_CHUNK_BYTES;
+            let held_bytes = BUDGET_BYTES as usize - REQUEST_SPOOL_CHUNK_BYTES;
             assert!(held.try_grow(held_bytes, 1));
             let (polled, first_poll) = tokio::sync::oneshot::channel();
             let body = Body::from_stream(stream::once(async move {

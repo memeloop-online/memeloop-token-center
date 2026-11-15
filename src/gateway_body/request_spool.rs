@@ -1,4 +1,4 @@
-use super::local_body_file::LocalBodyFile;
+use super::carrier::{BodyCarrier, CarrierCapture};
 use std::{
     path::PathBuf,
     sync::{
@@ -165,39 +165,57 @@ impl DurableRequestBodies {
         }
     }
 
-    async fn put_file(&self, key: &str, source: &LocalBodyFile) -> Result<(), ()> {
-        use tokio::io::AsyncReadExt;
-        let mut file = tokio::fs::File::from_std(source.reopen().map_err(|_| ())?);
+    async fn put_carrier(
+        &self,
+        key: &str,
+        source: &Arc<BodyCarrier>,
+        upload: &crate::api::proxy::persistence::Persistence,
+    ) -> Result<(), ()> {
         match self {
             Self::Archive(archive) => {
+                // Multipart owns queued buffers until a >=5MiB part completes.
+                // Its existing independent upload envelope must own those
+                // copies; retaining the source pool's replay lease here would
+                // wait on the very bytes queued in the multipart writer.
+                let _upload_memory = upload
+                    .stream_memory
+                    .temporary_wait(
+                        crate::archive::ARCHIVE_MULTIPART_PART_BYTES
+                            + 5 * REQUEST_SPOOL_CHUNK_BYTES,
+                        super::memory::CAPTURE_MEMORY_WEIGHT,
+                    )
+                    .await
+                    .ok_or(())?;
                 let mut writer = archive.start_writer(key).await.map_err(|_| ())?;
-                let mut buffer = vec![0u8; REQUEST_SPOOL_CHUNK_BYTES];
-                loop {
-                    let length = match file.read(&mut buffer).await {
-                        Ok(length) => length,
+                let mut stream = source.open_stream();
+                while let Some(chunk) = stream.next().await {
+                    let chunk = match chunk {
+                        Ok(chunk) => chunk,
                         Err(_) => {
                             let _ = writer.abort().await;
                             return Err(());
                         }
                     };
-                    if length == 0 {
-                        break;
-                    }
-                    if writer
-                        .write(Bytes::copy_from_slice(&buffer[..length]))
-                        .await
-                        .is_err()
-                    {
+                    let upload_bytes = Bytes::copy_from_slice(&chunk);
+                    drop(chunk);
+                    if writer.write(upload_bytes).await.is_err() {
                         let _ = writer.abort().await;
                         return Err(());
                     }
                 }
-                writer.finish_staged().await.map(|_| ()).map_err(|_| ())
+                let result = writer.finish_staged().await.map_err(|_| ())?;
+                if result.size_bytes != source.len() || result.blake3_digest != source.digest() {
+                    return Err(());
+                }
+                Ok(())
             }
             #[cfg(test)]
             Self::Memory(_) => {
                 let mut bytes = Vec::new();
-                file.read_to_end(&mut bytes).await.map_err(|_| ())?;
+                let mut stream = source.open_stream();
+                while let Some(chunk) = stream.next().await {
+                    bytes.extend_from_slice(&chunk.map_err(|_| ())?);
+                }
                 self.put(key, Bytes::from(bytes)).await
             }
         }
@@ -224,14 +242,9 @@ impl DurableRequestBodies {
     }
 }
 
-struct SpillSink {
-    owner: Arc<LocalBodyFile>,
-    file: tokio::fs::File,
-}
-
 struct CapturedBody {
     body: Option<Bytes>,
-    local: Option<Arc<LocalBodyFile>>,
+    carrier: Option<Arc<BodyCarrier>>,
     length: usize,
     json_nodes: usize,
     digest: [u8; 32],
@@ -248,13 +261,13 @@ struct BodyResidency {
     metadata: Mutex<Option<Arc<tokio::sync::OwnedSemaphorePermit>>>,
     memory_released: AtomicBool,
     durable_settled: AtomicBool,
-    local_backed: bool,
+    carrier_backed: bool,
 }
 
 impl BodyResidency {
     fn release_if_idle(&self) {
         if self.memory_released.load(Ordering::Acquire)
-            && (self.local_backed || self.durable_settled.load(Ordering::Acquire))
+            && (self.carrier_backed || self.durable_settled.load(Ordering::Acquire))
         {
             if let Ok(mut frames) = self.frames.lock() {
                 frames.clear();
@@ -304,15 +317,22 @@ impl RequestSpoolAdmission {
         }
     }
 
-    pub(crate) fn new(directory: PathBuf) -> Self {
+    pub(crate) fn new(_directory: PathBuf) -> Self {
         Self {
-            usage: Arc::new(RequestSpoolUsage {
-                directory,
-                ..RequestSpoolUsage::default()
-            }),
+            usage: Arc::new(RequestSpoolUsage::default()),
             #[cfg(test)]
             read_count: Arc::new(AtomicUsize::new(0)),
         }
+    }
+
+    pub(crate) fn with_upload_memory(
+        mut self,
+        memory: Arc<crate::api::proxy::persistence::Persistence>,
+    ) -> Self {
+        Arc::get_mut(&mut self.usage)
+            .expect("upload memory attached before admission sharing")
+            .upload_memory = memory;
+        self
     }
 
     /// Attach object storage before the admission is cloned into `AppState`.
@@ -376,8 +396,7 @@ impl RequestSpoolAdmission {
         };
         let metadata_bytes = request_metadata_bytes
             .saturating_add(std::mem::size_of::<RequestSpool>())
-            .saturating_add(std::mem::size_of::<Mutex<RequestSpoolLease>>())
-            .saturating_add(REQUEST_SPOOL_CHUNK_BYTES);
+            .saturating_add(std::mem::size_of::<Mutex<RequestSpoolLease>>());
         let mut metadata = memory.and_then(|memory| {
             memory
                 .try_reserve_ingress_bytes(metadata_bytes)
@@ -401,123 +420,78 @@ impl RequestSpoolAdmission {
             .lock()
             .map_err(|_| RequestSpoolCaptureError::Unavailable)?
             .opened();
-        let mut retained = Vec::new();
-        let mut retained_frames = Vec::new();
-        let mut length = 0_usize;
+        let mut length = 0usize;
         let mut hasher = blake3::Hasher::new();
-        let mut json_scanner = super::memory::JsonMemoryScanner::default();
-        let mut spilling = memory.is_some() && metadata.is_none();
-        let local_backed = memory.is_some();
-        let mut sink = if spilling || local_backed {
-            Some(open_spill(&self.usage.directory).await?)
-        } else {
-            None
-        };
-
-        let mut stream = body.into_data_stream();
-        while let Some(chunk) = stream.next().await {
-            let chunk = match chunk {
-                Ok(chunk) => chunk,
-                Err(_) => {
-                    abort_spill(sink).await;
-                    return Err(RequestSpoolCaptureError::BodyReadRejected);
-                }
-            };
+        let mut scanner = super::memory::JsonMemoryScanner::default();
+        let mut rejected = None;
+        let input = body.into_data_stream().map(|chunk| {
+            let chunk = chunk.map_err(|_| RequestSpoolCaptureError::BodyReadRejected)?;
             if chunk.len() > maximum.saturating_sub(length) {
-                abort_spill(sink).await;
+                rejected = Some(RequestSpoolCaptureError::TooLarge);
                 return Err(RequestSpoolCaptureError::TooLarge);
             }
-            let next = length
-                .checked_add(chunk.len())
-                .ok_or(RequestSpoolCaptureError::TooLarge)?;
-            if next > maximum {
-                abort_spill(sink).await;
-                return Err(RequestSpoolCaptureError::TooLarge);
-            }
-            if local_backed && let Some(sink) = sink.as_mut() {
-                write_spill(sink, chunk.clone()).await?;
-            }
-            if !spilling {
-                let mut frame_memory = memory
-                    .and_then(|memory| memory.try_reserve_ingress_bytes(chunk.len()).map(Arc::new));
-                while frame_memory.is_none()
-                    && memory.is_some()
-                    && evict_oldest_settled(&self.usage)
-                {
-                    frame_memory = memory.and_then(|memory| {
-                        memory.try_reserve_ingress_bytes(chunk.len()).map(Arc::new)
-                    });
-                }
-                if frame_memory.is_none() && memory.is_some() {
-                    spilling = true;
-                    let prior = Bytes::from(std::mem::take(&mut retained));
-                    retained_frames.clear();
-                    metadata.take();
-                    if let Ok(mut lease) = lease.lock() {
-                        lease.release_all();
-                    }
-                    if !local_backed {
-                        sink = Some(open_spill(&self.usage.directory).await?);
-                    }
-                    if !local_backed && let Some(sink) = sink.as_mut() {
-                        write_spill(sink, prior).await?;
-                        write_spill(sink, chunk.clone()).await?;
-                    }
-                } else {
-                    if let Some(permit) = frame_memory {
-                        retained_frames.push(permit);
-                    }
-                    lease
-                        .lock()
-                        .map_err(|_| RequestSpoolCaptureError::Unavailable)?
-                        .record_written(chunk.len());
-                    retained.extend_from_slice(&chunk);
-                }
-            } else if !local_backed && let Some(sink) = sink.as_mut() {
-                write_spill(sink, chunk.clone()).await?;
-            }
+            lease
+                .lock()
+                .map_err(|_| RequestSpoolCaptureError::Unavailable)?
+                .record_written(chunk.len());
+            length += chunk.len();
             hasher.update(&chunk);
-            json_scanner.observe(&chunk);
-            length = next;
-        }
-        let digest = *hasher.finalize().as_bytes();
-        if spilling {
-            let Some(sink) = sink.take() else {
-                return Err(RequestSpoolCaptureError::Unavailable);
+            scanner.observe(&chunk);
+            Ok(chunk)
+        });
+        let (body, carrier) = if let Some(memory) = memory {
+            let archive = match &durable {
+                Some(DurableRequestBodies::Archive(archive)) => Some(archive.clone()),
+                _ => None,
             };
-            let local = finish_spill(sink).await?;
-            let publish = durable.is_some();
-            return Ok(self
-                .finished_spool(CapturedBody {
-                    body: None,
-                    local: Some(local),
-                    length,
-                    json_nodes: json_scanner.observe(&[]),
-                    digest,
-                    metadata: None,
-                    frames: Vec::new(),
-                    lease,
-                    durable,
-                    object_key,
-                    durable_settled: !publish,
-                })
-                .arm());
-        }
-        let local = match sink.take() {
-            Some(sink) => Some(finish_spill(sink).await?),
-            None => None,
+            let staging = object_key
+                .as_deref()
+                .and_then(request_body_staging_key)
+                .unwrap_or_else(|| {
+                    use crate::archive_staging::{
+                        ArchiveStagingKey, ArchiveStagingOwner, ArchiveStagingPurpose,
+                    };
+                    let id = uuid::Uuid::now_v7();
+                    ArchiveStagingKey::new(
+                        ArchiveStagingOwner::ProxyRequest(id),
+                        ArchiveStagingPurpose::Request,
+                        id,
+                    )
+                    .expect("server-generated request staging identity")
+                });
+            let result = BodyCarrier::capture(
+                input,
+                CarrierCapture::new(memory.shared_budget(), archive, staging),
+            )
+            .await;
+            let carrier = match result {
+                Ok(carrier) => carrier,
+                Err(_) => {
+                    return Err(rejected.unwrap_or(RequestSpoolCaptureError::BodyReadRejected));
+                }
+            };
+            (None, Some(carrier))
+        } else {
+            // Only callers without a production admission budget use this path.
+            // Production bodies always retain allocation leases in BodyCarrier.
+            futures_util::pin_mut!(input);
+            let mut bytes = Vec::new();
+            while let Some(chunk) = input.next().await {
+                bytes.extend_from_slice(&chunk?);
+            }
+            (Some(Bytes::from(bytes)), None)
         };
-        let retained = Bytes::from(retained);
+        let digest = *hasher.finalize().as_bytes();
         let publish = durable.is_some() && object_key.is_some();
         Ok(self
             .finished_spool(CapturedBody {
-                body: Some(retained),
-                local,
+                body,
+                carrier,
                 length,
-                json_nodes: json_scanner.observe(&[]),
+                json_nodes: scanner.observe(&[]),
                 digest,
                 metadata,
-                frames: retained_frames,
+                frames: Vec::new(),
                 lease,
                 durable,
                 object_key,
@@ -527,12 +501,12 @@ impl RequestSpoolAdmission {
     }
 
     fn finished_spool(&self, captured: CapturedBody) -> RequestSpool {
-        let local_backed = captured.local.is_some();
+        let carrier_backed = captured.carrier.is_some();
         let durable_ok = captured.durable_settled && captured.durable.is_some();
         RequestSpool {
             shared: Arc::new(SharedBody {
                 body: Mutex::new(captured.body),
-                local: captured.local,
+                carrier: captured.carrier,
                 length: captured.length,
                 json_nodes: captured.json_nodes,
                 digest: captured.digest,
@@ -541,7 +515,7 @@ impl RequestSpoolAdmission {
                     metadata: Mutex::new(captured.metadata),
                     memory_released: AtomicBool::new(false),
                     durable_settled: AtomicBool::new(captured.durable_settled),
-                    local_backed,
+                    carrier_backed,
                 }),
                 lease: captured.lease,
                 durable: captured.durable,
@@ -588,12 +562,12 @@ pub(crate) struct RequestSpoolSnapshot {
 
 #[derive(Default)]
 struct RequestSpoolUsage {
-    directory: PathBuf,
     uploads: Arc<crate::proxy_lifecycle::ProxyLifecycleCounter>,
+    upload_memory: Arc<crate::api::proxy::persistence::Persistence>,
     used_bytes: AtomicUsize,
     active_files: AtomicUsize,
     durable: Option<DurableRequestBodies>,
-    /// Oldest resident first. A complete local or settled object copy can replace memory.
+    /// Oldest resident first. A settled object copy can replace resident memory.
     residents: Mutex<std::collections::VecDeque<std::sync::Weak<SharedBody>>>,
     sources: Mutex<std::collections::HashMap<uuid::Uuid, std::sync::Weak<RequestSpool>>>,
 }
@@ -653,7 +627,7 @@ impl Drop for RequestSpoolLease {
 
 struct SharedBody {
     body: Mutex<Option<Bytes>>,
-    local: Option<Arc<LocalBodyFile>>,
+    carrier: Option<Arc<BodyCarrier>>,
     length: usize,
     json_nodes: usize,
     digest: [u8; 32],
@@ -742,13 +716,17 @@ impl RequestSpool {
             _source: self.clone(),
         })
     }
+    pub(crate) fn carrier(&self) -> Option<&Arc<BodyCarrier>> {
+        self.shared.carrier.as_ref()
+    }
+
     pub(crate) fn len(&self) -> usize {
         self.shared.length
     }
 
-    /// The complete local file owns replay independently of archive upload.
+    /// The carrier owns replay independently of the background archive handoff.
     pub(crate) fn release_local_retained(&self) {
-        if self.shared.local.is_some() {
+        if self.shared.carrier.is_some() {
             release_resident_memory(&self.shared);
         }
     }
@@ -792,25 +770,13 @@ impl RequestSpool {
                 range: 0..self.len() as u64,
                 stream: Box::pin(futures_util::stream::once(async move { Ok(body) })),
             }
-        } else if let Some(local) = &self.shared.local {
-            let file =
-                tokio::fs::File::from_std(local.reopen().map_err(|_| RequestSpoolReadError)?);
+        } else if let Some(carrier) = &self.shared.carrier {
             crate::archive::ArchiveDownload {
-                object_size: self.len() as u64,
-                range: 0..self.len() as u64,
-                stream: Box::pin(futures_util::stream::try_unfold(
-                    file,
-                    |mut file| async move {
-                        use tokio::io::AsyncReadExt;
-                        let mut chunk = vec![0; 64 * 1024];
-                        let count = file.read(&mut chunk).await?;
-                        if count == 0 {
-                            return Ok::<_, std::io::Error>(None);
-                        }
-                        chunk.truncate(count);
-                        Ok(Some((Bytes::from(chunk), file)))
-                    },
-                )),
+                object_size: carrier.len(),
+                range: 0..carrier.len(),
+                stream: Box::pin(carrier.open_stream().map(|chunk| {
+                    chunk.map_err(|_| std::io::Error::other("request source read failed"))
+                })),
             }
         } else {
             if !self.shared.durable_ok.load(Ordering::Acquire) && !self.upload_outcome().await {
@@ -914,7 +880,42 @@ impl RequestSpool {
         }
     }
 
+    pub(crate) async fn read_prepaid_projection(
+        &self,
+        permit: &super::memory::ConversationProjectionPermit,
+    ) -> Result<Bytes, RequestSpoolReadError> {
+        if !permit.covers(self.len()) {
+            return Err(RequestSpoolReadError);
+        }
+        if let Some(carrier) = self.carrier() {
+            let mut bytes = vec![0; self.len()];
+            carrier
+                .read_into(0, &mut bytes)
+                .await
+                .map_err(|_| RequestSpoolReadError)?;
+            return verified_body(&self.shared, Bytes::from(bytes));
+        }
+        self.read_legacy_body().await
+    }
+
+    /// Test-only materialization: production callers use the prepaid projection
+    /// reader or stream. The collection belongs to the test's expected-value
+    /// workspace, not an unaccounted production body allocation.
+    #[cfg(test)]
     pub(crate) async fn read_all(&self) -> Result<Bytes, RequestSpoolReadError> {
+        if self.carrier().is_none() {
+            return self.read_legacy_body().await;
+        }
+        self.read_count.fetch_add(1, Ordering::AcqRel);
+        let mut source = self.open_stream().await?;
+        let mut body = Vec::new();
+        while let Some(chunk) = source.stream.next().await {
+            body.extend_from_slice(&chunk.map_err(|_| RequestSpoolReadError)?);
+        }
+        verified_body(&self.shared, Bytes::from(body))
+    }
+
+    async fn read_legacy_body(&self) -> Result<Bytes, RequestSpoolReadError> {
         #[cfg(test)]
         self.read_count.fetch_add(1, Ordering::AcqRel);
         let resident = self
@@ -926,15 +927,8 @@ impl RequestSpool {
         if let Some(body) = resident {
             return verified_body(&self.shared, body);
         }
-        if let Some(local) = &self.shared.local {
-            use tokio::io::AsyncReadExt;
-            let mut file =
-                tokio::fs::File::from_std(local.reopen().map_err(|_| RequestSpoolReadError)?);
-            let mut body = Vec::with_capacity(self.len());
-            file.read_to_end(&mut body)
-                .await
-                .map_err(|_| RequestSpoolReadError)?;
-            return verified_body(&self.shared, Bytes::from(body));
+        if self.shared.carrier.is_some() {
+            return Err(RequestSpoolReadError);
         }
         if !self.shared.durable_ok.load(Ordering::Acquire) && !self.upload_outcome().await {
             return Err(RequestSpoolReadError);
@@ -1051,7 +1045,7 @@ fn evict_oldest_settled(usage: &RequestSpoolUsage) -> bool {
             }
             Some(true) => {}
         }
-        if shared.local.is_none()
+        if shared.carrier.is_none()
             && (!shared.residency.durable_settled.load(Ordering::Acquire)
                 || !shared.durable_ok.load(Ordering::Acquire))
         {
@@ -1076,10 +1070,10 @@ fn publish_durable(shared: &Arc<SharedBody>) {
         .lock()
         .unwrap_or_else(|error| error.into_inner())
         .as_ref()
-        .filter(|_| shared.local.is_none())
+        .filter(|_| shared.carrier.is_none())
         .cloned();
-    let local = shared.local.clone();
-    if bytes.is_none() && local.is_none() {
+    let carrier = shared.carrier.clone();
+    if bytes.is_none() && carrier.is_none() {
         return;
     }
     let ok = Arc::clone(&shared.durable_ok);
@@ -1087,6 +1081,13 @@ fn publish_durable(shared: &Arc<SharedBody>) {
     let residency = shared.residency.clone();
     let outcome = shared.outcome.clone();
     let source = shared.clone();
+    let upload_memory = shared
+        .lease
+        .lock()
+        .unwrap_or_else(|error| error.into_inner())
+        .usage
+        .upload_memory
+        .clone();
     let activity = shared
         .lease
         .lock()
@@ -1100,9 +1101,11 @@ fn publish_durable(shared: &Arc<SharedBody>) {
         let upload = async {
             let retry_upload = async {
                 loop {
-                    let result = match (&bytes, &local) {
+                    let result = match (&bytes, &carrier) {
                         (Some(bytes), _) => store.put(&key, bytes.clone()).await,
-                        (_, Some(local)) => store.put_file(&key, local).await,
+                        (_, Some(carrier)) => {
+                            store.put_carrier(&key, carrier, &upload_memory).await
+                        }
                         _ => Err(()),
                     };
                     if result.is_ok() {
@@ -1182,7 +1185,7 @@ fn publish_durable(shared: &Arc<SharedBody>) {
                             }
                         };
                         if success {
-                            database
+                            let object = database
                                 .publish_request_source(
                                     identity,
                                     &key,
@@ -1190,6 +1193,18 @@ fn publish_durable(shared: &Arc<SharedBody>) {
                                     source.digest,
                                 )
                                 .await;
+                            // The immutable raw root now durably owns this
+                            // exact object even while SQL binding waits.
+                            if let Some(carrier) = &source.carrier
+                                && let Ok(archive) = database.body_archive()
+                                && carrier
+                                    .handoff_verified_publication(archive.clone(), object)
+                                    .is_err()
+                            {
+                                tracing::error!(
+                                    "request source durable handoff identity mismatch; retaining RAM"
+                                );
+                            }
                         }
                         let permit = if success {
                             database.try_request_source_completion()
@@ -1248,45 +1263,6 @@ fn publish_durable(shared: &Arc<SharedBody>) {
         .unwrap_or_else(|error| error.into_inner()) = Some(handle);
 }
 
-async fn open_spill(directory: &std::path::Path) -> Result<SpillSink, RequestSpoolCaptureError> {
-    tokio::fs::create_dir_all(directory)
-        .await
-        .map_err(|_| RequestSpoolCaptureError::Unavailable)?;
-    let owner =
-        Arc::new(LocalBodyFile::new(directory).map_err(|_| RequestSpoolCaptureError::Unavailable)?);
-    let mut file = tokio::fs::File::from_std(
-        owner
-            .writer()
-            .map_err(|_| RequestSpoolCaptureError::Unavailable)?,
-    );
-    file.set_max_buf_size(REQUEST_SPOOL_CHUNK_BYTES);
-    Ok(SpillSink { owner, file })
-}
-
-async fn write_spill(sink: &mut SpillSink, bytes: Bytes) -> Result<(), RequestSpoolCaptureError> {
-    use tokio::io::AsyncWriteExt;
-    for chunk in bytes.chunks(REQUEST_SPOOL_CHUNK_BYTES) {
-        sink.file
-            .write_all(chunk)
-            .await
-            .map_err(|_| RequestSpoolCaptureError::Unavailable)?;
-    }
-    Ok(())
-}
-
-async fn finish_spill(mut sink: SpillSink) -> Result<Arc<LocalBodyFile>, RequestSpoolCaptureError> {
-    use tokio::io::AsyncWriteExt;
-    sink.file
-        .flush()
-        .await
-        .map_err(|_| RequestSpoolCaptureError::Unavailable)?;
-    Ok(sink.owner)
-}
-
-async fn abort_spill(sink: Option<SpillSink>) {
-    drop(sink);
-}
-
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum RequestSpoolCaptureError {
     TooLarge,
@@ -1296,6 +1272,12 @@ pub(crate) enum RequestSpoolCaptureError {
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) struct RequestSpoolReadError;
+
+impl std::fmt::Display for RequestSpoolCaptureError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("request source capture failed")
+    }
+}
 
 #[cfg(test)]
 mod archive_source_tests;
@@ -1316,7 +1298,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn local_source_releases_cache_while_archive_upload_is_paused() {
+    async fn pending_object_upload_keeps_the_ram_source_charged() {
         let directory = tempfile::tempdir().unwrap();
         let store = MemoryObjectStore::new();
         let resume = store.pause_next_write();
@@ -1341,7 +1323,10 @@ mod tests {
         assert!(budget.snapshot().0 > 0);
         assert!(!source.shared.durable_ok.load(Ordering::Acquire));
         source.release_local_retained();
-        assert_eq!(budget.snapshot().0, 0);
+        assert!(
+            budget.snapshot().0 >= body.len(),
+            "live RAM source retains its real allocation lease"
+        );
         assert_eq!(source.read_all().await.unwrap(), body);
         assert_eq!(store.reads.load(Ordering::Acquire), 0);
         assert!(!source.shared.durable_ok.load(Ordering::Acquire));
@@ -1351,7 +1336,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn capture_round_trips_and_drop_unlinks_the_file() {
+    async fn memory_capture_round_trips_and_drop_releases_ownership() {
         let directory = tempfile::tempdir().unwrap();
         let admission = RequestSpoolAdmission::new(directory.path().to_owned());
         let body = Bytes::from(vec![b'x'; REQUEST_SPOOL_CHUNK_BYTES * 2 + 17]);
@@ -1423,7 +1408,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn anonymous_spool_leaves_no_restart_orphan() {
+    async fn ram_capture_creates_no_restart_orphan() {
         let directory = tempfile::tempdir().unwrap();
         let path = directory.path().join("request-spool");
         let admission = RequestSpoolAdmission::new(path.clone());
@@ -1431,7 +1416,11 @@ mod tests {
             .capture(Body::from("sensitive"), 1024, None)
             .await
             .unwrap();
-        assert_eq!(file_count(&path), 0, "active spool must be anonymous");
+        assert_eq!(
+            file_count(&path),
+            0,
+            "active capture must not create a body file"
+        );
         drop(spool);
         drop(admission);
         let restarted = RequestSpoolAdmission::new(path.clone());
@@ -1440,10 +1429,10 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn local_spill_forwards_complete_body_without_an_archive_backend() {
+    async fn available_ram_forwards_without_archive_or_local_files() {
         let directory = tempfile::tempdir().unwrap();
         let admission = RequestSpoolAdmission::new(directory.path().to_owned());
-        let budget = crate::gateway_body::memory::ProxyMemoryBudget::new(64 * 1024);
+        let budget = crate::gateway_body::memory::ProxyMemoryBudget::new(2 * 1024 * 1024);
         let memory = budget.reservation();
         let body = Bytes::from(vec![b'x'; 512 * 1024]);
         let spool = admission
@@ -1461,13 +1450,13 @@ mod tests {
         assert!(spool.object_locator().is_some());
         assert!(
             !spool.upload_outcome().await,
-            "local transport is not a durable archive receipt"
+            "RAM transport is not a durable archive receipt"
         );
         #[cfg(target_os = "linux")]
         assert_eq!(
             file_count(directory.path()),
             0,
-            "anonymous file cannot survive a process crash"
+            "capture never creates an application body file"
         );
         drop(spool);
         assert_eq!(admission.snapshot().active_files, 0);
@@ -1475,13 +1464,94 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn failed_archive_upload_does_not_block_local_spill_replay() {
+    async fn pressure_spills_to_typed_objects_without_touching_the_body_directory() {
+        let directory = tempfile::tempdir().unwrap();
+        let archive = crate::archive::ArchiveStore::memory_for_test();
+        let admission = RequestSpoolAdmission::new(directory.path().join("must-not-exist"))
+            .with_archive(archive);
+        let budget = crate::gateway_body::memory::ProxyMemoryBudget::new(128 * 1024);
+        let expected = Bytes::from(vec![b'p'; 512 * 1024]);
+        let source = tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            admission.capture_with_memory(
+                Body::from(expected.clone()),
+                usize::MAX,
+                Some(expected.len()),
+                Some(&budget.reservation()),
+                0,
+                Some("11111111-1111-4111-8111-111111111111"),
+            ),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        assert!(!directory.path().join("must-not-exist").exists());
+        assert!(source.shared.carrier.is_some());
+        let mut stream = source.open_stream().await.unwrap().stream;
+        let mut hash = blake3::Hasher::new();
+        let mut count = 0usize;
+        while let Some(chunk) = stream.next().await {
+            let bytes = chunk.unwrap();
+            hash.update(&bytes);
+            count += bytes.len();
+        }
+        assert_eq!(count, expected.len());
+        assert_eq!(hash.finalize(), blake3::hash(&expected));
+        assert!(
+            tokio::time::timeout(std::time::Duration::from_secs(5), source.upload_outcome())
+                .await
+                .unwrap()
+        );
+        assert_eq!(file_count(directory.path()), 0);
+    }
+
+    #[tokio::test]
+    async fn prepaid_projection_reads_without_acquiring_a_second_body_lease() {
+        let directory = tempfile::tempdir().unwrap();
+        let admission = RequestSpoolAdmission::new(directory.path().to_owned());
+        let budget = super::super::memory::ProxyMemoryBudget::new(192 * 1024);
+        let memory = budget.reservation();
+        let bytes = Bytes::from(vec![b'x'; 64 * 1024]);
+        let source = admission
+            .capture_with_memory(
+                Body::from(bytes.clone()),
+                usize::MAX,
+                Some(bytes.len()),
+                Some(&memory),
+                0,
+                None,
+            )
+            .await
+            .unwrap();
+        let projection = memory
+            .reserve_conversation_projection(bytes.len(), 1, tokio::time::Instant::now())
+            .unwrap();
+        let before = budget.snapshot().0;
+        assert_eq!(before, 192 * 1024);
+        let actual = tokio::time::timeout(
+            std::time::Duration::from_secs(1),
+            source.read_prepaid_projection(&projection),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        assert_eq!(actual, bytes);
+        assert_eq!(budget.snapshot().0, before);
+        drop(actual);
+        drop(projection);
+        drop(source);
+        assert_eq!(budget.snapshot().0, 0);
+        assert_eq!(file_count(directory.path()), 0);
+    }
+
+    #[tokio::test]
+    async fn failed_archive_upload_does_not_block_budgeted_ram_replay() {
         let directory = tempfile::tempdir().unwrap();
         let store = MemoryObjectStore::new();
         store.fail_writes.store(true, Ordering::Release);
         let admission = RequestSpoolAdmission::new(directory.path().to_owned())
             .with_memory_store(store.clone());
-        let budget = crate::gateway_body::memory::ProxyMemoryBudget::new(64 * 1024);
+        let budget = crate::gateway_body::memory::ProxyMemoryBudget::new(2 * 1024 * 1024);
         let memory = budget.reservation();
         let body = Bytes::from(vec![b'z'; 512 * 1024]);
         let spool = admission
@@ -1562,7 +1632,7 @@ mod tests {
         let store = MemoryObjectStore::new();
         let admission = RequestSpoolAdmission::new(directory.path().to_owned())
             .with_memory_store(store.clone());
-        let budget = crate::gateway_body::memory::ProxyMemoryBudget::new(256 * 1024);
+        let budget = crate::gateway_body::memory::ProxyMemoryBudget::new(512 * 1024);
         let memory = budget.reservation();
         let first = Bytes::from(vec![b'a'; 128 * 1024]);
         let oldest = admission
@@ -1605,7 +1675,7 @@ mod tests {
         assert_eq!(
             store.reads.load(Ordering::Acquire),
             0,
-            "evicted cache reopens its local file"
+            "both sources retain independent budgeted RAM readers"
         );
         assert_eq!(file_count(directory.path()), 0);
     }
@@ -1680,13 +1750,13 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn local_backed_unsettled_body_is_reclaimed_for_the_new_upload() {
+    async fn carrier_backed_unsettled_body_is_reclaimed_for_the_new_upload() {
         let directory = tempfile::tempdir().unwrap();
         let store = MemoryObjectStore::new();
         let admission = RequestSpoolAdmission::new(directory.path().to_owned())
             .with_memory_store(store.clone());
         let release = store.pause_next_write();
-        let budget = crate::gateway_body::memory::ProxyMemoryBudget::new(256 * 1024);
+        let budget = crate::gateway_body::memory::ProxyMemoryBudget::new(512 * 1024);
         let memory = budget.reservation();
         let first = Bytes::from(vec![b'a'; 128 * 1024]);
         let oldest = admission
@@ -1724,11 +1794,11 @@ mod tests {
         let reads_after_spill = store.reads.load(Ordering::Acquire);
         assert_eq!(
             reads_after_spill, 0,
-            "local replay must not wait for an archive download"
+            "RAM replay must not wait for the pending archive upload"
         );
         assert!(oldest.shared.body.lock().unwrap().is_none());
-        assert!(newest.shared.body.lock().unwrap().is_some());
-        assert!(newest.shared.local.is_some());
+        assert!(newest.shared.body.lock().unwrap().is_none());
+        assert!(newest.shared.carrier.is_some());
         assert_eq!(oldest.read_all().await.unwrap(), first);
         assert_eq!(store.reads.load(Ordering::Acquire), reads_after_spill);
         let _ = release.send(());

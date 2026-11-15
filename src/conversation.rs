@@ -1948,11 +1948,10 @@ fn strip_private_provider_fields(mut value: Value) -> Value {
     if matches!(
         value.get("type").and_then(Value::as_str),
         Some("reasoning" | "compaction")
-    ) {
-        if let Some(map) = value.as_object_mut() {
-            for key in PRIVATE_PROVIDER_KEYS {
-                map.remove(*key);
-            }
+    ) && let Some(map) = value.as_object_mut()
+    {
+        for key in PRIVATE_PROVIDER_KEYS {
+            map.remove(*key);
         }
     }
     value

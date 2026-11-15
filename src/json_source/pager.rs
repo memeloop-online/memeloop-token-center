@@ -67,16 +67,16 @@ impl Pager {
             self.frames[index].used = self.clock;
             return Ok(index);
         }
-        if self.frames.iter().all(|frame| frame.number.is_some()) {
-            if let Some(lease) = self.backend.try_reserve_page() {
-                self.frames.push(Frame {
-                    number: None,
-                    bytes: vec![0; PAGE_BYTES],
-                    dirty: false,
-                    used: 0,
-                    _lease: Some(lease),
-                });
-            }
+        if self.frames.iter().all(|frame| frame.number.is_some())
+            && let Some(lease) = self.backend.try_reserve_page()
+        {
+            self.frames.push(Frame {
+                number: None,
+                bytes: vec![0; PAGE_BYTES],
+                dirty: false,
+                used: 0,
+                _lease: Some(lease),
+            });
         }
         let index = self
             .frames
