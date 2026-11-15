@@ -236,6 +236,27 @@ async fn session_tasks_history_real_services_acceptance() {
             .await
             .unwrap();
     }
+    // A current-state comparison cannot bypass post-activation coverage.
+    // Complete the same fresh RR source proof required by the real CLI first.
+    let source = db
+        .clone()
+        .with_auxiliary_pool_max_connections(1)
+        .independent_persistence_pool();
+    let owner = Uuid::now_v7();
+    let mut baseline = db
+        .history_begin_source_snapshot(&source, owner)
+        .await
+        .unwrap();
+    let epoch = baseline.receipt["epoch"].as_i64().unwrap();
+    while baseline
+        .verify_next_page(db, &client, &client, 64)
+        .await
+        .unwrap()
+        != 0
+    {}
+    baseline.finish(db).await.unwrap();
+    db.history_resume_delivery(owner, epoch).await.unwrap();
+    source.close().await;
     crate::request_history::migration::verify(db, &client)
         .await
         .unwrap();
