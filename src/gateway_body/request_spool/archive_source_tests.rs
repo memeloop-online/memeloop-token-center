@@ -13,7 +13,11 @@ async fn archive_source_survives_request_drop_without_pinning_upload_bytes_on_da
         "sqlite://{}?mode=rwc",
         directory.path().join("source.db").display()
     );
-    let database = Database::connect_with_max(&database_url, 4).await.unwrap();
+    let archive = crate::archive::ArchiveStore::memory_for_test();
+    let database = Database::connect_with_max(&database_url, 4)
+        .await
+        .unwrap()
+        .with_archive(archive.clone());
     database.migrate().await.unwrap();
     let blocker = sqlx::AnyPool::connect(&database_url).await.unwrap();
     let held = blocker.begin_with("BEGIN IMMEDIATE").await.unwrap();
@@ -44,14 +48,12 @@ async fn archive_source_survives_request_drop_without_pinning_upload_bytes_on_da
     assert_eq!(raw.as_ptr(), shared.as_ptr());
     assert!(Arc::ptr_eq(&source, &admission.source(request_id).unwrap()));
     let locator = source.object_locator().unwrap().to_owned();
-    source.retain_for_archive(
-        database.clone(),
-        ArchiveSpoolIdentity {
-            request_id,
-            tenant_id: uuid::Uuid::now_v7(),
-            reservation_id: uuid::Uuid::now_v7(),
-        },
-    );
+    let identity = ArchiveSpoolIdentity {
+        request_id,
+        tenant_id: uuid::Uuid::now_v7(),
+        reservation_id: uuid::Uuid::now_v7(),
+    };
+    source.retain_for_archive(database.clone(), identity);
     drop(shared);
     drop(raw);
     source.release_retained();
@@ -60,12 +62,36 @@ async fn archive_source_survives_request_drop_without_pinning_upload_bytes_on_da
         budget.snapshot().0 >= body.len(),
         "the pending RAM carrier must keep its real credit"
     );
+    // Mirror the fake's gated PUT into the same real backend used by root
+    // publication, while its independent SQL handoff remains blocked.
+    store.resume_writes_for_test(archive.clone());
     release.send(()).unwrap();
     assert!(
         tokio::time::timeout(Duration::from_secs(1), source.upload_outcome())
             .await
             .unwrap()
     );
+    let root = tokio::time::timeout(Duration::from_secs(1), async {
+        loop {
+            if let Some(root) = archive
+                .raw_capture_reference(identity.tenant_id, request_id, "request")
+                .await
+                .unwrap()
+                && budget.snapshot().0 == 0
+            {
+                break root;
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("verified durable root releases source RAM without waiting for SQL");
+    assert_eq!(root.size_bytes, body.len() as u64);
+    assert_eq!(root.blake3_digest, blake3::hash(&body).to_hex().to_string());
+    archive
+        .verify_tenant_content(identity.tenant_id, &root)
+        .await
+        .unwrap();
     assert_eq!(
         tokio::time::timeout(Duration::from_secs(1), source.read_all())
             .await
