@@ -1101,6 +1101,12 @@ async fn process_conversation_projection_batch(state: &AppState, lease_owner: Uu
             .observe_background_projection(BackgroundProjectionKind::Conversation, false);
         tracing::error!(%error, "worker 未能把已有原始请求 JSON 和原始返回 JSON 的会话正文重新排队");
     }
+    if let Err(error) = state.db.recover_semantic_coverage().await {
+        tracing::warn!(
+            error_category = error.diagnostic_category(),
+            "semantic coverage confirmation remains pending"
+        );
+    }
     tracing::debug!(%lease_owner, stage = "claim_start", "conversation projection stage");
     let tasks = match state
         .db
@@ -1335,6 +1341,14 @@ pub(crate) async fn archive_session_body(
         .db
         .prepare_archived_session_body_archive(lease_owner, request_id, atoms, &nodes, &media)
         .await?
+    {
+        return Ok(false);
+    }
+    if coverage_complete
+        && !state
+            .db
+            .retain_semantic_coverage_obligation(lease_owner, request_id, &publication)
+            .await?
     {
         return Ok(false);
     }
