@@ -202,7 +202,11 @@ async fn failed_source_retries_the_original_bytes_without_releasing_their_budget
         "sqlite://{}?mode=rwc",
         directory.path().join("failure.db").display()
     );
-    let database = Database::connect_with_max(&database_url, 4).await.unwrap();
+    let archive = crate::archive::ArchiveStore::memory_for_test();
+    let database = Database::connect_with_max(&database_url, 4)
+        .await
+        .unwrap()
+        .with_archive(archive.clone());
     database.migrate().await.unwrap();
     let held = database.saturate_gateway_persistence_for_test().await;
     let store = MemoryObjectStore::new();
@@ -279,6 +283,7 @@ async fn failed_source_retries_the_original_bytes_without_releasing_their_budget
             .await
             .is_err()
     );
+    let locator = source.object_locator().unwrap().to_owned();
     source.release_retained();
     drop(source);
     drop(memory);
@@ -287,7 +292,7 @@ async fn failed_source_retries_the_original_bytes_without_releasing_their_budget
         "failed object writes must retain the only RAM source and its real credit"
     );
     drop(held);
-    store.fail_writes.store(false, Ordering::Release);
+    store.resume_writes_for_test(archive);
     tokio::time::timeout(Duration::from_secs(3), async {
         while budget.snapshot().0 != 0 {
             tokio::task::yield_now().await;
@@ -295,6 +300,10 @@ async fn failed_source_retries_the_original_bytes_without_releasing_their_budget
     })
     .await
     .unwrap();
+    assert_eq!(
+        store.objects.lock().unwrap().get(&locator),
+        Some(&Bytes::from(vec![b'x'; 128 * 1024]))
+    );
     database.drain_gateway_persistence_for_test().await;
     database.close().await;
 }
