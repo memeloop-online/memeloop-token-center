@@ -76,12 +76,12 @@ pub(crate) async fn encode(
                 }
                 let count = input.len().min(self.size);
                 let runtime = self.runtime.clone();
-                runtime.block_on(async {
-                    tokio::select! {
-                        _ = &mut self.cancelled => Err(io::Error::other("normalized encoding cancelled")),
-                        result = self.writer.write(Bytes::copy_from_slice(&input[..count])) => result.map_err(|error| io::Error::other(error.to_string())),
-                    }
-                })?;
+                runtime
+                    .block_on(cancel_upload(
+                        &mut self.cancelled,
+                        self.writer.write(Bytes::copy_from_slice(&input[..count])),
+                    ))
+                    .map_err(|error| io::Error::other(error.to_string()))?;
                 Ok(count)
             }
             fn flush(&mut self) -> io::Result<()> {
@@ -98,13 +98,13 @@ pub(crate) async fn encode(
         drop(value);
         drop(workspace);
         result.map_err(|_| AppError::storage("normalized_encoding_write_failed"))?;
-        let Writer { runtime, writer, mut cancelled, .. } = output;
-        runtime.block_on(async {
-            tokio::select! {
-                _ = &mut cancelled => Err(AppError::storage("normalized_encoding_cancelled")),
-                result = writer.finish_staged() => result,
-            }
-        })
+        let Writer {
+            runtime,
+            writer,
+            mut cancelled,
+            ..
+        } = output;
+        runtime.block_on(cancel_upload(&mut cancelled, writer.finish_staged()))
     })
     .await
     .map_err(|_| AppError::internal("normalized_encoding_join"))??;
@@ -113,4 +113,54 @@ pub(crate) async fn encode(
     let source = BodyCarrier::from_owned_staged(staged, capture, scope)?;
     previous.release_unretained_json();
     Ok(source)
+}
+
+async fn cancel_upload<T>(
+    cancelled: &mut tokio::sync::oneshot::Receiver<()>,
+    operation: impl std::future::Future<Output = Result<T, AppError>>,
+) -> Result<T, AppError> {
+    tokio::select! {
+        _ = cancelled => Err(AppError::storage("normalized_encoding_cancelled")),
+        result = operation => result,
+    }
+}
+
+#[cfg(test)]
+mod cancellation_contracts {
+    use super::*;
+    #[tokio::test]
+    async fn pending_write_and_finish_cancel_and_return_actual_upload_envelope() {
+        for phase in ["write", "finish"] {
+            let upload = Arc::new(crate::api::proxy::persistence::Persistence::default());
+            let bytes = crate::archive::ARCHIVE_MULTIPART_PART_BYTES + 5 * 64 * 1024;
+            let envelope = upload
+                .stream_memory
+                .temporary_wait(bytes, super::super::memory::CAPTURE_MEMORY_WEIGHT)
+                .await
+                .unwrap();
+            assert!(upload.stream_memory.snapshot().0 >= bytes);
+            let (cancel, mut cancelled) = tokio::sync::oneshot::channel();
+            let (entered, started) = tokio::sync::oneshot::channel();
+            let runtime = tokio::runtime::Handle::current();
+            let task = tokio::task::spawn_blocking(move || {
+                let _envelope = envelope;
+                runtime.block_on(cancel_upload(&mut cancelled, async move {
+                    entered.send(()).unwrap();
+                    std::future::pending::<Result<(), AppError>>().await
+                }))
+            });
+            started.await.unwrap();
+            drop(cancel);
+            let result = task.await.unwrap();
+            assert!(
+                result.is_err(),
+                "pending {phase} must exit after caller cancellation"
+            );
+            assert_eq!(
+                upload.stream_memory.snapshot().0,
+                0,
+                "{phase} must return the full multipart envelope"
+            );
+        }
+    }
 }
