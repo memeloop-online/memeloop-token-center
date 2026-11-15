@@ -824,7 +824,7 @@ impl Fixture {
         let response_locator = if source.is_some() {
             let object = state.archive.put_tenant_content(
                 key.tenant_id,
-                Bytes::from_static(br#"{"choices":[{"message":{"role":"assistant","content":"archive assistant answer"}}]}"#),
+                Bytes::from_static(br#"{"choices":[{"message":{"role":"assistant","content":"archive assistant answer"},"finish_reason":"stop"}]}"#),
             ).await.unwrap();
             state
                 .archive
@@ -1028,7 +1028,7 @@ impl Fixture {
     async fn capture(&self) {
         for (purpose, body) in [
             (BufferedArchivePurpose::Request, Bytes::from_static(br#"{"messages":[{"role":"user","content":"archive question"}]}"#)),
-            (BufferedArchivePurpose::Response, Bytes::from_static(br#"{"choices":[{"message":{"role":"assistant","content":"archive assistant answer"}}]}"#)),
+            (BufferedArchivePurpose::Response, Bytes::from_static(br#"{"choices":[{"message":{"role":"assistant","content":"archive assistant answer"},"finish_reason":"stop"}]}"#)),
         ] {
             let archive = BufferedArchive::new(
                 self.identity,
@@ -1977,7 +1977,7 @@ async fn postgres_source_identity_recovers_after_request_drop_and_missing_bindin
 fn archive_bodies() -> [(BufferedArchivePurpose, Bytes); 2] {
     [
         (BufferedArchivePurpose::Request, Bytes::from_static(br#"{"messages":[{"role":"user","content":"archive question"}]}"#)),
-        (BufferedArchivePurpose::Response, Bytes::from_static(br#"{"choices":[{"message":{"role":"assistant","content":"archive assistant answer"}}]}"#)),
+        (BufferedArchivePurpose::Response, Bytes::from_static(br#"{"choices":[{"message":{"role":"assistant","content":"archive assistant answer"},"finish_reason":"stop"}]}"#)),
     ]
 }
 
@@ -2074,5 +2074,100 @@ async fn postgres_archive_binding_and_financial_terminal_preserve_bodies_in_both
         .expect("archive terminal ordering PostgreSQL regression requires its CI database");
     let isolated = PostgresTestDatabase::create(&database_url).await;
     terminal_archive_order_contract(isolated.url().to_owned()).await;
+    isolated.cleanup().await;
+}
+
+async fn semantic_coverage_committed_recovery_contract(database_url: String) {
+    for fault in ["projection_commit_ack", "coverage_put"] {
+        let fixture = Fixture::new(database_url.clone(), true).await;
+        fixture.capture().await;
+        let owner = fixture.claim().await;
+        let result = Database::with_semantic_coverage_fault(
+            fault,
+            crate::worker::archive_session_body(&fixture.state, owner, fixture.request_id),
+        )
+        .await;
+        assert!(
+            result.is_err(),
+            "fault must occur after the actual SQL commit: {fault}"
+        );
+        let db = &fixture.state.db;
+        let before: (i64, String, String) = sqlx::query_as(
+            "SELECT p.projected_at, p.lease_owner, o.leaf_node_hash FROM conversation_projection_outbox p JOIN conversation_observations o ON o.request_id=p.request_id WHERE p.request_id=$1"
+        ).bind(fixture.request_id.to_string()).fetch_one(&db.pool).await.unwrap();
+        assert_eq!(before.1, "semantic-coverage-v2");
+        let snapshot: String = sqlx::query_scalar(
+            "SELECT semantic_snapshot_json FROM conversation_projection_outbox WHERE request_id=$1",
+        )
+        .bind(fixture.request_id.to_string())
+        .fetch_one(&db.pool)
+        .await
+        .unwrap();
+        let snapshot: serde_json::Value = serde_json::from_str(&snapshot).unwrap();
+        let publication: crate::archive::SemanticPublication =
+            serde_json::from_value(snapshot["semantic_coverage_pending"].clone()).unwrap();
+        let receipt = format!(
+            "tenants/{}/semantic/v2/requests/{}/{}-coverage.json",
+            fixture.key.tenant_id, fixture.request_id, publication.revision
+        );
+        assert!(fixture.state.archive.get(&receipt).await.is_err());
+        // Recovery itself can fail without losing the durable obligation.
+        assert!(
+            Database::with_semantic_coverage_fault("coverage_put", db.recover_semantic_coverage())
+                .await
+                .is_err()
+        );
+        let retained: String = sqlx::query_scalar(
+            "SELECT lease_owner FROM conversation_projection_outbox WHERE request_id=$1",
+        )
+        .bind(fixture.request_id.to_string())
+        .fetch_one(&db.pool)
+        .await
+        .unwrap();
+        assert_eq!(retained, "semantic-coverage-v2");
+        db.recover_semantic_coverage().await.unwrap();
+        assert!(
+            !fixture
+                .state
+                .archive
+                .get(&receipt)
+                .await
+                .unwrap()
+                .is_empty()
+        );
+        let after: (i64, Option<String>, String) = sqlx::query_as(
+            "SELECT p.projected_at, p.lease_owner, o.leaf_node_hash FROM conversation_projection_outbox p JOIN conversation_observations o ON o.request_id=p.request_id WHERE p.request_id=$1"
+        ).bind(fixture.request_id.to_string()).fetch_one(&db.pool).await.unwrap();
+        assert_eq!(
+            (after.0, &after.2),
+            (before.0, &before.2),
+            "recovery must not reproject the leaf or SQL acknowledgement"
+        );
+        assert!(after.1.is_none());
+        db.recover_semantic_coverage().await.unwrap();
+        assert!(
+            !crate::worker::archive_session_body(&fixture.state, owner, fixture.request_id)
+                .await
+                .unwrap()
+        );
+    }
+}
+
+#[tokio::test]
+async fn sqlite_semantic_coverage_recovers_committed_projection_and_failed_put() {
+    let directory = tempfile::tempdir().unwrap();
+    semantic_coverage_committed_recovery_contract(format!(
+        "sqlite://{}?mode=rwc",
+        directory.path().join("coverage.db").display()
+    ))
+    .await;
+}
+
+#[tokio::test]
+async fn postgres_semantic_coverage_recovers_committed_projection_and_failed_put() {
+    let url = std::env::var("MTC_TEST_POSTGRES_URL")
+        .expect("semantic coverage recovery requires real PostgreSQL");
+    let isolated = PostgresTestDatabase::create(&url).await;
+    semantic_coverage_committed_recovery_contract(isolated.url().to_owned()).await;
     isolated.cleanup().await;
 }

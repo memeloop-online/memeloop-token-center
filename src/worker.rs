@@ -1359,6 +1359,12 @@ pub(crate) async fn archive_session_body(
         .await;
     tracing::debug!(%request_id, %lease_owner, succeeded = result.is_ok(), stage = "semantic_projection_done", "conversation projection stage");
     let projected = result?;
+    #[cfg(test)]
+    if projected && coverage_complete {
+        // The database has actually committed. Simulate losing the result at
+        // this boundary, without rolling it back or replaying projection.
+        crate::db::Database::semantic_coverage_test_boundary("projection_commit_ack")?;
+    }
     if projected && coverage_complete {
         if let Some(head) = nodes.last() {
             let binding = state

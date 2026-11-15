@@ -250,6 +250,8 @@ impl ArchiveStore {
             binding: proof,
             coverage: &manifest.coverage,
         };
+        #[cfg(test)]
+        crate::db::Database::semantic_coverage_test_boundary("coverage_put")?;
         self.restore_durable_root(
             &format!(
                 "tenants/{}/semantic/v2/requests/{}/{}-coverage.json",
