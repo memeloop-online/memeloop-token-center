@@ -1327,6 +1327,8 @@ pub(crate) async fn archive_session_body(
         atoms,
         nodes,
         media,
+        publication,
+        coverage_complete,
         ..
     } = prepared;
     if !state
@@ -1342,7 +1344,23 @@ pub(crate) async fn archive_session_body(
         .project_claimed_conversation_projection_task(lease_owner, request_id)
         .await;
     tracing::debug!(%request_id, %lease_owner, succeeded = result.is_ok(), stage = "semantic_projection_done", "conversation projection stage");
-    result
+    let projected = result?;
+    if projected && coverage_complete {
+        if let Some(head) = nodes.last() {
+            let binding = state
+                .db
+                .semantic_archive_binding(tenant_id, request_id, &head.node_hash)
+                .await?
+                .ok_or_else(|| AppError::storage("semantic_sql_binding_not_committed"))?;
+            state
+                .archive
+                .confirm_semantic_coverage(&publication, &binding)
+                .await?;
+        }
+    }
+    // Coverage confirmation is a separate durable handoff, not financial ACK
+    // and not yet permission to delete raw still held by another retry owner.
+    Ok(projected)
 }
 
 async fn skip_session_body(

@@ -3,6 +3,26 @@
 use super::*;
 
 impl Database {
+    pub(crate) async fn published_semantic_revision(
+        &self,
+        scope: &SessionContextScope,
+    ) -> Result<Option<u64>, AppError> {
+        let leaf: Option<String> = sqlx::query_scalar("SELECT leaf_node_hash FROM conversation_observations WHERE tenant_id = $1 AND request_id = $2 AND key_id = $3")
+            .bind(scope.tenant_id.to_string()).bind(scope.request_id.to_string()).bind(scope.key_id.to_string())
+            .fetch_optional(&self.pool).await?.flatten();
+        let Some(leaf) = leaf else {
+            return Ok(None);
+        };
+        let archive = self
+            .archive
+            .as_ref()
+            .ok_or_else(|| AppError::storage("semantic_archive_unavailable"))?;
+        // The SQL connection is returned before any object-store operation.
+        archive
+            .published_semantic_revision(scope.tenant_id, scope.request_id, &leaf)
+            .await
+    }
+
     pub(crate) async fn semantic_archive_binding(
         &self,
         tenant: Uuid,

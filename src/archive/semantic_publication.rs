@@ -1,13 +1,13 @@
 //! Publication primitives for the single semantic body authority. Publishing
 //! objects is not acknowledgement of SQL binding or permission to delete raw.
 use bytes::Bytes;
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
 use super::{ArchiveStore, CasArchiveObject, SemanticInstancePage, SemanticManifestV2};
 use crate::error::AppError;
 
-#[derive(Serialize)]
+#[derive(Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct SemanticPublication {
     pub format_version: u32,
