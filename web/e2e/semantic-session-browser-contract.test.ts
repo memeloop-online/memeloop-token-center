@@ -25,10 +25,16 @@ test('semantic viewer reads verified atoms lazily, preserves parts and pages wit
     await page.getByText('Separate reasoning', { exact: true }).waitFor();
     assert.match(await page.locator('.semantic-atom-content').innerText(), /"query": "structured"/);
     assert.equal(await page.evaluate(() => window.semanticAtomReads), 1);
+    await page.getByRole('button', { name: 'Earlier messages', exact: true }).click();
+    await page.getByRole('button', { name: 'Read message · 1', exact: true }).waitFor();
+    assert.equal(await page.getByRole('button', { name: 'Read message · 2', exact: true }).count(), 0, 'old resident window is released');
+    await page.getByRole('button', { name: 'Read message · 1', exact: true }).click();
+    await page.getByText('Verified earlier answer', { exact: true }).waitFor();
+    assert.equal(await page.evaluate(() => window.semanticAtomReads), 2);
     // Explicit refresh returns to the latest signed manifest without reading its body again.
     await page.getByRole('button', { name: 'Refresh conversation', exact: true }).click();
-    await page.waitForFunction(() => window.semanticPageReads === 2);
-    assert.equal(await page.evaluate(() => window.semanticAtomReads), 1);
+    await page.waitForFunction(() => window.semanticPageReads === 3);
+    assert.equal(await page.evaluate(() => window.semanticAtomReads), 2);
     assert.equal(await page.locator('.semantic-atom-content').count(), 0);
     assert.equal(await page.evaluate(() => document.documentElement.scrollWidth <= innerWidth), true);
     assert.equal(await page.getByRole('textbox').count(), 0, 'read-only viewer has no composer');

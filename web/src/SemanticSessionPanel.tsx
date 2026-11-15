@@ -105,6 +105,7 @@ export function SemanticSessionPanel({ detail, loader }: { detail: LogicalSessio
       {requests.map(request => <option key={request.request_id} value={request.request_id}>{new Date(request.created_at).toLocaleString(locale)} · {request.model}</option>)}
     </select></label>
     <Button appearance="secondary" disabled={loading} onClick={() => void read()}>{zh ? '刷新会话记录' : 'Refresh conversation'}</Button>
+    {visiblePage?.next_cursor && <Button appearance="secondary" disabled={loading} onClick={() => void read(visiblePage.next_cursor ?? undefined)}>{zh ? '较早消息' : 'Earlier messages'}</Button>}
     <Button appearance="secondary" disabled={exporting || visiblePage?.status !== 'published'} onClick={() => void exportContext()}>{zh ? '流式导出此上下文' : 'Stream context export'}</Button>
     {exporting && <Button appearance="secondary" onClick={() => exportActive.current?.abort()}>{zh ? '取消导出' : 'Cancel export'}</Button>}
     <SemanticConversationViewer revision={revision} coverage={visiblePage?.coverage ?? pending}

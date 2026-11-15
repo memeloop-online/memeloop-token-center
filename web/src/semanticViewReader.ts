@@ -81,7 +81,7 @@ export async function exportSemanticContext(loader: SemanticViewLoader, request:
   try {
     let cursor: string | undefined;
     let revision: number | undefined;
-    const positions = new Set<string>();
+    let previousCursor: string | undefined;
     let found = false;
     do {
       signal.throwIfAborted();
@@ -93,9 +93,9 @@ export async function exportSemanticContext(loader: SemanticViewLoader, request:
         if (!only || instance.instance_id === only.instance_id) { await writeAtom(instance, revision); found = true; }
       }
       if (only && page.instances.some(instance => instance.instance_id === only.instance_id)) break;
+      previousCursor = cursor;
       cursor = page.next_cursor ?? undefined;
-      if (cursor && positions.has(cursor)) throw new Error('Repeated semantic page');
-      if (cursor) positions.add(cursor);
+      if (cursor && cursor === previousCursor) throw new Error('Repeated semantic page');
     } while (cursor);
     if (only && !found) throw new Error('Semantic instance is no longer available');
     await file.close();
