@@ -1,0 +1,30 @@
+name: semantic-viewer-dependencies
+on:
+  push:
+    branches: [feat/semantic-react-viewer-20261114]
+    paths: [web/package.json, web/src/SemanticConversationViewer.tsx, .github/workflows/semantic-viewer-dependencies.yml]
+  workflow_dispatch:
+permissions:
+  contents: read
+jobs:
+  web:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    defaults:
+      run:
+        working-directory: web
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020
+        with:
+          node-version: 24.18.0
+      - name: Generate dependency lock in GHA
+        run: npm install --package-lock-only --ignore-scripts --no-audit
+      - uses: actions/upload-artifact@65462800fd760344b1a7b4382951275a0abb4808
+        with:
+          name: semantic-viewer-package-lock
+          path: web/package-lock.json
+          retention-days: 3
+      - run: npm ci --ignore-scripts --no-audit
+      - run: npm run typecheck
+      - run: npm run build
