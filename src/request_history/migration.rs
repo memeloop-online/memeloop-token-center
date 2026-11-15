@@ -47,6 +47,10 @@ pub enum HistoryCommand {
     Bootstrap,
     /// Validate every installed definition, then atomically enable capture without DDL.
     Activate,
+    /// Upgrade known off-mode functions without reinstalling source triggers.
+    PrepareActivation,
+    /// Inspect the post-commit old-transaction cohort; Changed means still draining.
+    CaptureHorizon,
     /// Re-export every retained source after upgrading the read-model contract.
     Refresh,
     Backfill {
@@ -81,6 +85,14 @@ pub async fn command(config: &Config, command: HistoryCommand) -> Result<Value, 
         }));
     }
     match &command {
+        HistoryCommand::PrepareActivation => {
+            database.history_prepare_activation().await?;
+            return Ok(json!({"mode":"off","functions_prepared":true}));
+        }
+        HistoryCommand::CaptureHorizon => {
+            let ready = database.history_capture_horizon_ready().await?;
+            return Ok(json!({"capture_horizon_ready":ready,"cutover_verified":false}));
+        }
         HistoryCommand::AbortBaseline { owner, epoch } => {
             database
                 .history_abort_source_snapshot(*owner, *epoch)
@@ -115,6 +127,7 @@ pub async fn command(config: &Config, command: HistoryCommand) -> Result<Value, 
         HistoryCommand::Start
         | HistoryCommand::Bootstrap
         | HistoryCommand::Activate
+        | HistoryCommand::PrepareActivation
         | HistoryCommand::Refresh => "ADMIN",
         HistoryCommand::Verify | HistoryCommand::Switch => "READER",
         _ => "WRITER",
@@ -175,6 +188,14 @@ pub async fn command(config: &Config, command: HistoryCommand) -> Result<Value, 
         HistoryCommand::Bootstrap => {
             client.initialize().await?;
             return database.history_bootstrap_capture().await;
+        }
+        HistoryCommand::PrepareActivation => {
+            database.history_prepare_activation().await?;
+            return Ok(json!({"mode":"off","functions_prepared":true}));
+        }
+        HistoryCommand::CaptureHorizon => {
+            let ready = database.history_capture_horizon_ready().await?;
+            return Ok(json!({"capture_horizon_ready":ready,"cutover_verified":false}));
         }
         HistoryCommand::Activate => {
             client.initialize().await?;
@@ -313,7 +334,10 @@ pub(crate) async fn run_worker(state: AppState, mut shutdown: watch::Receiver<bo
 }
 
 pub async fn verify(database: &Database, client: &ClickHouse) -> Result<Value, HistoryError> {
-    if !database.history_backfill_done().await? || database.history_pending_count().await? != 0 {
+    if !database.history_activation_baseline_proved().await?
+        || !database.history_backfill_done().await?
+        || database.history_pending_count().await? != 0
+    {
         return Err(HistoryError::Changed);
     }
     let revision = database.history_revision().await?;

@@ -843,6 +843,11 @@ pub(crate) const SQLITE_MIGRATIONS: &[Migration] = &[
         name: "consistent history baseline receipts",
         sql: include_str!("../../../migrations/common/0159_history_baseline_receipts.sql"),
     },
+    Migration {
+        version: 160,
+        name: "history_activation_horizon",
+        sql: include_str!("../../../migrations/common/0160_history_activation_horizon.sql"),
+    },
 ];
 
 pub(crate) const POSTGRES_MIGRATIONS: &[Migration] = &[
@@ -1660,6 +1665,11 @@ pub(crate) const POSTGRES_MIGRATIONS: &[Migration] = &[
         version: 159,
         name: "consistent history baseline receipts",
         sql: include_str!("../../../migrations/common/0159_history_baseline_receipts.sql"),
+    },
+    Migration {
+        version: 160,
+        name: "history_activation_horizon",
+        sql: include_str!("../../../migrations/common/0160_history_activation_horizon.sql"),
     },
 ];
 

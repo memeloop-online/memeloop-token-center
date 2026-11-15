@@ -11,6 +11,7 @@ pub(crate) struct HistorySourceSnapshot {
     owner: Uuid,
     epoch: i64,
     ordinal: i64,
+    activation_epoch: i64,
 }
 
 #[derive(Clone)]
@@ -48,6 +49,9 @@ impl Database {
                 "consistent history snapshot requires PostgreSQL",
             ));
         }
+        if !self.history_capture_horizon_ready().await? {
+            return Err(HistoryError::Changed);
+        }
         let mut source = source_database.pool.begin().await?;
         sqlx::query("SET TRANSACTION ISOLATION LEVEL REPEATABLE READ READ ONLY")
             .execute(&mut *source)
@@ -74,6 +78,10 @@ impl Database {
         }
         let ceiling:i64=sqlx::query_scalar("SELECT CASE WHEN is_called THEN last_value ELSE 0 END FROM request_history_export_revision_seq")
             .fetch_one(&mut *barrier).await?;
+        let activation_epoch: i64 =
+            sqlx::query_scalar("SELECT epoch FROM request_history_activation WHERE id=1")
+                .fetch_one(&mut *barrier)
+                .await?;
         let snapshot: String = sqlx::query_scalar("SELECT pg_current_snapshot()::TEXT")
             .fetch_one(&mut *source)
             .await?;
@@ -93,6 +101,7 @@ impl Database {
             owner,
             epoch,
             ordinal: 0,
+            activation_epoch,
         })
     }
 }
@@ -274,6 +283,11 @@ impl HistorySourceSnapshot {
             .bind(self.owner.to_string()).bind(self.epoch).bind(chrono::Utc::now().timestamp_millis())
             .execute(&mut *transaction).await?;
         if updated.rows_affected() != 1 {
+            return Err(HistoryError::Changed);
+        }
+        let binding=sqlx::query("UPDATE request_history_activation SET baseline_owner=$1,baseline_epoch=$2 WHERE id=1 AND phase IN ('drained','legacy') AND epoch=$3")
+            .bind(self.owner.to_string()).bind(self.epoch).bind(self.activation_epoch).execute(&mut *transaction).await?;
+        if binding.rows_affected() != 1 {
             return Err(HistoryError::Changed);
         }
         transaction.commit().await?;
@@ -478,6 +492,7 @@ mod tests {
             != 0
         {}
         let receipt = snapshot.finish(&database).await.unwrap();
+        assert!(database.history_activation_baseline_proved().await.unwrap());
         assert_eq!(receipt["status"], "source_complete");
         assert_eq!(receipt["quiescent"], false);
         assert_eq!(receipt["cutover_verified"], false);

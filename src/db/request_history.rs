@@ -1,3 +1,4 @@
+mod activation;
 mod bootstrap;
 use super::*;
 
@@ -282,7 +283,7 @@ impl Database {
                 };
                 let name = format!("history_{table}_{}", event.to_lowercase());
                 let body = format!(
-                    "BEGIN PERFORM id FROM request_history_state WHERE id = 1 FOR SHARE; IF (SELECT mode FROM request_history_state WHERE id=1)='off' THEN RETURN NULL; END IF; {identity_guard} {enqueue} RETURN NULL; END"
+                    "BEGIN IF (SELECT mode FROM request_history_state WHERE id=1)='off' THEN RETURN NULL; END IF; PERFORM id FROM request_history_state WHERE id = 1 FOR SHARE; IF (SELECT mode FROM request_history_state WHERE id=1)='off' THEN RETURN NULL; END IF; {identity_guard} {enqueue} RETURN NULL; END"
                 );
                 let manifest = format!(
                     "mtc-history-bootstrap-v1-{}",
@@ -317,6 +318,7 @@ impl Database {
         let definitions = self.history_capture_definitions()?;
         let mut transaction = self.pool.begin().await?;
         if matches!(self.backend, DatabaseBackend::PostgreSql) {
+            Self::history_require_unprepared(&mut transaction).await?;
             let tables = definitions
                 .chunks(3)
                 .map(|group| group[0].table)
@@ -339,6 +341,9 @@ impl Database {
         )
         .execute(&mut *transaction)
         .await?;
+        if matches!(self.backend, DatabaseBackend::PostgreSql) {
+            Self::history_mark_activation(&mut transaction).await?;
+        }
         transaction.commit().await?;
         Ok(())
     }
@@ -352,6 +357,10 @@ impl Database {
             .await?;
         if pending != 0 {
             return Err(HistoryError::Changed);
+        }
+        if matches!(self.backend, DatabaseBackend::PostgreSql) {
+            sqlx::query("UPDATE request_history_activation SET baseline_owner=NULL,baseline_epoch=NULL WHERE id=1")
+                .execute(&mut *tx).await?;
         }
         sqlx::query("UPDATE request_history_backfill SET after_id = '', done = 0")
             .execute(&mut *tx)
@@ -402,6 +411,9 @@ impl Database {
             return Err(HistoryError::Invalid(
                 "start history capture before backfill; page_size must be positive",
             ));
+        }
+        if !self.history_capture_horizon_ready().await? {
+            return Err(HistoryError::Changed);
         }
         let mut transaction = self.pool.begin().await?;
         if matches!(self.backend, DatabaseBackend::PostgreSql) {
@@ -601,12 +613,28 @@ impl Database {
         revision: i64,
         report: &Value,
     ) -> Result<(), HistoryError> {
+        let mut transaction = self.pool.begin().await?;
+        if matches!(self.backend, DatabaseBackend::PostgreSql) {
+            sqlx::query("SELECT id FROM request_history_state WHERE id=1 FOR SHARE")
+                .fetch_one(&mut *transaction)
+                .await?;
+            let proved: bool = sqlx::query_scalar(activation::ACTIVATION_PROOF_SQL)
+                .fetch_one(&mut *transaction)
+                .await?;
+            if !proved {
+                return Err(HistoryError::Changed);
+            }
+        }
         sqlx::query("UPDATE request_history_state SET verified_revision = $1, verification_json = $2 WHERE id = 1")
-            .bind(revision).bind(serde_json::to_string(report)?).execute(&self.pool).await?;
+            .bind(revision).bind(serde_json::to_string(report)?).execute(&mut *transaction).await?;
+        transaction.commit().await?;
         Ok(())
     }
 
     pub async fn history_switch(&self, clickhouse: bool) -> Result<(), HistoryError> {
+        if clickhouse && !self.history_activation_baseline_proved().await? {
+            return Err(HistoryError::Changed);
+        }
         let mut transaction = self.begin_write_transaction().await?;
         if clickhouse {
             let lock = if matches!(self.backend, DatabaseBackend::PostgreSql) {
@@ -619,6 +647,14 @@ impl Database {
             )))
             .fetch_one(&mut *transaction)
             .await?;
+            if matches!(self.backend, DatabaseBackend::PostgreSql) {
+                let proved: bool = sqlx::query_scalar(activation::ACTIVATION_PROOF_SQL)
+                    .fetch_one(&mut *transaction)
+                    .await?;
+                if !proved {
+                    return Err(HistoryError::Changed);
+                }
+            }
             let report: Option<String> = sqlx::query_scalar(
                 "SELECT verification_json FROM request_history_state WHERE id = 1",
             )

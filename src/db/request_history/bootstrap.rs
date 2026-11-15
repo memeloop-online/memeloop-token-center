@@ -82,6 +82,66 @@ impl Database {
         )
     }
 
+    /// Upgrade only a known off-mode function body. Trigger OIDs, partition
+    /// clones and source table locks are untouched; unknown catalogs fail closed.
+    pub async fn history_prepare_activation(&self) -> Result<(), HistoryError> {
+        if !matches!(self.backend, DatabaseBackend::PostgreSql) {
+            return Err(HistoryError::Invalid(
+                "activation preparation requires PostgreSQL",
+            ));
+        }
+        let mut transaction = self.pool.begin().await?;
+        Self::history_bootstrap_maintenance_lock(&mut transaction).await?;
+        let mode: String = sqlx::query_scalar(
+            "SELECT mode FROM request_history_state WHERE id=1 FOR SHARE NOWAIT",
+        )
+        .fetch_one(&mut *transaction)
+        .await?;
+        if mode != "off" {
+            return Err(HistoryError::Changed);
+        }
+        Self::history_require_unprepared(&mut transaction).await?;
+        for definition in self.history_capture_definitions()? {
+            if definition.matches(&mut transaction).await? {
+                continue;
+            }
+            let old_body=definition.body.replacen("BEGIN IF (SELECT mode FROM request_history_state WHERE id=1)='off' THEN RETURN NULL; END IF; ","BEGIN ",1);
+            let old = CaptureDefinition {
+                table: definition.table,
+                event: definition.event,
+                name: definition.name.clone(),
+                manifest: format!(
+                    "mtc-history-bootstrap-v1-{}",
+                    crate::request_history::canonical_hash(&(
+                        1,
+                        definition.table,
+                        definition.event,
+                        &old_body
+                    ))?
+                ),
+                body: old_body,
+                sql: String::new(),
+            };
+            if !old.matches(&mut transaction).await? {
+                return Err(HistoryError::Verification(
+                    "unknown activation function catalog",
+                ));
+            }
+            let sql = format!(
+                "CREATE OR REPLACE FUNCTION {}() RETURNS trigger LANGUAGE plpgsql VOLATILE SECURITY INVOKER AS $history${}$history$; COMMENT ON FUNCTION {}() IS '{}';",
+                definition.name, definition.body, definition.name, definition.manifest
+            );
+            sqlx::raw_sql(sqlx::AssertSqlSafe(sql))
+                .execute(&mut *transaction)
+                .await?;
+            if !definition.matches(&mut transaction).await? {
+                return Err(HistoryError::Verification("activation function upgrade"));
+            }
+        }
+        transaction.commit().await?;
+        Ok(())
+    }
+
     pub async fn history_activate_capture(&self) -> Result<(), HistoryError> {
         if matches!(self.backend, DatabaseBackend::Sqlite) {
             return Err(HistoryError::Invalid(
@@ -91,6 +151,7 @@ impl Database {
         let definitions = self.history_capture_definitions()?;
         let mut transaction = self.pool.begin().await?;
         Self::history_bootstrap_maintenance_lock(&mut transaction).await?;
+        Self::history_require_unprepared(&mut transaction).await?;
         // The maintenance mutex, not the business state barrier, protects the
         // catalog validation phase from another bootstrap/atomic installer.
         let mode: String = sqlx::query_scalar("SELECT mode FROM request_history_state WHERE id=1")
@@ -129,6 +190,7 @@ impl Database {
         if activated.is_none() {
             return Err(HistoryError::Changed);
         }
+        Self::history_mark_activation(&mut transaction).await?;
         transaction.commit().await?;
         Ok(())
     }
@@ -260,6 +322,11 @@ mod tests {
         let old_event = Uuid::now_v7();
         let mut old_writer = writers.pool.begin().await.unwrap();
         insert_event(&mut old_writer, old_event).await.unwrap();
+        // Model a still-running legacy function invocation during upgrade.
+        sqlx::query("SELECT id FROM request_history_state WHERE id=1 FOR SHARE")
+            .execute(&mut *old_writer)
+            .await
+            .unwrap();
         assert_eq!(
             resumed.history_pending_count().await.unwrap(),
             0,

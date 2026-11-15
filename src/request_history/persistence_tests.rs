@@ -138,6 +138,36 @@ async fn capture_replay(database: &Database) {
     assert!(native_pending(database).await.is_empty());
 }
 
+// The post-activation source baseline is a separate proof from the ordinary
+// current-state verification, which must never bypass old snapshot coverage.
+async fn prove_activation_baseline(database: &Database, client: &ClickHouse) {
+    if database.history_activation_baseline_proved().await.unwrap() {
+        return;
+    }
+    let source = database
+        .clone()
+        .with_auxiliary_pool_max_connections(1)
+        .independent_persistence_pool();
+    let owner = Uuid::now_v7();
+    let mut snapshot = database
+        .history_begin_source_snapshot(&source, owner)
+        .await
+        .unwrap();
+    let epoch = snapshot.receipt["epoch"].as_i64().unwrap();
+    while snapshot
+        .verify_next_page(database, client, client, 64)
+        .await
+        .unwrap()
+        != 0
+    {}
+    snapshot.finish(database).await.unwrap();
+    database
+        .history_resume_delivery(owner, epoch)
+        .await
+        .unwrap();
+    source.close().await;
+}
+
 #[tokio::test]
 async fn sqlite_request_history_capture_freezes_retries_and_preserves_newer_corrections() {
     let directory = tempfile::tempdir().unwrap();
@@ -339,6 +369,7 @@ async fn request_history_real_services_acceptance() {
             actual.revision
         );
     }
+    prove_activation_baseline(&database, &client).await;
     let report = crate::request_history::migration::verify(&database, &client)
         .await
         .unwrap();
@@ -368,6 +399,7 @@ async fn request_history_real_services_acceptance() {
         pagination.cursor = Some(cursor);
     }
     assert_eq!(observed.len(), 3);
+    prove_activation_baseline(&database, &client).await;
     let report = crate::request_history::migration::verify(&database, &client)
         .await
         .unwrap();
@@ -872,6 +904,7 @@ async fn request_history_real_services_acceptance() {
     crate::request_history::migration::drain(&database, &client, 500)
         .await
         .unwrap();
+    prove_activation_baseline(&database, &client).await;
     crate::request_history::migration::verify(&database, &client)
         .await
         .unwrap();
@@ -883,6 +916,7 @@ async fn request_history_real_services_acceptance() {
         .await
         .unwrap();
     assert!(database.history_switch(true).await.is_err());
+    prove_activation_baseline(&database, &client).await;
     crate::request_history::migration::verify(&database, &client)
         .await
         .unwrap();
@@ -908,6 +942,7 @@ async fn request_history_real_services_acceptance() {
             .await
             .unwrap();
     }
+    prove_activation_baseline(&database, &client).await;
     crate::request_history::migration::verify(&database, &client)
         .await
         .unwrap();
