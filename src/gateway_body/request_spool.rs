@@ -1380,6 +1380,48 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn pressure_spills_to_typed_objects_without_touching_the_body_directory() {
+        let directory = tempfile::tempdir().unwrap();
+        let archive = crate::archive::ArchiveStore::memory_for_test();
+        let admission = RequestSpoolAdmission::new(directory.path().join("must-not-exist"))
+            .with_archive(archive);
+        let budget = crate::gateway_body::memory::ProxyMemoryBudget::new(128 * 1024);
+        let expected = Bytes::from(vec![b'p'; 512 * 1024]);
+        let source = tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            admission.capture_with_memory(
+                Body::from(expected.clone()),
+                usize::MAX,
+                Some(expected.len()),
+                Some(&budget.reservation()),
+                0,
+                Some("11111111-1111-4111-8111-111111111111"),
+            ),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        assert!(!directory.path().join("must-not-exist").exists());
+        assert!(source.shared.carrier.is_some());
+        let mut stream = source.open_stream().await.unwrap().stream;
+        let mut hash = blake3::Hasher::new();
+        let mut count = 0usize;
+        while let Some(chunk) = stream.next().await {
+            let bytes = chunk.unwrap();
+            hash.update(&bytes);
+            count += bytes.len();
+        }
+        assert_eq!(count, expected.len());
+        assert_eq!(hash.finalize(), blake3::hash(&expected));
+        assert!(
+            tokio::time::timeout(std::time::Duration::from_secs(5), source.upload_outcome())
+                .await
+                .unwrap()
+        );
+        assert_eq!(file_count(directory.path()), 0);
+    }
+
+    #[tokio::test]
     async fn failed_archive_upload_does_not_block_budgeted_ram_replay() {
         let directory = tempfile::tempdir().unwrap();
         let store = MemoryObjectStore::new();
