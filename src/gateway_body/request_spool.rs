@@ -1477,6 +1477,45 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn prepaid_projection_reads_without_acquiring_a_second_body_lease() {
+        let directory = tempfile::tempdir().unwrap();
+        let admission = RequestSpoolAdmission::new(directory.path().to_owned());
+        let budget = super::super::memory::ProxyMemoryBudget::new(192 * 1024);
+        let memory = budget.reservation();
+        let bytes = Bytes::from(vec![b'x'; 64 * 1024]);
+        let source = admission
+            .capture_with_memory(
+                Body::from(bytes.clone()),
+                usize::MAX,
+                Some(bytes.len()),
+                Some(&memory),
+                0,
+                None,
+            )
+            .await
+            .unwrap();
+        let projection = memory
+            .reserve_conversation_projection(bytes.len(), 1, tokio::time::Instant::now())
+            .unwrap();
+        let before = budget.snapshot().0;
+        assert_eq!(before, 192 * 1024);
+        let actual = tokio::time::timeout(
+            std::time::Duration::from_secs(1),
+            source.read_prepaid_projection(&projection),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        assert_eq!(actual, bytes);
+        assert_eq!(budget.snapshot().0, before);
+        drop(actual);
+        drop(projection);
+        drop(source);
+        assert_eq!(budget.snapshot().0, 0);
+        assert_eq!(file_count(directory.path()), 0);
+    }
+
+    #[tokio::test]
     async fn failed_archive_upload_does_not_block_budgeted_ram_replay() {
         let directory = tempfile::tempdir().unwrap();
         let store = MemoryObjectStore::new();
