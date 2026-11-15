@@ -2081,6 +2081,10 @@ async fn semantic_coverage_committed_recovery_contract(database_url: String) {
     for fault in ["projection_commit_ack", "coverage_put"] {
         let fixture = Fixture::new(database_url.clone(), true).await;
         fixture.capture().await;
+        // Commit both original raw publications through their real owners
+        // before exercising the separate semantic projection boundary.
+        assert!(response_archive_spool::process_one_for_test(&fixture.state).await);
+        assert!(response_archive_spool::process_one_for_test(&fixture.state).await);
         let owner = fixture.claim().await;
         let result = Database::with_semantic_coverage_fault(
             fault,
