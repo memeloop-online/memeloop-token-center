@@ -413,11 +413,9 @@ impl BodyCarrier {
         let Some(archive) = &self.archive else {
             return Ok(false);
         };
-        let Some(index) = self
-            .segments
-            .iter()
-            .position(|segment| matches!(&*segment.lock().unwrap(), Segment::Ram(_)))
-        else {
+        let Some(index) = self.segments.iter().position(
+            |segment| matches!(&*segment.lock().unwrap(), Segment::Ram(bytes) if !bytes.is_empty()),
+        ) else {
             return Ok(false);
         };
         let Segment::Ram(bytes) = self.segments[index].lock().unwrap().clone() else {
@@ -663,6 +661,9 @@ impl BodyCarrier {
     /// Release only confirmed offloaded allocation owners. Callers can cancel
     /// this wait by dropping the future; failed writes retain the RAM source.
     pub(crate) async fn seal_to_objects(self: &Arc<Self>) -> Result<(), AppError> {
+        if self.published.lock().unwrap().is_some() {
+            return Ok(());
+        }
         if self.archive.is_none() {
             return Err(AppError::internal("carrier_object_capability_missing"));
         }
