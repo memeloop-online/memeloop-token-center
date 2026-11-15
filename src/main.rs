@@ -199,7 +199,10 @@ async fn run() -> Result<(), &'static str> {
             let result =
                 memeloop_token_center::request_history::migration::command(&config, command)
                     .await
-                    .map_err(|_| "request_history_operation_failed")?;
+                    .map_err(|error| {
+                        tracing::error!(diagnostic = %error.safe_diagnostic(), "request history CLI operation failed");
+                        "request_history_operation_failed"
+                    })?;
             println!("{result}");
         }
         #[cfg(feature = "experimental-plugin-revisions")]

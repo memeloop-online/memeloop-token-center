@@ -129,6 +129,37 @@ impl ProxyMemoryBudget {
         }
         Ok(reservation)
     }
+    pub(crate) fn try_reserve_carrier_ingress(
+        &self,
+        bytes: usize,
+    ) -> Option<(OwnedSemaphorePermit, OwnedSemaphorePermit)> {
+        let units = u32::try_from(bytes.div_ceil(UNIT_BYTES)).ok()?;
+        let retained = self
+            .retained_requests
+            .clone()
+            .try_acquire_many_owned(units)
+            .ok()?;
+        let allocation = self.permits.clone().try_acquire_many_owned(units).ok()?;
+        Some((allocation, retained))
+    }
+
+    pub(crate) async fn reserve_carrier_bytes(
+        &self,
+        bytes: usize,
+    ) -> Result<OwnedSemaphorePermit, crate::error::AppError> {
+        let units = u32::try_from(bytes.div_ceil(UNIT_BYTES))
+            .map_err(|_| crate::error::AppError::internal("carrier_allocation_overflow"))?;
+        self.permits
+            .clone()
+            .acquire_many_owned(units)
+            .await
+            .map_err(|_| crate::error::AppError::internal("carrier_budget_closed"))
+    }
+
+    pub(crate) fn try_reserve_ingress_bytes(&self, bytes: usize) -> Option<OwnedSemaphorePermit> {
+        let units = u32::try_from(bytes.div_ceil(UNIT_BYTES)).ok()?;
+        self.permits.clone().try_acquire_many_owned(units).ok()
+    }
 }
 
 pub(crate) struct ProxyMemoryReservation {
@@ -196,6 +227,12 @@ impl Drop for SseStreamingMemory {
 }
 
 impl ProxyMemoryReservation {
+    // Existing request-source ingress uses the same global allocation permits.
+    pub(crate) fn try_reserve_ingress_bytes(&self, bytes: usize) -> Option<OwnedSemaphorePermit> {
+        let units = u32::try_from(bytes.div_ceil(UNIT_BYTES)).ok()?;
+        self.permits.clone().try_acquire_many_owned(units).ok()
+    }
+
     pub(crate) fn covers_json_shape(&self, bytes: usize, nodes: usize) -> bool {
         self.request_json_reserved_bytes() > 0
             && bytes <= self.json_body_ceiling.load(Ordering::Acquire)
@@ -217,11 +254,6 @@ impl ProxyMemoryReservation {
         Some(RequestRouteWorkspace {
             reservation: self.clone(),
         })
-    }
-
-    pub(crate) fn try_reserve_ingress_bytes(&self, bytes: usize) -> Option<OwnedSemaphorePermit> {
-        let units = u32::try_from(bytes.div_ceil(UNIT_BYTES)).ok()?;
-        self.permits.clone().try_acquire_many_owned(units).ok()
     }
 
     /// Reserve one request-local envelope for the two independently retained

@@ -47,8 +47,11 @@ impl Database {
         history_before: Option<&str>,
         limit: i64,
     ) -> Result<(Option<String>, Option<String>), AppError> {
+        let started = std::time::Instant::now();
         let budget = limit.clamp(2, CONVERSATION_PROJECTION_BATCH_LIMIT);
         let live_budget = (budget + 1) / 2;
+        tracing::debug!(target: "mtc_identity_projection", stage = "live_page_start",
+            ?live_after, ?history_before, budget, "conversation identity progress");
         let live: Vec<String> = if let Some(after) = live_after {
             sqlx::query_scalar(IDENTITY_FORWARD_PAGE)
                 .bind(after)
@@ -68,10 +71,15 @@ impl Database {
         }
         .cloned()
         .or_else(|| live_after.map(str::to_owned));
+        tracing::debug!(target: "mtc_identity_projection", stage = "live_page_done",
+            count = live.len(), ?next_live, elapsed_ms = started.elapsed().as_millis() as u64,
+            "conversation identity progress");
         let before = history_before
             .map(str::to_owned)
             .or_else(|| live.last().cloned());
         let history: Vec<String> = if let Some(before) = before {
+            tracing::debug!(target: "mtc_identity_projection", stage = "history_page_start",
+                history_before = %before, "conversation identity progress");
             sqlx::query_scalar(IDENTITY_HISTORY_PAGE)
                 .bind(before)
                 .bind(budget / 2)
@@ -81,11 +89,18 @@ impl Database {
             Vec::new()
         };
         let next_history = history.last().cloned().or_else(|| next_live.clone());
+        tracing::debug!(target: "mtc_identity_projection", stage = "history_page_done",
+            count = history.len(), ?next_history, wrapped = history.is_empty(),
+            elapsed_ms = started.elapsed().as_millis() as u64,
+            "conversation identity progress");
         let mut ids = live;
         ids.extend(history);
         let mut seen = std::collections::HashSet::new();
         ids.retain(|id| seen.insert(id.clone()));
         self.project_conversation_identity_ids(ids).await;
+        tracing::debug!(target: "mtc_identity_projection", stage = "batch_done",
+            ?next_live, ?next_history, elapsed_ms = started.elapsed().as_millis() as u64,
+            "conversation identity progress");
         Ok((next_live, next_history))
     }
 
@@ -114,8 +129,11 @@ impl Database {
             "SELECT c.tenant_id, c.key_id, c.principal_id, c.hints_json, c.key_snapshot_json, c.client_name, c.upstream_response_id, c.observed_at FROM conversation_projection_outbox c JOIN terminal_projection_outbox t ON t.request_id = c.request_id WHERE c.request_id = $1 AND {eligible}"
         );
         for id in ids {
+            let started = std::time::Instant::now();
             let result = async {
                 let request_id = parse_uuid(id.clone())?;
+                tracing::debug!(target: "mtc_identity_projection", stage = "preflight_start",
+                    %request_id, "conversation identity progress");
                 // Read/parse metadata before taking the shared stats writer.
                 // Invalid/unrelated historical rows must not queue on that lock.
                 let Some(row) = sqlx::query(sqlx::AssertSqlSafe(row_sql.clone()))
@@ -123,7 +141,7 @@ impl Database {
                     .fetch_optional(&self.pool)
                     .await?
                 else {
-                    return Ok(());
+                    return Ok("eligibility_skipped");
                 };
                 let hints: crate::conversation::ConversationHints =
                     serde_json::from_str(&row.try_get::<String, _>("hints_json")?)
@@ -133,10 +151,16 @@ impl Database {
                     .as_deref()
                     .is_none_or(|session| session.trim().is_empty())
                 {
-                    return Ok(());
+                    return Ok("undeclared_identity");
                 }
+                tracing::debug!(target: "mtc_identity_projection", stage = "transaction_start",
+                    %request_id, "conversation identity progress");
                 let mut transaction = self.begin_write_transaction().await?;
+                tracing::debug!(target: "mtc_identity_projection", stage = "stats_lock_start",
+                    %request_id, "conversation identity progress");
                 lock_request_stats_projection_writer_in_transaction(&mut transaction).await?;
+                tracing::debug!(target: "mtc_identity_projection", stage = "row_lock_start",
+                    %request_id, "conversation identity progress");
                 let lock = match self.backend {
                     DatabaseBackend::PostgreSql => " FOR UPDATE OF c SKIP LOCKED",
                     DatabaseBackend::Sqlite => "",
@@ -147,20 +171,38 @@ impl Database {
                     .bind(&id)
                     .fetch_optional(&mut *transaction)
                     .await?;
+                let mut outcome = "locked_or_eligibility_changed";
                 if let Some(row) = row {
+                    tracing::debug!(target: "mtc_identity_projection", stage = "projection_start",
+                        %request_id, "conversation identity progress");
                     self.project_conversation_identity_row_in_transaction(
                         &mut transaction,
                         request_id,
                         row,
                     )
                     .await?;
+                    // The helper can legitimately skip after its final fences.
+                    // Report a checked projection, not an unverified publication.
+                    outcome = "projection_checked";
                 }
+                tracing::debug!(target: "mtc_identity_projection", stage = "commit_start",
+                    %request_id, "conversation identity progress");
                 transaction.commit().await?;
-                Ok::<(), AppError>(())
+                Ok::<&'static str, AppError>(outcome)
             }
             .await;
-            if let Err(error) = result {
-                tracing::error!(%error, request_id = %id, "declared conversation identity remains pending");
+            match result {
+                Ok(outcome) => tracing::debug!(target: "mtc_identity_projection",
+                    stage = "request_done", request_id = %id, outcome,
+                    elapsed_ms = started.elapsed().as_millis() as u64,
+                    "conversation identity progress"),
+                Err(error) => {
+                    tracing::debug!(target: "mtc_identity_projection", stage = "request_done",
+                        request_id = %id, outcome = "error",
+                        elapsed_ms = started.elapsed().as_millis() as u64,
+                        "conversation identity progress");
+                    tracing::error!(%error, request_id = %id, "declared conversation identity remains pending");
+                }
             }
         }
     }

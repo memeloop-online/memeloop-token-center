@@ -18,7 +18,7 @@ const base: RequestDetail = { request_id: 'request-a', created_at: 1000, complet
 const backgroundHelpVisible = !new URLSearchParams(location.search).has('quiet-background-help');
 const supplierFailure = new URLSearchParams(location.search).has('supplier-error')
   ? { ...base, status_code: 402, completed_at: 3000, duration_ms: 2000, error_code: 'http_402',
-    supplier_error: { code: 'no_active_plan', message: '当前账号没有可用套餐; provider code: 402; provider message: 当前账号没有可用套餐' } } : undefined;
+    supplier_error: { code: 'no_active_plan', message: '当前账号没有可用套餐; provider code: 402; provider message: 当前账号没有可用套餐', provider_details: { error: { param: 'input.tools', vendor_extra: ['unmapped-provider-field', 17] } } } } : undefined;
 const diagnosticParam = new URLSearchParams(location.search).get('failure-diagnostic');
 const diagnosticFailure = diagnosticParam === 'downstream'
   ? { ...base, status_code: 499, completed_at: 3000, duration_ms: 2000, error_code: 'http_499',

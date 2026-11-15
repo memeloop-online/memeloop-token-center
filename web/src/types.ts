@@ -2,6 +2,17 @@
 export interface SupplierError {
   code: string;
   message: string;
+  /** Optional coarse kind (request/policy/authentication/quota/rate_limit/availability); absent on older records. */
+  category?: string;
+  /** Optional server hint that retrying the same request may succeed. */
+  retryable?: boolean;
+  /** Optional stable suggested next step (shorten_context/revise_request/contact_provider/retry_later/check_credentials/check_model). */
+  action?: string;
+  /** Optional provider identifiers kept as labeled technical details, never primary copy. */
+  provider_code?: string;
+  provider_message?: string;
+  /** Optional provider-supplied payload kept verbatim as a labeled technical detail. */
+  provider_details?: unknown;
 }
 
 /** Typed server-recorded failure evidence; a null stage means the observation phase was not recorded. */

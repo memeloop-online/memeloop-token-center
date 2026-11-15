@@ -5,6 +5,17 @@ async fn ensure_account_usage_state(
     account_id: &str,
     now: i64,
 ) -> Result<(), AppError> {
+    // ON CONFLICT alone does not skip the INSERT's historical SELECT. Check
+    // the indexed rollup first, while preserving the original locked-account
+    // initialization and conflict handling for genuinely missing rows.
+    if sqlx::query("SELECT account_id FROM account_usage_state WHERE account_id = $1")
+        .bind(account_id)
+        .fetch_optional(&mut **transaction)
+        .await?
+        .is_some()
+    {
+        return Ok(());
+    }
     // Migration-era and external importers may have created a legitimate
     // credit account without the rollup row introduced in schema v22. Repair
     // that invariant while the account is locked. Deriving the initial value
@@ -330,5 +341,74 @@ impl Database {
         }
         tx.commit().await?;
         Ok(micros_to_decimal_string(amount_micros))
+    }
+}
+
+#[cfg(test)]
+mod initialization_contracts {
+    use super::*;
+
+    async fn pool() -> sqlx::AnyPool {
+        sqlx::any::install_default_drivers();
+        let pool = sqlx::any::AnyPoolOptions::new()
+            .max_connections(1)
+            .connect("sqlite::memory:")
+            .await
+            .unwrap();
+        sqlx::query("CREATE TABLE account_usage_state (account_id TEXT PRIMARY KEY, settled_lifetime_micros BIGINT NOT NULL, updated_at BIGINT NOT NULL)").execute(&pool).await.unwrap();
+        pool
+    }
+
+    #[tokio::test]
+    async fn existing_usage_state_never_reads_historical_ledger() {
+        let pool = pool().await;
+        sqlx::query("INSERT INTO account_usage_state VALUES ('account', 321, 7)")
+            .execute(&pool)
+            .await
+            .unwrap();
+        // No historical tables exist: evaluating the old INSERT/SELECT fails.
+        let mut tx = pool.begin().await.unwrap();
+        ensure_account_usage_state(&mut tx, "account", 99)
+            .await
+            .unwrap();
+        tx.commit().await.unwrap();
+        let row = sqlx::query("SELECT settled_lifetime_micros,updated_at FROM account_usage_state WHERE account_id='account'").fetch_one(&pool).await.unwrap();
+        assert_eq!(row.get::<i64, _>("settled_lifetime_micros"), 321);
+        assert_eq!(row.get::<i64, _>("updated_at"), 7);
+    }
+
+    #[tokio::test]
+    async fn missing_usage_state_initializes_once_excluding_pending_settlements() {
+        let pool = pool().await;
+        for sql in [
+            "CREATE TABLE credit_accounts (id TEXT PRIMARY KEY)",
+            "CREATE TABLE ledger_entries (account_id TEXT,kind TEXT,amount_micros BIGINT,source TEXT)",
+            "CREATE TABLE metered_usage_projection_outbox (reservation_id TEXT,account_id TEXT,projected_at BIGINT)",
+            "INSERT INTO credit_accounts VALUES ('account')",
+            "INSERT INTO ledger_entries VALUES ('account','usage',-200,'paid'),('account','usage',-300,'pending')",
+            "INSERT INTO metered_usage_projection_outbox VALUES ('pending','account',NULL)",
+        ] {
+            sqlx::query(sqlx::AssertSqlSafe(sql))
+                .execute(&pool)
+                .await
+                .unwrap();
+        }
+        let mut tx = pool.begin().await.unwrap();
+        ensure_account_usage_state(&mut tx, "account", 10)
+            .await
+            .unwrap();
+        tx.commit().await.unwrap();
+        let mut tx = pool.begin().await.unwrap();
+        ensure_account_usage_state(&mut tx, "account", 20)
+            .await
+            .unwrap();
+        tx.commit().await.unwrap();
+        let value: i64 = sqlx::query_scalar(
+            "SELECT settled_lifetime_micros FROM account_usage_state WHERE account_id='account'",
+        )
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(value, 200);
     }
 }

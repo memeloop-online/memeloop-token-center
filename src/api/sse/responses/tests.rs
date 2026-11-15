@@ -12,7 +12,7 @@ fn event_with_field_count(fields: usize) -> Vec<u8> {
 }
 
 #[test]
-fn sanitizer_redacts_failures_and_rejects_terminal_conflicts() {
+fn sanitizer_preserves_failure_explanation_and_rejects_terminal_conflicts() {
     let failed = concat!(
         "event: response.failed\n",
         "data: {\"type\":\"response.failed\",\"response\":{\"error\":{\"message\":\"provider-secret\",\"token\":\"secret-token\"}}}\n\n",
@@ -26,9 +26,8 @@ fn sanitizer_redacts_failures_and_rejects_terminal_conflicts() {
         output.extend_from_slice(&sanitizer.push(&[*byte]).unwrap());
     }
     let output = String::from_utf8(output).unwrap();
-    assert!(output.contains("upstream request failed"));
+    assert!(output.contains("provider-secret"));
     for secret in [
-        "provider-secret",
         "secret-token",
         "failure-comment-secret",
         "post-terminal-secret",
@@ -132,7 +131,7 @@ fn safe_failure_is_an_explicit_failed_terminal_without_a_fabricated_identity() {
 }
 
 #[test]
-fn sanitizer_preserves_client_recovery_codes_without_provider_details() {
+fn sanitizer_preserves_client_recovery_codes_and_original_provider_details() {
     for code in [
         "context_length_exceeded",
         "insufficient_quota",
@@ -176,8 +175,9 @@ fn sanitizer_preserves_client_recovery_codes_without_provider_details() {
             assert_eq!(payload["response"]["error"]["code"], code);
             assert!(payload.pointer("/response/id").is_none());
             let text = String::from_utf8(output).unwrap();
-            assert!(!text.contains("secret"));
-            assert!(!text.contains("Authorization"));
+            assert!(text.contains("secret-token"));
+            assert!(text.contains("Authorization"));
+            assert_eq!(payload["response"]["error"]["mtc_provider_details"], event);
         }
     }
 }
@@ -299,9 +299,8 @@ fn failed_terminal_drops_a_bare_secret_event_before_done() {
     }
     output.extend_from_slice(&sanitizer.finish().unwrap());
     let output = String::from_utf8(output).unwrap();
-    assert!(output.contains("upstream request failed"));
+    assert!(output.contains("provider-secret"));
     assert!(output.contains("data: [DONE]"));
-    assert!(!output.contains("provider-secret"));
     assert!(!output.contains("bare-event-secret"));
 }
 

@@ -19,6 +19,7 @@ use object_store::{ObjectStoreExt, PutPayload, memory::InMemory, path::Path};
 
 mod backend;
 pub mod cache_command;
+mod carrier_ownership;
 mod cas;
 mod compressed;
 mod conversation;
@@ -43,6 +44,7 @@ mod routing;
 mod routing_tests;
 #[cfg(test)]
 mod rustfs_contract_tests;
+pub(crate) mod scratch_scope;
 mod semantic_manifest;
 mod semantic_publication;
 pub(crate) use semantic_publication::SemanticBindingProof;
@@ -53,6 +55,7 @@ mod supplier_summary;
 mod terminal_receipts;
 mod text;
 
+pub(crate) use carrier_ownership::CarrierObjectOwner;
 pub use cas::CasArchiveObject;
 pub use conversation::{
     ConversationBodyReference, ConversationEvent, ConversationManifest, ConversationMedia,

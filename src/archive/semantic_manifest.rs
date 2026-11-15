@@ -251,7 +251,11 @@ impl super::ArchiveStore {
         let mut source = self.open_semantic_atom(tenant, instance).await?.stream;
         use futures_util::TryStreamExt;
         let mut data = Vec::new();
-        while let Some(chunk) = source.try_next().await? {
+        while let Some(chunk) = source
+            .try_next()
+            .await
+            .map_err(|_| AppError::storage("semantic_atom_read_failed"))?
+        {
             data.extend_from_slice(&chunk);
         }
         let mut value: serde_json::Value = serde_json::from_slice(&data)

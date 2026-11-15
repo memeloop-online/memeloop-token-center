@@ -16,6 +16,7 @@
 {{- $roleConfig := index $.Values.roles $role }}
 {{- if $roleConfig.enabled }}
 {{- $runtimeWriter := or (eq $role "control") (eq $role "all") }}
+{{- $gatewayCache := and (eq $role "gateway") $.Values.plugins.runtimeInventory.enabled (ne ($.Values.plugins.runtimeInventory.gatewayCachePath | default "") "") }}
 {{- $spoolRole := or (eq $role "gateway") (eq $role "control") (eq $role "all") }}
 {{- if or (eq $role "gateway") (eq $role "all") -}}
 {{- $memoryLimit := dig "resources" "limits" "memory" "" $roleConfig -}}
@@ -31,7 +32,10 @@ kind: Deployment
 metadata:
   name: {{ include "memeloop-token-center.roleName" (dict "root" $ "role" $role) }}
   annotations:
-    {{- if $.Values.plugins.runtimeInventory.enabled }}
+    {{- if $gatewayCache }}
+    # Cached Gateway readers do not depend on shared-volume initialization.
+    argocd.argoproj.io/sync-wave: "0"
+    {{- else if $.Values.plugins.runtimeInventory.enabled }}
     # Writers initialize an empty shared PVC before read-only worker startup.
     # Gateway follows the worker so producers retain their drain dependency.
     argocd.argoproj.io/sync-wave: {{ if $runtimeWriter }}"0"{{ else if eq $role "worker" }}"1"{{ else }}"2"{{ end }}
@@ -93,9 +97,9 @@ spec:
       hostAliases:
         {{- toYaml . | nindent 8 }}
       {{- end }}
-      {{- if or $.Values.plugins.ociInstaller.enabled $.Values.plugins.runtimeInventory.enabled }}
+      {{- if or $.Values.plugins.ociInstaller.enabled (and $.Values.plugins.runtimeInventory.enabled (not $gatewayCache)) }}
       initContainers:
-        {{- if $.Values.plugins.runtimeInventory.enabled }}
+        {{- if and $.Values.plugins.runtimeInventory.enabled (not $gatewayCache) }}
         - name: prepare-plugin-inventory
           image: {{ include "memeloop-token-center.roleImage" (dict "root" $ "role" $role) | quote }}
           imagePullPolicy: {{ $.Values.image.pullPolicy }}
@@ -271,7 +275,7 @@ spec:
           emptyDir: {}
         {{- end }}
         {{- if or $.Values.plugins.enabled $.Values.plugins.runtimeInventory.enabled }}
-        {{- include "memeloop-token-center.runtimeInventory.volumes" (dict "root" $ "writer" $runtimeWriter) | nindent 8 }}
+        {{- include "memeloop-token-center.runtimeInventory.volumes" (dict "root" $ "writer" $runtimeWriter "gatewayCache" $gatewayCache) | nindent 8 }}
         {{- if $.Values.plugins.enabled }}
         - name: plugins
           {{- if $.Values.plugins.ociInstaller.enabled }}

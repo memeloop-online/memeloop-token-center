@@ -13,6 +13,12 @@ use crate::{archive_staging::ArchiveStagingKey, error::AppError};
 /// apply segment-boundary matching to every object returned by a lexical list.
 #[async_trait::async_trait]
 pub trait ArchiveStagingObjectStore: Send + Sync {
+    /// Resume only durably released carrier objects. Active receipts are not
+    /// permission to delete a body or a shared CAS object.
+    async fn reap_released_carrier_objects(&self) -> Result<u64, AppError> {
+        Ok(0)
+    }
+
     async fn delete_archive_staging_segment(&self, key: ArchiveStagingKey) -> Result<(), AppError>;
 
     async fn archive_staging_segment_is_empty(
@@ -123,6 +129,10 @@ impl ArchiveStore {
 
 #[async_trait::async_trait]
 impl ArchiveStagingObjectStore for ArchiveStore {
+    async fn reap_released_carrier_objects(&self) -> Result<u64, AppError> {
+        ArchiveStore::reap_released_carrier_objects(self).await
+    }
+
     async fn delete_archive_staging_segment(&self, key: ArchiveStagingKey) -> Result<(), AppError> {
         ArchiveStore::delete_archive_staging_segment(self, key).await
     }

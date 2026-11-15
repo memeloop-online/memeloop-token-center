@@ -494,12 +494,27 @@ pub(super) async fn execute_synchronous_image_request(
             .await;
     }
     if !upstream_status.is_success() {
-        drop(upstream);
-        return fail_image_request(
-            context,
-            &format!("upstream_http_{}", upstream_status.as_u16()),
-        )
-        .await;
+        let response = match upstream {
+            SynchronousImageUpstreamResponse::Reqwest(response)
+            | SynchronousImageUpstreamResponse::Codex(response) => response,
+        };
+        let response = crate::api::proxy::upstream_response::UpstreamResponse::from(response)
+            .with_original_archive_capture(
+                context.state,
+                crate::db::ArchiveSpoolIdentity {
+                    request_id: context.request_id,
+                    tenant_id: context.tenant_id,
+                    reservation_id: context.reservation.id,
+                },
+            );
+        let rejection = crate::api::proxy::upstream_error::read_rejection(response).await;
+        let error_code = rejection.reason().map_or_else(
+            || format!("upstream_http_{}", upstream_status.as_u16()),
+            |reason| reason.code().to_owned(),
+        );
+        let response = fail_image_request(context, &error_code).await?;
+        return crate::api::proxy::upstream_error::with_media_rejection(response, rejection.body)
+            .await;
     }
     let response_bytes = match read_synchronous_image_response_bounded(upstream).await {
         Ok(bytes) => bytes,

@@ -1,12 +1,10 @@
 use crate::{AppState, db::SessionResponseTask, error::AppError, model::RequestArchiveState};
-use futures_util::StreamExt;
+use bytes::Bytes;
+use futures_util::{Stream, StreamExt};
 use std::{
-    io::{BufReader, Cursor, Seek},
-    time::Duration,
+    io::{self, BufReader, Cursor, Read},
+    pin::Pin,
 };
-use tokio::io::AsyncWriteExt;
-
-const MAX_ARCHIVE_BYTES: u64 = 128 * 1024 * 1024;
 
 pub(crate) async fn process_one(state: &AppState) -> Result<(), AppError> {
     let Some(task) = state
@@ -51,9 +49,6 @@ async fn project(
     let Some(location) = refs.response_object else {
         if let Some(json) = refs.response_json {
             let bytes = serde_json::to_vec(&json).map_err(|_| "archive_invalid_json")?;
-            if bytes.len() as u64 > MAX_ARCHIVE_BYTES {
-                return Err("response_archive_too_large");
-            }
             return tokio::task::spawn_blocking(move || {
                 crate::session_response::extract(Cursor::new(bytes))
             })
@@ -63,9 +58,6 @@ async fn project(
         return Err("archive_unavailable");
     };
     if let Some(json) = location.strip_prefix("inline-json:") {
-        if json.len() as u64 > MAX_ARCHIVE_BYTES {
-            return Err("response_archive_too_large");
-        }
         let bytes = json.as_bytes().to_vec();
         return tokio::task::spawn_blocking(move || {
             crate::session_response::extract(Cursor::new(bytes))
@@ -76,49 +68,115 @@ async fn project(
     if !matches!(refs.response_archive_state, RequestArchiveState::Bound) {
         return Err("archive_unavailable");
     }
-    // One serial worker lane, bounded download and disk-backed parsing keep
-    // large archived tool streams out of HTTP and database result buffers.
-    tokio::fs::create_dir_all(&state.config.responses_request_spool_path)
+    let source = state
+        .archive
+        .open_stream(&location, None)
         .await
-        .map_err(|_| "projection_storage_unavailable")?;
-    let file = tempfile::tempfile_in(&state.config.responses_request_spool_path)
-        .map_err(|_| "projection_storage_unavailable")?;
-    let mut file = tokio::fs::File::from_std(file);
-    let download = async {
-        let mut source = state
-            .archive
-            .open_stream(&location, None)
-            .await
-            .map_err(|_| "archive_unavailable")?;
-        if source.object_size > MAX_ARCHIVE_BYTES {
-            return Err("response_archive_too_large");
-        }
-        let mut received = 0_u64;
-        while let Some(bytes) = source.stream.next().await {
-            let bytes = bytes.map_err(|_| "archive_read_failed")?;
-            received += bytes.len() as u64;
-            if received > MAX_ARCHIVE_BYTES {
-                return Err("response_archive_too_large");
-            }
-            file.write_all(&bytes)
-                .await
-                .map_err(|_| "projection_storage_unavailable")?;
-        }
-        file.flush()
-            .await
-            .map_err(|_| "projection_storage_unavailable")?;
-        Ok::<(), &'static str>(())
+        .map_err(|_| "archive_unavailable")?;
+    extract_stream(source.stream).await
+}
+
+/// The verified object stream is consumed directly; no full replay copy or
+/// temporary file survives while a remote object is being read.
+async fn extract_stream(
+    stream: Pin<Box<dyn Stream<Item = io::Result<Bytes>> + Send>>,
+) -> Result<Option<String>, &'static str> {
+    let (cancel_on_drop, cancelled) = tokio::sync::oneshot::channel();
+    let reader = ArchiveReader {
+        runtime: tokio::runtime::Handle::current(),
+        stream,
+        pending: Bytes::new(),
+        cancelled,
     };
-    tokio::time::timeout(Duration::from_secs(60), download)
-        .await
-        .map_err(|_| "archive_read_timeout")??;
-    let mut file = file.into_std().await;
-    // Await the blocking parser rather than detaching it on timeout. The input
-    // is a bounded regular file and its anonymous temporary storage is dropped.
-    tokio::task::spawn_blocking(move || {
-        file.rewind().map_err(|_| "archive_read_failed")?;
-        crate::session_response::extract(BufReader::new(file))
+    let result = tokio::task::spawn_blocking(move || {
+        crate::session_response::extract(BufReader::with_capacity(64 * 1024, reader))
     })
     .await
-    .map_err(|_| "projection_failed")?
+    .map_err(|_| "projection_failed")?;
+    drop(cancel_on_drop);
+    result
+}
+
+struct ArchiveReader {
+    runtime: tokio::runtime::Handle,
+    stream: Pin<Box<dyn Stream<Item = io::Result<Bytes>> + Send>>,
+    pending: Bytes,
+    cancelled: tokio::sync::oneshot::Receiver<()>,
+}
+
+impl Read for ArchiveReader {
+    fn read(&mut self, output: &mut [u8]) -> io::Result<usize> {
+        if output.is_empty() {
+            return Ok(0);
+        }
+        if self.cancelled.try_recv() != Err(tokio::sync::oneshot::error::TryRecvError::Empty) {
+            return Err(io::Error::other("session response projection cancelled"));
+        }
+        while self.pending.is_empty() {
+            let next = self.runtime.block_on(async {
+                tokio::select! {
+                    _ = &mut self.cancelled => Err(io::Error::other("session response projection cancelled")),
+                    next = self.stream.next() => Ok(next),
+                }
+            })?;
+            match next {
+                Some(bytes) => self.pending = bytes?,
+                None => return Ok(0),
+            }
+        }
+        let count = output.len().min(self.pending.len());
+        output[..count].copy_from_slice(&self.pending[..count]);
+        self.pending = self.pending.slice(count..);
+        Ok(count)
+    }
+}
+
+#[cfg(test)]
+mod stream_reader_contracts {
+    use super::*;
+    use futures_util::stream;
+
+    #[tokio::test]
+    async fn archived_response_is_parsed_across_chunks_without_local_storage() {
+        let wire = br#"{"output":[{"type":"message","role":"assistant","content":[{"type":"output_text","text":"saved answer"}]}]}"#;
+        let chunks: Vec<_> = wire
+            .chunks(3)
+            .map(|chunk| Ok(Bytes::copy_from_slice(chunk)))
+            .collect();
+        assert_eq!(
+            extract_stream(Box::pin(stream::iter(chunks)))
+                .await
+                .unwrap()
+                .as_deref(),
+            Some("saved answer")
+        );
+    }
+
+    #[tokio::test]
+    async fn object_read_failure_is_not_reported_as_a_completed_answer() {
+        let chunks = stream::iter(vec![
+            Ok(Bytes::from_static(b"{\"output\":")),
+            Err(io::Error::other("object disconnected")),
+        ]);
+        assert!(extract_stream(Box::pin(chunks)).await.is_err());
+    }
+
+    #[tokio::test]
+    async fn cancelling_projection_releases_the_waiting_object_reader() {
+        let (dropped, receiver) = tokio::sync::oneshot::channel();
+        let source = stream::unfold(Some(dropped), |owner| async move {
+            let _owner = owner;
+            futures_util::future::pending::<
+                Option<(io::Result<Bytes>, Option<tokio::sync::oneshot::Sender<()>>)>,
+            >()
+            .await
+        });
+        let mut projection = Box::pin(extract_stream(Box::pin(source)));
+        assert!(matches!(
+            futures_util::poll!(&mut projection),
+            std::task::Poll::Pending
+        ));
+        drop(projection);
+        assert!(receiver.await.is_err());
+    }
 }

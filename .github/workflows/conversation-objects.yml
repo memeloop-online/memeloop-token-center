@@ -86,11 +86,17 @@ jobs:
       - run: cargo test --locked --lib api::proxy::buffered_upstream
       - run: cargo test --locked --lib api::proxy::tests::memory_metrics
       - run: cargo test --locked --lib gateway_body
+      - run: cargo test --locked --lib json_source
+      - run: cargo test --locked --lib api::proxy::routing::compact_file
+      - run: cargo test --locked --lib api::proxy::routing::http::tests::compact
       - run: cargo test --locked --lib api::proxy::tests::early_terminal
       - run: cargo test --locked --lib archive::conversation
       - run: cargo test --locked --lib archive::session_projection -- --test-threads=1
       - run: cargo test --locked --lib conversation::return_stream_tests
       - run: cargo test --locked --lib db::archive_staging::backend_tests
+      - run: cargo test --locked --lib gateway_body::carrier::tests
+      - run: cargo test --locked --lib archive::carrier_ownership::tests
+      - run: cargo test --locked --lib archive::semantic_manifest::tests
       - run: cargo test --locked --lib archive::routing_tests
       - run: cargo test --locked --lib archive::compressed_tests
       - run: cargo test --locked --lib archive::text

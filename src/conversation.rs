@@ -488,6 +488,14 @@ pub struct SessionBodyPart {
     pub call_id: Option<String>,
     pub tool_call_id: Option<String>,
     pub media_bytes: Option<Vec<u8>>,
+    pub reasoning_source: Option<String>,
+    pub tool_name: Option<String>,
+    pub arguments: Option<Value>,
+    pub arguments_text: Option<String>,
+    pub arguments_encoding: Option<String>,
+    pub completeness: Option<String>,
+    pub result_content: Option<Value>,
+    pub result_status: Option<String>,
 }
 
 /// 一轮对话。同一个用户回合里的多个片段按 `part_index` 排在一起。
@@ -581,6 +589,8 @@ pub(crate) struct ReturnDocumentAccumulator {
     anthropic_message: Option<Value>,
     blocks: BTreeMap<u64, Value>,
     tool_inputs: BTreeMap<u64, String>,
+    responses: BTreeMap<u64, Value>,
+    response_parts: BTreeMap<(u64, bool, u64), Value>,
 }
 
 impl ReturnDocumentAccumulator {
@@ -593,17 +603,120 @@ impl ReturnDocumentAccumulator {
             anthropic_message,
             blocks,
             tool_inputs,
+            responses,
+            response_parts,
         } = self;
+        let event = value.get("type").and_then(Value::as_str).unwrap_or("");
         if let Some(response) = value.get("response").filter(|response| {
             response.get("output").is_some() || response.get("choices").is_some()
         }) {
-            *completed = Some(response.clone());
+            if event.is_empty() || event == "response.completed" {
+                *completed = Some(response.clone());
+            } else if let Some(items) = response.get("output").and_then(Value::as_array) {
+                for (position, item) in items.iter().enumerate() {
+                    let index = item
+                        .get("id")
+                        .and_then(Value::as_str)
+                        .and_then(|id| {
+                            responses.iter().find_map(|(index, observed)| {
+                                (observed.get("id").and_then(Value::as_str) == Some(id))
+                                    .then_some(*index)
+                            })
+                        })
+                        .unwrap_or(position as u64);
+                    let target = responses
+                        .entry(index)
+                        .or_insert_with(|| Value::Object(Map::new()));
+                    if let (Some(target), Some(snapshot)) =
+                        (target.as_object_mut(), item.as_object())
+                    {
+                        for (key, value) in snapshot {
+                            let empty = value.is_null()
+                                || value.as_str().is_some_and(str::is_empty)
+                                || value.as_array().is_some_and(Vec::is_empty);
+                            if !empty || !target.contains_key(key) {
+                                target.insert(key.clone(), value.clone());
+                            }
+                            if !empty && matches!(key.as_str(), "content" | "summary") {
+                                let summary = key == "summary";
+                                response_parts.retain(|(output, is_summary, _), _| {
+                                    *output != index || *is_summary != summary
+                                });
+                            }
+                        }
+                    }
+                }
+            }
             return;
         }
         if value.get("output").is_some()
             || (value.get("role").is_some() && value.get("content").is_some())
         {
             *completed = Some(value);
+            return;
+        }
+        if matches!(
+            event,
+            "response.output_item.added" | "response.output_item.done"
+        ) {
+            if let (Some(index), Some(item)) = (
+                value.get("output_index").and_then(Value::as_u64),
+                value.get("item"),
+            ) {
+                responses.insert(index, item.clone());
+                if event == "response.output_item.done" {
+                    response_parts.retain(|(output, _, _), _| *output != index);
+                }
+            }
+            return;
+        }
+        if matches!(
+            event,
+            "response.function_call_arguments.delta"
+                | "response.reasoning_summary_text.delta"
+                | "response.output_text.delta"
+        ) {
+            let index = value
+                .get("output_index")
+                .and_then(Value::as_u64)
+                .unwrap_or(0);
+            let item = responses.entry(index).or_insert_with(|| match event {
+                "response.function_call_arguments.delta" => serde_json::json!({"type":"function_call","arguments":"","status":"partial"}),
+                "response.reasoning_summary_text.delta" => serde_json::json!({"type":"reasoning","summary":[],"status":"partial"}),
+                _ => serde_json::json!({"type":"message","role":"assistant","content":[],"status":"partial"}),
+            });
+            if let Some(id) = value.get("item_id") {
+                item["id"] = id.clone();
+            }
+            if let Some(fragment) = value.get("delta").and_then(Value::as_str) {
+                if event == "response.function_call_arguments.delta" {
+                    let previous = item
+                        .get("arguments")
+                        .and_then(Value::as_str)
+                        .unwrap_or("")
+                        .to_owned();
+                    item["arguments"] = Value::String(previous + fragment);
+                } else {
+                    let summary = event == "response.reasoning_summary_text.delta";
+                    let position = value
+                        .get(if summary {
+                            "summary_index"
+                        } else {
+                            "content_index"
+                        })
+                        .and_then(Value::as_u64)
+                        .unwrap_or(0);
+                    let part = response_parts.entry((index, summary, position)).or_insert_with(|| {
+                        serde_json::json!({"type":if summary {"summary_text"} else {"output_text"},"text":""})
+                    });
+                    let previous = part
+                        .get("text")
+                        .and_then(Value::as_str)
+                        .unwrap_or("")
+                        .to_owned();
+                    part["text"] = Value::String(previous + fragment);
+                }
+            }
             return;
         }
         if let Some(choices) = value.get("choices").and_then(Value::as_array) {
@@ -626,6 +739,11 @@ impl ReturnDocumentAccumulator {
                         chat_message.insert("role".into(), role.clone());
                     }
                     append_stream_string(chat_message, "content", delta.get("content"));
+                    append_stream_string(
+                        chat_message,
+                        "reasoning_content",
+                        delta.get("reasoning_content"),
+                    );
                     if let Some(calls) = delta.get("tool_calls").and_then(Value::as_array) {
                         for call in calls {
                             let Some(index) = call.get("index").and_then(Value::as_u64) else {
@@ -737,6 +855,13 @@ impl ReturnDocumentAccumulator {
         for value in self.blocks.values_mut() {
             walk(value, &mut transform)?;
         }
+        for value in self
+            .responses
+            .values_mut()
+            .chain(self.response_parts.values_mut())
+        {
+            walk(value, &mut transform)?;
+        }
         for text in self.tool_inputs.values_mut() {
             transform(text)?;
         }
@@ -759,9 +884,25 @@ impl ReturnDocumentAccumulator {
             anthropic_message,
             mut blocks,
             tool_inputs,
+            mut responses,
+            response_parts,
         } = self;
         if let Some(value) = completed {
             return Some(value);
+        }
+        for ((index, summary, _), part) in response_parts {
+            if let Some(item) = responses.get_mut(&index) {
+                let field = if summary { "summary" } else { "content" };
+                if !item.get(field).is_some_and(Value::is_array) {
+                    item[field] = Value::Array(Vec::new());
+                }
+                item[field].as_array_mut().unwrap().push(part);
+            }
+        }
+        if !responses.is_empty() {
+            return Some(
+                serde_json::json!({"output":responses.into_values().collect::<Vec<_>>(),"status":"partial"}),
+            );
         }
         if !chat_message.is_empty() || !chat_tools.is_empty() {
             chat_message
@@ -779,10 +920,13 @@ impl ReturnDocumentAccumulator {
             let mut message =
                 anthropic_message.unwrap_or_else(|| serde_json::json!({"role": "assistant"}));
             for (index, input) in tool_inputs {
-                if let Some(block) = blocks.get_mut(&index)
-                    && let Some(input) = decode(&input)
-                {
-                    block["input"] = input;
+                if let Some(block) = blocks.get_mut(&index) {
+                    if let Some(decoded) = decode(&input) {
+                        block["input"] = decoded;
+                    } else {
+                        block["input"] = Value::String(input);
+                        block["status"] = "partial".into();
+                    }
                 }
             }
             if !blocks.is_empty() {
@@ -1065,6 +1209,14 @@ fn flush_owned_bare_parts(turns: &mut Vec<SessionBodyTurn>, parts: &mut Vec<Valu
 }
 
 fn turn_from_owned_entry(mut entry: Value, origin: &str) -> SessionBodyTurn {
+    let mut reasoning = Vec::new();
+    if push_reasoning_part(&mut reasoning, &entry) {
+        return SessionBodyTurn {
+            role: "assistant".into(),
+            origin: origin.to_owned(),
+            parts: reasoning,
+        };
+    }
     let kind = entry.get("type").and_then(Value::as_str).unwrap_or("");
     let role = entry
         .get("role")
@@ -1104,6 +1256,24 @@ fn turn_from_owned_entry(mut entry: Value, origin: &str) -> SessionBodyTurn {
     } else {
         turn_from_owned_content(role, origin, content, call_id, tool_call_id)
     };
+    if let Some(text) = entry
+        .get("reasoning_content")
+        .and_then(Value::as_str)
+        .filter(|text| !text.is_empty())
+    {
+        turn.parts.insert(
+            0,
+            SessionBodyPart {
+                kind: "reasoning".into(),
+                reasoning_source: Some("chat.reasoning_content".into()),
+                text: Some(text.to_owned()),
+                ..empty_part()
+            },
+        );
+        for (index, part) in turn.parts.iter_mut().enumerate() {
+            part.part_index = index as u32;
+        }
+    }
     if let Some(calls) = entry.get("tool_calls").and_then(Value::as_array) {
         for call in calls {
             turn.parts
@@ -1155,7 +1325,16 @@ fn push_owned_content_part(
             parts.push(SessionBodyPart {
                 part_index: parts.len() as u32,
                 kind: "tool_result".into(),
-                text: item.get("content").map(value_text),
+                result_content: item.get("content").cloned(),
+                result_status: Some(
+                    if item.get("is_error").and_then(Value::as_bool) == Some(true) {
+                        "error"
+                    } else {
+                        "observed"
+                    }
+                    .into(),
+                ),
+                text: None,
                 tool_call_id: item
                     .get("tool_use_id")
                     .and_then(Value::as_str)
@@ -1163,6 +1342,9 @@ fn push_owned_content_part(
                 ..empty_part()
             });
         }
+        return;
+    }
+    if push_reasoning_part(parts, &item) {
         return;
     }
     if part_is_private_only(&item) {
@@ -1213,6 +1395,14 @@ fn push_owned_content_part(
 }
 
 fn turn_from_entry(entry: &Value, origin: &str) -> SessionBodyTurn {
+    let mut reasoning = Vec::new();
+    if push_reasoning_part(&mut reasoning, entry) {
+        return SessionBodyTurn {
+            role: "assistant".into(),
+            origin: origin.to_owned(),
+            parts: reasoning,
+        };
+    }
     let kind = entry.get("type").and_then(Value::as_str).unwrap_or("");
     let role = entry.get("role").and_then(Value::as_str).unwrap_or(
         if matches!(kind, "function_call" | "function_call_output") {
@@ -1235,17 +1425,18 @@ fn turn_from_entry(entry: &Value, origin: &str) -> SessionBodyTurn {
         return tool_call_turn(origin, entry, call_id);
     }
     if matches!(kind, "function_call_output") || role == "tool" {
-        let text = entry
-            .get("output")
-            .or_else(|| entry.get("content"))
-            .map(value_text);
         return SessionBodyTurn {
             role: "tool".into(),
             origin: origin.to_owned(),
             parts: vec![SessionBodyPart {
                 part_index: 0,
                 kind: "tool_result".into(),
-                text,
+                result_content: entry
+                    .get("output")
+                    .or_else(|| entry.get("content"))
+                    .cloned(),
+                result_status: Some("observed".into()),
+                text: None,
                 call_id,
                 tool_call_id,
                 ..empty_part()
@@ -1262,6 +1453,24 @@ fn turn_from_entry(entry: &Value, origin: &str) -> SessionBodyTurn {
     } else {
         turn_from_content(role, origin, &content, call_id, tool_call_id)
     };
+    if let Some(text) = entry
+        .get("reasoning_content")
+        .and_then(Value::as_str)
+        .filter(|text| !text.is_empty())
+    {
+        turn.parts.insert(
+            0,
+            SessionBodyPart {
+                kind: "reasoning".into(),
+                reasoning_source: Some("chat.reasoning_content".into()),
+                text: Some(text.to_owned()),
+                ..empty_part()
+            },
+        );
+        for (index, part) in turn.parts.iter_mut().enumerate() {
+            part.part_index = index as u32;
+        }
+    }
     if let Some(calls) = entry.get("tool_calls").and_then(Value::as_array) {
         for call in calls {
             let index = turn.parts.len() as u32;
@@ -1299,7 +1508,26 @@ fn tool_call_part(part_index: u32, call: &Value) -> SessionBodyPart {
     SessionBodyPart {
         part_index,
         kind: "tool_call".into(),
-        text: Some(format!("{name}\n{arguments}")),
+        text: None,
+        tool_name: Some(name.to_owned()),
+        arguments: serde_json::from_str(&arguments).ok(),
+        arguments_text: serde_json::from_str::<Value>(&arguments)
+            .is_err()
+            .then(|| arguments.clone()),
+        arguments_encoding: Some(
+            if serde_json::from_str::<Value>(&arguments).is_ok() {
+                "json"
+            } else {
+                "text"
+            }
+            .into(),
+        ),
+        completeness: Some(
+            call.get("status")
+                .and_then(Value::as_str)
+                .unwrap_or("observed")
+                .to_owned(),
+        ),
         call_id,
         ..empty_part()
     }
@@ -1365,7 +1593,16 @@ fn push_content_part(
             parts.push(SessionBodyPart {
                 part_index: parts.len() as u32,
                 kind: "tool_result".into(),
-                text: cleaned.get("content").map(value_text),
+                result_content: cleaned.get("content").cloned(),
+                result_status: Some(
+                    if cleaned.get("is_error").and_then(Value::as_bool) == Some(true) {
+                        "error"
+                    } else {
+                        "observed"
+                    }
+                    .into(),
+                ),
+                text: None,
                 tool_call_id: cleaned
                     .get("tool_use_id")
                     .and_then(Value::as_str)
@@ -1375,6 +1612,9 @@ fn push_content_part(
             return;
         }
         _ => {}
+    }
+    if push_reasoning_part(parts, &cleaned) {
+        return;
     }
     if part_is_private_only(&cleaned) {
         return;
@@ -1416,6 +1656,50 @@ fn push_content_part(
         tool_call_id,
         ..empty_part()
     });
+}
+
+fn push_reasoning_part(parts: &mut Vec<SessionBodyPart>, value: &Value) -> bool {
+    if !matches!(
+        value.get("type").and_then(Value::as_str),
+        Some("reasoning" | "thinking")
+    ) {
+        return false;
+    }
+    let mut texts = Vec::new();
+    for key in ["text", "thinking", "content", "summary"] {
+        match value.get(key) {
+            Some(Value::String(text)) if !text.is_empty() => texts.push(text.clone()),
+            Some(Value::Array(items)) => {
+                for item in items {
+                    if let Some(text) = item
+                        .get("text")
+                        .and_then(Value::as_str)
+                        .filter(|text| !text.is_empty())
+                    {
+                        texts.push(text.to_owned());
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+    for text in texts {
+        parts.push(SessionBodyPart {
+            part_index: parts.len() as u32,
+            kind: "reasoning".into(),
+            reasoning_source: Some(
+                if value.get("summary").is_some() {
+                    "responses.summary"
+                } else {
+                    "protocol.plaintext_reasoning"
+                }
+                .into(),
+            ),
+            text: Some(text),
+            ..empty_part()
+        });
+    }
+    true
 }
 
 fn part_is_private_only(value: &Value) -> bool {
@@ -1542,6 +1826,14 @@ fn empty_part() -> SessionBodyPart {
         call_id: None,
         tool_call_id: None,
         media_bytes: None,
+        reasoning_source: None,
+        tool_name: None,
+        arguments: None,
+        arguments_text: None,
+        arguments_encoding: None,
+        completeness: None,
+        result_content: None,
+        result_status: None,
     }
 }
 
@@ -1623,29 +1915,47 @@ fn part_value(part: &SessionBodyPart, text: Option<String>) -> Value {
     if let Some(tool_call_id) = &part.tool_call_id {
         map.insert("tool_call_id".into(), Value::String(tool_call_id.clone()));
     }
+    if let Some(value) = &part.reasoning_source {
+        map.insert("reasoning_source".into(), Value::String(value.clone()));
+    }
+    if let Some(value) = &part.tool_name {
+        map.insert("tool_name".into(), Value::String(value.clone()));
+    }
+    if let Some(value) = &part.arguments {
+        map.insert("arguments".into(), value.clone());
+    }
+    if let Some(value) = &part.arguments_text {
+        map.insert("arguments_text".into(), Value::String(value.clone()));
+    }
+    if let Some(value) = &part.arguments_encoding {
+        map.insert("arguments_encoding".into(), Value::String(value.clone()));
+    }
+    if let Some(value) = &part.completeness {
+        map.insert("completeness".into(), Value::String(value.clone()));
+    }
+    if let Some(value) = &part.result_content {
+        map.insert("result_content".into(), value.clone());
+    }
+    if let Some(value) = &part.result_status {
+        map.insert("result_status".into(), Value::String(value.clone()));
+    }
     Value::Object(map)
 }
 
-fn strip_private_provider_fields(value: Value) -> Value {
-    match value {
-        Value::Array(items) => Value::Array(
-            items
-                .into_iter()
-                .map(strip_private_provider_fields)
-                .collect(),
-        ),
-        Value::Object(map) => {
-            let mut cleaned = Map::new();
-            for (key, child) in map {
-                if PRIVATE_PROVIDER_KEYS.contains(&key.as_str()) {
-                    continue;
-                }
-                cleaned.insert(key, strip_private_provider_fields(child));
+fn strip_private_provider_fields(mut value: Value) -> Value {
+    // Provider-owned opaque fields are removed only from their protocol item.
+    // Tool arguments/results and user objects may legally use the same names.
+    if matches!(
+        value.get("type").and_then(Value::as_str),
+        Some("reasoning" | "compaction")
+    ) {
+        if let Some(map) = value.as_object_mut() {
+            for key in PRIVATE_PROVIDER_KEYS {
+                map.remove(*key);
             }
-            Value::Object(cleaned)
         }
-        other => other,
     }
+    value
 }
 
 #[cfg(test)]
@@ -1781,6 +2091,7 @@ mod tests {
                             call_id: Some("original-call".into()),
                             tool_call_id: Some("original-tool-call".into()),
                             media_bytes: Some(b"png-bytes".to_vec()),
+                            ..empty_part()
                         },
                         SessionBodyPart {
                             part_index: 8,
@@ -2272,5 +2583,187 @@ mod tests {
             RequestAtomError::Json(error) | RequestAtomError::Visitor(error) => error,
         })?;
         Ok(atoms)
+    }
+}
+
+#[cfg(test)]
+mod semantic_reasoning_tool_contracts {
+    use super::*;
+    use serde_json::json;
+
+    #[test]
+    fn chat_stream_preserves_fragmented_plaintext_reasoning() {
+        let bytes = b"data: {\"choices\":[{\"index\":0,\"delta\":{\"role\":\"assistant\",\"reasoning_content\":\"first \"}}]}\n\ndata: {\"choices\":[{\"index\":0,\"delta\":{\"reasoning_content\":\"second\",\"content\":\"answer\"}}]}\n\ndata: [DONE]\n\n";
+        let response = raw_return_document(bytes).unwrap();
+        let body = session_body_from_documents(&json!({}), &response);
+        assert!(
+            body.turns
+                .iter()
+                .flat_map(|t| &t.parts)
+                .any(|p| p.kind == "reasoning" && p.text.as_deref() == Some("first second"))
+        );
+        assert!(
+            body.turns
+                .iter()
+                .flat_map(|t| &t.parts)
+                .any(|p| p.text.as_deref() == Some("answer"))
+        );
+    }
+
+    #[test]
+    fn responses_summary_uses_real_document_owned_and_completed_stream_entries() {
+        let response = json!({"output":[{"type":"reasoning","encrypted_content":"opaque","summary":[{"type":"summary_text","text":"actual summary"}]}]});
+        let borrowed = session_body_from_documents(&json!({}), &response);
+        let mut owned = SessionBody::from_request_document(json!({}));
+        owned.append_return_document(response.clone());
+        let wire = format!(
+            "data: {}\n\ndata: [DONE]\n\n",
+            json!({"type":"response.completed","response":response})
+        );
+        let streamed = raw_return_document(wire.as_bytes()).unwrap();
+        let streamed = session_body_from_documents(&json!({}), &streamed);
+        for body in [borrowed, owned, streamed] {
+            assert_eq!(body.turns.len(), 1);
+            assert_eq!(body.turns[0].role, "assistant");
+            assert_eq!(
+                body.turns[0].parts[0].text.as_deref(),
+                Some("actual summary")
+            );
+            assert_eq!(
+                body.turns[0].parts[0].reasoning_source.as_deref(),
+                Some("responses.summary")
+            );
+        }
+    }
+
+    #[test]
+    fn summary_is_readable_and_user_owned_encrypted_keys_survive() {
+        let reasoning = json!({"type":"reasoning","encrypted_content":"opaque-provider","summary":[{"type":"summary_text","text":"visible summary"}]});
+        let mut parts = Vec::new();
+        push_content_part(&mut parts, &reasoning, None, None);
+        assert_eq!(parts.len(), 1);
+        assert_eq!(parts[0].kind, "reasoning");
+        assert_eq!(parts[0].text.as_deref(), Some("visible summary"));
+        let call = json!({"type":"tool_use","id":"call-1","name":"inspect","input":{"encrypted_content":"user value","nested":{"encrypted_reasoning":"ordinary data"}}});
+        push_content_part(&mut parts, &call, None, None);
+        assert_eq!(parts[1].tool_name.as_deref(), Some("inspect"));
+        assert_eq!(parts[1].call_id.as_deref(), Some("call-1"));
+        assert_eq!(
+            parts[1].arguments.as_ref().unwrap()["encrypted_content"],
+            "user value"
+        );
+        assert_eq!(
+            parts[1].arguments.as_ref().unwrap()["nested"]["encrypted_reasoning"],
+            "ordinary data"
+        );
+        let result = json!({"type":"tool_result","tool_use_id":"call-1","content":[{"type":"text","text":"tool reply"}],"is_error":false});
+        push_content_part(&mut parts, &result, None, None);
+        assert_eq!(parts[2].tool_call_id.as_deref(), Some("call-1"));
+        assert_eq!(parts[2].result_content.as_ref(), result.get("content"));
+        assert_eq!(parts[2].result_status.as_deref(), Some("observed"));
+        let encoded = part_value(&parts[1], parts[1].text.clone());
+        assert_eq!(encoded["tool_name"], "inspect");
+        assert!(encoded["arguments"].is_object());
+        assert!(encoded.get("text").is_none());
+        assert!(encoded.get("arguments_text").is_none());
+        let encoded_result = part_value(&parts[2], parts[2].text.clone());
+        assert!(encoded_result.get("text").is_none());
+        assert_eq!(encoded_result["result_content"], result["content"]);
+    }
+}
+
+#[cfg(test)]
+mod semantic_partial_stream_contracts {
+    use super::*;
+    use serde_json::json;
+
+    fn accumulate(events: Vec<Value>) -> Value {
+        let mut accumulator = ReturnDocumentAccumulator::default();
+        for event in events {
+            accumulator.push(event);
+        }
+        accumulator.finish().expect("observed stream is retained")
+    }
+
+    #[test]
+    fn interrupted_responses_preserve_ordered_tools_reasoning_and_text() {
+        let events = vec![
+            json!({"type":"response.created","response":{"status":"in_progress","output":[]}}),
+            json!({"type":"response.in_progress","response":{"status":"in_progress","output":[]}}),
+            json!({"type":"response.output_item.added","output_index":0,"item":{"type":"reasoning","id":"reason-1","summary":[]}}),
+            json!({"type":"response.reasoning_summary_text.delta","output_index":0,"summary_index":0,"delta":"visible "}),
+            json!({"type":"response.reasoning_summary_text.delta","output_index":0,"summary_index":0,"delta":"thought"}),
+            json!({"type":"response.output_item.added","output_index":1,"item":{"type":"function_call","id":"item-1","call_id":"call-1","name":"inspect","arguments":"","status":"in_progress"}}),
+            json!({"type":"response.output_item.added","output_index":2,"item":{"type":"function_call","id":"item-2","call_id":"call-2","name":"read","arguments":"","status":"in_progress"}}),
+            json!({"type":"response.function_call_arguments.delta","output_index":2,"delta":"{\"path\":\"b"}),
+            json!({"type":"response.function_call_arguments.delta","output_index":1,"delta":"{\"path\":\"a\"}"}),
+            json!({"type":"response.output_text.delta","output_index":3,"content_index":1000000000,"delta":"partial answer"}),
+            json!({"type":"response.failed","response":{"status":"failed","output":[]}}),
+        ];
+        let wire = events
+            .into_iter()
+            .map(|event| format!("data: {event}\n\n"))
+            .collect::<String>();
+        let response = raw_return_document(wire.as_bytes()).expect("partial SSE is retained");
+        assert_eq!(response["status"], "partial");
+        let body = session_body_from_documents(&json!({}), &response);
+        let parts: Vec<_> = body.turns.iter().flat_map(|turn| &turn.parts).collect();
+        assert_eq!(parts[0].kind, "reasoning");
+        assert_eq!(parts[0].text.as_deref(), Some("visible thought"));
+        assert_eq!(parts[1].call_id.as_deref(), Some("call-1"));
+        assert_eq!(parts[1].arguments.as_ref().unwrap()["path"], "a");
+        assert_eq!(parts[2].call_id.as_deref(), Some("call-2"));
+        assert_eq!(parts[2].arguments_text.as_deref(), Some("{\"path\":\"b"));
+        assert!(parts[2].arguments.is_none());
+        assert_eq!(parts[3].text.as_deref(), Some("partial answer"));
+    }
+
+    #[test]
+    fn incomplete_snapshot_keeps_observed_items_and_adds_nonempty_terminal_content() {
+        let events = vec![
+            json!({"type":"response.output_item.added","output_index":0,"item":{"type":"message","id":"message-a","role":"assistant","content":[]}}),
+            json!({"type":"response.output_item.added","output_index":1,"item":{"type":"function_call","id":"item-tool","call_id":"call-kept","name":"inspect","arguments":"{\"x\":1}"}}),
+            json!({"type":"response.incomplete","response":{"status":"incomplete","output":[{"type":"message","id":"message-a","role":"assistant","content":[{"type":"output_text","text":"observed final fragment"}]}]}}),
+        ];
+        let wire = events
+            .into_iter()
+            .map(|event| format!("data: {event}\n\n"))
+            .collect::<String>();
+        let response = raw_return_document(wire.as_bytes()).unwrap();
+        let body = session_body_from_documents(&json!({}), &response);
+        let parts: Vec<_> = body.turns.iter().flat_map(|turn| &turn.parts).collect();
+        assert_eq!(parts.len(), 2);
+        assert_eq!(parts[0].text.as_deref(), Some("observed final fragment"));
+        assert_eq!(parts[1].call_id.as_deref(), Some("call-kept"));
+        assert_eq!(parts[1].arguments.as_ref().unwrap()["x"], 1);
+        assert_eq!(response["status"], "partial");
+    }
+
+    #[test]
+    fn completed_response_supersedes_observed_deltas_without_duplicates() {
+        let response = accumulate(vec![
+            json!({"type":"response.output_text.delta","output_index":0,"content_index":0,"delta":"old prefix"}),
+            json!({"type":"response.completed","response":{"output":[{"type":"message","role":"assistant","content":[{"type":"output_text","text":"final answer"}]}],"status":"completed"}}),
+        ]);
+        let body = session_body_from_documents(&json!({}), &response);
+        assert_eq!(body.turns.len(), 1);
+        assert_eq!(body.turns[0].parts.len(), 1);
+        assert_eq!(body.turns[0].parts[0].text.as_deref(), Some("final answer"));
+        assert_eq!(response["status"], "completed");
+    }
+
+    #[test]
+    fn interrupted_anthropic_tool_retains_invalid_json_fragment() {
+        let response = accumulate(vec![
+            json!({"type":"message_start","message":{"role":"assistant"}}),
+            json!({"type":"content_block_start","index":0,"content_block":{"type":"tool_use","id":"call-a","name":"inspect","input":{}}}),
+            json!({"type":"content_block_delta","index":0,"delta":{"type":"input_json_delta","partial_json":"{\"path\":"}}),
+        ]);
+        let body = session_body_from_documents(&json!({}), &response);
+        let part = &body.turns[0].parts[0];
+        assert_eq!(part.call_id.as_deref(), Some("call-a"));
+        assert_eq!(part.arguments_text.as_deref(), Some("{\"path\":"));
+        assert_eq!(part.completeness.as_deref(), Some("partial"));
+        assert!(part.arguments.is_none());
     }
 }
