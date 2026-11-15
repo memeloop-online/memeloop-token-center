@@ -136,7 +136,10 @@ async fn pending_sources_keep_last_reader_credit_and_cancel_a_pressure_waiter() 
     assert!(!capture.is_finished());
     assert!(budget.snapshot().0 <= budget.snapshot().1);
     capture.abort();
-    assert!(capture.await.unwrap_err().is_cancelled());
+    let Err(cancelled) = capture.await else {
+        panic!("the pressure waiter must be cancelled");
+    };
+    assert!(cancelled.is_cancelled());
     drop(second_memory);
     assert_eq!(budget.snapshot().0, pending_bytes);
     assert_eq!(first.read_all().await.unwrap(), first_body);
