@@ -1291,12 +1291,13 @@ impl Database {
         };
         let receipt = completed_snapshot.as_deref().map(semantic_payload::completed_receipt);
         let acknowledged = sqlx::query(
-            "UPDATE conversation_projection_outbox SET projected_at = $1, statistics_outcome = 'session_body', lease_owner = NULL, lease_expires_at = NULL, terminal_lease_owner = NULL, terminal_lease_expires_at = NULL, semantic_snapshot_json = CASE WHEN semantic_payload_snapshot_json IS NULL THEN $4 ELSE NULL END, semantic_payload_snapshot_json = CASE WHEN semantic_payload_snapshot_json IS NOT NULL THEN $4 ELSE NULL END WHERE request_id = $2 AND projected_at IS NULL AND COALESCE(terminal_lease_owner, lease_owner) = $3",
+            "UPDATE conversation_projection_outbox SET projected_at = $1, statistics_outcome = 'session_body', lease_owner = $5, lease_expires_at = NULL, terminal_lease_owner = NULL, terminal_lease_expires_at = NULL, semantic_snapshot_json = CASE WHEN semantic_payload_snapshot_json IS NULL THEN $4 ELSE NULL END, semantic_payload_snapshot_json = CASE WHEN semantic_payload_snapshot_json IS NOT NULL THEN $4 ELSE NULL END WHERE request_id = $2 AND projected_at IS NULL AND COALESCE(terminal_lease_owner, lease_owner) = $3",
         )
         .bind(now)
         .bind(request_id.to_string())
         .bind(lease_owner.to_string())
-        .bind(receipt)
+        .bind(&receipt)
+        .bind(if receipt.as_deref().is_some_and(|value| value.contains("\"semantic_coverage_pending\"")) { Some("semantic-coverage-v2") } else { None })
         .execute(&mut *transaction)
         .await?;
         if acknowledged.rows_affected() != 1 {

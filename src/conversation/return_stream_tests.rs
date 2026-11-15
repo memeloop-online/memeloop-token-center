@@ -50,12 +50,13 @@ data: [DONE]
     assert_eq!(parts.len(), 3);
     assert_eq!(parts[0].text.as_deref(), Some("正在查询"));
     assert_eq!(parts[1].call_id.as_deref(), Some("call_weather"));
-    assert_eq!(
-        parts[1].text.as_deref(),
-        Some("get_weather\n{\"city\":\"北京\"}")
-    );
+    assert!(parts[1].text.is_none());
+    assert_eq!(parts[1].tool_name.as_deref(), Some("get_weather"));
+    assert_eq!(parts[1].arguments, Some(json!({"city":"北京"})));
     assert_eq!(parts[2].call_id.as_deref(), Some("call_clock"));
-    assert_eq!(parts[2].text.as_deref(), Some("clock\n{}"));
+    assert!(parts[2].text.is_none());
+    assert_eq!(parts[2].tool_name.as_deref(), Some("clock"));
+    assert_eq!(parts[2].arguments, Some(json!({})));
     let followup = json!({"messages": [
         request["messages"][0], message,
         {"role": "tool", "tool_call_id": "call_weather", "content": "晴"},
@@ -128,7 +129,9 @@ fn chat_tool_only_deltas_survive_finish_and_crlf_usage_trailer() {
     assert_eq!(body.turns.len(), 1);
     assert_eq!(body.turns[0].parts.len(), 1);
     assert_eq!(body.turns[0].parts[0].kind, "tool_call");
-    assert_eq!(body.turns[0].parts[0].text.as_deref(), Some("lookup\n{}"));
+    assert!(body.turns[0].parts[0].text.is_none());
+    assert_eq!(body.turns[0].parts[0].tool_name.as_deref(), Some("lookup"));
+    assert_eq!(body.turns[0].parts[0].arguments, Some(json!({})));
     assert_eq!(body.turns[0].parts[0].call_id.as_deref(), Some("call-1"));
 }
 
@@ -209,10 +212,9 @@ data: {"type":"message_stop"}
         [0, 1, 2, 3]
     );
     assert_eq!(parts[1].call_id.as_deref(), Some("toolu_weather"));
-    assert_eq!(
-        parts[1].text.as_deref(),
-        Some("weather\n{\"city\":\"北京\"}")
-    );
+    assert!(parts[1].text.is_none());
+    assert_eq!(parts[1].tool_name.as_deref(), Some("weather"));
+    assert_eq!(parts[1].arguments, Some(json!({"city":"北京"})));
     assert_eq!(parts[3].call_id.as_deref(), Some("toolu_clock"));
     let followup = json!({"messages": [
         request["messages"][0], message,
@@ -239,10 +241,16 @@ data: {"type":"message_stop"}
         next.turns[2].parts[0].tool_call_id.as_deref(),
         Some("toolu_weather")
     );
-    assert_eq!(next.turns[2].parts[0].text.as_deref(), Some("晴"));
+    assert!(next.turns[2].parts[0].text.is_none());
+    assert_eq!(next.turns[2].parts[0].result_content, Some(json!("晴")));
     assert_eq!(
         next.turns[2].parts[1].tool_call_id.as_deref(),
         Some("toolu_clock")
+    );
+    assert!(next.turns[2].parts[1].text.is_none());
+    assert_eq!(
+        next.turns[2].parts[1].result_content,
+        Some(json!([{"type":"text","text":"12:00"}]))
     );
     assert_eq!(next.turns[2].parts[2].text.as_deref(), Some("请总结"));
     assert_eq!(first.into_prefix().1, next.into_prefix().1[..2]);

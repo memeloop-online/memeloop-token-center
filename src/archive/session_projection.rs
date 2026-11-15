@@ -1,4 +1,4 @@
-//! Worker-only JSON projection. Original documents stay in immutable raw CAS;
+//! Worker-only semantic projection. Raw captures are temporary extraction sources;
 //! decoded long strings spill in fixed chunks instead of being accumulated in
 //! Bytes, RawValue and Value at the same time. Markers never leave this module.
 use super::{ArchiveStore, ArchiveWriter, CasArchiveObject, ConversationBodyReference};
@@ -615,6 +615,8 @@ pub(crate) struct PreparedSessionBody {
     pub media: Vec<SessionMediaLocator>,
     pub request_size: usize,
     pub request_digest: [u8; 32],
+    pub publication: super::SemanticPublication,
+    pub coverage_complete: bool,
 }
 
 impl Context {
@@ -845,50 +847,6 @@ impl Context {
         // cannot be resolved; an unresolved dependency never certifies fidelity.
         Ok((media, gaps))
     }
-
-    #[allow(clippy::too_many_arguments)]
-    fn append(
-        &self,
-        request: Uuid,
-        hints: &crate::conversation::ConversationHints,
-        parent: Option<super::ConversationPrefix>,
-        origin: &str,
-        kind: &str,
-        document: &Value,
-        references: &References,
-        media: &[super::ConversationMedia],
-        gaps: &[String],
-    ) -> Result<super::ConversationPrefix, AppError> {
-        let depth = parent.as_ref().map_or(0, |head| head.event_count);
-        let mut digest = HashWriter(blake3::Hasher::new());
-        encode(self, references, document, &mut digest)?;
-        let mut metadata = serde_json::json!({
-            "event_id":format!("{origin}:{kind}:{depth}:{}", digest.0.finalize().to_hex()),
-            "request_id":request.to_string(), "branch_id":hints.branch_id.as_deref().unwrap_or("main"),
-            "parent_event_id":null, "agent_id":hints.agent_id, "parent_agent_id":hints.parent_agent_id,
-            "origin":origin, "role":null, "kind":kind, "media":media, "gaps":gaps,
-        });
-        metadata
-            .as_object_mut()
-            .unwrap()
-            .insert("document".into(), document.clone());
-        let mut sink = Sink::new(self);
-        encode(self, references, &metadata, &mut sink)?;
-        let (event, _, _) = sink.finish()?;
-        let object = self.runtime.block_on(self.archive.put_conversation_json(
-            self.tenant,
-            &super::conversation::PrefixNode {
-                format_version: 1,
-                parent,
-                event,
-            },
-            4096,
-        ))?;
-        Ok(super::ConversationPrefix {
-            object,
-            event_count: depth.checked_add(1).ok_or_else(invalid)?,
-        })
-    }
 }
 
 struct HashWriter(blake3::Hasher);
@@ -1042,7 +1000,6 @@ impl Context {
         response_locator: Option<&str>,
         response_complete: bool,
     ) -> Result<Option<PreparedSessionBody>, AppError> {
-        use object_store::ObjectStoreExt;
         let raw_request = self.source_object(request, "request", request_locator)?;
         let request_size = usize::try_from(raw_request.size_bytes).map_err(|_| invalid())?;
         let request_digest = *blake3::Hash::from_hex(&raw_request.blake3_digest)
@@ -1062,59 +1019,10 @@ impl Context {
             }
             Err(error) => return Err(error),
         };
-        let previous =
-            match self
-                .runtime
-                .block_on(self.archive.inner.head(&super::path::archive_path(&format!(
-                    "tenants/{}/conversations/v1/requests/{request}.json",
-                    self.tenant
-                ))?)) {
-                Ok(_) => {
-                    let reference = self.runtime.block_on(
-                        self.archive
-                            .request_conversation_reference(self.tenant, request),
-                    )?;
-                    Some(
-                        self.runtime.block_on(
-                            self.archive
-                                .get_conversation_manifest_streamed(self.tenant, &reference),
-                        )?,
-                    )
-                }
-                Err(object_store::Error::NotFound { .. }) => None,
-                Err(error) => return Err(error.into()),
-            };
         let (request_media, request_gaps) = self.media(&references, &request_document)?;
-        let mut head = previous.as_ref().and_then(|previous| previous.head.clone());
-        let mut gaps = previous
-            .as_ref()
-            .map_or_else(Vec::new, |previous| previous.gaps.clone());
-        if !response_complete && !gaps.iter().any(|gap| gap == "response_not_complete") {
+        let mut gaps = request_gaps;
+        if !response_complete {
             gaps.push("response_not_complete".into());
-        }
-        if previous.is_none() {
-            head = Some(self.append(
-                request,
-                &hints,
-                head,
-                "request",
-                "document",
-                &request_document,
-                &references,
-                &request_media,
-                &request_gaps,
-            )?);
-            head = Some(self.append(
-                request,
-                &hints,
-                head,
-                "request",
-                "execution",
-                &serde_json::to_value(&hints).map_err(|_| invalid())?,
-                &references,
-                &[],
-                &[],
-            )?);
         }
         let mut media_substitutes = HashMap::new();
         substitute_media(
@@ -1123,21 +1031,9 @@ impl Context {
             &mut media_substitutes,
         );
         let mut body = crate::conversation::SessionBody::from_request_document(request_document);
-        let mut raw_captures = previous
-            .as_ref()
-            .map_or_else(Vec::new, |previous| previous.raw_captures.clone());
-        if !raw_captures.iter().any(|capture| capture.side == "request") {
-            raw_captures.push(super::RawConversationCapture {
-                request_id: request.to_string(),
-                side: "request".into(),
-                format: super::RawConversationFormat::Json,
-                object: raw_request,
-            });
-        }
-        let had_response = raw_captures
-            .iter()
-            .any(|capture| capture.side == "response");
         let mut response_valid = true;
+        let mut protocol_terminal = false;
+        let mut protocol_incomplete = false;
         if let Some(locator) = response_locator {
             let raw_response = self.source_object(request, "response", locator)?;
             let mut source = BufReader::with_capacity(CHUNK, self.content(&raw_response)?);
@@ -1149,14 +1045,12 @@ impl Context {
             {
                 source.consume(1);
             }
-            let format;
             let mut response_document = if source
                 .fill_buf()
                 .map_err(io_error)?
                 .first()
                 .is_some_and(|byte| matches!(byte, b'{' | b'['))
             {
-                format = super::RawConversationFormat::Json;
                 let parsed = Json {
                     source,
                     context: self,
@@ -1165,20 +1059,26 @@ impl Context {
                 .document();
                 match parsed {
                     Ok(document) => {
+                        protocol_terminal = document.get("status").and_then(Value::as_str)
+                            == Some("completed")
+                            || document.get("stop_reason").is_some_and(|v| !v.is_null())
+                            || document
+                                .get("choices")
+                                .and_then(Value::as_array)
+                                .is_some_and(|choices| {
+                                    !choices.is_empty()
+                                        && choices.iter().all(|choice| {
+                                            choice
+                                                .get("finish_reason")
+                                                .is_some_and(|v| !v.is_null())
+                                        })
+                                });
+                        protocol_incomplete = matches!(
+                            document.get("status").and_then(Value::as_str),
+                            Some("incomplete" | "in_progress" | "failed")
+                        );
                         let (media, event_gaps) = self.media(&references, &document)?;
-                        if !had_response {
-                            head = Some(self.append(
-                                request,
-                                &hints,
-                                head,
-                                "response",
-                                "document",
-                                &document,
-                                &references,
-                                &media,
-                                &event_gaps,
-                            )?);
-                        }
+                        gaps.extend(event_gaps);
                         let mut document = document;
                         substitute_media(&mut document, &media, &mut media_substitutes);
                         Some(document)
@@ -1191,7 +1091,6 @@ impl Context {
                     Err(error) => return Err(error),
                 }
             } else {
-                format = super::RawConversationFormat::Sse;
                 let mut accumulator = crate::conversation::ReturnDocumentAccumulator::default();
                 let mut events = 0_u64;
                 while !source.fill_buf().map_err(io_error)?.is_empty() {
@@ -1209,6 +1108,7 @@ impl Context {
                         continue;
                     }
                     if prefix.starts_with(b"[DONE]") {
+                        protocol_terminal = true;
                         let mut suffix = [0_u8; 6];
                         frame.read_exact(&mut suffix).map_err(io_error)?;
                         while !frame.fill_buf().map_err(io_error)?.is_empty() {
@@ -1233,21 +1133,18 @@ impl Context {
                     let document = parser.document();
                     match document {
                         Ok(mut document) => {
+                            let event_type = document.get("type").and_then(Value::as_str);
+                            protocol_terminal |= matches!(
+                                event_type,
+                                Some("response.completed" | "response.done" | "message_stop")
+                            );
+                            protocol_incomplete |= matches!(
+                                event_type,
+                                Some("response.incomplete" | "response.failed" | "error")
+                            );
                             events = events.checked_add(1).ok_or_else(invalid)?;
                             let (media, event_gaps) = self.media(&references, &document)?;
-                            if !had_response {
-                                head = Some(self.append(
-                                    request,
-                                    &hints,
-                                    head,
-                                    "response",
-                                    "sse_data",
-                                    &document,
-                                    &references,
-                                    &media,
-                                    &event_gaps,
-                                )?);
-                            }
+                            gaps.extend(event_gaps);
                             substitute_media(&mut document, &media, &mut media_substitutes);
                             accumulator.push(document);
                             accumulator.try_map_strings(|text| {
@@ -1284,51 +1181,19 @@ impl Context {
             if let Some(document) = response_document.take() {
                 body.append_return_document(document);
             }
-            if !had_response {
-                raw_captures.push(super::RawConversationCapture {
-                    request_id: request.to_string(),
-                    side: "response".into(),
-                    format,
-                    object: raw_response,
-                });
-            }
             if response_valid {
                 gaps.retain(|gap| {
                     gap != "response_missing"
                         && (gap != "response_not_complete" || !response_complete)
                 });
-            } else if previous.is_none() {
+            } else {
                 gaps.push("response_document_invalid".into());
             }
         } else if !gaps.iter().any(|gap| gap == "response_missing") {
             gaps.push("response_missing".into());
         }
-        // Preserve previously published event prefixes and complete immutable
-        // roots; only a newly available response extends a partial root.
-        if previous.is_none() || (!had_response && response_locator.is_some() && response_valid) {
-            let manifest = super::ConversationManifest {
-                format_version: 1,
-                tenant_id: self.tenant,
-                session_id: hints
-                    .session_id
-                    .clone()
-                    .unwrap_or_else(|| request.to_string()),
-                branch_id: hints.branch_id.clone().unwrap_or_else(|| "main".into()),
-                parent_branch_id: None,
-                parent_event_id: None,
-                head,
-                raw_captures,
-                gaps,
-            };
-            let object = self
-                .runtime
-                .block_on(self.archive.put_conversation_manifest(&manifest))?;
-            self.runtime
-                .block_on(self.archive.publish_request_conversation(
-                    self.tenant,
-                    request,
-                    &object,
-                ))?;
+        if !protocol_terminal || protocol_incomplete {
+            gaps.push("response_protocol_incomplete".into());
         }
         let pending = body.take_media_bytes();
         for (turn_index, part_index, bytes) in pending {
@@ -1346,6 +1211,7 @@ impl Context {
             part.object_locator = Some(reference.object_locator);
         }
         let (mut atoms, _, mut media) = body.into_archive_parts();
+        let mut origins = Vec::with_capacity(atoms.len());
         for atom in &mut atoms {
             let old_hash = atom.content_hash.clone();
             let origin = atom.content.as_object_mut().unwrap().remove("origin");
@@ -1353,11 +1219,22 @@ impl Context {
             encode(self, &references, &atom.content, &mut digest)?;
             atom.content_hash = digest.0.finalize().to_hex().to_string();
             atom.instance_hash = atom.content_hash.clone();
-            if let Some(origin) = origin {
-                atom.content
-                    .as_object_mut()
-                    .unwrap()
-                    .insert("origin".into(), origin);
+            origins.push(
+                origin
+                    .and_then(|origin| origin.as_str().map(str::to_owned))
+                    .unwrap_or_else(|| "request".into()),
+            );
+            if atom
+                .content
+                .get("parts")
+                .and_then(Value::as_array)
+                .is_some_and(|parts| {
+                    parts.iter().any(|part| {
+                        part.get("completeness").and_then(Value::as_str) == Some("partial")
+                    })
+                })
+            {
+                gaps.push("partial_semantic_part".into());
             }
             let mut sink = Sink::new(self);
             encode(self, &references, &atom.content, &mut sink)?;
@@ -1374,12 +1251,136 @@ impl Context {
             }
         }
         let nodes = crate::conversation::build_prefix(&atoms);
+        gaps.sort();
+        gaps.dedup();
+        if atoms.is_empty() {
+            gaps.push("semantic_body_empty".into());
+        }
+        let coverage_complete = response_complete
+            && protocol_terminal
+            && !protocol_incomplete
+            && response_valid
+            && gaps.is_empty();
+        let backend_identity = atoms
+            .first()
+            .map(|atom| {
+                let reference: ConversationBodyReference =
+                    serde_json::from_value(atom.content.clone()).map_err(|_| invalid())?;
+                Ok::<_, AppError>(
+                    super::routing::split(&reference.conversation_body_v1.object_locator)?
+                        .map(|(identity, _)| identity.to_owned()),
+                )
+            })
+            .transpose()?
+            .flatten();
+        let mut manifest = super::SemanticManifestV2 {
+            format_version: 2,
+            projection_version: 2,
+            tenant_id: self.tenant,
+            session_id: hints
+                .session_id
+                .clone()
+                .unwrap_or_else(|| request.to_string()),
+            branch_id: hints.branch_id.clone().unwrap_or_else(|| "main".into()),
+            parent_branch_id: None,
+            parent_turn_id: hints.parent_turn_id.clone(),
+            request_id: request,
+            revision: 1,
+            backend_identity,
+            semantic_head: nodes.last().map(|node| super::SemanticHead {
+                node_hash: node.node_hash.clone(),
+                depth: node.depth as u64,
+            }),
+            instances_head: None,
+            coverage: super::SemanticCoverage {
+                observed_terminal: response_complete && protocol_terminal && !protocol_incomplete,
+                projection_state: if coverage_complete {
+                    super::SemanticProjectionState::Complete
+                } else {
+                    super::SemanticProjectionState::Partial
+                },
+                omissions: Vec::new(),
+                gaps,
+            },
+        };
+        for node in &nodes {
+            self.runtime
+                .block_on(self.archive.put_semantic_prefix_node(
+                    &manifest,
+                    &super::SemanticNode {
+                        node_hash: node.node_hash.clone(),
+                        parent_hash: node.parent_hash.clone(),
+                        atom_hash: node.atom_hash.clone(),
+                        depth: node.depth as u64,
+                    },
+                ))?;
+        }
+        for start in (0..atoms.len()).step_by(64) {
+            let mut instances = Vec::new();
+            for ordinal in start..(start + 64).min(atoms.len()) {
+                let atom = &atoms[ordinal];
+                let node = &nodes[ordinal];
+                let reference: ConversationBodyReference =
+                    serde_json::from_value(atom.content.clone()).map_err(|_| invalid())?;
+                instances.push(super::SemanticTurnInstance {
+                    role: Some(atom.role.clone()),
+                    instance_id: format!("{request}:{ordinal}:{}", node.node_hash),
+                    request_id: request,
+                    attempt_id: None,
+                    message_id: None,
+                    turn_id: hints.turn_id.clone(),
+                    branch_id: manifest.branch_id.clone(),
+                    parent_instance_id: ordinal.checked_sub(1).map(|previous| {
+                        format!("{request}:{previous}:{}", nodes[previous].node_hash)
+                    }),
+                    origin: origins[ordinal].clone(),
+                    ordinal: ordinal as u64,
+                    atom_hash: atom.content_hash.clone(),
+                    node_hash: node.node_hash.clone(),
+                    terminal_state: if response_complete {
+                        "ended"
+                    } else {
+                        "incomplete"
+                    }
+                    .into(),
+                    body: reference.conversation_body_v1,
+                });
+            }
+            manifest.instances_head = Some(self.runtime.block_on(
+                self.archive.put_semantic_instance_page(
+                    &manifest,
+                    &super::SemanticInstancePage {
+                        format_version: 2,
+                        tenant_id: self.tenant,
+                        session_id: manifest.session_id.clone(),
+                        branch_id: manifest.branch_id.clone(),
+                        first_ordinal: start as u64,
+                        previous: manifest.instances_head.clone(),
+                        instances,
+                    },
+                ),
+            )?);
+        }
+        // Coverage and metadata changes produce a new immutable revision; retry
+        // of the same publication recovers the exact same small root.
+        let revision_hash = blake3::hash(&serde_json::to_vec(&manifest).map_err(|_| invalid())?);
+        manifest.revision = u64::from_le_bytes(
+            revision_hash.as_bytes()[..8]
+                .try_into()
+                .map_err(|_| invalid())?,
+        )
+        .max(1);
+        let publication = self
+            .runtime
+            .block_on(self.archive.publish_semantic_manifest(&manifest))?;
         Ok(Some(PreparedSessionBody {
             atoms,
             nodes,
             media,
             request_size,
             request_digest,
+            publication,
+            coverage_complete,
         }))
     }
 }
@@ -1429,7 +1430,8 @@ mod tests {
         let (expected, nodes, _) =
             SessionBody::from_request_document(document).into_archive_parts();
         assert_eq!(prepared.nodes, nodes);
-        for (actual, expected) in prepared.atoms.iter().zip(expected) {
+        for (actual, mut expected) in prepared.atoms.iter().zip(expected) {
+            expected.content.as_object_mut().unwrap().remove("origin");
             assert_eq!(actual.content_hash, expected.content_hash);
             assert_eq!(
                 atom_document(&store, tenant, actual).await,
@@ -1524,24 +1526,20 @@ mod tests {
         let (expected, _, _) = expected.into_archive_parts();
         let returned: Vec<_> = prepared.atoms.iter().skip(1).collect();
         assert_eq!(returned.len(), expected.len());
-        for (actual, expected) in returned.into_iter().zip(expected) {
+        for (actual, mut expected) in returned.into_iter().zip(expected) {
+            expected.content.as_object_mut().unwrap().remove("origin");
             assert_eq!(actual.content_hash, expected.content_hash);
             assert_eq!(
                 atom_document(&store, tenant, actual).await,
                 expected.content
             );
         }
-        let reference = store
-            .request_conversation_reference(tenant, request)
+        let manifest = store
+            .get_semantic_manifest_streamed(tenant, &prepared.publication.manifest)
             .await
             .unwrap();
-        let mut export = store
-            .stream_conversation_export(tenant, &reference)
-            .await
-            .unwrap();
-        while let Some(chunk) = export.next().await {
-            chunk.unwrap();
-        }
+        assert!(manifest.coverage.observed_terminal);
+        assert!(manifest.instances_head.is_some());
     }
 
     #[tokio::test]
@@ -1584,40 +1582,77 @@ mod tests {
                 .as_ref(),
             bytes
         );
-        let root = store
-            .request_conversation_reference(tenant, request)
-            .await
-            .unwrap();
         let manifest = store
-            .get_conversation_manifest(tenant, &root, 1024 * 1024)
+            .get_semantic_manifest_streamed(tenant, &prepared.publication.manifest)
             .await
             .unwrap();
-        let mut head = manifest.head;
-        let mut found = false;
-        while let Some(prefix) = head {
-            let node: super::super::conversation::PrefixNode = store
-                .get_conversation_json(tenant, &prefix.object, 1024 * 1024)
-                .await
-                .unwrap();
-            let event: Value = store
-                .get_conversation_json(tenant, &node.event, 1024 * 1024)
-                .await
-                .unwrap();
-            if event["kind"] == "document" {
-                assert_eq!(event["document"], document);
-                assert!(
-                    event["gaps"]
-                        .as_array()
-                        .unwrap()
-                        .iter()
-                        .any(|gap| gap == "external_media_not_captured")
-                );
-                found = true;
-            }
-            head = node.parent;
-        }
-        assert!(found, "request event retains the media gap and exact URL");
+        assert!(!prepared.coverage_complete);
+        assert!(
+            manifest
+                .coverage
+                .gaps
+                .iter()
+                .any(|gap| gap == "external_media_not_captured")
+        );
+        assert!(!manifest.coverage.observed_terminal);
+        let atom = atom_document(&store, tenant, &prepared.atoms[0]).await;
+        assert!(atom.to_string().contains(&prepared.media[0].content_blake3));
+        // Uncaptured external media remains a gap; the exact original URL is
+        // retained in raw rather than claimed to be a captured atom payload.
         assert_eq!(store.get(&locator).await.unwrap(), original);
+    }
+
+    #[tokio::test]
+    async fn successful_transport_without_protocol_terminal_retains_partial_coverage() {
+        let store = ArchiveStore::memory_for_test();
+        let tenant = Uuid::now_v7();
+        for response in [
+            r#"{"status":"incomplete","output":[{"type":"message","role":"assistant","content":[{"type":"output_text","text":"partial"}]}]}"#,
+            "data: {\"choices\":[{\"index\":0,\"delta\":{\"role\":\"assistant\",\"content\":\"partial\"}}]}\n\n",
+        ] {
+            let request = Uuid::now_v7();
+            let input = store
+                .put_tenant_content(
+                    tenant,
+                    Bytes::from_static(br#"{"messages":[{"role":"user","content":"hello"}]}"#),
+                )
+                .await
+                .unwrap();
+            let output = store
+                .put_tenant_content(tenant, Bytes::copy_from_slice(response.as_bytes()))
+                .await
+                .unwrap();
+            let prepared = store
+                .prepare_session_body_streamed(
+                    tenant,
+                    request,
+                    ConversationHints::default(),
+                    input.object_locator,
+                    Some(output.object_locator),
+                    true,
+                )
+                .await
+                .unwrap()
+                .unwrap();
+            assert!(!prepared.coverage_complete);
+            let manifest = store
+                .get_semantic_manifest_streamed(tenant, &prepared.publication.manifest)
+                .await
+                .unwrap();
+            assert!(!manifest.coverage.observed_terminal);
+            assert_eq!(
+                manifest.coverage.projection_state,
+                super::super::SemanticProjectionState::Partial
+            );
+            assert!(
+                manifest
+                    .coverage
+                    .gaps
+                    .iter()
+                    .any(|gap| gap == "response_protocol_incomplete")
+            );
+            assert!(!prepared.atoms.is_empty());
+        }
     }
 
     #[tokio::test]
