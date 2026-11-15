@@ -26,7 +26,7 @@ impl ArchiveStore {
         manifest: &SemanticManifestV2,
         node: &super::SemanticNode,
     ) -> Result<(), AppError> {
-        use object_store::{ObjectStoreExt, PutMode, PutOptions, PutPayload};
+        use object_store::{PutMode, PutOptions, PutPayload};
         manifest.validate(manifest.tenant_id)?;
         node.validate(&super::SemanticHead {
             node_hash: node.node_hash.clone(),
