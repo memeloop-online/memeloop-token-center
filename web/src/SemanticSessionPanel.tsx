@@ -5,7 +5,7 @@ import { useI18n } from './i18n.js';
 import type { LogicalSessionDetail } from './types.js';
 import { SemanticConversationViewer, type SemanticCoverage } from './SemanticConversationViewer.js';
 import { semanticMessageId } from './semanticConversationIdentity.js';
-import type { SemanticViewInstance, SemanticViewLoader, SemanticViewPage } from './semanticViewReader.js';
+import { exportSemanticContext, type SemanticViewInstance, type SemanticViewLoader, type SemanticViewPage } from './semanticViewReader.js';
 
 const previewBudget = 128 * 1024;
 const pending: SemanticCoverage = { observed_terminal: false, projection_state: 'partial', gaps: ['semantic_publication_pending'], omissions: [] };
@@ -61,6 +61,15 @@ export function SemanticSessionPanel({ detail, loader }: { detail: LogicalSessio
   const [loading, setLoading] = useState(false);
   const [opened, setOpened] = useState<string>();
   const active = useRef<AbortController | null>(null);
+  const exportActive = useRef<AbortController | null>(null);
+  const [exporting, setExporting] = useState(false);
+  const exportContext = async (only?: SemanticViewInstance) => {
+    exportActive.current?.abort(); const controller = new AbortController(); exportActive.current = controller;
+    setExporting(true); setError(null);
+    try { await exportSemanticContext(loader, requestId, controller.signal, only); }
+    catch (reason) { if (!controller.signal.aborted) setError(reason instanceof Error ? reason : new Error(String(reason))); }
+    finally { if (exportActive.current === controller) setExporting(false); }
+  };
   const read = async (cursor?: string, signal?: AbortSignal) => {
     active.current?.abort(); const controller = new AbortController(); active.current = controller;
     const abort = () => controller.abort(); signal?.addEventListener('abort', abort, { once: true });
@@ -79,7 +88,7 @@ export function SemanticSessionPanel({ detail, loader }: { detail: LogicalSessio
   useEffect(() => {
     setPage(undefined); setInstances([]); setOpened(undefined);
     if (requestId) void read();
-    return () => active.current?.abort();
+    return () => { active.current?.abort(); exportActive.current?.abort(); };
   }, [loader, requestId]);
   const revision = String(page?.manifest_revision ?? 'pending');
   const messages = useMemo<ConversationMessageListProjection[]>(() => instances.map(instance => ({
@@ -93,6 +102,8 @@ export function SemanticSessionPanel({ detail, loader }: { detail: LogicalSessio
       {requests.map(request => <option key={request.request_id} value={request.request_id}>{new Date(request.created_at).toLocaleString(locale)} · {request.model}</option>)}
     </select></label>
     <Button appearance="secondary" disabled={loading} onClick={() => void read()}>{zh ? '刷新会话记录' : 'Refresh conversation'}</Button>
+    <Button appearance="secondary" disabled={exporting || page?.status !== 'published'} onClick={() => void exportContext()}>{zh ? '流式导出此上下文' : 'Stream context export'}</Button>
+    {exporting && <Button appearance="secondary" onClick={() => exportActive.current?.abort()}>{zh ? '取消导出' : 'Cancel export'}</Button>}
     <SemanticConversationViewer revision={revision} coverage={page?.coverage ?? pending}
       readOnlyMessage={zh ? '此视图只读' : 'This view is read-only'}
       incompleteMessage={zh ? '语义记录尚未完整发布。' : 'The semantic record is not fully published.'}
@@ -103,6 +114,7 @@ export function SemanticSessionPanel({ detail, loader }: { detail: LogicalSessio
         const instance = instances.find(item => semanticMessageId(revision, item) === message.messageId);
         if (!instance) return null;
         return <><Button appearance="secondary" onClick={() => setOpened(message.messageId)}>{zh ? '读取消息' : 'Read message'} · {instance.ordinal}</Button>
+          <Button appearance="secondary" disabled={exporting} onClick={() => void exportContext(instance)}>{zh ? '导出消息' : 'Export message'}</Button>
           {opened === message.messageId && <AtomContent key={instance.atom_cursor} loader={loader} request={requestId} cursor={instance.atom_cursor} />}</>;
       }} />
   </section>;
