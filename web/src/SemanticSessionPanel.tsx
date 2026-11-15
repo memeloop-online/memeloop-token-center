@@ -4,7 +4,7 @@ import { Button, DataSurface, Disclosure, Field, FormSection, Select } from './d
 import { MessageContent } from '@memeloop/react-ui/chat';
 import { useI18n } from './i18n.js';
 import type { LogicalSessionDetail } from './types.js';
-import { SemanticConversationViewer, type SemanticCoverage } from './SemanticConversationViewer.js';
+import { SemanticConversationViewer } from './SemanticConversationViewer.js';
 import { semanticMessageId } from './semanticConversationIdentity.js';
 import { exportSemanticContext, type SemanticViewInstance, type SemanticViewLoader, type SemanticViewPage } from './semanticViewReader.js';
 
@@ -12,21 +12,21 @@ const previewBudget = 128 * 1024;
 function knownRole(value: unknown): value is ConversationMessageListProjection['role'] {
   return value === 'user' || value === 'assistant' || value === 'tool' || value === 'agent' || value === 'error';
 }
-const pending: SemanticCoverage = { observed_terminal: false, projection_state: 'partial', gaps: ['semantic_publication_pending'], omissions: [] };
 
 function SemanticPart({ part, role, index }: { part: Record<string, unknown>; role: string; index: number }) {
   const { locale } = useI18n(); const zh = locale.startsWith('zh');
   const kind = String(part.kind ?? part.type ?? 'unknown');
   const text = typeof part.text === 'string' ? part.text : '';
-  const projection: ConversationMessageListProjection = {
+  const projection: ConversationMessageListProjection | undefined = knownRole(role) ? {
     messageId: String(index), turnId: String(index), conversationId: 'semantic-part',
-    role: knownRole(role) ? role : 'agent', content: text, originNodeId: 'semantic',
+    role, content: text, originNodeId: 'semantic',
     originSequence: index, lamportClock: index, timestamp: 0,
-  };
-  if (kind === 'text') return <MessageContent message={projection} />;
+  } : undefined;
+  const content = projection ? <MessageContent message={projection} /> : <div className="break-anywhere" style={{ whiteSpace: 'pre-wrap' }}>{text}</div>;
+  if (kind === 'text') return content;
   if (kind === 'reasoning') return <Disclosure title={zh ? '推理过程' : 'Reasoning'}>
     {part.completeness === 'partial' && <p>{zh ? '已记录部分推理' : 'Partially recorded reasoning'}</p>}
-    <MessageContent message={projection} />
+    {content}
   </Disclosure>;
   if (['tool_call', 'function_call', 'tool-call'].includes(kind)) {
     const name = typeof part.tool_name === 'string' ? part.tool_name : typeof part.name === 'string' ? part.name : '';
@@ -38,7 +38,7 @@ function SemanticPart({ part, role, index }: { part: Record<string, unknown>; ro
   }
   if (['tool_result', 'function_call_output', 'tool-result'].includes(kind)) return <Disclosure title={`${zh ? '工具结果' : 'Tool result'} · ${String(part.tool_name ?? '')}`}>
     <p>{String(part.tool_call_id ?? part.call_id ?? '')} · {String(part.result_status ?? '')}</p>
-    {text ? <MessageContent message={projection} /> : <pre className="break-anywhere">{JSON.stringify(part.result_content ?? null, null, 2)}</pre>}
+    {text ? content : <pre className="break-anywhere">{JSON.stringify(part.result_content ?? null, null, 2)}</pre>}
   </Disclosure>;
   if (['attachment', 'image', 'audio', 'file', 'input_image', 'input_audio'].includes(kind) || part.object_locator) return <DataSurface>
     <b>{zh ? '附件' : 'Attachment'}</b><p>{String(part.media_type ?? '')} · {String(part.byte_length ?? '')}</p>
@@ -113,7 +113,7 @@ export function SemanticSessionPanel({ detail, loader }: { detail: LogicalSessio
   const exportContext = async (only?: SemanticViewInstance) => {
     exportActive.current?.abort(); const controller = new AbortController(); exportActive.current = controller;
     setExporting(true); setError(null);
-    try { await exportSemanticContext(loader, requestId, controller.signal, only); }
+    try { await exportSemanticContext(loader, requestId, controller.signal, only, only ? page?.manifest_revision ?? undefined : undefined); }
     catch (reason) { if (!controller.signal.aborted) setError(reason instanceof Error ? reason : new Error(String(reason))); }
     finally { if (exportActive.current === controller) setExporting(false); }
   };
@@ -126,7 +126,9 @@ export function SemanticSessionPanel({ detail, loader }: { detail: LogicalSessio
       const next = await loader.page(requestId, cursor, controller.signal);
       controller.signal.throwIfAborted();
       if (cursor && page?.manifest_revision !== next.manifest_revision) throw new Error('Semantic revision changed; refresh');
-      setLoadedScope({ loader, request: requestId }); setPage(next); setOpened(undefined);
+      setLoadedScope({ loader, request: requestId }); setPage(next);
+      setOpened(current => page?.manifest_revision === next.manifest_revision
+        && next.instances.some(instance => semanticMessageId(String(next.manifest_revision), instance) === current) ? current : undefined);
       // Replace the resident page. Older pages remain available through the signed cursor.
       setInstances(next.instances);
     } catch (reason) { if (!controller.signal.aborted) setError(reason instanceof Error ? reason : new Error(String(reason))); }
@@ -167,7 +169,10 @@ export function SemanticSessionPanel({ detail, loader }: { detail: LogicalSessio
         {opened === id && <AtomContent key={instance.atom_cursor} loader={loader} request={requestId} cursor={instance.atom_cursor} />}
       </section>;
     })}
-    <SemanticConversationViewer revision={revision} coverage={visiblePage?.coverage ?? pending}
+    {!visiblePage && <p role={error ? 'alert' : 'status'}>{error ? String(error.message) : loading
+      ? (zh ? '正在读取会话记录…' : 'Loading conversation record…')
+      : (zh ? '尚未读取会话记录。' : 'Conversation record has not been read.')}</p>}
+    {visiblePage && <SemanticConversationViewer revision={revision} coverage={visiblePage.coverage}
       readOnlyMessage={zh ? '此视图只读' : 'This view is read-only'}
       incompleteMessage={zh ? '语义记录尚未完整发布。' : 'The semantic record is not fully published.'}
       adapter={{ conversationId: detail.session_id, messages, isRunning: false, isLoading: loading, error,
@@ -179,6 +184,6 @@ export function SemanticSessionPanel({ detail, loader }: { detail: LogicalSessio
         return <section data-semantic-role={message.role}><Button appearance="secondary" onClick={() => setOpened(message.messageId)}>{zh ? '读取消息' : 'Read message'} · {instance.ordinal}</Button>
           <Button appearance="secondary" disabled={exporting} onClick={() => void exportContext(instance)}>{zh ? '导出消息' : 'Export message'}</Button>
           {opened === message.messageId && <AtomContent key={instance.atom_cursor} loader={loader} request={requestId} cursor={instance.atom_cursor} />}</section>;
-      }} />
+      }} />}
   </DataSurface>;
 }

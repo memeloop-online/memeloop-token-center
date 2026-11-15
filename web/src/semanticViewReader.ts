@@ -56,7 +56,7 @@ interface StreamFile {
 }
 type SavePicker = (options: { suggestedName: string }) => Promise<{ createWritable(): Promise<StreamFile> }>;
 /** File-system stream only: no Blob, full-history array or object URL fallback. */
-export async function exportSemanticContext(loader: SemanticViewLoader, request: string, signal: AbortSignal, only?: SemanticViewInstance): Promise<void> {
+export async function exportSemanticContext(loader: SemanticViewLoader, request: string, signal: AbortSignal, only?: SemanticViewInstance, expectedRevision?: string): Promise<void> {
   const picker = (window as Window & { showSaveFilePicker?: SavePicker }).showSaveFilePicker;
   if (!picker) throw new Error('Streaming file export is unavailable in this browser');
   const handle = await picker.call(window, { suggestedName: `semantic-${request}.jsonl` });
@@ -81,23 +81,33 @@ export async function exportSemanticContext(loader: SemanticViewLoader, request:
   };
   try {
     let cursor: string | undefined;
-    let revision: string | undefined;
-    let previousCursor: string | undefined;
+    let revision: string | undefined = expectedRevision;
+    const positions: (string | undefined)[] = [];
+    const visited = new Set<string>();
     let found = false;
+    // Keep signed positions only; atom bodies are streamed oldest-to-newest.
     do {
       signal.throwIfAborted();
       const page = await loader.page(request, cursor, signal);
       if (page.status !== 'published' || page.manifest_revision === null) throw new Error('Semantic publication pending');
       revision ??= page.manifest_revision;
       if (page.manifest_revision !== revision) throw new Error('Semantic revision changed; export cancelled');
-      for (const instance of page.instances) {
-        if (!only || instance.instance_id === only.instance_id) { await writeAtom(instance, revision); found = true; }
-      }
-      if (only && page.instances.some(instance => instance.instance_id === only.instance_id)) break;
-      previousCursor = cursor;
+      positions.push(cursor);
       cursor = page.next_cursor ?? undefined;
-      if (cursor && cursor === previousCursor) throw new Error('Repeated semantic page');
+      if (cursor && visited.has(cursor)) throw new Error('Repeated semantic page');
+      if (cursor) visited.add(cursor);
     } while (cursor);
+    for (const position of positions.reverse()) {
+      signal.throwIfAborted();
+      const page = await loader.page(request, position, signal);
+      if (page.status !== 'published' || page.manifest_revision !== revision) throw new Error('Semantic revision changed; export cancelled');
+      for (const instance of page.instances) {
+        if (!only || (instance.instance_id === only.instance_id && instance.branch_id === only.branch_id && instance.request_id === only.request_id)) {
+          await writeAtom(instance, revision!); found = true;
+        }
+      }
+      if (only && found) break;
+    }
     if (only && !found) throw new Error('Semantic instance is no longer available');
     await file.close();
   } catch (reason) { await file.abort(reason); throw reason; }

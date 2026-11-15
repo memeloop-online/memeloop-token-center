@@ -27,7 +27,7 @@ test('stream export aborts a revision change instead of committing a mixed trans
   };
   try {
     await assert.rejects(exportSemanticContext(loader, 'request-a', new AbortController().signal), /revision changed/);
-    assert.ok(writes > 0); assert.equal(aborted, true); assert.equal(closed, false);
+    assert.equal(writes, 0); assert.equal(aborted, true); assert.equal(closed, false);
   } finally {
     if (previousWindow) Object.defineProperty(globalThis, 'window', previousWindow);
     else Reflect.deleteProperty(globalThis, 'window');
@@ -57,4 +57,28 @@ test('HTTP decimal u64 revision survives the actual loader without number roundi
     const result = await createSemanticViewLoader('fixture', () => '/semantic').page('request-a', undefined, new AbortController().signal);
     assert.equal(result.manifest_revision, '18446744073709551615');
   } finally { globalThis.fetch = old; }
+});
+
+test('stream export orders earlier pages first and selects the complete branch occurrence', async () => {
+  const previousWindow = Object.getOwnPropertyDescriptor(globalThis, 'window');
+  const run = async (single: boolean) => {
+    const chunks: Uint8Array[] = [];
+    Object.defineProperty(globalThis, 'window', { configurable: true, value: { showSaveFilePicker: async () => ({ createWritable: async () => ({
+      write: async (bytes: Uint8Array) => { chunks.push(bytes); }, close: async () => {}, abort: async () => assert.fail('unexpected abort'),
+    }) }) } });
+    const earlier = { ...instance, instance_id: 'same', branch_id: 'A', ordinal: 1, atom_cursor: 'A' };
+    const latest = { ...earlier, branch_id: 'B', ordinal: 2, atom_cursor: 'B' };
+    const loader: SemanticViewLoader = {
+      page: async (_request, cursor) => cursor === 'older' ? { ...page, instances: [earlier] } : { ...page, instances: [latest], next_cursor: 'older' },
+      atom: async (_request, cursor) => new Response(JSON.stringify({ role: 'user', parts: [{ kind: 'text', text: cursor }] })),
+    };
+    await exportSemanticContext(loader, 'request-a', new AbortController().signal, single ? earlier : undefined);
+    const lines = new TextDecoder().decode(Buffer.concat(chunks)).trim().split('\n').map(line => JSON.parse(line));
+    assert.deepEqual(lines.map(line => line.instance.branch_id), single ? ['A'] : ['A', 'B']);
+  };
+  try { await run(false); await run(true); }
+  finally {
+    if (previousWindow) Object.defineProperty(globalThis, 'window', previousWindow);
+    else Reflect.deleteProperty(globalThis, 'window');
+  }
 });
