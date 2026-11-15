@@ -52,3 +52,10 @@
 .quota-window-display-choice { min-width: 0; max-width: 100%; }
 .quota-window-display-choice .fui-Select { min-width: 0; max-width: 100%; }
 .quota-window-display-choice .fui-Select__select { min-width: 0; max-width: 100%; }
+
+/* Account actions share Fluent controls and retain a single bounded layout. */
+.upstream-quota-reset > .mtc-form-section { box-sizing: border-box; width: 100%; min-width: 0; }
+.upstream-quota-reset-action { display: flex; flex-direction: column; align-items: flex-start; gap: 8px; max-width: 100%; }
+.upstream-quota-reset-action .fui-Button { max-width: 100%; white-space: normal; overflow-wrap: anywhere; }
+.upstream-quota .quota-reset-danger { background: var(--colorPaletteRedBackground3); color: var(--colorNeutralForegroundOnBrand); }
+.upstream-quota .quota-reset-danger:disabled { background: var(--colorNeutralBackgroundDisabled); color: var(--colorNeutralForegroundDisabled); }
