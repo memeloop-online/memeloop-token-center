@@ -2,7 +2,7 @@ use super::*;
 
 #[tokio::test]
 async fn native_kimi_chat_uses_its_prepaid_workspace_under_budget_contention() {
-    let (mut state, directory) = crate::api::tests::test_state().await;
+    let (mut state, _directory) = crate::api::tests::test_state().await;
     state.proxy_memory_budget = std::sync::Arc::new(
         crate::gateway_body::memory::ProxyMemoryBudget::new(8 * 1024 * 1024),
     );
