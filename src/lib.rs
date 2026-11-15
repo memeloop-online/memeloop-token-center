@@ -194,6 +194,7 @@ impl AppState {
         ));
         let gateway_body_read_concurrency = config.gateway_body_read_concurrency as usize;
         let responses_body_read_concurrency = config.responses_body_read_concurrency as usize;
+        let persistence = Arc::new(api::proxy::persistence::Persistence::default());
         let mut responses_request_spool = gateway_body::request_spool::RequestSpoolAdmission::new(
             config.responses_request_spool_path.clone().into(),
         );
@@ -234,7 +235,9 @@ impl AppState {
             .await
             .map_err(|_| InitializationError::Archive)?;
         let db = db.with_archive(archive.clone());
-        responses_request_spool = responses_request_spool.with_archive(archive.clone());
+        responses_request_spool = responses_request_spool
+            .with_archive(archive.clone())
+            .with_upload_memory(persistence.clone());
         let persistence_db = db.independent_persistence_pool_for("raw-persistence");
         let routing_persistence_db = db.independent_persistence_pool_for("routing-persistence");
         let early_requests = early_request::Journal::new(
@@ -318,7 +321,7 @@ impl AppState {
             service_auth_role: None,
             db,
             persistence_db,
-            persistence: Arc::new(api::proxy::persistence::Persistence::default()),
+            persistence,
             routing_persistence: Arc::new(api::proxy::persistence::Persistence::default()),
             routing_persistence_db,
             session_preferences: Arc::default(),

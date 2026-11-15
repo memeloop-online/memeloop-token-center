@@ -165,14 +165,40 @@ impl DurableRequestBodies {
         }
     }
 
-    async fn put_carrier(&self, key: &str, source: &Arc<BodyCarrier>) -> Result<(), ()> {
+    async fn put_carrier(
+        &self,
+        key: &str,
+        source: &Arc<BodyCarrier>,
+        upload: &crate::api::proxy::persistence::Persistence,
+    ) -> Result<(), ()> {
         match self {
             Self::Archive(archive) => {
+                // Multipart owns queued buffers until a >=5MiB part completes.
+                // Its existing independent upload envelope must own those
+                // copies; retaining the source pool's replay lease here would
+                // wait on the very bytes queued in the multipart writer.
+                let _upload_memory = upload
+                    .stream_memory
+                    .temporary_wait(
+                        crate::archive::ARCHIVE_MULTIPART_PART_BYTES
+                            + 5 * REQUEST_SPOOL_CHUNK_BYTES,
+                        super::memory::CAPTURE_MEMORY_WEIGHT,
+                    )
+                    .await
+                    .ok_or(())?;
                 let mut writer = archive.start_writer(key).await.map_err(|_| ())?;
                 let mut stream = source.open_stream();
                 while let Some(chunk) = stream.next().await {
-                    let chunk = chunk.map_err(|_| ())?;
-                    if writer.write(chunk).await.is_err() {
+                    let chunk = match chunk {
+                        Ok(chunk) => chunk,
+                        Err(_) => {
+                            let _ = writer.abort().await;
+                            return Err(());
+                        }
+                    };
+                    let upload_bytes = Bytes::copy_from_slice(&chunk);
+                    drop(chunk);
+                    if writer.write(upload_bytes).await.is_err() {
                         let _ = writer.abort().await;
                         return Err(());
                     }
@@ -293,12 +319,20 @@ impl RequestSpoolAdmission {
 
     pub(crate) fn new(_directory: PathBuf) -> Self {
         Self {
-            usage: Arc::new(RequestSpoolUsage {
-                ..RequestSpoolUsage::default()
-            }),
+            usage: Arc::new(RequestSpoolUsage::default()),
             #[cfg(test)]
             read_count: Arc::new(AtomicUsize::new(0)),
         }
+    }
+
+    pub(crate) fn with_upload_memory(
+        mut self,
+        memory: Arc<crate::api::proxy::persistence::Persistence>,
+    ) -> Self {
+        Arc::get_mut(&mut self.usage)
+            .expect("upload memory attached before admission sharing")
+            .upload_memory = memory;
+        self
     }
 
     /// Attach object storage before the admission is cloned into `AppState`.
@@ -407,9 +441,6 @@ impl RequestSpoolAdmission {
             Ok(chunk)
         });
         let (body, carrier) = if let Some(memory) = memory {
-            // Carrier allocations own their leases; the former file-writer
-            // envelope must not occupy the only chunk of the same pool.
-            metadata.take();
             let archive = match &durable {
                 Some(DurableRequestBodies::Archive(archive)) => Some(archive.clone()),
                 _ => None,
@@ -533,6 +564,7 @@ pub(crate) struct RequestSpoolSnapshot {
 #[derive(Default)]
 struct RequestSpoolUsage {
     uploads: Arc<crate::proxy_lifecycle::ProxyLifecycleCounter>,
+    upload_memory: Arc<crate::api::proxy::persistence::Persistence>,
     used_bytes: AtomicUsize,
     active_files: AtomicUsize,
     durable: Option<DurableRequestBodies>,
@@ -1022,6 +1054,13 @@ fn publish_durable(shared: &Arc<SharedBody>) {
     let residency = shared.residency.clone();
     let outcome = shared.outcome.clone();
     let source = shared.clone();
+    let upload_memory = shared
+        .lease
+        .lock()
+        .unwrap_or_else(|error| error.into_inner())
+        .usage
+        .upload_memory
+        .clone();
     let activity = shared
         .lease
         .lock()
@@ -1037,7 +1076,9 @@ fn publish_durable(shared: &Arc<SharedBody>) {
                 loop {
                     let result = match (&bytes, &carrier) {
                         (Some(bytes), _) => store.put(&key, bytes.clone()).await,
-                        (_, Some(carrier)) => store.put_carrier(&key, carrier).await,
+                        (_, Some(carrier)) => {
+                            store.put_carrier(&key, carrier, &upload_memory).await
+                        }
                         _ => Err(()),
                     };
                     if result.is_ok() {
@@ -1467,7 +1508,7 @@ mod tests {
         let store = MemoryObjectStore::new();
         let admission = RequestSpoolAdmission::new(directory.path().to_owned())
             .with_memory_store(store.clone());
-        let budget = crate::gateway_body::memory::ProxyMemoryBudget::new(256 * 1024);
+        let budget = crate::gateway_body::memory::ProxyMemoryBudget::new(512 * 1024);
         let memory = budget.reservation();
         let first = Bytes::from(vec![b'a'; 128 * 1024]);
         let oldest = admission
@@ -1591,7 +1632,7 @@ mod tests {
         let admission = RequestSpoolAdmission::new(directory.path().to_owned())
             .with_memory_store(store.clone());
         let release = store.pause_next_write();
-        let budget = crate::gateway_body::memory::ProxyMemoryBudget::new(256 * 1024);
+        let budget = crate::gateway_body::memory::ProxyMemoryBudget::new(512 * 1024);
         let memory = budget.reservation();
         let first = Bytes::from(vec![b'a'; 128 * 1024]);
         let oldest = admission
