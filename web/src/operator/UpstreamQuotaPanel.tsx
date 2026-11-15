@@ -80,7 +80,7 @@ export function UpstreamQuotaResetSection({ accountId, accountName, tenant, toke
   const resetMessage = capability?.provider_supported == null ? 'quota.resetUnknown'
     : !capability.implementation_available ? 'quota.resetNotIntegrated' : 'quota.resetAvailable';
   const actionable = capability?.provider_supported === true && capability.implementation_available;
-  return <div className="upstream-quota-reset"><FormSection title={t('quota.resetCapability')}>
+  return <section className="upstream-quota-reset" aria-label={t('quota.resetCapability')}><FormSection title={t('quota.resetCapability')}>
     <div className="upstream-quota-reset-heading">
       {capability?.available_credits !== null && capability?.available_credits !== undefined && <span>{t('quota.resetCredits', { available: formatNumber(capability.available_credits, locale), applicable: capability.applicable_credits === null ? '—' : formatNumber(capability.applicable_credits, locale) })}</span>}
     </div>
@@ -94,7 +94,7 @@ export function UpstreamQuotaResetSection({ accountId, accountName, tenant, toke
       <Button type="button" appearance="secondary" disabled>{t('quota.resetAction')}</Button>
     </>}
     {resetSettings}
-  </FormSection></div>;
+  </FormSection></section>;
 }
 
 /** User-triggered read: never starts one upstream request per card on page load. */
