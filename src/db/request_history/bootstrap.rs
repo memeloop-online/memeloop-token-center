@@ -114,20 +114,21 @@ impl Database {
                 "unexpected capture catalog definitions",
             ));
         }
-        // Only the final mode recheck/update runs under the business barrier.
-        // No per-definition catalog queries remain after this NOWAIT lock.
-        let mode: String = sqlx::query_scalar(
-            "SELECT mode FROM request_history_state WHERE id=1 FOR UPDATE NOWAIT",
-        )
-        .fetch_one(&mut *transaction)
-        .await?;
-        if mode != "off" {
+        // A single bounded maintenance wait queues behind short off-mode
+        // writers instead of starving on continuous SHARE traffic. This local
+        // lock-wait budget neither changes serve settings nor retries a failed
+        // flip; later SHARE acquisitions can briefly queue behind this update.
+        // It is not an end-to-end latency bound, and long holders still fail.
+        sqlx::query("SET LOCAL lock_timeout='100ms'")
+            .execute(&mut *transaction)
+            .await?;
+        // UPDATE takes the state barrier and rechecks off after a concurrent
+        // row change. No catalog/source/object operation runs under this lock.
+        let activated: Option<i64> = sqlx::query_scalar("UPDATE request_history_state SET mode='shadow',verified_revision=NULL,verification_json=NULL WHERE id=1 AND mode='off' RETURNING id::BIGINT")
+            .fetch_optional(&mut *transaction).await?;
+        if activated.is_none() {
             return Err(HistoryError::Changed);
         }
-        // Off-mode triggers already participate in this shared state barrier.
-        // No source/DDL/network operation occurs under the exclusive flip.
-        sqlx::query("UPDATE request_history_state SET mode='shadow',verified_revision=NULL,verification_json=NULL WHERE id=1")
-            .execute(&mut *transaction).await?;
         transaction.commit().await?;
         Ok(())
     }
@@ -290,10 +291,57 @@ mod tests {
                 .unwrap(),
             1
         );
+        assert_eq!(resumed.history_mode().await.unwrap(), "off");
+        let prior_lock_timeout: String = sqlx::query_scalar("SHOW lock_timeout")
+            .fetch_one(&resumed.pool)
+            .await
+            .unwrap();
+        assert_ne!(
+            prior_lock_timeout, "100ms",
+            "SET LOCAL must not leak after timeout rollback"
+        );
         old_writer.commit().await.unwrap();
-        let (first_activation, second_activation) = tokio::join!(
+        // A short writer releases only once a single activation is actually
+        // queued, proving fairness without retrying activation or timing a
+        // wall-clock deadline. Both independent activators still race once.
+        let first_pid: i32 = sqlx::query_scalar("SELECT pg_backend_pid()")
+            .fetch_one(&resumed.pool)
+            .await
+            .unwrap();
+        let second_pid: i32 = sqlx::query_scalar("SELECT pg_backend_pid()")
+            .fetch_one(&database.pool)
+            .await
+            .unwrap();
+        let mut short_writer = writers.pool.begin().await.unwrap();
+        let writer_pid: i32 = sqlx::query_scalar("SELECT pg_backend_pid()")
+            .fetch_one(&mut *short_writer)
+            .await
+            .unwrap();
+        sqlx::query("SELECT id FROM request_history_state WHERE id=1 FOR SHARE")
+            .execute(&mut *short_writer)
+            .await
+            .unwrap();
+        let release_writer = async {
+            tokio::time::timeout(Duration::from_secs(3), async {
+                loop {
+                    let queued: bool = sqlx::query_scalar("SELECT EXISTS (SELECT 1 FROM pg_stat_activity WHERE pid IN ($1,$2) AND $3=ANY(pg_blocking_pids(pid)))")
+                        .bind(first_pid).bind(second_pid).bind(writer_pid)
+                        .fetch_one(&admin).await.unwrap();
+                    if queued { break; }
+                    tokio::time::sleep(Duration::from_millis(1)).await;
+                }
+            }).await.expect("one activation must queue behind the short writer");
+            // A failed maintenance attempt never aborts a source transaction.
+            sqlx::query("SELECT 1")
+                .execute(&mut *short_writer)
+                .await
+                .unwrap();
+            short_writer.commit().await.unwrap();
+        };
+        let (first_activation, second_activation, ()) = tokio::join!(
             resumed.history_activate_capture(),
             database.history_activate_capture(),
+            release_writer,
         );
         assert_ne!(
             first_activation.is_ok(),
@@ -301,6 +349,14 @@ mod tests {
             "exactly one concurrent activation owns the off-to-shadow transition"
         );
         assert_eq!(resumed.history_mode().await.unwrap(), "shadow");
+        let after_lock_timeout: String = sqlx::query_scalar("SHOW lock_timeout")
+            .fetch_one(&resumed.pool)
+            .await
+            .unwrap();
+        assert_eq!(
+            after_lock_timeout, prior_lock_timeout,
+            "SET LOCAL must not leak after commit"
+        );
         let new_event = Uuid::now_v7();
         let mut new_writer = writers.pool.begin().await.unwrap();
         insert_event(&mut new_writer, new_event).await.unwrap();

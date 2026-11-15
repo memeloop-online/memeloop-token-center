@@ -139,7 +139,7 @@ pub struct SemanticInstancePage {
 }
 
 impl SemanticInstancePage {
-    fn validate(&self, manifest: &SemanticManifestV2) -> Result<(), AppError> {
+    pub(super) fn validate(&self, manifest: &SemanticManifestV2) -> Result<(), AppError> {
         if self.format_version != 2
             || self.tenant_id != manifest.tenant_id
             || self.session_id != manifest.session_id

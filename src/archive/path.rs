@@ -122,7 +122,12 @@ pub(super) fn is_history_root_location(location: &str) -> bool {
 }
 
 pub(super) fn is_durable_root_location(location: &str) -> bool {
-    is_conversation_root_location(location) || is_history_root_location(location)
+    is_conversation_root_location(location)
+        || is_history_root_location(location)
+        || matches!(
+            location.split('/').collect::<Vec<_>>().as_slice(),
+            ["tenants", _, "semantic", "v2", "requests", _, _]
+        )
 }
 
 pub(super) fn may_include_v1_cas_location(location: &str) -> bool {
