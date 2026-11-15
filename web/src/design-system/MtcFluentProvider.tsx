@@ -1,7 +1,7 @@
 import { useSyncExternalStore, type CSSProperties, type ReactNode } from 'react';
 import { createDarkTheme, createLightTheme, FluentProvider, type Theme } from '@fluentui/react-components';
 import './foundation.css';
-import { brandRamp, dataThemes } from './dataTheme';
+import { brandRamp, dataThemes } from './dataTheme.js';
 
 const themes: Record<'light' | 'dark', Theme> = {
   light: { ...createLightTheme(brandRamp), fontFamilyBase: 'Inter, ui-sans-serif, system-ui, sans-serif' },
