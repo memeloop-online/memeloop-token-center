@@ -1457,6 +1457,14 @@ async fn request_history_real_services_acceptance_native_original_survives_ack_a
             .append_pair("options", &format!("-csearch_path={schema}"));
         let database = Database::connect(isolated.as_str()).await.unwrap();
         database.migrate().await.unwrap();
+        // Define the future schema before any producer prepares SELECT *;
+        // changing its result shape mid-session invalidates PostgreSQL plans.
+        if cas_case {
+            sqlx::query("ALTER TABLE request_records ADD COLUMN future_provenance TEXT")
+                .execute(&database.pool)
+                .await
+                .unwrap();
+        }
         database.history_start().await.unwrap();
         let (key, request_id, _) = seed(&database).await;
         if terminal_case {
@@ -1467,10 +1475,6 @@ async fn request_history_real_services_acceptance_native_original_survives_ack_a
             .bind(Uuid::now_v7().to_string()).bind(request_id.to_string()).execute(&database.pool).await.unwrap();
         }
         if cas_case {
-            sqlx::query("ALTER TABLE request_records ADD COLUMN future_provenance TEXT")
-                .execute(&database.pool)
-                .await
-                .unwrap();
             sqlx::query("UPDATE request_records SET future_provenance=$1 WHERE id=$2")
                 .bind("historical-business-fact".repeat(1024))
                 .bind(request_id.to_string())
