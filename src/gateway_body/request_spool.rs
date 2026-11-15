@@ -881,7 +881,6 @@ impl RequestSpool {
         }
     }
 
-    #[cfg(test)]
     pub(crate) async fn read_all(&self) -> Result<Bytes, RequestSpoolReadError> {
         #[cfg(test)]
         self.read_count.fetch_add(1, Ordering::AcqRel);
@@ -895,12 +894,11 @@ impl RequestSpool {
             return verified_body(&self.shared, body);
         }
         if let Some(carrier) = &self.shared.carrier {
-            let mut stream = carrier.open_stream();
-            let mut body = Vec::new();
-            while let Some(chunk) = stream.next().await {
-                body.extend_from_slice(&chunk.map_err(|_| RequestSpoolReadError)?);
-            }
-            return verified_body(&self.shared, Bytes::from(body));
+            let body = carrier
+                .read_range(0, self.len())
+                .await
+                .map_err(|_| RequestSpoolReadError)?;
+            return verified_body(&self.shared, body);
         }
         if !self.shared.durable_ok.load(Ordering::Acquire) && !self.upload_outcome().await {
             return Err(RequestSpoolReadError);
@@ -968,7 +966,6 @@ impl Drop for RequestSpool {
     }
 }
 
-#[cfg(test)]
 fn verified_body(shared: &SharedBody, body: Bytes) -> Result<Bytes, RequestSpoolReadError> {
     if body.len() != shared.length || *blake3::hash(&body).as_bytes() != shared.digest {
         return Err(RequestSpoolReadError);

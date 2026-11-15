@@ -680,6 +680,29 @@ impl ProxyMemoryReservation {
         self.release(self.json_reserved_bytes.swap(0, Ordering::AcqRel), 1);
     }
 
+    /// Called only after the parsed Value has been dropped. Transfer the
+    /// remaining prepaid JSON envelope into independently owned encoded bytes.
+    /// The caller subsequently uses release_unretained_json, never the legacy
+    /// length-based release path (which assumes no envelope transfer).
+    pub(crate) fn take_normalized_envelope(
+        &self,
+        encoded_len: usize,
+    ) -> Option<OwnedSemaphorePermit> {
+        let mut held = self.held.lock().ok()?;
+        let reserved = self.json_reserved_bytes.load(Ordering::Acquire);
+        let units = encoded_len.div_ceil(UNIT_BYTES);
+        if reserved == 0 || units > reserved / UNIT_BYTES {
+            return None;
+        }
+        let transferred = units.checked_mul(UNIT_BYTES)?;
+        let remaining = held.0.checked_sub(transferred)?;
+        let lease = held.1.as_mut()?.split(units)?;
+        held.0 = remaining;
+        self.json_reserved_bytes
+            .store(reserved - transferred, Ordering::Release);
+        Some(lease)
+    }
+
     pub(crate) fn request_json_reserved_bytes(&self) -> usize {
         self.json_reserved_bytes.load(Ordering::Acquire)
     }
@@ -723,11 +746,24 @@ impl ProxyMemoryReservation {
         if total.div_ceil(UNIT_BYTES) > self.capacity / UNIT_BYTES {
             return None;
         }
-        while !self.try_grow(total, 1) {
+        loop {
+            if let Some(working) = self.try_reserve_source_json(bytes, nodes) {
+                return Some(working);
+            }
             reclaim();
-            // No parsed tree, raw read buffer, or partial JSON permit is held.
-            // Dropping the request cancels this wait without a detached task.
             tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+    }
+
+    pub(crate) fn try_reserve_source_json(
+        self: &Arc<Self>,
+        bytes: usize,
+        nodes: usize,
+    ) -> Option<ArchiveOutputMemory> {
+        let json = bytes.checked_mul(3)?.checked_add(nodes.checked_mul(256)?)?;
+        let working = 64 * 1024;
+        if !self.try_grow(json.checked_add(working)?, 1) {
+            return None;
         }
         self.json_body_ceiling.store(bytes, Ordering::Release);
         self.json_node_ceiling.store(nodes, Ordering::Release);

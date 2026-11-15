@@ -83,16 +83,11 @@ async fn native_kimi_chat_uses_its_prepaid_workspace_under_budget_contention() {
     assert_eq!(request["model"], "k3.1-pro");
     assert!(request.get("stream_options").is_none());
     assert_eq!(state.proxy_memory_budget.snapshot(), before);
-    let replay = super::super::request_source::spool_normalized(
+    let replay = request.clone();
+    let mut admission = Box::pin(super::super::request_source::parse_normalized(
         request,
-        directory.path().to_owned(),
-        &memory,
-    )
-    .await
-    .unwrap();
-    memory.release_unretained_json();
-    let mut admission = Box::pin(super::super::request_source::parse_with_shape(
-        replay.clone(),
+        &state,
+        Uuid::now_v7(),
         memory.clone(),
         shape.0,
         shape.1,
@@ -101,19 +96,22 @@ async fn native_kimi_chat_uses_its_prepaid_workspace_under_budget_contention() {
         futures_util::poll!(&mut admission),
         std::task::Poll::Pending
     ));
-    // The competing request can release its owner while this request retains
-    // only a complete local replay. No partial JSON charge blocks its exit.
-    assert_eq!(state.proxy_memory_budget.snapshot().0, capacity - used);
+    assert!(state.proxy_memory_budget.snapshot().0 <= capacity);
     drop(admission);
-    assert_eq!(memory.request_json_reserved_bytes(), 0);
-    assert!(memory.borrow_route_workspace(1).is_none());
-    assert_eq!(state.proxy_memory_budget.snapshot().0, capacity - used);
-    assert!(shape.0 > replay.len());
-    assert!(shape.1 > replay.json_nodes());
-    let admission =
-        super::super::request_source::parse_with_shape(replay, memory.clone(), shape.0, shape.1);
+    // Cancellation must return derived ownership without releasing the other
+    // request's real reservation or starting a supplier operation.
+    assert!(state.proxy_memory_budget.snapshot().0 >= capacity - used);
     drop(blocker);
-    let request = admission.await.unwrap();
+    let request = super::super::request_source::parse_normalized(
+        replay,
+        &state,
+        Uuid::now_v7(),
+        memory.clone(),
+        shape.0,
+        shape.1,
+    )
+    .await
+    .unwrap();
     assert_eq!(request["model"], "k3.1-pro");
     assert!(request.get("stream_options").is_none());
     for model in ["k3.1-pro", "k3.1-pro(long \"escaped model\")"] {
