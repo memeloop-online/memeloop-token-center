@@ -408,6 +408,8 @@ jobs:
           toolchain: 1.95.0
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6
       - uses: ./.github/actions/checkout-plugin-examples
+      - name: Compile the exact library test executable before runtime windows
+        run: cargo test --locked --lib --no-run
       - name: Verify six actual request carrier ownership and pressure contracts
         run: |
           set -o pipefail
