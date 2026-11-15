@@ -1,7 +1,9 @@
-//! Disk-backed JSON syntax and span indexing shared by protocol projections.
+//! Incremental JSON syntax and RAM span indexing shared by protocol projections.
 //! Callers retain their own protocol validation and terminal evidence.
 pub(crate) mod index;
+pub(crate) mod pager;
 use sha2::{Digest, Sha256};
+#[cfg(test)]
 use std::fs::File;
 use std::io::{BufRead, BufReader, Read, Seek, SeekFrom, Write};
 use std::sync::{
@@ -13,7 +15,7 @@ pub(crate) const CHUNK: usize = 64 * 1024;
 pub(crate) type Result<T> = std::result::Result<T, &'static str>;
 
 /// Select a finite set of protocol fields to keep in memory. Array elements,
-/// raw fields and exact decoded-key equality are indexed on disk.
+/// raw fields and exact decoded-key equality are indexed in RAM.
 pub(crate) trait Projection: Copy {
     fn field(self, key: &str) -> Self;
     fn element(self) -> Self;
@@ -69,8 +71,62 @@ pub(crate) struct DiskNodes {
     pub(crate) count: usize,
 }
 
+pub(crate) trait SourceReader: Read + Seek + Send {}
+impl<T: Read + Seek + Send> SourceReader for T {}
+
+// Used only on the blocking translation worker. BufReader limits each remote
+// range to CHUNK; seeking does not fetch or materialize the body.
+struct CarrierReader {
+    body: Arc<crate::gateway_body::carrier::BodyCarrier>,
+    runtime: tokio::runtime::Handle,
+    offset: u64,
+    cancelled: Arc<AtomicBool>,
+    wake: Arc<tokio::sync::Notify>,
+}
+impl Read for CarrierReader {
+    fn read(&mut self, bytes: &mut [u8]) -> std::io::Result<usize> {
+        let count = self
+            .body
+            .len()
+            .saturating_sub(self.offset)
+            .min(bytes.len() as u64)
+            .min(CHUNK as u64) as usize;
+        if count == 0 {
+            return Ok(0);
+        }
+        self.runtime.block_on(async {
+            let notified = self.wake.notified();
+            tokio::pin!(notified);
+            notified.as_mut().enable();
+            if self.cancelled.load(Ordering::Acquire) {
+                return Err(std::io::Error::other("compact_cancelled"));
+            }
+            tokio::select! {
+                biased;
+                _ = notified => Err(std::io::Error::other("compact_cancelled")),
+                result = self.body.read_into(self.offset, &mut bytes[..count]) =>
+                    result.map_err(|_| std::io::Error::other("compact_carrier_read")),
+            }
+        })?;
+        self.offset += count as u64;
+        Ok(count)
+    }
+}
+impl Seek for CarrierReader {
+    fn seek(&mut self, position: SeekFrom) -> std::io::Result<u64> {
+        let next = match position {
+            SeekFrom::Start(at) => i128::from(at),
+            SeekFrom::End(delta) => i128::from(self.body.len()) + i128::from(delta),
+            SeekFrom::Current(delta) => i128::from(self.offset) + i128::from(delta),
+        };
+        self.offset =
+            u64::try_from(next).map_err(|_| std::io::Error::other("compact_carrier_seek"))?;
+        Ok(self.offset)
+    }
+}
+
 pub(crate) struct Scanner {
-    pub(crate) reader: BufReader<File>,
+    pub(crate) reader: BufReader<Box<dyn SourceReader>>,
     pub(crate) index: Option<index::Index>,
     pub(crate) position: u64,
     pub(crate) cancelled: Arc<AtomicBool>,
@@ -82,10 +138,35 @@ impl Scanner {
         Self::with_index(file, tempfile::tempfile().unwrap()).unwrap()
     }
 
-    pub(crate) fn with_index(file: File, index_file: File) -> Result<Self> {
+    #[cfg(test)]
+    pub(crate) fn with_index(file: File, _index_file: File) -> Result<Self> {
         Ok(Self {
-            reader: BufReader::with_capacity(CHUNK, file),
-            index: Some(index::Index::new(index_file)?),
+            reader: BufReader::with_capacity(CHUNK, Box::new(file) as Box<dyn SourceReader>),
+            index: Some(index::Index::memory()?),
+            position: 0,
+            cancelled: Arc::new(AtomicBool::new(false)),
+        })
+    }
+
+    pub(crate) fn from_carrier(
+        body: Arc<crate::gateway_body::carrier::BodyCarrier>,
+        runtime: tokio::runtime::Handle,
+        cancelled: Arc<AtomicBool>,
+        wake: Arc<tokio::sync::Notify>,
+        index: index::Index,
+    ) -> Result<Self> {
+        Ok(Self {
+            reader: BufReader::with_capacity(
+                CHUNK,
+                Box::new(CarrierReader {
+                    body,
+                    runtime,
+                    offset: 0,
+                    cancelled: cancelled.clone(),
+                    wake,
+                }),
+            ),
+            index: Some(index),
             position: 0,
             cancelled: Arc::new(AtomicBool::new(false)),
         })
@@ -451,7 +532,7 @@ impl Scanner {
         let end = self.position;
         self.seek(start)?;
         struct NumberReader<'a> {
-            source: std::io::Take<&'a mut BufReader<File>>,
+            source: std::io::Take<&'a mut BufReader<Box<dyn SourceReader>>>,
             cancelled: Arc<AtomicBool>,
         }
         impl Read for NumberReader<'_> {
@@ -538,4 +619,76 @@ impl Scanner {
 
 fn write(out: &mut impl Write, bytes: &[u8]) -> Result<()> {
     out.write_all(bytes).map_err(|_| "compact_file_io")
+}
+
+#[cfg(test)]
+mod carrier_cancel_tests {
+    use super::*;
+    use crate::{
+        archive::ArchiveStore,
+        archive_staging::*,
+        gateway_body::{
+            carrier::{BodyCarrier, CarrierCapture},
+            memory::ProxyMemoryBudget,
+        },
+    };
+
+    #[tokio::test]
+    async fn cancellation_drops_a_pending_object_read_and_releases_the_source() {
+        let (archive, store) = ArchiveStore::memory_for_test().with_read_delay_for_test();
+        let memory = Arc::new(ProxyMemoryBudget::new(256 * 1024));
+        let id = uuid::Uuid::new_v4();
+        let key = ArchiveStagingKey::new(
+            ArchiveStagingOwner::ProxyRequest(id),
+            ArchiveStagingPurpose::Response,
+            id,
+        )
+        .unwrap();
+        let body = BodyCarrier::capture(
+            futures_util::stream::iter([Ok::<_, std::io::Error>(bytes::Bytes::from_static(
+                br#"{"output":[]}"#,
+            ))]),
+            CarrierCapture::new(memory.clone(), Some(archive), key),
+        )
+        .await
+        .unwrap();
+        body.seal_to_objects().await.unwrap();
+        assert_eq!(memory.snapshot().0, 0);
+        let source = Arc::downgrade(&body);
+        store.config_mut(|config| config.wait_get_per_call = std::time::Duration::from_secs(60));
+        let cancelled = Arc::new(AtomicBool::new(false));
+        let wake = Arc::new(tokio::sync::Notify::new());
+        let worker_cancelled = cancelled.clone();
+        let worker_wake = wake.clone();
+        let runtime = tokio::runtime::Handle::current();
+        let mut worker = tokio::task::spawn_blocking(move || {
+            let mut scanner = Scanner::from_carrier(
+                body,
+                runtime,
+                worker_cancelled,
+                worker_wake,
+                index::Index::memory().unwrap(),
+            )
+            .unwrap();
+            scanner.peek()
+        });
+        // The genuine object GET is delayed; no provider bytes have arrived.
+        assert!(
+            tokio::time::timeout(std::time::Duration::from_millis(100), &mut worker)
+                .await
+                .is_err()
+        );
+        cancelled.store(true, Ordering::Release);
+        wake.notify_waiters();
+        assert!(
+            tokio::time::timeout(std::time::Duration::from_secs(2), worker)
+                .await
+                .unwrap()
+                .unwrap()
+                .is_err()
+        );
+        assert!(source.upgrade().is_none());
+        assert_eq!(memory.snapshot().0, 0);
+        store.config_mut(|config| config.wait_get_per_call = std::time::Duration::ZERO);
+    }
 }

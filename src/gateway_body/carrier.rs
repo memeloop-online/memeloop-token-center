@@ -429,6 +429,58 @@ impl BodyCarrier {
         }
     }
 
+    /// Reserve a fixed metadata workspace after releasing this source's own
+    /// offloadable allocations. The caller retains the permit through all
+    /// resident scratch pages and publication buffers.
+    pub(crate) async fn reserve_metadata_workspace(
+        self: &Arc<Self>,
+        bytes: usize,
+    ) -> Result<OwnedSemaphorePermit, AppError> {
+        self.reserve_workspace(bytes).await
+    }
+
+    pub(crate) fn try_reserve_metadata_workspace(
+        &self,
+        bytes: usize,
+    ) -> Option<OwnedSemaphorePermit> {
+        self.memory.try_reserve_ingress_bytes(bytes)
+    }
+
+    /// A derived replay plan owns the workspace acquisition for itself and its
+    /// ancestor body. This releases only as much of that chain as is needed.
+    pub(crate) async fn read_leased_source_chunk(
+        self: &Arc<Self>,
+        source: &Arc<Self>,
+        offset: u64,
+        maximum: usize,
+    ) -> Result<Bytes, AppError> {
+        if !Arc::ptr_eq(&self.memory, &source.memory) {
+            return Err(AppError::internal("carrier_source_budget_mismatch"));
+        }
+        let mut ancestor = Some(self);
+        while let Some(current) = ancestor {
+            if Arc::ptr_eq(current, source) {
+                break;
+            }
+            ancestor = current.parent.as_ref();
+        }
+        if ancestor.is_none() {
+            return Err(AppError::internal("carrier_source_not_ancestor"));
+        }
+        let remaining = source
+            .length
+            .checked_sub(offset)
+            .ok_or_else(|| AppError::internal("carrier_range_invalid"))?;
+        let count = remaining.min(maximum.min(64 * 1024) as u64) as usize;
+        if count == 0 {
+            return Ok(Bytes::new());
+        }
+        let lease = self.reserve_workspace(count).await?;
+        let mut output = vec![0; count];
+        source.read_into(offset, &mut output).await?;
+        Ok(self.leased_bytes(Bytes::from(output), lease, None))
+    }
+
     pub(crate) fn len(&self) -> u64 {
         self.length
     }
@@ -721,6 +773,42 @@ mod tests {
         assert_eq!(bytes.as_ref(), br#"{"input":"normalized"}"#);
         drop(bytes);
         drop(previous);
+        assert_eq!(memory.snapshot().0, 0);
+    }
+
+    #[tokio::test]
+    async fn derived_plan_replay_releases_its_own_ram_before_reading_ancestor() {
+        let memory = Arc::new(ProxyMemoryBudget::new(128 * 1024));
+        let source = full_ram_source(memory.clone()).await;
+        source.seal_to_objects().await.unwrap();
+        // Ingress retention credit intentionally offloads early when an object
+        // backend is present. Build the full-RAM fixture without that backend,
+        // then enable object pressure handling, as full_ram_source does.
+        let mut capture = CarrierCapture::derived_from(&source, key());
+        capture.archive = None;
+        let mut plan = BodyCarrier::capture(
+            stream::iter([
+                Ok::<_, std::io::Error>(Bytes::from(vec![b'p'; 65536])),
+                Ok(Bytes::from(vec![b'q'; 65536])),
+            ]),
+            capture,
+        )
+        .await
+        .unwrap();
+        Arc::get_mut(&mut plan).unwrap().archive = source.archive.clone();
+        assert_eq!(memory.snapshot().0, 128 * 1024);
+        let bytes = tokio::time::timeout(
+            std::time::Duration::from_secs(2),
+            plan.read_leased_source_chunk(&source, 65530, 12),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        assert_eq!(bytes, b"aaaaaabbbbbb"[..]);
+        assert!(memory.snapshot().0 <= 128 * 1024);
+        drop(bytes);
+        drop(plan);
+        drop(source);
         assert_eq!(memory.snapshot().0, 0);
     }
 
