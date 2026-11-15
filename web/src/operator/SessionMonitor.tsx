@@ -1,5 +1,5 @@
 import { createSemanticViewLoader } from '../semanticViewReader.js';
-import { useCallback, useEffect, useMemo, useRef, useState, type RefObject } from 'react';
+import { useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState, type RefObject } from 'react';
 import { createSessionContextLoader } from '../sessionContextReader.js';
 import { api, apiRead } from '../api.js';
 import { readArchiveRange, type ArchiveRangeLoader } from '../archiveRange.js';
@@ -120,6 +120,19 @@ export function SessionMonitor({ token, tenant, revision, eventKeyIds, eventOver
   const [selected, setSelected] = useState<LogicalSessionSummary>();
   const [returnOrigin, setReturnOrigin] = useState<SessionRequestOrigin>();
   const listReturn = useRef<{ element: HTMLElement; scrollY: number } | undefined>(undefined);
+  const pendingListReturn = useRef<{ element: HTMLElement; scrollY: number } | undefined>(undefined);
+  const [returnTailHeight, setReturnTailHeight] = useState(0);
+  useLayoutEffect(() => {
+    const origin = pendingListReturn.current;
+    if (!origin || selected) return;
+    // Removing a tall detail can make the original list position unreachable.
+    // Reserve only the missing viewport tail before restoring focus and scroll.
+    const missing = origin.scrollY + window.innerHeight - document.documentElement.scrollHeight;
+    if (missing > 0) { setReturnTailHeight(height => height + missing); return; }
+    window.scrollTo(0, origin.scrollY);
+    origin.element.focus({ preventScroll: true });
+    pendingListReturn.current = undefined;
+  }, [selected, returnTailHeight]);
   const [loading, setLoading] = useState(false);
   const [detailLoading, setDetailLoading] = useState(false);
   const [nextCursor, setNextCursor] = useState<LogicalSessionCursor | null>(null);
@@ -313,6 +326,7 @@ export function SessionMonitor({ token, tenant, revision, eventKeyIds, eventOver
   }
 
   async function selectSession(session: LogicalSessionSummary) {
+    pendingListReturn.current = undefined; setReturnTailHeight(0);
     if (isUnlinkedSession(session.session_id, session.unlinked)) {
       onOpenUnlinkedRequests?.(session.session_id, session.key_id);
       return;
@@ -538,6 +552,7 @@ export function SessionMonitor({ token, tenant, revision, eventKeyIds, eventOver
   }, [focus?.revision]);
 
   useEffect(() => {
+    pendingListReturn.current = undefined; setReturnTailHeight(0);
     scopeGeneration.current += 1;
     // A filter/scope transition starts an authoritative first-page read. Drop
     // events queued for the previous projection before issuing that snapshot;
@@ -775,12 +790,8 @@ export function SessionMonitor({ token, tenant, revision, eventKeyIds, eventOver
       onReturnOrigin(returnOrigin);
       return;
     }
-    const origin = listReturn.current;
+    pendingListReturn.current = listReturn.current;
     clearDetail();
-    if (origin) requestAnimationFrame(() => {
-      window.scrollTo(0, origin.scrollY);
-      origin.element.focus({ preventScroll: true });
-    });
   };
   const selectedParent = useSessionParentLabel(tenant, token,
     selected && visibleDetail && !visibleDetail.unlinked ? selected.key_id : undefined,
@@ -848,5 +859,6 @@ export function SessionMonitor({ token, tenant, revision, eventKeyIds, eventOver
           onSelect={(request) => { void onSelectRequest(request); }} onClose={returnFromDetail} />}
       </div>
     </div>
+    {returnTailHeight > 0 && <div aria-hidden="true" style={{ height: returnTailHeight }} />}
   </>;
 }

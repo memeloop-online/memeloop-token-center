@@ -41,6 +41,7 @@ test('semantic viewer reads verified atoms lazily, preserves parts and pages wit
     await mkdir(artifacts, { recursive: true });
     for (const theme of ['light', 'dark']) {
       await page.evaluate(value => { document.documentElement.dataset.theme = value; }, theme);
+      await page.locator(`[data-semantic-theme=${theme}]`).waitFor();
       for (const width of [390, 1440]) {
         await page.setViewportSize({ width, height: 900 });
         assert.equal(await page.evaluate(() => document.documentElement.scrollWidth <= innerWidth), true);

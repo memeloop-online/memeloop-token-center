@@ -19,8 +19,12 @@ function snapshot() {
   return document.documentElement.dataset.theme === 'light' ? 'light' : 'dark';
 }
 
+export function useMtcColorMode() {
+  return useSyncExternalStore<'light' | 'dark'>(subscribe, snapshot, () => 'dark');
+}
+
 export function MtcFluentProvider({ children }: { children: ReactNode }) {
-  const theme = useSyncExternalStore<'light' | 'dark'>(subscribe, snapshot, () => 'dark');
+  const theme = useMtcColorMode();
   const colors = dataThemes[theme];
   const dataTokens = Object.fromEntries(Object.entries(colors).map(([name, value]) => [`--mtc-data-${name}`, value])) as CSSProperties;
   return <FluentProvider theme={themes[theme]} style={dataTokens} className="mtc-fluent-root">

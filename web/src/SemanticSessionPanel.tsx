@@ -91,7 +91,7 @@ function AtomContent({ loader, request, cursor }: { loader: SemanticViewLoader; 
   }
   return <div className="semantic-atom-content">
     {error && <p role="alert">{error}</p>}
-    {atom ? <><b>{atom.role}</b>{atom.parts.map((part, index) => <SemanticPart key={index} part={part} role={atom.role} index={index} />)}</>
+    {atom ? <><p className="muted">{atom.role}</p>{atom.parts.map((part, index) => <SemanticPart key={index} part={part} role={atom.role} index={index} />)}</>
       : <><pre className="break-anywhere">{text}</pre>{complete && <p role="alert">{zh ? '语义消息结构无法识别。' : 'Semantic message structure is not recognized.'}</p>}</>}
     {!complete && <p>{zh ? '正在读取或仅显示有界预览；正文未据此标记完整。' : 'Loading or bounded preview; this does not mark the content complete.'}</p>}
   </div>;
@@ -177,7 +177,7 @@ export function SemanticSessionPanel({ detail, loader }: { detail: LogicalSessio
       incompleteMessage={zh ? '语义记录尚未完整发布。' : 'The semantic record is not fully published.'}
       adapter={{ conversationId: detail.session_id, messages, isRunning: false, isLoading: loading, error,
         residentMessageLimit: 32, residentContentByteLimit: previewBudget, residentRenderRowLimit: 32,
-        hasMoreBefore: !!visiblePage?.next_cursor, loadMoreBefore: signal => read(visiblePage?.next_cursor ?? undefined, signal) }}
+        hasMoreBefore: false }}
       renderMessageContent={message => {
         const instance = visibleInstances.find(item => semanticMessageId(revision, item) === message.messageId);
         if (!instance) return null;
