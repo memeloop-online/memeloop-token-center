@@ -1,5 +1,7 @@
 import assert from 'node:assert/strict';
 import { existsSync } from 'node:fs';
+import { mkdir } from 'node:fs/promises';
+import { join } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import test from 'node:test';
 import { chromium } from 'playwright';
@@ -35,6 +37,17 @@ test('semantic viewer reads verified atoms lazily, preserves parts and pages wit
     await page.waitForFunction(() => window.semanticPageReads === 2);
     await page.getByText('Verified latest answer', { exact: true }).waitFor();
     assert.equal(await page.evaluate(() => window.semanticAtomReads), 1, 'same revision preserves the open atom');
+    const artifacts = fileURLToPath(new URL('../e2e-artifacts/semantic-viewer/', import.meta.url));
+    await mkdir(artifacts, { recursive: true });
+    for (const theme of ['light', 'dark']) {
+      await page.evaluate(value => { document.documentElement.dataset.theme = value; }, theme);
+      for (const width of [390, 1440]) {
+        await page.setViewportSize({ width, height: 900 });
+        assert.equal(await page.evaluate(() => document.documentElement.scrollWidth <= innerWidth), true);
+        await page.screenshot({ path: join(artifacts, `semantic-${theme}-${width}.png`), fullPage: true });
+      }
+    }
+    await page.setViewportSize({ width: 390, height: 900 });
     await page.getByRole('button', { name: 'Earlier messages', exact: true }).click();
     await page.getByRole('button', { name: 'Read message · 1', exact: true }).waitFor();
     assert.equal(await page.getByRole('button', { name: 'Read message · 2', exact: true }).count(), 0, 'old resident window is released');
