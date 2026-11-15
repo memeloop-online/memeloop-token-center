@@ -2774,7 +2774,13 @@ impl ProxyConversation {
                 return Err(AppError::capacity_error("proxy_memory_projection"));
             }
         };
-        let request_body = self.request_body.read().await?;
+        let request_body = match &self.request_body {
+            ConversationBody::ProjectedSpool { spool, .. } => spool
+                .read_prepaid_projection(&projection_memory)
+                .await
+                .map_err(|_| AppError::capacity_error("request_spool_read_failed"))?,
+            body => body.read().await?,
+        };
         let request_json = serde_json::from_slice(&request_body)
             .map_err(|_| AppError::internal("proxy_project_2"))?;
         Ok(ProxyConversationProjection {

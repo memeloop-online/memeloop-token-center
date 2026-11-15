@@ -396,8 +396,7 @@ impl RequestSpoolAdmission {
         };
         let metadata_bytes = request_metadata_bytes
             .saturating_add(std::mem::size_of::<RequestSpool>())
-            .saturating_add(std::mem::size_of::<Mutex<RequestSpoolLease>>())
-            .saturating_add(REQUEST_SPOOL_CHUNK_BYTES);
+            .saturating_add(std::mem::size_of::<Mutex<RequestSpoolLease>>());
         let mut metadata = memory.and_then(|memory| {
             memory
                 .try_reserve_ingress_bytes(metadata_bytes)
@@ -879,6 +878,24 @@ impl RequestSpool {
         if self.shared.durable_ok.load(Ordering::Acquire) {
             release_resident_memory(&self.shared);
         }
+    }
+
+    pub(crate) async fn read_prepaid_projection(
+        &self,
+        permit: &super::memory::ConversationProjectionPermit,
+    ) -> Result<Bytes, RequestSpoolReadError> {
+        if !permit.covers(self.len()) {
+            return Err(RequestSpoolReadError);
+        }
+        if let Some(carrier) = self.carrier() {
+            let mut bytes = vec![0; self.len()];
+            carrier
+                .read_into(0, &mut bytes)
+                .await
+                .map_err(|_| RequestSpoolReadError)?;
+            return verified_body(&self.shared, Bytes::from(bytes));
+        }
+        self.read_all().await
     }
 
     pub(crate) async fn read_all(&self) -> Result<Bytes, RequestSpoolReadError> {

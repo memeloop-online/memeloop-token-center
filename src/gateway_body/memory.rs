@@ -201,6 +201,12 @@ pub(crate) struct ConversationProjectionPermit {
     _permit: OwnedSemaphorePermit,
 }
 
+impl ConversationProjectionPermit {
+    pub(crate) fn covers(&self, bytes: usize) -> bool {
+        bytes.div_ceil(UNIT_BYTES) <= self._permit.num_permits()
+    }
+}
+
 #[derive(Debug)]
 pub(crate) struct BufferedResponsePermit(OwnedSemaphorePermit);
 
