@@ -1101,6 +1101,12 @@ async fn process_conversation_projection_batch(state: &AppState, lease_owner: Uu
             .observe_background_projection(BackgroundProjectionKind::Conversation, false);
         tracing::error!(%error, "worker 未能把已有原始请求 JSON 和原始返回 JSON 的会话正文重新排队");
     }
+    if let Err(error) = state.db.recover_semantic_coverage().await {
+        tracing::warn!(
+            error_category = error.diagnostic_category(),
+            "semantic coverage confirmation remains pending"
+        );
+    }
     tracing::debug!(%lease_owner, stage = "claim_start", "conversation projection stage");
     let tasks = match state
         .db
@@ -1327,6 +1333,8 @@ pub(crate) async fn archive_session_body(
         atoms,
         nodes,
         media,
+        publication,
+        coverage_complete,
         ..
     } = prepared;
     if !state
@@ -1336,13 +1344,43 @@ pub(crate) async fn archive_session_body(
     {
         return Ok(false);
     }
+    if coverage_complete
+        && !state
+            .db
+            .retain_semantic_coverage_obligation(lease_owner, request_id, &publication)
+            .await?
+    {
+        return Ok(false);
+    }
     tracing::debug!(%request_id, %lease_owner, stage = "semantic_projection_start", "conversation projection stage");
     let result = state
         .db
         .project_claimed_conversation_projection_task(lease_owner, request_id)
         .await;
     tracing::debug!(%request_id, %lease_owner, succeeded = result.is_ok(), stage = "semantic_projection_done", "conversation projection stage");
-    result
+    let projected = result?;
+    #[cfg(test)]
+    if projected && coverage_complete {
+        // The database has actually committed. Simulate losing the result at
+        // this boundary, without rolling it back or replaying projection.
+        crate::db::Database::semantic_coverage_test_boundary("projection_commit_ack")?;
+    }
+    if projected && coverage_complete {
+        if let Some(head) = nodes.last() {
+            let binding = state
+                .db
+                .semantic_archive_binding(tenant_id, request_id, &head.node_hash)
+                .await?
+                .ok_or_else(|| AppError::storage("semantic_sql_binding_not_committed"))?;
+            state
+                .archive
+                .confirm_semantic_coverage(&publication, &binding)
+                .await?;
+        }
+    }
+    // Coverage confirmation is a separate durable handoff, not financial ACK
+    // and not yet permission to delete raw still held by another retry owner.
+    Ok(projected)
 }
 
 async fn skip_session_body(

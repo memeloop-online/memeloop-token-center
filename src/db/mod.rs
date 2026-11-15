@@ -933,3 +933,5 @@ impl Database {
 pub(crate) mod test_support;
 #[cfg(test)]
 mod tests;
+
+mod semantic_archive_binding;

@@ -92,6 +92,11 @@ jobs:
       - run: cargo test --locked --lib api::proxy::tests::early_terminal
       - run: cargo test --locked --lib archive::conversation
       - run: cargo test --locked --lib archive::session_projection -- --test-threads=1
+      - name: Verify committed semantic coverage recovery on SQLite and PostgreSQL
+        run: |
+          set -o pipefail
+          cargo test --locked --lib semantic_coverage_recovers_committed_projection_and_failed_put -- --test-threads=1 2>&1 | tee /tmp/semantic-coverage-recovery.log
+          grep -F '2 passed; 0 failed' /tmp/semantic-coverage-recovery.log
       - run: cargo test --locked --lib conversation::return_stream_tests
       - run: cargo test --locked --lib db::archive_staging::backend_tests
       - run: cargo test --locked --lib gateway_body::carrier::tests
