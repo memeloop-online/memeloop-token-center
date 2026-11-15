@@ -1,6 +1,7 @@
 import { useEffect, useMemo, useRef, useState } from 'react';
 import type { ConversationMessageListProjection } from 'memeloop';
-import { Button } from './design-system';
+import { Button, DataSurface, Disclosure, Field, FormSection, Select } from './design-system';
+import { MessageContent } from '@memeloop/react-ui/chat';
 import { useI18n } from './i18n.js';
 import type { LogicalSessionDetail } from './types.js';
 import { SemanticConversationViewer, type SemanticCoverage } from './SemanticConversationViewer.js';
@@ -12,6 +13,41 @@ function knownRole(value: unknown): value is ConversationMessageListProjection['
   return value === 'user' || value === 'assistant' || value === 'tool' || value === 'agent' || value === 'error';
 }
 const pending: SemanticCoverage = { observed_terminal: false, projection_state: 'partial', gaps: ['semantic_publication_pending'], omissions: [] };
+
+function SemanticPart({ part, role, index }: { part: Record<string, unknown>; role: string; index: number }) {
+  const { locale } = useI18n(); const zh = locale.startsWith('zh');
+  const kind = String(part.kind ?? part.type ?? 'unknown');
+  const text = typeof part.text === 'string' ? part.text : '';
+  const projection: ConversationMessageListProjection = {
+    messageId: String(index), turnId: String(index), conversationId: 'semantic-part',
+    role: knownRole(role) ? role : 'agent', content: text, originNodeId: 'semantic',
+    originSequence: index, lamportClock: index, timestamp: 0,
+  };
+  if (kind === 'text') return <MessageContent message={projection} />;
+  if (kind === 'reasoning') return <Disclosure title={zh ? '推理过程' : 'Reasoning'}>
+    {part.completeness === 'partial' && <p>{zh ? '已记录部分推理' : 'Partially recorded reasoning'}</p>}
+    <MessageContent message={projection} />
+  </Disclosure>;
+  if (['tool_call', 'function_call', 'tool-call'].includes(kind)) {
+    const name = typeof part.tool_name === 'string' ? part.tool_name : typeof part.name === 'string' ? part.name : '';
+    return <Disclosure title={`${zh ? '工具调用' : 'Tool call'} · ${name}`}>
+      <p>{String(part.call_id ?? part.tool_call_id ?? '')}</p>
+      <pre className="break-anywhere">{part.arguments !== undefined ? JSON.stringify(part.arguments, null, 2) : String(part.arguments_text ?? '')}</pre>
+      {part.completeness === 'partial' && <p>{zh ? '参数记录不完整' : 'Arguments partially recorded'}</p>}
+    </Disclosure>;
+  }
+  if (['tool_result', 'function_call_output', 'tool-result'].includes(kind)) return <Disclosure title={`${zh ? '工具结果' : 'Tool result'} · ${String(part.tool_name ?? '')}`}>
+    <p>{String(part.tool_call_id ?? part.call_id ?? '')} · {String(part.result_status ?? '')}</p>
+    {text ? <MessageContent message={projection} /> : <pre className="break-anywhere">{JSON.stringify(part.result_content ?? null, null, 2)}</pre>}
+  </Disclosure>;
+  if (['attachment', 'image', 'audio', 'file', 'input_image', 'input_audio'].includes(kind) || part.object_locator) return <DataSurface>
+    <b>{zh ? '附件' : 'Attachment'}</b><p>{String(part.media_type ?? '')} · {String(part.byte_length ?? '')}</p>
+    <p role="status">{zh ? '附件引用已记录，授权查看接口尚未就绪。' : 'Attachment reference recorded; its authorized reader is not yet available.'}</p>
+  </DataSurface>;
+  return <Disclosure title={`${zh ? '未识别内容类型' : 'Unrecognized content type'} · ${kind}`}>
+    <pre className="break-anywhere">{JSON.stringify(part, null, 2)}</pre>
+  </Disclosure>;
+}
 
 function AtomContent({ loader, request, cursor }: { loader: SemanticViewLoader; request: string; cursor: string }) {
   const { locale } = useI18n();
@@ -42,14 +78,21 @@ function AtomContent({ loader, request, cursor }: { loader: SemanticViewLoader; 
     })().catch(reason => { if (!controller.signal.aborted) setError(String(reason)); });
     return () => controller.abort();
   }, [loader, request, cursor]);
-  let atom: { role?: string; parts?: Record<string, unknown>[] } | undefined;
-  if (complete) { try { atom = JSON.parse(text); } catch { /* Surface the intact wire payload below. */ } }
+  let atom: { role: string; parts: Record<string, unknown>[] } | undefined;
+  if (complete) {
+    try {
+      const value: unknown = JSON.parse(text);
+      if (value && typeof value === 'object' && 'role' in value && typeof value.role === 'string'
+        && 'parts' in value && Array.isArray(value.parts)
+        && value.parts.every(part => part && typeof part === 'object' && !Array.isArray(part))) {
+        atom = { role: value.role, parts: value.parts as Record<string, unknown>[] };
+      }
+    } catch { /* The bounded wire preview remains available for malformed content. */ }
+  }
   return <div className="semantic-atom-content">
     {error && <p role="alert">{error}</p>}
-    {atom?.parts ? <><b>{atom.role}</b>{atom.parts.map((part, index) => <section key={index}>
-      <small>{String(part.kind ?? part.type ?? '')}</small>
-      {typeof part.text === 'string' ? <pre className="break-anywhere">{part.text}</pre> : <pre className="break-anywhere">{JSON.stringify(part, null, 2)}</pre>}
-    </section>)}</> : <pre className="break-anywhere">{text}</pre>}
+    {atom ? <><b>{atom.role}</b>{atom.parts.map((part, index) => <SemanticPart key={index} part={part} role={atom.role} index={index} />)}</>
+      : <><pre className="break-anywhere">{text}</pre>{complete && <p role="alert">{zh ? '语义消息结构无法识别。' : 'Semantic message structure is not recognized.'}</p>}</>}
     {!complete && <p>{zh ? '正在读取或仅显示有界预览；正文未据此标记完整。' : 'Loading or bounded preview; this does not mark the content complete.'}</p>}
   </div>;
 }
@@ -106,14 +149,16 @@ export function SemanticSessionPanel({ detail, loader }: { detail: LogicalSessio
     lamportClock: instance.ordinal, timestamp: requests.find(request => request.request_id === requestId)?.created_at ?? 0,
     role, content: '', metadata: { instance_id: instance.instance_id, branch_id: instance.branch_id },
   }]; }), [visibleInstances, revision, detail.session_id, requestId, requests]);
-  return <section aria-label={zh ? '会话记录' : 'Conversation record'}>
-    <label>{zh ? '请求上下文' : 'Request context'}<select value={requestId} onChange={event => setRequestId(event.target.value)}>
+  return <DataSurface aria-label={zh ? '会话记录' : 'Conversation record'}>
+    <FormSection title={zh ? '会话记录' : 'Conversation record'}>
+    <Field label={zh ? '请求上下文' : 'Request context'}><Select value={requestId} onChange={event => setRequestId(event.target.value)}>
       {requests.map(request => <option key={request.request_id} value={request.request_id}>{new Date(request.created_at).toLocaleString(locale)} · {request.model}</option>)}
-    </select></label>
+    </Select></Field>
     <Button appearance="secondary" disabled={loading} onClick={() => void read()}>{zh ? '刷新会话记录' : 'Refresh conversation'}</Button>
     {visiblePage?.next_cursor && <Button appearance="secondary" disabled={loading} onClick={() => void read(visiblePage.next_cursor ?? undefined)}>{zh ? '较早消息' : 'Earlier messages'}</Button>}
     <Button appearance="secondary" disabled={exporting || visiblePage?.status !== 'published'} onClick={() => void exportContext()}>{zh ? '流式导出此上下文' : 'Stream context export'}</Button>
     {exporting && <Button appearance="secondary" onClick={() => exportActive.current?.abort()}>{zh ? '取消导出' : 'Cancel export'}</Button>}
+    </FormSection>
     {visibleInstances.filter(instance => !knownRole(instance.role)).map(instance => {
       const id = semanticMessageId(revision, instance);
       return <section key={id} data-semantic-role="unrecorded">
@@ -135,5 +180,5 @@ export function SemanticSessionPanel({ detail, loader }: { detail: LogicalSessio
           <Button appearance="secondary" disabled={exporting} onClick={() => void exportContext(instance)}>{zh ? '导出消息' : 'Export message'}</Button>
           {opened === message.messageId && <AtomContent key={instance.atom_cursor} loader={loader} request={requestId} cursor={instance.atom_cursor} />}</section>;
       }} />
-  </section>;
+  </DataSurface>;
 }

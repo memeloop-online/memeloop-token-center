@@ -29,7 +29,7 @@ export function createSemanticViewLoader(credential: string, path: (request: str
   return {
     async page(request, cursor, signal) {
       const value = await api<SemanticViewPage>(url(request, 'cursor', cursor), credential, { signal, cache: 'no-store' });
-      if (!['pending', 'published'].includes(value.status) || !Array.isArray(value.instances)
+      if (!['pending', 'published'].includes(value.status) || !Array.isArray(value.instances) || value.instances.length > 32
         || (value.status === 'published' && (typeof value.manifest_revision !== 'string' || !/^[1-9][0-9]{0,19}$/.test(value.manifest_revision) || BigInt(value.manifest_revision) > 18446744073709551615n))
         || !value.coverage || !Array.isArray(value.coverage.gaps) || !Array.isArray(value.coverage.omissions)) throw new Error('Invalid semantic page');
       const ids = new Set<string>();

@@ -24,7 +24,9 @@ test('semantic viewer reads verified atoms lazily, preserves parts and pages wit
     await page.getByText('tool_result_not_recorded', { exact: true }).waitFor();
     await page.getByRole('button', { name: 'Read message · 2', exact: true }).click();
     await page.getByText('Verified latest answer', { exact: true }).waitFor();
+    await page.getByRole('button', { name: 'Reasoning', exact: true }).click();
     await page.getByText('Separate reasoning', { exact: true }).waitFor();
+    await page.getByRole('button', { name: 'Tool call · lookup', exact: true }).click();
     assert.match(await page.locator('.semantic-atom-content').innerText(), /"query": "structured"/);
     assert.equal(await page.evaluate(() => window.semanticAtomReads), 1);
     await page.getByRole('button', { name: 'Earlier messages', exact: true }).click();
