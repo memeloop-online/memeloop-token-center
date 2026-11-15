@@ -1365,18 +1365,19 @@ pub(crate) async fn archive_session_body(
         // this boundary, without rolling it back or replaying projection.
         crate::db::Database::semantic_coverage_test_boundary("projection_commit_ack")?;
     }
-    if projected && coverage_complete {
-        if let Some(head) = nodes.last() {
-            let binding = state
-                .db
-                .semantic_archive_binding(tenant_id, request_id, &head.node_hash)
-                .await?
-                .ok_or_else(|| AppError::storage("semantic_sql_binding_not_committed"))?;
-            state
-                .archive
-                .confirm_semantic_coverage(&publication, &binding)
-                .await?;
-        }
+    if projected
+        && coverage_complete
+        && let Some(head) = nodes.last()
+    {
+        let binding = state
+            .db
+            .semantic_archive_binding(tenant_id, request_id, &head.node_hash)
+            .await?
+            .ok_or_else(|| AppError::storage("semantic_sql_binding_not_committed"))?;
+        state
+            .archive
+            .confirm_semantic_coverage(&publication, &binding)
+            .await?;
     }
     // Coverage confirmation is a separate durable handoff, not financial ACK
     // and not yet permission to delete raw still held by another retry owner.
