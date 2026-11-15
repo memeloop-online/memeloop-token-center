@@ -77,6 +77,11 @@ async fn page(
 ) -> Result<Response, AppError> {
     let revision = state.db.published_semantic_revision(&scope).await?;
     let Some(revision) = revision else {
+        if query.cursor.is_some() || query.atom_cursor.is_some() {
+            return Err(AppError::Conflict(
+                "semantic publication is no longer bound; refresh this view".into(),
+            ));
+        }
         return Ok((
             [(header::CACHE_CONTROL, "private, no-store")],
             Json(serde_json::json!({
