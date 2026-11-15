@@ -10,7 +10,7 @@ export interface SemanticViewInstance extends SemanticInstanceIdentity {
 }
 export interface SemanticViewPage {
   status: 'pending' | 'published';
-  manifest_revision: number | null;
+  manifest_revision: string | null;
   coverage: SemanticCoverage;
   instances: SemanticViewInstance[];
   next_cursor: string | null;
@@ -29,7 +29,7 @@ export function createSemanticViewLoader(credential: string, path: (request: str
     async page(request, cursor, signal) {
       const value = await api<SemanticViewPage>(url(request, 'cursor', cursor), credential, { signal, cache: 'no-store' });
       if (!['pending', 'published'].includes(value.status) || !Array.isArray(value.instances)
-        || (value.status === 'published' && (!Number.isSafeInteger(value.manifest_revision) || Number(value.manifest_revision) < 1))
+        || (value.status === 'published' && (typeof value.manifest_revision !== 'string' || !/^[1-9][0-9]{0,19}$/.test(value.manifest_revision) || BigInt(value.manifest_revision) > 18446744073709551615n))
         || !value.coverage || !Array.isArray(value.coverage.gaps) || !Array.isArray(value.coverage.omissions)) throw new Error('Invalid semantic page');
       const ids = new Set<string>();
       for (const instance of value.instances) {
@@ -62,7 +62,7 @@ export async function exportSemanticContext(loader: SemanticViewLoader, request:
   signal.throwIfAborted();
   const file = await handle.createWritable();
   const encoder = new TextEncoder();
-  const writeAtom = async (instance: SemanticViewInstance, revision: number) => {
+  const writeAtom = async (instance: SemanticViewInstance, revision: string) => {
     const { atom_cursor: _cursor, ...identity } = instance;
     await file.write(encoder.encode(`${JSON.stringify({ manifest_revision: revision, instance: identity }).slice(0, -1)},"body":`));
     const response = await loader.atom(request, instance.atom_cursor, signal);
@@ -80,7 +80,7 @@ export async function exportSemanticContext(loader: SemanticViewLoader, request:
   };
   try {
     let cursor: string | undefined;
-    let revision: number | undefined;
+    let revision: string | undefined;
     let previousCursor: string | undefined;
     let found = false;
     do {

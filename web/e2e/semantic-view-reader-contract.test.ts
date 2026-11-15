@@ -4,7 +4,7 @@ import { exportSemanticContext, type SemanticViewLoader, type SemanticViewPage }
 import { semanticMessageId } from '../src/semanticConversationIdentity.js';
 
 const instance = { instance_id: 'occurrence-a', request_id: 'request-a', branch_id: 'branch-a', ordinal: 1, atom_hash: 'same-atom', node_hash: 'node-a', atom_cursor: 'signed-a', origin: 'request', terminal_state: 'complete' };
-const page: SemanticViewPage = { status: 'published', manifest_revision: 3,
+const page: SemanticViewPage = { status: 'published', manifest_revision: '18446744073709551615',
   coverage: { observed_terminal: true, projection_state: 'complete', gaps: [], omissions: [] }, instances: [instance], next_cursor: null };
 
 test('identical atom content preserves separate occurrence and revision identities', () => {
@@ -22,7 +22,7 @@ test('stream export aborts a revision change instead of committing a mixed trans
   } });
   let calls = 0;
   const loader: SemanticViewLoader = {
-    page: async () => calls++ === 0 ? { ...page, next_cursor: 'older' } : { ...page, manifest_revision: 4 },
+    page: async () => calls++ === 0 ? { ...page, next_cursor: 'older' } : { ...page, manifest_revision: '18446744073709551614' },
     atom: async () => new Response('{"role":"assistant","parts":[]}'),
   };
   try {

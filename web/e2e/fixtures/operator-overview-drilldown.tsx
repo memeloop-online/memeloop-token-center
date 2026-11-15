@@ -134,7 +134,7 @@ globalThis.fetch = async (input: RequestInfo | URL, init?: RequestInit) => {
   });
   if (url.pathname.endsWith('/semantic-view')) {
     if (url.searchParams.has('atom_cursor')) return json({ role: 'assistant', parts: [{ kind: 'text', text: 'The checklist is ready for review.' }] });
-    return json({ status: 'published', manifest_revision: 1,
+    return json({ status: 'published', manifest_revision: '1',
       coverage: { observed_terminal: true, projection_state: 'complete', gaps: [], omissions: [] },
       instances: [{ instance_id: 'checklist-answer', request_id: drilledRequest.request_id, branch_id: null,
         ordinal: 1, atom_hash: 'a'.repeat(64), node_hash: 'b'.repeat(64), origin: 'return', terminal_state: 'complete', atom_cursor: 'fixture-signed-atom' }], next_cursor: null });

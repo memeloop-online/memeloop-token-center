@@ -187,6 +187,10 @@ async fn page(
         .as_object_mut()
         .ok_or_else(|| AppError::internal("semantic_view_page_shape"))?;
     object.remove("previous");
+    object.insert(
+        "manifest_revision".into(),
+        Value::String(revision.to_string()),
+    );
     object.insert("status".into(), Value::String("published".into()));
     if let Some(instances) = object.get_mut("instances").and_then(Value::as_array_mut) {
         for (instance, token) in instances.iter_mut().zip(atom_tokens) {
@@ -253,6 +257,13 @@ mod tests {
             request_id: Uuid::new_v4(),
             leaf: None,
         }
+    }
+
+    #[test]
+    fn semantic_revision_wire_string_preserves_full_u64() {
+        let value = Value::String(u64::MAX.to_string());
+        let encoded = serde_json::to_string(&value).unwrap();
+        assert_eq!(encoded, "\"18446744073709551615\"");
     }
 
     #[test]
