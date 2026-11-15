@@ -21,6 +21,7 @@ pub(crate) async fn encode(
     archive: ArchiveStore,
     database: Database,
     staging: ArchiveStagingKey,
+    upload: Arc<crate::api::proxy::persistence::Persistence>,
 ) -> Result<Arc<BodyCarrier>, AppError> {
     let capture = CarrierCapture::new(memory, Some(archive.clone()), staging);
     let (value, capture) = match BodyCarrier::encode_normalized_prepaid(value, &previous, capture)?
@@ -31,6 +32,14 @@ pub(crate) async fn encode(
         }
         Err(overflow) => overflow,
     };
+    let upload_memory = upload
+        .stream_memory
+        .temporary_wait(
+            crate::archive::ARCHIVE_MULTIPART_PART_BYTES + 5 * 64 * 1024,
+            super::memory::CAPTURE_MEMORY_WEIGHT,
+        )
+        .await
+        .ok_or_else(|| AppError::internal("normalized_upload_envelope"))?;
     let scope = Arc::new(ScratchScope::new(archive, database, staging)?);
     let (archive, selected) = scope.begin_body_write().await?;
     let writer = archive
@@ -51,6 +60,7 @@ pub(crate) async fn encode(
     let writer_scope = scope.clone();
     let staged = tokio::task::spawn_blocking(move || {
         let _scope = writer_scope;
+        let _upload_memory = upload_memory;
         struct Writer {
             runtime: tokio::runtime::Handle,
             writer: crate::archive::ArchiveWriter,
@@ -65,9 +75,13 @@ pub(crate) async fn encode(
                     return Err(io::Error::other("normalized encoding cancelled"));
                 }
                 let count = input.len().min(self.size);
-                self.runtime
-                    .block_on(self.writer.write(Bytes::copy_from_slice(&input[..count])))
-                    .map_err(|error| io::Error::other(error.to_string()))?;
+                let runtime = self.runtime.clone();
+                runtime.block_on(async {
+                    tokio::select! {
+                        _ = &mut self.cancelled => Err(io::Error::other("normalized encoding cancelled")),
+                        result = self.writer.write(Bytes::copy_from_slice(&input[..count])) => result.map_err(|error| io::Error::other(error.to_string())),
+                    }
+                })?;
                 Ok(count)
             }
             fn flush(&mut self) -> io::Result<()> {
@@ -84,7 +98,13 @@ pub(crate) async fn encode(
         drop(value);
         drop(workspace);
         result.map_err(|_| AppError::storage("normalized_encoding_write_failed"))?;
-        output.runtime.block_on(output.writer.finish_staged())
+        let Writer { runtime, writer, mut cancelled, .. } = output;
+        runtime.block_on(async {
+            tokio::select! {
+                _ = &mut cancelled => Err(AppError::storage("normalized_encoding_cancelled")),
+                result = writer.finish_staged() => result,
+            }
+        })
     })
     .await
     .map_err(|_| AppError::internal("normalized_encoding_join"))??;

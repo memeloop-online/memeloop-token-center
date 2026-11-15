@@ -127,6 +127,7 @@ pub(super) async fn parse_normalized(
             ArchiveStagingPurpose::Request,
             uuid::Uuid::new_v4(),
         )?,
+        state.persistence.clone(),
     )
     .await?;
     let working = match memory.try_reserve_source_json(bytes, nodes) {
