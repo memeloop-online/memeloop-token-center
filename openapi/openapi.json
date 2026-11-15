@@ -4457,26 +4457,60 @@
     },
     "/internal/v1/plugins/mtc-health-intelligence/private-data/concurrency-advice": {
       "get": {
-        "tags": ["System"],
+        "tags": [
+          "System"
+        ],
         "operationId": "getPrivatePluginConcurrencyAdvice",
         "summary": "Read tenant-bound private concurrency observations",
         "description": "Requires an installed Health Intelligence plugin and plugins:read.\nPrivate data additionally requires providers:read and requests:read.\nThe authorized tenant must match the host-provisioned companion tenant.\nReads never trigger collection or modify routing. Responses are private, no-store.\n",
-        "parameters": [{"name": "tenant_external_id", "in": "query", "schema": {"type": "string"}}],
+        "parameters": [
+          {
+            "name": "tenant_external_id",
+            "in": "query",
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
         "responses": {
           "200": {
             "description": "Observations or an explicit unavailable/configuration/permission state",
-            "content": {"application/json": {"schema": {
-              "type": "object",
-              "required": ["state"],
-              "properties": {
-                "state": {"type": "string", "enum": ["ready", "select_tenant", "not_configured", "permission_required", "unavailable"]},
-                "data": {"type": "object", "additionalProperties": true}
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "required": [
+                    "state"
+                  ],
+                  "properties": {
+                    "state": {
+                      "type": "string",
+                      "enum": [
+                        "ready",
+                        "select_tenant",
+                        "not_configured",
+                        "permission_required",
+                        "unavailable"
+                      ]
+                    },
+                    "data": {
+                      "type": "object",
+                      "additionalProperties": true
+                    }
+                  }
+                }
               }
-            }}}
+            }
           },
-          "401": {"$ref": "#/components/responses/Unauthorized"},
-          "403": {"$ref": "#/components/responses/Forbidden"},
-          "404": {"$ref": "#/components/responses/NotFound"}
+          "401": {
+            "$ref": "#/components/responses/Unauthorized"
+          },
+          "403": {
+            "$ref": "#/components/responses/Forbidden"
+          },
+          "404": {
+            "$ref": "#/components/responses/NotFound"
+          }
         }
       }
     },
@@ -13118,60 +13152,140 @@
     },
     "/internal/v1/sessions/{session_id}/requests/{request_id}/training": {
       "get": {
-        "tags": ["Operator traffic"],
+        "tags": [
+          "Operator traffic"
+        ],
         "operationId": "getOperatorSessionTrainingArchive",
         "summary": "Export verified conversation events and durable raw and media references",
         "description": "Reads immutable tenant archive objects. Incomplete captures or missing media fail rather than being labelled complete training data. Raw JSON and SSE can be streamed separately without a document size limit.",
-        "security": [{"serviceBearer": []}],
+        "security": [
+          {
+            "serviceBearer": []
+          }
+        ],
         "x-required-scope": "requests:read",
         "parameters": [
-          {"$ref": "#/components/parameters/ContextSessionId"},
-          {"$ref": "#/components/parameters/RequestIdPath"},
-          {"$ref": "#/components/parameters/TenantFilter"},
-          {"$ref": "#/components/parameters/ContextKeyId"}
+          {
+            "$ref": "#/components/parameters/ContextSessionId"
+          },
+          {
+            "$ref": "#/components/parameters/RequestIdPath"
+          },
+          {
+            "$ref": "#/components/parameters/TenantFilter"
+          },
+          {
+            "$ref": "#/components/parameters/ContextKeyId"
+          }
         ],
         "responses": {
           "200": {
             "description": "NDJSON manifest and event references with descending ordinals. Require the verified end record and EOF; a truncated stream is not a complete export.",
-            "content": {"application/x-ndjson": {"schema": {"type": "string"}}}
+            "content": {
+              "application/x-ndjson": {
+                "schema": {
+                  "type": "string"
+                }
+              }
+            }
           },
-          "400": {"$ref": "#/components/responses/InvalidRequest"},
-          "401": {"$ref": "#/components/responses/Unauthorized"},
-          "403": {"$ref": "#/components/responses/Forbidden"},
-          "404": {"$ref": "#/components/responses/NotFound"},
-          "503": {"description": "Archive is incomplete, inconsistent or unavailable."}
+          "400": {
+            "$ref": "#/components/responses/InvalidRequest"
+          },
+          "401": {
+            "$ref": "#/components/responses/Unauthorized"
+          },
+          "403": {
+            "$ref": "#/components/responses/Forbidden"
+          },
+          "404": {
+            "$ref": "#/components/responses/NotFound"
+          },
+          "503": {
+            "description": "Archive is incomplete, inconsistent or unavailable."
+          }
         }
       }
     },
     "/internal/v1/sessions/{session_id}/requests/{request_id}/training/raw/{side}": {
       "get": {
-        "tags": ["Operator traffic"],
+        "tags": [
+          "Operator traffic"
+        ],
         "operationId": "getOperatorSessionTrainingRaw",
         "summary": "Stream the exact retained raw request or response",
         "description": "Rechecks session ownership and streams the durable object with byte and BLAKE3 verification. Consumers must read to EOF and verify x-content-blake3 and x-content-bytes. This endpoint does not certify that a partial upstream response is a complete dialogue.",
-        "security": [{"serviceBearer": []}],
+        "security": [
+          {
+            "serviceBearer": []
+          }
+        ],
         "x-required-scope": "requests:read",
         "parameters": [
-          {"$ref": "#/components/parameters/ContextSessionId"},
-          {"$ref": "#/components/parameters/RequestIdPath"},
-          {"$ref": "#/components/parameters/TenantFilter"},
-          {"$ref": "#/components/parameters/ContextKeyId"},
-          {"name": "side", "in": "path", "required": true, "schema": {"type": "string", "enum": ["request", "response"]}}
+          {
+            "$ref": "#/components/parameters/ContextSessionId"
+          },
+          {
+            "$ref": "#/components/parameters/RequestIdPath"
+          },
+          {
+            "$ref": "#/components/parameters/TenantFilter"
+          },
+          {
+            "$ref": "#/components/parameters/ContextKeyId"
+          },
+          {
+            "name": "side",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "enum": [
+                "request",
+                "response"
+              ]
+            }
+          }
         ],
         "responses": {
           "200": {
             "description": "Exact JSON or SSE bytes, never an evictable cache reference.",
             "headers": {
-              "x-content-blake3": {"schema": {"type": "string"}},
-              "x-content-bytes": {"schema": {"type": "string"}}
+              "x-content-blake3": {
+                "schema": {
+                  "type": "string"
+                }
+              },
+              "x-content-bytes": {
+                "schema": {
+                  "type": "string"
+                }
+              }
             },
-            "content": {"application/octet-stream": {"schema": {"type": "string", "format": "binary"}}}
+            "content": {
+              "application/octet-stream": {
+                "schema": {
+                  "type": "string",
+                  "format": "binary"
+                }
+              }
+            }
           },
-          "400": {"$ref": "#/components/responses/InvalidRequest"},
-          "401": {"$ref": "#/components/responses/Unauthorized"},
-          "403": {"$ref": "#/components/responses/Forbidden"},
-          "404": {"$ref": "#/components/responses/NotFound"},
-          "503": {"description": "Archive is inconsistent or unavailable."}
+          "400": {
+            "$ref": "#/components/responses/InvalidRequest"
+          },
+          "401": {
+            "$ref": "#/components/responses/Unauthorized"
+          },
+          "403": {
+            "$ref": "#/components/responses/Forbidden"
+          },
+          "404": {
+            "$ref": "#/components/responses/NotFound"
+          },
+          "503": {
+            "description": "Archive is inconsistent or unavailable."
+          }
         }
       }
     },
@@ -17031,6 +17145,152 @@
           }
         }
       }
+    },
+    "/internal/v1/sessions/{session_id}/requests/{request_id}/semantic-view": {
+      "get": {
+        "tags": [
+          "Operator traffic"
+        ],
+        "operationId": "getOperatorSessionSemanticView",
+        "summary": "Read a verified semantic manifest page or anchored atom stream",
+        "description": "Ownership is checked on every read. No published root returns explicit pending coverage. Revisions are lossless decimal u64 strings; continuations bind tenant, request, revision and instance. No raw fallback.",
+        "security": [
+          {
+            "serviceBearer": []
+          }
+        ],
+        "parameters": [
+          {
+            "$ref": "#/components/parameters/ContextSessionId"
+          },
+          {
+            "$ref": "#/components/parameters/RequestIdPath"
+          },
+          {
+            "$ref": "#/components/parameters/TenantFilter"
+          },
+          {
+            "$ref": "#/components/parameters/ContextKeyId"
+          },
+          {
+            "name": "cursor",
+            "in": "query",
+            "required": false,
+            "description": "Signed fixed-revision page continuation; mutually exclusive with atom_cursor.",
+            "schema": {
+              "type": "string",
+              "maxLength": 16384
+            }
+          },
+          {
+            "name": "atom_cursor",
+            "in": "query",
+            "required": false,
+            "description": "Signed manifest-anchored instance capability; returns verified JSON atom stream.",
+            "schema": {
+              "type": "string",
+              "maxLength": 16384
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Published or pending semantic page, or verified atom JSON stream selected by atom_cursor.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "additionalProperties": true
+                }
+              }
+            }
+          },
+          "400": {
+            "$ref": "#/components/responses/InvalidRequest"
+          },
+          "401": {
+            "$ref": "#/components/responses/Unauthorized"
+          },
+          "404": {
+            "$ref": "#/components/responses/NotFound"
+          },
+          "409": {
+            "description": "Publication revision changed or no longer has a bound semantic root."
+          },
+          "403": {
+            "$ref": "#/components/responses/Forbidden"
+          }
+        },
+        "x-required-scope": "requests:read"
+      }
+    },
+    "/self/v1/sessions/{session_id}/requests/{request_id}/semantic-view": {
+      "get": {
+        "tags": [
+          "Self service"
+        ],
+        "operationId": "getSelfSessionSemanticView",
+        "summary": "Read a verified semantic manifest page or anchored atom stream",
+        "description": "Ownership is checked on every read. No published root returns explicit pending coverage. Revisions are lossless decimal u64 strings; continuations bind tenant, request, revision and instance. No raw fallback.",
+        "security": [
+          {
+            "clientBearer": []
+          }
+        ],
+        "parameters": [
+          {
+            "$ref": "#/components/parameters/ContextSessionId"
+          },
+          {
+            "$ref": "#/components/parameters/RequestIdPath"
+          },
+          {
+            "name": "cursor",
+            "in": "query",
+            "required": false,
+            "description": "Signed fixed-revision page continuation; mutually exclusive with atom_cursor.",
+            "schema": {
+              "type": "string",
+              "maxLength": 16384
+            }
+          },
+          {
+            "name": "atom_cursor",
+            "in": "query",
+            "required": false,
+            "description": "Signed manifest-anchored instance capability; returns verified JSON atom stream.",
+            "schema": {
+              "type": "string",
+              "maxLength": 16384
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Published or pending semantic page, or verified atom JSON stream selected by atom_cursor.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "additionalProperties": true
+                }
+              }
+            }
+          },
+          "400": {
+            "$ref": "#/components/responses/InvalidRequest"
+          },
+          "401": {
+            "$ref": "#/components/responses/Unauthorized"
+          },
+          "404": {
+            "$ref": "#/components/responses/NotFound"
+          },
+          "409": {
+            "description": "Publication revision changed or no longer has a bound semantic root."
+          }
+        }
+      }
     }
   },
   "components": {
@@ -19726,12 +19986,23 @@
             "type": "object",
             "description": "Local plugin availability; does not determine core gateway readiness.",
             "properties": {
-              "ready": { "type": "boolean" },
-              "error": { "type": ["string", "null"] },
+              "ready": {
+                "type": "boolean"
+              },
+              "error": {
+                "type": [
+                  "string",
+                  "null"
+                ]
+              },
               "revision": {
                 "oneOf": [
-                  { "$ref": "#/components/schemas/ApplicationPluginRevision" },
-                  { "type": "null" }
+                  {
+                    "$ref": "#/components/schemas/ApplicationPluginRevision"
+                  },
+                  {
+                    "type": "null"
+                  }
                 ]
               }
             }
