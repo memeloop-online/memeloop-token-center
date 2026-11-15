@@ -1596,7 +1596,9 @@ mod tests {
         );
         assert!(!manifest.coverage.observed_terminal);
         let atom = atom_document(&store, tenant, &prepared.atoms[0]).await;
-        assert!(atom.to_string().contains("https://"));
+        assert!(atom.to_string().contains(&prepared.media[0].content_blake3));
+        // Uncaptured external media remains a gap; the exact original URL is
+        // retained in raw rather than claimed to be a captured atom payload.
         assert_eq!(store.get(&locator).await.unwrap(), original);
     }
 
