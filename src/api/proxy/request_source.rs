@@ -56,8 +56,8 @@ pub(super) async fn parse_with_shape(
     required_bytes: usize,
     required_nodes: usize,
 ) -> Result<Value, AppError> {
-    // Upload and parse both reopen the complete local file. Neither needs the
-    // resident cache to remain charged while JSON admission waits.
+    // The carrier keeps the complete source. Reclaim the legacy resident cache;
+    // only offload the carrier if the JSON workspace cannot fit alongside it.
     source.release_local_retained();
     let bytes = source.len().max(required_bytes);
     let nodes = source.json_nodes().max(required_nodes);
@@ -104,9 +104,8 @@ pub(super) async fn parse_with_shape(
     })
 }
 
-/// The normalized replay is private, local and independent of the canonical
-/// archive source. Moving the tree into this function ensures none survives
-/// when its caller releases the old JSON admission and waits to parse again.
+/// The normalized replay shares the carrier's RAM/object ownership. Moving the
+/// tree here lets encoding transfer its prepaid JSON credit before reparsing.
 pub(super) async fn parse_normalized(
     value: Value,
     state: &crate::AppState,
@@ -190,24 +189,38 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn local_spill_parses_without_an_archive_upload() {
+    async fn ram_carrier_parses_without_an_archive_upload() {
         let value = serde_json::json!({"model": "test", "input": "x".repeat(96 * 1024)});
         let body = Bytes::from(serde_json::to_vec(&value).unwrap());
         let admission = RequestSpoolAdmission::new(std::env::temp_dir());
-        let exhausted = ProxyMemoryBudget::new(0);
-        let source = admission
-            .capture_with_memory(
-                axum::body::Body::from(body.clone()),
-                body.len(),
-                Some(body.len()),
-                Some(&exhausted.reservation()),
-                0,
-                None,
-            )
-            .await
-            .unwrap();
-        let memory = ProxyMemoryBudget::new(1024 * 1024).reservation();
-        assert_eq!(parse(Arc::new(source), memory).await.unwrap(), value);
+        let budget = ProxyMemoryBudget::new(1024 * 1024);
+        let memory = budget.reservation();
+        let source = Arc::new(
+            admission
+                .capture_with_memory(
+                    axum::body::Body::from(body.clone()),
+                    body.len(),
+                    Some(body.len()),
+                    Some(&memory),
+                    0,
+                    None,
+                )
+                .await
+                .unwrap(),
+        );
+        assert!(budget.snapshot().0 >= body.len());
+        assert_eq!(parse(source.clone(), memory.clone()).await.unwrap(), value);
+        assert!(
+            source
+                .carrier()
+                .unwrap()
+                .sealed_staged_reference()
+                .is_none()
+        );
+        assert_eq!(source.read_all().await.unwrap(), body);
+        drop(source);
+        drop(memory);
+        assert_eq!(budget.snapshot().0, 0);
     }
 
     #[tokio::test]
