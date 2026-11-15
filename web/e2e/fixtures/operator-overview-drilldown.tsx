@@ -132,6 +132,13 @@ globalThis.fetch = async (input: RequestInfo | URL, init?: RequestInit) => {
       session_context: { session_id: realSession, association: 'confirmed', session_name: 'Named Codex conversation', task_kind: 'interactive', agent_id: 'codex', semantics_source: 'declared' } }],
     edges: [], has_more: false, next_cursor: null, edges_truncated: false,
   });
+  if (url.pathname.endsWith('/semantic-view')) {
+    if (url.searchParams.has('atom_cursor')) return json({ role: 'assistant', parts: [{ kind: 'text', text: 'The checklist is ready for review.' }] });
+    return json({ status: 'published', manifest_revision: 1,
+      coverage: { observed_terminal: true, projection_state: 'complete', gaps: [], omissions: [] },
+      instances: [{ instance_id: 'checklist-answer', request_id: drilledRequest.request_id, branch_id: null,
+        ordinal: 1, atom_hash: 'a'.repeat(64), node_hash: 'b'.repeat(64), origin: 'return', terminal_state: 'complete', atom_cursor: 'fixture-signed-atom' }], next_cursor: null });
+  }
   if (url.pathname === `/internal/v1/sessions/${realSession}/relationships`) return json({ relationships: [] });
   if (url.pathname === `/internal/v1/sessions/${realSession}/title`) return json({ title: 'Named Codex conversation', state: 'ready', error_code: null, updated_at: now, source: 'manual', revision: 1 });
   if (url.pathname === `/internal/v1/sessions/${realSession}/requests/${drilledRequest.request_id}/context`) return json({

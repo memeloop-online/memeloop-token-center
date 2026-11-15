@@ -76,6 +76,10 @@ if (new URLSearchParams(location.search).has('titles')) {
 window.fetch = async (input, init) => {
   const url = String(input);
   const requestUrl = new URL(url, location.origin);
+  if (requestUrl.pathname.endsWith('/semantic-view')) return new Response(JSON.stringify({
+    status: 'pending', manifest_revision: null, instances: [], next_cursor: null,
+    coverage: { observed_terminal: false, projection_state: 'partial', gaps: ['semantic_publication_pending'], omissions: [] },
+  }), { headers: { 'content-type': 'application/json' } });
   if (requestUrl.pathname.endsWith('/title')) {
     return new Response(JSON.stringify({ title: null, state: 'unavailable', error_code: null, updated_at: null }));
   }
