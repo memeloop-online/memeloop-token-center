@@ -1193,19 +1193,17 @@ fn publish_durable(shared: &Arc<SharedBody>) {
                                     source.digest,
                                 )
                                 .await;
-                            if let Some(carrier) = &source.carrier {
-                                // The immutable raw root now durably owns this
-                                // exact object even while SQL binding waits.
-                                if let Ok(archive) = database.body_archive() {
-                                    if carrier
-                                        .handoff_verified_publication(archive.clone(), object)
-                                        .is_err()
-                                    {
-                                        tracing::error!(
-                                            "request source durable handoff identity mismatch; retaining RAM"
-                                        );
-                                    }
-                                }
+                            // The immutable raw root now durably owns this
+                            // exact object even while SQL binding waits.
+                            if let Some(carrier) = &source.carrier
+                                && let Ok(archive) = database.body_archive()
+                                && carrier
+                                    .handoff_verified_publication(archive.clone(), object)
+                                    .is_err()
+                            {
+                                tracing::error!(
+                                    "request source durable handoff identity mismatch; retaining RAM"
+                                );
                             }
                         }
                         let permit = if success {
