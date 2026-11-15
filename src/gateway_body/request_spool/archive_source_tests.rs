@@ -56,7 +56,10 @@ async fn archive_source_survives_request_drop_without_pinning_upload_bytes_on_da
     drop(raw);
     source.release_retained();
     drop(memory);
-    assert_eq!(budget.snapshot().0, 0, "local file owns the pending upload");
+    assert!(
+        budget.snapshot().0 >= body.len(),
+        "the pending RAM carrier must keep its real credit"
+    );
     release.send(()).unwrap();
     assert!(
         tokio::time::timeout(Duration::from_secs(1), source.upload_outcome())
@@ -80,33 +83,27 @@ async fn archive_source_survives_request_drop_without_pinning_upload_bytes_on_da
 }
 
 #[tokio::test]
-async fn pending_sources_share_one_budget_and_later_upload_spills_without_a_queue_limit() {
+async fn pending_sources_keep_last_reader_credit_and_cancel_a_pressure_waiter() {
     let directory = tempfile::tempdir().unwrap();
     let store = MemoryObjectStore::new();
     let release = store.pause_next_write();
     let admission =
         RequestSpoolAdmission::new(directory.path().to_owned()).with_memory_store(store.clone());
-    // Leave room for the first body plus its 64 KiB capture metadata
-    // and structs. At 192 KiB the first capture would also spill, so this
-    // fixture could not exercise the shared resident byte owner.
-    let budget = ProxyMemoryBudget::new(256 * 1024);
+    let budget = Arc::new(ProxyMemoryBudget::new(256 * 1024));
     let first_memory = budget.reservation();
-    let second_memory = budget.reservation();
+    let first_body = Bytes::from(vec![b'a'; 128 * 1024]);
     let first = Arc::new(
-        tokio::time::timeout(
-            Duration::from_secs(1),
-            admission.capture_with_memory(
-                Body::from(vec![b'a'; 128 * 1024]),
-                128 * 1024,
+        admission
+            .capture_with_memory(
+                Body::from(first_body.clone()),
+                first_body.len(),
                 None,
                 Some(&first_memory),
                 0,
                 Some(&uuid::Uuid::now_v7().to_string()),
-            ),
-        )
-        .await
-        .expect("the first capture must stay resident before its upload is released")
-        .unwrap(),
+            )
+            .await
+            .unwrap(),
     );
     tokio::time::timeout(Duration::from_secs(1), async {
         while store.entered_writes.load(Ordering::Acquire) == 0 {
@@ -117,62 +114,46 @@ async fn pending_sources_share_one_budget_and_later_upload_spills_without_a_queu
     .unwrap();
     assert!(!first.durable_settled_for_test());
     let raw = first.read_all().await.unwrap();
+    assert_eq!(raw, first_body);
     let shared = first.shared_bytes(raw.clone());
     assert_eq!(raw.as_ptr(), shared.as_ptr());
     let pending_bytes = budget.snapshot().0;
-    assert!(pending_bytes > raw.len());
-    let release_second = store.pause_next_write();
-    let second = tokio::time::timeout(
-        Duration::from_secs(1),
-        admission.capture_with_memory(
-            Body::from(vec![b'b'; 256 * 1024]),
-            256 * 1024,
-            None,
-            Some(&second_memory),
-            0,
-            Some(&uuid::Uuid::now_v7().to_string()),
-        ),
-    )
-    .await
-    .expect("a later upload must spill without waiting for the pending upload")
-    .unwrap();
-    assert!(!second.durable_settled_for_test());
-    assert_eq!(
-        tokio::time::timeout(Duration::from_secs(1), second.read_all())
+    assert!(pending_bytes >= first_body.len());
+    let second_memory = budget.reservation();
+    let active_memory = second_memory.clone();
+    let active_admission = admission.clone();
+    let (polled, first_poll) = tokio::sync::oneshot::channel();
+    let input = Body::from_stream(futures_util::stream::once(async move {
+        let _ = polled.send(());
+        Ok::<_, std::convert::Infallible>(Bytes::from(vec![b'b'; 256 * 1024]))
+    }));
+    let capture = tokio::spawn(async move {
+        active_admission
+            .capture_with_memory(input, 256 * 1024, None, Some(&active_memory), 0, None)
             .await
-            .unwrap()
-            .unwrap(),
-        Bytes::from(vec![b'b'; 256 * 1024])
-    );
-    assert_eq!(
-        store.reads.load(Ordering::Acquire),
-        0,
-        "read the local spill"
-    );
-    release_second.send(()).unwrap();
-    assert!(second.upload_outcome().await);
-    assert!(second.durable_settled_for_test());
-    assert!(!first.durable_settled_for_test());
-    assert_eq!(first.read_all().await.unwrap().as_ptr(), shared.as_ptr());
-    assert_eq!(store.reads.load(Ordering::Acquire), 0);
+    });
+    first_poll.await.unwrap();
+    assert!(!capture.is_finished());
+    assert!(budget.snapshot().0 <= budget.snapshot().1);
+    capture.abort();
+    assert!(capture.await.unwrap_err().is_cancelled());
+    drop(second_memory);
     assert_eq!(budget.snapshot().0, pending_bytes);
-    assert!(pending_bytes <= budget.snapshot().1);
-    assert_eq!(admission.snapshot().used_bytes, 128 * 1024);
+    assert_eq!(first.read_all().await.unwrap(), first_body);
+    assert!(!first.durable_settled_for_test());
     release.send(()).unwrap();
     assert!(
         tokio::time::timeout(Duration::from_secs(1), first.upload_outcome())
             .await
-            .expect("the pending upload must settle after release")
+            .unwrap()
     );
     drop(raw);
     drop(first);
-    drop(second);
     drop(first_memory);
-    drop(second_memory);
     assert_eq!(
         budget.snapshot().0,
         pending_bytes,
-        "shared bytes own the source"
+        "the last shared reader still owns the source"
     );
     drop(shared);
     tokio::time::timeout(Duration::from_secs(1), async {
@@ -181,7 +162,7 @@ async fn pending_sources_share_one_budget_and_later_upload_spills_without_a_queu
         }
     })
     .await
-    .expect("all source owners must release their shared budget and leases");
+    .expect("all real source owners release their credit and leases");
     assert_eq!(admission.snapshot().used_bytes, 0);
 }
 
@@ -272,10 +253,9 @@ async fn failed_source_retries_the_original_bytes_without_releasing_their_budget
     source.release_retained();
     drop(source);
     drop(memory);
-    assert_eq!(
-        budget.snapshot().0,
-        0,
-        "failed archive retries retain the local file, not raw memory"
+    assert!(
+        budget.snapshot().0 >= 128 * 1024,
+        "failed object writes must retain the only RAM source and its real credit"
     );
     drop(held);
     store.fail_writes.store(false, Ordering::Release);
