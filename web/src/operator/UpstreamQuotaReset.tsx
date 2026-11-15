@@ -212,7 +212,7 @@ export function UpstreamQuotaReset({ accountId, accountName, tenant, token, snap
   </>;
   return <div className="upstream-quota-reset-action">
     {confirmationDialog}
-    {!operation && <button type="button" className="danger" disabled={busy || !capability.prepare_available || error === 'status-unavailable'} onClick={() => void prepare()}>{t('quota.resetAction')}</button>}
+    {!operation && <Button type="button" appearance="primary" className="quota-reset-danger" disabled={busy || !capability.prepare_available || error === 'status-unavailable'} onClick={() => void prepare()}>{t('quota.resetAction')}</Button>}
     {settled && <p role="status" title={t('quota.resetSettledDetail')}>{t('quota.resetSettled', {
       available: settled.available ?? '—', applicable: settled.applicable ?? '—',
     })}</p>}
@@ -224,9 +224,9 @@ export function UpstreamQuotaReset({ accountId, accountName, tenant, token, snap
       {operation.quota_refresh_status === 'pending' && <p>{t('quota.resetReadbackPending')}</p>}
       <Disclosure title={t('quota.resetOperationDetails')}>{operationDetails}</Disclosure>
       <div className="button-row">
-        {(recoveryError || error || operation.state === 'prepared' && !secret.current) && <button type="button" className="secondary" disabled={busy} onClick={() => void inspect(false)}>{t('quota.resetCheckStatus')}</button>}
-        {operation.state === 'prepared' && secret.current && <button type="button" className="danger" disabled={busy || operation.expires_at <= now} onClick={() => void retryConfirmation()}>{t('quota.resetRetryConfirmation')}</button>}
-        {dispatchState && !recoverable && !unlocked && <button type="button" className="secondary" disabled={busy} onClick={() => void inspect(true)}>{t('quota.resetReconcile')}</button>}
+        {(recoveryError || error || operation.state === 'prepared' && !secret.current) && <Button type="button" appearance="secondary" disabled={busy} onClick={() => void inspect(false)}>{t('quota.resetCheckStatus')}</Button>}
+        {operation.state === 'prepared' && secret.current && <Button type="button" appearance="primary" className="quota-reset-danger" disabled={busy || operation.expires_at <= now} onClick={() => void retryConfirmation()}>{t('quota.resetRetryConfirmation')}</Button>}
+        {dispatchState && !recoverable && !unlocked && <Button type="button" appearance="secondary" disabled={busy} onClick={() => void inspect(true)}>{t('quota.resetReconcile')}</Button>}
       </div>
       {recoverable && <Button appearance="secondary" disabled={busy || recoveryError === 'stale' || recoveryError === 'forbidden'} onClick={() => void recover()}>{t('quota.recoverAction')}</Button>}
       {unlocked && <Button appearance="primary" disabled={busy} onClick={() => { setOperation(undefined); setReleased(false); setRecoveryError(undefined); }}>{t('quota.recoverContinue')}</Button>}
