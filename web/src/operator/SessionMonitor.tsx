@@ -1,3 +1,4 @@
+import { createSemanticViewLoader } from '../semanticViewReader.js';
 import { useCallback, useEffect, useMemo, useRef, useState, type RefObject } from 'react';
 import { createSessionContextLoader } from '../sessionContextReader.js';
 import { api, apiRead } from '../api.js';
@@ -173,6 +174,11 @@ export function SessionMonitor({ token, tenant, revision, eventKeyIds, eventOver
     const params = new URLSearchParams({ key_id: selected.key_id });
     if (tenant) params.set('tenant_external_id', tenant);
     return `/internal/v1/sessions/${encodeURIComponent(selected.session_id)}/requests/${encodeURIComponent(requestId)}/context${content ? '/content' : ''}?${params}`;
+  }) : undefined, [selected?.session_id, selected?.key_id, token, tenant]);
+  const semanticLoader = useMemo(() => selected ? createSemanticViewLoader(token, requestId => {
+    const params = new URLSearchParams({ key_id: selected.key_id });
+    if (tenant) params.set('tenant_external_id', tenant);
+    return `/internal/v1/sessions/${encodeURIComponent(selected.session_id)}/requests/${encodeURIComponent(requestId)}/semantic-view?${params}`;
   }) : undefined, [selected?.session_id, selected?.key_id, token, tenant]);
   const detailRef = useRef<LogicalSessionDetail | undefined>(detail);
   filtersRef.current = filters;
@@ -823,7 +829,7 @@ export function SessionMonitor({ token, tenant, revision, eventKeyIds, eventOver
       <div className="session-detail-region">
         {!visibleDetail && detailLoading && <div className="session-detail-skeleton" role="status" aria-label={t('common.loading')}><i /><i /><i /><i /></div>}
         {!visibleDetail && !detailLoading && <div className="empty">{selected && visibleError ? <button type="button" className="secondary" onClick={() => void selectSession(selected)}>{t('sessions.retryLoad')}</button> : t('sessions.selectHint')}</div>}
-        {visibleDetail && <SessionDetailSurface detail={visibleDetail} summary={selected} showDiagnosticIds loading={detailLoading} onLoadOlder={() => void loadEarlier()} loadReplayArchive={loadReplayArchive} loadArchiveRange={loadArchiveRange} contextLoader={contextLoader}
+        {visibleDetail && <SessionDetailSurface detail={visibleDetail} summary={selected} showDiagnosticIds loading={detailLoading} onLoadOlder={() => void loadEarlier()} loadReplayArchive={loadReplayArchive} loadArchiveRange={loadArchiveRange} contextLoader={contextLoader} semanticLoader={semanticLoader}
           backNav={<p className="session-origin-nav"><Button appearance="transparent" className="table-link" onClick={returnFromDetail}><span aria-hidden="true">←</span> {t(returnOrigin ? 'sessions.backToRequest' : 'sessions.backToList')}</Button></p>}
           parentNav={selectedParent ? <p className="session-parent-nav"><Button appearance="transparent" className="table-link"
             onClick={() => openSessionIdentity(selectedParent.identity)}>{t('sessions.rel.backToParent', { name: selectedParent.label })}</Button></p> : undefined}

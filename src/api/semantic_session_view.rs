@@ -6,8 +6,10 @@ use crate::{
 };
 use axum::{
     Json,
+    body::Body,
     extract::{Path, Query, State},
-    http::HeaderMap,
+    http::{HeaderMap, header},
+    response::{IntoResponse, Response},
 };
 use base64::{Engine as _, engine::general_purpose::URL_SAFE_NO_PAD};
 use serde::{Deserialize, Serialize};
@@ -19,6 +21,7 @@ pub(super) struct SemanticViewQuery {
     tenant_external_id: Option<String>,
     key_id: Option<Uuid>,
     cursor: Option<String>,
+    atom_cursor: Option<String>,
 }
 #[derive(Serialize, Deserialize)]
 struct Continuation {
@@ -27,7 +30,8 @@ struct Continuation {
     session_id: Uuid,
     request_id: Uuid,
     revision: u64,
-    page: CasArchiveObject,
+    page: Option<CasArchiveObject>,
+    instance_id: Option<String>,
 }
 const DOMAIN: &str = "mtc-semantic-view-v2:";
 fn invalid() -> AppError {
@@ -70,8 +74,47 @@ async fn page(
     state: &AppState,
     scope: SessionContextScope,
     query: SemanticViewQuery,
-) -> Result<Json<Value>, AppError> {
+) -> Result<Response, AppError> {
     let revision = state.db.published_semantic_revision(&scope).await?;
+    let Some(revision) = revision else {
+        return Ok(Json(serde_json::json!({
+            "status": "pending", "manifest_revision": null,
+            "coverage": {"observed_terminal": false, "projection_state": "partial",
+                         "gaps": ["semantic_publication_pending"], "omissions": []},
+            "instances": [], "next_cursor": null
+        }))
+        .into_response());
+    };
+    if query.cursor.is_some() && query.atom_cursor.is_some() {
+        return Err(invalid());
+    }
+    if let Some(token) = query.atom_cursor.as_deref() {
+        let position = decode(token, &scope, state.config.key_pepper.as_bytes())?;
+        if position.revision != revision {
+            return Err(AppError::Conflict(
+                "semantic manifest revision changed; refresh this view".into(),
+            ));
+        }
+        let instance = position.instance_id.as_deref().ok_or_else(invalid)?;
+        let download = state
+            .archive
+            .open_semantic_view_atom(
+                scope.tenant_id,
+                scope.request_id,
+                revision,
+                position.page.as_ref(),
+                instance,
+            )
+            .await?;
+        return Ok((
+            [
+                (header::CONTENT_TYPE, "application/json"),
+                (header::CACHE_CONTROL, "private, no-store"),
+            ],
+            Body::from_stream(download.stream),
+        )
+            .into_response());
+    }
     let continuation = query
         .cursor
         .as_deref()
@@ -79,7 +122,7 @@ async fn page(
         .transpose()?;
     if continuation
         .as_ref()
-        .is_some_and(|value| value.revision != revision)
+        .is_some_and(|value| value.revision != revision || value.instance_id.is_some())
     {
         return Err(AppError::Conflict(
             "semantic manifest revision changed; refresh this view".into(),
@@ -91,7 +134,7 @@ async fn page(
             scope.tenant_id,
             scope.request_id,
             revision,
-            continuation.as_ref().map(|value| &value.page),
+            continuation.as_ref().and_then(|value| value.page.as_ref()),
         )
         .await?;
     let cursor = page
@@ -105,31 +148,59 @@ async fn page(
                     session_id: scope.session_id,
                     request_id: scope.request_id,
                     revision,
-                    page: previous.clone(),
+                    page: Some(previous.clone()),
+                    instance_id: None,
                 },
                 state.config.key_pepper.as_bytes(),
             )
         })
         .transpose()?;
+    let atom_tokens = page
+        .instances
+        .iter()
+        .map(|instance| {
+            encode(
+                &Continuation {
+                    tenant_id: scope.tenant_id,
+                    key_id: scope.key_id,
+                    session_id: scope.session_id,
+                    request_id: scope.request_id,
+                    revision,
+                    page: continuation.as_ref().and_then(|value| value.page.clone()),
+                    instance_id: Some(instance.instance_id.clone()),
+                },
+                state.config.key_pepper.as_bytes(),
+            )
+        })
+        .collect::<Result<Vec<_>, _>>()?;
     let mut body =
         serde_json::to_value(page).map_err(|_| AppError::internal("semantic_view_page_encode"))?;
     let object = body
         .as_object_mut()
         .ok_or_else(|| AppError::internal("semantic_view_page_shape"))?;
     object.remove("previous");
+    object.insert("status".into(), Value::String("published".into()));
+    if let Some(instances) = object.get_mut("instances").and_then(Value::as_array_mut) {
+        for (instance, token) in instances.iter_mut().zip(atom_tokens) {
+            if let Some(instance) = instance.as_object_mut() {
+                instance.remove("body");
+                instance.insert("atom_cursor".into(), Value::String(token));
+            }
+        }
+    }
     object.insert(
         "next_cursor".into(),
         serde_json::to_value(cursor)
             .map_err(|_| AppError::internal("semantic_view_cursor_shape"))?,
     );
-    Ok(Json(body))
+    Ok(([(header::CACHE_CONTROL, "private, no-store")], Json(body)).into_response())
 }
 pub(super) async fn internal_semantic_view(
     State(state): State<AppState>,
     headers: HeaderMap,
     Path((session_id, request_id)): Path<(Uuid, Uuid)>,
     Query(query): Query<SemanticViewQuery>,
-) -> Result<Json<Value>, AppError> {
+) -> Result<Response, AppError> {
     let service = require_service(&headers, &state, "requests:read").await?;
     let tenant = management_tenant(&service, query.tenant_external_id.clone())?
         .ok_or_else(|| AppError::BadRequest("tenant_external_id is required".into()))?;
@@ -147,7 +218,7 @@ pub(super) async fn self_semantic_view(
     headers: HeaderMap,
     Path((session_id, request_id)): Path<(Uuid, Uuid)>,
     Query(query): Query<SemanticViewQuery>,
-) -> Result<Json<Value>, AppError> {
+) -> Result<Response, AppError> {
     let key = authenticate_downstream(&headers, &state).await?;
     let scope = state
         .db
