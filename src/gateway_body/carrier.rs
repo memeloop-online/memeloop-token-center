@@ -85,9 +85,83 @@ pub(crate) struct BodyCarrier {
     digest: String,
     owned_objects: Mutex<Vec<(CarrierObjectOwner, bool)>>,
     _external_owner: Option<Arc<dyn Send + Sync>>,
+    published: Mutex<Option<Arc<BodyCarrier>>>,
+    readers: std::sync::atomic::AtomicUsize,
+}
+
+struct CarrierReadOwner(Arc<BodyCarrier>);
+impl Drop for CarrierReadOwner {
+    fn drop(&mut self) {
+        if self
+            .0
+            .readers
+            .fetch_sub(1, std::sync::atomic::Ordering::AcqRel)
+            == 1
+        {
+            self.0.release_published_ram();
+        }
+    }
 }
 
 impl BodyCarrier {
+    fn read_owner(self: &Arc<Self>) -> CarrierReadOwner {
+        self.readers
+            .fetch_add(1, std::sync::atomic::Ordering::AcqRel);
+        CarrierReadOwner(self.clone())
+    }
+
+    fn release_published_ram(&self) {
+        if self.readers.load(std::sync::atomic::Ordering::Acquire) != 0
+            || self.published.lock().unwrap().is_none()
+        {
+            return;
+        }
+        for segment in &self.segments {
+            let mut segment = segment.lock().unwrap();
+            if matches!(&*segment, Segment::Ram(_)) {
+                *segment = Segment::Ram(Bytes::new());
+            }
+        }
+    }
+
+    /// The caller has confirmed this exact content and registered its durable
+    /// publication owner. No upload or cleanup ownership is created here.
+    /// Readers already using RAM finish against the original segmentation;
+    /// later readers use the durable reference. External Bytes keep real leases.
+    pub(crate) fn handoff_verified_publication(
+        self: &Arc<Self>,
+        archive: ArchiveStore,
+        reference: crate::archive::CasArchiveObject,
+    ) -> Result<(), AppError> {
+        if reference.size_bytes != self.length || reference.blake3_digest != self.digest {
+            return Err(AppError::storage("carrier_publication_identity_mismatch"));
+        }
+        let staged = StagedArchiveObject {
+            object_locator: reference.object_locator,
+            size_bytes: reference.size_bytes,
+            blake3_digest: reference.blake3_digest,
+        };
+        let replacement = Arc::new(Self {
+            memory: self.memory.clone(),
+            archive: Some(archive),
+            staging: self.staging,
+            segments: vec![Mutex::new(Segment::Object(staged.clone()))],
+            offload: tokio::sync::Mutex::new(()),
+            sealed_reference: Some(staged),
+            parent: None,
+            allocations: Mutex::new(Vec::new()),
+            length: self.length,
+            digest: self.digest.clone(),
+            owned_objects: Mutex::new(Vec::new()),
+            _external_owner: None,
+            published: Mutex::new(None),
+            readers: std::sync::atomic::AtomicUsize::new(0),
+        });
+        *self.published.lock().unwrap() = Some(replacement);
+        self.release_published_ram();
+        Ok(())
+    }
+
     /// Count first, then encode into an exactly preallocated destination while
     /// the old JSON envelope still owns both IR and serialization workspace.
     /// A non-fitting value is returned intact for the streaming object path.
@@ -152,6 +226,8 @@ impl BodyCarrier {
             digest,
             owned_objects: Mutex::new(Vec::new()),
             _external_owner: None,
+            published: Mutex::new(None),
+            readers: std::sync::atomic::AtomicUsize::new(0),
         };
         let owned = source.leased_bytes(Bytes::from(encoded), lease, None);
         let mut source = source;
@@ -195,6 +271,8 @@ impl BodyCarrier {
             allocations: Mutex::new(Vec::new()),
             owned_objects: Mutex::new(Vec::new()),
             _external_owner: Some(owner),
+            published: Mutex::new(None),
+            readers: std::sync::atomic::AtomicUsize::new(0),
         }))
     }
 
@@ -226,6 +304,8 @@ impl BodyCarrier {
             digest: String::new(),
             owned_objects: Mutex::new(Vec::new()),
             _external_owner: None,
+            published: Mutex::new(None),
+            readers: std::sync::atomic::AtomicUsize::new(0),
         };
         let mut hash = blake3::Hasher::new();
         futures_util::pin_mut!(input);
@@ -496,14 +576,19 @@ impl BodyCarrier {
     }
 
     pub(crate) fn open_stream(self: &Arc<Self>) -> CarrierStream {
+        let reader = self.read_owner();
+        let published = self.published.lock().unwrap().clone();
+        if let Some(published) = published {
+            return published.open_stream();
+        }
         let source = self.clone();
         Box::pin(stream::unfold(
-            (source, 0usize, None::<CarrierStream>),
-            |(source, mut index, mut remote)| async move {
+            (source, 0usize, None::<CarrierStream>, reader),
+            |(source, mut index, mut remote, reader)| async move {
                 loop {
                     if let Some(stream) = &mut remote {
                         if let Some(chunk) = stream.next().await {
-                            return Some((chunk, (source, index, remote)));
+                            return Some((chunk, (source, index, remote, reader)));
                         }
                         remote = None;
                     }
@@ -511,14 +596,14 @@ impl BodyCarrier {
                     index += 1;
                     match &segment {
                         Segment::Ram(bytes) => {
-                            return Some((Ok(bytes.clone()), (source, index, remote)));
+                            return Some((Ok(bytes.clone()), (source, index, remote, reader)));
                         }
                         Segment::Object(reference) => {
                             let Some(archive) = &source.archive else {
                                 let end = source.segments.len();
                                 return Some((
                                     Err(AppError::storage("carrier_backend_missing")),
-                                    (source, end, None),
+                                    (source, end, None, reader),
                                 ));
                             };
                             let _ = archive;
@@ -616,6 +701,11 @@ impl BodyCarrier {
         offset: u64,
         length: usize,
     ) -> Result<Bytes, AppError> {
+        let _reader = self.read_owner();
+        let published = self.published.lock().unwrap().clone();
+        if let Some(published) = published {
+            return Box::pin(published.read_range(offset, length)).await;
+        }
         let end = offset
             .checked_add(length as u64)
             .filter(|end| *end <= self.length)
@@ -655,6 +745,11 @@ impl BodyCarrier {
         offset: u64,
         output: &mut [u8],
     ) -> Result<(), AppError> {
+        let _reader = self.read_owner();
+        let published = self.published.lock().unwrap().clone();
+        if let Some(published) = published {
+            return Box::pin(published.read_into(offset, output)).await;
+        }
         let length = output.len();
         let end = offset
             .checked_add(length as u64)
@@ -754,6 +849,76 @@ mod tests {
             uuid::Uuid::now_v7(),
         )
         .unwrap()
+    }
+
+    #[tokio::test]
+    async fn published_handoff_preserves_old_readers_and_releases_only_real_ram_owners() {
+        let archive = ArchiveStore::memory_for_test();
+        let tenant = uuid::Uuid::now_v7();
+        let request = uuid::Uuid::now_v7();
+        let memory = Arc::new(ProxyMemoryBudget::new(256 * 1024));
+        let expected = Bytes::from(vec![b'x'; 128 * 1024]);
+        let source = BodyCarrier::capture(
+            stream::iter([Ok::<_, std::io::Error>(expected.clone())]),
+            CarrierCapture::new(memory.clone(), Some(archive.clone()), key()),
+        )
+        .await
+        .unwrap();
+        let mut old_reader = source.open_stream();
+        let first = old_reader.next().await.unwrap().unwrap();
+        let object = archive
+            .put_tenant_content(tenant, expected.clone())
+            .await
+            .unwrap();
+        archive
+            .publish_raw_capture(tenant, request, "request", &object)
+            .await
+            .unwrap();
+        let mut wrong = object.clone();
+        wrong.size_bytes += 1;
+        assert!(
+            source
+                .handoff_verified_publication(archive.clone(), wrong)
+                .is_err()
+        );
+        source
+            .handoff_verified_publication(archive.clone(), object.clone())
+            .unwrap();
+        assert_eq!(
+            memory.snapshot().0,
+            128 * 1024,
+            "old stream still owns the original source"
+        );
+        let mut old_bytes = first.to_vec();
+        while let Some(chunk) = old_reader.next().await {
+            old_bytes.extend_from_slice(&chunk.unwrap());
+        }
+        assert_eq!(old_bytes.as_slice(), expected.as_ref());
+        drop(old_reader);
+        assert_eq!(
+            memory.snapshot().0,
+            first.len(),
+            "only the escaped allocation remains charged"
+        );
+        drop(first);
+        assert_eq!(memory.snapshot().0, 0);
+        let mut fresh = source.open_stream();
+        let mut replay = Vec::new();
+        while let Some(chunk) = fresh.next().await {
+            replay.extend_from_slice(&chunk.unwrap());
+        }
+        assert_eq!(replay.as_slice(), expected.as_ref());
+        drop(fresh);
+        assert_eq!(memory.snapshot().0, 0);
+        assert_eq!(
+            archive
+                .raw_capture_reference(tenant, request, "request")
+                .await
+                .unwrap()
+                .unwrap()
+                .blake3_digest,
+            object.blake3_digest
+        );
     }
 
     #[tokio::test]

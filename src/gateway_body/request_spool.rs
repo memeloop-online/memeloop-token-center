@@ -895,10 +895,27 @@ impl RequestSpool {
                 .map_err(|_| RequestSpoolReadError)?;
             return verified_body(&self.shared, Bytes::from(bytes));
         }
-        self.read_all().await
+        self.read_legacy_body().await
     }
 
+    /// Test-only materialization: production callers use the prepaid projection
+    /// reader or stream. The collection belongs to the test's expected-value
+    /// workspace, not an unaccounted production body allocation.
+    #[cfg(test)]
     pub(crate) async fn read_all(&self) -> Result<Bytes, RequestSpoolReadError> {
+        if self.carrier().is_none() {
+            return self.read_legacy_body().await;
+        }
+        self.read_count.fetch_add(1, Ordering::AcqRel);
+        let mut source = self.open_stream().await?;
+        let mut body = Vec::new();
+        while let Some(chunk) = source.stream.next().await {
+            body.extend_from_slice(&chunk.map_err(|_| RequestSpoolReadError)?);
+        }
+        verified_body(&self.shared, Bytes::from(body))
+    }
+
+    async fn read_legacy_body(&self) -> Result<Bytes, RequestSpoolReadError> {
         #[cfg(test)]
         self.read_count.fetch_add(1, Ordering::AcqRel);
         let resident = self
@@ -910,12 +927,8 @@ impl RequestSpool {
         if let Some(body) = resident {
             return verified_body(&self.shared, body);
         }
-        if let Some(carrier) = &self.shared.carrier {
-            let body = carrier
-                .read_range(0, self.len())
-                .await
-                .map_err(|_| RequestSpoolReadError)?;
-            return verified_body(&self.shared, body);
+        if self.shared.carrier.is_some() {
+            return Err(RequestSpoolReadError);
         }
         if !self.shared.durable_ok.load(Ordering::Acquire) && !self.upload_outcome().await {
             return Err(RequestSpoolReadError);
@@ -1172,7 +1185,7 @@ fn publish_durable(shared: &Arc<SharedBody>) {
                             }
                         };
                         if success {
-                            database
+                            let object = database
                                 .publish_request_source(
                                     identity,
                                     &key,
@@ -1180,6 +1193,20 @@ fn publish_durable(shared: &Arc<SharedBody>) {
                                     source.digest,
                                 )
                                 .await;
+                            if let Some(carrier) = &source.carrier {
+                                // The immutable raw root now durably owns this
+                                // exact object even while SQL binding waits.
+                                if let Ok(archive) = database.body_archive() {
+                                    if carrier
+                                        .handoff_verified_publication(archive.clone(), object)
+                                        .is_err()
+                                    {
+                                        tracing::error!(
+                                            "request source durable handoff identity mismatch; retaining RAM"
+                                        );
+                                    }
+                                }
+                            }
                         }
                         let permit = if success {
                             database.try_request_source_completion()
@@ -1311,7 +1338,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn capture_round_trips_and_drop_unlinks_the_file() {
+    async fn memory_capture_round_trips_and_drop_releases_ownership() {
         let directory = tempfile::tempdir().unwrap();
         let admission = RequestSpoolAdmission::new(directory.path().to_owned());
         let body = Bytes::from(vec![b'x'; REQUEST_SPOOL_CHUNK_BYTES * 2 + 17]);
@@ -1383,7 +1410,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn anonymous_spool_leaves_no_restart_orphan() {
+    async fn ram_capture_creates_no_restart_orphan() {
         let directory = tempfile::tempdir().unwrap();
         let path = directory.path().join("request-spool");
         let admission = RequestSpoolAdmission::new(path.clone());
@@ -1391,7 +1418,11 @@ mod tests {
             .capture(Body::from("sensitive"), 1024, None)
             .await
             .unwrap();
-        assert_eq!(file_count(&path), 0, "active spool must be anonymous");
+        assert_eq!(
+            file_count(&path),
+            0,
+            "active capture must not create a body file"
+        );
         drop(spool);
         drop(admission);
         let restarted = RequestSpoolAdmission::new(path.clone());
