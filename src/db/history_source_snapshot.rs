@@ -78,10 +78,17 @@ impl Database {
         }
         let ceiling:i64=sqlx::query_scalar("SELECT CASE WHEN is_called THEN last_value ELSE 0 END FROM request_history_export_revision_seq")
             .fetch_one(&mut *barrier).await?;
-        let activation_epoch: i64 =
-            sqlx::query_scalar("SELECT epoch FROM request_history_activation WHERE id=1")
+        // The optimistic preflight can race a new activation. Revalidate under
+        // the state barrier before the RR socket takes its first MVCC snapshot.
+        let activation =
+            sqlx::query("SELECT epoch,phase FROM request_history_activation WHERE id=1")
                 .fetch_one(&mut *barrier)
                 .await?;
+        let activation_epoch: i64 = activation.try_get("epoch")?;
+        let phase: String = activation.try_get("phase")?;
+        if phase != "drained" && phase != "legacy" {
+            return Err(HistoryError::Changed);
+        }
         let snapshot: String = sqlx::query_scalar("SELECT pg_current_snapshot()::TEXT")
             .fetch_one(&mut *source)
             .await?;
@@ -576,6 +583,47 @@ mod tests {
         let writer = Database::connect_with_max(isolated.as_str(), 1)
             .await
             .unwrap();
+        // Deterministically race the successful horizon preflight with a new
+        // activation epoch before either source barrier is acquired.
+        let rejected = database
+            .history_begin_source_snapshot_after_ready(&source, Uuid::now_v7(), async {
+                database.history_start().await?;
+                Ok(())
+            })
+            .await;
+        assert!(matches!(rejected, Err(HistoryError::Changed)));
+        let receipts: i64 =
+            sqlx::query_scalar("SELECT COUNT(*) FROM request_history_baseline_runs")
+                .fetch_one(&database.pool)
+                .await
+                .unwrap();
+        assert_eq!(receipts, 0, "pending epoch cannot obtain a source receipt");
+        // Await the rejected RR socket's queued rollback before inspecting its
+        // virtual transaction; the coordinator must not mistake it for a user.
+        drop(source.pool.acquire().await.unwrap());
+        assert!(database.history_capture_horizon_ready().await.unwrap());
+        // The next preflight naturally drains that cohort. A second activation
+        // in the backfill gap must also fail before reading a source or cursor.
+        let rejected = database
+            .history_backfill_page_after_ready(64, async {
+                database.history_start().await?;
+                Ok(())
+            })
+            .await;
+        assert!(matches!(rejected, Err(HistoryError::Changed)));
+        let phase: String =
+            sqlx::query_scalar("SELECT phase FROM request_history_activation WHERE id=1")
+                .fetch_one(&database.pool)
+                .await
+                .unwrap();
+        assert_eq!(phase, "pending", "the interleaved activation actually ran");
+        let progressed: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM request_history_backfill WHERE done<>0 OR after_id<>''",
+        )
+        .fetch_one(&database.pool)
+        .await
+        .unwrap();
+        assert_eq!(progressed, 0);
         let request = Uuid::now_v7().to_string();
         let tenant = Uuid::now_v7().to_string();
         let key = Uuid::now_v7().to_string();

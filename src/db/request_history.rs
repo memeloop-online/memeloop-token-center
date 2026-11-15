@@ -407,6 +407,15 @@ impl Database {
     }
 
     pub async fn history_backfill_page(&self, page_size: i64) -> Result<usize, HistoryError> {
+        self.history_backfill_page_after_ready(page_size, std::future::ready(Ok(())))
+            .await
+    }
+
+    pub(super) async fn history_backfill_page_after_ready(
+        &self,
+        page_size: i64,
+        ready: impl std::future::Future<Output = Result<(), HistoryError>>,
+    ) -> Result<usize, HistoryError> {
         if page_size <= 0 || self.history_mode().await? == "off" {
             return Err(HistoryError::Invalid(
                 "start history capture before backfill; page_size must be positive",
@@ -415,6 +424,7 @@ impl Database {
         if !self.history_capture_horizon_ready().await? {
             return Err(HistoryError::Changed);
         }
+        ready.await?;
         let mut transaction = self.pool.begin().await?;
         if matches!(self.backend, DatabaseBackend::PostgreSql) {
             // Backfill also allocates global revisions and must participate in
@@ -422,6 +432,14 @@ impl Database {
             sqlx::query("SELECT id FROM request_history_state WHERE id=1 FOR SHARE")
                 .execute(&mut *transaction)
                 .await?;
+            let covered: bool = sqlx::query_scalar(
+                "SELECT phase IN ('drained','legacy') FROM request_history_activation WHERE id=1",
+            )
+            .fetch_one(&mut *transaction)
+            .await?;
+            if !covered {
+                return Err(HistoryError::Changed);
+            }
         }
         let lock = if matches!(self.backend, DatabaseBackend::PostgreSql) {
             " FOR UPDATE"
