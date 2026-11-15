@@ -1,6 +1,6 @@
 import { useMemo } from 'react';
 import { ThemeProvider, createTheme } from '@mui/material/styles';
-import { useMtcColorMode } from './design-system/MtcFluentProvider';
+import { useMtcColorMode } from './design-system/MtcFluentProvider.js';
 import { MessageBar, MessageBarBody } from '@fluentui/react-components';
 import { MemeLoopRuntimeProvider, MemeLoopThread, type WebMemeLoopChatAdapter, type MemeLoopThreadProps } from '@memeloop/react-ui/chat';
 
