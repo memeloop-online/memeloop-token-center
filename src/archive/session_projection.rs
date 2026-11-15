@@ -1601,6 +1601,59 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn successful_transport_without_protocol_terminal_retains_partial_coverage() {
+        let store = ArchiveStore::memory_for_test();
+        let tenant = Uuid::now_v7();
+        for response in [
+            r#"{"status":"incomplete","output":[{"type":"message","role":"assistant","content":[{"type":"output_text","text":"partial"}]}]}"#,
+            "data: {\"choices\":[{\"index\":0,\"delta\":{\"role\":\"assistant\",\"content\":\"partial\"}}]}\n\n",
+        ] {
+            let request = Uuid::now_v7();
+            let input = store
+                .put_tenant_content(
+                    tenant,
+                    Bytes::from_static(br#"{"messages":[{"role":"user","content":"hello"}]}"#),
+                )
+                .await
+                .unwrap();
+            let output = store
+                .put_tenant_content(tenant, Bytes::copy_from_slice(response.as_bytes()))
+                .await
+                .unwrap();
+            let prepared = store
+                .prepare_session_body_streamed(
+                    tenant,
+                    request,
+                    ConversationHints::default(),
+                    input.object_locator,
+                    Some(output.object_locator),
+                    true,
+                )
+                .await
+                .unwrap()
+                .unwrap();
+            assert!(!prepared.coverage_complete);
+            let manifest = store
+                .get_semantic_manifest_streamed(tenant, &prepared.publication.manifest)
+                .await
+                .unwrap();
+            assert!(!manifest.coverage.observed_terminal);
+            assert_eq!(
+                manifest.coverage.projection_state,
+                super::super::SemanticProjectionState::Partial
+            );
+            assert!(
+                manifest
+                    .coverage
+                    .gaps
+                    .iter()
+                    .any(|gap| gap == "response_protocol_incomplete")
+            );
+            assert!(!prepared.atoms.is_empty());
+        }
+    }
+
+    #[tokio::test]
     async fn streamed_projection_has_no_former_128_mib_body_ceiling() {
         let directory = tempfile::tempdir().unwrap();
         let mut config = Config::for_test("sqlite::memory:".into());
