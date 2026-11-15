@@ -107,28 +107,56 @@ pub(super) async fn parse_with_shape(
 /// The normalized replay is private, local and independent of the canonical
 /// archive source. Moving the tree into this function ensures none survives
 /// when its caller releases the old JSON admission and waits to parse again.
-pub(super) async fn spool_normalized(
+pub(super) async fn parse_normalized(
     value: Value,
-    directory: std::path::PathBuf,
-    memory: &Arc<ProxyMemoryReservation>,
-) -> Result<Arc<RequestSpool>, AppError> {
-    let encoded =
-        serde_json::to_vec(&value).map_err(|_| AppError::internal("request_replay_serialize"))?;
-    drop(value);
-    let length = encoded.len();
-    let source = crate::gateway_body::request_spool::RequestSpoolAdmission::new(directory)
-        .capture_with_memory(
-            axum::body::Body::from(encoded),
-            length,
-            Some(length),
-            Some(memory),
-            0,
-            None,
-        )
-        .await
-        .map_err(|_| AppError::capacity_error("request_spool_read_failed"))?;
-    source.release_local_retained();
-    Ok(Arc::new(source))
+    state: &crate::AppState,
+    request_id: uuid::Uuid,
+    memory: Arc<ProxyMemoryReservation>,
+    bytes: usize,
+    nodes: usize,
+) -> Result<Value, AppError> {
+    use crate::archive_staging::{ArchiveStagingKey, ArchiveStagingOwner, ArchiveStagingPurpose};
+    let source = crate::gateway_body::normalized_encoding::encode(
+        value,
+        memory.clone(),
+        state.proxy_memory_budget.clone(),
+        state.archive.clone(),
+        state.db.clone(),
+        ArchiveStagingKey::new(
+            ArchiveStagingOwner::ProxyRequest(request_id),
+            ArchiveStagingPurpose::Request,
+            uuid::Uuid::new_v4(),
+        )?,
+    )
+    .await?;
+    let working = match memory.try_reserve_source_json(bytes, nodes) {
+        Some(permit) => permit,
+        None => {
+            source.seal_to_objects().await?;
+            memory
+                .reserve_source_json(bytes, nodes, || {})
+                .await
+                .ok_or_else(|| AppError::capacity_error("proxy_memory_json"))?
+        }
+    };
+    let stream = source
+        .open_stream()
+        .map(|chunk| chunk.map_err(|error| io::Error::other(error.to_string())));
+    let (cancel_on_drop, cancelled) = tokio::sync::oneshot::channel();
+    let reader = SourceReader {
+        runtime: tokio::runtime::Handle::current(),
+        stream: Box::pin(stream),
+        pending: Bytes::new(),
+        cancelled,
+    };
+    let result = tokio::task::spawn_blocking(move || {
+        let (_source, _memory, _working) = (source, memory, working);
+        super::super::sse::parse_unique_json_reader(io::BufReader::with_capacity(64 * 1024, reader))
+    })
+    .await
+    .map_err(|_| AppError::internal("normalized_parser_join"))?;
+    drop(cancel_on_drop);
+    result.map_err(|_| AppError::internal("normalized_parser_invalid"))
 }
 
 #[cfg(test)]

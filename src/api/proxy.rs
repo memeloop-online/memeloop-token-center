@@ -1130,17 +1130,10 @@ async fn proxy_with_cancellation_guard(
         );
         body = Bytes::new();
         drop(std::mem::take(&mut original_request_json));
-        let replay = request_source::spool_normalized(
+        request_json = request_source::parse_normalized(
             std::mem::take(&mut request_json),
-            std::path::PathBuf::from(&state.config.responses_request_spool_path),
-            &memory,
-        )
-        .await?;
-        memory.release_unretained_json();
-        // Only complete, independently readable local sources survive this
-        // cancellable admission. It has neither old JSON nor a partial permit.
-        request_json = request_source::parse_with_shape(
-            replay,
+            &state,
+            request_id,
             memory.clone(),
             required_bytes,
             required_nodes,
