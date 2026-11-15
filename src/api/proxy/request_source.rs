@@ -59,16 +59,22 @@ pub(super) async fn parse_with_shape(
     // Upload and parse both reopen the complete local file. Neither needs the
     // resident cache to remain charged while JSON admission waits.
     source.release_local_retained();
-    let working = memory
-        .reserve_source_json(
-            source.len().max(required_bytes),
-            source.json_nodes().max(required_nodes),
-            || {
-                source.reclaim_for(|| false);
-            },
-        )
-        .await
-        .ok_or_else(|| AppError::capacity_error("proxy_memory_json"))?;
+    let bytes = source.len().max(required_bytes);
+    let nodes = source.json_nodes().max(required_nodes);
+    let working = match memory.try_reserve_source_json(bytes, nodes) {
+        Some(permit) => permit,
+        None => {
+            if let Some(carrier) = source.carrier() {
+                carrier.seal_to_objects().await?;
+            }
+            memory
+                .reserve_source_json(bytes, nodes, || {
+                    source.reclaim_for(|| false);
+                })
+                .await
+                .ok_or_else(|| AppError::capacity_error("proxy_memory_json"))?
+        }
+    };
     let download = source
         .open_stream()
         .await

@@ -746,11 +746,24 @@ impl ProxyMemoryReservation {
         if total.div_ceil(UNIT_BYTES) > self.capacity / UNIT_BYTES {
             return None;
         }
-        while !self.try_grow(total, 1) {
+        loop {
+            if let Some(working) = self.try_reserve_source_json(bytes, nodes) {
+                return Some(working);
+            }
             reclaim();
-            // No parsed tree, raw read buffer, or partial JSON permit is held.
-            // Dropping the request cancels this wait without a detached task.
             tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+    }
+
+    pub(crate) fn try_reserve_source_json(
+        self: &Arc<Self>,
+        bytes: usize,
+        nodes: usize,
+    ) -> Option<ArchiveOutputMemory> {
+        let json = bytes.checked_mul(3)?.checked_add(nodes.checked_mul(256)?)?;
+        let working = 64 * 1024;
+        if !self.try_grow(json.checked_add(working)?, 1) {
+            return None;
         }
         self.json_body_ceiling.store(bytes, Ordering::Release);
         self.json_node_ceiling.store(nodes, Ordering::Release);
