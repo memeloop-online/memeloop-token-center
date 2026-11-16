@@ -633,8 +633,8 @@ test('transport proxy groups: CRUD, policies, validation, CAS, secrets, permissi
         await workspace.getByText(new RegExp(`${copy.requestSuccessRate}: 90%`)).waitFor();
         const details = await workspace.locator('.network-proxy-item').innerText();
         assert.match(details, new RegExp(`${copy.transportSuccessRate}: 95%`));
-        assert.match(details, /4,096 B/);
-        assert.match(details, /16,384 B/);
+        assert.match(details, /4\.1 KB/);
+        assert.match(details, /16\.38 KB/);
         assert.match(details, new RegExp(`${copy.concurrency}: 1`));
         assert.match(details, new RegExp(`${copy.healthTitle}: ${copy.health.healthy}`));
         assert.ok(details.includes(copy.trafficTitle));
