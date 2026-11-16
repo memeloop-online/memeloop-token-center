@@ -10,6 +10,7 @@ on:
         required: true
         type: choice
         options:
+          - history-maintenance975973
           - request-carrier-958
           - response-carrier-968
           - pg-executor-959
@@ -493,3 +494,85 @@ jobs:
           git rev-parse HEAD
           cargo test --locked --lib db::request_pool::tests::postgres_paused_returning_stream_retains_transaction_until_drop_but_execute_commits -- --exact --nocapture 2>&1 | tee /tmp/pg-executor.log
           grep -F '1 passed; 0 failed' /tmp/pg-executor.log
+
+  history-maintenance-contract:
+    if: inputs.contract == 'history-maintenance975973'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
+    permissions:
+      contents: read
+      packages: write
+    env:
+      SOURCE: 3c7da18a07fcfd29018b529cd1ba0d03d8935c67
+      MTC_TEST_POSTGRES_URL: postgres://token_center:token_center@127.0.0.1:5432/token_center_test
+    services:
+      postgres:
+        image: postgres:16-alpine
+        env:
+          POSTGRES_USER: token_center
+          POSTGRES_PASSWORD: token_center
+          POSTGRES_DB: token_center_test
+        ports: ['5432:5432']
+        options: --health-cmd pg_isready --health-interval 5s --health-timeout 5s --health-retries 10
+    steps:
+      - name: Require the reviewed fixed source
+        env:
+          REQUESTED_SOURCE: ${{ inputs.source_revision }}
+        run: test "$REQUESTED_SOURCE" = "$SOURCE"
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+        with:
+          ref: ${{ env.SOURCE }}
+          persist-credentials: false
+      - name: Record exact source
+        run: |
+          test "$(git rev-parse HEAD)" = "$SOURCE"
+          mkdir -p evidence
+          git rev-parse HEAD | tee evidence/source.txt
+      - uses: dtolnay/rust-toolchain@4360b52568e2003a75bf9bc1d59f33a8e3fc893c
+        with:
+          toolchain: 1.95.0
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6
+      - uses: ./.github/actions/checkout-plugin-examples
+      - name: Verify four exact maintenance contracts
+        run: |
+          set -euo pipefail
+          exact() {
+            local name="$1"; shift
+            cargo test --locked --all-features "$@" 2>&1 | tee "evidence/$name.log"
+            grep -F '1 passed; 0 failed' "evidence/$name.log"
+          }
+          exact archive-cli --test request_history_cli request_history_cli_loads_configured_archive_before_export -- --exact --nocapture
+          exact backfill-page --test request_history_cli request_history_cli_backfill_page_queues_without_archive_or_delivery -- --exact --nocapture
+          exact operational-update --lib db::request_history::bootstrap::upstream_projection_tests::request_history_upstream_projection_ignores_operational_updates -- --exact --nocapture
+          exact upgrade-fanout --lib db::request_history::bootstrap::upstream_projection_tests::request_history_real_services_acceptance_upstream_projection_upgrade_and_fanout -- --ignored --exact --nocapture
+      - uses: docker/setup-buildx-action@8d2750c68a42422c14e847fe6c8ac0403b4cbd6f
+      - name: Export Docker-native release input
+        run: |
+          set -euo pipefail
+          docker buildx build --file Dockerfile --target release-input-export --platform linux/amd64 --build-arg MTC_BUILD_GIT_SHA_INPUT="$SOURCE" --build-arg MTC_BUILD_TIMESTAMP_INPUT="$(git show -s --format=%cI HEAD)" --build-arg MTC_BUILD_TARGET_INPUT=linux/amd64 --output type=local,dest=release-service-input .
+      - uses: docker/login-action@c94ce9fb468520275223c153574b00df6fe4bcc9
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+      - name: Publish and verify immutable maintenance image
+        env:
+          REPOSITORY: ${{ github.repository }}
+        run: |
+          set -euo pipefail
+          image="ghcr.io/${REPOSITORY,,}:maintenance-${SOURCE}-${GITHUB_RUN_ID}"
+          docker buildx build --file Dockerfile.release --platform linux/amd64 --build-context release-input=./release-service-input --label org.opencontainers.image.revision="$SOURCE" --tag "$image" --metadata-file evidence/image.json --push .
+          digest=$(jq -er '."containerimage.digest"' evidence/image.json)
+          immutable="$image@$digest"
+          printf '%s\n' "$immutable" | tee evidence/immutable-image.txt
+          docker pull "$immutable"
+          test "$(docker inspect --format '{{ index .Config.Labels "org.opencontainers.image.revision" }}' "$immutable")" = "$SOURCE"
+          docker run --rm "$immutable" request-history upgrade-upstream-capture --help | tee evidence/upgrade-help.txt
+          docker run --rm "$immutable" request-history backfill-page --help | tee evidence/backfill-help.txt
+      - name: Preserve source, exact results and OCI identity
+        if: always()
+        uses: actions/upload-artifact@65462800fd760344b1a7b4382951275a0abb4808
+        with:
+          name: history-maintenance-${{ github.run_id }}
+          path: evidence/
+          if-no-files-found: error
