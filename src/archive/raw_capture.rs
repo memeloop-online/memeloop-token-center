@@ -703,6 +703,72 @@ mod retirement_contracts {
     }
 
     #[tokio::test]
+    async fn incomplete_protocol_keeps_both_raw_roots_owned() {
+        let archive = ArchiveStore::memory_for_test();
+        let tenant = Uuid::now_v7();
+        let request = Uuid::now_v7();
+        let input = archive
+            .put_tenant_content(
+                tenant,
+                Bytes::from_static(
+                    br#"{"messages":[{"role":"user","content":"keep the partial answer"}]}"#,
+                ),
+            )
+            .await
+            .unwrap();
+        let response = archive
+            .put_tenant_content(
+                tenant,
+                Bytes::from_static(
+                    br#"{"choices":[{"delta":{"content":"observed partial text"}}]}"#,
+                ),
+            )
+            .await
+            .unwrap();
+        let prepared = archive
+            .prepare_session_body_streamed(
+                tenant,
+                request,
+                crate::conversation::ConversationHints::default(),
+                input.object_locator.clone(),
+                Some(response.object_locator.clone()),
+                true,
+            )
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(
+            !prepared.coverage_complete,
+            "HTTP completion is not a protocol terminal"
+        );
+        let proof = super::super::SemanticBindingProof {
+            tenant_id: tenant,
+            request_id: request,
+            node_hash: prepared.nodes.last().unwrap().node_hash.clone(),
+            projected_at: 1,
+        };
+        assert!(
+            archive
+                .retire_covered_raw_roots(&prepared.publication, &proof)
+                .await
+                .is_err()
+        );
+        for (side, expected) in [("request", input), ("response", response)] {
+            assert_eq!(
+                archive
+                    .raw_capture_reference(tenant, request, side)
+                    .await
+                    .unwrap(),
+                Some(expected.clone())
+            );
+            archive
+                .verify_tenant_content(tenant, &expected)
+                .await
+                .unwrap();
+        }
+    }
+
+    #[tokio::test]
     #[ignore = "requires isolated RustFS; executed by the exact retirement GHA profile"]
     async fn rustfs_complete_coverage_retires_exact_roots_and_rejects_stale_backend_versions() {
         let mut config = crate::config::Config::for_test("sqlite::memory:".into());
