@@ -372,7 +372,7 @@ async fn request_candidate_contract(database: &Database) {
     for (_, request, _) in candidates {
         let uncertain: Option<i64> =
             sqlx::query_scalar("SELECT submission_uncertain_at FROM request_records WHERE id = $1")
-                .bind(request)
+                .bind(&request)
                 .fetch_one(&database.pool)
                 .await
                 .unwrap();
