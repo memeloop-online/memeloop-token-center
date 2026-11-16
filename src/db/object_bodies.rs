@@ -6,7 +6,7 @@ impl Database {
     pub(crate) async fn resolve_raw_archive_roots(
         &self,
         tenant_id: Uuid,
-        mut refs: crate::model::RequestArchiveRefs,
+        refs: crate::model::RequestArchiveRefs,
     ) -> Result<crate::model::RequestArchiveRefs, AppError> {
         let archive = self.body_archive()?;
         let request_id = refs.view.request_id;
@@ -15,11 +15,35 @@ impl Database {
         // admission does not depend on semantic archival.
         let leaf: Option<String> = sqlx::query_scalar("SELECT leaf_node_hash FROM conversation_observations WHERE tenant_id=$1 AND request_id=$2")
             .bind(tenant_id.to_string()).bind(request_id.to_string()).fetch_optional(&self.pool).await?.flatten();
-        if let Some(leaf) = leaf {
-            refs.semantic_archive = archive
-                .semantic_archive_authority(tenant_id, request_id, &leaf)
-                .await?;
+        let authority = match leaf {
+            Some(leaf) => {
+                archive
+                    .semantic_archive_authority(tenant_id, request_id, &leaf)
+                    .await?
+            }
+            None => None,
+        };
+        self.resolve_raw_archive_roots_with_semantic_authority(tenant_id, refs, authority)
+            .await
+    }
+
+    /// Frozen history snapshots pass their own exact authority. None is
+    /// explicit pending and never triggers a new live-observation SQL lookup.
+    pub(crate) async fn resolve_raw_archive_roots_with_semantic_authority(
+        &self,
+        tenant_id: Uuid,
+        mut refs: crate::model::RequestArchiveRefs,
+        authority: Option<crate::archive::SemanticArchiveAuthority>,
+    ) -> Result<crate::model::RequestArchiveRefs, AppError> {
+        let archive = self.body_archive()?;
+        let request_id = refs.view.request_id;
+        if authority.as_ref().is_some_and(|authority| {
+            authority.publication.tenant_id != tenant_id
+                || authority.publication.request_id != request_id
+        }) {
+            return Err(AppError::storage("semantic_publication_identity_mismatch"));
         }
+        refs.semantic_archive = authority;
 
         if refs.view.status_code.is_some_and(|status| status >= 400)
             && let Some(summary) = archive.supplier_summary(tenant_id, request_id).await?
