@@ -38,3 +38,14 @@ test("TEST-only immutable manifests never mount production secrets or service-ac
   assert.throws(()=>manifests("contract","example.invalid/test:latest","b".repeat(40),plan));
   assert.throws(()=>validatePlan({...plan,arrivals:[{...plan.arrivals[0],at_ms:1001}]}));
 });
+
+test("tool session mock preserves the tool-call identity through its result", async()=>{
+  const {server}=createStagingMock(); await new Promise<void>(resolve=>server.listen(0,"127.0.0.1",resolve));
+  const address=server.address(); assert(address&&typeof address!=="string"); const url=`http://127.0.0.1:${address.port}/scenario/tool-session/v1/chat/completions`;
+  try {
+    const first=await fetch(url,{method:"POST",body:JSON.stringify({model:"synthetic",messages:[{role:"user",content:"tool"}]})});
+    const message=(await first.json() as any).choices[0].message; assert.equal(message.tool_calls[0].id,"call_staging_echo");
+    const second=await fetch(url,{method:"POST",body:JSON.stringify({model:"synthetic",messages:[message,{role:"tool",tool_call_id:message.tool_calls[0].id,content:"synthetic"}]})});
+    assert.equal((await second.json() as any).choices[0].message.content,"tool-complete");
+  }finally{server.closeAllConnections();await new Promise<void>(resolve=>server.close(()=>resolve()));}
+});

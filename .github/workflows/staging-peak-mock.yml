@@ -21,6 +21,9 @@ jobs:
       - name: State evidence boundary
         run: echo 'Harness contracts only. Historical peak and TEST-cluster lifecycle qualification require measured baseline and a separate cluster run.' >> "$GITHUB_STEP_SUMMARY"
   package-harness:
+    permissions:
+      contents: read
+      packages: write
     runs-on: ubuntu-24.04
     timeout-minutes: 15
     needs: harness-contract
@@ -34,6 +37,17 @@ jobs:
           printf '%s\n' '${{ github.sha }}' > evidence/source-sha.txt
           docker save mtc-staging-peak:${{ github.sha }} -o evidence/staging-peak-image.tar
           sha256sum evidence/staging-peak-image.tar > evidence/archive-sha256.txt
+      - name: Publish isolated TEST harness image
+        if: github.event_name == 'workflow_dispatch' || github.event.pull_request.head.repo.full_name == github.repository
+        env:
+          GHCR_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          printf '%s' "$GHCR_TOKEN" | docker login ghcr.io -u '${{ github.actor }}' --password-stdin
+          image='ghcr.io/${{ github.repository }}-staging-peak-mock:${{ github.sha }}'
+          docker tag mtc-staging-peak:${{ github.sha }} "$image"
+          docker push "$image"
+          docker image inspect "$image" --format '{{json .RepoDigests}}' > evidence/registry-digests.json
+          docker logout ghcr.io
       - uses: actions/upload-artifact@65462800fd760344b1a7b4382951275a0abb4808
         with:
           name: staging-peak-harness-${{ github.sha }}

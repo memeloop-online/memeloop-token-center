@@ -4,16 +4,17 @@ import { setTimeout as delay } from "node:timers/promises";
 import { pathToFileURL } from "node:url";
 import { validateBaseline, baselineIdentity } from "./baseline.ts";
 
-export type Arrival = { at_ms: number; scenario: "normal" | "slow-read" | "upstream-error" | "disconnect"; session: string; stream: boolean; request_bytes: number; response_bytes: number; chunk_delay_ms: number; client_read_delay_ms: number; expected_status: number };
+export type Arrival = { at_ms: number; scenario: "normal" | "slow-read" | "upstream-error" | "disconnect" | "tool-session"; session: string; stream: boolean; request_bytes: number; response_bytes: number; chunk_delay_ms: number; client_read_delay_ms: number; expected_status: number };
 export type Plan = { release_batch: string; window_ms: number; drain_timeout_ms: number; arrivals: Arrival[]; baseline: unknown };
 export function validatePlan(value: unknown): Plan {
   const plan = value as Plan;
   if (!plan?.release_batch || !Number.isSafeInteger(plan.window_ms) || plan.window_ms <= 0 || !Number.isSafeInteger(plan.drain_timeout_ms) || plan.drain_timeout_ms <= 0 || !Array.isArray(plan.arrivals) || !plan.arrivals.length) throw new Error("explicit release batch, arrival window and drain period required");
   let previous = -1;
   for (const row of plan.arrivals) {
-    if (!Number.isSafeInteger(row.at_ms) || row.at_ms < previous || row.at_ms >= plan.window_ms || !["normal", "slow-read", "upstream-error", "disconnect"].includes(row.scenario) || !row.session || typeof row.stream !== "boolean") throw new Error("invalid ordered arrival or scenario");
+    if (!Number.isSafeInteger(row.at_ms) || row.at_ms < previous || row.at_ms >= plan.window_ms || !["normal", "slow-read", "upstream-error", "disconnect", "tool-session"].includes(row.scenario) || !row.session || typeof row.stream !== "boolean") throw new Error("invalid ordered arrival or scenario");
     for (const number of [row.request_bytes, row.response_bytes, row.chunk_delay_ms, row.client_read_delay_ms]) if (!Number.isSafeInteger(number) || number < 0) throw new Error("invalid measured workload size or delay");
     if (!Number.isInteger(row.expected_status) || row.expected_status < 100 || row.expected_status > 599) throw new Error("expected gateway result required");
+    if(row.scenario==="tool-session" && row.stream) throw new Error("tool conversation fixture requires buffered replies");
     if (row.stream && row.response_bytes < 4096) throw new Error("SSE workload must include protocol framing");
     previous = row.at_ms;
   }
@@ -30,6 +31,9 @@ export async function run(plan: Plan, env = process.env): Promise<Record<string,
   const control = new URL(env.MTC_TEST_CONTROL_URL ?? "http://memeloop-token-center-test-control:8080");
   const mock = new URL(env.MTC_TEST_MOCK_URL ?? `http://mtc-peak-${runId}-mock:8080`);
   for (const [url, host] of [[gateway,"memeloop-token-center-test-gateway"],[control,"memeloop-token-center-test-control"],[mock,`mtc-peak-${runId}-mock`]] as const) if (url.protocol !== "http:" || url.hostname !== host || url.port !== "8080" || url.pathname !== "/") throw new Error("TEST-only service identity mismatch");
+  const identityResponse=await fetch(new URL("/identity",mock),{signal:AbortSignal.timeout(10_000)});
+  const identity=await identityResponse.json() as {run_id?:string;source_sha?:string};
+  if(!identityResponse.ok || identity.run_id!==runId || identity.source_sha!==env.MTC_HARNESS_SOURCE_SHA) throw new Error("exact-run mock identity mismatch");
   const token = env.MTC_TEST_SERVICE_TOKEN;
   if (!token) throw new Error("TEST service token secret reference required");
   const call = async (path: string, payload: unknown) => {
@@ -66,6 +70,14 @@ export async function run(plan: Plan, env = process.env): Promise<Record<string,
         if (response.body) for await (const chunk of response.body) { bytes+=chunk.length; hash.update(chunk); tail=(tail+Buffer.from(chunk).toString("utf8")).slice(-4096); if(arrival.client_read_delay_ms) await delay(arrival.client_read_delay_ms); }
         if(status!==arrival.expected_status) error="unexpected_gateway_status";
         if(arrival.stream && status===200 && !tail.includes("data: [DONE]")) error="missing_stream_terminal";
+        if(arrival.scenario==="tool-session" && status===200) {
+          const message=JSON.parse(tail).choices[0].message;
+          const tool=message.tool_calls?.[0];
+          if(tool?.id!=="call_staging_echo" || tool.function?.name!=="staging_echo") throw new Error("tool_identity_mismatch");
+          const followup=await fetch(new URL("/v1/chat/completions",gateway),{method:"POST",headers:{authorization:`Bearer ${key}`,"content-type":"application/json","x-mtc-conversation-id":session},body:JSON.stringify({model:models[arrival.scenario],metadata:{session_id:session},messages:[{role:"user",content:"synthetic tool session"},message,{role:"tool",tool_call_id:tool.id,content:'{"value":"synthetic"}'}]}),signal:AbortSignal.timeout(plan.drain_timeout_ms)});
+          const completed=await followup.json() as any;
+          if(followup.status!==200 || completed.choices?.[0]?.message?.content!=="tool-complete") error="tool_followup_mismatch";
+        }
       } catch { error="transport_or_timeout"; }
       finally { active--; requests.push({index,session,scenario:arrival.scenario,offered_at_ms:arrival.at_ms,started_at_ms:began-start,generator_lag_ms:lag,status,response_bytes:bytes,response_sha256:hash.digest("hex"),latency_ms:performance.now()-began,error}); }
     })());
