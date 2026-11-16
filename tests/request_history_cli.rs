@@ -137,3 +137,114 @@ async fn request_history_cli_loads_configured_archive_before_export() {
     );
     server.abort();
 }
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn request_history_cli_backfill_page_queues_without_archive_or_delivery() {
+    let root = tempfile::tempdir().unwrap();
+    let database_url = format!(
+        "sqlite://{}?mode=rwc",
+        root.path().join("page.db").display()
+    );
+    let database = Database::connect(&database_url).await.unwrap();
+    database.migrate().await.unwrap();
+    let pepper = b"test-pepper-must-have-at-least-32-bytes";
+    let issued = database
+        .create_key(
+            CreateKeyInput {
+                tenant_external_id: "cli-page".into(),
+                principal_external_id: "member".into(),
+                alias: "page".into(),
+                currency: "USD".into(),
+                policy: KeyPolicy::default(),
+                initial_balance: Decimal::ZERO,
+                idempotency_key: None,
+            },
+            pepper,
+        )
+        .await
+        .unwrap();
+    let key = database
+        .authenticate_key(&issued.key, pepper)
+        .await
+        .unwrap();
+    let request = Uuid::now_v7();
+    database
+        .record_request_started(NewRequest {
+            request_id: request,
+            key_id: key.key_id,
+            tenant_id: key.tenant_id,
+            protocol: "openai".into(),
+            model: "history-model".into(),
+            request_object: "gap://fixture/request".into(),
+            reservation_id: Uuid::now_v7(),
+            upstream_account_id: None,
+            model_route_id: None,
+        })
+        .await
+        .unwrap();
+    database.history_start().await.unwrap();
+    let pool = sqlx::AnyPool::connect(&database_url).await.unwrap();
+    // Isolate one native source page. The CLI must commit its journal entry
+    // without trying to materialize or ACK this retained source.
+    sqlx::query("UPDATE request_history_backfill SET done=1 WHERE source<>'native'")
+        .execute(&pool)
+        .await
+        .unwrap();
+    let before: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM request_history_export")
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+    assert_eq!(before, 0, "the request was created while capture was off");
+    let unused_archive = root.path().join("must-not-initialize");
+    for expected_queued in [1, 0] {
+        let url = database_url.clone();
+        let archive_path = unused_archive.clone();
+        let output = tokio::task::spawn_blocking(move || {
+            Command::new(env!("CARGO_BIN_EXE_memeloop-token-center"))
+                .args(["request-history", "backfill-page"])
+                .env(
+                    "MTC_KEY_PEPPER",
+                    String::from_utf8(pepper.to_vec()).unwrap(),
+                )
+                .env("MTC_SERVICE_TOKEN", "s".repeat(32))
+                .env("MTC_DATABASE_URL", url)
+                .env("MTC_ARCHIVE_BACKEND", "filesystem")
+                .env("MTC_ARCHIVE_PATH", archive_path)
+                .env_remove("MTC_REQUEST_HISTORY_URL")
+                .output()
+                .unwrap()
+        })
+        .await
+        .unwrap();
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        let receipt: serde_json::Value = String::from_utf8(output.stdout)
+            .unwrap()
+            .lines()
+            .filter_map(|line| serde_json::from_str::<serde_json::Value>(line).ok())
+            .find(|value| value.get("queued").is_some())
+            .unwrap();
+        assert_eq!(receipt["queued"], expected_queued);
+        assert_eq!(receipt["backfill_done"], true);
+        assert!(
+            !unused_archive.exists(),
+            "metadata queueing must not initialize an archive"
+        );
+        let retained: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM request_history_export WHERE request_id=$1 AND snapshot IS NULL",
+        )
+        .bind(request.to_string())
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(
+            retained, 1,
+            "queue-only CLI must never ACK the retained request"
+        );
+    }
+    pool.close().await;
+    database.close().await;
+}
