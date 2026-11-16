@@ -26,3 +26,15 @@ test("external staging mock reuses gateway JSON/SSE contracts and isolates failu
     assert.equal(unknown.status, 404);
   } finally { server.closeAllConnections(); await new Promise<void>((resolve) => server.close(() => resolve())); }
 });
+
+import { validatePlan } from "./run.ts";
+import { manifests } from "./manifests.ts";
+test("TEST-only immutable manifests never mount production secrets or service-account tokens", () => {
+  const plan=validatePlan({release_batch:"synthetic-contract-only",window_ms:1000,drain_timeout_ms:1000,baseline:null,arrivals:[{at_ms:0,scenario:"normal",session:"unit",stream:false,request_bytes:0,response_bytes:0,chunk_delay_ms:0,client_read_delay_ms:0,expected_status:200}]});
+  const bundle=manifests("contract","example.invalid/test@sha256:"+"a".repeat(64),"b".repeat(40),plan);
+  for(const item of bundle.items) assert.equal(item.metadata.namespace,"memeloop-token-center-test");
+  const serialized=JSON.stringify(bundle); assert(!serialized.includes("memeloop-token-center-secrets"));
+  for(const item of bundle.items.filter(item=>["Job","Deployment"].includes(item.kind))) assert.equal((item as any).spec.template.spec.automountServiceAccountToken,false);
+  assert.throws(()=>manifests("contract","example.invalid/test:latest","b".repeat(40),plan));
+  assert.throws(()=>validatePlan({...plan,arrivals:[{...plan.arrivals[0],at_ms:1001}]}));
+});

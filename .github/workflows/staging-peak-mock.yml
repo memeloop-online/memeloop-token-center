@@ -20,3 +20,22 @@ jobs:
       - run: node --test tests/load/staging-peak/test-framework.ts
       - name: State evidence boundary
         run: echo 'Harness contracts only. Historical peak and TEST-cluster lifecycle qualification require measured baseline and a separate cluster run.' >> "$GITHUB_STEP_SUMMARY"
+  package-harness:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    needs: harness-contract
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
+      - name: Build exact-source isolated mock and load image
+        run: |
+          mkdir -p evidence
+          docker build --file tests/load/staging-peak/Dockerfile --tag mtc-staging-peak:${{ github.sha }} .
+          docker image inspect mtc-staging-peak:${{ github.sha }} --format '{{.Id}}' > evidence/image-id.txt
+          printf '%s\n' '${{ github.sha }}' > evidence/source-sha.txt
+          docker save mtc-staging-peak:${{ github.sha }} -o evidence/staging-peak-image.tar
+          sha256sum evidence/staging-peak-image.tar > evidence/archive-sha256.txt
+      - uses: actions/upload-artifact@65462800fd760344b1a7b4382951275a0abb4808
+        with:
+          name: staging-peak-harness-${{ github.sha }}
+          path: evidence/
+          retention-days: 7
