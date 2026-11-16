@@ -669,7 +669,7 @@ impl Context {
                     },
                 ))?
         };
-        self.runtime.block_on(self.archive.publish_raw_capture(
+        self.runtime.block_on(self.archive.settle_raw_capture(
             self.tenant,
             request,
             side,
