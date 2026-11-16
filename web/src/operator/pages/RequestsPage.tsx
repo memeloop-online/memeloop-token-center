@@ -472,7 +472,7 @@ export function RequestsPage({ token, tenant, writeTenant = tenant, liveEvents, 
       onApply={(next) => { setFilters(next); scope.current = { token, tenant, filters: next }; void load(next); }}
       onClear={() => { setFilters(emptyTypedFilterAst); scope.current = { token, tenant, filters: emptyTypedFilterAst }; void load(emptyTypedFilterAst); }}
       onLoadOlder={() => void load(filters, true)} onRefreshFilteredResults={() => void load(filters, false, true)} onReturnToLatest={() => void load(filters)} onSelect={selectRequest} onOpenSessions={onOpenSessions} onOpenSession={openSession} onOpenGenerations={onOpenGenerations} />
-    {detail && <RequestDrawer token={token} tenant={tenant} detail={detail} upstreamName={upstreams.find((account) => account.id === detail.upstream_account_id)?.name} accountNames={new Map(upstreams.map(account => [account.id, account.name]))} onOpenSession={openSession} onRefresh={() => void load(filters, false, true)} refreshing={loading} onClose={closeRequestDetail} />}
+    {detail && <RequestDrawer token={token} tenant={tenant} detail={detail} upstreamName={upstreams.find((account) => account.id === detail.upstream_account_id)?.name} accountNames={new Map(upstreams.map(account => [account.id, account.name]))} onOpenSession={openSession} onRefresh={() => void load(filters, false, true)} refreshing={loading} refreshError={errorSource.current === 'load' || errorSource.current === 'refresh' ? error : undefined} onClose={closeRequestDetail} />}
   </PageLoadingRegion>;
 }
 
@@ -510,7 +510,7 @@ function RequestsPanel({ requests, upstreams, filters, loading, hasOlder, stream
   const settlementCurrency = summary.localCosts.length === 1 ? summary.localCosts[0].currency : undefined;
   return <article className="panel request-page-surface" aria-busy={loading}><div className="panel-title traffic-heading"><div><h2>{typedFiltersActive(filters) ? t('traffic.filtered') : t('traffic.live')}</h2><span>{typedFiltersActive(filters) ? t('traffic.filteredHint') : t('traffic.liveHint')}</span></div><div className="traffic-heading-actions"><Button appearance="primary" disabled={loading || !token.trim() || !tenant} onClick={onRefreshFilteredResults}>{t('usage.refresh')}</Button><div className={`request-live-state session-live-state ${streamState}`} role="status">{t(`sessions.live.${streamState}`)}</div><RequestWorkspaceTabs selected="requests" onRequests={() => undefined} onGenerations={onOpenGenerations ?? (() => undefined)} onSessions={onOpenSessions} /></div></div>
     <p className="request-metrics-scope" data-request-read-freshness>
-      {locale === 'zh-CN' ? '最近成功读取当前结果：' : 'Last successful read of current results: '}
+      {locale === 'zh-CN' ? '最近成功读取当前筛选首页：' : 'Last successful read of the current first page: '}
       {lastSuccessfulRead === undefined ? '—' : <time dateTime={new Date(lastSuccessfulRead).toISOString()}>{new Date(lastSuccessfulRead).toLocaleString(locale, { timeZone: displayTimeZone() })}</time>}
     </p>
     {requestRefresh && <div className="request-refresh-row">
@@ -538,13 +538,14 @@ function RequestsPanel({ requests, upstreams, filters, loading, hasOlder, stream
   </article>;
 }
 
-function RequestDrawer({ token, tenant, detail, upstreamName, accountNames, onOpenSession, onRefresh, refreshing, onClose }: { token: string; tenant: string; detail: RequestDetail; upstreamName?: string; accountNames: ReadonlyMap<string, string>; onOpenSession: (sessionId: string, keyId?: string, requestId?: string) => void; onRefresh: () => void; refreshing: boolean; onClose: () => void }) {
+function RequestDrawer({ token, tenant, detail, upstreamName, accountNames, onOpenSession, onRefresh, refreshing, refreshError, onClose }: { token: string; tenant: string; detail: RequestDetail; upstreamName?: string; accountNames: ReadonlyMap<string, string>; onOpenSession: (sessionId: string, keyId?: string, requestId?: string) => void; onRefresh: () => void; refreshing: boolean; refreshError?: string; onClose: () => void }) {
   const { locale, t } = useI18n();
   const [technicalOpen, setTechnicalOpen] = useState(false);
   const technicalId = useId();
   const parent = useSessionParentLabel(tenant, token, detail.credential_identity?.key_id, detail.session_context?.association === 'confirmed' ? detail.session_context.session_id : null, session => session.session_name?.trim() || unnamedSessionName(t, locale, session.last_activity_at, credentialDisplayName(session.key_alias, t), true));
   return <DrawerFrame title={detail.model} eyebrow={t('request.operatorDiagnosis')} onClose={onClose}>
     <Button appearance="secondary" disabled={refreshing} onClick={onRefresh}>{t('usage.refresh')}</Button>
+    {refreshError && <div className="notice error" role="alert">{t('request.listSource')}: {refreshError}</div>}
     <RequestDiagnostics request={detail} onOpenSession={onOpenSession} upstreamName={upstreamName} sessionParent={parent ? { label: parent.label, sessionId: parent.identity.session_id, keyId: parent.identity.key_id } : undefined} />
     <RequestEgressDetails attempts={detail.egress_attempts} accountNames={accountNames} />
     <div className="request-diagnostics request-detail-surface request-archive-diagnostics">

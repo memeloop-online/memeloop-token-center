@@ -219,6 +219,13 @@ export function NetworkProxyWorkspace({ token, tenant, onChanged, closeRequest }
       await request(`${networkProxiesPath}/${encodeURIComponent(proxy.id)}/probe`, {
         method: 'POST', body: JSON.stringify({ tenant_external_id: tenant, expected_version: proxy.version }),
       });
+      const [list, concurrency] = await Promise.all([
+        request<{ items: NetworkProxy[] }>(`${networkProxiesPath}${query}`),
+        request<UpstreamConcurrencySnapshot>(`${upstreamConcurrencyPath}${query}`).catch(() => undefined),
+      ]);
+      if (!alive.current) return;
+      setProxies(list.items); setSnapshot(concurrency); setConcurrencyFailed(concurrency === undefined);
+      if (details[proxy.id]?.open) await loadDetails(proxy);
     }, copy.probeQueued);
   }
 
