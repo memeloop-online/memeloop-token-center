@@ -246,5 +246,5 @@ async fn request_history_cli_backfill_page_queues_without_archive_or_delivery() 
         );
     }
     pool.close().await;
-    database.close().await;
+    drop(database);
 }
