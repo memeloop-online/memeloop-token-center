@@ -47,20 +47,31 @@ impl super::super::Database {
     ) -> Result<Vec<SupplierAvailabilityDecision>, super::super::AppError> {
         let now = super::super::unix_millis();
         let rank = CANDIDATE_AVAILABILITY_RANK.replace("$6", "$2");
-        let statement = format!("SELECT quota.upstream_model,quota.credential_generation,
-            quota.transport_revision,quota.capacity_scope,quota.failure_kind,quota.reset_at,
-            quota.observed_at,legacy.cooldown_until,legacy.last_failure_kind,
+        let statement = format!("WITH models AS (
+                SELECT e.upstream_model FROM model_route_eligible_upstream_accounts e
+                JOIN model_routes r ON r.id=e.model_route_id AND r.tenant_id=e.tenant_id
+                WHERE e.upstream_account_id=$1 AND r.enabled=1 AND r.archived_at IS NULL
+                UNION SELECT q.upstream_model FROM upstream_supplier_availability q
+                JOIN upstream_accounts current_account ON current_account.id=q.upstream_account_id
+                    AND current_account.credential_generation=q.credential_generation
+                    AND current_account.updated_at=q.transport_revision
+                WHERE q.upstream_account_id=$1
+            ) SELECT models.upstream_model,a.credential_generation,
+            a.updated_at AS transport_revision,COALESCE(quota.capacity_scope,'unknown') AS capacity_scope,
+            COALESCE(quota.failure_kind,'unknown') AS failure_kind,quota.reset_at,
+            COALESCE(quota.observed_at,0) AS observed_at,legacy.cooldown_until,legacy.last_failure_kind,
             {rank} AS probe_rank
-            FROM upstream_supplier_availability quota
-            JOIN upstream_accounts a ON a.id=quota.upstream_account_id
+            FROM models JOIN upstream_accounts a ON a.id=$1
+            LEFT JOIN upstream_supplier_availability quota ON quota.upstream_account_id=a.id
+                AND quota.upstream_model=models.upstream_model
                 AND a.credential_generation=quota.credential_generation
                 AND a.updated_at=quota.transport_revision
             LEFT JOIN upstream_account_health legacy ON legacy.upstream_account_id=a.id
                 AND legacy.credential_generation=a.credential_generation AND legacy.transport_revision=a.updated_at
             LEFT JOIN upstream_service_probes service_probe ON service_probe.upstream_account_id=a.id
                 AND service_probe.credential_generation=a.credential_generation AND service_probe.transport_revision=a.updated_at
-                AND service_probe.actual_model=quota.upstream_model
-            WHERE a.id=$1 AND a.status='active' ORDER BY quota.upstream_model");
+                AND service_probe.actual_model=models.upstream_model
+            WHERE a.status='active' ORDER BY models.upstream_model");
         let rows = sqlx::query(sqlx::AssertSqlSafe(statement))
             .bind(account_id.to_string())
             .bind(now)

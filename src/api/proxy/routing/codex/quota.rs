@@ -724,6 +724,50 @@ mod tests {
     }
 
     #[test]
+    fn quota_capacity_scope_keeps_ordinary_review_and_named_limits_distinct() {
+        use crate::db::SupplierQuotaScope;
+        for (extra, expected) in [
+            (serde_json::json!({}), SupplierQuotaScope::OrdinaryCode),
+            (
+                serde_json::json!({"metered_feature":"code_review"}),
+                SupplierQuotaScope::CodeReview,
+            ),
+            (
+                serde_json::json!({"limit_name":"model-specific"}),
+                SupplierQuotaScope::ModelSpecific,
+            ),
+            (
+                serde_json::json!({"metered_feature":null,"limit_name":"model-specific"}),
+                SupplierQuotaScope::ModelSpecific,
+            ),
+            (
+                serde_json::json!({"metered_feature":"codex","limit_name":"model-specific"}),
+                SupplierQuotaScope::Unknown,
+            ),
+            (
+                serde_json::json!({"metered_feature":{}}),
+                SupplierQuotaScope::Unknown,
+            ),
+        ] {
+            let mut error =
+                serde_json::json!({"type":"usage_limit_reached","resets_in_seconds":300});
+            error
+                .as_object_mut()
+                .unwrap()
+                .extend(extra.as_object().unwrap().clone());
+            let body = serde_json::to_vec(&serde_json::json!({"error":error})).unwrap();
+            let evidence = quota_evidence(&HeaderMap::new(), Some(&body), NOW);
+            assert!(evidence.exhausted);
+            assert_eq!(evidence.capacity_scope, expected);
+        }
+        let body = br#"{"error":{"code":"insufficient_quota"}}"#;
+        assert_eq!(
+            quota_evidence(&HeaderMap::new(), Some(body), NOW).capacity_scope,
+            SupplierQuotaScope::Unknown
+        );
+    }
+
+    #[test]
     fn structured_quota_codes_reuse_safe_supplier_classification_not_message_substrings() {
         for body in [
             r#"{"error":{"code":"insufficient_user_quota","type":"new_api_error","message":"用户额度不足, private-canary"}}"#,
