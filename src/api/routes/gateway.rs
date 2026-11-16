@@ -42,6 +42,10 @@ pub(in crate::api) fn gateway_router(state: AppState) -> Router<AppState> {
         .route("/self/v1/sessions", get(self_sessions))
         .route("/self/v1/sessions/{session_id}", get(self_session_detail))
         .route(
+            "/self/v1/sessions/{session_id}/requests/{request_id}/semantic-view",
+            get(self_semantic_view),
+        )
+        .route(
             "/self/v1/sessions/{session_id}/requests/{request_id}/context",
             get(self_session_context),
         )
