@@ -555,6 +555,171 @@ impl ArchiveStore {
 mod retirement_contracts {
     use super::*;
 
+    async fn retire_complete_sources_contract(archive: ArchiveStore) {
+        let tenant = Uuid::now_v7();
+        let request = Uuid::now_v7();
+        let input = archive
+            .put_tenant_content(
+                tenant,
+                Bytes::from_static(
+                    br#"{"messages":[{"role":"user","content":"shared semantic prefix"}]}"#,
+                ),
+            )
+            .await
+            .unwrap();
+        let response = archive.put_tenant_content(tenant, Bytes::from_static(
+            br#"{"choices":[{"message":{"role":"assistant","content":"complete answer"},"finish_reason":"stop"}]}"#
+        )).await.unwrap();
+        let prepared = archive
+            .prepare_session_body_streamed(
+                tenant,
+                request,
+                crate::conversation::ConversationHints::default(),
+                input.object_locator.clone(),
+                Some(response.object_locator.clone()),
+                true,
+            )
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(prepared.coverage_complete);
+        let proof = super::super::SemanticBindingProof {
+            tenant_id: tenant,
+            request_id: request,
+            node_hash: prepared.nodes.last().unwrap().node_hash.clone(),
+            projected_at: 1,
+        };
+        let path = archive_path(&root(tenant, request, "request").unwrap()).unwrap();
+        let original_meta = archive.inner.head(&path).await.unwrap();
+        let other = archive
+            .put_tenant_content(
+                tenant,
+                Bytes::from_static(b"concurrent relocation identity"),
+            )
+            .await
+            .unwrap();
+        archive
+            .inner
+            .put_opts(
+                &path,
+                PutPayload::from_bytes(Bytes::from(serde_json::to_vec(&other).unwrap())),
+                PutOptions {
+                    mode: PutMode::Update(object_store::UpdateVersion {
+                        e_tag: original_meta.e_tag.clone(),
+                        version: original_meta.version.clone(),
+                    }),
+                    ..Default::default()
+                },
+            )
+            .await
+            .unwrap();
+        // A stale ETag must really be rejected by the selected backend.
+        assert!(
+            archive
+                .inner
+                .put_opts(
+                    &path,
+                    PutPayload::from_bytes(Bytes::from_static(b"stale marker")),
+                    PutOptions {
+                        mode: PutMode::Update(object_store::UpdateVersion {
+                            e_tag: original_meta.e_tag,
+                            version: original_meta.version
+                        }),
+                        ..Default::default()
+                    }
+                )
+                .await
+                .is_err()
+        );
+        assert!(
+            archive
+                .retire_covered_raw_roots(&prepared.publication, &proof)
+                .await
+                .is_err()
+        );
+        assert_eq!(
+            archive
+                .raw_capture_reference(tenant, request, "request")
+                .await
+                .unwrap(),
+            Some(other)
+        );
+        let current = archive.inner.head(&path).await.unwrap();
+        archive
+            .inner
+            .put_opts(
+                &path,
+                PutPayload::from_bytes(Bytes::from(serde_json::to_vec(&input).unwrap())),
+                PutOptions {
+                    mode: PutMode::Update(object_store::UpdateVersion {
+                        e_tag: current.e_tag,
+                        version: current.version,
+                    }),
+                    ..Default::default()
+                },
+            )
+            .await
+            .unwrap();
+        archive
+            .retire_covered_raw_roots(&prepared.publication, &proof)
+            .await
+            .unwrap();
+        archive
+            .retire_covered_raw_roots(&prepared.publication, &proof)
+            .await
+            .unwrap();
+        for (side, object) in [("request", input), ("response", response)] {
+            assert!(
+                archive
+                    .raw_capture_reference(tenant, request, side)
+                    .await
+                    .unwrap()
+                    .is_none()
+            );
+            assert!(matches!(
+                archive
+                    .settle_raw_capture(tenant, request, side, &object)
+                    .await
+                    .unwrap(),
+                RawPublicationSettlement::Retired { .. }
+            ));
+            archive
+                .verify_tenant_content(tenant, &object)
+                .await
+                .unwrap();
+            let marker = archive
+                .get_bounded(&root(tenant, request, side).unwrap(), 4096)
+                .await
+                .unwrap();
+            let marker: serde_json::Value = serde_json::from_slice(&marker).unwrap();
+            assert_eq!(marker["retired"], true);
+            assert!(marker.get("object_locator").is_none());
+        }
+    }
+
+    #[tokio::test]
+    async fn complete_coverage_retires_exact_roots_and_rejects_stale_backend_versions() {
+        retire_complete_sources_contract(ArchiveStore::memory_for_test()).await;
+    }
+
+    #[tokio::test]
+    #[ignore = "requires isolated RustFS; executed by the exact retirement GHA profile"]
+    async fn rustfs_complete_coverage_retires_exact_roots_and_rejects_stale_backend_versions() {
+        let mut config = crate::config::Config::for_test("sqlite::memory:".into());
+        config.archive_backend = crate::config::ArchiveBackend::S3;
+        config.s3_endpoint =
+            Some(std::env::var("MTC_RUSTFS_TEST_ENDPOINT").expect("RustFS endpoint required"));
+        config.s3_bucket =
+            Some(std::env::var("MTC_RUSTFS_TEST_BUCKET").expect("RustFS bucket required"));
+        config.s3_access_key =
+            Some(std::env::var("MTC_RUSTFS_TEST_ACCESS_KEY").expect("RustFS access key required"));
+        config.s3_secret_key =
+            Some(std::env::var("MTC_RUSTFS_TEST_SECRET_KEY").expect("RustFS secret required"));
+        config.s3_region = "us-east-1".into();
+        config.s3_allow_http = true;
+        retire_complete_sources_contract(ArchiveStore::from_config(&config).await.unwrap()).await;
+    }
+
     #[tokio::test]
     async fn retirement_fence_hides_late_root_and_rejects_republication_without_deleting_cas() {
         let archive = super::super::tests::memory_store();
