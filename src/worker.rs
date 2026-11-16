@@ -1107,6 +1107,12 @@ async fn process_conversation_projection_batch(state: &AppState, lease_owner: Uu
             "semantic coverage confirmation remains pending"
         );
     }
+    if let Err(error) = state.db.recover_semantic_raw_retirement().await {
+        tracing::warn!(
+            error_category = error.diagnostic_category(),
+            "semantic raw retirement remains pending"
+        );
+    }
     tracing::debug!(%lease_owner, stage = "claim_start", "conversation projection stage");
     let tasks = match state
         .db

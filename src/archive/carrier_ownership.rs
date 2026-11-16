@@ -132,6 +132,36 @@ async fn immutable_metadata(
 }
 
 impl ArchiveStore {
+    /// Background-only protection for a candidate raw retirement. Listing is
+    /// streamed and retains one bounded receipt; unknown writers stay owners.
+    pub(crate) async fn has_carrier_owner_for_request(
+        &self,
+        request: uuid::Uuid,
+    ) -> Result<bool, AppError> {
+        let mut stores = vec![self.inner.clone()];
+        if let Some(training) = &self.training {
+            stores.push(training.store.clone());
+        }
+        for store in stores {
+            let prefix = archive_path(OWNERS)?;
+            let mut listed = store.list(Some(&prefix));
+            while let Some(item) = listed.next().await {
+                let metadata = item?;
+                let bytes = read_metadata(&store, &metadata.location).await?;
+                let owner: CarrierObjectOwner =
+                    serde_json::from_slice(&bytes).map_err(|_| invalid())?;
+                owner.key()?;
+                if owner.path(OWNERS)? != metadata.location {
+                    return Err(invalid());
+                }
+                if owner.owner_id == request.to_string() {
+                    return Ok(true);
+                }
+            }
+        }
+        Ok(false)
+    }
+
     /// Must be confirmed before starting any body upload. An unknown receipt
     /// write cannot authorize upload or release the sole RAM source.
     pub(crate) async fn begin_carrier_object(

@@ -2147,7 +2147,72 @@ async fn semantic_coverage_committed_recovery_contract(database_url: String) {
             (before.0, &before.2),
             "recovery must not reproject the leaf or SQL acknowledgement"
         );
-        assert!(after.1.is_none());
+        assert_eq!(after.1.as_deref(), Some("semantic-raw-retire-v1"));
+        // The root replacement really commits, then its ACK is lost. The
+        // original outbox remains a retryable owner of the exact retirement.
+        assert!(
+            Database::with_semantic_coverage_fault(
+                "raw_retirement_marker_ack",
+                db.recover_semantic_raw_retirement()
+            )
+            .await
+            .is_err()
+        );
+        let retained: Option<String> = sqlx::query_scalar(
+            "SELECT lease_owner FROM conversation_projection_outbox WHERE request_id=$1",
+        )
+        .bind(fixture.request_id.to_string())
+        .fetch_one(&db.pool)
+        .await
+        .unwrap();
+        assert_eq!(retained.as_deref(), Some("semantic-raw-retire-v1"));
+        db.recover_semantic_raw_retirement().await.unwrap();
+        let retired: Option<String> = sqlx::query_scalar(
+            "SELECT lease_owner FROM conversation_projection_outbox WHERE request_id=$1",
+        )
+        .bind(fixture.request_id.to_string())
+        .fetch_one(&db.pool)
+        .await
+        .unwrap();
+        assert!(retired.is_none());
+        let manifest = fixture
+            .state
+            .archive
+            .get_semantic_manifest_streamed(fixture.key.tenant_id, &publication.manifest)
+            .await
+            .unwrap();
+        let sources = manifest.raw_sources.unwrap();
+        for (side, source) in [
+            ("request", sources.request),
+            ("response", sources.response.unwrap()),
+        ] {
+            assert!(
+                fixture
+                    .state
+                    .archive
+                    .raw_capture_reference(fixture.key.tenant_id, fixture.request_id, side)
+                    .await
+                    .unwrap()
+                    .is_none()
+            );
+            assert!(matches!(
+                fixture
+                    .state
+                    .archive
+                    .settle_raw_capture(fixture.key.tenant_id, fixture.request_id, side, &source)
+                    .await
+                    .unwrap(),
+                crate::archive::RawPublicationSettlement::Retired { .. }
+            ));
+            // This is reference retirement only. Shared physical CAS remains
+            // protected until its independent history/read/publication GC proof.
+            fixture
+                .state
+                .archive
+                .verify_tenant_content(fixture.key.tenant_id, &source)
+                .await
+                .unwrap();
+        }
         db.recover_semantic_coverage().await.unwrap();
         assert!(
             !crate::worker::archive_session_body(&fixture.state, owner, fixture.request_id)

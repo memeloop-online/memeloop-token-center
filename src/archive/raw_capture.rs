@@ -70,6 +70,113 @@ pub(crate) enum RawPublicationSettlement {
 }
 
 impl ArchiveStore {
+    /// Retire only the small raw-root reference. Shared CAS bytes are retained
+    /// until physical GC separately proves all reader/publication/history refs.
+    pub(crate) async fn retire_covered_raw_roots(
+        &self,
+        publication: &super::SemanticPublication,
+        binding: &super::SemanticBindingProof,
+    ) -> Result<(), AppError> {
+        self.confirm_semantic_coverage(publication, binding).await?;
+        let manifest = self
+            .get_semantic_manifest_streamed(publication.tenant_id, &publication.manifest)
+            .await?;
+        let sources = manifest
+            .raw_sources
+            .ok_or_else(|| AppError::storage("raw_retirement_source_proof_missing"))?;
+        for (side, source) in [
+            ("request", Some(sources.request)),
+            ("response", sources.response),
+        ] {
+            let Some(source) = source else {
+                continue;
+            };
+            let fence = match self
+                .raw_retirement(publication.tenant_id, publication.request_id, side)
+                .await?
+            {
+                Some(existing) => {
+                    if existing.source != source || existing.semantic_leaf != binding.node_hash {
+                        return Err(AppError::Conflict(
+                            "raw retirement identity conflict".into(),
+                        ));
+                    }
+                    existing
+                }
+                None => RawRetirement {
+                    format_version: 1,
+                    tenant_id: publication.tenant_id,
+                    request_id: publication.request_id,
+                    side: side.into(),
+                    source: source.clone(),
+                    semantic_revision: publication.revision,
+                    semantic_leaf: binding.node_hash.clone(),
+                    release_generation: Uuid::from_u128(publication.revision as u128),
+                },
+            };
+            let root_key = root(fence.tenant_id, fence.request_id, side)?;
+            let path = archive_path(&root_key)?;
+            let metadata = self.inner.head(&path).await?;
+            let original = self.get_bounded(&root_key, 4096).await?;
+            let marker = Bytes::from(
+                serde_json::to_vec(&serde_json::json!({
+                    "format_version":1,"retired":true,"release_generation":fence.release_generation
+                }))
+                .map_err(|_| AppError::internal("raw_retirement_encode"))?,
+            );
+            if original == marker {
+                continue;
+            }
+            let current: CasArchiveObject = serde_json::from_slice(&original)
+                .map_err(|_| AppError::storage("raw_capture_reference_invalid"))?;
+            if current != source {
+                return Err(AppError::Conflict("raw retirement root changed".into()));
+            }
+            if metadata.e_tag.is_none() && metadata.version.is_none() {
+                return Err(AppError::storage(
+                    "raw_retirement_conditional_update_unavailable",
+                ));
+            }
+            self.restore_durable_root(
+                &retirement_root(fence.tenant_id, fence.request_id, side)?,
+                Bytes::from(
+                    serde_json::to_vec(&fence)
+                        .map_err(|_| AppError::internal("raw_retirement_encode"))?,
+                ),
+            )
+            .await?;
+            // This comparison is performed by the backend. GET followed by an
+            // unconditional DELETE would allow a concurrent relocation to lose.
+            let result = self
+                .inner
+                .put_opts(
+                    &path,
+                    PutPayload::from_bytes(marker.clone()),
+                    PutOptions {
+                        mode: PutMode::Update(object_store::UpdateVersion {
+                            e_tag: metadata.e_tag,
+                            version: metadata.version,
+                        }),
+                        ..Default::default()
+                    },
+                )
+                .await;
+            match result {
+                Ok(_) => {}
+                Err(error) => {
+                    // Lost ACK is success only after exact marker readback.
+                    // A conflicting root leaves the durable obligation pending.
+                    if self.get_bounded(&root_key, 4096).await? != marker {
+                        return Err(error.into());
+                    }
+                }
+            }
+            #[cfg(test)]
+            crate::db::Database::semantic_coverage_test_boundary("raw_retirement_marker_ack")?;
+        }
+        Ok(())
+    }
+
     /// Settle a late publisher explicitly against the durable semantic
     /// retirement obligation. This is never acknowledgement of a new raw root.
     pub(crate) async fn settle_raw_capture(
@@ -136,6 +243,38 @@ impl ArchiveStore {
             || fence.release_generation.is_nil()
         {
             return Err(AppError::storage("raw_retirement_invalid"));
+        }
+        // The fence is authoritative only together with the immutable exact
+        // source coverage receipt. A projected row or a root-exists bit cannot
+        // substitute for this handoff proof.
+        let receipt = self
+            .get_bounded(
+                &format!(
+                    "tenants/{tenant}/semantic/v2/requests/{request}/{}-coverage.json",
+                    fence.semantic_revision
+                ),
+                4096,
+            )
+            .await?;
+        let receipt: serde_json::Value = serde_json::from_slice(&receipt)
+            .map_err(|_| AppError::storage("raw_retirement_coverage_invalid"))?;
+        let publication = &receipt["publication"];
+        let binding = &receipt["binding"];
+        let coverage = &receipt["coverage"];
+        if publication["tenant_id"].as_str() != Some(tenant.to_string().as_str())
+            || publication["request_id"].as_str() != Some(request.to_string().as_str())
+            || publication["revision"].as_u64() != Some(fence.semantic_revision)
+            || binding["node_hash"].as_str() != Some(fence.semantic_leaf.as_str())
+            || binding["tenant_id"] != publication["tenant_id"]
+            || binding["request_id"] != publication["request_id"]
+            || coverage["observed_terminal"].as_bool() != Some(true)
+            || coverage["projection_state"].as_str() != Some("complete")
+            || !coverage["gaps"].as_array().is_some_and(Vec::is_empty)
+            || receipt["raw_sources"][side]
+                != serde_json::to_value(&fence.source)
+                    .map_err(|_| AppError::storage("raw_retirement_invalid"))?
+        {
+            return Err(AppError::storage("raw_retirement_coverage_invalid"));
         }
         Ok(Some(fence))
     }
@@ -433,6 +572,15 @@ mod retirement_contracts {
         };
         // This seeds future cleanup metadata only. Production activation must
         // separately prove coverage and the end of retry/publication owners.
+        archive.restore_durable_root(
+            &format!("tenants/{tenant}/semantic/v2/requests/{request}/7-coverage.json"),
+            Bytes::from(serde_json::to_vec(&serde_json::json!({
+                "publication": {"tenant_id":tenant,"request_id":request,"revision":7},
+                "binding": {"tenant_id":tenant,"request_id":request,"node_hash":"a".repeat(64)},
+                "coverage": {"observed_terminal":true,"projection_state":"complete","gaps":[]},
+                "raw_sources": {"request":object,"response":null}
+            })).unwrap()),
+        ).await.unwrap();
         archive
             .restore_durable_root(
                 &retirement_root(tenant, request, "request").unwrap(),
