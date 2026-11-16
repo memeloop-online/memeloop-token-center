@@ -1119,9 +1119,18 @@ pub struct RequestProvenanceView {
 }
 
 #[derive(Clone, Debug, Serialize)]
+pub struct SemanticArchiveView {
+    /// Hash-derived revisions are decimal strings on the JSON/JavaScript wire.
+    pub manifest_revision: String,
+    pub projection_version: u32,
+    pub semantic_head: crate::archive::SemanticHead,
+    pub coverage: crate::archive::SemanticCoverage,
+}
+
+#[derive(Clone, Debug, Serialize)]
 pub struct RequestDetail {
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub semantic_archive: Option<crate::archive::SemanticArchiveAuthority>,
+    pub semantic_archive: Option<SemanticArchiveView>,
     #[serde(flatten)]
     pub view: RequestView,
     pub request_body: serde_json::Value,

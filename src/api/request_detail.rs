@@ -85,7 +85,14 @@ pub(super) async fn request_detail(
             }
         };
     crate::model::RequestDetail {
-        semantic_archive: refs.semantic_archive,
+        semantic_archive: refs.semantic_archive.map(|authority| {
+            crate::model::SemanticArchiveView {
+                manifest_revision: authority.publication.revision.to_string(),
+                projection_version: authority.publication.projection_version,
+                semantic_head: authority.semantic_head,
+                coverage: authority.coverage,
+            }
+        }),
         view: refs.view,
         request_body: request.value,
         response_body: response.value,
