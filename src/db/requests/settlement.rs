@@ -11,7 +11,7 @@ mod usage_normalization_tests;
 /// Scan positions advance over inspected rows, including rows that are not orphans.
 #[derive(Clone, Default)]
 pub(crate) struct OrphanReservationScan {
-    request_after: Option<(i64, String)>,
+    request_after: Option<(String, String)>,
     reservation_after: Option<(i64, String)>,
 }
 
@@ -142,10 +142,10 @@ impl Database {
         // Materialize a bounded index page before any correlated eligibility
         // checks. LIMIT on the old anti-join only bounded its output, not work.
         let request_page = match &scan.request_after {
-            Some((created, id)) => sqlx::query("SELECT id, created_at FROM request_records WHERE created_at < $1 AND (created_at, id) > ($2, $3) ORDER BY created_at, id LIMIT $4")
-                .bind(cutoff).bind(created).bind(id).bind(limit).fetch_all(&self.pool).await?,
-            None => sqlx::query("SELECT id, created_at FROM request_records WHERE created_at < $1 ORDER BY created_at, id LIMIT $2")
-                .bind(cutoff).bind(limit).fetch_all(&self.pool).await?,
+            Some((tenant, id)) => sqlx::query("SELECT id, created_at, tenant_id FROM request_records WHERE submission_started_at IS NOT NULL AND completed_at IS NULL AND (tenant_id, id) > ($1, $2) ORDER BY tenant_id, id LIMIT $3")
+                .bind(tenant).bind(id).bind(limit).fetch_all(&self.pool).await?,
+            None => sqlx::query("SELECT id, created_at, tenant_id FROM request_records WHERE submission_started_at IS NOT NULL AND completed_at IS NULL ORDER BY tenant_id, id LIMIT $1")
+                .bind(limit).fetch_all(&self.pool).await?,
         };
         if request_page.is_empty() {
             scan.request_after = None;
@@ -155,7 +155,7 @@ impl Database {
             let created: i64 = candidate.try_get("created_at")?;
             sqlx::query("UPDATE request_records SET submission_uncertain_at = $1, error_code = 'image_submission_uncertain' WHERE id = $2 AND created_at = $3 AND created_at < $4 AND completed_at IS NULL AND submission_started_at IS NOT NULL AND submission_uncertain_at IS NULL AND NOT EXISTS (SELECT 1 FROM synchronous_image_idempotency s WHERE s.request_id = request_records.id AND s.key_id = request_records.key_id AND s.status = 'pending' AND s.lease_expires_at > $1)")
                 .bind(now).bind(&id).bind(created).bind(cutoff).execute(&self.pool).await?;
-            scan.request_after = Some((created, id));
+            scan.request_after = Some((candidate.try_get("tenant_id")?, id));
         }
         let candidates = match &scan.reservation_after {
             Some((created, id)) => sqlx::query("SELECT id, created_at FROM usage_reservations WHERE status IN ('reserved', 'settled') AND created_at < $1 AND (created_at, id) > ($2, $3) ORDER BY created_at, id LIMIT $4")
