@@ -325,6 +325,7 @@ impl CacheKey {
 
 #[derive(Clone, Serialize)]
 pub(crate) struct QuotaSnapshot {
+    pub(crate) routing_availability: Option<Vec<crate::db::SupplierAvailabilityDecision>>,
     contract_version: &'static str,
     upstream_account_id: Uuid,
     tenant_external_id: String,
@@ -461,6 +462,7 @@ impl QuotaSnapshot {
         let codex = account.driver == "openai-codex";
         let known_read_adapter = QuotaCapabilities::for_provider(&account.driver).read;
         Self {
+            routing_availability: None,
             contract_version: "upstream_quota_v1",
             upstream_account_id: account.id,
             tenant_external_id: tenant.to_owned(),
