@@ -38,7 +38,78 @@ fn root(tenant: Uuid, request: Uuid, side: &str) -> Result<String, AppError> {
     Ok(format!("tenants/{tenant}/raw/v1/{request}/{side}.json"))
 }
 
+/// A permanent, small retirement fence. Its source is provenance only: this
+/// metadata does not keep a retired raw CAS body alive in a GC reference set.
+#[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct RawRetirement {
+    pub format_version: u32,
+    pub tenant_id: Uuid,
+    pub request_id: Uuid,
+    pub side: String,
+    pub source: CasArchiveObject,
+    pub semantic_revision: u64,
+    pub semantic_leaf: String,
+    pub release_generation: Uuid,
+}
+
+fn retirement_root(tenant: Uuid, request: Uuid, side: &str) -> Result<String, AppError> {
+    root(tenant, request, side)?;
+    Ok(format!(
+        "tenants/{tenant}/semantic/v2/requests/{request}/retired-{side}.json"
+    ))
+}
+
 impl ArchiveStore {
+    async fn raw_retirement(
+        &self,
+        tenant: Uuid,
+        request: Uuid,
+        side: &str,
+    ) -> Result<Option<RawRetirement>, AppError> {
+        let key = retirement_root(tenant, request, side)?;
+        match self.inner.head(&archive_path(&key)?).await {
+            Err(object_store::Error::NotFound { .. }) => return Ok(None),
+            Err(error) => return Err(error.into()),
+            Ok(_) => {}
+        }
+        let bytes = self.get_bounded(&key, 4096).await?;
+        let fence: RawRetirement = serde_json::from_slice(&bytes)
+            .map_err(|_| AppError::storage("raw_retirement_invalid"))?;
+        fence.source.validate_tenant(tenant)?;
+        if fence.format_version != 1
+            || fence.tenant_id != tenant
+            || fence.request_id != request
+            || fence.side != side
+            || fence.semantic_revision == 0
+            || blake3::Hash::from_hex(&fence.semantic_leaf).is_err()
+            || fence.release_generation.is_nil()
+        {
+            return Err(AppError::storage("raw_retirement_invalid"));
+        }
+        Ok(Some(fence))
+    }
+
+    // Both checks are necessary: retirement may race an already in-flight PUT.
+    // A retired publication is not acknowledged as a new durable raw capture.
+    async fn ensure_raw_not_retired(
+        &self,
+        tenant: Uuid,
+        request: Uuid,
+        side: &str,
+        object: &CasArchiveObject,
+    ) -> Result<(), AppError> {
+        if let Some(fence) = self.raw_retirement(tenant, request, side).await? {
+            let reason = if fence.source == *object {
+                "raw capture retired"
+            } else {
+                "raw retired source identity conflict"
+            };
+            return Err(AppError::Conflict(reason.into()));
+        }
+        Ok(())
+    }
+
     pub async fn publish_response_attempt(
         &self,
         tenant: Uuid,
@@ -182,12 +253,16 @@ impl ArchiveStore {
         side: &str,
         object: &CasArchiveObject,
     ) -> Result<(), AppError> {
+        self.ensure_raw_not_retired(tenant, request, side, object)
+            .await?;
         if self
             .verified_published_raw_capture(tenant, request, side, object)
             .await?
             .is_some()
         {
-            return Ok(());
+            return self
+                .ensure_raw_not_retired(tenant, request, side, object)
+                .await;
         }
         self.verify_tenant_content(tenant, object).await?;
         let key = root(tenant, request, side)?;
@@ -205,14 +280,18 @@ impl ArchiveStore {
             )
             .await
         {
-            Ok(_) => Ok(()),
+            Ok(_) => {
+                self.ensure_raw_not_retired(tenant, request, side, object)
+                    .await
+            }
             Err(object_store::Error::AlreadyExists { .. }) => {
                 if self
                     .verified_published_raw_capture(tenant, request, side, object)
                     .await?
                     .is_some()
                 {
-                    Ok(())
+                    self.ensure_raw_not_retired(tenant, request, side, object)
+                        .await
                 } else {
                     Err(AppError::Conflict(
                         "raw archive root content conflict".into(),
@@ -254,6 +333,9 @@ impl ArchiveStore {
         request: Uuid,
         side: &str,
     ) -> Result<Option<CasArchiveObject>, AppError> {
+        if self.raw_retirement(tenant, request, side).await?.is_some() {
+            return Ok(None);
+        }
         let key = root(tenant, request, side)?;
         match self.inner.head(&archive_path(&key)?).await {
             Err(object_store::Error::NotFound { .. }) => return Ok(None),
@@ -264,6 +346,85 @@ impl ArchiveStore {
         let reference: CasArchiveObject = serde_json::from_slice(&encoded)
             .map_err(|_| AppError::storage("raw_capture_reference_invalid"))?;
         reference.validate_tenant(tenant)?;
+        if self.raw_retirement(tenant, request, side).await?.is_some() {
+            return Ok(None);
+        }
         Ok(Some(reference))
+    }
+}
+
+#[cfg(test)]
+mod retirement_contracts {
+    use super::*;
+
+    #[tokio::test]
+    async fn retirement_fence_hides_late_root_and_rejects_republication_without_deleting_cas() {
+        let archive = super::super::tests::memory_store();
+        let tenant = Uuid::now_v7();
+        let request = Uuid::now_v7();
+        let bytes = Bytes::from_static(b"exact temporary original");
+        let object = archive
+            .put_tenant_content(tenant, bytes.clone())
+            .await
+            .unwrap();
+        archive
+            .publish_raw_capture(tenant, request, "request", &object)
+            .await
+            .unwrap();
+        let fence = RawRetirement {
+            format_version: 1,
+            tenant_id: tenant,
+            request_id: request,
+            side: "request".into(),
+            source: object.clone(),
+            semantic_revision: 7,
+            semantic_leaf: "a".repeat(64),
+            release_generation: Uuid::now_v7(),
+        };
+        // This seeds future cleanup metadata only. Production activation must
+        // separately prove coverage and the end of retry/publication owners.
+        archive
+            .restore_durable_root(
+                &retirement_root(tenant, request, "request").unwrap(),
+                Bytes::from(serde_json::to_vec(&fence).unwrap()),
+            )
+            .await
+            .unwrap();
+        assert!(
+            archive
+                .raw_capture_reference(tenant, request, "request")
+                .await
+                .unwrap()
+                .is_none()
+        );
+        assert!(
+            archive
+                .publish_raw_capture(tenant, request, "request", &object)
+                .await
+                .is_err()
+        );
+        // Even a physically remaining/re-created old root is not live. No
+        // shared body deletion is granted by this metadata preparation step.
+        assert!(
+            archive
+                .inner
+                .head(&archive_path(&root(tenant, request, "request").unwrap()).unwrap())
+                .await
+                .is_ok()
+        );
+        assert_eq!(
+            archive
+                .get_tenant_content(tenant, &object, bytes.len())
+                .await
+                .unwrap(),
+            bytes
+        );
+        assert!(
+            archive
+                .raw_capture_reference(tenant, request, "response")
+                .await
+                .unwrap()
+                .is_none()
+        );
     }
 }

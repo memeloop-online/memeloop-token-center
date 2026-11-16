@@ -243,12 +243,15 @@ impl ArchiveStore {
             publication: &'a SemanticPublication,
             binding: &'a SemanticBindingProof,
             coverage: &'a super::SemanticCoverage,
+            #[serde(skip_serializing_if = "Option::is_none")]
+            raw_sources: Option<&'a super::semantic_manifest::SemanticRawSources>,
         }
         let receipt = Receipt {
             format_version: 2,
             publication,
             binding: proof,
             coverage: &manifest.coverage,
+            raw_sources: manifest.raw_sources.as_ref(),
         };
         #[cfg(test)]
         crate::db::Database::semantic_coverage_test_boundary("coverage_put")?;

@@ -1034,8 +1034,10 @@ impl Context {
         let mut response_valid = true;
         let mut protocol_terminal = false;
         let mut protocol_incomplete = false;
+        let mut parsed_response = None;
         if let Some(locator) = response_locator {
             let raw_response = self.source_object(request, "response", locator)?;
+            parsed_response = Some(raw_response.clone());
             let mut source = BufReader::with_capacity(CHUNK, self.content(&raw_response)?);
             while source
                 .fill_buf()
@@ -1292,6 +1294,10 @@ impl Context {
                 depth: node.depth as u64,
             }),
             instances_head: None,
+            raw_sources: Some(super::semantic_manifest::SemanticRawSources {
+                request: raw_request,
+                response: parsed_response,
+            }),
             coverage: super::SemanticCoverage {
                 observed_terminal: response_complete && protocol_terminal && !protocol_incomplete,
                 projection_state: if coverage_complete {
