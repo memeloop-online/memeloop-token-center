@@ -245,7 +245,6 @@ pub use providers::{
     NativeOAuthImportCohortResult, ReauthorizeUpstreamAccountInput, ReplaceModelCatalogResult,
     UpdateModelRouteInput, UpdateUpstreamAccountInput, UpstreamModelCatalogView, UpstreamModelView,
 };
-pub(crate) use requests::RequestArchiveAdmission;
 pub use requests::{
     AttachProxyArchiveResult, ConversationDetailFilter, ConversationListFilter,
     ConversationProjectionTask, FinishMeteredSynchronousRequest, FinishProxyRequest,
@@ -270,6 +269,7 @@ pub(crate) use requests::{
     reserve_usage_in_transaction, search_prefix, settle_token_usage_in_transaction,
     validate_numeric_range,
 };
+pub(crate) use requests::{OrphanReservationScan, RequestArchiveAdmission};
 #[cfg(test)]
 pub(crate) use requests::{
     RequestEventCursor, claim_request_event_locator, claim_request_record_locator,
