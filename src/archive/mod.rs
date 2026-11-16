@@ -36,6 +36,7 @@ mod path;
 mod quota_reset_receipts;
 mod raw_cache;
 mod raw_capture;
+pub(crate) use raw_capture::RawPublicationSettlement;
 #[cfg(test)]
 mod raw_capture_tests;
 mod readiness;

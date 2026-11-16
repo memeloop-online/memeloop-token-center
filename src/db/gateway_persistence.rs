@@ -305,14 +305,17 @@ impl Database {
                 let object = archive
                     .promote_staged_text_to_cas(identity.tenant_id, &staged)
                     .await?;
-                archive
-                    .publish_raw_capture(
+                let settlement = archive
+                    .settle_raw_capture(
                         identity.tenant_id,
                         identity.request_id,
                         "request",
                         &object,
                     )
                     .await?;
+                if let crate::archive::RawPublicationSettlement::Retired { semantic_revision, semantic_leaf } = settlement {
+                    tracing::debug!(request_id = %identity.request_id, semantic_revision, %semantic_leaf, "late raw source settled by semantic retirement");
+                }
                 Ok(object)
             }
             .await;

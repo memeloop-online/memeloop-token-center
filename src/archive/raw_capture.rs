@@ -60,7 +60,57 @@ fn retirement_root(tenant: Uuid, request: Uuid, side: &str) -> Result<String, Ap
     ))
 }
 
+#[derive(Clone, Debug)]
+pub(crate) enum RawPublicationSettlement {
+    Published,
+    Retired {
+        semantic_revision: u64,
+        semantic_leaf: String,
+    },
+}
+
 impl ArchiveStore {
+    /// Settle a late publisher explicitly against the durable semantic
+    /// retirement obligation. This is never acknowledgement of a new raw root.
+    pub(crate) async fn settle_raw_capture(
+        &self,
+        tenant: Uuid,
+        request: Uuid,
+        side: &str,
+        object: &CasArchiveObject,
+    ) -> Result<RawPublicationSettlement, AppError> {
+        if let Some(retired) = self.raw_retirement(tenant, request, side).await? {
+            if retired.source != *object {
+                return Err(AppError::Conflict(
+                    "raw retired source identity conflict".into(),
+                ));
+            }
+            return Ok(RawPublicationSettlement::Retired {
+                semantic_revision: retired.semantic_revision,
+                semantic_leaf: retired.semantic_leaf,
+            });
+        }
+        match self
+            .publish_raw_capture(tenant, request, side, object)
+            .await
+        {
+            Ok(()) => Ok(RawPublicationSettlement::Published),
+            Err(error) => {
+                // A retirement may have won while the old PUT was in flight.
+                // Re-read its immutable identity rather than retrying forever.
+                if let Some(retired) = self.raw_retirement(tenant, request, side).await? {
+                    if retired.source == *object {
+                        return Ok(RawPublicationSettlement::Retired {
+                            semantic_revision: retired.semantic_revision,
+                            semantic_leaf: retired.semantic_leaf,
+                        });
+                    }
+                }
+                Err(error)
+            }
+        }
+    }
+
     async fn raw_retirement(
         &self,
         tenant: Uuid,
