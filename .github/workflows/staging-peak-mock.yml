@@ -32,7 +32,7 @@ jobs:
       - name: Build exact-source isolated mock and load image
         run: |
           mkdir -p evidence
-          docker build --file tests/load/staging-peak/Dockerfile --tag mtc-staging-peak:${{ github.sha }} .
+          docker build --build-arg MTC_HARNESS_SOURCE_SHA=${{ github.sha }} --file tests/load/staging-peak/Dockerfile --tag mtc-staging-peak:${{ github.sha }} .
           docker image inspect mtc-staging-peak:${{ github.sha }} --format '{{.Id}}' > evidence/image-id.txt
           printf '%s\n' '${{ github.sha }}' > evidence/source-sha.txt
           docker save mtc-staging-peak:${{ github.sha }} -o evidence/staging-peak-image.tar

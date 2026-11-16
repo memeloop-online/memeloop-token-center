@@ -4,17 +4,17 @@ import { setTimeout as delay } from "node:timers/promises";
 import { pathToFileURL } from "node:url";
 import { validateBaseline, baselineIdentity } from "./baseline.ts";
 
-export type Arrival = { at_ms: number; scenario: "normal" | "slow-read" | "upstream-error" | "disconnect" | "tool-session"; session: string; stream: boolean; request_bytes: number; response_bytes: number; chunk_delay_ms: number; client_read_delay_ms: number; expected_status: number };
+export type Arrival = { protocol: "chat" | "responses"; at_ms: number; scenario: "normal" | "slow-read" | "upstream-error" | "disconnect" | "tool-session"; session: string; stream: boolean; request_bytes: number; response_bytes: number; chunk_delay_ms: number; client_read_delay_ms: number; expected_status: number };
 export type Plan = { release_batch: string; window_ms: number; drain_timeout_ms: number; arrivals: Arrival[]; baseline: unknown };
 export function validatePlan(value: unknown): Plan {
   const plan = value as Plan;
   if (!plan?.release_batch || !Number.isSafeInteger(plan.window_ms) || plan.window_ms <= 0 || !Number.isSafeInteger(plan.drain_timeout_ms) || plan.drain_timeout_ms <= 0 || !Array.isArray(plan.arrivals) || !plan.arrivals.length) throw new Error("explicit release batch, arrival window and drain period required");
   let previous = -1;
   for (const row of plan.arrivals) {
-    if (!Number.isSafeInteger(row.at_ms) || row.at_ms < previous || row.at_ms >= plan.window_ms || !["normal", "slow-read", "upstream-error", "disconnect", "tool-session"].includes(row.scenario) || !row.session || typeof row.stream !== "boolean") throw new Error("invalid ordered arrival or scenario");
+    if (!Number.isSafeInteger(row.at_ms) || row.at_ms < previous || row.at_ms >= plan.window_ms || !["normal", "slow-read", "upstream-error", "disconnect", "tool-session"].includes(row.scenario) || !row.session || typeof row.stream !== "boolean" || !["chat","responses"].includes(row.protocol)) throw new Error("invalid ordered arrival or scenario");
     for (const number of [row.request_bytes, row.response_bytes, row.chunk_delay_ms, row.client_read_delay_ms]) if (!Number.isSafeInteger(number) || number < 0) throw new Error("invalid measured workload size or delay");
     if (!Number.isInteger(row.expected_status) || row.expected_status < 100 || row.expected_status > 599) throw new Error("expected gateway result required");
-    if(row.scenario==="tool-session" && row.stream) throw new Error("tool conversation fixture requires buffered replies");
+    if(row.scenario==="tool-session" && (row.stream || row.protocol!=="chat")) throw new Error("tool conversation fixture requires buffered replies");
     if (row.stream && row.response_bytes < 4096) throw new Error("SSE workload must include protocol framing");
     previous = row.at_ms;
   }
@@ -61,25 +61,27 @@ export async function run(plan: Plan, env = process.env): Promise<Record<string,
     active++; peakActive=Math.max(peakActive,active);
     tasks.push((async () => {
       const began=performance.now(), session=`${runId}:${arrival.session}`;
-      let status=0, bytes=0, error:string|undefined, hash=createHash("sha256"), tail="";
+      let status=0, bytes=0, exchanges=1, requestId:string|null=null, error:string|undefined, hash=createHash("sha256"), tail="";
       try {
         const payload: Record<string,unknown>={ model:models[arrival.scenario], messages:[{role:"user",content:"synthetic peak replay"+"x".repeat(arrival.request_bytes)}], metadata:{session_id:session}, stream:arrival.stream, max_tokens:1 };
         if (arrival.stream) payload.benchmark={mode:"stream",bytes:arrival.response_bytes,chunk_bytes:4096,delay_ms:arrival.chunk_delay_ms};
-        const response=await fetch(new URL("/v1/chat/completions",gateway), {method:"POST",headers:{authorization:`Bearer ${key}`,"content-type":"application/json","x-mtc-conversation-id":session},body:JSON.stringify(payload),signal:AbortSignal.timeout(plan.window_ms+plan.drain_timeout_ms)});
-        status=response.status;
+        if(arrival.protocol==="responses"){payload.input=payload.messages;delete payload.messages;}
+        const response=await fetch(new URL(arrival.protocol==="responses"?"/v1/responses":"/v1/chat/completions",gateway), {method:"POST",headers:{authorization:`Bearer ${key}`,"content-type":"application/json","x-mtc-conversation-id":session},body:JSON.stringify(payload),signal:AbortSignal.timeout(plan.window_ms+plan.drain_timeout_ms)});
+        status=response.status;requestId=response.headers.get("x-request-id");
         if (response.body) for await (const chunk of response.body) { bytes+=chunk.length; hash.update(chunk); tail=(tail+Buffer.from(chunk).toString("utf8")).slice(-4096); if(arrival.client_read_delay_ms) await delay(arrival.client_read_delay_ms); }
         if(status!==arrival.expected_status) error="unexpected_gateway_status";
-        if(arrival.stream && status===200 && !tail.includes("data: [DONE]")) error="missing_stream_terminal";
+        if(arrival.stream && status===200 && !(arrival.protocol==="responses"?tail.includes('"type":"response.completed"'):tail.includes("data: [DONE]"))) error="missing_stream_terminal";
         if(arrival.scenario==="tool-session" && status===200) {
           const message=JSON.parse(tail).choices[0].message;
           const tool=message.tool_calls?.[0];
           if(tool?.id!=="call_staging_echo" || tool.function?.name!=="staging_echo") throw new Error("tool_identity_mismatch");
+          exchanges++;
           const followup=await fetch(new URL("/v1/chat/completions",gateway),{method:"POST",headers:{authorization:`Bearer ${key}`,"content-type":"application/json","x-mtc-conversation-id":session},body:JSON.stringify({model:models[arrival.scenario],metadata:{session_id:session},messages:[{role:"user",content:"synthetic tool session"},message,{role:"tool",tool_call_id:tool.id,content:'{"value":"synthetic"}'}]}),signal:AbortSignal.timeout(plan.drain_timeout_ms)});
           const completed=await followup.json() as any;
           if(followup.status!==200 || completed.choices?.[0]?.message?.content!=="tool-complete") error="tool_followup_mismatch";
         }
       } catch { error="transport_or_timeout"; }
-      finally { active--; requests.push({index,session,scenario:arrival.scenario,offered_at_ms:arrival.at_ms,started_at_ms:began-start,generator_lag_ms:lag,status,response_bytes:bytes,response_sha256:hash.digest("hex"),latency_ms:performance.now()-began,error}); }
+      finally { active--; requests.push({index,session,protocol:arrival.protocol,http_exchanges:exchanges,request_id:requestId,scenario:arrival.scenario,offered_at_ms:arrival.at_ms,started_at_ms:began-start,generator_lag_ms:lag,status,response_bytes:bytes,response_sha256:hash.digest("hex"),latency_ms:performance.now()-began,error}); }
     })());
   }
   await Promise.all(tasks);
@@ -87,7 +89,7 @@ export async function run(plan: Plan, env = process.env): Promise<Record<string,
   let baselineHash:string|undefined, baselineError:string|undefined;
   try { baselineHash=baselineIdentity(validateBaseline(plan.baseline)); } catch { baselineError="historical_peak_coverage_incomplete"; }
   const latencies=requests.map(row=>Number(row.latency_ms));
-  return {schema_version:1,run_id:runId,release_batch:plan.release_batch,source_sha:env.MTC_HARNESS_SOURCE_SHA??null,tenant,offered:plan.arrivals.length,started:requests.length,completed:requests.filter(row=>!row.error).length,failed:requests.filter(row=>row.error).length,unissued:plan.arrivals.length-requests.length,peak_active:peakActive,latency_ms:{p50:percentile(latencies,.5),p95:percentile(latencies,.95),p99:percentile(latencies,.99),max:Math.max(...latencies)},baseline_sha256:baselineHash,baseline_error:baselineError,qualification:"NOT_EVALUATED",missing_evidence:["complete historical multidimensional peak","financial exactly-once assertions","semantic/archive API payload verification","PG poolwait/IO/locks and memory recovery","archive debt drain confirmation"],requests};
+  return {schema_version:1,run_id:runId,release_batch:plan.release_batch,source_sha:env.MTC_HARNESS_SOURCE_SHA??null,tenant,offered:plan.arrivals.length,started:requests.length,completed:requests.filter(row=>!row.error).length,failed:requests.filter(row=>row.error).length,unissued:plan.arrivals.length-requests.length,peak_active:peakActive,http_exchanges:requests.reduce((sum,row)=>sum+Number(row.http_exchanges),0),latency_ms:{p50:percentile(latencies,.5),p95:percentile(latencies,.95),p99:percentile(latencies,.99),max:Math.max(...latencies)},baseline_sha256:baselineHash,baseline_error:baselineError,qualification:"NOT_EVALUATED",missing_evidence:["complete historical multidimensional peak","financial exactly-once assertions","semantic/archive API payload verification","PG poolwait/IO/locks and memory recovery","archive debt drain confirmation"],requests};
 }
 if(process.argv[1] && import.meta.url===pathToFileURL(process.argv[1]).href) {
   try { const report=await run(validatePlan(JSON.parse(readFileSync(process.env.MTC_PEAK_PLAN_FILE??"/plan/plan.json","utf8")))); writeFileSync(process.env.MTC_PEAK_REPORT_FILE??"/evidence/report.json",JSON.stringify(report,null,2)); console.log(JSON.stringify(report)); process.exitCode=Number(report.failed)>0?2:0; }

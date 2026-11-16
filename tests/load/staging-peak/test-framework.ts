@@ -30,7 +30,7 @@ test("external staging mock reuses gateway JSON/SSE contracts and isolates failu
 import { validatePlan } from "./run.ts";
 import { manifests } from "./manifests.ts";
 test("TEST-only immutable manifests never mount production secrets or service-account tokens", () => {
-  const plan=validatePlan({release_batch:"synthetic-contract-only",window_ms:1000,drain_timeout_ms:1000,baseline:null,arrivals:[{at_ms:0,scenario:"normal",session:"unit",stream:false,request_bytes:0,response_bytes:0,chunk_delay_ms:0,client_read_delay_ms:0,expected_status:200}]});
+  const plan=validatePlan({release_batch:"synthetic-contract-only",window_ms:1000,drain_timeout_ms:1000,baseline:null,arrivals:[{protocol:"chat",at_ms:0,scenario:"normal",session:"unit",stream:false,request_bytes:0,response_bytes:0,chunk_delay_ms:0,client_read_delay_ms:0,expected_status:200}]});
   const bundle=manifests("contract","example.invalid/test@sha256:"+"a".repeat(64),"b".repeat(40),plan);
   for(const item of bundle.items) assert.equal(item.metadata.namespace,"memeloop-token-center-test");
   const serialized=JSON.stringify(bundle); assert(!serialized.includes("memeloop-token-center-secrets"));
@@ -48,4 +48,20 @@ test("tool session mock preserves the tool-call identity through its result", as
     const second=await fetch(url,{method:"POST",body:JSON.stringify({model:"synthetic",messages:[message,{role:"tool",tool_call_id:message.tool_calls[0].id,content:"synthetic"}]})});
     assert.equal((await second.json() as any).choices[0].message.content,"tool-complete");
   }finally{server.closeAllConnections();await new Promise<void>(resolve=>server.close(()=>resolve()));}
+});
+
+
+test("native Responses SSE exposes completed usage and output",async()=>{
+  const {server}=createStagingMock();await new Promise<void>(resolve=>server.listen(0,"127.0.0.1",resolve));
+  const address=server.address();assert(address&&typeof address!=="string");
+  try{const response=await fetch(`http://127.0.0.1:${address.port}/scenario/normal/v1/responses`,{method:"POST",body:JSON.stringify({model:"synthetic",input:"test",stream:true,benchmark:{bytes:8192}})});const text=await response.text();assert.match(text,/event: response.completed/);assert.match(text,/"input_tokens":2/);assert.match(text,/"output_text"/);}finally{server.closeAllConnections();await new Promise<void>(resolve=>server.close(()=>resolve()));}
+});
+
+import { referencePlan } from "./reference-plan.ts";
+test("sampled reference phases preserve lower-bound qualification gaps",()=>{
+  const plan=referencePlan("synthetic-unit-only",1.7,91);
+  assert.equal(plan.arrivals.filter(row=>row.at_ms===0).length,91);
+  assert.equal(plan.arrivals.filter(row=>row.at_ms>=30_000&&row.at_ms<90_000).length,102);
+  assert.equal(plan.baseline,null);
+  assert.throws(()=>referencePlan("",1.7,91));
 });

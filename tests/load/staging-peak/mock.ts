@@ -31,6 +31,31 @@ export function createStagingMock() {
         response.end(JSON.stringify({id:"chatcmpl-staging-tool",object:"chat.completion",model:body.model,choices:[{index:0,message,finish_reason:followup?"stop":"tool_calls"}],usage:{prompt_tokens:2,completion_tokens:1,total_tokens:3}})); return;
       }
       if (match[1] === "slow-read") { request.pause(); await delay(250); request.resume(); }
+      if(request.url==="/v1/responses") {
+        const chunks:Buffer[]=[]; for await(const chunk of request) chunks.push(Buffer.from(chunk));
+        const body=JSON.parse(Buffer.concat(chunks).toString("utf8"));
+        const text="x".repeat(Number(body.benchmark?.bytes??2));
+        const item={id:"msg_staging",type:"message",status:"completed",role:"assistant",content:[{type:"output_text",text,annotations:[]}]};
+        const complete={id:"resp_staging",object:"response",status:"completed",model:body.model,output:[item],usage:{input_tokens:2,output_tokens:1,total_tokens:3}};
+        if(!body.stream){response.writeHead(200,{"content-type":"application/json"});response.end(JSON.stringify(complete));return;}
+        response.writeHead(200,{"content-type":"text/event-stream"}); let sequence=0;
+        const event=async(type:string,data:Record<string,unknown>)=>{
+          if(response.destroyed)return;
+          const written=response.write(`event: ${type}\ndata: ${JSON.stringify({type,sequence_number:sequence++,...data})}\n\n`);
+          if(!written)await new Promise<void>(resolve=>{const done=()=>{response.off("drain",done);response.off("close",done);resolve();};response.once("drain",done);response.once("close",done);});
+        };
+        state.begin(); try{
+          await event("response.created",{response:{...complete,status:"in_progress",output:[]}});
+          await event("response.output_item.added",{output_index:0,item:{...item,status:"in_progress",content:[]}});
+          await event("response.content_part.added",{item_id:item.id,output_index:0,content_index:0,part:{type:"output_text",text:"",annotations:[]}});
+          for(let offset=0;offset<text.length&&!response.destroyed;offset+=4096){await event("response.output_text.delta",{item_id:item.id,output_index:0,content_index:0,delta:text.slice(offset,offset+4096)});if(body.benchmark?.delay_ms)await delay(Number(body.benchmark.delay_ms));}
+          if(response.destroyed)return;
+          await event("response.output_text.done",{item_id:item.id,output_index:0,content_index:0,text});
+          await event("response.content_part.done",{item_id:item.id,output_index:0,content_index:0,part:item.content[0]});
+          await event("response.output_item.done",{output_index:0,item});
+          await event("response.completed",{response:complete});response.end();
+        }finally{state.end();}return;
+      }
       fallback(request, response);
     };
     void execute().catch(() => { if (!response.headersSent) response.writeHead(500); response.end(); });
