@@ -49,7 +49,7 @@ mod semantic_manifest;
 mod semantic_publication;
 mod semantic_view;
 pub(crate) use semantic_publication::SemanticBindingProof;
-pub use semantic_publication::SemanticPublication;
+pub use semantic_publication::{SemanticArchiveAuthority, SemanticPublication};
 mod session_projection;
 mod staging;
 mod supplier_summary;
