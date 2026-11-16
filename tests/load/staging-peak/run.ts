@@ -61,16 +61,16 @@ export async function run(plan: Plan, env = process.env): Promise<Record<string,
     active++; peakActive=Math.max(peakActive,active);
     tasks.push((async () => {
       const began=performance.now(), session=`${runId}:${arrival.session}`;
-      let status=0, bytes=0, exchanges=1, requestId:string|null=null, error:string|undefined, hash=createHash("sha256"), tail="";
+      let status=0, bytes=0, exchanges=1, requestId:string|null=null, error:string|undefined, hash=createHash("sha256"), tail="", terminal=false;
       try {
         const payload: Record<string,unknown>={ model:models[arrival.scenario], messages:[{role:"user",content:"synthetic peak replay"+"x".repeat(arrival.request_bytes)}], metadata:{session_id:session}, stream:arrival.stream, max_tokens:1 };
         if (arrival.stream) payload.benchmark={mode:"stream",bytes:arrival.response_bytes,chunk_bytes:4096,delay_ms:arrival.chunk_delay_ms};
         if(arrival.protocol==="responses"){payload.input=payload.messages;delete payload.messages;}
         const response=await fetch(new URL(arrival.protocol==="responses"?"/v1/responses":"/v1/chat/completions",gateway), {method:"POST",headers:{authorization:`Bearer ${key}`,"content-type":"application/json","x-mtc-conversation-id":session},body:JSON.stringify(payload),signal:AbortSignal.timeout(plan.window_ms+plan.drain_timeout_ms)});
         status=response.status;requestId=response.headers.get("x-request-id");
-        if (response.body) for await (const chunk of response.body) { bytes+=chunk.length; hash.update(chunk); tail=(tail+Buffer.from(chunk).toString("utf8")).slice(-4096); if(arrival.client_read_delay_ms) await delay(arrival.client_read_delay_ms); }
+        if (response.body) for await (const chunk of response.body) { bytes+=chunk.length; hash.update(chunk); const scan=tail+Buffer.from(chunk).toString("utf8");terminal ||= arrival.protocol==="responses"?scan.includes('"type":"response.completed"'):scan.includes("data: [DONE]");tail=scan.slice(-4096); if(arrival.client_read_delay_ms) await delay(arrival.client_read_delay_ms); }
         if(status!==arrival.expected_status) error="unexpected_gateway_status";
-        if(arrival.stream && status===200 && !(arrival.protocol==="responses"?tail.includes('"type":"response.completed"'):tail.includes("data: [DONE]"))) error="missing_stream_terminal";
+        if(arrival.stream && status===200 && !terminal) error="missing_stream_terminal";
         if(arrival.scenario==="tool-session" && status===200) {
           const message=JSON.parse(tail).choices[0].message;
           const tool=message.tool_calls?.[0];

@@ -65,3 +65,10 @@ test("sampled reference phases preserve lower-bound qualification gaps",()=>{
   assert.equal(plan.baseline,null);
   assert.throws(()=>referencePlan("",1.7,91));
 });
+
+import { qualify } from "./report.ts";
+test("missing observer or real baseline cannot qualify the release",()=>{
+  const report=qualify({run_id:"contract",source_sha:"a".repeat(40),offered:1,started:1,unissued:0,failed:0,requests:[]},null,null);
+  assert.equal(report.qualification,"NOT_EVALUATED");assert(report.missing_evidence.includes("complete_historical_baseline"));
+  assert.equal(qualify({run_id:"contract",offered:1,started:1,unissued:0,failed:1},null,null).qualification,"FAILED");
+});
