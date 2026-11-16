@@ -17031,6 +17031,152 @@
           }
         }
       }
+    },
+    "/internal/v1/sessions/{session_id}/requests/{request_id}/semantic-view": {
+      "get": {
+        "tags": [
+          "Operator traffic"
+        ],
+        "operationId": "getOperatorSessionSemanticView",
+        "summary": "Read a verified semantic manifest page or anchored atom stream",
+        "description": "Ownership is checked on every read. No published root returns explicit pending coverage. Revisions are lossless decimal u64 strings; continuations bind tenant, request, revision and instance. No raw fallback.",
+        "security": [
+          {
+            "serviceBearer": []
+          }
+        ],
+        "parameters": [
+          {
+            "$ref": "#/components/parameters/ContextSessionId"
+          },
+          {
+            "$ref": "#/components/parameters/RequestIdPath"
+          },
+          {
+            "$ref": "#/components/parameters/TenantFilter"
+          },
+          {
+            "$ref": "#/components/parameters/ContextKeyId"
+          },
+          {
+            "name": "cursor",
+            "in": "query",
+            "required": false,
+            "description": "Signed fixed-revision page continuation; mutually exclusive with atom_cursor.",
+            "schema": {
+              "type": "string",
+              "maxLength": 16384
+            }
+          },
+          {
+            "name": "atom_cursor",
+            "in": "query",
+            "required": false,
+            "description": "Signed manifest-anchored instance capability; returns verified JSON atom stream.",
+            "schema": {
+              "type": "string",
+              "maxLength": 16384
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Published or pending semantic page, or verified atom JSON stream selected by atom_cursor.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "additionalProperties": true
+                }
+              }
+            }
+          },
+          "400": {
+            "$ref": "#/components/responses/InvalidRequest"
+          },
+          "401": {
+            "$ref": "#/components/responses/Unauthorized"
+          },
+          "404": {
+            "$ref": "#/components/responses/NotFound"
+          },
+          "409": {
+            "description": "Publication revision changed or no longer has a bound semantic root."
+          },
+          "403": {
+            "$ref": "#/components/responses/Forbidden"
+          }
+        },
+        "x-required-scope": "requests:read"
+      }
+    },
+    "/self/v1/sessions/{session_id}/requests/{request_id}/semantic-view": {
+      "get": {
+        "tags": [
+          "Self service"
+        ],
+        "operationId": "getSelfSessionSemanticView",
+        "summary": "Read a verified semantic manifest page or anchored atom stream",
+        "description": "Ownership is checked on every read. No published root returns explicit pending coverage. Revisions are lossless decimal u64 strings; continuations bind tenant, request, revision and instance. No raw fallback.",
+        "security": [
+          {
+            "clientBearer": []
+          }
+        ],
+        "parameters": [
+          {
+            "$ref": "#/components/parameters/ContextSessionId"
+          },
+          {
+            "$ref": "#/components/parameters/RequestIdPath"
+          },
+          {
+            "name": "cursor",
+            "in": "query",
+            "required": false,
+            "description": "Signed fixed-revision page continuation; mutually exclusive with atom_cursor.",
+            "schema": {
+              "type": "string",
+              "maxLength": 16384
+            }
+          },
+          {
+            "name": "atom_cursor",
+            "in": "query",
+            "required": false,
+            "description": "Signed manifest-anchored instance capability; returns verified JSON atom stream.",
+            "schema": {
+              "type": "string",
+              "maxLength": 16384
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Published or pending semantic page, or verified atom JSON stream selected by atom_cursor.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "additionalProperties": true
+                }
+              }
+            }
+          },
+          "400": {
+            "$ref": "#/components/responses/InvalidRequest"
+          },
+          "401": {
+            "$ref": "#/components/responses/Unauthorized"
+          },
+          "404": {
+            "$ref": "#/components/responses/NotFound"
+          },
+          "409": {
+            "description": "Publication revision changed or no longer has a bound semantic root."
+          }
+        }
+      }
     }
   },
   "components": {

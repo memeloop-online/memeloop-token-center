@@ -103,6 +103,7 @@ test('Usage virtual credential buckets open scoped requests while real sessions 
     const readyDetail = async () => {
       await page.locator('.session-detail-region .session-detail').waitFor();
       await page.getByRole('button', { name: 'Rename', exact: true }).waitFor();
+      await page.getByRole('button', { name: 'Read message · 1', exact: true }).click();
       await page.getByText('The checklist is ready for review.', { exact: true }).waitFor();
       assert.equal(await page.locator('.session-title-action').count(), 1, 'one title editor per selected session');
       assert.deepEqual(pageErrors, [], 'session focus must not cause browser render errors');
@@ -168,8 +169,10 @@ test('Usage virtual credential buckets open scoped requests while real sessions 
     await page.locator('.session-detail').waitFor({ state: 'detached' });
     await page.waitForFunction(() => document.activeElement?.classList.contains('session-sidebar-item')
       && document.activeElement.textContent?.includes('Named Codex conversation'));
-    assert.ok(Math.abs((await page.evaluate(() => window.scrollY)) - listScroll) <= 1);
     await page.screenshot({ path: join(evidence, 'session-list-return-mobile.png'), fullPage: true });
+    const returnedListPosition = await page.evaluate(() => ({ scrollY: window.scrollY, height: document.documentElement.scrollHeight, viewport: innerHeight,
+      origin: document.activeElement?.getBoundingClientRect().toJSON() }));
+    assert.ok(Math.abs(returnedListPosition.scrollY - listScroll) <= 1, JSON.stringify({ expectedScroll: listScroll, ...returnedListPosition }));
     await page.setViewportSize({ width: 1440, height: 900 });
 
     await page.goto(`http://127.0.0.1:${address.port}/e2e/fixtures/operator-overview-drilldown.html?request-session=1`);
