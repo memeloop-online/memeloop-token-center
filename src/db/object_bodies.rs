@@ -13,7 +13,7 @@ impl Database {
         // This detail/history read is already tenant-authorized. Complete SQL
         // metadata acquisition before any object-store operation; inference
         // admission does not depend on semantic archival.
-        let leaf: Option<String> = sqlx::query_scalar("SELECT leaf_node_hash FROM conversation_observations WHERE tenant_id=$1 AND request_id=$2")
+        let leaf: Option<String> = sqlx::query_scalar("SELECT o.leaf_node_hash FROM conversation_observations o JOIN conversation_clusters c ON c.id=o.cluster_id WHERE c.tenant_id=$1 AND o.request_id=$2")
             .bind(tenant_id.to_string()).bind(request_id.to_string()).fetch_optional(&self.pool).await?.flatten();
         let authority = match leaf {
             Some(leaf) => {
