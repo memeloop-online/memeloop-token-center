@@ -302,10 +302,65 @@ async fn legacy_deadline_and_provenance(db: &Database) {
 }
 
 async fn contracts(db: &Database) {
+    unknown_reset_is_recoverable_without_erasing_evidence(db).await;
     evidence_merge_orders(db).await;
     retained_evidence_success_orders(db).await;
     deadlines_and_reset_verification(db).await;
     legacy_deadline_and_provenance(db).await;
+}
+
+async fn unknown_reset_is_recoverable_without_erasing_evidence(db: &Database) {
+    let now = super::super::super::unix_millis();
+    let route = fixture(db).await;
+    let key = billing_key(db).await;
+    let public = format!("unknown-reset-{}", route.account_id);
+    let id = super::route(db, route.account_id, &public, "exact").await;
+    grant(db, key.key_id, id, None).await;
+    db.store_supplier_quota(&route, Uuid::now_v7(), now, failure(true, None))
+        .await
+        .unwrap();
+    let candidates = db
+        .list_authorized_upstream_candidates_with_hint(
+            key.key_id,
+            key.tenant_id,
+            &public,
+            "openai",
+            selection(Some(route.account_id)),
+        )
+        .await
+        .unwrap();
+    assert_eq!(candidates.len(), 1, "unknown reset cannot exclude forever");
+    assert_eq!(candidates[0].account_id, route.account_id);
+    assert_eq!(kind(db, &route).await, "quota_exhausted");
+    assert_eq!(
+        db.supplier_quota_recovery_models(route.account_id)
+            .await
+            .unwrap(),
+        vec!["exact".to_owned()],
+        "eligibility is not a fabricated successful probe"
+    );
+
+    db.store_supplier_quota(
+        &route,
+        Uuid::now_v7(),
+        now + 1,
+        failure(true, Some(now + 3_600_000)),
+    )
+    .await
+    .unwrap();
+    assert!(
+        db.list_authorized_upstream_candidates_with_hint(
+            key.key_id,
+            key.tenant_id,
+            &public,
+            "openai",
+            selection(Some(route.account_id)),
+        )
+        .await
+        .unwrap()
+        .is_empty(),
+        "an actual future reset must still protect exhausted capacity"
+    );
 }
 
 /// R2-F2: H(T), W(T+3), S(T+2) must have the same routing meaning in

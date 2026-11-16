@@ -1,4 +1,5 @@
 mod associations;
+mod availability;
 mod catalog_policy;
 mod create_idempotency;
 pub mod egress;
