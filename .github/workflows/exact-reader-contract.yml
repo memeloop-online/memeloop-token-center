@@ -564,6 +564,7 @@ jobs:
             archive::raw_capture::retirement_contracts::retirement_fence_hides_late_root_and_rejects_republication_without_deleting_cas \
             archive::raw_capture::retirement_contracts::complete_coverage_retires_exact_roots_and_rejects_stale_backend_versions \
             archive::raw_capture::retirement_contracts::incomplete_protocol_keeps_both_raw_roots_owned \
+            response_archive_spool::tests::late_response_capture_settles_against_retired_semantics_without_restoring_raw_binding \
             api::self_service::requests::tests::retired_raw_detail_uses_lossless_semantic_identity_without_reading_old_body \
             db::requests::conversations::archive_readiness_tests::sqlite_semantic_coverage_recovers_committed_projection_and_failed_put \
             db::requests::conversations::archive_readiness_tests::postgres_semantic_coverage_recovers_committed_projection_and_failed_put
