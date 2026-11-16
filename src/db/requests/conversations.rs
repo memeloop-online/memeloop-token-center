@@ -121,6 +121,9 @@ fn empty_semantic_snapshot(item: &ConversationSemanticSnapshot) -> bool {
 }
 
 const CONVERSATION_PROJECTION_BATCH_LIMIT: i64 = 32;
+// 已投影行保留 7 天便于排查，超期即回收。每行携带请求/语义快照（可达数 MB），
+// 没有回收路径时该表会无限增长并把存储 IO 打满。
+const CONVERSATION_PROJECTION_RETENTION_MS: i64 = 7 * 24 * 60 * 60 * 1_000;
 const CONVERSATION_PROJECTION_LEASE_MILLIS: i64 = 5 * 60 * 1_000;
 const SESSION_BODY_REBUILD_LEASE_OWNER: &str = "session-body-rebuild";
 const SESSION_BODY_REBUILD_OUTCOME: &str = "session_body";
@@ -511,6 +514,37 @@ impl Database {
             .await?;
         transaction.commit().await?;
         Ok(updated.rows_affected())
+    }
+
+    /// 回收已经投影完成且超过保留期的会话投影 outbox 行。
+    ///
+    /// `conversation_projection_outbox` 的每一行都携带请求与语义快照，单行可达数 MB。
+    /// 缺少回收路径时该表会无限增长（实测累积到数十 GB、数十万行），并让投影、
+    /// 归档和结算的普遍查询退化成全表扫描，最终把磁盘 IO 打满。
+    ///
+    /// 只删除 `projected_at` 已落地且早于保留期的行；未投影任务一律保留。
+    /// 用 `request_id` 子查询 + `LIMIT` 分批，避免一次性大事务放大 WAL 与 IO。
+    pub async fn delete_projected_conversation_outbox(
+        &self,
+        limit: i64,
+    ) -> Result<u64, AppError> {
+        let cutoff = unix_millis().saturating_sub(CONVERSATION_PROJECTION_RETENTION_MS);
+        let rows = sqlx::query(
+            "DELETE FROM conversation_projection_outbox
+             WHERE request_id IN (
+                 SELECT request_id
+                 FROM conversation_projection_outbox
+                 WHERE projected_at IS NOT NULL AND projected_at < $1
+                 ORDER BY projected_at ASC, request_id ASC
+                 LIMIT $2
+             )",
+        )
+        .bind(cutoff)
+        .bind(limit.clamp(1, 10_000))
+        .execute(&self.pool)
+        .await?
+        .rows_affected();
+        Ok(rows)
     }
 
     /// Claims a bounded batch of terminal conversation observations for one
