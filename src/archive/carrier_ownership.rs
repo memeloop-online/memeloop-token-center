@@ -33,6 +33,22 @@ impl CarrierObjectOwner {
         locator: String,
         bytes: &Bytes,
     ) -> Result<Self, AppError> {
+        Self::from_identity(
+            key,
+            locator,
+            bytes.len() as u64,
+            blake3::hash(bytes).to_hex().to_string(),
+        )
+    }
+
+    /// Records exact expected identity before a streamed writer starts. This
+    /// declaration does not acknowledge completion or authorize source release.
+    pub(crate) fn from_identity(
+        key: ArchiveStagingKey,
+        locator: String,
+        size_bytes: u64,
+        digest: String,
+    ) -> Result<Self, AppError> {
         crate::archive_staging::validate_bound_locator(key, &locator)?;
         let value = Self {
             version: 1,
@@ -42,8 +58,8 @@ impl CarrierObjectOwner {
             attempt_id: key.attempt_id.to_string(),
             backend_identity: key.backend_identity_text(),
             object_locator: locator,
-            byte_len: bytes.len() as u64,
-            blake3_digest: blake3::hash(bytes).to_hex().to_string(),
+            byte_len: size_bytes,
+            blake3_digest: digest,
         };
         value.key()?;
         Ok(value)
