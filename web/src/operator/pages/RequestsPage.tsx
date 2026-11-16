@@ -48,6 +48,7 @@ export function RequestsPage({ token, tenant, writeTenant = tenant, liveEvents, 
   const { t } = useI18n();
   const diagnosticLabels = { requestId: t('request.correlationId'), streamInterrupted: t('request.streamInterrupted') };
   const [requests, setRequests] = useState<RequestView[]>([]);
+  const [successfulRead, setSuccessfulRead] = useState<{ token: string; tenant: string; filters: TypedFilterAst; at: number }>();
   const [snapshotRevision, setSnapshotRevision] = useState(0);
   const [upstreams, setUpstreams] = useState<UpstreamAccount[]>([]);
   const [filters, setFilters] = useState<TypedFilterAst>(emptyTypedFilterAst);
@@ -154,6 +155,7 @@ export function RequestsPage({ token, tenant, writeTenant = tenant, liveEvents, 
       const current = requestsRef.current;
       const page = mergeBatchedRequestPage(mergeRefreshedRequestPage(current, next, current.length > 100), new Map(liveEventsRef.current), next.next_cursor !== null, loadedHistoryIds.current);
       setRequests(page.requests); setHasOlder(page.hasOlder);
+      setSuccessfulRead({ ...currentScope, at: Date.now() });
       setSnapshotRevision(value => value + 1);
       succeeded = true;
       if (errorSource.current === 'refresh') {
@@ -197,7 +199,7 @@ export function RequestsPage({ token, tenant, writeTenant = tenant, liveEvents, 
     if (!older) {
       if (!refresh) loadedHistoryIds.current.clear();
       setFilteredResultsStale(false);
-      if (!refresh) { setRequests([]); setHasOlder(false); closeRequestDetail(); }
+      if (!refresh) { setRequests([]); setHasOlder(false); setSuccessfulRead(undefined); closeRequestDetail(); }
     }
     loadingRef.current = true;
     errorSource.current = undefined;
@@ -220,6 +222,7 @@ export function RequestsPage({ token, tenant, writeTenant = tenant, liveEvents, 
         setHasOlder(next.next_cursor !== null);
       }
       setSnapshotRevision(value => value + 1);
+      if (!older) setSuccessfulRead({ ...currentScope, at: Date.now() });
     } catch (reason) {
       if (request === sequence.current && !controller.signal.aborted) {
         if (!older && !refresh) { setRequests([]); setHasOlder(false); }
@@ -465,6 +468,7 @@ export function RequestsPage({ token, tenant, writeTenant = tenant, liveEvents, 
     {upstreamDenied && <div className="notice warning" role="status">{t('request.upstreamCatalogDenied')}</div>}
     {streamError && <div className="notice error" role="alert">{t('request.streamSource')}: {streamError}</div>}
     <RequestsPanel requests={requests} upstreams={upstreams} filters={filters} loading={loading} hasOlder={hasOlder} streamState={streamState} token={token} tenant={tenant} filteredResultsStale={filteredResultsStale} requestRefresh={requestRefresh} refreshPaused={userPaused} onToggleRefreshPaused={() => setUserPaused((value) => !value)} historyLoaded={loadedHistoryIds.current.size > 0}
+      lastSuccessfulRead={successfulRead?.token === token && successfulRead.tenant === tenant && successfulRead.filters === filters ? successfulRead.at : undefined}
       onApply={(next) => { setFilters(next); scope.current = { token, tenant, filters: next }; void load(next); }}
       onClear={() => { setFilters(emptyTypedFilterAst); scope.current = { token, tenant, filters: emptyTypedFilterAst }; void load(emptyTypedFilterAst); }}
       onLoadOlder={() => void load(filters, true)} onRefreshFilteredResults={() => void load(filters, false, true)} onReturnToLatest={() => void load(filters)} onSelect={selectRequest} onOpenSessions={onOpenSessions} onOpenSession={openSession} onOpenGenerations={onOpenGenerations} />
@@ -472,7 +476,7 @@ export function RequestsPage({ token, tenant, writeTenant = tenant, liveEvents, 
   </PageLoadingRegion>;
 }
 
-function RequestsPanel({ requests, upstreams, filters, loading, hasOlder, streamState, token, tenant, filteredResultsStale, onApply, onClear, onLoadOlder, onRefreshFilteredResults, onReturnToLatest, onSelect, onOpenSessions, onOpenSession, onOpenGenerations, requestRefresh, refreshPaused = false, onToggleRefreshPaused, historyLoaded }: {
+function RequestsPanel({ requests, upstreams, filters, loading, hasOlder, streamState, token, tenant, filteredResultsStale, onApply, onClear, onLoadOlder, onRefreshFilteredResults, onReturnToLatest, onSelect, onOpenSessions, onOpenSession, onOpenGenerations, requestRefresh, refreshPaused = false, onToggleRefreshPaused, historyLoaded, lastSuccessfulRead }: {
   requests: RequestView[];
   upstreams: UpstreamAccount[];
   filters: TypedFilterAst;
@@ -483,6 +487,7 @@ function RequestsPanel({ requests, upstreams, filters, loading, hasOlder, stream
   tenant: string;
   filteredResultsStale: boolean;
   historyLoaded: boolean;
+  lastSuccessfulRead?: number;
   onApply: (filters: TypedFilterAst) => void;
   onClear: () => void;
   onLoadOlder: () => void;
@@ -504,6 +509,10 @@ function RequestsPanel({ requests, upstreams, filters, loading, hasOlder, stream
   const count = (value: number) => formatMetricDisplay(value, locale);
   const settlementCurrency = summary.localCosts.length === 1 ? summary.localCosts[0].currency : undefined;
   return <article className="panel request-page-surface" aria-busy={loading}><div className="panel-title traffic-heading"><div><h2>{typedFiltersActive(filters) ? t('traffic.filtered') : t('traffic.live')}</h2><span>{typedFiltersActive(filters) ? t('traffic.filteredHint') : t('traffic.liveHint')}</span></div><div className="traffic-heading-actions"><Button appearance="primary" disabled={loading || !token.trim() || !tenant} onClick={onRefreshFilteredResults}>{t('usage.refresh')}</Button><div className={`request-live-state session-live-state ${streamState}`} role="status">{t(`sessions.live.${streamState}`)}</div><RequestWorkspaceTabs selected="requests" onRequests={() => undefined} onGenerations={onOpenGenerations ?? (() => undefined)} onSessions={onOpenSessions} /></div></div>
+    <p className="request-metrics-scope" data-request-read-freshness>
+      {locale === 'zh-CN' ? '最近成功读取当前结果：' : 'Last successful read of current results: '}
+      {lastSuccessfulRead === undefined ? '—' : <time dateTime={new Date(lastSuccessfulRead).toISOString()}>{new Date(lastSuccessfulRead).toLocaleString(locale, { timeZone: displayTimeZone() })}</time>}
+    </p>
     {requestRefresh && <div className="request-refresh-row">
       <RequestRefreshControl intervalMs={requestRefresh.intervalMs} onIntervalChange={requestRefresh.onIntervalChange}
         paused={requestRefresh.paused || refreshPaused}

@@ -13,7 +13,7 @@ import '../../src/styles/metrics.css';
 import '../../src/styles/request-table.css';
 import '../../src/operator/operator.css';
 
-declare global { interface Window { requestLifecycleFixture: { observe: () => void; finish: () => void; settle: (cost: string, kind: 'finished' | 'projected' | 'archive_bound') => void; replay: () => void; hold: () => void; release: () => void; switchScope: () => void; filter: () => void; failQuery: () => void; held: boolean; queryHeld: boolean; queryCalls: number; detailCalls: number; scopeCommits: { scope: string; drawers: number }[] }; } }
+declare global { interface Window { requestLifecycleFixture: { observe: () => void; finish: () => void; settle: (cost: string, kind: 'finished' | 'projected' | 'archive_bound') => void; replay: () => void; hold: () => void; release: () => void; switchScope: () => void; filter: () => void; failQuery: () => void; failNextQuery: () => void; held: boolean; queryHeld: boolean; queryCalls: number; detailCalls: number; scopeCommits: { scope: string; drawers: number }[] }; } }
 const base: RequestDetail = { request_id: 'request-a', created_at: 1000, completed_at: null, model: 'model-a', protocol: 'openai', status_code: null, duration_ms: null, input_tokens: 0, output_tokens: 0, cost: '0', error_code: null, request_body: null, response_body: null, archive_complete: false };
 const backgroundHelpVisible = !new URLSearchParams(location.search).has('quiet-background-help');
 const supplierFailure = new URLSearchParams(location.search).has('supplier-error')
@@ -57,6 +57,7 @@ let hold = false;
 let release: (() => void) | undefined;
 let holdQuery = false;
 let failQuery: (() => void) | undefined;
+let rejectNextQuery = false;
 const json = (value: unknown) => new Response(JSON.stringify(value), { headers: { 'Content-Type': 'application/json' } });
 window.fetch = async (input) => {
   const url = new URL(String(input), location.origin);
@@ -69,6 +70,7 @@ window.fetch = async (input) => {
   }
   if (url.pathname === '/internal/v1/requests/query') {
     window.requestLifecycleFixture.queryCalls += 1;
+    if (rejectNextQuery) { rejectNextQuery = false; return new Response(JSON.stringify({ error: 'fixture query failure' }), { status: 503 }); }
     if (holdQuery) {
       holdQuery = false; window.requestLifecycleFixture.queryHeld = true;
       return new Promise<Response>((resolve) => { failQuery = () => { window.requestLifecycleFixture.queryHeld = false; resolve(new Response(JSON.stringify({ error: 'fixture query failure' }), { status: 503 })); }; });
@@ -104,6 +106,7 @@ function Fixture() {
     } }; },
     filter: () => { holdQuery = true; setDrilldown({ ast: { logical_operator: 'and', conditions: [{ field: 'model', operator: 'equals', value: { type: 'model', value: 'different-model' } }] }, revision: 1 }); },
     failQuery: () => { failQuery?.(); },
+    failNextQuery: () => { rejectNextQuery = true; },
     hold: () => { hold = true; }, release: () => { release?.(); }, switchScope: () => {
       if (operational) { first = operational; setEvents(new Map()); }
       setTenant('tenant-b');

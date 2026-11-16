@@ -1,4 +1,5 @@
 import assert from 'node:assert/strict';
+import { mkdir } from 'node:fs/promises';
 import { fileURLToPath } from 'node:url';
 import test from 'node:test';
 import { chromium, type Page } from 'playwright';
@@ -851,6 +852,44 @@ test('transport proxy groups: CRUD, policies, validation, CAS, secrets, permissi
       await page.getByRole('button', { name: '重试', exact: true }).click();
       await page.getByText('你没有管理代理组的权限，请联系管理员开通。', { exact: true }).waitFor();
       assert.equal(await page.evaluate(() => window.proxyGroupFixture.reads), 0);
+      await page.close();
+    });
+    await context.test('shared network surfaces preserve three tabs and distinct policy evidence in both themes', async () => {
+      const page = await prepare(true, 'en', 'proxies');
+      const copy = networkProxyCopy('en');
+      const groupCopy = transportProxyGroupCopy('en');
+      const root = fileURLToPath(new URL('../e2e-artifacts/network-unified/', import.meta.url));
+      await mkdir(root, { recursive: true });
+      const tabs = [copy.proxiesTab, groupCopy.title, copy.policiesTab];
+      const lightBackground = await page.locator('.proxy-groups-page').evaluate(e => getComputedStyle(e).backgroundColor);
+      for (const [index, name] of tabs.entries()) {
+        await page.getByRole('tab', { name, exact: true }).click();
+        assert.equal(await page.getByRole('tab', { name, exact: true }).getAttribute('aria-selected'), 'true');
+        if (index === 2) {
+          const policy = page.locator('.network-proxy-policy-workspace');
+          await policy.getByRole('button', { name: '研发订阅', exact: true }).click();
+          await policy.getByText(copy.policyObservationHint, { exact: true }).waitFor();
+          assert.equal(await policy.locator('dt').filter({ hasText: copy.currentPolicy }).count(), 1);
+          assert.equal(await policy.locator('dt').filter({ hasText: copy.effectiveSource }).count(), 1);
+        }
+        for (const theme of ['light', 'dark']) {
+          await page.evaluate(theme => { document.documentElement.dataset.theme = theme; }, theme);
+          await page.waitForFunction(({ light, theme }) => {
+            const surface = document.querySelector('.proxy-groups-page');
+            return surface && (getComputedStyle(surface).backgroundColor === light) === (theme === 'light');
+          }, { light: lightBackground, theme });
+          for (const width of [390, 1440]) {
+            await page.setViewportSize({ width, height: 900 });
+            assert.equal(await page.getByRole('tab', { name, exact: true }).getAttribute('aria-selected'), 'true');
+            assert.ok(await page.evaluate(() => document.documentElement.scrollWidth <= innerWidth), 'network surface must not overflow');
+            for (const tab of await page.getByRole('tab').all()) {
+              const box = await tab.boundingBox(); assert.ok(box && box.height >= 44, 'tabs retain visible touch targets');
+            }
+            await page.screenshot({ path: `${root}/network-${index}-${theme}-${width}.png`, fullPage: true, animations: 'disabled' });
+          }
+        }
+      }
+      assert.equal(await page.evaluate(() => window.proxyGroupFixture.writes.length), 0, 'navigation and policy inspection do not save or probe');
       await page.close();
     });
     assert.doesNotMatch(errors.join('\n'), /privateProxySecret|fixture-user/);

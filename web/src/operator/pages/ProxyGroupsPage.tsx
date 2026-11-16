@@ -1,6 +1,6 @@
 import { useEffect, useId, useRef, useState } from 'react';
 import { api } from '../../api';
-import { Button, LoadingProgress, LoadingState, Tab, TabList } from '../../design-system';
+import { Button, DataSurface, LoadingProgress, LoadingState, Tab, TabList } from '../../design-system';
 import { useI18n } from '../../i18n';
 import type { UpstreamAccount } from '../../types';
 import { useNavigationGuard } from '../../app/NavigationGuard';
@@ -55,7 +55,7 @@ export function ProxyGroupsPage({ token, tenant, initialAccountId, onBack }: {
       setTab(next);
     } finally { switching.current = false; }
   }
-  return <section className="proxy-groups-page" aria-label={copy.pageTitle}>
+  return <DataSurface className="proxy-groups-page" aria-label={copy.pageTitle}>
     <header className="panel-title proxy-groups-title"><Button appearance="secondary" type="button" onClick={onBack}>{copy.backToAccounts}</Button><div><h2>{copy.pageTitle}</h2></div></header>
     <LoadingProgress active={Boolean(tenant) && (access.state.kind === 'idle' || access.state.kind === 'loading')} label={copy.checking} level="page" />
     {!tenant ? <p role="status">{copy.selectTenant}</p> : accessError ? <div>
@@ -83,5 +83,5 @@ export function ProxyGroupsPage({ token, tenant, initialAccountId, onBack }: {
       </div>
       <RequestEgressSummaryPanel key={`${token}\0${tenant}`} token={token} tenant={tenant} />
     </>}
-  </section>;
+  </DataSurface>;
 }

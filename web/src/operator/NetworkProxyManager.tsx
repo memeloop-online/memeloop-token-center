@@ -1,5 +1,5 @@
 import { useEffect, useLayoutEffect, useRef, useState, type RefObject } from 'react';
-import { Button, Checkbox, DetailTooltip, Disclosure, Field, FormSection, Input, Label, LoadingProgress, LoadingState, Select, Textarea } from '../design-system';
+import { Button, Checkbox, DataSurface, DetailTooltip, Disclosure, Field, FormSection, Input, Label, LoadingProgress, LoadingState, Select, Textarea } from '../design-system';
 import { DrawerFrame } from '../components';
 import { useI18n } from '../i18n';
 import type { UpstreamAccount } from '../types';
@@ -639,7 +639,7 @@ export function NetworkProxyPolicyWorkspace({ token, tenant, accounts, accountsS
     } finally { pendingWrite.current = null; locked.current = false; if (alive.current) setBusy(false); }
   }
 
-  return <div className="transport-proxy-workspace network-proxy-policy-workspace">
+  return <DataSurface className="transport-proxy-workspace network-proxy-policy-workspace" aria-label={copy.policyTitle}>
     {confirmationDialog}
     {!embedded && <p>{copy.policyHint}</p>}
     <div className="button-row"><Button type="button" disabled={busy} onClick={async () => {
@@ -660,10 +660,12 @@ export function NetworkProxyPolicyWorkspace({ token, tenant, accounts, accountsS
           {accountId && busy && !selection && <LoadingState label={copy.loadingPolicy} variant="compact" />}
           {selection && <>
             <dl className="network-proxy-policy-summary">
-              <div><dt>{copy.currentPolicy}</dt><dd><DetailTooltip content={`${copy.effectiveSource}: ${effective?.source === 'credential' ? copy.credentialSource : effective?.source ? copy.modes[effective.source] ?? copy.unknownSource : copy.unknownSource}`}><span tabIndex={0}>{copy.modes[selection.desired.mode] ?? copy.policyLegacy}</span></DetailTooltip></dd></div>
+              <div><dt>{copy.currentPolicy}</dt><dd>{copy.modes[selection.desired.mode] ?? copy.policyLegacy}</dd></div>
+              <div><dt>{copy.effectiveSource}</dt><dd>{effective?.source === 'credential' ? copy.credentialSource : effective?.source ? copy.modes[effective.source] ?? copy.unknownSource : copy.unknownSource}</dd></div>
               <div><dt>{copy.effectiveExit}</dt><dd>{effective?.configuration_state === 'pending' ? copy.appliedPending : effective ? proxies.find(proxy => proxy.id === effective.selected_member_id)?.name ?? groups.flatMap(group => group.members).find(member => member.id === effective.selected_member_id)?.label ?? effectiveAddress : copy.unknownSource}</dd></div>
               <div><dt>{copy.appliedStatus}</dt><dd>{effective?.configuration_state === 'pending' ? copy.appliedPending : effective?.configuration_state === 'applied' ? copy.appliedReady : effective?.configuration_state === 'credential' ? copy.credentialSource : copy.appliedUnknown}</dd></div>
             </dl>
+            <p className="muted">{copy.policyObservationHint}</p>
             <div className={embedded ? 'network-proxy-policy-controls' : 'operator-form-section-fields'}>
               <Field label={copy.mode} required><Select value={draft.mode} disabled={disabled || busy || !ready} onChange={event => changeStrategy(event.target.value)}>
                 <option value="manual">{copy.modes.manual}</option><option value="auto">{copy.modes.auto}</option>
@@ -698,5 +700,5 @@ export function NetworkProxyPolicyWorkspace({ token, tenant, accounts, accountsS
           </>}
         </>}
     </FormSection>
-  </div>;
+  </DataSurface>;
 }
