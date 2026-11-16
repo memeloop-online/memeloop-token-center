@@ -489,3 +489,69 @@ async fn readable_stream_archives_are_not_reported_as_missing_or_invalid() {
     );
     assert!(detail.archive.response.preview.is_none());
 }
+
+#[tokio::test]
+async fn retired_raw_detail_uses_lossless_semantic_identity_without_reading_old_body() {
+    let (state, _directory) = test_state().await;
+    let request = Uuid::now_v7();
+    let mut refs = request_detail_refs(request);
+    refs.request_object = "must-not-read-retired-request".into();
+    refs.response_object = Some("must-not-read-retired-response".into());
+    refs.request_archive_state = crate::model::RequestArchiveState::MetadataOnly;
+    refs.response_archive_state = crate::model::RequestArchiveState::MetadataOnly;
+    refs.request_archive_reason = Some("raw_retired_semantic_archive".into());
+    refs.response_archive_reason = Some("raw_retired_semantic_archive".into());
+    refs.semantic_archive = Some(crate::archive::SemanticArchiveAuthority {
+        publication: crate::archive::SemanticPublication {
+            format_version: 2,
+            tenant_id: Uuid::now_v7(),
+            request_id: request,
+            projection_version: 2,
+            revision: u64::MAX,
+            manifest: crate::archive::CasArchiveObject {
+                object_locator: "internal-manifest-must-not-leak".into(),
+                blake3_digest: "a".repeat(64),
+                size_bytes: 1,
+            },
+        },
+        semantic_head: crate::archive::SemanticHead {
+            node_hash: "a".repeat(64),
+            depth: 1,
+        },
+        coverage: crate::archive::SemanticCoverage {
+            observed_terminal: true,
+            projection_state: crate::archive::SemanticProjectionState::Complete,
+            omissions: Vec::new(),
+            gaps: Vec::new(),
+        },
+    });
+    let raw = crate::api::request_detail::request_archive_content_response(
+        &state,
+        &HeaderMap::new(),
+        &refs,
+        crate::api::request_detail::RequestArchiveSide::Request,
+    )
+    .await
+    .unwrap();
+    assert_eq!(raw.status(), StatusCode::CONFLICT);
+    let response = request_detail_response(&state, refs).await.unwrap();
+    let body = axum::body::to_bytes(response.into_body(), MAX_ARCHIVE_DETAIL_RESPONSE)
+        .await
+        .unwrap();
+    let detail: Value = serde_json::from_slice(&body).unwrap();
+    assert_eq!(
+        detail["semantic_archive"]["manifest_revision"],
+        u64::MAX.to_string()
+    );
+    assert_eq!(detail["request_body"]["semantic_archive_available"], true);
+    assert_eq!(detail["response_body"]["semantic_archive_available"], true);
+    assert_eq!(detail["archive_complete"], true);
+    let encoded = std::str::from_utf8(&body).unwrap();
+    for forbidden in [
+        "must-not-read",
+        "internal-manifest-must-not-leak",
+        "object_locator",
+    ] {
+        assert!(!encoded.contains(forbidden));
+    }
+}
