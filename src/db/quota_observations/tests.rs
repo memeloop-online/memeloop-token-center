@@ -501,6 +501,23 @@ async fn verify_scoped_supplier_usage_recovery(db: &Database, tenant: &str, pepp
             assert_eq!(row.get::<String, _>("capacity_scope"), "unknown");
         }
     }
+    let decisions = db
+        .supplier_availability_decisions(account.id)
+        .await
+        .unwrap();
+    assert_eq!(
+        decisions.len(),
+        5,
+        "presentation excludes other generation/revision facts"
+    );
+    for decision in decisions {
+        assert_eq!(
+            decision.dispatch_eligible,
+            decision.upstream_model == "covered",
+            "shared scheduling decision for {}",
+            decision.upstream_model
+        );
+    }
     db.migrate().await.unwrap();
     assert_eq!(
         sqlx::query_scalar::<_, i64>(
