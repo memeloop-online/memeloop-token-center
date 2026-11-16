@@ -111,10 +111,10 @@ impl Database {
         &self,
         scope: &SessionContextScope,
     ) -> Result<Option<u64>, AppError> {
-        let leaf: Option<String> = sqlx::query_scalar("SELECT leaf_node_hash FROM conversation_observations WHERE tenant_id = $1 AND request_id = $2 AND key_id = $3")
-            .bind(scope.tenant_id.to_string()).bind(scope.request_id.to_string()).bind(scope.key_id.to_string())
-            .fetch_optional(&self.pool).await?.flatten();
-        let Some(leaf) = leaf else {
+        // This leaf belongs to the exact tenant/key/session/request authorized
+        // by session_context_scope for this read, rather than the session's
+        // latest leaf. Observations do not have a tenant_id column.
+        let Some(leaf) = scope.leaf.as_deref() else {
             return Ok(None);
         };
         let archive = self
@@ -123,7 +123,7 @@ impl Database {
             .ok_or_else(|| AppError::storage("semantic_archive_unavailable"))?;
         // The SQL connection is returned before any object-store operation.
         archive
-            .published_semantic_revision(scope.tenant_id, scope.request_id, &leaf)
+            .published_semantic_revision(scope.tenant_id, scope.request_id, leaf)
             .await
     }
 
