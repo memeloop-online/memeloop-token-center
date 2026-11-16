@@ -252,6 +252,7 @@ async fn verify(config: Config) {
         generation: target.generation,
         config_revision: target.config_revision,
         provider: "kimi-oauth".into(),
+        ordinary_code_allowance: None,
         observed_at: 100,
         valid_until: 200,
         windows: vec![RoutingQuotaWindow {
