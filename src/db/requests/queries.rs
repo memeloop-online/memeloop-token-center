@@ -2217,6 +2217,7 @@ fn request_archive_refs_from_row(row: AnyRow) -> Result<RequestArchiveRefs, AppE
         projection("response", response_object.as_deref())?;
     view.archive_state = combined_archive_state(request_archive_state, response_archive_state);
     Ok(RequestArchiveRefs {
+        semantic_archive: None,
         view,
         request_object,
         response_object,
@@ -2268,6 +2269,7 @@ fn session_archive_unlinked_refs_from_row(row: AnyRow) -> Result<RequestArchiveR
         output_tokens,
     });
     Ok(RequestArchiveRefs {
+        semantic_archive: None,
         view: RequestView {
             operational_terminal: None,
             egress: None,
@@ -2400,6 +2402,7 @@ fn generation_archive_refs_from_row(row: AnyRow) -> Result<RequestArchiveRefs, A
     };
     let archive_state = combined_archive_state(request_archive_state, response_archive_state);
     Ok(RequestArchiveRefs {
+        semantic_archive: None,
         view: RequestView {
             operational_terminal: None,
             egress: None,

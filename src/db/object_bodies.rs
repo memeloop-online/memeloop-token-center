@@ -10,6 +10,17 @@ impl Database {
     ) -> Result<crate::model::RequestArchiveRefs, AppError> {
         let archive = self.body_archive()?;
         let request_id = refs.view.request_id;
+        // This detail/history read is already tenant-authorized. Complete SQL
+        // metadata acquisition before any object-store operation; inference
+        // admission does not depend on semantic archival.
+        let leaf: Option<String> = sqlx::query_scalar("SELECT leaf_node_hash FROM conversation_observations WHERE tenant_id=$1 AND request_id=$2")
+            .bind(tenant_id.to_string()).bind(request_id.to_string()).fetch_optional(&self.pool).await?.flatten();
+        if let Some(leaf) = leaf {
+            refs.semantic_archive = archive
+                .semantic_archive_authority(tenant_id, request_id, &leaf)
+                .await?;
+        }
+
         if refs.view.status_code.is_some_and(|status| status >= 400)
             && let Some(summary) = archive.supplier_summary(tenant_id, request_id).await?
         {
@@ -32,6 +43,31 @@ impl Database {
                     object.object_locator,
                     crate::model::RequestArchiveState::Bound,
                     None,
+                )
+            } else if archive
+                .raw_capture_is_retired(tenant_id, request_id, side)
+                .await?
+            {
+                if !refs.semantic_archive.as_ref().is_some_and(|authority| {
+                    authority.coverage.projection_state
+                        == crate::archive::SemanticProjectionState::Complete
+                        && authority.coverage.observed_terminal
+                        && authority.coverage.gaps.is_empty()
+                }) {
+                    return Err(AppError::storage("raw_retired_semantic_authority_missing"));
+                }
+                // Preserve the old URI as audit provenance while history
+                // consumers switch to the typed permanent authority. It does
+                // not mean raw bytes remain a permanent archive requirement.
+                let provenance = if side == "request" {
+                    refs.request_object.clone()
+                } else {
+                    refs.response_object.clone().unwrap_or_default()
+                };
+                (
+                    provenance,
+                    crate::model::RequestArchiveState::MetadataOnly,
+                    Some("raw_retired_semantic_archive".into()),
                 )
             } else {
                 let failed = archive

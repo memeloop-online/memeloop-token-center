@@ -3,6 +3,7 @@ use crate::api::tests::test_state;
 
 fn request_detail_refs(request_id: Uuid) -> crate::model::RequestArchiveRefs {
     crate::model::RequestArchiveRefs {
+        semantic_archive: None,
         view: crate::model::RequestView {
             operational_terminal: None,
             egress: None,

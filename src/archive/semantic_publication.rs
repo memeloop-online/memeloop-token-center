@@ -7,7 +7,7 @@ use uuid::Uuid;
 use super::{ArchiveStore, CasArchiveObject, SemanticInstancePage, SemanticManifestV2};
 use crate::error::AppError;
 
-#[derive(Clone, Serialize, Deserialize)]
+#[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct SemanticPublication {
     pub format_version: u32,
@@ -20,7 +20,7 @@ pub struct SemanticPublication {
 
 /// A permanent semantic authority for metadata consumers such as history.
 /// Raw provenance is deliberately excluded from this durable ownership view.
-#[derive(Clone, Serialize, Deserialize)]
+#[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct SemanticArchiveAuthority {
     pub publication: SemanticPublication,

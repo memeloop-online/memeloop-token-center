@@ -218,6 +218,15 @@ impl ArchiveStore {
         }
     }
 
+    pub(crate) async fn raw_capture_is_retired(
+        &self,
+        tenant: Uuid,
+        request: Uuid,
+        side: &str,
+    ) -> Result<bool, AppError> {
+        Ok(self.raw_retirement(tenant, request, side).await?.is_some())
+    }
+
     async fn raw_retirement(
         &self,
         tenant: Uuid,
