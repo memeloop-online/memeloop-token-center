@@ -140,6 +140,52 @@ async fn large_source_backed_conversation_stream_releases_raw_bytes_before_termi
         "routing reads the source-backed request once"
     );
 
+    let tenant_id = fixture
+        .state
+        .db
+        .authenticate_key(&fixture.key, fixture.state.config.key_pepper.as_bytes())
+        .await
+        .unwrap()
+        .tenant_id;
+    // Headers precede asynchronous publication. Keep the upstream SSE gate held
+    // until the exact durable request authority has actually handed RAM off.
+    tokio::time::timeout(Duration::from_secs(5), async {
+        loop {
+            if let Some(object) = fixture
+                .state
+                .archive
+                .raw_capture_reference(tenant_id, request_id, "request")
+                .await
+                .unwrap()
+            {
+                let bytes = fixture
+                    .state
+                    .archive
+                    .get_tenant_content(tenant_id, &object, RETAINED_BYTES + 4096)
+                    .await
+                    .unwrap();
+                assert_eq!(object.size_bytes, bytes.len() as u64);
+                assert_eq!(
+                    object.blake3_digest,
+                    blake3::hash(&bytes).to_hex().to_string()
+                );
+                let document: Value = serde_json::from_slice(&bytes).unwrap();
+                assert_eq!(
+                    document["metadata"]["padding"].as_str().unwrap().len(),
+                    RETAINED_BYTES
+                );
+                assert_eq!(document["input"], "small semantic input");
+                drop(document);
+                drop(bytes);
+                if fixture.state.proxy_memory_budget.snapshot().0 < RETAINED_BYTES {
+                    break;
+                }
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("durable request publication must release source RAM while SSE remains open");
     let (held, _, _, _) = fixture.state.proxy_memory_budget.snapshot();
     assert!(
         held < RETAINED_BYTES,

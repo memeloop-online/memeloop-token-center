@@ -697,6 +697,7 @@ impl BodyCarrier {
         Ok(self.leased_bytes(Bytes::from(output), lease, None))
     }
 
+    #[cfg(test)]
     pub(crate) async fn read_range(
         self: &Arc<Self>,
         offset: u64,
@@ -721,10 +722,11 @@ impl BodyCarrier {
                 Segment::Ram(bytes) => bytes.len() as u64,
                 Segment::Object(reference) => reference.size_bytes,
             };
-            if offset >= position && end <= position + size {
-                if let Segment::Ram(bytes) = &segment {
-                    return Ok(bytes.slice((offset - position) as usize..(end - position) as usize));
-                }
+            if offset >= position
+                && end <= position + size
+                && let Segment::Ram(bytes) = &segment
+            {
+                return Ok(bytes.slice((offset - position) as usize..(end - position) as usize));
             }
             position += size;
         }
