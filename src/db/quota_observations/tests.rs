@@ -354,4 +354,163 @@ async fn verify(config: Config) {
         .await
         .unwrap();
     assert!(metadata[0].windows.is_empty());
+    verify_scoped_supplier_usage_recovery(db, &tenant, state.config.key_pepper.as_bytes()).await;
+}
+
+async fn verify_scoped_supplier_usage_recovery(db: &Database, tenant: &str, pepper: &[u8]) {
+    use crate::upstream_quota::observations::OrdinaryCodeAllowance;
+    let account = db
+        .create_upstream_account(
+            CreateUpstreamAccountInput {
+                tenant_external_id: tenant.into(),
+                name: "supplier-only-recovery".into(),
+                driver: "http-json".into(),
+                config: json!({"base_url":"http://127.0.0.1:18083","network_scope":"private"}),
+                credential: UpstreamCredential::None,
+                oauth_session_id: None,
+                oauth_driver: None,
+                oauth_refresh_url: None,
+            },
+            pepper,
+        )
+        .await
+        .unwrap();
+    sqlx::query("UPDATE upstream_accounts SET driver='openai-codex' WHERE id=$1")
+        .bind(account.id.to_string())
+        .execute(&db.pool)
+        .await
+        .unwrap();
+    let now = unix_millis();
+    let started_at = now - 100;
+    for (model, scope, generation, revision, failed_at) in [
+        (
+            "covered",
+            "ordinary_code",
+            account.credential_generation,
+            account.updated_at,
+            started_at - 1,
+        ),
+        (
+            "during-read",
+            "ordinary_code",
+            account.credential_generation,
+            account.updated_at,
+            started_at + 1,
+        ),
+        (
+            "review",
+            "code_review",
+            account.credential_generation,
+            account.updated_at,
+            started_at - 1,
+        ),
+        (
+            "specific",
+            "model_specific",
+            account.credential_generation,
+            account.updated_at,
+            started_at - 1,
+        ),
+        (
+            "old-generation",
+            "ordinary_code",
+            account.credential_generation - 1,
+            account.updated_at,
+            started_at - 1,
+        ),
+        (
+            "old-revision",
+            "ordinary_code",
+            account.credential_generation,
+            account.updated_at - 1,
+            started_at - 1,
+        ),
+    ] {
+        sqlx::query("INSERT INTO upstream_supplier_availability (upstream_account_id,upstream_model,credential_generation,transport_revision,failure_kind,reset_at,reset_source,observed_at,request_id,capacity_scope,hard_observed_at,reset_observed_at) VALUES ($1,$2,$3,$4,'quota_exhausted',$5,'provider_reset',$6,'fixture',$7,$6,$6)")
+            .bind(account.id.to_string()).bind(model).bind(generation).bind(revision)
+            .bind(now + 86_400_000).bind(failed_at).bind(scope).execute(&db.pool).await.unwrap();
+    }
+    // Old writers/migrated rows have no proved capacity scope; the default must
+    // remain unknown rather than becoming account-wide evidence.
+    sqlx::query("INSERT INTO upstream_supplier_availability (upstream_account_id,upstream_model,credential_generation,transport_revision,failure_kind,reset_at,reset_source,observed_at,request_id) VALUES ($1,'unknown',$2,$3,'quota_exhausted',$4,'provider_reset',$5,'legacy-fixture')")
+        .bind(account.id.to_string()).bind(account.credential_generation).bind(account.updated_at)
+        .bind(now + 86_400_000).bind(started_at - 1).execute(&db.pool).await.unwrap();
+    let target = db
+        .quota_observation_targets(&[], &[], now, 100)
+        .await
+        .unwrap()
+        .into_iter()
+        .find(|target| target.account_id == account.id)
+        .unwrap();
+    assert!(
+        target.recovering_quota,
+        "scoped-only failures need independent quota recovery"
+    );
+    let lease = Uuid::now_v7();
+    assert!(
+        db.claim_quota_observation(&target, lease, now, now + 30_000)
+            .await
+            .unwrap()
+    );
+    let value = RoutingQuotaObservation {
+        account_id: account.id,
+        generation: account.credential_generation,
+        config_revision: account.updated_at,
+        provider: "openai-codex".into(),
+        observed_at: now - 10,
+        valid_until: now + 30_000,
+        windows: vec![RoutingQuotaWindow {
+            id: "code:primary_window".into(),
+            period_seconds: Some(604800),
+            reset_at: Some(now + 86_400_000),
+            reset_is_estimated: false,
+            remaining_fraction: Some(0.98),
+            exhausted: Some(false),
+        }],
+        ordinary_code_allowance: Some(OrdinaryCodeAllowance {
+            started_at,
+            window_ids: vec!["code:primary_window".into()],
+        }),
+    };
+    db.finish_quota_observation(&target, lease, Some(&value), now + 10_000)
+        .await
+        .unwrap();
+    let rows = sqlx::query("SELECT upstream_model,failure_kind,capacity_scope,request_id FROM upstream_supplier_availability WHERE upstream_account_id=$1")
+        .bind(account.id.to_string()).fetch_all(&db.pool).await.unwrap();
+    assert_eq!(rows.len(), 7);
+    for row in rows {
+        let model: String = row.get("upstream_model");
+        assert_eq!(
+            row.get::<String, _>("failure_kind"),
+            if model == "covered" {
+                "available"
+            } else {
+                "quota_exhausted"
+            },
+            "scope/time fence for {model}"
+        );
+        assert_eq!(
+            row.get::<String, _>("request_id"),
+            if model == "unknown" {
+                "legacy-fixture"
+            } else {
+                "fixture"
+            }
+        );
+        if model == "unknown" {
+            assert_eq!(row.get::<String, _>("capacity_scope"), "unknown");
+        }
+    }
+    db.migrate().await.unwrap();
+    assert_eq!(
+        sqlx::query_scalar::<_, i64>(
+            "SELECT COUNT(*) FROM upstream_supplier_availability WHERE upstream_account_id=$1"
+        )
+        .bind(account.id.to_string())
+        .fetch_one(&db.pool)
+        .await
+        .unwrap(),
+        7,
+        "migration replay retains all facts"
+    );
 }
