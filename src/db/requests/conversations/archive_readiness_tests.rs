@@ -2148,6 +2148,19 @@ async fn semantic_coverage_committed_recovery_contract(database_url: String) {
             "recovery must not reproject the leaf or SQL acknowledgement"
         );
         assert_eq!(after.1.as_deref(), Some("semantic-raw-retire-v1"));
+        // An unrelated global carrier receipt is deliberately unreadable as
+        // ownership metadata. Logical retirement must not enumerate that
+        // namespace, and must leave its bytes/cleanup responsibility untouched.
+        let unrelated_owner = "carrier-owners/v1/unrelated-incomplete-owner.json";
+        fixture
+            .state
+            .archive
+            .put(
+                unrelated_owner,
+                Bytes::from_static(b"unrelated active owner"),
+            )
+            .await
+            .unwrap();
         // The root replacement really commits, then its ACK is lost. The
         // original outbox remains a retryable owner of the exact retirement.
         assert!(
@@ -2175,6 +2188,10 @@ async fn semantic_coverage_committed_recovery_contract(database_url: String) {
         .await
         .unwrap();
         assert!(retired.is_none());
+        assert_eq!(
+            fixture.state.archive.get(unrelated_owner).await.unwrap(),
+            Bytes::from_static(b"unrelated active owner")
+        );
         let manifest = fixture
             .state
             .archive
