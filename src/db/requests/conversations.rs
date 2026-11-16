@@ -524,10 +524,7 @@ impl Database {
     ///
     /// 只删除 `projected_at` 已落地且早于保留期的行；未投影任务一律保留。
     /// 用 `request_id` 子查询 + `LIMIT` 分批，避免一次性大事务放大 WAL 与 IO。
-    pub async fn delete_projected_conversation_outbox(
-        &self,
-        limit: i64,
-    ) -> Result<u64, AppError> {
+    pub async fn delete_projected_conversation_outbox(&self, limit: i64) -> Result<u64, AppError> {
         let cutoff = unix_millis().saturating_sub(CONVERSATION_PROJECTION_RETENTION_MS);
         let rows = sqlx::query(
             "DELETE FROM conversation_projection_outbox
