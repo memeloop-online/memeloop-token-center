@@ -443,6 +443,11 @@ impl ResponseArchiveSettlement {
     }
 
     #[cfg(test)]
+    pub(super) async fn wait_result_for_test(mut self) -> Option<Result<(), AppError>> {
+        self._writer.wait().await
+    }
+
+    #[cfg(test)]
     pub(crate) fn pending_for_test(released: tokio::sync::oneshot::Receiver<()>) -> Self {
         Self {
             _writer: super::OwnedTask::spawn(
@@ -659,28 +664,17 @@ impl CaptureTarget {
         archive: &crate::archive::ArchiveStore,
         identity: ArchiveSpoolIdentity,
         object: &crate::archive::CasArchiveObject,
-    ) -> Result<(), AppError> {
+    ) -> Result<crate::archive::RawPublicationSettlement, AppError> {
         match self {
             Self::Response => {
                 archive
-                    .publish_raw_capture(
-                        identity.tenant_id,
-                        identity.request_id,
-                        "response",
-                        object,
-                    )
+                    .settle_raw_capture(identity.tenant_id, identity.request_id, "response", object)
                     .await
             }
-            Self::DiscardedAttempt(attempt) => {
-                archive
-                    .publish_response_attempt(
-                        identity.tenant_id,
-                        identity.request_id,
-                        attempt,
-                        object,
-                    )
-                    .await
-            }
+            Self::DiscardedAttempt(attempt) => archive
+                .publish_response_attempt(identity.tenant_id, identity.request_id, attempt, object)
+                .await
+                .map(|()| crate::archive::RawPublicationSettlement::Published),
         }
     }
 }
@@ -1299,9 +1293,9 @@ async fn run_response_archive_writer(
             Err(error) => return Err(error),
         }
     };
-    loop {
+    let publication = loop {
         match target.publish(&state.archive, identity, &object).await {
-            Ok(()) => break,
+            Ok(publication) => break publication,
             Err(error @ AppError::Storage { .. }) => {
                 tracing::warn!(request_id = %identity.request_id, error_category = error.diagnostic_category(),
                     "immutable original awaits durable root publication");
@@ -1309,15 +1303,27 @@ async fn run_response_archive_writer(
             }
             Err(error) => return Err(error),
         }
-    }
-    // The CAS object and its immutable root are confirmed. Future reads can
-    // use that authority while old readers keep their original allocation leases.
+    };
+    // The immutable CAS object is confirmed. Publication either owns a raw
+    // root or has transferred responsibility to verified semantic retirement.
+    // Old readers retain their original allocation leases in either case.
     source.handoff_verified_publication(state.archive.clone(), object.clone())?;
     if let Some(owner) = staging_owner
         && let Err(error) = state.archive.release_carrier_object(&owner).await
     {
         tracing::warn!(request_id = %identity.request_id, error_category = error.diagnostic_category(),
             "complete original retains its exact staging cleanup receipt");
+    }
+    if let crate::archive::RawPublicationSettlement::Retired {
+        semantic_revision,
+        semantic_leaf,
+    } = publication
+    {
+        tracing::debug!(request_id = %identity.request_id, semantic_revision, %semantic_leaf,
+            "late response publisher transferred responsibility to verified semantic retirement");
+        // Retirement is not a new raw-root acknowledgement. In particular, a
+        // late publisher must not restore the retired SQL locator binding.
+        return Ok(WriterOutcome::Sealed);
     }
     if matches!(target, CaptureTarget::DiscardedAttempt(_)) {
         return Ok(WriterOutcome::Sealed);

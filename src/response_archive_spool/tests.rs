@@ -8,6 +8,96 @@ use crate::{AppState, config::Config, db::ArchiveSpoolIdentity};
 const PEPPER: &[u8] = b"existing-test-pepper-over-thirty-two-bytes";
 
 #[tokio::test]
+async fn late_response_capture_settles_against_retired_semantics_without_restoring_raw_binding() {
+    let (_directory, state, pool, identity) = fixture().await;
+    let baseline = state.proxy_memory_budget.snapshot().0;
+    let input = state
+        .archive
+        .put_tenant_content(
+            identity.tenant_id,
+            Bytes::from_static(br#"{"messages":[{"role":"user","content":"retired original"}]}"#),
+        )
+        .await
+        .unwrap();
+    let bytes = Bytes::from_static(br#"{"choices":[{"message":{"role":"assistant","content":"complete answer"},"finish_reason":"stop"}]}"#);
+    let response = state
+        .archive
+        .put_tenant_content(identity.tenant_id, bytes.clone())
+        .await
+        .unwrap();
+    let prepared = state
+        .archive
+        .prepare_session_body_streamed(
+            identity.tenant_id,
+            identity.request_id,
+            crate::conversation::ConversationHints::default(),
+            input.object_locator,
+            Some(response.object_locator.clone()),
+            true,
+        )
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(prepared.coverage_complete);
+    let proof = crate::archive::SemanticBindingProof {
+        tenant_id: identity.tenant_id,
+        request_id: identity.request_id,
+        node_hash: prepared.nodes.last().unwrap().node_hash.clone(),
+        projected_at: 1,
+    };
+    state
+        .archive
+        .retire_covered_raw_roots(&prepared.publication, &proof)
+        .await
+        .unwrap();
+    for _ in 0..2 {
+        let mut producer = ResponseArchiveProducer::begin_original(&state, identity)
+            .await
+            .unwrap();
+        assert!(producer.append_with_backpressure(bytes.clone()).await);
+        tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            producer.seal().unwrap().wait_result_for_test(),
+        )
+        .await
+        .unwrap()
+        .unwrap()
+        .unwrap();
+        assert!(
+            state
+                .archive
+                .raw_capture_reference(identity.tenant_id, identity.request_id, "response")
+                .await
+                .unwrap()
+                .is_none()
+        );
+        let binding: Option<String> =
+            sqlx::query_scalar("SELECT response_object FROM request_records WHERE id = $1")
+                .bind(identity.request_id.to_string())
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        assert!(
+            binding.is_none(),
+            "semantic retirement cannot be a new raw binding ACK"
+        );
+        assert_eq!(
+            state
+                .archive
+                .get_tenant_content(identity.tenant_id, &response, bytes.len())
+                .await
+                .unwrap(),
+            bytes
+        );
+        assert_eq!(state.proxy_memory_budget.snapshot().0, baseline);
+        assert_eq!(
+            state.proxy_archive_stream_permits.available_permits(),
+            crate::PROXY_ARCHIVE_STREAM_CONCURRENCY
+        );
+    }
+}
+
+#[tokio::test]
 async fn shared_capture_reaches_eof_while_all_upload_slots_are_held() {
     let (_directory, state, _pool, identity) = fixture().await;
     let baseline = state.proxy_memory_budget.snapshot().0;
