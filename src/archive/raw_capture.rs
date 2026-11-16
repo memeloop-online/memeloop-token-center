@@ -205,13 +205,13 @@ impl ArchiveStore {
             Err(error) => {
                 // A retirement may have won while the old PUT was in flight.
                 // Re-read its immutable identity rather than retrying forever.
-                if let Some(retired) = self.raw_retirement(tenant, request, side).await? {
-                    if retired.source == *object {
-                        return Ok(RawPublicationSettlement::Retired {
-                            semantic_revision: retired.semantic_revision,
-                            semantic_leaf: retired.semantic_leaf,
-                        });
-                    }
+                if let Some(retired) = self.raw_retirement(tenant, request, side).await?
+                    && retired.source == *object
+                {
+                    return Ok(RawPublicationSettlement::Retired {
+                        semantic_revision: retired.semantic_revision,
+                        semantic_leaf: retired.semantic_leaf,
+                    });
                 }
                 Err(error)
             }
