@@ -89,6 +89,15 @@ impl ArchiveReaper {
                 pass.cleaned = pass.cleaned.saturating_add(1);
             }
         }
+        // Retirement may enumerate durable object owners. Keep that work in
+        // this independent, shutdown-cancellable cleanup loop rather than
+        // delaying the next conversation projection claim.
+        if let Err(error) = self.database.recover_semantic_raw_retirement().await {
+            tracing::warn!(
+                error_category = error.diagnostic_category(),
+                "semantic raw retirement remains pending"
+            );
+        }
         Ok(pass)
     }
 
