@@ -1,6 +1,32 @@
 use super::*;
 use rust_decimal::Decimal;
 
+#[derive(Debug, PartialEq, Eq)]
+struct FinanceSnapshot {
+    status: String,
+    actual: Option<i64>,
+    settled_at: Option<i64>,
+    available: i64,
+    reserved: i64,
+    ledger: Vec<(String, i64)>,
+}
+
+async fn finance_snapshot(database: &Database, reservation: Uuid) -> FinanceSnapshot {
+    let row = sqlx::query("SELECT r.status, r.actual_micros, r.settled_at, a.available_micros, a.reserved_micros FROM usage_reservations r JOIN credit_accounts a ON a.id = r.account_id WHERE r.id = $1")
+        .bind(reservation.to_string()).fetch_one(&database.pool).await.unwrap();
+    let ledger = sqlx::query("SELECT id, amount_micros FROM ledger_entries WHERE kind = 'usage' AND source = $1 ORDER BY id")
+        .bind(reservation.to_string()).fetch_all(&database.pool).await.unwrap()
+        .into_iter().map(|row| (row.get("id"), row.get("amount_micros"))).collect();
+    FinanceSnapshot {
+        status: row.get("status"),
+        actual: row.get("actual_micros"),
+        settled_at: row.get("settled_at"),
+        available: row.get("available_micros"),
+        reserved: row.get("reserved_micros"),
+        ledger,
+    }
+}
+
 async fn bounded_scan_contract(database: &Database) {
     let pepper = b"bounded orphan reservation scan contract pepper";
     let issued = database
@@ -168,6 +194,21 @@ async fn bounded_scan_contract(database: &Database) {
             .await
             .unwrap(),
         1
+    );
+    let late_finance = finance_snapshot(database, reservations[0].id).await;
+    for _ in 0..=reservations.len() {
+        assert_eq!(
+            database
+                .release_orphaned_reservations_page(1, &mut scan)
+                .await
+                .unwrap(),
+            0
+        );
+    }
+    assert_eq!(
+        finance_snapshot(database, reservations[0].id).await,
+        late_finance,
+        "late eligibility must not repeat a financial transition or ledger entry"
     );
     let ledger_count: i64 = sqlx::query_scalar(
         "SELECT COUNT(*) FROM ledger_entries WHERE kind = 'usage' AND source = $1",
