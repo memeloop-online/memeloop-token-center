@@ -17,7 +17,14 @@
     "@rjsf/core": "6.7.1",
     "echarts": "6.1.0",
     "react": "19.2.8",
-    "react-dom": "19.2.8"
+    "react-dom": "19.2.8",
+    "@memeloop/react-ui": "0.2.13",
+    "@assistant-ui/react": "0.15.36",
+    "@mui/material": "9.5.0",
+    "@mui/icons-material": "9.5.0",
+    "@emotion/react": "11.14.0",
+    "@emotion/styled": "11.14.1",
+    "memeloop": "0.3.12"
   },
   "devDependencies": {
     "@cucumber/cucumber": "13.2.1",

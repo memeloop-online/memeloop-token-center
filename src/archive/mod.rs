@@ -50,7 +50,6 @@ mod semantic_publication;
 mod semantic_view;
 pub(crate) use semantic_publication::SemanticBindingProof;
 pub use semantic_publication::SemanticPublication;
-pub(crate) use semantic_view::SemanticViewPage;
 mod session_projection;
 mod staging;
 mod supplier_summary;

@@ -1,3 +1,5 @@
+import { SemanticSessionPanel } from './SemanticSessionPanel.js';
+import type { SemanticViewLoader } from './semanticViewReader.js';
 import { DrawerFrame } from './components.js';
 import { Button, DetailTooltip, Disclosure, LoadingState } from './design-system';
 import type { CSSProperties, ReactNode } from 'react';
@@ -306,7 +308,7 @@ function SessionActivity({ detail, summary, currency, loading, onSelect }: {
   </div>;
 }
 
-export function SessionDetailSurface({ detail, summary, currency, showDiagnosticIds = false, loading, onLoadOlder, onSelect, onClose, loadReplayArchive, loadArchiveRange, titleAction, taskRelations, backNav, parentNav, contextLoader }: {
+export function SessionDetailSurface({ detail, summary, currency, showDiagnosticIds = false, loading, onLoadOlder, onSelect, onClose, loadReplayArchive, loadArchiveRange, titleAction, taskRelations, backNav, parentNav, contextLoader, semanticLoader }: {
   detail: LogicalSessionDetail;
   summary?: LogicalSessionSummary;
   currency?: string;
@@ -325,6 +327,7 @@ export function SessionDetailSurface({ detail, summary, currency, showDiagnostic
   /** Uniform top-left navigation back to the parent session. */
   parentNav?: ReactNode;
   contextLoader?: SessionContextLoader;
+  semanticLoader?: SemanticViewLoader;
 }) {
   const { locale, t } = useI18n();
   const declaredSessionName = latestDeclaredSessionName(detail);
@@ -351,8 +354,9 @@ export function SessionDetailSurface({ detail, summary, currency, showDiagnostic
     {titleAction}
     {taskRelations}
     {showDiagnosticIds && <div className="session-diagnostics"><Disclosure title={t('sessions.diagnostics')}><small>{t('filter.field.session_id')}</small><code className="break-anywhere">{detail.session_id}</code><CopyDiagnostic value={detail.session_id} kind="session" />{reportedSessionId && <><small>{t('sessions.reportedSession')}</small><code className="break-anywhere">{reportedSessionId}</code><CopyDiagnostic value={reportedSessionId} kind="session" /><small>{t('sessions.identitySource')}</small><span>{reportedIdentitySources.join(' · ')}</span></>}</Disclosure></div>}
-    {contextLoader && !detail.unlinked && <SessionContextPanel key={`${summary?.key_id}:${detail.session_id}`} detail={detail} loader={contextLoader} />}
-    {!(detail.unlinked && detail.session_id.startsWith('unlinked:')) && (contextLoader && !detail.unlinked
+    {semanticLoader && !detail.unlinked && <SemanticSessionPanel key={`${summary?.key_id}:${detail.session_id}`} detail={detail} loader={semanticLoader} />}
+    {!semanticLoader && contextLoader && !detail.unlinked && <SessionContextPanel key={`${summary?.key_id}:${detail.session_id}`} detail={detail} loader={contextLoader} />}
+    {!semanticLoader && !(detail.unlinked && detail.session_id.startsWith('unlinked:')) && (contextLoader && !detail.unlinked
       ? <DeferredSessionDetails label={t('sessionReplay.originalArchives')}><SessionReplayPanel detail={detail} scopeKey={summary?.key_id ?? detail.session_id} loadArchiveDetail={loadReplayArchive} loadArchiveRange={loadArchiveRange} onLoadEarlierRequests={onLoadOlder} loadingEarlier={loading} /></DeferredSessionDetails>
       : <SessionReplayPanel detail={detail} scopeKey={summary?.key_id ?? detail.session_id} loadArchiveDetail={loadReplayArchive} loadArchiveRange={loadArchiveRange} onLoadEarlierRequests={onLoadOlder} loadingEarlier={loading} />)}
     <Disclosure title={t('sessions.executionTimeline')} defaultOpen={detail.unlinked}><SessionActivity detail={detail} summary={summary} currency={currency} loading={loading} onSelect={onSelect} /></Disclosure>
