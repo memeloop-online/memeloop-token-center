@@ -114,7 +114,12 @@ async fn projection_contract(database: &Database) {
 
 #[tokio::test]
 async fn request_history_upstream_projection_ignores_operational_updates() {
-    let database = Database::connect("sqlite::memory:").await.unwrap();
+    let root = tempfile::tempdir().unwrap();
+    let url = format!(
+        "sqlite://{}?mode=rwc",
+        root.path().join("upstream.db").display()
+    );
+    let database = Database::connect(&url).await.unwrap();
     projection_contract(&database).await;
     database.close().await;
 }
