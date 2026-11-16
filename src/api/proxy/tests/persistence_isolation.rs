@@ -135,11 +135,11 @@ async fn pending_response_archive_begin_does_not_hold_first_byte_or_eof() {
     let (entered, release) =
         crate::response_archive_spool::pause_next_begin_for_test(&fixture.state);
     let upstream = MockServer::start().await;
+    let original = Bytes::from(completed_codex_sse("complete while archive is paused"));
     Mock::given(method("POST"))
-        .respond_with(ResponseTemplate::new(200).set_body_raw(
-            completed_codex_sse("complete while archive is paused"),
-            "text/event-stream",
-        ))
+        .respond_with(
+            ResponseTemplate::new(200).set_body_raw(original.clone(), "text/event-stream"),
+        )
         .expect(1)
         .mount(&upstream)
         .await;
@@ -189,19 +189,19 @@ async fn pending_response_archive_begin_does_not_hold_first_byte_or_eof() {
                 .await
                 .unwrap()
             {
-                assert_eq!(object.size_bytes, delivered.len() as u64);
+                assert_eq!(object.size_bytes, original.len() as u64);
                 assert_eq!(
                     object.blake3_digest,
-                    blake3::hash(&delivered).to_hex().to_string()
+                    blake3::hash(&original).to_hex().to_string()
                 );
                 assert_eq!(
                     fixture
                         .state
                         .archive
-                        .get_tenant_content(tenant_id, &object, delivered.len())
+                        .get_tenant_content(tenant_id, &object, original.len())
                         .await
                         .unwrap(),
-                    delivered
+                    original
                 );
                 if fixture.state.proxy_memory_budget.snapshot().0 == 0 {
                     break;
