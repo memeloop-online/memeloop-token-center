@@ -50,6 +50,7 @@ jobs:
       - name: Verify response carrier ownership and archive behavior
         run: |
           set -o pipefail
+          cargo test --locked --lib --no-run
           for selector in \
             response_archive_spool::tests::shared_capture_reaches_eof_while_all_upload_slots_are_held \
             response_archive_spool::tests::unavailable_local_directory_does_not_gate_complete_original \
