@@ -558,7 +558,7 @@ jobs:
           exit 1
       - name: Compile exact source before contract windows
         run: cargo test --locked --lib --no-run
-      - name: Verify seven exact retirement contracts
+      - name: Verify eight exact retirement contracts
         run: |
           set -o pipefail
           for selector in \
@@ -566,6 +566,7 @@ jobs:
             archive::raw_capture::retirement_contracts::complete_coverage_retires_exact_roots_and_rejects_stale_backend_versions \
             archive::raw_capture::retirement_contracts::incomplete_protocol_keeps_both_raw_roots_owned \
             response_archive_spool::tests::late_response_capture_settles_against_retired_semantics_without_restoring_raw_binding \
+            gateway_body::request_spool::archive_source_tests::late_request_capture_retires_source_metadata_without_rebinding_after_commit_unknown \
             api::self_service::requests::tests::retired_raw_detail_uses_lossless_semantic_identity_without_reading_old_body \
             db::requests::conversations::archive_readiness_tests::sqlite_semantic_coverage_recovers_committed_projection_and_failed_put \
             db::requests::conversations::archive_readiness_tests::postgres_semantic_coverage_recovers_committed_projection_and_failed_put

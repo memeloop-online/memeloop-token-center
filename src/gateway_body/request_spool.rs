@@ -1184,8 +1184,8 @@ fn publish_durable(shared: &Arc<SharedBody>) {
                                 break false;
                             }
                         };
-                        if success {
-                            let object = database
+                        let settlement = if success {
+                            let (object, settlement) = database
                                 .publish_request_source(
                                     identity,
                                     &key,
@@ -1193,8 +1193,8 @@ fn publish_durable(shared: &Arc<SharedBody>) {
                                     source.digest,
                                 )
                                 .await;
-                            // The immutable raw root now durably owns this
-                            // exact object even while SQL binding waits.
+                            // Either the immutable raw root or verified semantic
+                            // retirement durably owns this exact object.
                             if let Some(carrier) = &source.carrier
                                 && let Ok(archive) = database.body_archive()
                                 && carrier
@@ -1205,8 +1205,16 @@ fn publish_durable(shared: &Arc<SharedBody>) {
                                     "request source durable handoff identity mismatch; retaining RAM"
                                 );
                             }
-                        }
-                        let permit = if success {
+                            Some(settlement)
+                        } else {
+                            None
+                        };
+                        let permit = if matches!(
+                            settlement.as_ref(),
+                            Some(crate::archive::RawPublicationSettlement::Retired { .. })
+                        ) {
+                            Some(database.request_source_completion().await)
+                        } else if success {
                             database.try_request_source_completion()
                         } else {
                             Some(database.request_source_completion().await)
@@ -1214,9 +1222,9 @@ fn publish_durable(shared: &Arc<SharedBody>) {
                         release_resident_memory(&source);
                         residency.durable_settled.store(true, Ordering::Release);
                         residency.release_if_idle();
-                        permit
+                        (permit, settlement)
                     };
-                    let (wrote, permit) = tokio::join!(lease, handoff);
+                    let (wrote, (permit, settlement)) = tokio::join!(lease, handoff);
                     if let (Some(_permit), Some(wrote)) = (permit, wrote) {
                         if wrote {
                             database
@@ -1225,6 +1233,7 @@ fn publish_durable(shared: &Arc<SharedBody>) {
                                     &key,
                                     source.length,
                                     source.digest,
+                                    settlement.expect("uploaded source has a publication outcome"),
                                 )
                                 .await;
                         } else {

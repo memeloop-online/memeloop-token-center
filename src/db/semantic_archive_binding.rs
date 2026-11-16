@@ -141,7 +141,9 @@ impl Database {
             // publisher is fenced separately, and CAS bytes remain readable.
             let busy: i64 = sqlx::query_scalar("SELECT CAST(CASE WHEN EXISTS(SELECT 1 FROM request_archive_spools WHERE request_id=$1 AND (state IN ('capturing','pending','uploading') OR lease_owner IS NOT NULL)) OR EXISTS(SELECT 1 FROM response_archive_spools WHERE request_id=$1 AND (state IN ('capturing','pending','uploading') OR lease_owner IS NOT NULL)) OR EXISTS(SELECT 1 FROM archive_staging_attempts WHERE owner_id=$1 AND state='writing') THEN 1 ELSE 0 END AS BIGINT)")
                 .bind(&request).fetch_one(&self.pool).await?;
-            if busy != 0 || archive.has_carrier_owner_for_request(request_id).await? {
+            // Logical root retirement leaves every CAS object readable. It
+            // does not use a global owner scan as physical-GC permission.
+            if busy != 0 {
                 continue;
             }
             let manifest = archive

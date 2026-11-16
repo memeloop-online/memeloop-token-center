@@ -7,6 +7,186 @@ use crate::{
 use std::time::Duration;
 
 #[tokio::test]
+async fn late_request_capture_retires_source_metadata_without_rebinding_after_commit_unknown() {
+    let directory = tempfile::tempdir().unwrap();
+    let url = format!(
+        "sqlite://{}?mode=rwc",
+        directory.path().join("late-request.db").display()
+    );
+    let archive = crate::archive::ArchiveStore::memory_for_test();
+    let database = Database::connect(&url)
+        .await
+        .unwrap()
+        .with_archive(archive.clone());
+    database.migrate().await.unwrap();
+    let pool = sqlx::AnyPool::connect(&url).await.unwrap();
+    let identity = ArchiveSpoolIdentity {
+        request_id: uuid::Uuid::now_v7(),
+        tenant_id: uuid::Uuid::now_v7(),
+        reservation_id: uuid::Uuid::now_v7(),
+    };
+    let body = Bytes::from_static(br#"{"messages":[{"role":"user","content":"late source"}]}"#);
+    let original = archive
+        .put_tenant_content(identity.tenant_id, body.clone())
+        .await
+        .unwrap();
+    let response = archive.put_tenant_content(identity.tenant_id, Bytes::from_static(br#"{"choices":[{"message":{"role":"assistant","content":"answer"},"finish_reason":"stop"}]}"#)).await.unwrap();
+    let prepared = archive
+        .prepare_session_body_streamed(
+            identity.tenant_id,
+            identity.request_id,
+            crate::conversation::ConversationHints::default(),
+            original.object_locator.clone(),
+            Some(response.object_locator),
+            true,
+        )
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(prepared.coverage_complete);
+    let proof = crate::archive::SemanticBindingProof {
+        tenant_id: identity.tenant_id,
+        request_id: identity.request_id,
+        node_hash: prepared.nodes.last().unwrap().node_hash.clone(),
+        projected_at: 1,
+    };
+    archive
+        .retire_covered_raw_roots(&prepared.publication, &proof)
+        .await
+        .unwrap();
+    let store = MemoryObjectStore::new();
+    let release = store.pause_next_write();
+    let admission =
+        RequestSpoolAdmission::new(directory.path().to_owned()).with_memory_store(store.clone());
+    let budget = ProxyMemoryBudget::new(512 * 1024);
+    let memory = budget.reservation();
+    let source = Arc::new(
+        admission
+            .capture_with_memory(
+                Body::from(body.clone()),
+                body.len(),
+                Some(body.len()),
+                Some(&memory),
+                0,
+                Some(&identity.request_id.to_string()),
+            )
+            .await
+            .unwrap(),
+    );
+    let locator = source.object_locator().unwrap().to_owned();
+    sqlx::query("INSERT INTO request_records (id,tenant_id,key_id,created_at,protocol,model,input_tokens,output_tokens,cost_micros,request_object,reservation_id) VALUES ($1,$2,$3,1,'openai','test',0,0,0,$4,$5)")
+        .bind(identity.request_id.to_string()).bind(identity.tenant_id.to_string()).bind(uuid::Uuid::now_v7().to_string()).bind(&locator).bind(identity.reservation_id.to_string()).execute(&pool).await.unwrap();
+    source.retain_for_archive(database.clone(), identity);
+    tokio::time::timeout(Duration::from_secs(5), async {
+        loop {
+            let count: i64 = sqlx::query_scalar(
+                "SELECT COUNT(*) FROM request_archive_spools WHERE request_id=$1",
+            )
+            .bind(identity.request_id.to_string())
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+            if count == 1 {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .unwrap();
+    source.release_retained();
+    drop(memory);
+    store.resume_writes_for_test(archive.clone());
+    release.send(()).unwrap();
+    assert!(source.upload_outcome().await);
+    tokio::time::timeout(Duration::from_secs(5), async {
+        loop {
+            let count: i64 = sqlx::query_scalar(
+                "SELECT COUNT(*) FROM request_archive_spools WHERE request_id=$1",
+            )
+            .bind(identity.request_id.to_string())
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+            if count == 0 && budget.snapshot().0 == 0 {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("late typed retirement clears old source metadata after durable handoff");
+    // Replay a source completion whose SQL actually committed but lost its ACK.
+    sqlx::query("INSERT INTO request_archive_spools (request_id,tenant_id,reservation_id,state,next_attempt_at,created_at,updated_at,expires_at,body_byte_count,body_blake3) VALUES ($1,$2,$3,'capturing',1,1,1,9223372036854775807,$4,$5)")
+        .bind(identity.request_id.to_string()).bind(identity.tenant_id.to_string()).bind(identity.reservation_id.to_string()).bind(body.len() as i64).bind(blake3::hash(&body).to_hex().to_string()).execute(&pool).await.unwrap();
+    tokio::time::timeout(
+        Duration::from_secs(5),
+        Database::with_semantic_coverage_fault(
+            "retired_request_source_committed",
+            database.complete_request_source(
+                identity,
+                &locator,
+                body.len(),
+                *blake3::hash(&body).as_bytes(),
+                true,
+            ),
+        ),
+    )
+    .await
+    .unwrap();
+    database
+        .complete_request_source(
+            identity,
+            &locator,
+            body.len(),
+            *blake3::hash(&body).as_bytes(),
+            true,
+        )
+        .await;
+    let count: i64 =
+        sqlx::query_scalar("SELECT COUNT(*) FROM request_archive_spools WHERE request_id=$1")
+            .bind(identity.request_id.to_string())
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+    assert_eq!(
+        count, 0,
+        "retired completion must never recreate a bound source"
+    );
+    assert!(
+        archive
+            .raw_capture_reference(identity.tenant_id, identity.request_id, "request")
+            .await
+            .unwrap()
+            .is_none()
+    );
+    assert_eq!(
+        archive
+            .get_tenant_content(identity.tenant_id, &original, body.len())
+            .await
+            .unwrap(),
+        body
+    );
+    assert_eq!(source.read_all().await.unwrap(), body);
+    let row = sqlx::query("SELECT request_object,completed_at FROM request_records WHERE id=$1")
+        .bind(identity.request_id.to_string())
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+    use sqlx::Row as _;
+    assert_eq!(
+        row.get::<String, _>("request_object"),
+        locator,
+        "no new raw SQL binding or financial completion"
+    );
+    assert_eq!(row.get::<Option<i64>, _>("completed_at"), None);
+    drop(source);
+    assert_eq!(budget.snapshot().0, 0);
+    pool.close().await;
+    database.close().await;
+}
+
+#[tokio::test]
 async fn archive_source_survives_request_drop_without_pinning_upload_bytes_on_database() {
     let directory = tempfile::tempdir().unwrap();
     let database_url = format!(
