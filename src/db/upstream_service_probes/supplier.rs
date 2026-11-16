@@ -80,7 +80,13 @@ impl Database {
                AND credential_generation = $3 AND updated_at = $4
              ON CONFLICT (upstream_account_id, upstream_model, credential_generation, transport_revision)
              DO UPDATE SET
-               capacity_scope = CASE WHEN upstream_supplier_availability.failure_kind = 'quota_exhausted'
+               capacity_scope = CASE
+                 WHEN upstream_supplier_availability.hard_observed_at > excluded.hard_observed_at
+                   THEN upstream_supplier_availability.capacity_scope
+                 WHEN upstream_supplier_availability.hard_observed_at = excluded.hard_observed_at
+                    AND upstream_supplier_availability.capacity_scope <> excluded.capacity_scope
+                   THEN 'unknown'
+                 WHEN upstream_supplier_availability.failure_kind = 'quota_exhausted'
                     AND excluded.failure_kind <> 'quota_exhausted'
                     AND (upstream_supplier_availability.reset_at IS NULL OR upstream_supplier_availability.reset_at > excluded.observed_at)
                  THEN upstream_supplier_availability.capacity_scope ELSE excluded.capacity_scope END,
