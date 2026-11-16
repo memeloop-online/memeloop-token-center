@@ -1,0 +1,22 @@
+name: staging-peak-mock
+on:
+  workflow_dispatch:
+  pull_request:
+    paths:
+      - tests/load/staging-peak/**
+      - tests/load/benchmark-memory.ts
+      - .github/workflows/staging-peak-mock.yml
+permissions:
+  contents: read
+jobs:
+  harness-contract:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020
+        with:
+          node-version: 24.18.0
+      - run: node --test tests/load/staging-peak/test-framework.ts
+      - name: State evidence boundary
+        run: echo 'Harness contracts only. Historical peak and TEST-cluster lifecycle qualification require measured baseline and a separate cluster run.' >> "$GITHUB_STEP_SUMMARY"
