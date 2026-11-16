@@ -3,7 +3,27 @@ use super::*;
 /// Provider response evidence only; local admission 429s never enter here.
 /// An unknown reset is NULL, not a fabricated deadline.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum SupplierQuotaScope {
+    Unknown,
+    OrdinaryCode,
+    CodeReview,
+    ModelSpecific,
+}
+
+impl SupplierQuotaScope {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Unknown => "unknown",
+            Self::OrdinaryCode => "ordinary_code",
+            Self::CodeReview => "code_review",
+            Self::ModelSpecific => "model_specific",
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) struct SupplierQuotaEvidence {
+    pub(crate) capacity_scope: SupplierQuotaScope,
     pub(crate) exhausted: bool,
     pub(crate) reset_at: Option<i64>,
     pub(crate) reset_source: &'static str,
@@ -40,19 +60,30 @@ impl Database {
         observed_at: i64,
         evidence: SupplierQuotaEvidence,
     ) -> Result<(), AppError> {
-        // This endpoint supplies model evidence only, never account scope.
+        // A failure remains attached to the exact model. The provider's
+        // capacity identity determines which later quota observation can
+        // supersede it; only the native Codex adapter supplies that identity.
+        let capacity_scope = if route.driver == "openai-codex" {
+            evidence.capacity_scope
+        } else {
+            SupplierQuotaScope::Unknown
+        };
         sqlx::query(
             "INSERT INTO upstream_supplier_availability
              (upstream_account_id, upstream_model, credential_generation, transport_revision,
               failure_kind, reset_at, reset_source, observed_at, request_id,
-              hard_observed_at, reset_observed_at)
+              hard_observed_at, reset_observed_at, capacity_scope)
              SELECT id, $2, $3, $4, $5, $6, $7, $8, $9,
                CASE WHEN $5 = 'quota_exhausted' THEN $8 ELSE NULL END,
-               CASE WHEN $6 IS NOT NULL THEN $8 ELSE NULL END FROM upstream_accounts
+               CASE WHEN $6 IS NOT NULL THEN $8 ELSE NULL END, $10 FROM upstream_accounts
              WHERE id = $1 AND status = 'active'
                AND credential_generation = $3 AND updated_at = $4
              ON CONFLICT (upstream_account_id, upstream_model, credential_generation, transport_revision)
              DO UPDATE SET
+               capacity_scope = CASE WHEN upstream_supplier_availability.failure_kind = 'quota_exhausted'
+                    AND excluded.failure_kind <> 'quota_exhausted'
+                    AND (upstream_supplier_availability.reset_at IS NULL OR upstream_supplier_availability.reset_at > excluded.observed_at)
+                 THEN upstream_supplier_availability.capacity_scope ELSE excluded.capacity_scope END,
                failure_kind = CASE WHEN upstream_supplier_availability.failure_kind = 'quota_exhausted'
                     AND excluded.failure_kind = 'rate_limited'
                     AND (upstream_supplier_availability.reset_at IS NULL OR upstream_supplier_availability.reset_at > excluded.observed_at)
@@ -94,6 +125,7 @@ impl Database {
         .bind(evidence.reset_source)
         .bind(observed_at)
         .bind(request_id.to_string())
+        .bind(capacity_scope.as_str())
         .execute(&self.pool)
         .await?;
         Ok(())

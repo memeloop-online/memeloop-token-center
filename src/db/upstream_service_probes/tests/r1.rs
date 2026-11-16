@@ -18,6 +18,7 @@ async fn fixture(db: &Database) -> ResolvedUpstream {
 
 fn failure(exhausted: bool, reset_at: Option<i64>) -> SupplierQuotaEvidence {
     SupplierQuotaEvidence {
+        capacity_scope: crate::db::SupplierQuotaScope::Unknown,
         exhausted,
         reset_at,
         reset_source: if reset_at.is_some() {

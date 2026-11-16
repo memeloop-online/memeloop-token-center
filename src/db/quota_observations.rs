@@ -120,8 +120,17 @@ impl Database {
             FROM upstream_account_health h
             JOIN upstream_accounts a ON a.id=h.upstream_account_id
                 AND a.credential_generation=h.credential_generation
+                AND a.updated_at=h.transport_revision
             WHERE a.status='active' AND a.driver='openai-codex'
                 AND h.last_failure_kind='quota_exhausted' AND h.probe_lease_until<=$2
+            UNION ALL
+            SELECT q.upstream_account_id,a.tenant_id,0,q.observed_at,0
+            FROM upstream_supplier_availability q
+            JOIN upstream_accounts a ON a.id=q.upstream_account_id
+                AND a.credential_generation=q.credential_generation
+                AND a.updated_at=q.transport_revision
+            WHERE a.status='active' AND a.driver='openai-codex'
+                AND q.failure_kind='quota_exhausted'
         ), prioritized AS (
             SELECT id,tenant_id,MIN(recovery_priority) AS recovery_priority,
                 MAX(recovery_mark) AS recovery_mark,MAX(allocation_history) AS allocation_history
@@ -187,8 +196,12 @@ impl Database {
             WHERE id=$1 AND tenant_id=$2 AND credential_generation=$3 AND updated_at=$4 AND status='active'
                 AND ($8=0 OR EXISTS (SELECT 1 FROM upstream_account_health h
                     WHERE h.upstream_account_id=$1 AND h.credential_generation=$3
+                        AND h.transport_revision=$4
                         AND h.last_failure_kind='quota_exhausted' AND h.updated_at=$8
-                        AND h.probe_lease_until<=$5))
+                        AND h.probe_lease_until<=$5)
+                    OR EXISTS (SELECT 1 FROM upstream_supplier_availability q
+                        WHERE q.upstream_account_id=$1 AND q.credential_generation=$3
+                            AND q.transport_revision=$4 AND q.failure_kind='quota_exhausted' AND q.observed_at=$8))
             ON CONFLICT(upstream_account_id) DO UPDATE SET tenant_id=excluded.tenant_id,credential_generation=excluded.credential_generation,
                 config_revision=excluded.config_revision,last_attempt_at=excluded.last_attempt_at,lease_id=excluded.lease_id,lease_until=excluded.lease_until
             WHERE upstream_quota_observations.lease_until<=$5 AND (upstream_quota_observations.next_refresh_at<=$5
@@ -197,8 +210,13 @@ impl Database {
                 OR ($8>upstream_quota_observations.last_attempt_at
                     AND EXISTS (SELECT 1 FROM upstream_account_health h
                         WHERE h.upstream_account_id=$1 AND h.credential_generation=$3
+                            AND h.transport_revision=$4
                             AND h.last_failure_kind='quota_exhausted' AND h.updated_at=$8
-                            AND h.probe_lease_until<=$5)))")
+                            AND h.probe_lease_until<=$5)
+                    OR ($8>upstream_quota_observations.last_attempt_at AND EXISTS (
+                        SELECT 1 FROM upstream_supplier_availability q
+                        WHERE q.upstream_account_id=$1 AND q.credential_generation=$3
+                            AND q.transport_revision=$4 AND q.failure_kind='quota_exhausted' AND q.observed_at=$8))))")
             .bind(target.account_id.to_string()).bind(target.tenant_id.to_string()).bind(target.generation).bind(target.config_revision).bind(now).bind(lease.to_string()).bind(lease_until).bind(target.recovery_mark)
             .execute(&self.pool).await?.rows_affected();
         Ok(changed == 1)
@@ -215,12 +233,61 @@ impl Database {
             .map(serde_json::to_string)
             .transpose()
             .map_err(|_| AppError::internal("quota_observations_finish_quota_observation_1"))?;
-        sqlx::query("UPDATE upstream_quota_observations SET observation_json=$1,valid_until=$2,next_refresh_at=$3,lease_id=NULL,lease_until=0
+        let published = sqlx::query("UPDATE upstream_quota_observations SET observation_json=$1,valid_until=$2,next_refresh_at=$3,lease_id=NULL,lease_until=0
             WHERE upstream_account_id=$4 AND tenant_id=$5 AND credential_generation=$6 AND config_revision=$7 AND lease_id=$8
                 AND EXISTS (SELECT 1 FROM upstream_accounts a WHERE a.id=$4 AND a.tenant_id=$5 AND a.credential_generation=$6 AND a.updated_at=$7 AND a.status='active')")
             .bind(json).bind(observation.map_or(0,|value|value.valid_until)).bind(next_refresh)
             .bind(target.account_id.to_string()).bind(target.tenant_id.to_string()).bind(target.generation).bind(target.config_revision).bind(lease.to_string())
-            .execute(&self.pool).await?;
+            .execute(&self.pool).await?.rows_affected();
+        if published == 1
+            && let Some(observation) = observation
+        {
+            self.recover_supplier_quota_from_usage(observation).await?;
+        }
+        Ok(())
+    }
+
+    async fn recover_supplier_quota_from_usage(
+        &self,
+        observation: &RoutingQuotaObservation,
+    ) -> Result<(), AppError> {
+        let Some(allowance) = &observation.ordinary_code_allowance else {
+            return Ok(());
+        };
+        let now = unix_millis();
+        if observation.provider != "openai-codex"
+            || observation.valid_until <= now
+            || observation.observed_at > now
+            || allowance.started_at < 0
+            || allowance.started_at > observation.observed_at
+        {
+            return Ok(());
+        }
+        // Only ordinary-code failures are covered. Historical unknown and
+        // model-specific/code-review failures retain their independent facts.
+        // A rejection received during the read wins even if publication is late.
+        sqlx::query(
+            "UPDATE upstream_supplier_availability SET
+                failure_kind='available', reset_at=NULL, reset_source='quota_observation',
+                observed_at=$5, success_at=$4, hard_observed_at=NULL,
+                reset_observed_at=NULL, verification_after=NULL
+            WHERE upstream_account_id=$1 AND credential_generation=$2 AND transport_revision=$3
+                AND capacity_scope='ordinary_code' AND failure_kind='quota_exhausted'
+                AND observed_at<$4 AND (hard_observed_at IS NULL OR hard_observed_at<$4)
+                AND (reset_observed_at IS NULL OR reset_observed_at<$4)
+                AND (success_at IS NULL OR success_at<$4)
+                AND EXISTS (SELECT 1 FROM upstream_accounts a
+                    WHERE a.id=upstream_supplier_availability.upstream_account_id
+                        AND a.driver='openai-codex' AND a.status='active'
+                        AND a.credential_generation=$2 AND a.updated_at=$3)",
+        )
+        .bind(observation.account_id.to_string())
+        .bind(observation.generation)
+        .bind(observation.config_revision)
+        .bind(allowance.started_at)
+        .bind(observation.observed_at)
+        .execute(&self.pool)
+        .await?;
         Ok(())
     }
 
