@@ -25,7 +25,7 @@ jobs:
   build-release-input:
     if: github.ref == 'refs/heads/master' && inputs.accept_archive_risk
     runs-on: ubuntu-latest
-    timeout-minutes: 45
+    timeout-minutes: 120
     permissions:
       contents: read
     steps:
