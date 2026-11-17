@@ -948,6 +948,73 @@ mod tests {
     }
 
     #[tokio::test]
+    #[ignore = "requires the CI PostgreSQL fixture"]
+    async fn postgres_history_capture_skips_locked_identity_and_commits_progress() {
+        let postgres = std::env::var("MTC_TEST_POSTGRES_URL").unwrap();
+        let admin = sqlx::PgPool::connect(&postgres).await.unwrap();
+        let schema = format!("history_capture_{}", Uuid::now_v7().simple());
+        sqlx::query(sqlx::AssertSqlSafe(format!("CREATE SCHEMA {schema}")))
+            .execute(&admin)
+            .await
+            .unwrap();
+        let mut isolated = url::Url::parse(&postgres).unwrap();
+        isolated
+            .query_pairs_mut()
+            .append_pair("options", &format!("-csearch_path={schema}"));
+        let db = Database::connect(isolated.as_str()).await.unwrap();
+        db.migrate().await.unwrap();
+        sqlx::query("UPDATE request_history_state SET mode='shadow' WHERE id=1")
+            .execute(&db.pool)
+            .await
+            .unwrap();
+        for revision in [1_i64, 2] {
+            sqlx::query("INSERT INTO request_history_export (revision,source,request_id,tenant_id,key_id,created_at) VALUES ($1,'native',$2,$3,$4,42)")
+                .bind(revision).bind(Uuid::now_v7().to_string()).bind(Uuid::now_v7().to_string()).bind(Uuid::now_v7().to_string()).execute(&db.pool).await.unwrap();
+        }
+        let mut held = db.pool.begin().await.unwrap();
+        sqlx::query("SELECT revision FROM request_history_export WHERE revision=2 FOR UPDATE")
+            .fetch_one(&mut *held)
+            .await
+            .unwrap();
+        tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            db.history_capture_pending(2),
+        )
+        .await
+        .expect("locked second identity must not block first")
+        .unwrap();
+        let count: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM request_history_immutable_outbox WHERE revision=1",
+        )
+        .fetch_one(&db.pool)
+        .await
+        .unwrap();
+        assert_eq!(count, 1);
+        let mut probe = db.pool.begin().await.unwrap();
+        sqlx::query(
+            "SELECT revision FROM request_history_export WHERE revision=1 FOR UPDATE NOWAIT",
+        )
+        .fetch_one(&mut *probe)
+        .await
+        .expect("first identity lock must already be released");
+        probe.rollback().await.unwrap();
+        held.rollback().await.unwrap();
+        db.history_capture_pending(2).await.unwrap();
+        let count: i64 =
+            sqlx::query_scalar("SELECT COUNT(*) FROM request_history_immutable_outbox")
+                .fetch_one(&db.pool)
+                .await
+                .unwrap();
+        assert_eq!(count, 2);
+        db.close().await;
+        sqlx::query(sqlx::AssertSqlSafe(format!("DROP SCHEMA {schema} CASCADE")))
+            .execute(&admin)
+            .await
+            .unwrap();
+        admin.close().await;
+    }
+
+    #[tokio::test]
     async fn immutable_history_delivery_survives_source_absence_restart_and_stale_ack() {
         let directory = tempfile::tempdir().unwrap();
         let url = format!(
