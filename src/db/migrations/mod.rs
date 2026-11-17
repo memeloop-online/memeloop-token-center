@@ -2002,12 +2002,11 @@ pub(super) async fn maintain_postgres_partitions(
             // 加 ACCESS EXCLUSIVE 锁，一旦有长事务持锁，这条 DDL 会排队，而排队中的
             // ACCESS EXCLUSIVE 会挡住后续所有读写，把整张热表堵死。用目录查询先判断
             // 存在性可以完全避开这把锁。
-            let existing: Option<String> =
-                sqlx::query_scalar("SELECT to_regclass($1)::text")
-                    .bind(&partition)
-                    .fetch_optional(&mut *connection)
-                    .await?;
-            if existing.is_some() {
+            let existing: bool = sqlx::query_scalar("SELECT to_regclass($1) IS NOT NULL")
+                .bind(&partition)
+                .fetch_one(&mut *connection)
+                .await?;
+            if existing {
                 report.ready_partitions += 1;
                 continue;
             }
@@ -2072,11 +2071,11 @@ pub(super) async fn maintain_postgres_partitions(
     }
     for table in ["request_records", "request_events"] {
         let default_partition = format!("{table}_default");
-        let existing: Option<String> = sqlx::query_scalar("SELECT to_regclass($1)::text")
+        let existing: bool = sqlx::query_scalar("SELECT to_regclass($1) IS NOT NULL")
             .bind(&default_partition)
-            .fetch_optional(&mut *connection)
+            .fetch_one(&mut *connection)
             .await?;
-        if existing.is_some() {
+        if existing {
             continue;
         }
         let statement = match table {
