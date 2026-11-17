@@ -43,8 +43,9 @@ pub(crate) use queries::{
 pub(crate) use session_routing::{SessionRoutingTerminalInput, is_session_avoid_terminal};
 pub use settlement::normalize_proxy_usage;
 pub(crate) use settlement::{
-    normalize_proxy_usage_with_output_limit, price_token_usage, reserve_usage_in_transaction,
-    settle_confirmed_image_charge_in_transaction, settle_token_usage_in_transaction,
+    OrphanReservationScan, normalize_proxy_usage_with_output_limit, price_token_usage,
+    reserve_usage_in_transaction, settle_confirmed_image_charge_in_transaction,
+    settle_token_usage_in_transaction,
 };
 pub use stats::StatsFilter;
 #[cfg(test)]

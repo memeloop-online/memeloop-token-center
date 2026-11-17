@@ -114,7 +114,7 @@ impl Database {
             .bind(lease_owner.to_string())
             .bind(now.saturating_add(300_000))
             .bind(now)
-            .bind(limit.clamp(1, 32))
+            .bind(limit)
             .fetch_all(&mut *transaction)
             .await?;
         transaction.commit().await?;

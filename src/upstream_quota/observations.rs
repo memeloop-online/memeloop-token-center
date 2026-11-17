@@ -107,7 +107,7 @@ fn observation_timeout_millis(
         .ok()
         .and_then(|budget| i64::try_from(budget.total.as_millis()).ok())
         .unwrap_or(configured)
-        .clamp(1_000, 30_000);
+        ;
     configured.max(account_budget)
 }
 

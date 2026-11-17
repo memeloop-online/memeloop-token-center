@@ -122,7 +122,7 @@ impl Database {
              )",
         )
         .bind(unix_millis())
-        .bind(limit.clamp(1, 100_000))
+        .bind(limit)
         .execute(&self.pool)
         .await?
         .rows_affected();

@@ -28,7 +28,7 @@ impl Database {
     ) -> Result<Vec<MeteredUsageProjectionTask>, AppError> {
         let now = unix_millis();
         let expires_at = now.saturating_add(METERED_USAGE_PROJECTION_LEASE_MILLIS);
-        let limit = limit.clamp(1, METERED_USAGE_PROJECTION_BATCH_LIMIT);
+        let limit = limit;
         let mut transaction = self.begin_write_transaction().await?;
         let claimable = match self.backend {
             DatabaseBackend::PostgreSql => {

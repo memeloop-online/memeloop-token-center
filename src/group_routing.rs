@@ -306,7 +306,7 @@ impl CandidatePolicy {
         }
         (
             core.min(snapshot.started + Duration::from_millis(self.directive.recovery_wait_ms)),
-            Duration::from_millis(self.directive.recheck_ms.clamp(25, 5_000)),
+            Duration::from_millis(self.directive.recheck_ms),
         )
     }
     pub(crate) fn active_transient_policy(&self) -> Option<GroupRoutingTransientPolicy> {

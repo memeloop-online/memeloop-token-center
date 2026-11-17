@@ -4,8 +4,9 @@ use std::sync::{
     atomic::{AtomicU64, Ordering},
 };
 
-const JOBS: usize = 4;
-const BYTES: usize = 64 * 1024 * 1024;
+// 并发准入不再用个位数常量限制：目标量级是十万到百万并发。
+const JOBS: usize = 1024;
+const BYTES: usize = 4 * 1024 * 1024 * 1024;
 
 pub(crate) struct Persistence {
     pub(crate) stream_memory: crate::gateway_body::memory::ProxyMemoryBudget,
@@ -233,6 +234,7 @@ pub(crate) fn capture(
             .await
             .expect("archive capture semaphore stays open");
         let mut durable = None;
+        let mut semantically_retired = false;
         let mut db = background.persistence_db.clone();
         loop {
             db.refresh_closed_persistence_pool();
@@ -263,15 +265,16 @@ pub(crate) fn capture(
                                 .archive
                                 .promote_staged_text_to_cas(identity.tenant_id, &staged)
                                 .await?;
-                            background
+                            let settlement = background
                                 .archive
-                                .publish_raw_capture(
+                                .settle_raw_capture(
                                     identity.tenant_id,
                                     identity.request_id,
                                     purpose.as_str(),
                                     &reference,
                                 )
                                 .await?;
+                            semantically_retired = matches!(settlement, crate::archive::RawPublicationSettlement::Retired { .. });
                             background.archive.delete_archive_staging_segment(staging_key).await?;
                             reference
                         });
@@ -284,15 +287,21 @@ pub(crate) fn capture(
                 // durable above. A slow metadata pool only needs the reference:
                 // it must not retain the original body or frontend budget.
                 drop(source.take());
-                background
+                if semantically_retired {
+                    return Ok(true);
+                }
+                let settlement = background
                     .archive
-                    .publish_raw_capture(
+                    .settle_raw_capture(
                         identity.tenant_id,
                         identity.request_id,
                         purpose.as_str(),
                         reference,
                     )
                     .await?;
+                if matches!(settlement, crate::archive::RawPublicationSettlement::Retired { .. }) {
+                    return Ok(true);
+                }
                 let _ = db
                     .bind_raw_capture(
                         identity.tenant_id,

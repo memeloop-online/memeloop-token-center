@@ -69,7 +69,7 @@ fn score(candidate: &ProxyCandidate, now: i64, config: &AutoConfig) -> f64 {
     } else {
         50.0
     };
-    active + observed - candidate.latency_ms.unwrap_or(1000).clamp(0, 10000) as f64 / 10000.0
+    active + observed - candidate.latency_ms.unwrap_or(1000) as f64 / 10000.0
 }
 
 pub(crate) fn choose_auto(

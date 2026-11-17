@@ -480,6 +480,15 @@ mod tests {
         insert_event(&mut new_writer, new_event).await.unwrap();
         new_writer.commit().await.unwrap();
         assert_eq!(resumed.history_pending_count().await.unwrap(), 1);
+        // Activation requires the committed old-transaction horizon before
+        // backfill may cover pre-activation writes.
+        tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            while !resumed.history_capture_horizon_ready().await.unwrap() {
+                tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .unwrap();
         while !resumed.history_backfill_done().await.unwrap() {
             resumed.history_backfill_page(64).await.unwrap();
         }

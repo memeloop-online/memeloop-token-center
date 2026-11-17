@@ -245,7 +245,6 @@ pub use providers::{
     NativeOAuthImportCohortResult, ReauthorizeUpstreamAccountInput, ReplaceModelCatalogResult,
     UpdateModelRouteInput, UpdateUpstreamAccountInput, UpstreamModelCatalogView, UpstreamModelView,
 };
-pub(crate) use requests::RequestArchiveAdmission;
 pub use requests::{
     AttachProxyArchiveResult, ConversationDetailFilter, ConversationListFilter,
     ConversationProjectionTask, FinishMeteredSynchronousRequest, FinishProxyRequest,
@@ -270,6 +269,7 @@ pub(crate) use requests::{
     reserve_usage_in_transaction, search_prefix, settle_token_usage_in_transaction,
     validate_numeric_range,
 };
+pub(crate) use requests::{OrphanReservationScan, RequestArchiveAdmission};
 #[cfg(test)]
 pub(crate) use requests::{
     RequestEventCursor, claim_request_event_locator, claim_request_record_locator,
@@ -568,7 +568,7 @@ impl Database {
             "SELECT external_id FROM tenants WHERE status = 'active' AND external_id > $1 ORDER BY external_id ASC LIMIT $2",
         )
         .bind(after_external_id.unwrap_or_default())
-        .bind(limit.clamp(1, 100))
+        .bind(limit)
         .fetch_all(&self.pool)
         .await?;
         rows.into_iter()
@@ -661,7 +661,7 @@ impl Database {
         };
         let mut pool_options = AnyPoolOptions::new()
             .min_connections(0)
-            .max_connections(maximum_connections.clamp(1, 32))
+            .max_connections(maximum_connections)
             .acquire_timeout(Duration::from_secs(10))
             .idle_timeout(Some(Duration::from_secs(5 * 60)))
             .max_lifetime(Some(Duration::from_secs(30 * 60)))
@@ -835,7 +835,8 @@ impl Database {
     }
 
     pub(crate) fn with_auxiliary_pool_max_connections(mut self, maximum: u32) -> Self {
-        self.auxiliary_pool_max_connections = maximum.clamp(1, 2);
+        // 调用方显式传入的规模就是最终规模，不再二次夹取上限。
+        self.auxiliary_pool_max_connections = maximum;
         self
     }
 

@@ -145,7 +145,7 @@ impl Database {
                 AppError::internal("quota_observations_quota_observation_targets_1")
             })?)
             .bind(now)
-            .bind(limit.clamp(1, 16))
+            .bind(limit)
             .bind(
                 serde_json::to_string(allocation_plugins)
                     .map_err(|_| AppError::internal("quota_observations_allocation_plugins"))?,

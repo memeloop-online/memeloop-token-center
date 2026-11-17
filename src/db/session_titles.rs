@@ -153,7 +153,7 @@ impl Database {
         let retry = if waiting {
             60 * 60 * 1_000
         } else {
-            60_000 * task.attempts.clamp(1, 3)
+            60_000 * task.attempts
         };
         sqlx::query("UPDATE session_generated_titles SET title = COALESCE($1, title), state = $2, error_code = $3, next_attempt_at = $4, updated_at = $5, lease_owner = NULL, lease_until = NULL, attempts = CASE WHEN $6 = 1 THEN 0 ELSE attempts END WHERE tenant_id = $7 AND key_id = $8 AND session_id = $9 AND revision = $10 AND lease_owner = $11 AND lease_until > $5")
             .bind(title).bind(state).bind(error_code).bind(now + retry).bind(now).bind(i64::from(waiting))

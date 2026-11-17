@@ -234,7 +234,7 @@ pub async fn process_one(state: &AppState, worker_id: &str) -> Result<bool, AppE
             // Never refund an upstream-submitted task merely because its
             // cancellation endpoint is unavailable. Keep the fenced job and
             // reservation retryable until the provider confirms cancellation.
-            let exponent = u32::try_from(next_failure.clamp(0, 6)).unwrap_or(6);
+            let exponent = u32::try_from(next_failure).unwrap_or(6);
             let delay = 1_000_i64.saturating_mul(2_i64.saturating_pow(exponent));
             state
                 .db
@@ -248,7 +248,7 @@ pub async fn process_one(state: &AppState, worker_id: &str) -> Result<bool, AppE
         } else if next_failure >= MAX_FAILURES {
             terminal_failure(state, worker_id, &job, "retry_exhausted").await?;
         } else {
-            let exponent = u32::try_from(next_failure.clamp(0, 6)).unwrap_or(6);
+            let exponent = u32::try_from(next_failure).unwrap_or(6);
             let delay = 1_000_i64.saturating_mul(2_i64.saturating_pow(exponent));
             state
                 .db
@@ -960,7 +960,7 @@ async fn poll_siliconflow_video(
 
 fn siliconflow_poll_delay_millis(attempt_count: i64) -> i64 {
     let exponent =
-        u32::try_from(attempt_count.saturating_sub(1).div_euclid(5).clamp(0, 4)).unwrap_or(4);
+        u32::try_from(attempt_count.saturating_sub(1).div_euclid(5)).unwrap_or(4);
     2_000_i64.saturating_mul(2_i64.saturating_pow(exponent))
 }
 

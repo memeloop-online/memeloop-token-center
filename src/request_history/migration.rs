@@ -59,6 +59,11 @@ pub enum HistoryCommand {
         #[arg(long, default_value_t = 500, value_parser = clap::value_parser!(i64).range(1..))]
         page_size: i64,
     },
+    /// Queue one source page; delivery remains with the asynchronous exporter.
+    BackfillPage {
+        #[arg(long, default_value_t = 64, value_parser = clap::value_parser!(i64).range(1..=64))]
+        page_size: i64,
+    },
     Drain {
         #[arg(long, default_value_t = 500, value_parser = clap::value_parser!(i64).range(1..))]
         page_size: i64,
@@ -89,6 +94,13 @@ pub async fn command(config: &Config, command: HistoryCommand) -> Result<Value, 
     match &command {
         HistoryCommand::UpgradeUpstreamCapture => {
             return database.history_upgrade_upstream_capture().await;
+        }
+        HistoryCommand::BackfillPage { page_size } => {
+            let queued = database.history_backfill_page(*page_size).await?;
+            return Ok(json!({
+                "queued": queued,
+                "backfill_done": database.history_backfill_done().await?,
+            }));
         }
         HistoryCommand::PrepareActivation => {
             database.history_prepare_activation().await?;
@@ -239,6 +251,7 @@ pub async fn command(config: &Config, command: HistoryCommand) -> Result<Value, 
         HistoryCommand::Rollback
         | HistoryCommand::Status
         | HistoryCommand::UpgradeUpstreamCapture
+        | HistoryCommand::BackfillPage { .. }
         | HistoryCommand::FenceDelivery { .. }
         | HistoryCommand::ResumeDelivery { .. }
         | HistoryCommand::AbortBaseline { .. } => unreachable!(),

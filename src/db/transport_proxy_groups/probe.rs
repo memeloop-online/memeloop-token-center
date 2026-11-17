@@ -63,7 +63,7 @@ impl TransportProxyGroups {
                 continue;
             }
             entry.probe_requested.store(false, Ordering::Release);
-            let attempts = entry.probe_attempts.load(Ordering::Acquire).clamp(1, 8);
+            let attempts = entry.probe_attempts.load(Ordering::Acquire);
             let pool = pool.clone();
             let account_id = entry.group.account_id;
             let http = self

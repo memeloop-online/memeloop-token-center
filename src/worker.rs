@@ -18,6 +18,9 @@ mod background_actions_tests;
 
 const MAINTENANCE_INTERVAL: Duration = Duration::from_secs(6 * 60 * 60);
 const ORPHANED_RESERVATION_REAPER_INTERVAL: Duration = Duration::from_secs(5 * 60);
+// 已投影的会话 outbox 行回收节奏。表里存的是可达数 MB 的请求/语义快照，
+// 必须在后台持续回收，否则会把存储 IO 拖垮。
+const PROJECTION_OUTBOX_CLEANUP_INTERVAL: Duration = Duration::from_secs(5 * 60);
 const GENERATION_INTERVAL: Duration = Duration::from_millis(500);
 const PROJECTION_INTERVAL: Duration = Duration::from_secs(1);
 const OAUTH_REFRESH_INTERVAL: Duration = Duration::from_secs(60);
@@ -339,11 +342,49 @@ pub async fn run_until_shutdown_with_oauth_stop(
             }
         }
     );
+    let orphan_reservation_scan = Mutex::new(crate::db::OrphanReservationScan::default());
+    periodic!(
+        "projection_outbox_cleanup",
+        PROJECTION_OUTBOX_CLEANUP_INTERVAL,
+        async |state: &AppState, _shutdown: &watch::Receiver<bool>| {
+            let cleanup_deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+            let mut deleted_total = 0_u64;
+            loop {
+                match state.db.delete_projected_conversation_outbox(2_000).await {
+                    Ok(deleted) => {
+                        deleted_total = deleted_total.saturating_add(deleted);
+                        if deleted < 2_000 || tokio::time::Instant::now() >= cleanup_deadline {
+                            break;
+                        }
+                    }
+                    Err(error) => {
+                        tracing::error!(
+                            %error,
+                            "worker failed to delete projected conversation outbox rows"
+                        );
+                        break;
+                    }
+                }
+            }
+            if deleted_total > 0 {
+                tracing::info!(
+                    deleted = deleted_total,
+                    "worker deleted projected conversation outbox rows"
+                );
+            }
+        }
+    );
     periodic!(
         "orphaned_reservations",
         ORPHANED_RESERVATION_REAPER_INTERVAL,
         async |state: &AppState, _shutdown: &watch::Receiver<bool>| {
-            match state.db.release_orphaned_reservations(100).await {
+            let mut scan = orphan_reservation_scan.lock().unwrap().clone();
+            let result = state
+                .db
+                .release_orphaned_reservations_page(100, &mut scan)
+                .await;
+            *orphan_reservation_scan.lock().unwrap() = scan;
+            match result {
                 Ok(released) if released > 0 => {
                     tracing::warn!(released, "worker released orphaned usage reservations");
                 }
@@ -809,7 +850,7 @@ async fn refresh_plugin_service_data(
                 }
             }
             Err(failure) => {
-                let shift = u32::try_from(previous_failures.clamp(0, 6)).unwrap_or(6);
+                let shift = u32::try_from(previous_failures).unwrap_or(6);
                 let backoff_seconds = 5_i64
                     .saturating_mul(1_i64.checked_shl(shift).unwrap_or(64))
                     .min(300);

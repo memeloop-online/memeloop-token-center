@@ -120,7 +120,7 @@ impl Database {
                     self.history_scope(Some(tenant_external_id)).await?,
                     after_event_at,
                     after_event_id,
-                    limit.clamp(1, 500) as usize,
+                    limit as usize,
                 )
                 .await?);
         }
@@ -134,7 +134,7 @@ impl Database {
         .bind(after_event_at)
         .bind(after_event_at)
         .bind(after_event_id)
-        .bind(limit.clamp(1, 500))
+        .bind(limit)
         .fetch_all(&self.pool)
         .await?;
         let tenants = rows
@@ -168,7 +168,7 @@ impl Database {
                     crate::request_history::HistoryScope::GlobalOperator,
                     after_event_at,
                     after_event_id,
-                    limit.clamp(1, 500) as usize,
+                    limit as usize,
                 )
                 .await?);
         }
@@ -181,7 +181,7 @@ impl Database {
         .bind(after_event_at)
         .bind(after_event_at)
         .bind(after_event_id)
-        .bind(limit.clamp(1, 500))
+        .bind(limit)
         .fetch_all(&self.pool)
         .await?;
         let tenants = rows
@@ -547,6 +547,27 @@ impl Database {
         key_id: Uuid,
         request_id: Uuid,
     ) -> Result<RequestArchiveRefs, AppError> {
+        self.source_request_archive_refs_inner(key_id, request_id, true)
+            .await
+    }
+
+    /// Authorized native SQL metadata only. The caller resolves its frozen
+    /// semantic leaf after leaving the source transaction.
+    pub(crate) async fn source_request_archive_refs_unresolved(
+        &self,
+        key_id: Uuid,
+        request_id: Uuid,
+    ) -> Result<RequestArchiveRefs, AppError> {
+        self.source_request_archive_refs_inner(key_id, request_id, false)
+            .await
+    }
+
+    async fn source_request_archive_refs_inner(
+        &self,
+        key_id: Uuid,
+        request_id: Uuid,
+        resolve_native: bool,
+    ) -> Result<RequestArchiveRefs, AppError> {
         let request_id = request_id.to_string();
         let locator = self.request_record_locator(&request_id).await?;
         if let Some(locator) = locator.filter(|locator| locator.key_id == key_id.to_string()) {
@@ -559,11 +580,15 @@ impl Database {
             .fetch_optional(&self.pool)
             .await?
             .ok_or(AppError::internal("queries_site_1"))?;
-            self.resolve_raw_archive_roots(
-                parse_uuid(locator.tenant_id)?,
-                request_archive_refs_from_row(row)?,
-            )
-            .await
+            let refs = request_archive_refs_from_row(row)?;
+            if resolve_native {
+                self.resolve_raw_archive_roots(parse_uuid(locator.tenant_id)?, refs)
+                    .await
+            } else {
+                Ok(refs)
+            }
+        } else if !resolve_native {
+            Err(AppError::NotFound)
         } else {
             match self
                 .generation_archive_refs(key_id, parse_uuid(request_id.clone())?)
@@ -972,7 +997,7 @@ fn build_request_list_query_for_history(
     } else {
         500
     };
-    let page_limit = filter.limit.clamp(1, maximum) + i64::from(filter.lookahead);
+    let page_limit = filter.limit + i64::from(filter.lookahead);
     let mut query = PortableRequestListQuery::new(
         "SELECT id, created_at, completed_at, operational_completed_at, operational_stage, financial_state, source_completed_at, protocol, model, upstream_model, upstream_account_id, route_id, status_code, generation_status, duration_ms, first_output_ms, generation_duration_ms, usage_basis, input_tokens, cached_input_tokens, cache_write_tokens, output_tokens, billed_units, billing_unit, cost_micros, currency, billable, error_code, terminal_cause_code, in_flight_stage, supplier_error_inline_json, native_terminal, archive_state, archive_reason, session_id, session_association, compaction, session_name, task_kind, agent_id, semantics_source, tenant_external_id, credential_key_id, key_alias, principal_external_id FROM (SELECT * FROM (SELECT r.id, r.created_at, r.completed_at, op.completed_at AS operational_completed_at, op.stage AS operational_stage, CASE WHEN financial.state = 'applied' THEN 'applied' WHEN financial.unknown_reason IS NOT NULL THEN 'unknown' WHEN financial.state = 'pending' THEN 'pending' ELSE NULL END AS financial_state, CAST(NULL AS BIGINT) AS source_completed_at, r.protocol, r.model, r.upstream_model, (CASE WHEN op.request_id IS NOT NULL THEN op.upstream_account_id ELSE r.upstream_account_id END) AS upstream_account_id, (CASE WHEN op.request_id IS NOT NULL THEN op.model_route_id ELSE r.model_route_id END) AS route_id, (CASE WHEN op.request_id IS NOT NULL THEN op.status_code ELSE r.status_code END) AS status_code, CAST(NULL AS TEXT) AS generation_status, (CASE WHEN op.request_id IS NOT NULL THEN op.duration_ms ELSE r.duration_ms END) AS duration_ms, (CASE WHEN op.request_id IS NOT NULL THEN op.first_output_ms ELSE r.first_output_ms END) AS first_output_ms, (CASE WHEN op.request_id IS NOT NULL THEN op.generation_duration_ms ELSE r.generation_duration_ms END) AS generation_duration_ms, r.usage_basis, CASE WHEN r.completed_at IS NULL THEN NULL ELSE r.input_tokens END AS input_tokens, CASE WHEN r.completed_at IS NULL THEN NULL ELSE r.cached_input_tokens END AS cached_input_tokens, CASE WHEN r.completed_at IS NULL THEN NULL ELSE r.cache_write_tokens END AS cache_write_tokens, CASE WHEN r.completed_at IS NULL THEN NULL ELSE r.output_tokens END AS output_tokens, CASE WHEN r.completed_at IS NULL THEN NULL ELSE r.billed_units END AS billed_units, CASE WHEN r.completed_at IS NULL THEN NULL ELSE NULLIF(r.billing_unit, '') END AS billing_unit, CASE WHEN r.completed_at IS NULL THEN NULL ELSE r.cost_micros END AS cost_micros, CASE WHEN r.completed_at IS NULL THEN NULL ELSE NULLIF(r.currency, '') END AS currency, CAST(1 AS BIGINT) AS billable, (CASE WHEN op.request_id IS NOT NULL THEN op.error_code ELSE r.error_code END) AS error_code, (CASE WHEN op.request_id IS NOT NULL THEN op.terminal_cause_code ELSE r.terminal_cause_code END) AS terminal_cause_code, r.in_flight_stage, CASE WHEN (r.completed_at IS NOT NULL OR op.request_id IS NOT NULL) AND (CASE WHEN op.request_id IS NOT NULL THEN op.status_code ELSE r.status_code END) >= 400 AND (CASE WHEN r.response_object IS NOT NULL AND r.response_object NOT LIKE 'gap://%' THEN r.response_object WHEN op.request_id IS NOT NULL THEN op.response_object ELSE r.response_object END) LIKE 'inline-json:%' AND LENGTH((CASE WHEN r.response_object IS NOT NULL AND r.response_object NOT LIKE 'gap://%' THEN r.response_object WHEN op.request_id IS NOT NULL THEN op.response_object ELSE r.response_object END)) <= 2048 THEN (CASE WHEN r.response_object IS NOT NULL AND r.response_object NOT LIKE 'gap://%' THEN r.response_object WHEN op.request_id IS NOT NULL THEN op.response_object ELSE r.response_object END) ELSE NULL END AS supplier_error_inline_json, CAST(1 AS BIGINT) AS native_terminal, CASE WHEN request_spool.state = 'uploading' OR spool.state = 'uploading' THEN 'uploading' WHEN request_spool.state = 'pending' OR spool.state = 'pending' THEN 'pending' WHEN request_spool.state = 'capturing' OR spool.state = 'capturing' OR (r.completed_at IS NULL AND op.request_id IS NULL) THEN 'capturing' WHEN request_spool.state IS NULL AND spool.state IS NULL AND r.request_object LIKE 'metadata-only-json:%' AND ((CASE WHEN r.response_object IS NOT NULL AND r.response_object NOT LIKE 'gap://%' THEN r.response_object WHEN op.request_id IS NOT NULL THEN op.response_object ELSE r.response_object END) LIKE 'metadata-only-json:%' OR (CASE WHEN r.response_object IS NOT NULL AND r.response_object NOT LIKE 'gap://%' THEN r.response_object WHEN op.request_id IS NOT NULL THEN op.response_object ELSE r.response_object END) LIKE 'provider-reference-json:%') THEN 'metadata_only' WHEN request_spool.state = 'gap' OR spool.state = 'gap' OR r.request_object LIKE 'gap://%' OR (CASE WHEN r.response_object IS NOT NULL AND r.response_object NOT LIKE 'gap://%' THEN r.response_object WHEN op.request_id IS NOT NULL THEN op.response_object ELSE r.response_object END) IS NULL OR (CASE WHEN r.response_object IS NOT NULL AND r.response_object NOT LIKE 'gap://%' THEN r.response_object WHEN op.request_id IS NOT NULL THEN op.response_object ELSE r.response_object END) LIKE 'gap://%' THEN 'gap' ELSE 'bound' END AS archive_state, CASE WHEN request_spool.state IN ('capturing', 'pending', 'uploading') OR spool.state IN ('capturing', 'pending', 'uploading') OR (r.completed_at IS NULL AND op.request_id IS NULL) THEN NULL WHEN request_spool.state = 'gap' THEN COALESCE(request_spool.gap_reason, request_spool.last_error_code, 'archive_object_unavailable') WHEN spool.state = 'gap' THEN COALESCE(spool.last_error_code, 'archive_object_unavailable') WHEN r.request_object LIKE 'gap://%' OR (CASE WHEN r.response_object IS NOT NULL AND r.response_object NOT LIKE 'gap://%' THEN r.response_object WHEN op.request_id IS NOT NULL THEN op.response_object ELSE r.response_object END) IS NULL OR (CASE WHEN r.response_object IS NOT NULL AND r.response_object NOT LIKE 'gap://%' THEN r.response_object WHEN op.request_id IS NOT NULL THEN op.response_object ELSE r.response_object END) LIKE 'gap://%' THEN 'archive_object_unavailable' ELSE NULL END AS archive_reason, r.conversation_cluster_id AS session_id, CASE WHEN r.conversation_cluster_id IS NULL THEN 'unlinked' ELSE 'confirmed' END AS session_association, observation.compaction, observation.session_name, observation.task_kind, observation.agent_id, observation.metadata_source AS semantics_source",
     );
@@ -1044,6 +1069,21 @@ fn push_history_identity(
         } else {
             query.push(&format!(" AND {column} = "));
             query.bind_text(identity.request_id.to_string());
+            let alias = column
+                .split_once('.')
+                .expect("static history source column")
+                .0;
+            query.push(&format!(" AND {alias}.tenant_id = "));
+            query.bind_text(identity.tenant_id.to_string());
+            query.push(&format!(" AND {alias}.key_id = "));
+            query.bind_text(identity.key_id.to_string());
+            let time_column = if source == "archive" {
+                "source_started_at"
+            } else {
+                "created_at"
+            };
+            query.push(&format!(" AND {alias}.{time_column} = "));
+            query.bind_i64(identity.created_at);
         }
     }
 }
@@ -2217,6 +2257,7 @@ fn request_archive_refs_from_row(row: AnyRow) -> Result<RequestArchiveRefs, AppE
         projection("response", response_object.as_deref())?;
     view.archive_state = combined_archive_state(request_archive_state, response_archive_state);
     Ok(RequestArchiveRefs {
+        semantic_archive: None,
         view,
         request_object,
         response_object,
@@ -2268,6 +2309,7 @@ fn session_archive_unlinked_refs_from_row(row: AnyRow) -> Result<RequestArchiveR
         output_tokens,
     });
     Ok(RequestArchiveRefs {
+        semantic_archive: None,
         view: RequestView {
             operational_terminal: None,
             egress: None,
@@ -2400,6 +2442,7 @@ fn generation_archive_refs_from_row(row: AnyRow) -> Result<RequestArchiveRefs, A
     };
     let archive_state = combined_archive_state(request_archive_state, response_archive_state);
     Ok(RequestArchiveRefs {
+        semantic_archive: None,
         view: RequestView {
             operational_terminal: None,
             egress: None,
@@ -2820,6 +2863,63 @@ mod query_shape_tests {
             query
                 .binds
                 .contains(&RequestListBind::Text(route_id.to_string()))
+        );
+    }
+}
+
+#[cfg(test)]
+mod history_point_contract_tests {
+    use super::*;
+
+    #[test]
+    fn history_point_query_binds_partition_and_full_identity() {
+        let identity = crate::request_history::HistoryIdentity {
+            source: "native".into(),
+            request_id: Uuid::now_v7(),
+            tenant_id: Uuid::now_v7(),
+            key_id: Uuid::now_v7(),
+            created_at: 12345,
+        };
+        let query = build_request_list_query_for_history(
+            RequestListScope::Global,
+            &RequestListFilter {
+                limit: 1,
+                ..Default::default()
+            },
+            Some(&identity),
+        );
+        let before_page = query.statement.split("OFFSET 0) r").next().unwrap();
+        for predicate in [
+            "AND r.id =",
+            "AND r.tenant_id =",
+            "AND r.key_id =",
+            "AND r.created_at =",
+        ] {
+            assert!(
+                before_page.contains(predicate),
+                "point identity must constrain the source scan: {predicate}"
+            );
+        }
+        assert!(
+            query
+                .binds
+                .contains(&RequestListBind::I64(identity.created_at))
+        );
+        for value in [identity.request_id, identity.tenant_id, identity.key_id] {
+            assert!(
+                query
+                    .binds
+                    .contains(&RequestListBind::Text(value.to_string()))
+            );
+        }
+        let list = build_request_list_query_for_history(
+            RequestListScope::Global,
+            &RequestListFilter::default(),
+            None,
+        );
+        assert!(
+            !list.statement.contains("AND r.created_at ="),
+            "ordinary list pagination is unchanged"
         );
     }
 }

@@ -7,7 +7,7 @@ use uuid::Uuid;
 use super::{ArchiveStore, CasArchiveObject, SemanticInstancePage, SemanticManifestV2};
 use crate::error::AppError;
 
-#[derive(Serialize, Deserialize)]
+#[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct SemanticPublication {
     pub format_version: u32,
@@ -18,7 +18,67 @@ pub struct SemanticPublication {
     pub manifest: CasArchiveObject,
 }
 
+/// A permanent semantic authority for metadata consumers such as history.
+/// Raw provenance is deliberately excluded from this durable ownership view.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct SemanticArchiveAuthority {
+    pub publication: SemanticPublication,
+    pub semantic_head: super::SemanticHead,
+    pub coverage: super::SemanticCoverage,
+}
+
 impl ArchiveStore {
+    /// The caller obtains `leaf` from its already authorized SQL observation.
+    /// This performs metadata reads only; atom bytes remain in the single
+    /// semantic body store and are read through the verified semantic reader.
+    pub async fn semantic_archive_authority(
+        &self,
+        tenant: Uuid,
+        request: Uuid,
+        leaf: &str,
+    ) -> Result<Option<SemanticArchiveAuthority>, AppError> {
+        let Some(revision) = self
+            .published_semantic_revision(tenant, request, leaf)
+            .await?
+        else {
+            return Ok(None);
+        };
+        let bytes = self
+            .get_bounded(
+                &format!("tenants/{tenant}/semantic/v2/requests/{request}/{revision}.json"),
+                4096,
+            )
+            .await?;
+        let publication: SemanticPublication = serde_json::from_slice(&bytes)
+            .map_err(|_| AppError::storage("semantic_publication_invalid"))?;
+        if publication.format_version != 2
+            || publication.tenant_id != tenant
+            || publication.request_id != request
+            || publication.revision != revision
+        {
+            return Err(AppError::storage("semantic_publication_identity_mismatch"));
+        }
+        let manifest = self
+            .get_semantic_manifest_streamed(tenant, &publication.manifest)
+            .await?;
+        let head = manifest
+            .semantic_head
+            .ok_or_else(|| AppError::storage("semantic_head_missing"))?;
+        if head.node_hash != leaf
+            || manifest.request_id != request
+            || manifest.revision != revision
+            || manifest.projection_version != publication.projection_version
+        {
+            return Err(AppError::storage("semantic_publication_identity_mismatch"));
+        }
+        Ok(Some(SemanticArchiveAuthority {
+            publication,
+            semantic_head: head,
+            coverage: manifest.coverage,
+        }))
+    }
+
     /// Store exactly the existing relational prefix identity as recoverable
     /// metadata, not another body/event tree. Conflicts are never overwritten.
     pub async fn put_semantic_prefix_node(
@@ -243,12 +303,15 @@ impl ArchiveStore {
             publication: &'a SemanticPublication,
             binding: &'a SemanticBindingProof,
             coverage: &'a super::SemanticCoverage,
+            #[serde(skip_serializing_if = "Option::is_none")]
+            raw_sources: Option<&'a super::semantic_manifest::SemanticRawSources>,
         }
         let receipt = Receipt {
             format_version: 2,
             publication,
             binding: proof,
             coverage: &manifest.coverage,
+            raw_sources: manifest.raw_sources.as_ref(),
         };
         #[cfg(test)]
         crate::db::Database::semantic_coverage_test_boundary("coverage_put")?;

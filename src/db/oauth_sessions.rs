@@ -436,7 +436,7 @@ impl Database {
             "DELETE FROM oauth_login_sessions WHERE id IN (SELECT id FROM oauth_login_sessions WHERE expires_at < $1 ORDER BY expires_at, id LIMIT $2)",
         )
         .bind(now.saturating_sub(24 * 60 * 60 * 1_000))
-        .bind(limit.clamp(1, 1_000))
+        .bind(limit)
         .execute(&self.pool)
         .await?;
         Ok(result.rows_affected())

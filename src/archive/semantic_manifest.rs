@@ -31,6 +31,15 @@ pub enum SemanticProjectionState {
     Partial,
 }
 
+/// Evidence of the exact temporary bytes consumed by the semantic parser.
+/// These references are provenance, not permanent body ownership or GC roots.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct SemanticRawSources {
+    pub request: CasArchiveObject,
+    pub response: Option<CasArchiveObject>,
+}
+
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct SemanticManifestV2 {
@@ -48,6 +57,8 @@ pub struct SemanticManifestV2 {
     pub semantic_head: Option<SemanticHead>,
     pub instances_head: Option<CasArchiveObject>,
     pub coverage: SemanticCoverage,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub raw_sources: Option<SemanticRawSources>,
 }
 
 impl SemanticManifestV2 {
@@ -71,6 +82,12 @@ impl SemanticManifestV2 {
                 && (!self.coverage.observed_terminal || !self.coverage.gaps.is_empty()))
         {
             return Err(AppError::storage("semantic_manifest_invalid"));
+        }
+        if let Some(sources) = &self.raw_sources {
+            sources.request.validate_tenant(tenant)?;
+            if let Some(response) = &sources.response {
+                response.validate_tenant(tenant)?;
+            }
         }
         if let Some(page) = &self.instances_head {
             page.validate_tenant(tenant)?;
@@ -375,6 +392,7 @@ mod tests {
             backend_identity: None,
             semantic_head: None,
             instances_head: None,
+            raw_sources: None,
             coverage: SemanticCoverage {
                 observed_terminal: true,
                 projection_state: SemanticProjectionState::Complete,

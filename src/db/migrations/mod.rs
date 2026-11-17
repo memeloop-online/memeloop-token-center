@@ -1998,10 +1998,27 @@ pub(super) async fn maintain_postgres_partitions(
         let suffix = day.format("%Y%m%d");
         for table in ["request_records", "request_events"] {
             let partition = format!("{table}_{suffix}");
+            // 已存在的分区不再下发 DDL。CREATE TABLE ... PARTITION OF 需要对父表
+            // 加 ACCESS EXCLUSIVE 锁，一旦有长事务持锁，这条 DDL 会排队，而排队中的
+            // ACCESS EXCLUSIVE 会挡住后续所有读写，把整张热表堵死。用目录查询先判断
+            // 存在性可以完全避开这把锁。
+            let existing: bool = sqlx::query_scalar("SELECT to_regclass($1) IS NOT NULL")
+                .bind(&partition)
+                .fetch_one(&mut *connection)
+                .await?;
+            if existing {
+                report.ready_partitions += 1;
+                continue;
+            }
             let statement = format!(
                 "CREATE TABLE IF NOT EXISTS {partition} PARTITION OF {table} FOR VALUES FROM ({start}) TO ({end})"
             );
             sqlx::query("SAVEPOINT memeloop_partition_maintenance")
+                .execute(&mut *connection)
+                .await?;
+            // 真正需要建分区时也必须有界等待：拿不到锁就跳过，下一轮维护再试，
+            // 绝不把 ACCESS EXCLUSIVE 排进锁队列去阻塞在线流量。
+            sqlx::query("SET LOCAL lock_timeout = '3000ms'")
                 .execute(&mut *connection)
                 .await?;
             // SQL safety boundary: table is selected from the two literals above, suffix is a
@@ -2028,7 +2045,9 @@ pub(super) async fn maintain_postgres_partitions(
                         .execute(&mut *connection)
                         .await?;
 
-                    if !is_default_partition_overlap(&error) {
+                    // 拿不到锁（lock_timeout）与 DEFAULT 分区重叠都属于“本轮先跳过”，
+                    // 不能让一次 DDL 等待拖垮整个启动/迁移事务。
+                    if !is_default_partition_overlap(&error) && !is_lock_timeout(&error) {
                         return Err(error);
                     }
 
@@ -2039,7 +2058,7 @@ pub(super) async fn maintain_postgres_partitions(
                         start,
                         end,
                         %error,
-                        "partition creation skipped because its DEFAULT partition contains rows in the target range; rows were left unchanged and a later maintenance run will retry"
+                        "partition creation skipped for now; rows were left unchanged and a later maintenance run will retry"
                     );
                     report.blocked_partitions.push(BlockedPartition {
                         table: table.to_owned(),
@@ -2051,6 +2070,14 @@ pub(super) async fn maintain_postgres_partitions(
         }
     }
     for table in ["request_records", "request_events"] {
+        let default_partition = format!("{table}_default");
+        let existing: bool = sqlx::query_scalar("SELECT to_regclass($1) IS NOT NULL")
+            .bind(&default_partition)
+            .fetch_one(&mut *connection)
+            .await?;
+        if existing {
+            continue;
+        }
         let statement = match table {
             "request_records" => {
                 "CREATE TABLE IF NOT EXISTS request_records_default PARTITION OF request_records DEFAULT"
@@ -2063,6 +2090,15 @@ pub(super) async fn maintain_postgres_partitions(
         sqlx::query(statement).execute(&mut *connection).await?;
     }
     Ok(report)
+}
+
+/// SQLSTATE 55P03：lock_timeout 触发，代表本轮拿不到父表的 ACCESS EXCLUSIVE 锁。
+fn is_lock_timeout(error: &sqlx::Error) -> bool {
+    matches!(
+        error,
+        sqlx::Error::Database(database_error)
+            if database_error.code().as_deref() == Some("55P03")
+    )
 }
 
 fn is_default_partition_overlap(error: &sqlx::Error) -> bool {
