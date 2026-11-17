@@ -6,6 +6,21 @@ import { artifactHash, candidateIdentity, type Candidate } from "./identity.ts";
 import { FixtureVerifier } from "./fixture.ts";
 import { validateBaseline, baselineIdentity } from "./baseline.ts";
 
+type Phase = "plan_read" | "plan_validate" | "environment" | "mock_identity" | "candidate_identity" | "control_version" | "upstream_setup" | "route_setup" | "price_setup" | "key_setup" | "load" | "report_write";
+let phase: Phase = "plan_read";
+let httpStatus: number | undefined;
+let setupIndex: number | undefined;
+let setupScenario: Arrival["scenario"] | undefined;
+function enter(next: Phase) { phase = next; httpStatus = undefined; }
+export function failureDiagnostic(error: unknown) {
+  const names = ["Error", "TypeError", "SyntaxError", "AbortError", "TimeoutError"];
+  const networks = ["ECONNREFUSED", "ECONNRESET", "ETIMEDOUT", "ENOTFOUND", "EAI_AGAIN", "UND_ERR_CONNECT_TIMEOUT", "UND_ERR_HEADERS_TIMEOUT", "UND_ERR_SOCKET"];
+  const e = error as { name?: unknown; cause?: { code?: unknown } } | null;
+  const errorName = typeof e?.name === "string" && names.includes(e.name) ? e.name : undefined;
+  const networkCode = typeof e?.cause?.code === "string" && networks.includes(e.cause.code) ? e.cause.code : undefined;
+  return { event: "staging_peak_failed", phase, code: httpStatus && httpStatus >= 400 ? "http_failure" : networkCode ? "network_failure" : errorName === "SyntaxError" ? "invalid_json" : "phase_failure", http_status: httpStatus, error_name: errorName, network_code: networkCode, scenario: setupScenario, setup_index: setupIndex };
+}
+
 export type Arrival = { protocol: "chat" | "responses"; at_ms: number; scenario: "normal" | "slow-read" | "upstream-error" | "disconnect" | "tool-session"; session: string; stream: boolean; request_padding_bytes: number; response_fixture_bytes: number; chunk_delay_ms: number; client_read_delay_ms: number; expected_status: number };
 export type Plan = { candidate?:Candidate; candidate_evidence?:{candidate:Candidate;observed_at:string}; release_batch: string; window_ms: number; drain_timeout_ms: number; arrivals: Arrival[]; baseline: unknown };
 export function validatePlan(value: unknown): Plan {
@@ -25,7 +40,9 @@ export function validatePlan(value: unknown): Plan {
 const percentile = (values: number[], p: number) => values.length ? [...values].sort((a,b) => a-b)[Math.ceil(values.length*p)-1] : null;
 
 export async function run(plan: Plan, env = process.env): Promise<Record<string, unknown>> {
+  enter("plan_validate");
   validatePlan(plan);
+  enter("environment");
   if (env.POD_NAMESPACE !== "memeloop-token-center-test") throw new Error("only the isolated TEST namespace is supported");
   const runId = env.MTC_PEAK_RUN_ID;
   if (!runId || !/^[a-z0-9-]{1,40}$/.test(runId)) throw new Error("DNS-safe explicit run identity required");
@@ -33,31 +50,41 @@ export async function run(plan: Plan, env = process.env): Promise<Record<string,
   const control = new URL(env.MTC_TEST_CONTROL_URL ?? "http://memeloop-token-center-test-control:8080");
   const mock = new URL(env.MTC_TEST_MOCK_URL ?? `http://mtc-peak-${runId}-mock:8080`);
   for (const [url, host] of [[gateway,"memeloop-token-center-test-gateway"],[control,"memeloop-token-center-test-control"],[mock,`mtc-peak-${runId}-mock`]] as const) if (url.protocol !== "http:" || url.hostname !== host || url.port !== "8080" || url.pathname !== "/") throw new Error("TEST-only service identity mismatch");
+  enter("mock_identity");
   const identityResponse=await fetch(new URL("/identity",mock),{signal:AbortSignal.timeout(10_000)});
+  httpStatus=identityResponse.status;
   const identity=await identityResponse.json() as {run_id?:string;source_sha?:string};
   if(!identityResponse.ok || identity.run_id!==runId || identity.source_sha!==env.MTC_HARNESS_SOURCE_SHA) throw new Error("exact-run mock identity mismatch");
   const token = env.MTC_TEST_SERVICE_TOKEN;
   if (!token) throw new Error("TEST service token secret reference required");
-  const call = async (path: string, payload: unknown) => {
+  const call = async (stage: Phase, path: string, payload: unknown) => {
+    enter(stage);
     const response = await fetch(new URL(path, control), { method: "POST", headers: { authorization: `Bearer ${token}`, "content-type":"application/json" }, body: JSON.stringify(payload), signal: AbortSignal.timeout(30_000) });
+    httpStatus=response.status;
     if (!response.ok) throw new Error(`isolated control setup HTTP ${response.status}`);
     return await response.json() as Record<string, any>;
   };
+  enter("candidate_identity");
   const expectedCandidate=candidateIdentity(plan.candidate);
   const actualCandidate=candidateIdentity(plan.candidate_evidence?.candidate);
   if(!Number.isFinite(Date.parse(plan.candidate_evidence?.observed_at??""))||artifactHash(expectedCandidate)!==artifactHash(actualCandidate))throw new Error("candidate observation does not match this workload plan");
+  enter("control_version");
   const versionResponse=await fetch(new URL("/version",control),{headers:{authorization:`Bearer ${token}`},signal:AbortSignal.timeout(10_000)});
+  httpStatus=versionResponse.status;
   const version=await versionResponse.json() as {revision?:string};
   if(!versionResponse.ok||version.revision!==actualCandidate.control.source_sha)throw new Error("actual control revision differs from observed candidate");
   const tenant = `staging-peak-${runId}`, models: Record<string,string> = {}, routes: string[] = [];
   for (const scenario of new Set(plan.arrivals.map(row => row.scenario))) {
+    setupScenario=scenario; setupIndex=(setupIndex ?? -1)+1;
     const model = `staging-peak-${runId}-${scenario}`;
-    const upstream = await call("/internal/v1/upstreams", { tenant_external_id:tenant, name:model, driver:"http-json", config:{ base_url:new URL(`/scenario/${scenario}`,mock).href }, credential:{ type:"none" } });
-    const route = await call("/internal/v1/model-routes", { tenant_external_id:tenant, public_model:model, upstream_account_id:upstream.id, upstream_model:model, protocol:"openai", priority:0, custom_model_confirmed:true });
-    await call(`/internal/v1/prices/USD/${model}`, { input_per_million:"0.01", output_per_million:"0.02" });
+    const upstream = await call("upstream_setup", "/internal/v1/upstreams", { tenant_external_id:tenant, name:model, driver:"http-json", config:{ base_url:new URL(`/scenario/${scenario}`,mock).href }, credential:{ type:"none" } });
+    const route = await call("route_setup", "/internal/v1/model-routes", { tenant_external_id:tenant, public_model:model, upstream_account_id:upstream.id, upstream_model:model, protocol:"openai", priority:0, custom_model_confirmed:true });
+    await call("price_setup", `/internal/v1/prices/USD/${model}`, { input_per_million:"0.01", output_per_million:"0.02" });
     models[scenario]=model; routes.push(String(route.id));
   }
-  const issued = await call("/internal/v1/keys", { tenant_external_id:tenant, principal_external_id:`staging-peak-${runId}`, alias:`Isolated ${runId}`, currency:"USD", initial_balance:"100000", route_ids:routes, policy:{requests_per_minute:Math.max(1,plan.arrivals.length*60), tokens_per_minute:1_000_000_000, max_concurrency:plan.arrivals.length, enforcement_mode:"metered_unlimited", daily_budget:null, weekly_budget:null, lifetime_budget:null} });
+  setupScenario=undefined; setupIndex=undefined;
+  const issued = await call("key_setup", "/internal/v1/keys", { tenant_external_id:tenant, principal_external_id:`staging-peak-${runId}`, alias:`Isolated ${runId}`, currency:"USD", initial_balance:"100000", route_ids:routes, policy:{requests_per_minute:Math.max(1,plan.arrivals.length*60), tokens_per_minute:1_000_000_000, max_concurrency:plan.arrivals.length, enforcement_mode:"metered_unlimited", daily_budget:null, weekly_budget:null, lifetime_budget:null} });
+  enter("load");
   const key = String(issued.key);
   const requests: Record<string,unknown>[] = [];
   let active=0, peakActive=0;
@@ -103,6 +130,6 @@ export async function run(plan: Plan, env = process.env): Promise<Record<string,
   return {schema_version:1,run_id:runId,release_batch:plan.release_batch,source_sha:env.MTC_HARNESS_SOURCE_SHA??null,harness_source_sha:env.MTC_HARNESS_SOURCE_SHA??null,candidate:actualCandidate,candidate_evidence_sha256:artifactHash(plan.candidate_evidence),plan_sha256:artifactHash(plan),tenant,offered:plan.arrivals.length,started:requests.length,completed:requests.filter(row=>!row.error).length,failed:requests.filter(row=>row.error).length,unissued:plan.arrivals.length-requests.length,peak_active:peakActive,http_exchanges:requests.reduce((sum,row)=>sum+Number(row.http_exchanges),0),latency_ms:{p50:percentile(latencies,.5),p95:percentile(latencies,.95),p99:percentile(latencies,.99),max:Math.max(...latencies)},baseline_sha256:artifactHash(plan.baseline),validated_baseline_sha256:baselineHash,baseline_error:baselineError,qualification:"NOT_EVALUATED",missing_evidence:["complete historical multidimensional peak","financial exactly-once assertions","semantic/archive API payload verification","PG poolwait/IO/locks and memory recovery","archive debt drain confirmation"],requests};
 }
 if(process.argv[1] && import.meta.url===pathToFileURL(process.argv[1]).href) {
-  try { const report=await run(validatePlan(JSON.parse(readFileSync(process.env.MTC_PEAK_PLAN_FILE??"/plan/plan.json","utf8")))); writeFileSync(process.env.MTC_PEAK_REPORT_FILE??"/evidence/report.json",JSON.stringify(report,null,2)); console.log(JSON.stringify(report)); process.exitCode=Number(report.failed)>0?2:0; }
-  catch { console.error("staging peak harness failed; credentials and response bodies suppressed"); process.exitCode=3; }
+  try { enter("plan_read"); const plan=JSON.parse(readFileSync(process.env.MTC_PEAK_PLAN_FILE??"/plan/plan.json","utf8")); enter("plan_validate"); const report=await run(validatePlan(plan)); enter("report_write"); writeFileSync(process.env.MTC_PEAK_REPORT_FILE??"/evidence/report.json",JSON.stringify(report,null,2)); console.log(JSON.stringify(report)); process.exitCode=Number(report.failed)>0?2:0; }
+  catch (error) { console.error(JSON.stringify(failureDiagnostic(error))); process.exitCode=3; }
 }
