@@ -170,6 +170,13 @@ impl Database {
     }
 
     fn history_capture_definitions(&self) -> Result<Vec<CaptureDefinition>, HistoryError> {
+        self.history_capture_definitions_with_upstream_projection(true)
+    }
+
+    fn history_capture_definitions_with_upstream_projection(
+        &self,
+        projected_updates_only: bool,
+    ) -> Result<Vec<CaptureDefinition>, HistoryError> {
         let sources = [
             ("request_events", Some(("event", "event_id", "event_at"))),
             ("request_records", Some(("native", "id", "created_at"))),
@@ -260,7 +267,22 @@ impl Database {
                 if event == "UPDATE" && identity.is_none() {
                     // A correction may move a metadata row between requests.
                     // Both dependencies must get fresh canonical snapshots.
-                    enqueue.push_str(&enqueue.replace("NEW.", "OLD."));
+                    let old = enqueue.replace("NEW.", "OLD.");
+                    if projected_updates_only && table == "upstream_accounts" {
+                        // A rename affects one account. Only an identity move
+                        // needs both the old and new dependency sets.
+                        match self.backend {
+                            DatabaseBackend::PostgreSql => enqueue.push_str(&format!(
+                                "IF OLD.id IS DISTINCT FROM NEW.id THEN {old} END IF;"
+                            )),
+                            DatabaseBackend::Sqlite => enqueue.push_str(&old.replace(
+                                " != 'off' ON CONFLICT",
+                                " != 'off' AND OLD.id IS NOT NEW.id ON CONFLICT",
+                            )),
+                        }
+                    } else {
+                        enqueue.push_str(&old);
+                    }
                 }
                 let identity_guard = if event == "UPDATE" {
                     if let Some((_, id, created_at)) = identity {
@@ -282,8 +304,15 @@ impl Database {
                     String::new()
                 };
                 let name = format!("history_{table}_{}", event.to_lowercase());
+                let upstream_update =
+                    projected_updates_only && table == "upstream_accounts" && event == "UPDATE";
+                let projection_guard = if upstream_update {
+                    "IF OLD.id IS NOT DISTINCT FROM NEW.id AND OLD.name IS NOT DISTINCT FROM NEW.name THEN RETURN NULL; END IF; "
+                } else {
+                    ""
+                };
                 let body = format!(
-                    "BEGIN IF (SELECT mode FROM request_history_state WHERE id=1)='off' THEN RETURN NULL; END IF; PERFORM id FROM request_history_state WHERE id = 1 FOR SHARE; IF (SELECT mode FROM request_history_state WHERE id=1)='off' THEN RETURN NULL; END IF; {identity_guard} {enqueue} RETURN NULL; END"
+                    "BEGIN IF (SELECT mode FROM request_history_state WHERE id=1)='off' THEN RETURN NULL; END IF; {projection_guard}PERFORM id FROM request_history_state WHERE id = 1 FOR SHARE; IF (SELECT mode FROM request_history_state WHERE id=1)='off' THEN RETURN NULL; END IF; {identity_guard} {enqueue} RETURN NULL; END"
                 );
                 let manifest = format!(
                     "mtc-history-bootstrap-v1-{}",
@@ -297,9 +326,16 @@ impl Database {
                          ALTER FUNCTION {name}() RESET ALL;
                          COMMENT ON FUNCTION {name}() IS '{manifest}';"
                     ),
-                    DatabaseBackend::Sqlite => format!(
-                        "DROP TRIGGER IF EXISTS {name}; CREATE TRIGGER {name} AFTER {event} ON {table} BEGIN {identity_guard} {enqueue} END;"
-                    ),
+                    DatabaseBackend::Sqlite => {
+                        let when = if upstream_update {
+                            " WHEN OLD.id IS NOT NEW.id OR OLD.name IS NOT NEW.name"
+                        } else {
+                            ""
+                        };
+                        format!(
+                            "DROP TRIGGER IF EXISTS {name}; CREATE TRIGGER {name} AFTER {event} ON {table}{when} BEGIN {identity_guard} {enqueue} END;"
+                        )
+                    }
                 };
                 definitions.push(CaptureDefinition {
                     table,
