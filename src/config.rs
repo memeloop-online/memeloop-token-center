@@ -451,9 +451,8 @@ impl Config {
             ),
             // 不再对连接数做上限夹取：容量应由部署规模决定，而不是代码常量。
             // 只保留下限 1，因为 0 会让 sqlx 连接池无法工作。
-            database_max_connections: env_u32("MTC_DATABASE_MAX_CONNECTIONS", 4)?.max(1),
-            database_aux_pool_max_connections: env_u32("MTC_DATABASE_AUX_POOL_MAX_CONNECTIONS", 2)?
-                .max(1),
+            database_max_connections: env_u32("MTC_DATABASE_MAX_CONNECTIONS", 4)?,
+            database_aux_pool_max_connections: env_u32("MTC_DATABASE_AUX_POOL_MAX_CONNECTIONS", 2)?,
             terminal_projection_enabled: env_bool(
                 "MTC_TERMINAL_PROJECTION_ENABLED",
                 DEFAULT_TERMINAL_PROJECTION_ENABLED,
@@ -486,15 +485,12 @@ impl Config {
             quota_observation_interval_millis: env_u32(
                 "MTC_QUOTA_OBSERVATION_INTERVAL_MILLIS",
                 10_000,
-            )?
-            .max(1),
-            quota_observation_batch_limit: env_u32("MTC_QUOTA_OBSERVATION_BATCH_LIMIT", 4)?
-                .max(1),
+            )?,
+            quota_observation_batch_limit: env_u32("MTC_QUOTA_OBSERVATION_BATCH_LIMIT", 4)?,
             quota_observation_timeout_millis: env_u32(
                 "MTC_QUOTA_OBSERVATION_TIMEOUT_MILLIS",
                 10_000,
-            )?
-            .max(1),
+            )?,
             run_migrations_on_start: env_bool("MTC_RUN_MIGRATIONS_ON_START", true),
             key_pepper,
             service_token,
@@ -759,12 +755,11 @@ fn health_millis(name: &'static str, default: i64) -> Result<i64, ConfigError> {
 }
 
 fn gateway_body_read_concurrency(value: u32) -> u32 {
-    // 上限由部署规模决定，不再用代码常量压掉运维配置。
-    value.max(1)
+    value
 }
 
 fn responses_body_max_bytes(value: u32) -> u32 {
-    value.max(MIN_RESPONSES_BODY_MAX_BYTES)
+    value
 }
 
 fn default_responses_request_spool_path() -> String {
@@ -776,7 +771,7 @@ const fn default_audio_body_max_bytes() -> u32 {
 }
 
 fn responses_body_read_concurrency(value: u32) -> u32 {
-    value.max(1)
+    value
 }
 
 #[derive(Debug, thiserror::Error)]

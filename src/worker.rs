@@ -850,7 +850,7 @@ async fn refresh_plugin_service_data(
                 }
             }
             Err(failure) => {
-                let shift = u32::try_from(previous_failures.clamp(0, 6)).unwrap_or(6);
+                let shift = u32::try_from(previous_failures).unwrap_or(6);
                 let backoff_seconds = 5_i64
                     .saturating_mul(1_i64.checked_shl(shift).unwrap_or(64))
                     .min(300);

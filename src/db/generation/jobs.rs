@@ -618,7 +618,7 @@ impl Database {
         };
         let rows = sqlx::query(select)
             .bind(now)
-            .bind(limit.clamp(1, 1_000))
+            .bind(limit)
             .fetch_all(&mut *transaction)
             .await?;
         let mut expired = 0_u64;
@@ -751,7 +751,7 @@ impl Database {
             "SELECT id, created_at, updated_at, completed_at, public_model, driver, billing_unit_snapshot, status, upstream_job_id, estimated_units, billed_units, cost_micros, error_code, result_json FROM generation_jobs WHERE key_id = $1 ORDER BY created_at DESC, id DESC LIMIT $2",
         )
         .bind(key_id.to_string())
-        .bind(limit.clamp(1, 200))
+        .bind(limit)
         .fetch_all(&self.pool)
         .await?;
         rows.into_iter().map(generation_job_view).collect()

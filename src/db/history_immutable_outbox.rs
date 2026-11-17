@@ -661,7 +661,7 @@ impl Database {
         // advances this journal. Hold its revision fence while reading source
         // rows with plain MVCC SELECTs; never reverse it with source FOR UPDATE.
         let rows=sqlx::query(sqlx::AssertSqlSafe(format!("SELECT revision,source,request_id,tenant_id,key_id,created_at FROM request_history_export WHERE snapshot IS NULL ORDER BY revision LIMIT $1{lock}")))
-            .bind(page_size.clamp(1, 64)).fetch_all(&mut *transaction).await?;
+            .bind(page_size).fetch_all(&mut *transaction).await?;
         for row in rows {
             let revision: i64 = row.try_get("revision")?;
             let identity = crate::request_history::HistoryIdentity {

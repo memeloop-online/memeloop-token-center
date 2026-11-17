@@ -400,7 +400,7 @@ impl Database {
                         &filter,
                     )
                     .await?;
-                let limit = filter.limit.clamp(1, 200) as usize;
+                let limit = filter.limit as usize;
                 let has_more = requests.len() > limit;
                 requests.truncate(limit);
                 let next_cursor = if has_more {
@@ -544,7 +544,7 @@ impl Database {
         filter: LogicalSessionListFilter,
         allow_candidate_first: bool,
     ) -> Result<Vec<LogicalSessionSummary>, AppError> {
-        let limit = filter.limit.clamp(1, 100) + 1;
+        let limit = filter.limit + 1;
         let key_id = filter.key_id.map(|id| id.to_string()).unwrap_or_default();
         let has_cursor = filter.cursor.is_some();
         let (before_last_activity_at, before_session_id, mut before_key_id) =
@@ -1187,7 +1187,7 @@ impl Database {
         filter: ConversationDetailFilter,
     ) -> Result<LogicalSessionDetail, AppError> {
         let key_id = key_id.to_string();
-        let limit = filter.limit.clamp(1, 200);
+        let limit = filter.limit;
         let rows = if let (Some(before_created_at), Some(before_request_id)) =
             (filter.before_created_at, filter.before_request_id)
         {

@@ -116,7 +116,7 @@ pub(super) async fn internal_requests(
     let service = require_service(&headers, &state, "requests:read").await?;
     let tenant = management_tenant(&service, query.tenant_external_id.clone())?;
     let filter = query.to_filter(true)?;
-    let limit = filter.limit.clamp(1, 500) as usize;
+    let limit = filter.limit as usize;
     let paged = query.requests_page_requested();
     // The database fetches one bounded extra row only for clients that opted
     // into the envelope. Existing clients retain their exact requested array
@@ -185,7 +185,7 @@ pub(super) async fn typed_internal_requests(
     let service = require_service(&headers, &state, "requests:read").await?;
     let tenant = management_tenant(&service, body.tenant_external_id)?;
     body.ast.validate()?;
-    let limit = body.limit.clamp(1, 100) as usize;
+    let limit = body.limit as usize;
     let filter = crate::db::RequestListFilter {
         limit: limit as i64,
         lookahead: body.paged,

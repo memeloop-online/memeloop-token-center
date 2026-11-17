@@ -1132,7 +1132,7 @@ impl Database {
             return Ok(());
         };
         let attempts: i64 = row.try_get("attempts")?;
-        let backoff = 5_000_i64 * (1_i64 << attempts.clamp(0, 10) as u32);
+        let backoff = 5_000_i64 * (1_i64 << attempts as u32);
         sqlx::query(sqlx::AssertSqlSafe(spool_sql(purpose, "UPDATE response_archive_spools SET state = 'pending', next_attempt_at = $1, updated_at = $2, last_error_code = $3, lease_owner = NULL, lease_token = NULL, lease_expires_at = NULL WHERE request_id = $4")))
             .bind(now + backoff).bind(now).bind(reason_code(reason)).bind(task.identity.request_id.to_string()).execute(&mut *tx).await?;
         tx.commit().await?;
@@ -1164,7 +1164,7 @@ impl Database {
     ) -> Result<u64, AppError> {
         let started = Instant::now();
         let mut completed = 0;
-        for index in 0..limit.clamp(0, 32) {
+        for index in 0..limit {
             // Keep the transaction owned by an independent task. If the
             // worker is cancelled for shutdown while this await is pending,
             // dropping the JoinHandle detaches the batch and lets SQLx finish

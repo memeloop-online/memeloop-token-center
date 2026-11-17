@@ -4,8 +4,9 @@ use std::sync::{
     atomic::{AtomicU64, Ordering},
 };
 
-const JOBS: usize = 4;
-const BYTES: usize = 64 * 1024 * 1024;
+// 并发准入不再用个位数常量限制：目标量级是十万到百万并发。
+const JOBS: usize = 1024;
+const BYTES: usize = 4 * 1024 * 1024 * 1024;
 
 pub(crate) struct Persistence {
     pub(crate) stream_memory: crate::gateway_body::memory::ProxyMemoryBudget,

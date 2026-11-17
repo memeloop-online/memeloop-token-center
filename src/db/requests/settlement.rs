@@ -22,7 +22,7 @@ impl Database {
             "DELETE FROM rate_limit_windows WHERE (key_id, window_start) IN (SELECT key_id, window_start FROM rate_limit_windows WHERE window_start < $1 ORDER BY window_start ASC, key_id ASC LIMIT $2)",
         )
         .bind(cutoff)
-        .bind(limit.clamp(1, 100_000))
+        .bind(limit)
         .execute(&self.pool)
         .await?
         .rows_affected();
@@ -32,7 +32,7 @@ impl Database {
     pub async fn delete_expired_budget_rollups(&self, limit: i64) -> Result<u64, AppError> {
         let cutoff_day = unix_millis().saturating_sub(7 * 86_400_000) / 86_400_000;
         let cutoff_at = cutoff_day.saturating_mul(86_400_000);
-        let limit = limit.clamp(1, 100_000);
+        let limit = limit;
         let mut tx = self.begin_write_transaction().await?;
         let events = sqlx::query(
             "DELETE FROM key_budget_usage_events WHERE usage_entry_id IN (SELECT usage_entry_id FROM key_budget_usage_events WHERE settled_at < $1 ORDER BY settled_at ASC, usage_entry_id ASC LIMIT $2)",
@@ -138,7 +138,7 @@ impl Database {
         // its unknown result, including requests without an idempotency key.
         // Preserve reservation and archive evidence; never infer no-send from
         // the absence of a terminal response.
-        let limit = limit.clamp(1, 1_000);
+        let limit = limit;
         // Materialize a bounded index page before any correlated eligibility
         // checks. LIMIT on the old anti-join only bounded its output, not work.
         let request_page = match &scan.request_after {

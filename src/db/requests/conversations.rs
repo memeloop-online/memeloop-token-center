@@ -484,7 +484,7 @@ impl Database {
     /// `statistics_outcome = session_body` 留在完成之后，避免同一行被反复重开。
     /// locator 缺一就不重开。不改 `request_object` / `response_object`。
     pub async fn reopen_session_body_rebuilds(&self, limit: i64) -> Result<u64, AppError> {
-        let limit = limit.clamp(1, CONVERSATION_PROJECTION_BATCH_LIMIT);
+        let limit = limit;
         let mut transaction = self.begin_write_transaction().await?;
         // Serialize the count and replenishment across worker transactions.
         // This background operation never waits for a busy replenisher.
@@ -540,7 +540,7 @@ impl Database {
              )",
         )
         .bind(cutoff)
-        .bind(limit.clamp(1, 10_000))
+        .bind(limit)
         .execute(&self.pool)
         .await?
         .rows_affected();
@@ -557,7 +557,7 @@ impl Database {
     ) -> Result<Vec<ConversationProjectionTask>, AppError> {
         let now = unix_millis();
         let expires_at = now.saturating_add(CONVERSATION_PROJECTION_LEASE_MILLIS);
-        let limit = limit.clamp(1, CONVERSATION_PROJECTION_BATCH_LIMIT);
+        let limit = limit;
         let mut transaction = self.begin_write_transaction().await?;
         let lock = match self.backend {
             DatabaseBackend::PostgreSql => " FOR UPDATE SKIP LOCKED",
@@ -1771,7 +1771,7 @@ impl Database {
                 candidate_selection = Some(ConversationSelection {
                     observation_id: row.try_get("id")?,
                     relation: RelationKind::Candidate,
-                    confidence: confidence.clamp(1, 699),
+                    confidence: confidence,
                     direct_parent: false,
                     same_turn: false,
                     semantic_prefix: false,
@@ -2004,7 +2004,7 @@ impl Database {
         key_id: Uuid,
         filter: ConversationListFilter,
     ) -> Result<Vec<ConversationClusterView>, AppError> {
-        let limit = filter.limit.clamp(1, 100);
+        let limit = filter.limit;
         let key_id = key_id.to_string();
         let rows = if let (Some(before_updated_at), Some(before_cluster_id)) =
             (filter.before_updated_at, filter.before_cluster_id)
@@ -2063,7 +2063,7 @@ impl Database {
             request_count: cluster_row.try_get("request_count")?,
             candidate_edge_count: cluster_row.try_get("candidate_edge_count")?,
         };
-        let limit = filter.limit.clamp(1, 200);
+        let limit = filter.limit;
         // Bound each ordered source before touching archive spools. Applying
         // only the outer LIMIT makes large sessions hash-join the entire spool
         // tables and sort the complete history just to display one page.
@@ -2121,7 +2121,7 @@ impl Database {
             .collect();
         requests.reverse();
 
-        let edge_limit = (limit * 2).clamp(1, 400);
+        let edge_limit = (limit * 2);
         let edge_rows = if page_request_ids.is_empty() {
             Vec::new()
         } else {

@@ -48,7 +48,7 @@ impl Database {
         limit: i64,
     ) -> Result<(Option<String>, Option<String>), AppError> {
         let started = std::time::Instant::now();
-        let budget = limit.clamp(2, CONVERSATION_PROJECTION_BATCH_LIMIT);
+        let budget = limit;
         let live_budget = (budget + 1) / 2;
         tracing::debug!(target: "mtc_identity_projection", stage = "live_page_start",
             ?live_after, ?history_before, budget, "conversation identity progress");
@@ -112,7 +112,7 @@ impl Database {
     ) -> Result<Option<String>, AppError> {
         let ids: Vec<String> = sqlx::query_scalar(IDENTITY_FORWARD_PAGE)
             .bind(after.unwrap_or(""))
-            .bind(limit.clamp(1, CONVERSATION_PROJECTION_BATCH_LIMIT))
+            .bind(limit)
             .fetch_all(&self.pool)
             .await?;
         let next = ids.last().cloned();

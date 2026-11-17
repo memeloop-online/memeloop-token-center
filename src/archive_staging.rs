@@ -361,7 +361,7 @@ pub fn cleanup_backoff_millis(failure_count: u32) -> i64 {
 
 pub(crate) fn cleanup_backoff_with_jitter(attempt_id: Uuid, failure_count: u32) -> i64 {
     let base = cleanup_backoff_millis(failure_count);
-    let jitter_bound = (base / 4).clamp(1, 60_000);
+    let jitter_bound = (base / 4);
     let bytes = attempt_id.as_bytes();
     let sample = u64::from_be_bytes(bytes[..8].try_into().expect("UUID has sixteen bytes"));
     base.saturating_add(i64::try_from(sample % jitter_bound as u64).unwrap_or(0))
