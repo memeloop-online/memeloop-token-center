@@ -1006,6 +1006,51 @@ mod tests {
                 .await
                 .unwrap();
         assert_eq!(count, 2);
+        // Different source relations let only the second identity pause.
+        for (revision, source) in [(3_i64, "native"), (4, "generation")] {
+            sqlx::query("INSERT INTO request_history_export (revision,source,request_id,tenant_id,key_id,created_at) VALUES ($1,$2,$3,$4,$5,42)")
+                .bind(revision).bind(source).bind(Uuid::now_v7().to_string()).bind(Uuid::now_v7().to_string()).bind(Uuid::now_v7().to_string()).execute(&db.pool).await.unwrap();
+        }
+        let mut source_lock = db.pool.begin().await.unwrap();
+        sqlx::query("LOCK TABLE generation_jobs IN ACCESS EXCLUSIVE MODE")
+            .execute(&mut *source_lock)
+            .await
+            .unwrap();
+        let capture = db.history_capture_pending(4);
+        tokio::pin!(capture);
+        let observer = async {
+            loop {
+                let waiting: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM pg_stat_activity WHERE datname=current_database() AND wait_event_type='Lock' AND query LIKE 'SELECT 1 FROM generation_jobs%' AND pid<>pg_backend_pid()")
+                    .fetch_one(&db.pool).await.unwrap();
+                if waiting > 0 {
+                    break;
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+            }
+            let mut probe = db.pool.begin().await.unwrap();
+            sqlx::query(
+                "SELECT revision FROM request_history_export WHERE revision=3 FOR UPDATE NOWAIT",
+            )
+            .fetch_one(&mut *probe)
+            .await
+            .expect("first identity must commit before second source finishes");
+            let visible: i64 = sqlx::query_scalar(
+                "SELECT COUNT(*) FROM request_history_immutable_outbox WHERE revision=3",
+            )
+            .fetch_one(&mut *probe)
+            .await
+            .unwrap();
+            assert_eq!(visible, 1);
+            probe.rollback().await.unwrap();
+            source_lock.rollback().await.unwrap();
+        };
+        tokio::time::timeout(std::time::Duration::from_secs(10), async {
+            tokio::select! {
+                result = &mut capture => panic!("capture returned before the locked second source was released: {result:?}"),
+                () = observer => {}
+            }
+            capture.await.unwrap();
+        }).await.expect("capture interleaving must finish within deadline");
         db.close().await;
         sqlx::query(sqlx::AssertSqlSafe(format!("DROP SCHEMA {schema} CASCADE")))
             .execute(&admin)
