@@ -449,9 +449,11 @@ impl Config {
                 "MTC_DATABASE_URL",
                 "postgres://postgres:postgres@127.0.0.1:5432/memeloop_token_center",
             ),
-            database_max_connections: env_u32("MTC_DATABASE_MAX_CONNECTIONS", 4)?.clamp(1, 32),
+            // 不再对连接数做上限夹取：容量应由部署规模决定，而不是代码常量。
+            // 只保留下限 1，因为 0 会让 sqlx 连接池无法工作。
+            database_max_connections: env_u32("MTC_DATABASE_MAX_CONNECTIONS", 4)?.max(1),
             database_aux_pool_max_connections: env_u32("MTC_DATABASE_AUX_POOL_MAX_CONNECTIONS", 2)?
-                .clamp(1, 2),
+                .max(1),
             terminal_projection_enabled: env_bool(
                 "MTC_TERMINAL_PROJECTION_ENABLED",
                 DEFAULT_TERMINAL_PROJECTION_ENABLED,

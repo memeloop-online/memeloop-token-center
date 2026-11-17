@@ -835,7 +835,8 @@ impl Database {
     }
 
     pub(crate) fn with_auxiliary_pool_max_connections(mut self, maximum: u32) -> Self {
-        self.auxiliary_pool_max_connections = maximum.clamp(1, 2);
+        // 调用方显式传入的规模就是最终规模，不再二次夹取上限。
+        self.auxiliary_pool_max_connections = maximum.max(1);
         self
     }
 
