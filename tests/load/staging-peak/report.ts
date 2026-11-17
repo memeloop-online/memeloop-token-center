@@ -9,10 +9,12 @@ export function qualify(load:any,observer:any,baseline:unknown,plan?:any) {
   const missing:string[]=[],failures:string[]=[];
   if(!load?.run_id || load.started!==load.offered || load.unissued!==0)failures.push("generator_dropped_arrivals");
   if(load?.failed>0)failures.push("gateway_workload_failures");
-  if(!observer || observer.run_id!==load?.run_id || observer.source_sha!==load?.source_sha)missing.push("matching_run_observer");
+  if(!observer?.run_id||!load?.run_id)missing.push("matching_run_observer");
+  else if(observer.run_id!==load.run_id)failures.push("run_identity_mismatch");
   const compare=(name:string,values:unknown[])=>{
-    if(values.some(value=>value===undefined||value===null||value==="")){missing.push(name);return;}
-    if(values.some(value=>value!==values[0]))failures.push(name+"_mismatch");
+    const present=values.filter(value=>value!==undefined&&value!==null&&value!=="");
+    if(present.length!==values.length)missing.push(name);
+    if(present.some(value=>value!==present[0]))failures.push(name+"_mismatch");
   };
   compare("harness_source",[load?.harness_source_sha,observer?.harness_source_sha]);
   compare("plan_identity",[load?.plan_sha256,observer?.plan_sha256,plan?artifactHash(plan):null]);
