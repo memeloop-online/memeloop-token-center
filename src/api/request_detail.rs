@@ -32,47 +32,67 @@ pub(super) async fn request_detail(
     state: &AppState,
     refs: crate::model::RequestArchiveRefs,
 ) -> crate::model::RequestDetail {
-    let request = if archive_is_pending(refs.request_archive_state) {
+    let retired = || ArchiveValue {
+        value: serde_json::json!({"semantic_archive_available":true}),
+        complete: true,
+        reason: Some("raw_retired_semantic_archive".into()),
+        preview: None,
+    };
+    let request = if refs.request_archive_reason.as_deref() == Some("raw_retired_semantic_archive")
+    {
+        retired()
+    } else if archive_is_pending(refs.request_archive_state) {
         ArchiveValue::pending()
     } else {
         archive_value(state, &refs.request_object).await
     };
-    let response = if archive_is_pending(refs.response_archive_state) {
-        ArchiveValue::pending()
-    } else {
-        match refs.response_object.as_deref() {
-            Some(location) => archive_value(state, location).await,
-            None => match refs.response_json {
-                Some(value) if json_value_structure_is_bounded(&value) => ArchiveValue {
-                    value,
-                    complete: true,
-                    reason: None,
-                    preview: None,
-                },
-                Some(_) => ArchiveValue::gap("archive_payload_invalid"),
-                None if matches!(
-                    refs.response_archive_state,
-                    crate::model::RequestArchiveState::Bound
-                        | crate::model::RequestArchiveState::MetadataOnly
-                ) =>
-                {
-                    ArchiveValue {
-                        value: Value::Null,
+    let response =
+        if refs.response_archive_reason.as_deref() == Some("raw_retired_semantic_archive") {
+            retired()
+        } else if archive_is_pending(refs.response_archive_state) {
+            ArchiveValue::pending()
+        } else {
+            match refs.response_object.as_deref() {
+                Some(location) => archive_value(state, location).await,
+                None => match refs.response_json {
+                    Some(value) if json_value_structure_is_bounded(&value) => ArchiveValue {
+                        value,
                         complete: true,
                         reason: None,
                         preview: None,
+                    },
+                    Some(_) => ArchiveValue::gap("archive_payload_invalid"),
+                    None if matches!(
+                        refs.response_archive_state,
+                        crate::model::RequestArchiveState::Bound
+                            | crate::model::RequestArchiveState::MetadataOnly
+                    ) =>
+                    {
+                        ArchiveValue {
+                            value: Value::Null,
+                            complete: true,
+                            reason: None,
+                            preview: None,
+                        }
                     }
-                }
-                None => ArchiveValue {
-                    value: Value::Null,
-                    complete: false,
-                    reason: refs.response_archive_reason.clone(),
-                    preview: None,
+                    None => ArchiveValue {
+                        value: Value::Null,
+                        complete: false,
+                        reason: refs.response_archive_reason.clone(),
+                        preview: None,
+                    },
                 },
-            },
-        }
-    };
+            }
+        };
     crate::model::RequestDetail {
+        semantic_archive: refs.semantic_archive.map(|authority| {
+            crate::model::SemanticArchiveView {
+                manifest_revision: authority.publication.revision.to_string(),
+                projection_version: authority.publication.projection_version,
+                semantic_head: authority.semantic_head,
+                coverage: authority.coverage,
+            }
+        }),
         view: refs.view,
         request_body: request.value,
         response_body: response.value,
@@ -135,6 +155,9 @@ fn archive_content_source(
             refs.response_object.as_deref(),
         ),
     };
+    if reason == Some("raw_retired_semantic_archive") {
+        return Err("raw_retired_semantic_archive");
+    }
     if archive_is_pending(state) {
         return Err("archive_pending");
     }

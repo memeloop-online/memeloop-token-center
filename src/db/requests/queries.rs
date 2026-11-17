@@ -547,6 +547,27 @@ impl Database {
         key_id: Uuid,
         request_id: Uuid,
     ) -> Result<RequestArchiveRefs, AppError> {
+        self.source_request_archive_refs_inner(key_id, request_id, true)
+            .await
+    }
+
+    /// Authorized native SQL metadata only. The caller resolves its frozen
+    /// semantic leaf after leaving the source transaction.
+    pub(crate) async fn source_request_archive_refs_unresolved(
+        &self,
+        key_id: Uuid,
+        request_id: Uuid,
+    ) -> Result<RequestArchiveRefs, AppError> {
+        self.source_request_archive_refs_inner(key_id, request_id, false)
+            .await
+    }
+
+    async fn source_request_archive_refs_inner(
+        &self,
+        key_id: Uuid,
+        request_id: Uuid,
+        resolve_native: bool,
+    ) -> Result<RequestArchiveRefs, AppError> {
         let request_id = request_id.to_string();
         let locator = self.request_record_locator(&request_id).await?;
         if let Some(locator) = locator.filter(|locator| locator.key_id == key_id.to_string()) {
@@ -559,11 +580,15 @@ impl Database {
             .fetch_optional(&self.pool)
             .await?
             .ok_or(AppError::internal("queries_site_1"))?;
-            self.resolve_raw_archive_roots(
-                parse_uuid(locator.tenant_id)?,
-                request_archive_refs_from_row(row)?,
-            )
-            .await
+            let refs = request_archive_refs_from_row(row)?;
+            if resolve_native {
+                self.resolve_raw_archive_roots(parse_uuid(locator.tenant_id)?, refs)
+                    .await
+            } else {
+                Ok(refs)
+            }
+        } else if !resolve_native {
+            Err(AppError::NotFound)
         } else {
             match self
                 .generation_archive_refs(key_id, parse_uuid(request_id.clone())?)
@@ -2217,6 +2242,7 @@ fn request_archive_refs_from_row(row: AnyRow) -> Result<RequestArchiveRefs, AppE
         projection("response", response_object.as_deref())?;
     view.archive_state = combined_archive_state(request_archive_state, response_archive_state);
     Ok(RequestArchiveRefs {
+        semantic_archive: None,
         view,
         request_object,
         response_object,
@@ -2268,6 +2294,7 @@ fn session_archive_unlinked_refs_from_row(row: AnyRow) -> Result<RequestArchiveR
         output_tokens,
     });
     Ok(RequestArchiveRefs {
+        semantic_archive: None,
         view: RequestView {
             operational_terminal: None,
             egress: None,
@@ -2400,6 +2427,7 @@ fn generation_archive_refs_from_row(row: AnyRow) -> Result<RequestArchiveRefs, A
     };
     let archive_state = combined_archive_state(request_archive_state, response_archive_state);
     Ok(RequestArchiveRefs {
+        semantic_archive: None,
         view: RequestView {
             operational_terminal: None,
             egress: None,

@@ -1094,6 +1094,10 @@ impl Serialize for RequestEventView {
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
 pub struct RequestArchiveRefs {
+    /// Permanent semantic body authority. Raw locators below are legacy
+    /// provenance while their consumers migrate; they are not semantic roots.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub semantic_archive: Option<crate::archive::SemanticArchiveAuthority>,
     pub view: RequestView,
     pub request_object: String,
     pub response_object: Option<String>,
@@ -1115,7 +1119,18 @@ pub struct RequestProvenanceView {
 }
 
 #[derive(Clone, Debug, Serialize)]
+pub struct SemanticArchiveView {
+    /// Hash-derived revisions are decimal strings on the JSON/JavaScript wire.
+    pub manifest_revision: String,
+    pub projection_version: u32,
+    pub semantic_head: crate::archive::SemanticHead,
+    pub coverage: crate::archive::SemanticCoverage,
+}
+
+#[derive(Clone, Debug, Serialize)]
 pub struct RequestDetail {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub semantic_archive: Option<SemanticArchiveView>,
     #[serde(flatten)]
     pub view: RequestView,
     pub request_body: serde_json::Value,

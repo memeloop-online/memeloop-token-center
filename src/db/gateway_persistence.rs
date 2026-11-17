@@ -31,6 +31,11 @@ tokio::task_local! {
 
 #[cfg(test)]
 tokio::task_local! {
+    static TEST_EXISTING_ROOT_GATE: (Arc<tokio::sync::Notify>, Arc<tokio::sync::Notify>);
+}
+
+#[cfg(test)]
+tokio::task_local! {
     static TEST_CAPTURE_BEFORE_DISPATCH: Arc<GatewayPersistence>;
     static TEST_SOURCE_POOL_TIMEOUT: Duration;
 }
@@ -230,8 +235,12 @@ impl Database {
         success: bool,
     ) {
         if success {
-            self.publish_request_source(identity, locator, length, digest)
+            let (_, settlement) = self
+                .publish_request_source(identity, locator, length, digest)
                 .await;
+            self.complete_uploaded_request_source(identity, locator, length, digest, settlement)
+                .await;
+            return;
         }
         self.complete_request_source_state(identity, locator, length, digest, success, false)
             .await;
@@ -245,9 +254,102 @@ impl Database {
         locator: &str,
         length: usize,
         digest: [u8; 32],
+        settlement: crate::archive::RawPublicationSettlement,
     ) {
-        self.complete_request_source_state(identity, locator, length, digest, true, true)
-            .await;
+        if matches!(
+            settlement,
+            crate::archive::RawPublicationSettlement::Retired { .. }
+        ) {
+            self.complete_retired_request_source(identity, locator, length, digest)
+                .await;
+        } else {
+            self.complete_request_source_state(identity, locator, length, digest, true, true)
+                .await;
+        }
+    }
+
+    // Verified retirement completes only this original source's temporary
+    // metadata. It is not a new raw-root ACK and never writes bound_locator.
+    async fn complete_retired_request_source(
+        &self,
+        identity: ArchiveSpoolIdentity,
+        locator: &str,
+        length: usize,
+        digest: [u8; 32],
+    ) {
+        let mut database = self.clone();
+        database.pool = self.gateway_persistence.pool.clone();
+        database.pool_role = "gateway_archive";
+        loop {
+            match database
+                .retire_request_source_metadata(identity, locator, length, digest)
+                .await
+            {
+                Ok(_) => return,
+                Err(error) => {
+                    tracing::warn!(request_id = %identity.request_id, error_category = error.diagnostic_category(), "retired source metadata retained for retry");
+                    tokio::time::sleep(Duration::from_millis(250)).await;
+                }
+            }
+        }
+    }
+
+    async fn retire_request_source_metadata(
+        &self,
+        identity: ArchiveSpoolIdentity,
+        locator: &str,
+        length: usize,
+        digest: [u8; 32],
+    ) -> Result<bool, AppError> {
+        let key = crate::gateway_body::request_spool::request_body_staging_key(locator)
+            .filter(|key| key.owner.id() == identity.request_id)
+            .ok_or_else(|| AppError::internal("gateway_request_source_identity"))?;
+        let mut tx = self.begin_write_transaction().await?;
+        let owned = sqlx::query("UPDATE request_records SET request_object=request_object WHERE id=$1 AND tenant_id=$2 AND reservation_id=$3 AND request_object=$4 RETURNING id")
+            .bind(identity.request_id.to_string()).bind(identity.tenant_id.to_string()).bind(identity.reservation_id.to_string()).bind(locator)
+            .fetch_optional(&mut *tx).await?;
+        if owned.is_none() {
+            return Ok(false);
+        }
+        // Match the existing request -> stage -> spool lock order.
+        let stage = sqlx::query("UPDATE archive_staging_attempts SET updated_at=updated_at WHERE attempt_id=$1 AND owner_kind='proxy_request' AND owner_id=$1 AND purpose='request' AND writer_owner='gateway-source' AND writer_token=$1 RETURNING backend_identity")
+            .bind(identity.request_id.to_string()).fetch_optional(&mut *tx).await?;
+        if let Some(stage) = stage
+            && stage.try_get::<Option<String>, _>("backend_identity")?
+                != key.backend_identity_text()
+        {
+            return Ok(false);
+        }
+        let row = sqlx::query("UPDATE request_archive_spools SET updated_at=updated_at WHERE request_id=$1 RETURNING tenant_id,reservation_id,bound_locator,body_byte_count,body_blake3,cipher_bytes,chunk_count")
+            .bind(identity.request_id.to_string()).fetch_optional(&mut *tx).await?;
+        if let Some(row) = row {
+            let expected_digest = blake3::Hash::from_bytes(digest).to_hex().to_string();
+            if row.try_get::<String, _>("tenant_id")? != identity.tenant_id.to_string()
+                || row.try_get::<String, _>("reservation_id")?
+                    != identity.reservation_id.to_string()
+                || row
+                    .try_get::<Option<String>, _>("bound_locator")?
+                    .is_some_and(|value| value != locator)
+                || row
+                    .try_get::<Option<i64>, _>("body_byte_count")?
+                    .is_some_and(|value| value != length as i64)
+                || row
+                    .try_get::<Option<String>, _>("body_blake3")?
+                    .is_some_and(|value| value != expected_digest)
+                || row.try_get::<i64, _>("cipher_bytes")? != 0
+                || row.try_get::<i64, _>("chunk_count")? != 0
+            {
+                return Ok(false);
+            }
+            sqlx::query("DELETE FROM request_archive_spools WHERE request_id=$1 AND tenant_id=$2 AND reservation_id=$3")
+                .bind(identity.request_id.to_string()).bind(identity.tenant_id.to_string()).bind(identity.reservation_id.to_string()).execute(&mut *tx).await?;
+        }
+        sqlx::query("UPDATE archive_staging_attempts SET state='cleanup_pending',lease_owner=NULL,lease_token=NULL,lease_expires_at=NULL,next_cleanup_at=$2,updated_at=$2 WHERE attempt_id=$1 AND owner_kind='proxy_request' AND owner_id=$1 AND purpose='request' AND writer_owner='gateway-source' AND writer_token=$1 AND (backend_identity=$3 OR (backend_identity IS NULL AND $3 IS NULL)) AND state='writing'")
+            .bind(identity.request_id.to_string()).bind(super::unix_millis()).bind(key.backend_identity_text()).execute(&mut *tx).await?;
+        tx.commit().await?;
+        #[cfg(test)]
+        Self::semantic_coverage_test_boundary("retired_request_source_committed")?;
+        Ok(true)
     }
 
     async fn complete_request_source_state(
@@ -271,6 +373,17 @@ impl Database {
         }
     }
 
+    #[cfg(test)]
+    pub(crate) async fn with_existing_source_root_gate<T>(
+        entered: Arc<tokio::sync::Notify>,
+        resume: Arc<tokio::sync::Notify>,
+        future: impl std::future::Future<Output = T>,
+    ) -> T {
+        TEST_EXISTING_ROOT_GATE
+            .scope((entered, resume), future)
+            .await
+    }
+
     /// The immutable root must not depend on optional SQL metadata capacity.
     pub(crate) async fn publish_request_source(
         &self,
@@ -278,9 +391,12 @@ impl Database {
         locator: &str,
         length: usize,
         digest: [u8; 32],
-    ) -> crate::archive::CasArchiveObject {
+    ) -> (
+        crate::archive::CasArchiveObject,
+        crate::archive::RawPublicationSettlement,
+    ) {
         loop {
-            let persisted: Result<crate::archive::CasArchiveObject, AppError> = async {
+            let persisted: Result<_, AppError> = async {
                 let archive = self.body_archive()?;
                 let expected_digest = blake3::Hash::from_bytes(digest).to_hex().to_string();
                 if let Some(existing) = archive
@@ -292,10 +408,18 @@ impl Database {
                     {
                         return Err(AppError::storage("request_source_root_conflict"));
                     }
+                    #[cfg(test)]
+                    if let Ok((entered, resume)) = TEST_EXISTING_ROOT_GATE.try_with(Clone::clone) {
+                        entered.notify_one();
+                        resume.notified().await;
+                    }
                     archive
                         .verify_tenant_content(identity.tenant_id, &existing)
                         .await?;
-                    return Ok(existing);
+                    // Verification may race retirement. Resolve the typed
+                    // outcome again instead of fabricating a Published ACK.
+                    let settlement = archive.settle_raw_capture(identity.tenant_id, identity.request_id, "request", &existing).await?;
+                    return Ok((existing, settlement));
                 }
                 let staged = crate::archive::StagedArchiveObject {
                     object_locator: locator.to_owned(),
@@ -305,19 +429,22 @@ impl Database {
                 let object = archive
                     .promote_staged_text_to_cas(identity.tenant_id, &staged)
                     .await?;
-                archive
-                    .publish_raw_capture(
+                let settlement = archive
+                    .settle_raw_capture(
                         identity.tenant_id,
                         identity.request_id,
                         "request",
                         &object,
                     )
                     .await?;
-                Ok(object)
+                if let crate::archive::RawPublicationSettlement::Retired { semantic_revision, semantic_leaf } = &settlement {
+                    tracing::debug!(request_id = %identity.request_id, semantic_revision, %semantic_leaf, "late raw source settled by semantic retirement");
+                }
+                Ok((object, settlement))
             }
             .await;
-            if let Ok(object) = persisted {
-                return object;
+            if let Ok(publication) = persisted {
+                return publication;
             }
             tracing::warn!(request_id = %identity.request_id, "request object publication retained for retry");
             tokio::time::sleep(Duration::from_millis(250)).await;
@@ -447,18 +574,38 @@ impl Database {
     ) {
         let database = self.clone();
         tokio::spawn(async move {
-            if success {
-                database
-                    .publish_request_source(identity, &locator, length, digest)
-                    .await;
-            }
-            let Some(_permit) = database.try_request_source_completion() else {
-                // Raw roots are independently discoverable by the body worker.
+            let settlement = if success {
+                Some(
+                    database
+                        .publish_request_source(identity, &locator, length, digest)
+                        .await
+                        .1,
+                )
+            } else {
+                None
+            };
+            let permit = if matches!(
+                settlement.as_ref(),
+                Some(crate::archive::RawPublicationSettlement::Retired { .. })
+            ) {
+                Some(database.request_source_completion().await)
+            } else {
+                database.try_request_source_completion()
+            };
+            let Some(_permit) = permit else {
+                // Published raw roots are independently discoverable. A retired
+                // source instead keeps this background completion responsibility.
                 return;
             };
             if success {
                 database
-                    .complete_uploaded_request_source(identity, &locator, length, digest)
+                    .complete_uploaded_request_source(
+                        identity,
+                        &locator,
+                        length,
+                        digest,
+                        settlement.expect("successful source has a publication outcome"),
+                    )
                     .await;
             } else {
                 database
