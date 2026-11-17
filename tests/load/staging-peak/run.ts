@@ -2,20 +2,22 @@ import { createHash } from "node:crypto";
 import { readFileSync, writeFileSync } from "node:fs";
 import { setTimeout as delay } from "node:timers/promises";
 import { pathToFileURL } from "node:url";
+import { artifactHash, candidateIdentity, type Candidate } from "./identity.ts";
+import { FixtureVerifier } from "./fixture.ts";
 import { validateBaseline, baselineIdentity } from "./baseline.ts";
 
-export type Arrival = { protocol: "chat" | "responses"; at_ms: number; scenario: "normal" | "slow-read" | "upstream-error" | "disconnect" | "tool-session"; session: string; stream: boolean; request_bytes: number; response_bytes: number; chunk_delay_ms: number; client_read_delay_ms: number; expected_status: number };
-export type Plan = { release_batch: string; window_ms: number; drain_timeout_ms: number; arrivals: Arrival[]; baseline: unknown };
+export type Arrival = { protocol: "chat" | "responses"; at_ms: number; scenario: "normal" | "slow-read" | "upstream-error" | "disconnect" | "tool-session"; session: string; stream: boolean; request_padding_bytes: number; response_fixture_bytes: number; chunk_delay_ms: number; client_read_delay_ms: number; expected_status: number };
+export type Plan = { candidate?:Candidate; candidate_evidence?:{candidate:Candidate;observed_at:string}; release_batch: string; window_ms: number; drain_timeout_ms: number; arrivals: Arrival[]; baseline: unknown };
 export function validatePlan(value: unknown): Plan {
   const plan = value as Plan;
   if (!plan?.release_batch || !Number.isSafeInteger(plan.window_ms) || plan.window_ms <= 0 || !Number.isSafeInteger(plan.drain_timeout_ms) || plan.drain_timeout_ms <= 0 || !Array.isArray(plan.arrivals) || !plan.arrivals.length) throw new Error("explicit release batch, arrival window and drain period required");
   let previous = -1;
   for (const row of plan.arrivals) {
     if (!Number.isSafeInteger(row.at_ms) || row.at_ms < previous || row.at_ms >= plan.window_ms || !["normal", "slow-read", "upstream-error", "disconnect", "tool-session"].includes(row.scenario) || !row.session || typeof row.stream !== "boolean" || !["chat","responses"].includes(row.protocol)) throw new Error("invalid ordered arrival or scenario");
-    for (const number of [row.request_bytes, row.response_bytes, row.chunk_delay_ms, row.client_read_delay_ms]) if (!Number.isSafeInteger(number) || number < 0) throw new Error("invalid measured workload size or delay");
+    for (const number of [row.request_padding_bytes, row.response_fixture_bytes, row.chunk_delay_ms, row.client_read_delay_ms]) if (!Number.isSafeInteger(number) || number < 0) throw new Error("invalid measured workload size or delay");
     if (!Number.isInteger(row.expected_status) || row.expected_status < 100 || row.expected_status > 599) throw new Error("expected gateway result required");
     if(row.scenario==="tool-session" && (row.stream || row.protocol!=="chat")) throw new Error("tool conversation fixture requires buffered replies");
-    if (row.stream && row.response_bytes < 4096) throw new Error("SSE workload must include protocol framing");
+    if (row.stream && row.response_fixture_bytes < 4096) throw new Error("SSE workload must include protocol framing");
     previous = row.at_ms;
   }
   return plan;
@@ -41,6 +43,12 @@ export async function run(plan: Plan, env = process.env): Promise<Record<string,
     if (!response.ok) throw new Error(`isolated control setup HTTP ${response.status}`);
     return await response.json() as Record<string, any>;
   };
+  const expectedCandidate=candidateIdentity(plan.candidate);
+  const actualCandidate=candidateIdentity(plan.candidate_evidence?.candidate);
+  if(!Number.isFinite(Date.parse(plan.candidate_evidence?.observed_at??""))||artifactHash(expectedCandidate)!==artifactHash(actualCandidate))throw new Error("candidate observation does not match this workload plan");
+  const versionResponse=await fetch(new URL("/version",control),{headers:{authorization:`Bearer ${token}`},signal:AbortSignal.timeout(10_000)});
+  const version=await versionResponse.json() as {revision?:string};
+  if(!versionResponse.ok||version.revision!==actualCandidate.control.source_sha)throw new Error("actual control revision differs from observed candidate");
   const tenant = `staging-peak-${runId}`, models: Record<string,string> = {}, routes: string[] = [];
   for (const scenario of new Set(plan.arrivals.map(row => row.scenario))) {
     const model = `staging-peak-${runId}-${scenario}`;
@@ -61,14 +69,17 @@ export async function run(plan: Plan, env = process.env): Promise<Record<string,
     active++; peakActive=Math.max(peakActive,active);
     tasks.push((async () => {
       const began=performance.now(), session=`${runId}:${arrival.session}`;
-      let status=0, bytes=0, exchanges=1, requestId:string|null=null, error:string|undefined, hash=createHash("sha256"), tail="", terminal=false;
+      let status=0, bytes=0, exchanges=1, requestId:string|null=null, error:string|undefined, hash=createHash("sha256"), tail="", terminal=false, serializedRequestBytes=0, fixtureEvidence:Record<string,unknown>={};
+      const verifier=new FixtureVerifier(arrival.protocol,arrival.stream,arrival.response_fixture_bytes);
       try {
-        const payload: Record<string,unknown>={ model:models[arrival.scenario], messages:[{role:"user",content:"synthetic peak replay"+"x".repeat(arrival.request_bytes)}], metadata:{session_id:session}, stream:arrival.stream, max_tokens:1 };
-        if (arrival.stream) payload.benchmark={mode:"stream",bytes:arrival.response_bytes,chunk_bytes:4096,delay_ms:arrival.chunk_delay_ms};
+        const payload: Record<string,unknown>={ model:models[arrival.scenario], messages:[{role:"user",content:"synthetic peak replay"+"x".repeat(arrival.request_padding_bytes)}], metadata:{session_id:session}, stream:arrival.stream, max_tokens:1 };
+        payload.benchmark={mode:arrival.stream?"stream":"buffered",bytes:arrival.response_fixture_bytes,chunk_bytes:4096,delay_ms:arrival.chunk_delay_ms};
         if(arrival.protocol==="responses"){payload.input=payload.messages;delete payload.messages;}
-        const response=await fetch(new URL(arrival.protocol==="responses"?"/v1/responses":"/v1/chat/completions",gateway), {method:"POST",headers:{authorization:`Bearer ${key}`,"content-type":"application/json","x-mtc-conversation-id":session},body:JSON.stringify(payload),signal:AbortSignal.timeout(plan.window_ms+plan.drain_timeout_ms)});
+        const serialized=JSON.stringify(payload);serializedRequestBytes=Buffer.byteLength(serialized);
+        const response=await fetch(new URL(arrival.protocol==="responses"?"/v1/responses":"/v1/chat/completions",gateway), {method:"POST",headers:{authorization:`Bearer ${key}`,"content-type":"application/json","x-mtc-conversation-id":session},body:serialized,signal:AbortSignal.timeout(plan.window_ms+plan.drain_timeout_ms)});
         status=response.status;requestId=response.headers.get("x-request-id");
-        if (response.body) for await (const chunk of response.body) { bytes+=chunk.length; hash.update(chunk); const scan=tail+Buffer.from(chunk).toString("utf8");terminal ||= arrival.protocol==="responses"?scan.includes('"type":"response.completed"'):scan.includes("data: [DONE]");tail=scan.slice(-4096); if(arrival.client_read_delay_ms) await delay(arrival.client_read_delay_ms); }
+        if (response.body) for await (const chunk of response.body) { bytes+=chunk.length; hash.update(chunk); if(status===200&&arrival.scenario!=="tool-session")verifier.consume(chunk); const scan=tail+Buffer.from(chunk).toString("utf8");terminal ||= arrival.protocol==="responses"?scan.includes('"type":"response.completed"'):scan.includes("data: [DONE]");tail=scan.slice(-4096); if(arrival.client_read_delay_ms) await delay(arrival.client_read_delay_ms); }
+        if(status===200&&arrival.scenario!=="tool-session"){fixtureEvidence=verifier.finish(bytes);if(fixtureEvidence.verified!==true)error="fixture_content_or_size_mismatch";}
         if(status!==arrival.expected_status) error="unexpected_gateway_status";
         if(arrival.stream && status===200 && !terminal) error="missing_stream_terminal";
         if(arrival.scenario==="tool-session" && status===200) {
@@ -81,7 +92,7 @@ export async function run(plan: Plan, env = process.env): Promise<Record<string,
           if(followup.status!==200 || completed.choices?.[0]?.message?.content!=="tool-complete") error="tool_followup_mismatch";
         }
       } catch { error="transport_or_timeout"; }
-      finally { active--; requests.push({index,session,protocol:arrival.protocol,http_exchanges:exchanges,request_id:requestId,scenario:arrival.scenario,offered_at_ms:arrival.at_ms,started_at_ms:began-start,generator_lag_ms:lag,status,response_bytes:bytes,response_sha256:hash.digest("hex"),latency_ms:performance.now()-began,error}); }
+      finally { active--; requests.push({index,session,...fixtureEvidence,request_padding_bytes:arrival.request_padding_bytes,serialized_request_bytes:serializedRequestBytes,protocol:arrival.protocol,http_exchanges:exchanges,request_id:requestId,scenario:arrival.scenario,offered_at_ms:arrival.at_ms,started_at_ms:began-start,generator_lag_ms:lag,status,response_wire_bytes:bytes,response_sha256:hash.digest("hex"),latency_ms:performance.now()-began,error}); }
     })());
   }
   await Promise.all(tasks);
@@ -89,7 +100,7 @@ export async function run(plan: Plan, env = process.env): Promise<Record<string,
   let baselineHash:string|undefined, baselineError:string|undefined;
   try { baselineHash=baselineIdentity(validateBaseline(plan.baseline)); } catch { baselineError="historical_peak_coverage_incomplete"; }
   const latencies=requests.map(row=>Number(row.latency_ms));
-  return {schema_version:1,run_id:runId,release_batch:plan.release_batch,source_sha:env.MTC_HARNESS_SOURCE_SHA??null,tenant,offered:plan.arrivals.length,started:requests.length,completed:requests.filter(row=>!row.error).length,failed:requests.filter(row=>row.error).length,unissued:plan.arrivals.length-requests.length,peak_active:peakActive,http_exchanges:requests.reduce((sum,row)=>sum+Number(row.http_exchanges),0),latency_ms:{p50:percentile(latencies,.5),p95:percentile(latencies,.95),p99:percentile(latencies,.99),max:Math.max(...latencies)},baseline_sha256:baselineHash,baseline_error:baselineError,qualification:"NOT_EVALUATED",missing_evidence:["complete historical multidimensional peak","financial exactly-once assertions","semantic/archive API payload verification","PG poolwait/IO/locks and memory recovery","archive debt drain confirmation"],requests};
+  return {schema_version:1,run_id:runId,release_batch:plan.release_batch,source_sha:env.MTC_HARNESS_SOURCE_SHA??null,harness_source_sha:env.MTC_HARNESS_SOURCE_SHA??null,candidate:actualCandidate,candidate_evidence_sha256:artifactHash(plan.candidate_evidence),plan_sha256:artifactHash(plan),tenant,offered:plan.arrivals.length,started:requests.length,completed:requests.filter(row=>!row.error).length,failed:requests.filter(row=>row.error).length,unissued:plan.arrivals.length-requests.length,peak_active:peakActive,http_exchanges:requests.reduce((sum,row)=>sum+Number(row.http_exchanges),0),latency_ms:{p50:percentile(latencies,.5),p95:percentile(latencies,.95),p99:percentile(latencies,.99),max:Math.max(...latencies)},baseline_sha256:artifactHash(plan.baseline),validated_baseline_sha256:baselineHash,baseline_error:baselineError,qualification:"NOT_EVALUATED",missing_evidence:["complete historical multidimensional peak","financial exactly-once assertions","semantic/archive API payload verification","PG poolwait/IO/locks and memory recovery","archive debt drain confirmation"],requests};
 }
 if(process.argv[1] && import.meta.url===pathToFileURL(process.argv[1]).href) {
   try { const report=await run(validatePlan(JSON.parse(readFileSync(process.env.MTC_PEAK_PLAN_FILE??"/plan/plan.json","utf8")))); writeFileSync(process.env.MTC_PEAK_REPORT_FILE??"/evidence/report.json",JSON.stringify(report,null,2)); console.log(JSON.stringify(report)); process.exitCode=Number(report.failed)>0?2:0; }

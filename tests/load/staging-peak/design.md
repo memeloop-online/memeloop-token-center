@@ -23,3 +23,9 @@ Fault phases isolate mock upstream errors, slow upstream reads/writes, midstream
 Batch-specific history assertions supplied by the history owner cover credential/config/status updates without history revision fan-out, exact-once rename identity updates, financial acknowledgements during slow archive/export activity, and queue acknowledgement only after confirmed durable writes. This harness does not modify those production features.
 
 Until complete historical metadata, real TEST lifecycle results and the approved release-batch checks are available, the release qualification is **NOT_EVALUATED**. Passing the framework's focused GHA tests is never reported as passing historical peak acceptance.
+
+## Evidence identity envelope
+
+The plan includes the expected gateway/control/worker immutable image digests and application source revisions, plus an independently collected pre-run TEST observation. The generator verifies the actual control `/version` before setup and records the observed role identities, canonical plan hash, baseline hash and observation hash separately from the harness source SHA. The final observer supplies independently read before/after candidate identities and those same plan/baseline/observation hashes. Missing identity evidence is NOT_EVALUATED; conflicting identities are FAILED. Reusing the same run label or harness version cannot qualify a different application image or workload.
+
+`request_padding_bytes` describes synthetic content padding; `serialized_request_bytes` records the actual JSON bytes sent. `response_fixture_bytes` is explicitly payload bytes for buffered JSON/native Responses, and wire bytes for the reused Chat SSE generator. Reports record actual response wire bytes, payload bytes and content hashes; generated x-content and target sizes are verified before a request can succeed. The reference phases include separate large buffered and streaming fixtures, not only declared metadata.

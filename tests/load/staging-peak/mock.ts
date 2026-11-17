@@ -1,4 +1,4 @@
-import { createMockServer, MockState } from "../benchmark-memory.ts";
+import { createMockServer, MockState, streamChatSse } from "../benchmark-memory.ts";
 import { setTimeout as delay } from "node:timers/promises";
 import { pathToFileURL } from "node:url";
 import type { IncomingMessage, ServerResponse } from "node:http";
@@ -31,6 +31,12 @@ export function createStagingMock() {
         response.end(JSON.stringify({id:"chatcmpl-staging-tool",object:"chat.completion",model:body.model,choices:[{index:0,message,finish_reason:followup?"stop":"tool_calls"}],usage:{prompt_tokens:2,completion_tokens:1,total_tokens:3}})); return;
       }
       if (match[1] === "slow-read") { request.pause(); await delay(250); request.resume(); }
+      if(request.url==="/v1/chat/completions") {
+        const chunks:Buffer[]=[];for await(const chunk of request)chunks.push(Buffer.from(chunk));const body=JSON.parse(Buffer.concat(chunks).toString("utf8"));
+        if(body.stream||body.benchmark?.mode==="stream"){await streamChatSse(request,response,state,Number(body.benchmark?.bytes),Math.max(4096,Math.min(Number(body.benchmark?.chunk_bytes??4096),1048576)),Number(body.benchmark?.delay_ms??0));return;}
+        const text=body.benchmark?"x".repeat(Number(body.benchmark.bytes)):"ok";
+        response.writeHead(200,{"content-type":"application/json"});response.end(JSON.stringify({id:"chatcmpl-staging",object:"chat.completion",model:body.model,choices:[{index:0,message:{role:"assistant",content:text},finish_reason:"stop"}],usage:{prompt_tokens:2,completion_tokens:1,total_tokens:3}}));return;
+      }
       if(request.url==="/v1/responses") {
         const chunks:Buffer[]=[]; for await(const chunk of request) chunks.push(Buffer.from(chunk));
         const body=JSON.parse(Buffer.concat(chunks).toString("utf8"));
