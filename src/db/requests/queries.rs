@@ -2837,6 +2837,12 @@ mod query_shape_tests {
                 .contains(&RequestListBind::Text(route_id.to_string()))
         );
     }
+}
+
+#[cfg(test)]
+mod history_point_contract_tests {
+    use super::*;
+
     #[test]
     fn history_point_query_binds_partition_and_full_identity() {
         let identity = crate::request_history::HistoryIdentity {

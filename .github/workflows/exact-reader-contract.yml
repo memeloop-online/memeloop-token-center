@@ -377,7 +377,7 @@ jobs:
           set -o pipefail
           git rev-parse HEAD
           for selector in \
-            db::requests::queries::query_shape_tests::history_point_query_binds_partition_and_full_identity \
+            db::requests::queries::history_point_contract_tests::history_point_query_binds_partition_and_full_identity \
             db::history_immutable_outbox::tests::immutable_history_delivery_survives_source_absence_restart_and_stale_ack
           do
             cargo test --locked --all-features --lib "$selector" -- --exact 2>&1 | tee /tmp/history-capture.log
