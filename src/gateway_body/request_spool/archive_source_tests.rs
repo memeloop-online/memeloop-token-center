@@ -50,10 +50,47 @@ async fn late_request_capture_retires_source_metadata_without_rebinding_after_co
         node_hash: prepared.nodes.last().unwrap().node_hash.clone(),
         projected_at: 1,
     };
+    // Hold the existing-root fast path after it read the old root, retire
+    // during its verification window, then require the real typed outcome.
+    let entered = Arc::new(tokio::sync::Notify::new());
+    let resume = Arc::new(tokio::sync::Notify::new());
+    let publisher_db = database.clone();
+    let original_len = body.len();
+    let original_digest = *blake3::hash(&body).as_bytes();
+    let publisher = tokio::spawn(Database::with_existing_source_root_gate(
+        entered.clone(),
+        resume.clone(),
+        async move {
+            publisher_db
+                .publish_request_source(
+                    identity,
+                    "unused-existing-fastpath",
+                    original_len,
+                    original_digest,
+                )
+                .await
+        },
+    ));
+    tokio::time::timeout(Duration::from_secs(5), entered.notified())
+        .await
+        .unwrap();
     archive
         .retire_covered_raw_roots(&prepared.publication, &proof)
         .await
         .unwrap();
+    resume.notify_one();
+    let (existing, settlement) = tokio::time::timeout(Duration::from_secs(5), publisher)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(existing, original);
+    assert!(
+        matches!(
+            settlement,
+            crate::archive::RawPublicationSettlement::Retired { .. }
+        ),
+        "old root read is not a current publication ACK"
+    );
     let store = MemoryObjectStore::new();
     let release = store.pause_next_write();
     let admission =

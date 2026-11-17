@@ -31,6 +31,11 @@ tokio::task_local! {
 
 #[cfg(test)]
 tokio::task_local! {
+    static TEST_EXISTING_ROOT_GATE: (Arc<tokio::sync::Notify>, Arc<tokio::sync::Notify>);
+}
+
+#[cfg(test)]
+tokio::task_local! {
     static TEST_CAPTURE_BEFORE_DISPATCH: Arc<GatewayPersistence>;
     static TEST_SOURCE_POOL_TIMEOUT: Duration;
 }
@@ -368,6 +373,17 @@ impl Database {
         }
     }
 
+    #[cfg(test)]
+    pub(crate) async fn with_existing_source_root_gate<T>(
+        entered: Arc<tokio::sync::Notify>,
+        resume: Arc<tokio::sync::Notify>,
+        future: impl std::future::Future<Output = T>,
+    ) -> T {
+        TEST_EXISTING_ROOT_GATE
+            .scope((entered, resume), future)
+            .await
+    }
+
     /// The immutable root must not depend on optional SQL metadata capacity.
     pub(crate) async fn publish_request_source(
         &self,
@@ -392,10 +408,18 @@ impl Database {
                     {
                         return Err(AppError::storage("request_source_root_conflict"));
                     }
+                    #[cfg(test)]
+                    if let Ok((entered, resume)) = TEST_EXISTING_ROOT_GATE.try_with(Clone::clone) {
+                        entered.notify_one();
+                        resume.notified().await;
+                    }
                     archive
                         .verify_tenant_content(identity.tenant_id, &existing)
                         .await?;
-                    return Ok((existing, crate::archive::RawPublicationSettlement::Published));
+                    // Verification may race retirement. Resolve the typed
+                    // outcome again instead of fabricating a Published ACK.
+                    let settlement = archive.settle_raw_capture(identity.tenant_id, identity.request_id, "request", &existing).await?;
+                    return Ok((existing, settlement));
                 }
                 let staged = crate::archive::StagedArchiveObject {
                     object_locator: locator.to_owned(),
