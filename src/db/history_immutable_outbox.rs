@@ -50,10 +50,11 @@ pub(super) async fn source_native_envelope_in_transaction(
         .fetch_optional(&mut **transaction)
         .await?;
     let request =
-        sqlx::query("SELECT * FROM request_records WHERE id=$1 AND tenant_id=$2 AND key_id=$3")
+        sqlx::query("SELECT * FROM request_records WHERE id=$1 AND tenant_id=$2 AND key_id=$3 AND created_at=$4")
             .bind(request_id)
             .bind(identity.try_get::<String, _>("tenant_id")?)
             .bind(identity.try_get::<String, _>("key_id")?)
+            .bind(identity.try_get::<i64, _>("created_at")?)
             .fetch_one(&mut **transaction)
             .await?;
     let mut originals = serde_json::Map::new();
@@ -651,7 +652,6 @@ impl Database {
         if self.history_mode().await.map_err(AppError::from)? == "off" {
             return Ok(());
         }
-        let mut transaction = self.pool.begin().await?;
         let lock = if matches!(self.backend, DatabaseBackend::PostgreSql) {
             " FOR UPDATE SKIP LOCKED"
         } else {
@@ -660,8 +660,8 @@ impl Database {
         // Source writers update their source row before their AFTER trigger
         // advances this journal. Hold its revision fence while reading source
         // rows with plain MVCC SELECTs; never reverse it with source FOR UPDATE.
-        let rows=sqlx::query(sqlx::AssertSqlSafe(format!("SELECT revision,source,request_id,tenant_id,key_id,created_at FROM request_history_export WHERE snapshot IS NULL ORDER BY revision LIMIT $1{lock}")))
-            .bind(page_size).fetch_all(&mut *transaction).await?;
+        let rows=sqlx::query("SELECT revision,source,request_id,tenant_id,key_id,created_at FROM request_history_export WHERE snapshot IS NULL ORDER BY revision LIMIT $1")
+            .bind(page_size).fetch_all(&self.pool).await?;
         for row in rows {
             let revision: i64 = row.try_get("revision")?;
             let identity = crate::request_history::HistoryIdentity {
@@ -671,9 +671,12 @@ impl Database {
                 key_id: parse_uuid(row.try_get("key_id")?)?,
                 created_at: row.try_get("created_at")?,
             };
-            let locked=sqlx::query("UPDATE request_history_export SET snapshot=snapshot WHERE revision=$1 AND source=$2 AND request_id=$3 AND snapshot IS NULL")
-                .bind(revision).bind(&identity.source).bind(identity.request_id.to_string()).execute(&mut *transaction).await?;
-            if locked.rows_affected() == 0 {
+            let mut transaction = self.pool.begin().await?;
+            let locked=sqlx::query(sqlx::AssertSqlSafe(format!("SELECT revision,tenant_id,key_id,created_at FROM request_history_export WHERE revision=$1 AND source=$2 AND request_id=$3 AND tenant_id=$4 AND key_id=$5 AND created_at=$6 AND snapshot IS NULL{lock}")))
+                .bind(revision).bind(&identity.source).bind(identity.request_id.to_string())
+                .bind(identity.tenant_id.to_string()).bind(identity.key_id.to_string()).bind(identity.created_at)
+                .fetch_optional(&mut *transaction).await?;
+            if locked.is_none() {
                 continue;
             }
             let request_id = identity.request_id.to_string();
@@ -691,27 +694,75 @@ impl Database {
                 let envelope = serde_json::json!({"originals":{"event":original_event},"version":1,"source":"event","revision":revision,"request_id":identity.request_id,"tenant_id":identity.tenant_id,"key_id":identity.key_id,"created_at":identity.created_at,"payload":payload,"read_model":null,"statistics":null,"filter_cost_micros":null,"archive_identity":archive_identity});
                 insert_envelope_in_transaction(&mut transaction, &identity, revision, &envelope)
                     .await?;
+                transaction.commit().await?;
                 continue;
             }
-            if Self::history_original_view_in_transaction(&mut transaction, &identity)
+            let source_sql = match identity.source.as_str() {
+                "native" => {
+                    "SELECT 1 FROM request_records WHERE id=$1 AND tenant_id=$2 AND key_id=$3 AND created_at=$4"
+                }
+                "generation" => {
+                    "SELECT 1 FROM generation_jobs WHERE id=$1 AND tenant_id=$2 AND key_id=$3 AND created_at=$4"
+                }
+                "archive" => {
+                    "SELECT 1 FROM session_archive_unlinked_requests WHERE archive_request_id=$1 AND tenant_id=$2 AND key_id=$3 AND source_started_at=$4"
+                }
+                _ => return Err(AppError::storage("immutable_history_unknown_source")),
+            };
+            let exists = sqlx::query(sqlx::AssertSqlSafe(source_sql))
+                .bind(&request_id)
+                .bind(identity.tenant_id.to_string())
+                .bind(identity.key_id.to_string())
+                .bind(identity.created_at)
+                .fetch_optional(&mut *transaction)
                 .await?
-                .is_none()
-            {
+                .is_some();
+            if !exists {
                 let envelope = serde_json::json!({"version":1,"source":identity.source,"revision":revision,"request_id":identity.request_id,"tenant_id":identity.tenant_id,"key_id":identity.key_id,"created_at":identity.created_at,"payload":null,"read_model":null,"statistics":null,"filter_cost_micros":null});
                 insert_envelope_in_transaction(&mut transaction, &identity, revision, &envelope)
                     .await?;
+                transaction.commit().await?;
                 continue;
             }
-            match identity.source.as_str() {
-                "native" => capture_native_in_transaction(&mut transaction, &request_id).await?,
-                "generation" => {
-                    capture_generation_in_transaction(&mut transaction, &request_id).await?
+            // Capture only the fenced identity. Sibling events own independent
+            // journal rows and are captured by their own page candidates.
+            let locked_identity = locked.as_ref().expect("journal identity is locked");
+            let (captured_identity, envelope) = match identity.source.as_str() {
+                "native" => {
+                    source_native_envelope_in_transaction(
+                        &mut transaction,
+                        &request_id,
+                        locked_identity,
+                    )
+                    .await?
                 }
-                "archive" => capture_archive_in_transaction(&mut transaction, &request_id).await?,
+                "generation" => {
+                    source_generation_envelope_in_transaction(
+                        &mut transaction,
+                        &request_id,
+                        locked_identity,
+                    )
+                    .await?
+                }
+                "archive" => {
+                    source_archive_envelope_in_transaction(
+                        &mut transaction,
+                        &request_id,
+                        locked_identity,
+                    )
+                    .await?
+                }
                 _ => return Err(AppError::storage("immutable_history_unknown_source")),
-            }
+            };
+            insert_envelope_in_transaction(
+                &mut transaction,
+                &captured_identity,
+                revision,
+                &envelope,
+            )
+            .await?;
+            transaction.commit().await?;
         }
-        transaction.commit().await?;
         Ok(())
     }
 
@@ -889,6 +940,118 @@ mod tests {
         let database = Database::connect(isolated.as_str()).await.unwrap();
         compact_identity_receipt_contract(&database).await;
         database.close().await;
+        sqlx::query(sqlx::AssertSqlSafe(format!("DROP SCHEMA {schema} CASCADE")))
+            .execute(&admin)
+            .await
+            .unwrap();
+        admin.close().await;
+    }
+
+    #[tokio::test]
+    #[ignore = "requires the CI PostgreSQL fixture"]
+    async fn postgres_history_capture_skips_locked_identity_and_commits_progress() {
+        let postgres = std::env::var("MTC_TEST_POSTGRES_URL").unwrap();
+        let admin = sqlx::PgPool::connect(&postgres).await.unwrap();
+        let schema = format!("history_capture_{}", Uuid::now_v7().simple());
+        sqlx::query(sqlx::AssertSqlSafe(format!("CREATE SCHEMA {schema}")))
+            .execute(&admin)
+            .await
+            .unwrap();
+        let mut isolated = url::Url::parse(&postgres).unwrap();
+        isolated
+            .query_pairs_mut()
+            .append_pair("options", &format!("-csearch_path={schema}"));
+        let db = Database::connect(isolated.as_str()).await.unwrap();
+        db.migrate().await.unwrap();
+        sqlx::query("UPDATE request_history_state SET mode='shadow' WHERE id=1")
+            .execute(&db.pool)
+            .await
+            .unwrap();
+        for revision in [1_i64, 2] {
+            sqlx::query("INSERT INTO request_history_export (revision,source,request_id,tenant_id,key_id,created_at) VALUES ($1,'native',$2,$3,$4,42)")
+                .bind(revision).bind(Uuid::now_v7().to_string()).bind(Uuid::now_v7().to_string()).bind(Uuid::now_v7().to_string()).execute(&db.pool).await.unwrap();
+        }
+        let mut held = db.pool.begin().await.unwrap();
+        sqlx::query("SELECT revision FROM request_history_export WHERE revision=2 FOR UPDATE")
+            .fetch_one(&mut *held)
+            .await
+            .unwrap();
+        tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            db.history_capture_pending(2),
+        )
+        .await
+        .expect("locked second identity must not block first")
+        .unwrap();
+        let count: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM request_history_immutable_outbox WHERE revision=1",
+        )
+        .fetch_one(&db.pool)
+        .await
+        .unwrap();
+        assert_eq!(count, 1);
+        let mut probe = db.pool.begin().await.unwrap();
+        sqlx::query(
+            "SELECT revision FROM request_history_export WHERE revision=1 FOR UPDATE NOWAIT",
+        )
+        .fetch_one(&mut *probe)
+        .await
+        .expect("first identity lock must already be released");
+        probe.rollback().await.unwrap();
+        held.rollback().await.unwrap();
+        db.history_capture_pending(2).await.unwrap();
+        let count: i64 =
+            sqlx::query_scalar("SELECT COUNT(*) FROM request_history_immutable_outbox")
+                .fetch_one(&db.pool)
+                .await
+                .unwrap();
+        assert_eq!(count, 2);
+        // Different source relations let only the second identity pause.
+        for (revision, source) in [(3_i64, "native"), (4, "generation")] {
+            sqlx::query("INSERT INTO request_history_export (revision,source,request_id,tenant_id,key_id,created_at) VALUES ($1,$2,$3,$4,$5,42)")
+                .bind(revision).bind(source).bind(Uuid::now_v7().to_string()).bind(Uuid::now_v7().to_string()).bind(Uuid::now_v7().to_string()).execute(&db.pool).await.unwrap();
+        }
+        let mut source_lock = db.pool.begin().await.unwrap();
+        sqlx::query("LOCK TABLE generation_jobs IN ACCESS EXCLUSIVE MODE")
+            .execute(&mut *source_lock)
+            .await
+            .unwrap();
+        let capture = db.history_capture_pending(4);
+        tokio::pin!(capture);
+        let observer = async {
+            loop {
+                let waiting: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM pg_stat_activity WHERE datname=current_database() AND wait_event_type='Lock' AND query LIKE 'SELECT 1 FROM generation_jobs%' AND pid<>pg_backend_pid()")
+                    .fetch_one(&db.pool).await.unwrap();
+                if waiting > 0 {
+                    break;
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+            }
+            let mut probe = db.pool.begin().await.unwrap();
+            sqlx::query(
+                "SELECT revision FROM request_history_export WHERE revision=3 FOR UPDATE NOWAIT",
+            )
+            .fetch_one(&mut *probe)
+            .await
+            .expect("first identity must commit before second source finishes");
+            let visible: i64 = sqlx::query_scalar(
+                "SELECT COUNT(*) FROM request_history_immutable_outbox WHERE revision=3",
+            )
+            .fetch_one(&mut *probe)
+            .await
+            .unwrap();
+            assert_eq!(visible, 1);
+            probe.rollback().await.unwrap();
+            source_lock.rollback().await.unwrap();
+        };
+        tokio::time::timeout(std::time::Duration::from_secs(10), async {
+            tokio::select! {
+                result = &mut capture => panic!("capture returned before the locked second source was released: {result:?}"),
+                () = observer => {}
+            }
+            capture.await.unwrap();
+        }).await.expect("capture interleaving must finish within deadline");
+        db.close().await;
         sqlx::query(sqlx::AssertSqlSafe(format!("DROP SCHEMA {schema} CASCADE")))
             .execute(&admin)
             .await

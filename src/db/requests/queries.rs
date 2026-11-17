@@ -1069,6 +1069,21 @@ fn push_history_identity(
         } else {
             query.push(&format!(" AND {column} = "));
             query.bind_text(identity.request_id.to_string());
+            let alias = column
+                .split_once('.')
+                .expect("static history source column")
+                .0;
+            query.push(&format!(" AND {alias}.tenant_id = "));
+            query.bind_text(identity.tenant_id.to_string());
+            query.push(&format!(" AND {alias}.key_id = "));
+            query.bind_text(identity.key_id.to_string());
+            let time_column = if source == "archive" {
+                "source_started_at"
+            } else {
+                "created_at"
+            };
+            query.push(&format!(" AND {alias}.{time_column} = "));
+            query.bind_i64(identity.created_at);
         }
     }
 }
@@ -2848,6 +2863,63 @@ mod query_shape_tests {
             query
                 .binds
                 .contains(&RequestListBind::Text(route_id.to_string()))
+        );
+    }
+}
+
+#[cfg(test)]
+mod history_point_contract_tests {
+    use super::*;
+
+    #[test]
+    fn history_point_query_binds_partition_and_full_identity() {
+        let identity = crate::request_history::HistoryIdentity {
+            source: "native".into(),
+            request_id: Uuid::now_v7(),
+            tenant_id: Uuid::now_v7(),
+            key_id: Uuid::now_v7(),
+            created_at: 12345,
+        };
+        let query = build_request_list_query_for_history(
+            RequestListScope::Global,
+            &RequestListFilter {
+                limit: 1,
+                ..Default::default()
+            },
+            Some(&identity),
+        );
+        let before_page = query.statement.split("OFFSET 0) r").next().unwrap();
+        for predicate in [
+            "AND r.id =",
+            "AND r.tenant_id =",
+            "AND r.key_id =",
+            "AND r.created_at =",
+        ] {
+            assert!(
+                before_page.contains(predicate),
+                "point identity must constrain the source scan: {predicate}"
+            );
+        }
+        assert!(
+            query
+                .binds
+                .contains(&RequestListBind::I64(identity.created_at))
+        );
+        for value in [identity.request_id, identity.tenant_id, identity.key_id] {
+            assert!(
+                query
+                    .binds
+                    .contains(&RequestListBind::Text(value.to_string()))
+            );
+        }
+        let list = build_request_list_query_for_history(
+            RequestListScope::Global,
+            &RequestListFilter::default(),
+            None,
+        );
+        assert!(
+            !list.statement.contains("AND r.created_at ="),
+            "ordinary list pagination is unchanged"
         );
     }
 }
