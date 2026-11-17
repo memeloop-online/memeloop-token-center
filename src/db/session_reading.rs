@@ -256,6 +256,92 @@ fn validate_context_page(head: &str, nodes: &[SessionContextNode]) -> Result<(),
 mod tests {
     use super::*;
 
+    async fn semantic_revision_scope_contract(url: &str) {
+        use crate::db::requests::conversations::prefix_storage::tests::{key, observe};
+        let database = Database::connect(url)
+            .await
+            .unwrap()
+            .with_archive(crate::archive::ArchiveStore::memory_for_test());
+        database.migrate().await.unwrap();
+        let key = key(&database, "semantic-reader-scope").await;
+        let request = Uuid::now_v7();
+        let session = observe(
+            &database,
+            &key,
+            &serde_json::json!({"messages":[{"role":"user","content":"scope contract"}]}),
+            &ConversationHints::default(),
+            request,
+            1,
+            true,
+        )
+        .await;
+        let scope = database
+            .session_context_scope(None, Some(key.tenant_id), key.key_id, session, request)
+            .await
+            .unwrap();
+        assert!(scope.leaf.is_some());
+        // An authorized but unpublished leaf is pending, not a SQL error.
+        assert_eq!(
+            database.published_semantic_revision(&scope).await.unwrap(),
+            None
+        );
+        for (tenant, credential, cluster, id) in [
+            (Uuid::now_v7(), key.key_id, session, request),
+            (key.tenant_id, Uuid::now_v7(), session, request),
+            (key.tenant_id, key.key_id, Uuid::now_v7(), request),
+            (key.tenant_id, key.key_id, session, Uuid::now_v7()),
+        ] {
+            assert!(matches!(
+                database
+                    .session_context_scope(None, Some(tenant), credential, cluster, id)
+                    .await,
+                Err(AppError::NotFound)
+            ));
+        }
+        sqlx::query("UPDATE conversation_observations SET leaf_node_hash=NULL WHERE request_id=$1")
+            .bind(request.to_string())
+            .execute(&database.pool)
+            .await
+            .unwrap();
+        let pending = database
+            .session_context_scope(None, Some(key.tenant_id), key.key_id, session, request)
+            .await
+            .unwrap();
+        assert_eq!(pending.leaf, None);
+        assert_eq!(
+            database
+                .published_semantic_revision(&pending)
+                .await
+                .unwrap(),
+            None
+        );
+        // A captured authorized scope remains tied to its original leaf.
+        assert_eq!(
+            database.published_semantic_revision(&scope).await.unwrap(),
+            None
+        );
+        database.close().await;
+    }
+
+    #[tokio::test]
+    async fn sqlite_semantic_revision_uses_authorized_request_scope() {
+        let directory = tempfile::tempdir().unwrap();
+        semantic_revision_scope_contract(&format!(
+            "sqlite://{}?mode=rwc",
+            directory.path().join("semantic-scope.db").display()
+        ))
+        .await;
+    }
+
+    #[tokio::test]
+    async fn postgres_semantic_revision_uses_authorized_request_scope() {
+        let url = std::env::var("MTC_TEST_POSTGRES_URL")
+            .expect("semantic reader regression requires PostgreSQL");
+        let isolated = crate::db::test_support::PostgresTestDatabase::create(&url).await;
+        semantic_revision_scope_contract(isolated.url()).await;
+        isolated.cleanup().await;
+    }
+
     #[tokio::test]
     async fn text_chunks_preserve_long_unicode_messages_without_tool_or_media_content() {
         use crate::db::requests::conversations::prefix_storage::tests::{key, observe};
