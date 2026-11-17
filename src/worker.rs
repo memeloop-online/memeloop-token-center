@@ -342,6 +342,7 @@ pub async fn run_until_shutdown_with_oauth_stop(
             }
         }
     );
+    let orphan_reservation_scan = Mutex::new(crate::db::OrphanReservationScan::default());
     periodic!(
         "projection_outbox_cleanup",
         PROJECTION_OUTBOX_CLEANUP_INTERVAL,
@@ -377,7 +378,13 @@ pub async fn run_until_shutdown_with_oauth_stop(
         "orphaned_reservations",
         ORPHANED_RESERVATION_REAPER_INTERVAL,
         async |state: &AppState, _shutdown: &watch::Receiver<bool>| {
-            match state.db.release_orphaned_reservations(100).await {
+            let mut scan = orphan_reservation_scan.lock().unwrap().clone();
+            let result = state
+                .db
+                .release_orphaned_reservations_page(100, &mut scan)
+                .await;
+            *orphan_reservation_scan.lock().unwrap() = scan;
+            match result {
                 Ok(released) if released > 0 => {
                     tracing::warn!(released, "worker released orphaned usage reservations");
                 }
