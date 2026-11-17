@@ -1,7 +1,8 @@
 import { createHash } from "node:crypto";
 export class FixtureVerifier {
   private carry="";private payloadBytes=0;private terminal=false;private valid=true;private hash=createHash("sha256");
-  constructor(private protocol:"chat"|"responses",private stream:boolean,private fixtureBytes:number){}
+  private protocol:"chat"|"responses"; private stream:boolean; private fixtureBytes:number;
+  constructor(protocol:"chat"|"responses",stream:boolean,fixtureBytes:number){this.protocol=protocol;this.stream=stream;this.fixtureBytes=fixtureBytes;}
   private content(text:unknown){if(typeof text!=="string"||/[^x]/.test(text)){this.valid=false;return;}this.payloadBytes+=Buffer.byteLength(text);this.hash.update(text);}
   consume(chunk:Uint8Array){this.carry+=Buffer.from(chunk).toString("utf8");if(!this.stream)return;
     let end:number;while((end=this.carry.indexOf("\n\n"))>=0){const frame=this.carry.slice(0,end);this.carry=this.carry.slice(end+2);const data=frame.split("\n").find(line=>line.startsWith("data: "))?.slice(6);if(!data)continue;if(data==="[DONE]"){this.terminal=true;continue;}
