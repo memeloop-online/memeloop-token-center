@@ -883,23 +883,11 @@ impl UpstreamAttemptGuard {
                 );
             }
         }
-        let Some(completion) = self.take_completion(terminal, !mandatory) else {
-            return;
-        };
-        if mandatory {
-            if tokio::time::timeout(std::time::Duration::from_millis(500), completion)
-                .await
-                .is_err()
-            {
-                tracing::warn!(
-                    "mandatory upstream attempt persistence exceeded the request budget; continuing"
-                );
-            }
-        } else {
+        // 认证/限流终态的持久化一律交给后台队列，请求路径完全不等它。
+        // 落库晚几毫秒只影响熔断/配额收敛的速度，不应该反过来卡住请求本身。
+        if let Some(completion) = self.take_completion(terminal, !mandatory) {
             queue.submit(4096, async move {
-                tokio::time::timeout(std::time::Duration::from_secs(2), completion)
-                    .await
-                    .map_err(|_| AppError::internal("probe_complete_1"))?;
+                let _ = tokio::time::timeout(std::time::Duration::from_secs(2), completion).await;
                 Ok(())
             });
         }
