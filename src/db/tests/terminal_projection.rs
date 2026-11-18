@@ -1467,6 +1467,12 @@ async fn postgres_terminal_writer_does_not_capture_sibling_events() {
     .fetch_one(&database.pool)
     .await
     .unwrap();
+    let original_event: String =
+        sqlx::query_scalar("SELECT row_to_json(e)::text FROM request_events e WHERE event_id=$1")
+            .bind(&sibling)
+            .fetch_one(&database.pool)
+            .await
+            .unwrap();
     // Gate only attempts to freeze the OLD event. New event capture and all
     // normal source/journal writes remain available to the real terminal writer.
     sqlx::raw_sql(sqlx::AssertSqlSafe(format!("CREATE FUNCTION gate_sibling_capture() RETURNS trigger LANGUAGE plpgsql AS $$ BEGIN IF NEW.source='event' AND NEW.request_id='{sibling}' THEN PERFORM pg_advisory_xact_lock(984,1); END IF; RETURN NEW; END $$; CREATE TRIGGER gate_sibling_capture BEFORE INSERT ON request_history_immutable_outbox FOR EACH ROW EXECUTE FUNCTION gate_sibling_capture();")))
@@ -1516,6 +1522,29 @@ async fn postgres_terminal_writer_does_not_capture_sibling_events() {
         restored, 1,
         "background must freeze the pending sibling revision"
     );
+    let frozen: String = sqlx::query_scalar("SELECT o.snapshot FROM request_history_export x JOIN request_history_immutable_outbox o ON o.revision=x.revision WHERE x.source='event' AND x.request_id=$1").bind(&sibling).fetch_one(&database.pool).await.unwrap();
+    let frozen: serde_json::Value = serde_json::from_str(&frozen).unwrap();
+    let original: serde_json::Value = serde_json::from_str(&original_event).unwrap();
+    assert_eq!(frozen["originals"]["event"], original);
+    assert!(matches!(
+        database
+            .finish_proxy_request_deferred(finish(&key, &reservation, request_id))
+            .await
+            .unwrap(),
+        FinishProxyRequestResult::AlreadyFinished { .. }
+    ));
+    database
+        .project_claimed_terminal_projection_task(owner, request_id)
+        .await
+        .unwrap();
+    let finished: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM request_events WHERE request_id=$1 AND event_kind='finished'",
+    )
+    .bind(request_id.to_string())
+    .fetch_one(&database.pool)
+    .await
+    .unwrap();
+    assert_eq!(finished, 1);
     assert_counts(&database, request_id, reservation.id, 1).await;
     database.close().await;
     sqlx::query(sqlx::AssertSqlSafe(format!("DROP SCHEMA {schema} CASCADE")))
