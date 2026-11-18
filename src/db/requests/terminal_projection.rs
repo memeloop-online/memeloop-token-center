@@ -229,6 +229,12 @@ impl Database {
         .bind(&request_id)
         .execute(&mut *transaction)
         .await?;
+            super::super::history_immutable_outbox::capture_event_in_transaction(
+                &mut transaction,
+                &event.event_id.to_string(),
+                event.event_at,
+            )
+            .await?;
         }
         let acknowledged = sqlx::query(
             "UPDATE terminal_projection_outbox SET projected_at = $1, statistics_outcome = $2, lease_owner = NULL, lease_expires_at = NULL WHERE request_id = $3 AND projected_at IS NULL AND lease_owner = $4 AND account_projected_at IS NOT NULL",

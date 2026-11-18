@@ -261,19 +261,20 @@ impl Database {
 
     pub(crate) async fn history_original_event_in_transaction(
         transaction: &mut Transaction<'_, Any>,
-        event_id: Uuid,
+        identity: &crate::request_history::HistoryIdentity,
     ) -> Result<Option<RequestEventView>, AppError> {
         let rows = sqlx::query(sqlx::AssertSqlSafe(enriched_request_events_sql(
-            "SELECT e.* FROM request_events e WHERE e.event_id = $1",
+            "SELECT e.* FROM request_events e WHERE e.event_id = $1 AND e.tenant_id=$2 AND e.key_id=$3 AND e.event_at=$4",
         )))
-        .bind(event_id.to_string())
+        .bind(identity.request_id.to_string())
+        .bind(identity.tenant_id.to_string()).bind(identity.key_id.to_string()).bind(identity.created_at)
         .fetch_all(&mut **transaction)
         .await?;
         let Some(mut event) = request_event_views(rows)?.into_iter().next() else {
             return Ok(None);
         };
-        let row = sqlx::query("SELECT source, request_id, tenant_id, key_id, created_at FROM request_history_source_ids WHERE source IN ('native', 'generation') AND request_id = $1 AND key_id = $2 AND tenant_id = (SELECT tenant_id FROM request_events WHERE event_id = $3)")
-            .bind(event.request_id.to_string()).bind(event.key_id.to_string()).bind(event_id.to_string()).fetch_optional(&mut **transaction).await?;
+        let row = sqlx::query("SELECT source, request_id, tenant_id, key_id, created_at FROM request_history_source_ids WHERE source IN ('native', 'generation') AND request_id = $1 AND key_id = $2 AND tenant_id = $3")
+            .bind(event.request_id.to_string()).bind(event.key_id.to_string()).bind(identity.tenant_id.to_string()).fetch_optional(&mut **transaction).await?;
         if let Some(row) = row {
             let identity = crate::request_history::HistoryIdentity {
                 source: row.try_get("source")?,

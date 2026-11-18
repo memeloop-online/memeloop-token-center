@@ -1499,6 +1499,12 @@ async fn emit_response_archive_transition_event_in_transaction(
     .bind(key_id)
     .execute(&mut **tx)
     .await?;
+    super::history_immutable_outbox::capture_event_in_transaction(
+        tx,
+        &cursor.event_id.to_string(),
+        cursor.event_at,
+    )
+    .await?;
     if inserted.rows_affected() != 1 {
         return Err(AppError::internal(
             "archive_spool_emit_response_archive_transition_event_in_transact",

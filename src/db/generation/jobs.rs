@@ -297,6 +297,12 @@ impl Database {
         .bind(&input.public_model)
         .execute(&mut *transaction)
         .await?;
+        super::super::history_immutable_outbox::capture_event_in_transaction(
+            &mut transaction,
+            &event.event_id.to_string(),
+            event.event_at,
+        )
+        .await?;
         super::super::history_immutable_outbox::capture_generation_in_transaction(
             &mut transaction,
             &request_id,
@@ -717,6 +723,12 @@ impl Database {
         .bind(&input.public_model)
         .execute(&mut *transaction)
         .await?;
+        super::super::history_immutable_outbox::capture_event_in_transaction(
+            &mut transaction,
+            &event.event_id.to_string(),
+            event.event_at,
+        )
+        .await?;
         super::super::history_immutable_outbox::capture_generation_in_transaction(
             &mut transaction,
             &request_id,
@@ -1011,6 +1023,12 @@ impl Database {
         .bind(public_model)
         .bind(now.saturating_sub(created_at))
         .execute(&mut *transaction)
+        .await?;
+        super::super::history_immutable_outbox::capture_event_in_transaction(
+            &mut transaction,
+            &event.event_id.to_string(),
+            event.event_at,
+        )
         .await?;
         super::super::history_immutable_outbox::capture_generation_in_transaction(
             &mut transaction,
@@ -1580,6 +1598,12 @@ async fn fail_preparing_generation_in_transaction(
     .bind(now.saturating_sub(row.try_get("created_at")?))
     .bind(error_code)
     .execute(&mut **tx)
+    .await?;
+    super::super::history_immutable_outbox::capture_event_in_transaction(
+        tx,
+        &event.event_id.to_string(),
+        event.event_at,
+    )
     .await?;
     Ok(true)
 }

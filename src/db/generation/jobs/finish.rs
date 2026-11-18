@@ -523,6 +523,12 @@ impl Database {
         .bind(&request_id)
         .execute(&mut *transaction)
         .await?;
+        super::super::super::history_immutable_outbox::capture_event_in_transaction(
+            &mut transaction,
+            &event.event_id.to_string(),
+            event.event_at,
+        )
+        .await?;
         if inserted.rows_affected() != 1 {
             return Err(AppError::internal("finish_site_5"));
         }
