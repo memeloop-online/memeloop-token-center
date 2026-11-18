@@ -782,7 +782,7 @@ impl Database {
             let mut transaction = self.pool.begin().await?;
             let original = super::history_immutable_outbox::original_event_in_transaction(
                 &mut transaction,
-                identity.request_id,
+                &identity,
             )
             .await?;
             transaction.commit().await?;

@@ -1491,13 +1491,19 @@ async fn emit_response_archive_transition_event_in_transaction(
     let cursor = allocate_request_event_cursor(tx, now, &tenant_id, &key_id, &request_id).await?;
     let inserted = sqlx::query(sqlx::AssertSqlSafe(spool_sql(purpose,
         "INSERT INTO request_events (event_id, tenant_id, key_id, request_id, event_at, event_kind, protocol, model, status_code, duration_ms, input_tokens, output_tokens, cost_micros, error_code) SELECT $1, tenant_id, key_id, id, $2, $3, protocol, model, status_code, duration_ms, input_tokens, output_tokens, cost_micros, error_code FROM request_records WHERE id = $4 AND tenant_id = $5 AND key_id = $6")))
-    .bind(cursor.event_id)
+    .bind(&cursor.event_id)
     .bind(cursor.event_at)
     .bind(event_kind)
     .bind(request_id)
     .bind(tenant_id)
     .bind(key_id)
     .execute(&mut **tx)
+    .await?;
+    super::history_immutable_outbox::capture_event_in_transaction(
+        tx,
+        &cursor.event_id.to_string(),
+        cursor.event_at,
+    )
     .await?;
     if inserted.rows_affected() != 1 {
         return Err(AppError::internal(

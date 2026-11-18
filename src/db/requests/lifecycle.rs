@@ -2234,6 +2234,12 @@ impl Database {
         .bind(&request.model)
         .execute(&mut *transaction)
         .await?;
+        super::super::history_immutable_outbox::capture_event_in_transaction(
+            &mut transaction,
+            &event.event_id.to_string(),
+            event.event_at,
+        )
+        .await?;
         transaction.commit().await?;
         Ok(())
     }
@@ -2535,6 +2541,12 @@ async fn insert_request_started_event_in_transaction(
     .bind(&request.protocol)
     .bind(&request.model)
     .execute(&mut **transaction)
+    .await?;
+    super::super::history_immutable_outbox::capture_event_in_transaction(
+        transaction,
+        &event.event_id.to_string(),
+        event.event_at,
+    )
     .await?;
     Ok(())
 }
@@ -2877,6 +2889,12 @@ async fn record_request_finished_with_basis_and_metering_in_transaction(
     .bind(&request_id)
     .bind(created_at)
     .execute(&mut **tx)
+    .await?;
+    super::super::history_immutable_outbox::capture_event_in_transaction(
+        tx,
+        &event.event_id.to_string(),
+        event.event_at,
+    )
     .await?;
     if inserted.rows_affected() != 1 {
         return Err(AppError::internal("lifecycle_site_8"));

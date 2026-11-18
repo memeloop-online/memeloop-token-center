@@ -26,10 +26,11 @@ fn original_row(row: &AnyRow) -> Result<Value, AppError> {
 // envelopes must not include the append-only collection of sibling events.
 pub(super) async fn original_event_in_transaction(
     transaction: &mut Transaction<'_, Any>,
-    event_id: Uuid,
+    identity: &crate::request_history::HistoryIdentity,
 ) -> Result<Value, AppError> {
-    let row = sqlx::query("SELECT * FROM request_events WHERE event_id=$1")
-        .bind(event_id.to_string())
+    let row = sqlx::query("SELECT * FROM request_events WHERE event_id=$1 AND tenant_id=$2 AND key_id=$3 AND event_at=$4")
+        .bind(identity.request_id.to_string())
+        .bind(identity.tenant_id.to_string()).bind(identity.key_id.to_string()).bind(identity.created_at)
         .fetch_optional(&mut **transaction)
         .await?;
     Ok(row
@@ -374,6 +375,42 @@ pub(super) async fn source_archive_envelope_in_transaction(
     Ok((history_identity, envelope))
 }
 
+pub(super) async fn capture_event_in_transaction(
+    transaction: &mut Transaction<'_, Any>,
+    event_id: &str,
+    event_at: i64,
+) -> Result<(), AppError> {
+    let row = sqlx::query("SELECT revision,tenant_id,key_id,created_at FROM request_history_export WHERE source='event' AND request_id=$1 AND created_at=$2 AND EXISTS(SELECT 1 FROM request_history_state WHERE id=1 AND mode<>'off')")
+        .bind(event_id).bind(event_at).fetch_optional(&mut **transaction).await?;
+    let Some(row) = row else {
+        return Ok(());
+    };
+    let identity = crate::request_history::HistoryIdentity {
+        source: "event".into(),
+        request_id: parse_uuid(event_id.to_owned())?,
+        tenant_id: parse_uuid(row.try_get("tenant_id")?)?,
+        key_id: parse_uuid(row.try_get("key_id")?)?,
+        created_at: event_at,
+    };
+    capture_event_envelope_in_transaction(transaction, &identity, row.try_get("revision")?).await
+}
+
+async fn capture_event_envelope_in_transaction(
+    transaction: &mut Transaction<'_, Any>,
+    identity: &crate::request_history::HistoryIdentity,
+    revision: i64,
+) -> Result<(), AppError> {
+    let request_id = identity.request_id.to_string();
+    let payload = Database::history_original_event_in_transaction(transaction, identity).await?;
+    let archive_identity=sqlx::query("SELECT e.request_id,CASE WHEN EXISTS(SELECT 1 FROM generation_jobs g WHERE g.id=e.request_id AND g.tenant_id=e.tenant_id AND g.key_id=e.key_id) THEN 'generation' ELSE 'native' END AS source FROM request_events e WHERE e.event_id=$1 AND e.tenant_id=$2 AND e.key_id=$3 AND e.event_at=$4")
+        .bind(&request_id).bind(identity.tenant_id.to_string()).bind(identity.key_id.to_string()).bind(identity.created_at).fetch_optional(&mut **transaction).await?;
+    let archive_identity=archive_identity.map(|row| -> Result<Value,AppError> {Ok(serde_json::json!({"tenant_id":identity.tenant_id,"request_id":row.try_get::<String,_>("request_id")?,"source":row.try_get::<String,_>("source")?}))}).transpose()?;
+    let original_event = original_event_in_transaction(transaction, identity).await?;
+    let envelope = serde_json::json!({"originals":{"event":original_event},"version":1,"source":"event","revision":revision,"request_id":identity.request_id,"tenant_id":identity.tenant_id,"key_id":identity.key_id,"created_at":identity.created_at,"payload":payload,"read_model":null,"statistics":null,"filter_cost_micros":null,"archive_identity":archive_identity});
+    insert_envelope_in_transaction(transaction, &identity, revision, &envelope).await?;
+    Ok(())
+}
+
 pub(super) async fn capture_native_in_transaction(
     transaction: &mut Transaction<'_, Any>,
     request_id: &str,
@@ -386,29 +423,12 @@ pub(super) async fn capture_native_in_transaction(
         return Ok(());
     };
     let revision: i64 = identity.try_get("revision")?;
-    let tenant: String = identity.try_get("tenant_id")?;
-    let key: String = identity.try_get("key_id")?;
     let (history_identity, envelope) =
         source_native_envelope_in_transaction(transaction, request_id, &identity).await?;
     insert_envelope_in_transaction(transaction, &history_identity, revision, &envelope).await?;
-    let events = sqlx::query("SELECT x.revision,x.request_id,x.created_at FROM request_history_export x JOIN request_events e ON e.event_id=x.request_id AND e.tenant_id=x.tenant_id AND e.key_id=x.key_id WHERE x.source='event' AND e.request_id=$1 AND x.tenant_id=$2 AND x.key_id=$3 ORDER BY x.revision")
-        .bind(request_id).bind(&tenant).bind(&key).fetch_all(&mut **transaction).await?;
-    for event in events {
-        let event_id = parse_uuid(event.try_get("request_id")?)?;
-        let event_identity = crate::request_history::HistoryIdentity {
-            source: "event".into(),
-            request_id: event_id,
-            created_at: event.try_get("created_at")?,
-            ..history_identity.clone()
-        };
-        let event_revision: i64 = event.try_get("revision")?;
-        let payload =
-            Database::history_original_event_in_transaction(transaction, event_id).await?;
-        let original_event = original_event_in_transaction(transaction, event_id).await?;
-        let envelope = serde_json::json!({"originals":{"event":original_event},"version":1,"source":"event","revision":event_revision,"tenant_id":tenant,"key_id":key,"request_id":event_id,"created_at":event_identity.created_at,"payload":payload,"filter_cost_micros":null,"statistics":null,"read_model":null,"archive_identity":{"tenant_id":tenant,"request_id":request_id,"source":"native"}});
-        insert_envelope_in_transaction(transaction, &event_identity, event_revision, &envelope)
-            .await?;
-    }
+    // Parent changes enqueue dependent event revisions durably through the
+    // source journal. Capture those identities independently in the exporter;
+    // never enumerate sibling events while holding this writer transaction.
     Ok(())
 }
 
@@ -424,29 +444,12 @@ pub(super) async fn capture_generation_in_transaction(
         return Ok(());
     };
     let revision: i64 = identity.try_get("revision")?;
-    let tenant: String = identity.try_get("tenant_id")?;
-    let key: String = identity.try_get("key_id")?;
     let (history_identity, envelope) =
         source_generation_envelope_in_transaction(transaction, request_id, &identity).await?;
     insert_envelope_in_transaction(transaction, &history_identity, revision, &envelope).await?;
-    let events = sqlx::query("SELECT x.revision,x.request_id,x.created_at FROM request_history_export x JOIN request_events e ON e.event_id=x.request_id AND e.tenant_id=x.tenant_id AND e.key_id=x.key_id WHERE x.source='event' AND e.request_id=$1 AND x.tenant_id=$2 AND x.key_id=$3 ORDER BY x.revision")
-        .bind(request_id).bind(&tenant).bind(&key).fetch_all(&mut **transaction).await?;
-    for event in events {
-        let event_id = parse_uuid(event.try_get("request_id")?)?;
-        let event_identity = crate::request_history::HistoryIdentity {
-            source: "event".into(),
-            request_id: event_id,
-            created_at: event.try_get("created_at")?,
-            ..history_identity.clone()
-        };
-        let event_revision: i64 = event.try_get("revision")?;
-        let payload =
-            Database::history_original_event_in_transaction(transaction, event_id).await?;
-        let original_event = original_event_in_transaction(transaction, event_id).await?;
-        let envelope = serde_json::json!({"originals":{"event":original_event},"version":1,"source":"event","revision":event_revision,"tenant_id":tenant,"key_id":key,"request_id":event_id,"created_at":event_identity.created_at,"payload":payload,"filter_cost_micros":null,"statistics":null,"read_model":null,"archive_identity":{"tenant_id":tenant,"request_id":request_id,"source":"generation"}});
-        insert_envelope_in_transaction(transaction, &event_identity, event_revision, &envelope)
-            .await?;
-    }
+    // Parent changes enqueue dependent event revisions durably through the
+    // source journal. Capture those identities independently in the exporter;
+    // never enumerate sibling events while holding this writer transaction.
     Ok(())
 }
 
@@ -681,18 +684,7 @@ impl Database {
             }
             let request_id = identity.request_id.to_string();
             if identity.source == "event" {
-                let payload = Self::history_original_event_in_transaction(
-                    &mut transaction,
-                    identity.request_id,
-                )
-                .await?;
-                let archive_identity=sqlx::query("SELECT e.request_id,CASE WHEN EXISTS(SELECT 1 FROM generation_jobs g WHERE g.id=e.request_id AND g.tenant_id=e.tenant_id AND g.key_id=e.key_id) THEN 'generation' ELSE 'native' END AS source FROM request_events e WHERE e.event_id=$1 AND e.tenant_id=$2 AND e.key_id=$3")
-                    .bind(&request_id).bind(identity.tenant_id.to_string()).bind(identity.key_id.to_string()).fetch_optional(&mut *transaction).await?;
-                let archive_identity=archive_identity.map(|row| -> Result<Value,AppError> {Ok(serde_json::json!({"tenant_id":identity.tenant_id,"request_id":row.try_get::<String,_>("request_id")?,"source":row.try_get::<String,_>("source")?}))}).transpose()?;
-                let original_event =
-                    original_event_in_transaction(&mut transaction, identity.request_id).await?;
-                let envelope = serde_json::json!({"originals":{"event":original_event},"version":1,"source":"event","revision":revision,"request_id":identity.request_id,"tenant_id":identity.tenant_id,"key_id":identity.key_id,"created_at":identity.created_at,"payload":payload,"read_model":null,"statistics":null,"filter_cost_micros":null,"archive_identity":archive_identity});
-                insert_envelope_in_transaction(&mut transaction, &identity, revision, &envelope)
+                capture_event_envelope_in_transaction(&mut transaction, &identity, revision)
                     .await?;
                 transaction.commit().await?;
                 continue;

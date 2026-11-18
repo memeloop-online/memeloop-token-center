@@ -754,8 +754,14 @@ impl Database {
             )
             .await?;
             sqlx::query("INSERT INTO request_events (event_id, tenant_id, key_id, request_id, event_at, event_kind, protocol, model, status_code, duration_ms, input_tokens, output_tokens, cost_micros, error_code) SELECT $1, tenant_id, key_id, id, $2, $3, protocol, model, status_code, duration_ms, input_tokens, output_tokens, cost_micros, error_code FROM request_records WHERE id = $4 AND tenant_id = $5 AND key_id = $6")
-                .bind(cursor.event_id).bind(cursor.event_at).bind(if success { "archive_bound" } else { "archive_gap" })
+                .bind(&cursor.event_id).bind(cursor.event_at).bind(if success { "archive_bound" } else { "archive_gap" })
                 .bind(request_id).bind(tenant_id).bind(key_id).execute(&mut *transaction).await?;
+            super::history_immutable_outbox::capture_event_in_transaction(
+                &mut transaction,
+                &cursor.event_id.to_string(),
+                cursor.event_at,
+            )
+            .await?;
         }
         transaction.commit().await?;
         if changed.rows_affected() == 1

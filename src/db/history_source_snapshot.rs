@@ -185,12 +185,12 @@ impl HistorySourceSnapshot {
                         };
                         let payload = Database::history_original_event_in_transaction(
                             &mut self.transaction,
-                            identity.request_id,
+                            &identity,
                         )
                         .await?;
                         let original = history_immutable_outbox::original_event_in_transaction(
                             &mut self.transaction,
-                            identity.request_id,
+                            &identity,
                         )
                         .await?;
                         let parent: Option<String> = sqlx::query_scalar(
