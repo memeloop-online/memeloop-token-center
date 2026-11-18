@@ -2321,7 +2321,7 @@ async fn emit_conversation_projected_event_in_transaction(
             WHERE request_id = $3 AND tenant_id = $4 AND key_id = $5
               AND NOT EXISTS (SELECT 1 FROM request_records WHERE id = $3)"#,
     )
-    .bind(event.event_id)
+    .bind(&event.event_id)
     .bind(event.event_at)
     .bind(&request_id)
     .bind(tenant_id)
