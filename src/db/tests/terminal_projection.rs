@@ -1438,3 +1438,88 @@ async fn postgres_terminal_prune_rebuild_and_delayed_commit_share_durable_bounda
         .await
         .unwrap();
 }
+
+#[tokio::test]
+#[ignore = "requires the CI PostgreSQL fixture"]
+async fn postgres_terminal_writer_does_not_capture_sibling_events() {
+    let database_url = std::env::var("MTC_TEST_POSTGRES_URL").unwrap();
+    let admin = sqlx::PgPool::connect(&database_url).await.unwrap();
+    let schema = format!("writer_capture_{}", Uuid::now_v7().simple());
+    sqlx::query(sqlx::AssertSqlSafe(format!("CREATE SCHEMA {schema}")))
+        .execute(&admin)
+        .await
+        .unwrap();
+    let mut isolated = url::Url::parse(&database_url).unwrap();
+    isolated
+        .query_pairs_mut()
+        .append_pair("options", &format!("-csearch_path={schema}"));
+    let database = Database::connect_with_max(isolated.as_str(), 8)
+        .await
+        .unwrap();
+    database.migrate().await.unwrap();
+    database.history_bootstrap_capture().await.unwrap();
+    database.history_activate_capture().await.unwrap();
+    let (key, reservation, request_id) = admitted(&database, false).await;
+    let sibling: String = sqlx::query_scalar(
+        "SELECT event_id FROM request_events WHERE request_id=$1 ORDER BY event_at LIMIT 1",
+    )
+    .bind(request_id.to_string())
+    .fetch_one(&database.pool)
+    .await
+    .unwrap();
+    // Gate only attempts to freeze the OLD event. New event capture and all
+    // normal source/journal writes remain available to the real terminal writer.
+    sqlx::raw_sql(sqlx::AssertSqlSafe(format!("CREATE FUNCTION gate_sibling_capture() RETURNS trigger LANGUAGE plpgsql AS $$ BEGIN IF NEW.source='event' AND NEW.request_id='{sibling}' THEN PERFORM pg_advisory_xact_lock(984,1); END IF; RETURN NEW; END $$; CREATE TRIGGER gate_sibling_capture BEFORE INSERT ON request_history_immutable_outbox FOR EACH ROW EXECUTE FUNCTION gate_sibling_capture();")))
+        .execute(&database.pool).await.unwrap();
+    let mut gate = database.pool.begin().await.unwrap();
+    sqlx::query("SELECT pg_advisory_xact_lock(984,1)")
+        .execute(&mut *gate)
+        .await
+        .unwrap();
+    tokio::time::timeout(
+        Duration::from_secs(5),
+        database.finish_proxy_request_deferred(finish(&key, &reservation, request_id)),
+    )
+    .await
+    .expect("financial terminal must not enumerate old events")
+    .unwrap();
+    let owner = Uuid::now_v7();
+    database
+        .claim_terminal_projection_tasks(owner, 32)
+        .await
+        .unwrap();
+    tokio::time::timeout(
+        Duration::from_secs(5),
+        database.project_claimed_terminal_projection_task(owner, request_id),
+    )
+    .await
+    .expect("real terminal projection must not capture old siblings")
+    .unwrap();
+    assert_counts(&database, request_id, reservation.id, 1).await;
+    let current: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM request_events e JOIN request_history_immutable_outbox o ON o.source='event' AND o.request_id=e.event_id AND o.created_at=e.event_at WHERE e.request_id=$1 AND e.event_kind='finished'")
+        .bind(request_id.to_string()).fetch_one(&database.pool).await.unwrap();
+    assert_eq!(
+        current, 1,
+        "new event must freeze atomically with terminal projection"
+    );
+    let pending: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM request_history_export WHERE source='event' AND request_id=$1 AND snapshot IS NULL")
+        .bind(&sibling).fetch_one(&database.pool).await.unwrap();
+    assert_eq!(
+        pending, 1,
+        "parent-derived sibling revision must remain durable"
+    );
+    gate.rollback().await.unwrap();
+    database.history_capture_pending(64).await.unwrap();
+    let restored: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM request_history_export x JOIN request_history_immutable_outbox o ON o.revision=x.revision WHERE x.source='event' AND x.request_id=$1")
+        .bind(&sibling).fetch_one(&database.pool).await.unwrap();
+    assert_eq!(
+        restored, 1,
+        "background must freeze the pending sibling revision"
+    );
+    assert_counts(&database, request_id, reservation.id, 1).await;
+    database.close().await;
+    sqlx::query(sqlx::AssertSqlSafe(format!("DROP SCHEMA {schema} CASCADE")))
+        .execute(&admin)
+        .await
+        .unwrap();
+}
