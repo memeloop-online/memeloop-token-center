@@ -659,6 +659,12 @@ impl Database {
         } else {
             DatabaseBackend::PostgreSql
         };
+        let diagnostics = request_pool::PoolDiagnostics::new(match profile {
+            ConnectionProfile::Serve => "serve",
+            ConnectionProfile::Migration => "migration",
+        });
+        let initialization_diagnostics = diagnostics.clone();
+        let release_diagnostics = diagnostics.clone();
         let mut pool_options = AnyPoolOptions::new()
             .min_connections(0)
             .max_connections(maximum_connections)
@@ -666,7 +672,9 @@ impl Database {
             .idle_timeout(Some(Duration::from_secs(5 * 60)))
             .max_lifetime(Some(Duration::from_secs(30 * 60)))
             .after_release(move |connection, _metadata| {
-                Box::pin(async move { Ok(request_connection::can_reuse(connection, backend)) })
+                let reusable = request_connection::can_reuse(connection, backend);
+                release_diagnostics.released(reusable);
+                Box::pin(async move { Ok(reusable) })
             });
         if matches!(backend, DatabaseBackend::Sqlite) {
             // SQLite is a supported lightweight/test backend and can have a
@@ -689,9 +697,13 @@ impl Database {
             let application_name = postgres_application_name("mtc-serve");
             pool_options = pool_options.after_connect(move |connection, _metadata| {
                 let application_name = application_name.clone();
+                let mut initialization = initialization_diagnostics.initializing();
                 Box::pin(async move {
-                    initialize_postgres_connection(connection, &application_name, profile).await?;
-                    Ok(())
+                    let result =
+                        initialize_postgres_connection(connection, &application_name, profile)
+                            .await;
+                    initialization.finish(result.is_ok());
+                    result
                 })
             });
         }
@@ -699,11 +711,14 @@ impl Database {
         // invalid URL, so the same `sqlite://...` fixtures never open a file.
         let database_url = Self::normalized_sqlite_url(database_url);
         let pool = if matches!(backend, DatabaseBackend::PostgreSql) {
-            let pool: AnyPool = pool_options.connect_lazy(database_url.as_ref())?.into();
+            let pool: AnyPool =
+                request_pool::RequestPool::from(pool_options.connect_lazy(database_url.as_ref())?)
+                    .with_diagnostics(diagnostics.clone());
             wait_for_initial_postgres_connection(&pool).await?;
             pool
         } else {
             AnyPool::from(pool_options.connect(database_url.as_ref()).await?)
+                .with_diagnostics(diagnostics)
         };
         if matches!(backend, DatabaseBackend::Sqlite) {
             // The control, gateway, and worker roles may be separate processes
