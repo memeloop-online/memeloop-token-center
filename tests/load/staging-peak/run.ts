@@ -49,7 +49,14 @@ export async function run(plan: Plan, env = process.env): Promise<Record<string,
   const gateway = new URL(env.MTC_TEST_GATEWAY_URL ?? "http://memeloop-token-center-test-gateway:8080");
   const control = new URL(env.MTC_TEST_CONTROL_URL ?? "http://memeloop-token-center-test-control:8080");
   const mock = new URL(env.MTC_TEST_MOCK_URL ?? `http://mtc-peak-${runId}-mock:8080`);
-  for (const [url, host] of [[gateway,"memeloop-token-center-test-gateway"],[control,"memeloop-token-center-test-control"],[mock,`mtc-peak-${runId}-mock`]] as const) if (url.protocol !== "http:" || url.hostname !== host || url.port !== "8080" || url.pathname !== "/") throw new Error("TEST-only service identity mismatch");
+  const forwarded = env.MTC_PEAK_OPERATOR_FORWARD === "1";
+  const upstreamBase = forwarded ? new URL(env.MTC_PEAK_UPSTREAM_BASE_URL ?? "") : mock;
+  if (forwarded) {
+    for (const [url, port] of [[gateway,"18090"],[control,"18089"],[mock,"18091"]] as const) if (url.protocol !== "http:" || url.hostname !== "127.0.0.1" || url.port !== port || url.pathname !== "/" || url.username || url.password || url.search || url.hash) throw new Error("invalid operator forward endpoint");
+    if (upstreamBase.protocol !== "http:" || upstreamBase.hostname !== env.MTC_PEAK_TEST_GATEWAY_POD_IP || !/^10\.42\.\d{1,3}\.\d{1,3}$/.test(upstreamBase.hostname) || upstreamBase.port !== "18080" || upstreamBase.pathname !== "/" || upstreamBase.username || upstreamBase.password || upstreamBase.search || upstreamBase.hash) throw new Error("invalid TEST sidecar upstream");
+  } else {
+    for (const [url, host] of [[gateway,"memeloop-token-center-test-gateway"],[control,"memeloop-token-center-test-control"],[mock,`mtc-peak-${runId}-mock`]] as const) if (url.protocol !== "http:" || url.hostname !== host || url.port !== "8080" || url.pathname !== "/") throw new Error("TEST-only service identity mismatch");
+  }
   enter("mock_identity");
   const identityResponse=await fetch(new URL("/identity",mock),{signal:AbortSignal.timeout(10_000)});
   httpStatus=identityResponse.status;
@@ -77,7 +84,7 @@ export async function run(plan: Plan, env = process.env): Promise<Record<string,
   for (const scenario of new Set(plan.arrivals.map(row => row.scenario))) {
     setupScenario=scenario; setupIndex=(setupIndex ?? -1)+1;
     const model = `staging-peak-${runId}-${scenario}`;
-    const upstream = await call("upstream_setup", "/internal/v1/upstreams", { tenant_external_id:tenant, name:model, driver:"http-json", config:{ base_url:new URL(`/scenario/${scenario}`,mock).href }, credential:{ type:"none" } });
+    const upstream = await call("upstream_setup", "/internal/v1/upstreams", { tenant_external_id:tenant, name:model, driver:"http-json", config:{ base_url:new URL(`/scenario/${scenario}`,upstreamBase).href, network_scope:"private" }, credential:{ type:"none" } });
     const route = await call("route_setup", "/internal/v1/model-routes", { tenant_external_id:tenant, public_model:model, upstream_account_id:upstream.id, upstream_model:model, protocol:"openai", priority:0, custom_model_confirmed:true });
     await call("price_setup", `/internal/v1/prices/USD/${model}`, { input_per_million:"0.01", output_per_million:"0.02" });
     models[scenario]=model; routes.push(String(route.id));
@@ -127,7 +134,7 @@ export async function run(plan: Plan, env = process.env): Promise<Record<string,
   let baselineHash:string|undefined, baselineError:string|undefined;
   try { baselineHash=baselineIdentity(validateBaseline(plan.baseline)); } catch { baselineError="historical_peak_coverage_incomplete"; }
   const latencies=requests.map(row=>Number(row.latency_ms));
-  return {schema_version:1,run_id:runId,release_batch:plan.release_batch,source_sha:env.MTC_HARNESS_SOURCE_SHA??null,harness_source_sha:env.MTC_HARNESS_SOURCE_SHA??null,candidate:actualCandidate,candidate_evidence_sha256:artifactHash(plan.candidate_evidence),plan_sha256:artifactHash(plan),tenant,offered:plan.arrivals.length,started:requests.length,completed:requests.filter(row=>!row.error).length,failed:requests.filter(row=>row.error).length,unissued:plan.arrivals.length-requests.length,peak_active:peakActive,http_exchanges:requests.reduce((sum,row)=>sum+Number(row.http_exchanges),0),latency_ms:{p50:percentile(latencies,.5),p95:percentile(latencies,.95),p99:percentile(latencies,.99),max:Math.max(...latencies)},baseline_sha256:artifactHash(plan.baseline),validated_baseline_sha256:baselineHash,baseline_error:baselineError,qualification:"NOT_EVALUATED",missing_evidence:["complete historical multidimensional peak","financial exactly-once assertions","semantic/archive API payload verification","PG poolwait/IO/locks and memory recovery","archive debt drain confirmation"],requests};
+  return {topology:forwarded?"same-pod-mock+port-forward":"cross-pod",schema_version:1,run_id:runId,release_batch:plan.release_batch,source_sha:env.MTC_HARNESS_SOURCE_SHA??null,harness_source_sha:env.MTC_HARNESS_SOURCE_SHA??null,candidate:actualCandidate,candidate_evidence_sha256:artifactHash(plan.candidate_evidence),plan_sha256:artifactHash(plan),tenant,offered:plan.arrivals.length,started:requests.length,completed:requests.filter(row=>!row.error).length,failed:requests.filter(row=>row.error).length,unissued:plan.arrivals.length-requests.length,peak_active:peakActive,http_exchanges:requests.reduce((sum,row)=>sum+Number(row.http_exchanges),0),latency_ms:{p50:percentile(latencies,.5),p95:percentile(latencies,.95),p99:percentile(latencies,.99),max:Math.max(...latencies)},baseline_sha256:artifactHash(plan.baseline),validated_baseline_sha256:baselineHash,baseline_error:baselineError,qualification:"NOT_EVALUATED",missing_evidence:["complete historical multidimensional peak","financial exactly-once assertions","semantic/archive API payload verification","PG poolwait/IO/locks and memory recovery","archive debt drain confirmation"],requests};
 }
 if(process.argv[1] && import.meta.url===pathToFileURL(process.argv[1]).href) {
   try { enter("plan_read"); const plan=JSON.parse(readFileSync(process.env.MTC_PEAK_PLAN_FILE??"/plan/plan.json","utf8")); enter("plan_validate"); const report=await run(validatePlan(plan)); enter("report_write"); writeFileSync(process.env.MTC_PEAK_REPORT_FILE??"/evidence/report.json",JSON.stringify(report,null,2)); console.log(JSON.stringify(report)); process.exitCode=Number(report.failed)>0?2:0; }
