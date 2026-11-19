@@ -319,6 +319,24 @@ async fn assert_event_enrichment(database: &Database) {
         .bind(&request).bind(now).fetch_one(&mut *transaction).await.unwrap();
     assert_eq!(timing, (Some(7), Some(11)));
     transaction.rollback().await.unwrap();
+    // Execution has completed while financial projection has not: both read
+    // surfaces must use the same operational receipt, without inventing money.
+    sqlx::query("INSERT INTO proxy_operational_terminals (request_id, request_created_at, tenant_id, key_id, account_id, reservation_id, owner_token, fence, contract_digest, receipt_id, operational_digest, status_code, completed_at, duration_ms, response_object, recorded_at) SELECT id, created_at, tenant_id, key_id, $1, reservation_id, 'owner', 'fence', 'contract', 'receipt', 'digest', 200, created_at + 25, 25, 'gap://fixture', created_at + 30 FROM request_records WHERE id = $2 AND created_at = $3")
+        .bind(&account).bind(&request).bind(now).execute(&database.pool).await.unwrap();
+    sqlx::query("INSERT INTO pending_proxy_settlements (request_id, tenant_id, key_id, account_id, reservation_id, owner_token, fence, contract_digest, contract_json, state, created_at, updated_at) SELECT id, tenant_id, key_id, $1, reservation_id, 'owner', 'fence', 'contract', '{}', 'pending', created_at, created_at + 30 FROM request_records WHERE id = $2 AND created_at = $3")
+        .bind(&account).bind(&request).bind(now).execute(&database.pool).await.unwrap();
+    sqlx::query("UPDATE request_records SET status_code = NULL, completed_at = NULL WHERE id = $1 AND created_at = $2")
+        .bind(&request).bind(now).execute(&database.pool).await.unwrap();
+    let rest = database.list_all_requests(&external, 10).await.unwrap();
+    let live = database.request_events_after(&external, now, None, 500).await.unwrap();
+    let rest = serde_json::to_value(&rest[0]).unwrap();
+    let live = serde_json::to_value(&live[0]).unwrap();
+    for field in ["status_code", "duration_ms", "operational_terminal", "cost", "usage", "billing"] {
+        assert_eq!(live[field], rest[field], "operational pending field {field}");
+    }
+    assert_eq!(live["status_code"], 200);
+    assert_eq!(live["operational_terminal"]["financial_state"], "pending");
+    assert!(live["cost"].is_null());
     // The SQLite fixture owns its pool. PostgreSQL CI shares its database
     // with concurrent high-volume tests, so a global first page is not ours.
     if matches!(database.backend, DatabaseBackend::Sqlite) {

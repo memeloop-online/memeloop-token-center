@@ -229,6 +229,7 @@ export type RequestEventKind = 'started' | 'finished' | 'projected' | 'archive_b
 export type RequestArchiveState = 'capturing' | 'pending' | 'uploading' | 'metadata_only' | 'bound' | 'gap';
 
 export interface RequestEvent {
+  egress?: RequestView['egress'];
   operational_terminal?: RequestView['operational_terminal'];
   usage_basis?: RequestView['usage_basis'];
   compaction?: true | null;

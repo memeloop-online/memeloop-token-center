@@ -986,6 +986,10 @@ impl RequestSessionContext {
 
 #[derive(Clone, Debug, Deserialize)]
 pub struct RequestEventView {
+    #[serde(default)]
+    pub operational_terminal: Option<RequestOperationalTerminalView>,
+    #[serde(default)]
+    pub egress: Option<RequestEgressObservation>,
     pub usage_basis: Option<RequestUsageBasis>,
     pub compaction: Option<bool>,
     pub first_output_ms: Option<i64>,
@@ -1040,6 +1044,8 @@ impl Serialize for RequestEventView {
 
         let tokens = self.usage.tokens.as_ref();
         let mut state = serializer.serialize_struct("RequestEventView", 36)?;
+        state.serialize_field("operational_terminal", &self.operational_terminal)?;
+        state.serialize_field("egress", &self.egress)?;
         state.serialize_field("usage_basis", &self.usage_basis)?;
         state.serialize_field("compaction", &self.compaction.filter(|value| *value))?;
         state.serialize_field("event_id", &self.event_id)?;

@@ -164,3 +164,32 @@ test('legacy SSE without terminal cause preserves the recorded typed cause', () 
   };
   assert.equal(requestViewFromEvent(terminal, recorded)?.terminal_cause_code, 'upstream_eof_without_terminal');
 });
+
+test('live-only rows receive the same recorded exit as REST and retain newer observations', () => {
+  const egress: NonNullable<RequestView['egress']> = {
+    selected: { kind: 'direct', group_id: null, group_version: null, group_name: null,
+      member_id: null, member_name: null, scheme: null, host: null, port: null },
+    observed_at: 800,
+  };
+  const live = requestViewFromEvent({ ...event, created_at: 100, egress });
+  assert.deepEqual(live?.egress, egress);
+  assert.deepEqual(requestViewFromEvent({ ...event, created_at: 100 }, live)?.egress, egress);
+  assert.deepEqual(requestViewFromEvent({ ...event, egress: { ...egress, observed_at: 700 } }, live)?.egress, egress);
+  const terminal = { ...recorded, operational_terminal: { completed_at: 800, stage: null, financial_state: 'pending' as const } };
+  assert.deepEqual(requestViewFromEvent({ ...event, egress }, terminal)?.egress, egress);
+});
+
+test('authoritative receipt permits settlement and prevents applied receipt regression', () => {
+  const pending: RequestView = { ...recorded, completed_at: null, cost: null,
+    operational_terminal: { completed_at: 800, stage: null, financial_state: 'pending' } };
+  const settled: RequestEvent = { ...event, completed_at: 1000,
+    operational_terminal: { completed_at: 800, stage: null, financial_state: 'applied' },
+    input_tokens: 124319, output_tokens: 156, cost: '2' };
+  const live = requestViewFromEvent(settled, pending)!;
+  assert.equal(live.input_tokens, 124319);
+  assert.equal(live.cost, '2');
+  assert.equal(live.operational_terminal?.financial_state, 'applied');
+  const delayed = { ...event, status_code: null, cost: null, operational_terminal: pending.operational_terminal };
+  assert.deepEqual(requestViewFromEvent(delayed, live), live);
+  assert.deepEqual(requestViewFromEvent(event, live), live);
+});

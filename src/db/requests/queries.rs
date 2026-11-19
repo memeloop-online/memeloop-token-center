@@ -142,6 +142,11 @@ impl Database {
             .map(|row| parse_uuid(row.try_get("tenant_id")?))
             .collect::<Result<Vec<_>, AppError>>()?;
         let mut events = request_event_views(rows)?;
+        let ids = events.iter().map(|event| event.request_id.to_string()).collect::<Vec<_>>();
+        let observations = egress::request_list_egress(self, &ids).await?;
+        for event in &mut events {
+            event.egress = observations.get(&event.request_id).cloned();
+        }
         if let Some(archive) = &self.archive {
             for (event, tenant) in events.iter_mut().zip(tenants) {
                 if event.protocol != "generation"
@@ -189,6 +194,11 @@ impl Database {
             .map(|row| parse_uuid(row.try_get("tenant_id")?))
             .collect::<Result<Vec<_>, AppError>>()?;
         let mut events = request_event_views(rows)?;
+        let ids = events.iter().map(|event| event.request_id.to_string()).collect::<Vec<_>>();
+        let observations = egress::request_list_egress(self, &ids).await?;
+        for event in &mut events {
+            event.egress = observations.get(&event.request_id).cloned();
+        }
         if let Some(archive) = &self.archive {
             for (event, tenant) in events.iter_mut().zip(tenants) {
                 if event.protocol != "generation"
@@ -216,6 +226,7 @@ impl Database {
         let Some(mut event) = request_event_views(rows)?.into_iter().next() else {
             return Ok(None);
         };
+        event.egress = egress::request_list_egress(self, &[event.request_id.to_string()]).await?.remove(&event.request_id);
         let row = sqlx::query("SELECT source, request_id, tenant_id, key_id, created_at FROM request_history_source_ids WHERE source IN ('native', 'generation') AND request_id = $1 AND key_id = $2 AND tenant_id = (SELECT tenant_id FROM request_events WHERE event_id = $3)")
             .bind(event.request_id.to_string()).bind(event.key_id.to_string()).bind(event_id.to_string()).fetch_optional(&self.pool).await?;
         if let Some(row) = row {
@@ -253,6 +264,8 @@ impl Database {
                 event.supplier_error = view.supplier_error;
                 event.archive_state = view.archive_state;
                 event.session_context = view.session_context;
+                event.operational_terminal = view.operational_terminal;
+                event.egress = view.egress;
                 event.credential_identity = view.credential_identity;
             }
         }
@@ -273,6 +286,7 @@ impl Database {
         let Some(mut event) = request_event_views(rows)?.into_iter().next() else {
             return Ok(None);
         };
+        event.egress = egress::request_list_egress_in_transaction(transaction, &[event.request_id.to_string()]).await?.remove(&event.request_id);
         let row = sqlx::query("SELECT source, request_id, tenant_id, key_id, created_at FROM request_history_source_ids WHERE source IN ('native', 'generation') AND request_id = $1 AND key_id = $2 AND tenant_id = $3")
             .bind(event.request_id.to_string()).bind(event.key_id.to_string()).bind(identity.tenant_id.to_string()).fetch_optional(&mut **transaction).await?;
         if let Some(row) = row {
@@ -312,6 +326,8 @@ impl Database {
                 event.supplier_error = view.supplier_error;
                 event.archive_state = view.archive_state;
                 event.session_context = view.session_context;
+                event.operational_terminal = view.operational_terminal;
+                event.egress = view.egress;
                 event.credential_identity = view.credential_identity;
             }
         }
@@ -2039,25 +2055,29 @@ fn enriched_request_events_sql(events: &str) -> String {
     format!(
         r#"WITH events AS MATERIALIZED ({events})
 SELECT e.*, COALESCE(r.created_at, g.created_at) AS created_at,
+       CAST(CASE WHEN r.id IS NOT NULL THEN 1 ELSE 0 END AS BIGINT) AS native_terminal,
+       op.completed_at AS operational_completed_at, op.stage AS operational_stage,
+       CASE WHEN financial.state = 'applied' THEN 'applied' WHEN financial.unknown_reason IS NOT NULL THEN 'unknown' WHEN financial.state = 'pending' THEN 'pending' ELSE NULL END AS financial_state,
        COALESCE(r.completed_at, g.completed_at) AS completed_at,
        CAST(NULL AS BIGINT) AS source_completed_at,
-       r.first_output_ms, r.generation_duration_ms, r.usage_basis,
+       CASE WHEN op.request_id IS NOT NULL THEN op.first_output_ms ELSE r.first_output_ms END AS first_output_ms,
+       CASE WHEN op.request_id IS NOT NULL THEN op.generation_duration_ms ELSE r.generation_duration_ms END AS generation_duration_ms, r.usage_basis,
        g.status AS generation_status,
        COALESCE(r.upstream_model, g.upstream_model) AS upstream_model,
-       COALESCE(r.upstream_account_id, g.upstream_account_id) AS upstream_account_id,
-       COALESCE(r.model_route_id, g.model_route_id) AS route_id,
-       COALESCE(r.status_code, CASE WHEN g.id IS NULL THEN e.status_code ELSE NULL END) AS current_status_code,
-       COALESCE(r.duration_ms, CASE WHEN g.completed_at IS NULL THEN NULL ELSE g.completed_at - g.created_at END, e.duration_ms) AS current_duration_ms,
-       CASE WHEN r.completed_at IS NOT NULL THEN r.input_tokens WHEN g.id IS NULL AND e.event_kind = 'finished' THEN e.input_tokens ELSE NULL END AS current_input_tokens,
+       CASE WHEN op.request_id IS NOT NULL THEN op.upstream_account_id ELSE COALESCE(r.upstream_account_id, g.upstream_account_id) END AS upstream_account_id,
+       CASE WHEN op.request_id IS NOT NULL THEN op.model_route_id ELSE COALESCE(r.model_route_id, g.model_route_id) END AS route_id,
+       COALESCE(op.status_code, r.status_code, CASE WHEN g.id IS NULL THEN e.status_code ELSE NULL END) AS current_status_code,
+       COALESCE(op.duration_ms, r.duration_ms, CASE WHEN g.completed_at IS NULL THEN NULL ELSE g.completed_at - g.created_at END, e.duration_ms) AS current_duration_ms,
+       CASE WHEN r.completed_at IS NOT NULL THEN r.input_tokens WHEN r.id IS NULL AND g.id IS NULL AND e.event_kind = 'finished' THEN e.input_tokens ELSE NULL END AS current_input_tokens,
        CASE WHEN r.completed_at IS NOT NULL THEN r.cached_input_tokens ELSE NULL END AS cached_input_tokens,
        CASE WHEN r.completed_at IS NOT NULL THEN r.cache_write_tokens ELSE NULL END AS cache_write_tokens,
-       CASE WHEN r.completed_at IS NOT NULL THEN r.output_tokens WHEN g.id IS NULL AND e.event_kind = 'finished' THEN e.output_tokens ELSE NULL END AS current_output_tokens,
+       CASE WHEN r.completed_at IS NOT NULL THEN r.output_tokens WHEN r.id IS NULL AND g.id IS NULL AND e.event_kind = 'finished' THEN e.output_tokens ELSE NULL END AS current_output_tokens,
        COALESCE(facts.billed_units, CASE WHEN r.completed_at IS NOT NULL THEN r.billed_units ELSE NULL END) AS billed_units,
        COALESCE(NULLIF(facts.billing_unit, ''), CASE WHEN r.completed_at IS NOT NULL THEN NULLIF(r.billing_unit, '') ELSE NULL END) AS billing_unit,
-       COALESCE(facts.cost_micros, CASE WHEN r.completed_at IS NOT NULL THEN r.cost_micros WHEN g.id IS NULL AND e.event_kind = 'finished' THEN e.cost_micros ELSE NULL END) AS current_cost_micros,
-       COALESCE(NULLIF(facts.currency, ''), NULLIF(r.currency, '')) AS currency,
-       COALESCE(r.error_code, g.error_code, e.error_code) AS current_error_code,
-       r.terminal_cause_code AS current_terminal_cause_code, r.in_flight_stage AS in_flight_stage,
+       COALESCE(facts.cost_micros, CASE WHEN r.completed_at IS NOT NULL THEN r.cost_micros WHEN r.id IS NULL AND g.id IS NULL AND e.event_kind = 'finished' THEN e.cost_micros ELSE NULL END) AS current_cost_micros,
+       COALESCE(NULLIF(facts.currency, ''), CASE WHEN r.completed_at IS NOT NULL THEN NULLIF(r.currency, '') ELSE NULL END) AS currency,
+       CASE WHEN op.request_id IS NOT NULL THEN op.error_code ELSE COALESCE(r.error_code, g.error_code, e.error_code) END AS current_error_code,
+       CASE WHEN op.request_id IS NOT NULL THEN op.terminal_cause_code ELSE r.terminal_cause_code END AS current_terminal_cause_code, r.in_flight_stage AS in_flight_stage,
        CASE WHEN r.completed_at IS NOT NULL AND r.status_code >= 400 AND r.response_object LIKE 'inline-json:%' AND LENGTH(r.response_object) <= 131072 THEN r.response_object ELSE NULL END AS supplier_error_inline_json,
        CASE WHEN g.id IS NOT NULL THEN
             CASE WHEN g.status IN ('preparing', 'queued') THEN 'pending'
@@ -2083,6 +2103,12 @@ SELECT e.*, COALESCE(r.created_at, g.created_at) AS created_at,
   LEFT JOIN request_records r
     ON r.id = locator.id AND r.created_at = locator.created_at
    AND r.tenant_id = e.tenant_id AND r.key_id = e.key_id
+  LEFT JOIN proxy_operational_terminals op
+    ON op.request_id = r.id AND op.request_created_at = r.created_at
+   AND op.tenant_id = r.tenant_id AND op.key_id = r.key_id AND op.reservation_id = r.reservation_id
+  LEFT JOIN pending_proxy_settlements financial
+    ON financial.request_id = r.id AND financial.tenant_id = r.tenant_id
+   AND financial.key_id = r.key_id AND financial.reservation_id = r.reservation_id
   LEFT JOIN generation_jobs g
     ON r.id IS NULL AND e.protocol = 'generation' AND g.id = e.request_id
    AND g.tenant_id = e.tenant_id AND g.key_id = e.key_id
@@ -2158,6 +2184,8 @@ fn request_event_views(rows: Vec<AnyRow>) -> Result<Vec<RequestEventView>, AppEr
                 },
             );
             Ok(RequestEventView {
+                operational_terminal: operational_terminal_view(&row)?,
+                egress: None,
                 usage_basis,
                 compaction: row
                     .try_get::<Option<i64>, _>("compaction")?

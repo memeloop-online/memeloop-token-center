@@ -261,15 +261,24 @@ export function requestViewFromEvent(event: RequestEvent, previous?: RequestView
   const createdAt = event.created_at ?? previous?.created_at
     ?? (event.event_kind === 'started' ? event.event_at : undefined);
   if (createdAt === undefined) return previous;
-  if (previous?.operational_terminal) {
+  // An operational receipt is immutable. Legacy events have no receipt authority;
+  // an applied financial receipt cannot return to pending settlement.
+  const priorTerminal = previous?.operational_terminal;
+  const incomingTerminal = event.operational_terminal;
+  const preserveReceipt = priorTerminal && (!incomingTerminal
+    || incomingTerminal.completed_at < priorTerminal.completed_at
+    || (incomingTerminal.completed_at === priorTerminal.completed_at
+      && priorTerminal.financial_state === 'applied' && incomingTerminal.financial_state !== 'applied'));
+  if (previous && preserveReceipt) {
     return {
       ...previous,
+      ...mergeRequestObservations({ ...previous, egress: event.egress }, previous),
       archive_state: mergeArchiveState(previous.archive_state, event),
       session_context: mergeSessionContext(previous.session_context, event),
     };
   }
   // Replayed starts must not regress an authoritative terminal history row.
-  if (event.event_kind === 'started' && previous?.status_code != null) return {
+  if (!incomingTerminal && event.event_kind === 'started' && previous?.status_code != null) return {
     ...previous,
     ...(event.session_context != null ? { session_context: mergeSessionContext(previous.session_context, event) } : {}),
   };
@@ -314,7 +323,7 @@ export function requestViewFromEvent(event: RequestEvent, previous?: RequestView
   const usageBasis = event.usage_basis === undefined ? previous?.usage_basis : event.usage_basis;
   if (usageBasis !== undefined) request.usage_basis = usageBasis;
   if (credentialIdentity !== undefined) request.credential_identity = credentialIdentity;
-  return request;
+  return mergeRequestObservations({ ...request, egress: event.egress }, previous);
 }
 
 export function mergeLiveRequestEvents(
