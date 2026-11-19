@@ -38,7 +38,7 @@ impl BoundedUpstreamError {
         }
     }
 
-    fn from_stream_error(error: &str) -> Self {
+    pub(super) fn from_stream_error(error: &str) -> Self {
         match error {
             upstream_response::UPSTREAM_READ_TIMEOUT => Self::ReadTimeout,
             upstream_response::UPSTREAM_REQUEST_TIMEOUT => Self::RequestTimeout,
@@ -81,10 +81,10 @@ pub(super) fn is_local_response_boundary(error_code: &str) -> bool {
     )
 }
 
-struct ResponseReadMemory<'a> {
-    memory: &'a crate::gateway_body::memory::ProxyMemoryReservation,
-    conversation: Option<&'a ProxyConversation>,
-    keep: bool,
+pub(super) struct ResponseReadMemory<'a> {
+    pub(super) memory: &'a crate::gateway_body::memory::ProxyMemoryReservation,
+    pub(super) conversation: Option<&'a ProxyConversation>,
+    pub(super) keep: bool,
 }
 
 impl Drop for ResponseReadMemory<'_> {
