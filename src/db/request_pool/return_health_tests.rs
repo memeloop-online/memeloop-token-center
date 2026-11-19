@@ -107,6 +107,16 @@ pub(super) async fn postgres_return_health_timeout_releases_slot(url: &str) {
         .unwrap();
     assert_eq!(same_pid, reused_pid);
     reused.finish();
+    let mut healthy = pool.acquire().await.unwrap();
+    let healthy_pid: i32 = sqlx::query_scalar("SELECT pg_backend_pid()")
+        .fetch_one(&mut *healthy)
+        .await
+        .unwrap();
+    assert_eq!(
+        healthy_pid, reused_pid,
+        "healthy maintenance preserves backend reuse"
+    );
+    healthy.finish();
     pool.close().await;
     drop(relay);
 }
