@@ -455,6 +455,57 @@ async fn verify_scoped_supplier_usage_recovery(db: &Database, tenant: &str, pepp
     sqlx::query("INSERT INTO upstream_account_health (upstream_account_id,credential_generation,transport_revision,consecutive_failures,cooldown_until,probe_lease_until,last_failure_kind,updated_at) VALUES ($1,$2,$3,1,$4,0,'quota_exhausted',$5)")
         .bind(account.id.to_string()).bind(account.credential_generation).bind(account.updated_at)
         .bind(now+86_400_000).bind(started_at-1).execute(&db.pool).await.unwrap();
+    let route = db
+        .create_model_route(CreateModelRouteInput {
+            tenant_external_id: tenant.into(),
+            public_model: "quota-recovery-contract".into(),
+            upstream_account_id: account.id,
+            upstream_model: "covered".into(),
+            protocol: "openai".into(),
+            priority: 0,
+        })
+        .await
+        .unwrap();
+    let key = db
+        .create_key_with_routing(
+            CreateKeyInput {
+                tenant_external_id: tenant.into(),
+                principal_external_id: "recovery-contract".into(),
+                alias: "recovery-contract".into(),
+                currency: "USD".into(),
+                policy: KeyPolicy::default(),
+                initial_balance: Decimal::TEN,
+                idempotency_key: None,
+            },
+            &[route.id],
+            &[],
+            pepper,
+        )
+        .await
+        .unwrap();
+    let tenant_id = db
+        .authenticate_key(&key.key, pepper)
+        .await
+        .unwrap()
+        .tenant_id;
+    let selection = RouteSelectionOptions {
+        upstream_account_hint: None,
+        avoid_route_account: None,
+        selection_seed: Uuid::now_v7(),
+    };
+    assert!(
+        db.list_authorized_upstream_candidates_with_hint(
+            key.key_id,
+            tenant_id,
+            "quota-recovery-contract",
+            "openai",
+            selection,
+        )
+        .await
+        .unwrap()
+        .is_empty(),
+        "same-source legacy and scoped exhaustion blocks actual dispatch"
+    );
     let value = RoutingQuotaObservation {
         account_id: account.id,
         generation: account.credential_generation,
@@ -476,6 +527,37 @@ async fn verify_scoped_supplier_usage_recovery(db: &Database, tenant: &str, pepp
             legacy_fence: Some((1, started_at - 1)),
         }),
     };
+    // Publication and both recovery projections share the caller transaction.
+    // Aborting after every mutation must retain the original lease and blockers.
+    let mut aborted = db.begin_write_transaction().await.unwrap();
+    db.publish_accepted_quota_observation(&mut aborted, &value)
+        .await
+        .unwrap();
+    aborted.rollback().await.unwrap();
+    let unpublished: Option<String> = sqlx::query_scalar(
+        "SELECT observation_json FROM upstream_quota_observations WHERE upstream_account_id=$1",
+    )
+    .bind(account.id.to_string())
+    .fetch_one(&db.pool)
+    .await
+    .unwrap();
+    assert!(
+        unpublished.is_none(),
+        "aborted publication cannot leak a routing observation"
+    );
+    assert!(
+        db.list_authorized_upstream_candidates_with_hint(
+            key.key_id,
+            tenant_id,
+            "quota-recovery-contract",
+            "openai",
+            selection,
+        )
+        .await
+        .unwrap()
+        .is_empty(),
+        "aborted recovery retains the dispatch blockers"
+    );
     db.finish_quota_observation(&target, lease, Some(&value), now + 10_000)
         .await
         .unwrap();
@@ -490,6 +572,22 @@ async fn verify_scoped_supplier_usage_recovery(db: &Database, tenant: &str, pepp
         legacy, 0,
         "same accepted proof clears the fenced legacy blocker atomically"
     );
+    let dispatched = db
+        .list_authorized_upstream_candidates_with_hint(
+            key.key_id,
+            tenant_id,
+            "quota-recovery-contract",
+            "openai",
+            selection,
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        dispatched.len(),
+        1,
+        "accepted proof restores actual dispatch"
+    );
+    assert_eq!(dispatched[0].account_id, account.id);
     let mut newer = value.clone();
     newer.observed_at = now;
     newer.valid_until = now + 40_000;
