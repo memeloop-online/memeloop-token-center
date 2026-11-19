@@ -492,6 +492,29 @@ pub async fn run_until_shutdown_with_oauth_stop(
             }
         }
     );
+    // Recovery obligations have independent serial lanes: historical object IO
+    // must not prevent already eligible body tasks from being claimed.
+    periodic!(
+        "session_body_rebuild_recovery",
+        PROJECTION_INTERVAL,
+        async |state: &AppState, _shutdown: &watch::Receiver<bool>| {
+            process_session_body_rebuild_recovery(state).await;
+        }
+    );
+    periodic!(
+        "semantic_coverage_recovery",
+        PROJECTION_INTERVAL,
+        async |state: &AppState, _shutdown: &watch::Receiver<bool>| {
+            let started = std::time::Instant::now();
+            tracing::debug!(stage = "coverage_start", "conversation recovery stage");
+            if let Err(error) = state.db.recover_semantic_coverage().await {
+                tracing::warn!(error_category = error.diagnostic_category(),
+                    "semantic coverage confirmation remains pending");
+            }
+            tracing::debug!(stage = "coverage_done", elapsed_ms = started.elapsed().as_millis() as u64,
+                "conversation recovery stage");
+        }
+    );
     periodic!(
         "conversation_projection",
         PROJECTION_INTERVAL,
@@ -1130,8 +1153,9 @@ async fn process_metered_usage_projection_batch(state: &AppState, lease_owner: U
     }
 }
 
-async fn process_conversation_projection_batch(state: &AppState, lease_owner: Uuid) {
-    tracing::debug!(%lease_owner, stage = "reopen_start", "conversation projection stage");
+async fn process_session_body_rebuild_recovery(state: &AppState) {
+    let started = std::time::Instant::now();
+    tracing::debug!(stage = "reopen_start", "conversation recovery stage");
     if let Err(error) = state
         .db
         .reopen_session_body_rebuilds(PROJECTION_BATCH_LIMIT / 4)
@@ -1142,12 +1166,11 @@ async fn process_conversation_projection_batch(state: &AppState, lease_owner: Uu
             .observe_background_projection(BackgroundProjectionKind::Conversation, false);
         tracing::error!(%error, "worker 未能把已有原始请求 JSON 和原始返回 JSON 的会话正文重新排队");
     }
-    if let Err(error) = state.db.recover_semantic_coverage().await {
-        tracing::warn!(
-            error_category = error.diagnostic_category(),
-            "semantic coverage confirmation remains pending"
-        );
-    }
+    tracing::debug!(stage = "reopen_done", elapsed_ms = started.elapsed().as_millis() as u64,
+        "conversation recovery stage");
+}
+
+async fn process_conversation_projection_batch(state: &AppState, lease_owner: Uuid) {
     tracing::debug!(%lease_owner, stage = "claim_start", "conversation projection stage");
     let tasks = match state
         .db
