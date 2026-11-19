@@ -508,11 +508,16 @@ pub async fn run_until_shutdown_with_oauth_stop(
             let started = std::time::Instant::now();
             tracing::debug!(stage = "coverage_start", "conversation recovery stage");
             if let Err(error) = state.db.recover_semantic_coverage().await {
-                tracing::warn!(error_category = error.diagnostic_category(),
-                    "semantic coverage confirmation remains pending");
+                tracing::warn!(
+                    error_category = error.diagnostic_category(),
+                    "semantic coverage confirmation remains pending"
+                );
             }
-            tracing::debug!(stage = "coverage_done", elapsed_ms = started.elapsed().as_millis() as u64,
-                "conversation recovery stage");
+            tracing::debug!(
+                stage = "coverage_done",
+                elapsed_ms = started.elapsed().as_millis() as u64,
+                "conversation recovery stage"
+            );
         }
     );
     periodic!(
@@ -1092,6 +1097,8 @@ async fn supervise_roles_with_early_oauth_shutdown(
 }
 
 async fn process_terminal_projection_batch(state: &AppState, lease_owner: Uuid) {
+    let started = std::time::Instant::now();
+    tracing::debug!(%lease_owner, stage = "claim_start", "terminal projection stage");
     let tasks = match state
         .db
         .claim_terminal_projection_tasks(lease_owner, PROJECTION_BATCH_LIMIT)
@@ -1099,17 +1106,30 @@ async fn process_terminal_projection_batch(state: &AppState, lease_owner: Uuid) 
     {
         Ok(tasks) => tasks,
         Err(error) => {
-            tracing::error!(%error, "worker failed to claim terminal projections");
+            tracing::error!(%lease_owner, stage = "claim_failed",
+                elapsed_ms = started.elapsed().as_millis() as u64,
+                error_category = error.diagnostic_category(),
+                "worker failed to claim terminal projections");
             return;
         }
     };
+    tracing::debug!(%lease_owner, stage = "claim_done", count = tasks.len(),
+        elapsed_ms = started.elapsed().as_millis() as u64, "terminal projection stage");
     for request_id in tasks {
-        if let Err(error) = state
+        let started = std::time::Instant::now();
+        tracing::debug!(%lease_owner, %request_id, stage = "apply_start", "terminal projection stage");
+        match state
             .db
             .project_claimed_terminal_projection_task(lease_owner, request_id)
             .await
         {
-            tracing::error!(%error, %request_id, "worker failed to apply terminal projection");
+            Ok(projected) => tracing::debug!(%lease_owner, %request_id, stage = "apply_done",
+                projected, elapsed_ms = started.elapsed().as_millis() as u64,
+                "terminal projection stage"),
+            Err(error) => tracing::error!(%lease_owner, %request_id, stage = "apply_failed",
+                elapsed_ms = started.elapsed().as_millis() as u64,
+                error_category = error.diagnostic_category(),
+                "worker failed to apply terminal projection"),
         }
     }
 }
@@ -1166,8 +1186,11 @@ async fn process_session_body_rebuild_recovery(state: &AppState) {
             .observe_background_projection(BackgroundProjectionKind::Conversation, false);
         tracing::error!(%error, "worker 未能把已有原始请求 JSON 和原始返回 JSON 的会话正文重新排队");
     }
-    tracing::debug!(stage = "reopen_done", elapsed_ms = started.elapsed().as_millis() as u64,
-        "conversation recovery stage");
+    tracing::debug!(
+        stage = "reopen_done",
+        elapsed_ms = started.elapsed().as_millis() as u64,
+        "conversation recovery stage"
+    );
 }
 
 async fn process_conversation_projection_batch(state: &AppState, lease_owner: Uuid) {
