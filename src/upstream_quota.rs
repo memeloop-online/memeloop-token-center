@@ -361,6 +361,7 @@ struct VerificationObservation {
     generation: i64,
     revision: i64,
     started_at: i64,
+    legacy_fence: Option<(i64, i64)>,
 }
 
 #[derive(Clone, Serialize)]
@@ -589,15 +590,18 @@ impl QuotaCache {
         tenant: &str,
         trigger: QuotaReadTrigger,
     ) -> QuotaSnapshot {
-        self.read_inner(
-            state,
-            account,
-            credential,
-            tenant,
-            CacheReadPolicy::Cached,
-            trigger,
-        )
-        .await
+        let snapshot = self
+            .read_inner(
+                state,
+                account,
+                credential,
+                tenant,
+                CacheReadPolicy::Cached,
+                trigger,
+            )
+            .await;
+        publish_operator_observation(state, account, &snapshot, trigger).await;
+        snapshot
     }
 
     /// Performs a supplier read even when the account has a recent cached
@@ -623,6 +627,7 @@ impl QuotaCache {
                 trigger,
             )
             .await;
+        publish_operator_observation(state, account, &snapshot, trigger).await;
         // This effect belongs to the accepted-reset caller, not the supplier
         // read owner (which can be manual/bulk/background). Coalescing stays on.
         if trigger == QuotaReadTrigger::ResetWorkflow
@@ -896,6 +901,25 @@ fn stale_or_error(
     }
 }
 
+async fn publish_operator_observation(
+    state: &AppState,
+    account: &UpstreamAccountView,
+    snapshot: &QuotaSnapshot,
+    trigger: QuotaReadTrigger,
+) {
+    if trigger != QuotaReadTrigger::BackgroundRecovery
+        && let Some(observation) = observations::project(account, snapshot, unix_millis())
+        && let Err(error) = state
+            .db
+            .publish_manual_quota_observation(&observation)
+            .await
+    {
+        tracing::warn!(upstream_account_id = %account.id,
+            error_category = error.diagnostic_category(),
+            "fresh quota observation publication failed");
+    }
+}
+
 async fn read_codex(
     state: &AppState,
     account: &UpstreamAccountView,
@@ -1061,53 +1085,16 @@ async fn read_codex(
         generation: account.credential_generation,
         revision: account.updated_at,
         started_at: observation_started_at,
+        legacy_fence: recovery_fence.map(|fence| (fence.consecutive_failures, fence.updated_at)),
     });
     #[cfg(test)]
     r2_tests::before_publish().await;
-    if snapshot.conclusively_allows_codex()
-        && let Some(recovery_fence) = recovery_fence
-    {
-        match state
-            .db
-            .recover_upstream_quota_from_observation(
-                account.id,
-                account.credential_generation,
-                account.updated_at,
-                recovery_fence,
-            )
-            .await
-        {
-            Ok(true) => tracing::info!(
-                upstream_account_id = %account.id,
-                credential_generation = account.credential_generation,
-                trigger = trigger.as_str(),
-                observation_started_at,
-                observed_at,
-                "fresh quota evidence cleared an exhausted upstream cooldown"
-            ),
-            Ok(false) => {}
-            Err(_) => tracing::warn!(
-                upstream_account_id = %account.id,
-                credential_generation = account.credential_generation,
-                trigger = trigger.as_str(),
-                error_code = "quota_health_recovery_failed",
-                "failed to apply fresh quota recovery evidence"
-            ),
-        }
-    }
     Ok(snapshot)
 }
 
 impl QuotaSnapshot {
     fn conclusively_allows_codex(&self) -> bool {
-        self.status == "ready"
-            && !self.stale
-            && self.error_code.is_none()
-            && self.windows.iter().any(|window| {
-                window.id.starts_with("code:")
-                    && window.allowed == Some(true)
-                    && window.limit_reached != Some(true)
-            })
+        observations::conclusively_allows_codex(self)
     }
 
     fn finalize_reset_capability(&mut self) {
@@ -1357,13 +1344,14 @@ mod tests {
                 false,
             ),
             (
-                json!({"rate_limit":{"allowed":true,"limit_reached":false,"primary_window":{}}}),
+                json!({"rate_limit":{"allowed":true,"limit_reached":false,"primary_window":{"limit_window_seconds":604800}}}),
                 true,
             ),
         ] {
             let mut snapshot = QuotaSnapshot::empty(&account, "test", None);
             normalize::usage(&mut snapshot, &usage, 20).unwrap();
             snapshot.status = "ready";
+            snapshot.freshness = "fresh";
             assert_eq!(snapshot.conclusively_allows_codex(), allowed);
             snapshot.stale = true;
             assert!(!snapshot.conclusively_allows_codex());

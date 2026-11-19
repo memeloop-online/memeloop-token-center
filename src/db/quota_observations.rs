@@ -229,26 +229,74 @@ impl Database {
         observation: Option<&RoutingQuotaObservation>,
         next_refresh: i64,
     ) -> Result<(), AppError> {
-        let json = observation
-            .map(serde_json::to_string)
-            .transpose()
-            .map_err(|_| AppError::internal("quota_observations_finish_quota_observation_1"))?;
-        let published = sqlx::query("UPDATE upstream_quota_observations SET observation_json=$1,valid_until=$2,next_refresh_at=$3,lease_id=NULL,lease_until=0
-            WHERE upstream_account_id=$4 AND tenant_id=$5 AND credential_generation=$6 AND config_revision=$7 AND lease_id=$8
-                AND EXISTS (SELECT 1 FROM upstream_accounts a WHERE a.id=$4 AND a.tenant_id=$5 AND a.credential_generation=$6 AND a.updated_at=$7 AND a.status='active')")
-            .bind(json).bind(observation.map_or(0,|value|value.valid_until)).bind(next_refresh)
-            .bind(target.account_id.to_string()).bind(target.tenant_id.to_string()).bind(target.generation).bind(target.config_revision).bind(lease.to_string())
-            .execute(&self.pool).await?.rows_affected();
-        if published == 1
+        let mut transaction = self.begin_write_transaction().await?;
+        let claimed = sqlx::query("UPDATE upstream_quota_observations SET next_refresh_at=$1,lease_id=NULL,lease_until=0
+            WHERE upstream_account_id=$2 AND tenant_id=$3 AND credential_generation=$4 AND config_revision=$5 AND lease_id=$6
+                AND EXISTS (SELECT 1 FROM upstream_accounts a WHERE a.id=$2 AND a.tenant_id=$3 AND a.credential_generation=$4 AND a.updated_at=$5 AND a.status='active')")
+            .bind(next_refresh).bind(target.account_id.to_string()).bind(target.tenant_id.to_string())
+            .bind(target.generation).bind(target.config_revision).bind(lease.to_string())
+            .execute(&mut *transaction).await?.rows_affected();
+        if claimed == 1
             && let Some(observation) = observation
         {
-            self.recover_supplier_quota_from_usage(observation).await?;
+            if observation.account_id == target.account_id
+                && observation.generation == target.generation
+                && observation.config_revision == target.config_revision
+            {
+                self.publish_accepted_quota_observation(&mut transaction, observation)
+                    .await?;
+            }
+        }
+        transaction.commit().await?;
+        Ok(())
+    }
+
+    pub(crate) async fn publish_manual_quota_observation(
+        &self,
+        observation: &RoutingQuotaObservation,
+    ) -> Result<(), AppError> {
+        let mut transaction = self.begin_write_transaction().await?;
+        self.publish_accepted_quota_observation(&mut transaction, observation)
+            .await?;
+        transaction.commit().await?;
+        Ok(())
+    }
+
+    async fn publish_accepted_quota_observation(
+        &self,
+        transaction: &mut sqlx::Transaction<'_, sqlx::Any>,
+        observation: &RoutingQuotaObservation,
+    ) -> Result<(), AppError> {
+        let now = unix_millis();
+        if observation.observed_at > now || observation.valid_until <= now {
+            return Ok(());
+        }
+        let json = serde_json::to_string(observation)
+            .map_err(|_| AppError::internal("quota_observation_serialize"))?;
+        let published = sqlx::query("INSERT INTO upstream_quota_observations
+            (upstream_account_id,tenant_id,credential_generation,config_revision,observation_json,valid_until,observed_at)
+            SELECT id,tenant_id,$2,$3,$4,$5,$6 FROM upstream_accounts
+            WHERE id=$1 AND credential_generation=$2 AND updated_at=$3 AND status='active'
+            ON CONFLICT(upstream_account_id) DO UPDATE SET
+                tenant_id=excluded.tenant_id,credential_generation=excluded.credential_generation,
+                config_revision=excluded.config_revision,observation_json=excluded.observation_json,
+                valid_until=excluded.valid_until,observed_at=excluded.observed_at
+            WHERE upstream_quota_observations.credential_generation<>excluded.credential_generation
+               OR upstream_quota_observations.config_revision<>excluded.config_revision
+               OR upstream_quota_observations.observed_at<excluded.observed_at")
+            .bind(observation.account_id.to_string()).bind(observation.generation)
+            .bind(observation.config_revision).bind(json).bind(observation.valid_until)
+            .bind(observation.observed_at).execute(&mut **transaction).await?.rows_affected();
+        if published == 1 {
+            self.recover_supplier_quota_from_usage(transaction, observation)
+                .await?;
         }
         Ok(())
     }
 
     async fn recover_supplier_quota_from_usage(
         &self,
+        transaction: &mut sqlx::Transaction<'_, sqlx::Any>,
         observation: &RoutingQuotaObservation,
     ) -> Result<(), AppError> {
         let Some(allowance) = &observation.ordinary_code_allowance else {
@@ -286,8 +334,26 @@ impl Database {
         .bind(observation.config_revision)
         .bind(allowance.started_at)
         .bind(observation.observed_at)
-        .execute(&self.pool)
+        .execute(&mut **transaction)
         .await?;
+        if let Some((failures, updated_at)) = allowance.legacy_fence {
+            sqlx::query(
+                "DELETE FROM upstream_account_health WHERE upstream_account_id=$1
+                AND credential_generation=$2 AND transport_revision=$3
+                AND last_failure_kind='quota_exhausted' AND consecutive_failures=$4
+                AND updated_at=$5 AND probe_lease_until<=$6
+                AND EXISTS (SELECT 1 FROM upstream_accounts a WHERE a.id=$1
+                    AND a.status='active' AND a.credential_generation=$2 AND a.updated_at=$3)",
+            )
+            .bind(observation.account_id.to_string())
+            .bind(observation.generation)
+            .bind(observation.config_revision)
+            .bind(failures)
+            .bind(updated_at)
+            .bind(now)
+            .execute(&mut **transaction)
+            .await?;
+        }
         Ok(())
     }
 

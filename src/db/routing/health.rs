@@ -96,8 +96,8 @@ pub(crate) enum UpstreamAttemptAdmission {
 /// same millisecond timestamp.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) struct QuotaRecoveryFence {
-    consecutive_failures: i64,
-    updated_at: i64,
+    pub(crate) consecutive_failures: i64,
+    pub(crate) updated_at: i64,
 }
 
 impl UpstreamAttemptAdmission {

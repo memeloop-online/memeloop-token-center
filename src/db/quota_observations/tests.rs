@@ -452,6 +452,9 @@ async fn verify_scoped_supplier_usage_recovery(db: &Database, tenant: &str, pepp
             .await
             .unwrap()
     );
+    sqlx::query("INSERT INTO upstream_account_health (upstream_account_id,credential_generation,transport_revision,consecutive_failures,cooldown_until,probe_lease_until,last_failure_kind,updated_at) VALUES ($1,$2,$3,1,$4,0,'quota_exhausted',$5)")
+        .bind(account.id.to_string()).bind(account.credential_generation).bind(account.updated_at)
+        .bind(now+86_400_000).bind(started_at-1).execute(&db.pool).await.unwrap();
     let value = RoutingQuotaObservation {
         account_id: account.id,
         generation: account.credential_generation,
@@ -470,11 +473,39 @@ async fn verify_scoped_supplier_usage_recovery(db: &Database, tenant: &str, pepp
         ordinary_code_allowance: Some(OrdinaryCodeAllowance {
             started_at,
             window_ids: vec!["code:primary_window".into()],
+            legacy_fence: Some((1, started_at - 1)),
         }),
     };
     db.finish_quota_observation(&target, lease, Some(&value), now + 10_000)
         .await
         .unwrap();
+    let legacy: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM upstream_account_health WHERE upstream_account_id=$1",
+    )
+    .bind(account.id.to_string())
+    .fetch_one(&db.pool)
+    .await
+    .unwrap();
+    assert_eq!(
+        legacy, 0,
+        "same accepted proof clears the fenced legacy blocker atomically"
+    );
+    let mut newer = value.clone();
+    newer.observed_at = now;
+    newer.valid_until = now + 40_000;
+    db.publish_manual_quota_observation(&newer).await.unwrap();
+    db.publish_manual_quota_observation(&value).await.unwrap();
+    let accepted: i64 = sqlx::query_scalar(
+        "SELECT observed_at FROM upstream_quota_observations WHERE upstream_account_id=$1",
+    )
+    .bind(account.id.to_string())
+    .fetch_one(&db.pool)
+    .await
+    .unwrap();
+    assert_eq!(
+        accepted, now,
+        "older publication cannot replace newer authority"
+    );
     let rows = sqlx::query("SELECT upstream_model,failure_kind,capacity_scope,request_id FROM upstream_supplier_availability WHERE upstream_account_id=$1")
         .bind(account.id.to_string()).fetch_all(&db.pool).await.unwrap();
     assert_eq!(rows.len(), 7);

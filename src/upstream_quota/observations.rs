@@ -25,6 +25,8 @@ pub(crate) struct RoutingQuotaObservation {
 pub(crate) struct OrdinaryCodeAllowance {
     pub started_at: i64,
     pub window_ids: Vec<String>,
+    #[serde(default)]
+    pub legacy_fence: Option<(i64, i64)>,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -116,12 +118,11 @@ fn observation_timeout_millis(
     let account_budget = super::codex_quota_budget(&account.config)
         .ok()
         .and_then(|budget| i64::try_from(budget.total.as_millis()).ok())
-        .unwrap_or(configured)
-        ;
+        .unwrap_or(configured);
     configured.max(account_budget)
 }
 
-fn project(
+pub(super) fn project(
     account: &crate::provider::UpstreamAccountView,
     snapshot: &super::QuotaSnapshot,
     now: i64,
@@ -210,17 +211,7 @@ fn ordinary_code_allowance(
     account: &crate::provider::UpstreamAccountView,
     snapshot: &super::QuotaSnapshot,
 ) -> Option<OrdinaryCodeAllowance> {
-    if account.driver != "openai-codex"
-        || snapshot.status != "ready"
-        || snapshot.stale
-        || snapshot.freshness != "fresh"
-        || snapshot.error_code.is_some()
-        // A named model/feature limit needs its own capacity mapping. Do not
-        // let the ordinary account window erase an additional quota failure.
-        || snapshot.windows.iter().any(|window| {
-            !window.id.starts_with("code:") && !window.id.starts_with("code_review:")
-        })
-    {
+    if account.driver != "openai-codex" || !conclusively_allows_codex(snapshot) {
         return None;
     }
     let source = snapshot.verification_observation.as_ref()?;
@@ -236,6 +227,31 @@ fn ordinary_code_allowance(
         .iter()
         .filter(|window| window.id.starts_with("code:"))
         .collect::<Vec<_>>();
+    Some(OrdinaryCodeAllowance {
+        started_at: source.started_at,
+        window_ids: windows.iter().map(|window| window.id.clone()).collect(),
+        legacy_fence: source.legacy_fence,
+    })
+}
+
+pub(super) fn conclusively_allows_codex(snapshot: &super::QuotaSnapshot) -> bool {
+    if snapshot.provider != "openai-codex"
+        || snapshot.status != "ready"
+        || snapshot.stale
+        || snapshot.freshness != "fresh"
+        || snapshot.error_code.is_some()
+        || snapshot
+            .windows
+            .iter()
+            .any(|window| !window.id.starts_with("code:") && !window.id.starts_with("code_review:"))
+    {
+        return false;
+    }
+    let windows = snapshot
+        .windows
+        .iter()
+        .filter(|window| window.id.starts_with("code:"))
+        .collect::<Vec<_>>();
     if windows.is_empty()
         || windows.iter().any(|window| {
             window.source != "codex_usage"
@@ -245,12 +261,9 @@ fn ordinary_code_allowance(
                 || window.used_percent.is_some_and(|used| used >= 100.0)
         })
     {
-        return None;
+        return false;
     }
-    Some(OrdinaryCodeAllowance {
-        started_at: source.started_at,
-        window_ids: windows.iter().map(|window| window.id.clone()).collect(),
-    })
+    true
 }
 
 pub(crate) async fn run(state: AppState, mut shutdown: tokio::sync::watch::Receiver<bool>) {
@@ -490,6 +503,7 @@ mod tests {
             generation: 2,
             revision: 10,
             started_at: 90,
+            legacy_fence: None,
         });
         super::super::normalize::usage(
             &mut snapshot,
