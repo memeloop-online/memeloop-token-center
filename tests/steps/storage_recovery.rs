@@ -10,6 +10,7 @@ pub(super) struct RecoveryState {
     pub(super) proxy: RecoveryObjectProxy,
     failed_prefix: Option<String>,
     isolated: postgres_isolation::IsolatedPostgres,
+    pub(super) scheduler: Option<super::storage_recovery_scheduler::SchedulerState>,
 }
 
 #[given("a recovery service backed by PostgreSQL and real object storage")]
@@ -36,6 +37,7 @@ pub(super) async fn start_recovery_service(world: &mut TokenCenterWorld) {
         proxy,
         failed_prefix: None,
         isolated,
+        scheduler: None,
     });
 }
 

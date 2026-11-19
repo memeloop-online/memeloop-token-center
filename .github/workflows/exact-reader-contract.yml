@@ -234,7 +234,7 @@ jobs:
           set -o pipefail
           test -n "$MTC_TEST_POSTGRES_URL"
           cargo test --locked --test cucumber -- --tags @storage-recovery 2>&1 | tee /tmp/storage-recovery-cucumber.log
-          grep -E '[1-9][0-9]* scenario(s)? \([1-9][0-9]* passed\)' /tmp/storage-recovery-cucumber.log
+          grep -F '3 scenarios (3 passed)' /tmp/storage-recovery-cucumber.log
   next-release-contract:
     if: inputs.contract == 'next-release'
     runs-on: ubuntu-24.04

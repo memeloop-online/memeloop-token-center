@@ -16,16 +16,16 @@ use std::{
 use tokio::sync::Notify;
 
 #[derive(Default)]
-pub(super) struct ObjectReadGate {
+pub(crate) struct ObjectReadGate {
     entered: Notify,
     released: AtomicBool,
     release: Notify,
 }
 impl ObjectReadGate {
-    pub(super) async fn entered(&self) {
+    pub(crate) async fn entered(&self) {
         self.entered.notified().await;
     }
-    pub(super) fn release(&self) {
+    pub(crate) fn release(&self) {
         self.released.store(true, Ordering::SeqCst);
         self.release.notify_waiters();
         self.release.notify_one();
@@ -44,13 +44,13 @@ struct ProxyState {
     faults: Mutex<Faults>,
     failed_puts: AtomicUsize,
 }
-pub(super) struct RecoveryObjectProxy {
+pub(crate) struct RecoveryObjectProxy {
     endpoint: String,
     state: Arc<ProxyState>,
     task: tokio::task::JoinHandle<()>,
 }
 impl RecoveryObjectProxy {
-    pub(super) async fn start(upstream: &str) -> Self {
+    pub(crate) async fn start(upstream: &str) -> Self {
         let state = Arc::new(ProxyState {
             upstream: upstream.trim_end_matches('/').to_owned(),
             client: reqwest::Client::builder()
@@ -74,10 +74,10 @@ impl RecoveryObjectProxy {
             task,
         }
     }
-    pub(super) fn endpoint(&self) -> &str {
+    pub(crate) fn endpoint(&self) -> &str {
         &self.endpoint
     }
-    pub(super) fn gate_get(&self, path: &str) -> Arc<ObjectReadGate> {
+    pub(crate) fn gate_get(&self, path: &str) -> Arc<ObjectReadGate> {
         assert!(path.starts_with('/'));
         let gate = Arc::new(ObjectReadGate::default());
         assert!(
@@ -91,7 +91,7 @@ impl RecoveryObjectProxy {
         );
         gate
     }
-    pub(super) fn fail_put(&self, path: &str, enabled: bool) {
+    pub(crate) fn fail_put(&self, path: &str, enabled: bool) {
         assert!(path.starts_with('/'));
         let mut faults = self.state.faults.lock().unwrap();
         if enabled {
@@ -100,7 +100,7 @@ impl RecoveryObjectProxy {
             faults.puts.remove(path);
         }
     }
-    pub(super) fn fail_put_prefix(&self, prefix: &str, enabled: bool) {
+    pub(crate) fn fail_put_prefix(&self, prefix: &str, enabled: bool) {
         assert!(prefix.starts_with('/') && prefix.len() > 1);
         let mut faults = self.state.faults.lock().unwrap();
         if enabled {
@@ -109,7 +109,7 @@ impl RecoveryObjectProxy {
             faults.put_prefixes.remove(prefix);
         }
     }
-    pub(super) fn fail_put_scope(&self, prefix: &str, suffix: &str, enabled: bool) {
+    pub(crate) fn fail_put_scope(&self, prefix: &str, suffix: &str, enabled: bool) {
         assert!(prefix.starts_with('/') && prefix.len() > 1 && !suffix.is_empty());
         let mut faults = self.state.faults.lock().unwrap();
         let scope = (prefix.to_owned(), suffix.to_owned());
@@ -119,7 +119,7 @@ impl RecoveryObjectProxy {
             faults.put_scopes.remove(&scope);
         }
     }
-    pub(super) fn failed_puts(&self) -> usize {
+    pub(crate) fn failed_puts(&self) -> usize {
         self.state.failed_puts.load(Ordering::SeqCst)
     }
 }

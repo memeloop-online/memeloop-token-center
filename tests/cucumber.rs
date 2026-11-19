@@ -45,6 +45,10 @@ mod logical_sessions;
 mod security_acceptance;
 #[path = "steps/storage_recovery.rs"]
 mod storage_recovery;
+#[path = "steps/storage_recovery_legacy.rs"]
+mod storage_recovery_legacy;
+#[path = "steps/storage_recovery_scheduler.rs"]
+mod storage_recovery_scheduler;
 #[path = "steps/tkmarket_seedance.rs"]
 mod tkmarket_seedance;
 #[path = "steps/wasu_wan.rs"]
