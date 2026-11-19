@@ -203,3 +203,32 @@ test('partial deltas preserve absent values while authoritative null remains exp
     operational_terminal: { completed_at: 800, stage: null, financial_state: 'pending' as const } };
   assert.equal(requestViewFromEvent(authoritative, active)?.duration_ms, null);
 });
+
+test('authoritative explicit null clears optional observations while absent fields retain them', () => {
+  const previous: RequestView = { ...recorded, first_output_ms: 5, generation_duration_ms: 20,
+    supplier_error: { code: 'old', message: 'old' }, failure_diagnostic: { source: 'old', reason: 'old' } };
+  const optional = ['completed_at', 'upstream_account_id', 'route_id', 'currency', 'cached_input_tokens',
+    'cache_write_tokens', 'terminal_cause_code', 'first_output_ms', 'generation_duration_ms',
+    'supplier_error', 'failure_diagnostic', 'credential_identity'] as const;
+  const authoritative = { ...event, operational_terminal: { completed_at: 800, stage: null, financial_state: 'pending' as const } };
+  const missing = requestViewFromEvent(authoritative, previous)!;
+  for (const field of optional) assert.deepEqual(missing[field], previous[field], field);
+  const cleared = requestViewFromEvent({ ...authoritative, ...Object.fromEntries(optional.map(field => [field, null])) }, previous)!;
+  for (const field of optional) assert.equal(cleared[field], null, field);
+});
+
+test('old settlement receipt protects financial fields while new archive observations update across REST and SSE', () => {
+  const applied: RequestView = { ...recorded, archive_state: 'pending',
+    operational_terminal: { completed_at: 800, stage: null, financial_state: 'applied' } };
+  const oldReceipt = { ...event, archive_state: 'bound' as const, cost: null,
+    credential_identity: { ...recorded.credential_identity!, key_alias: 'Updated key' },
+    operational_terminal: { completed_at: 800, stage: null, financial_state: 'pending' as const } };
+  const refreshed = mergeRefreshedRequestPage([applied], { requests: [{ ...applied, ...oldReceipt }], next_cursor: null })[0];
+  const streamed = requestViewFromEvent(oldReceipt, applied)!;
+  for (const row of [refreshed, streamed]) {
+    assert.equal(row.cost, applied.cost);
+    assert.equal(row.operational_terminal?.financial_state, 'applied');
+    assert.equal(row.archive_state, 'bound');
+    assert.equal(row.credential_identity?.key_alias, 'Updated key');
+  }
+});

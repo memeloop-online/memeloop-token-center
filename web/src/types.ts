@@ -45,8 +45,8 @@ export interface RequestView {
   duration_ms: number | null;
   input_tokens: number;
   // Missing cache telemetry is unknown, never an inferred zero.
-  cached_input_tokens?: number;
-  cache_write_tokens?: number;
+  cached_input_tokens?: number | null;
+  cache_write_tokens?: number | null;
   output_tokens: number;
   cost: string | null;
   /** Stable final upstream assignment, not a routing-attempt history. */

@@ -239,7 +239,8 @@ async fn assert_event_enrichment(database: &Database) {
     sqlx::query("UPDATE request_records SET status_code = 502, error_code = 'rate_limited', response_object = NULL, completed_at = $1 WHERE id = $2 AND created_at = $3")
         .bind(now + 25).bind(&request).bind(now).execute(&database.pool).await.unwrap();
     let rate_limited = serde_json::json!({
-        "code": "rate_limited", "message": "The upstream request rate limit was exceeded"
+        "code": "rate_limited", "message": "The upstream request rate limit was exceeded",
+        "category": "rate_limit", "retryable": true, "action": "retry_later"
     });
     let self_list = database.list_requests(key_id, 10).await.unwrap();
     let operator_list = database.list_all_requests(&external, 10).await.unwrap();
@@ -388,6 +389,34 @@ async fn assert_event_enrichment(database: &Database) {
     }
     assert_eq!(live["input_tokens"], 124319);
     assert_eq!(live["operational_terminal"]["financial_state"], "applied");
+    // A separate operational failure remains authoritative before settlement,
+    // including its bounded safe error and valid response archive locator.
+    sqlx::query("UPDATE request_records SET status_code = NULL, completed_at = NULL, response_object = NULL, request_object = 'objects://fixture/request' WHERE id = $1 AND created_at = $2")
+        .bind(&request).bind(now).execute(&database.pool).await.unwrap();
+    sqlx::query("UPDATE proxy_operational_terminals SET status_code = 502, error_code = 'no_active_plan', response_object = $1 WHERE request_id = $2")
+        .bind(&safe).bind(&request).execute(&database.pool).await.unwrap();
+    let rest = database.list_all_requests(&external, 10).await.unwrap();
+    let live = database
+        .request_events_after(&external, now, None, 500)
+        .await
+        .unwrap();
+    let rest = serde_json::to_value(&rest[0]).unwrap();
+    let live = serde_json::to_value(&live[0]).unwrap();
+    for field in [
+        "status_code",
+        "duration_ms",
+        "archive_state",
+        "supplier_error",
+        "egress",
+    ] {
+        assert_eq!(
+            live[field], rest[field],
+            "operational failure field {field}"
+        );
+    }
+    assert_eq!(live["status_code"], 502);
+    assert_eq!(live["archive_state"], "bound");
+    assert_eq!(live["supplier_error"], fixed);
     // The SQLite fixture owns its pool. PostgreSQL CI shares its database
     // with concurrent high-volume tests, so a global first page is not ours.
     if matches!(database.backend, DatabaseBackend::Sqlite) {
