@@ -99,6 +99,8 @@ jobs:
           set -o pipefail
           cargo test --locked --lib --no-run
           for selector in \
+            error::tests::object_storage_classification_preserves_only_typed_safe_facts \
+            error::tests::dependency_errors_do_not_retain_secret_bearing_driver_messages \
             response_archive_spool::tests::shared_capture_reaches_eof_while_all_upload_slots_are_held \
             response_archive_spool::tests::unavailable_local_directory_does_not_gate_complete_original \
             response_archive_spool::tests::cancelled_unsealed_carrier_releases_owned_capture_without_acknowledging_original \
