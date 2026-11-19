@@ -223,6 +223,11 @@ impl RequestPool {
                 {
                     timeouts += 1;
                     if timeouts == 1 || timeouts.is_multiple_of(6) {
+                        tracing::warn!(
+                            active_pooled_transactions = self.inner.active_transactions(),
+                            pool_label = self.diagnostics.label,
+                            "database pooled transaction ownership"
+                        );
                         self.diagnostics.observe_phases();
                         let (waiters, initializing, cancelled, failed, returned, discarded) =
                             self.diagnostics.snapshot();
@@ -280,6 +285,10 @@ impl RequestPool {
     pub(crate) fn connect_options(&self) -> Arc<AnyConnectOptions> {
         self.inner.connect_options()
     }
+    pub(super) fn active_transactions(&self) -> usize {
+        self.inner.active_transactions()
+    }
+
     pub(crate) fn size(&self) -> u32 {
         self.inner.size()
     }

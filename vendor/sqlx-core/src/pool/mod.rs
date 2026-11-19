@@ -531,6 +531,13 @@ impl<DB: Database> Pool<DB> {
         self.0.close_event()
     }
 
+    /// Returns confirmed transactions currently owned by pooled borrowers.
+    pub fn active_transactions(&self) -> usize {
+        self.0
+            .active_transactions
+            .load(std::sync::atomic::Ordering::Relaxed)
+    }
+
     /// Returns the number of connections currently active. This includes idle connections.
     pub fn size(&self) -> u32 {
         self.0.size()
