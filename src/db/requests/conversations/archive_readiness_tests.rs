@@ -2575,7 +2575,18 @@ async fn postgres_exact_legacy_body_rebuild_preserves_incomplete_and_financial_r
     let snapshot: String = sqlx::query_scalar("SELECT semantic_snapshot_json FROM conversation_projection_outbox WHERE request_id = $1 AND projected_at IS NOT NULL")
         .bind(fixture.request_id.to_string()).fetch_one(&db.pool).await.unwrap();
     let snapshot: serde_json::Value = serde_json::from_str(&snapshot).unwrap();
-    assert!(snapshot["leaf"].as_str().is_some());
+    assert!(
+        snapshot["completed_snapshot_digest_v1"].as_str().is_some()
+            || snapshot["leaf"].as_str().is_some()
+    );
+    let leaf: Option<String> = sqlx::query_scalar(
+        "SELECT leaf_node_hash FROM conversation_observations WHERE request_id = $1",
+    )
+    .bind(fixture.request_id.to_string())
+    .fetch_one(&db.pool)
+    .await
+    .unwrap();
+    assert!(leaf.is_some());
     let financial_after: String = sqlx::query_scalar(
         "SELECT row_to_json(t)::TEXT FROM terminal_projection_outbox t WHERE request_id = $1",
     )
