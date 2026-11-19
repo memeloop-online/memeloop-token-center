@@ -142,6 +142,17 @@ impl Database {
             .map(|row| parse_uuid(row.try_get("tenant_id")?))
             .collect::<Result<Vec<_>, AppError>>()?;
         let mut events = request_event_views(rows)?;
+        let ids = events
+            .iter()
+            .filter(|event| event.created_at.is_some())
+            .map(|event| event.request_id.to_string())
+            .collect::<Vec<_>>();
+        let observations = egress::request_list_egress(self, &ids).await?;
+        for event in &mut events {
+            if event.created_at.is_some() {
+                event.egress = observations.get(&event.request_id).cloned();
+            }
+        }
         if let Some(archive) = &self.archive {
             for (event, tenant) in events.iter_mut().zip(tenants) {
                 if event.protocol != "generation"
@@ -189,6 +200,17 @@ impl Database {
             .map(|row| parse_uuid(row.try_get("tenant_id")?))
             .collect::<Result<Vec<_>, AppError>>()?;
         let mut events = request_event_views(rows)?;
+        let ids = events
+            .iter()
+            .filter(|event| event.created_at.is_some())
+            .map(|event| event.request_id.to_string())
+            .collect::<Vec<_>>();
+        let observations = egress::request_list_egress(self, &ids).await?;
+        for event in &mut events {
+            if event.created_at.is_some() {
+                event.egress = observations.get(&event.request_id).cloned();
+            }
+        }
         if let Some(archive) = &self.archive {
             for (event, tenant) in events.iter_mut().zip(tenants) {
                 if event.protocol != "generation"
@@ -216,6 +238,11 @@ impl Database {
         let Some(mut event) = request_event_views(rows)?.into_iter().next() else {
             return Ok(None);
         };
+        if event.created_at.is_some() {
+            event.egress = egress::request_list_egress(self, &[event.request_id.to_string()])
+                .await?
+                .remove(&event.request_id);
+        }
         let row = sqlx::query("SELECT source, request_id, tenant_id, key_id, created_at FROM request_history_source_ids WHERE source IN ('native', 'generation') AND request_id = $1 AND key_id = $2 AND tenant_id = (SELECT tenant_id FROM request_events WHERE event_id = $3)")
             .bind(event.request_id.to_string()).bind(event.key_id.to_string()).bind(event_id.to_string()).fetch_optional(&self.pool).await?;
         if let Some(row) = row {
@@ -253,6 +280,8 @@ impl Database {
                 event.supplier_error = view.supplier_error;
                 event.archive_state = view.archive_state;
                 event.session_context = view.session_context;
+                event.operational_terminal = view.operational_terminal;
+                event.egress = view.egress;
                 event.credential_identity = view.credential_identity;
             }
         }
@@ -273,6 +302,14 @@ impl Database {
         let Some(mut event) = request_event_views(rows)?.into_iter().next() else {
             return Ok(None);
         };
+        if event.created_at.is_some() {
+            event.egress = egress::request_list_egress_in_transaction(
+                transaction,
+                &[event.request_id.to_string()],
+            )
+            .await?
+            .remove(&event.request_id);
+        }
         let row = sqlx::query("SELECT source, request_id, tenant_id, key_id, created_at FROM request_history_source_ids WHERE source IN ('native', 'generation') AND request_id = $1 AND key_id = $2 AND tenant_id = $3")
             .bind(event.request_id.to_string()).bind(event.key_id.to_string()).bind(identity.tenant_id.to_string()).fetch_optional(&mut **transaction).await?;
         if let Some(row) = row {
@@ -312,6 +349,8 @@ impl Database {
                 event.supplier_error = view.supplier_error;
                 event.archive_state = view.archive_state;
                 event.session_context = view.session_context;
+                event.operational_terminal = view.operational_terminal;
+                event.egress = view.egress;
                 event.credential_identity = view.credential_identity;
             }
         }
@@ -981,6 +1020,28 @@ impl Database {
     }
 }
 
+fn expand_request_read_model_sql(sql: &str) -> String {
+    let mut sql = sql.to_owned();
+    sql = sql.replace("__REQUEST_SUPPLIER_ERROR_INLINE_JSON__", r#"CASE WHEN (r.completed_at IS NOT NULL OR op.request_id IS NOT NULL) AND __REQUEST_STATUS_CODE__ >= 400 AND (CASE WHEN r.response_object IS NOT NULL AND r.response_object NOT LIKE 'gap://%' THEN r.response_object WHEN op.request_id IS NOT NULL THEN op.response_object ELSE r.response_object END) LIKE 'inline-json:%' AND LENGTH((CASE WHEN r.response_object IS NOT NULL AND r.response_object NOT LIKE 'gap://%' THEN r.response_object WHEN op.request_id IS NOT NULL THEN op.response_object ELSE r.response_object END)) <= 2048 THEN (CASE WHEN r.response_object IS NOT NULL AND r.response_object NOT LIKE 'gap://%' THEN r.response_object WHEN op.request_id IS NOT NULL THEN op.response_object ELSE r.response_object END) ELSE NULL END"#);
+    sql = sql.replace("__REQUEST_ARCHIVE_STATE__", r#"CASE WHEN request_spool.state = 'uploading' OR spool.state = 'uploading' THEN 'uploading' WHEN request_spool.state = 'pending' OR spool.state = 'pending' THEN 'pending' WHEN request_spool.state = 'capturing' OR spool.state = 'capturing' OR (r.completed_at IS NULL AND op.request_id IS NULL) THEN 'capturing' WHEN request_spool.state IS NULL AND spool.state IS NULL AND r.request_object LIKE 'metadata-only-json:%' AND ((CASE WHEN r.response_object IS NOT NULL AND r.response_object NOT LIKE 'gap://%' THEN r.response_object WHEN op.request_id IS NOT NULL THEN op.response_object ELSE r.response_object END) LIKE 'metadata-only-json:%' OR (CASE WHEN r.response_object IS NOT NULL AND r.response_object NOT LIKE 'gap://%' THEN r.response_object WHEN op.request_id IS NOT NULL THEN op.response_object ELSE r.response_object END) LIKE 'provider-reference-json:%') THEN 'metadata_only' WHEN request_spool.state = 'gap' OR spool.state = 'gap' OR r.request_object LIKE 'gap://%' OR (CASE WHEN r.response_object IS NOT NULL AND r.response_object NOT LIKE 'gap://%' THEN r.response_object WHEN op.request_id IS NOT NULL THEN op.response_object ELSE r.response_object END) IS NULL OR (CASE WHEN r.response_object IS NOT NULL AND r.response_object NOT LIKE 'gap://%' THEN r.response_object WHEN op.request_id IS NOT NULL THEN op.response_object ELSE r.response_object END) LIKE 'gap://%' THEN 'gap' ELSE 'bound' END"#);
+    // Both REST and live event pages use the same immutable execution receipt.
+    for field in [
+        "status_code",
+        "duration_ms",
+        "first_output_ms",
+        "generation_duration_ms",
+        "error_code",
+        "terminal_cause_code",
+        "upstream_account_id",
+    ] {
+        sql = sql.replace(
+            &format!("__REQUEST_{}__", field.to_ascii_uppercase()),
+            &format!("(CASE WHEN op.request_id IS NOT NULL THEN op.{field} ELSE r.{field} END)"),
+        );
+    }
+    sql
+}
+
 fn build_request_list_query(
     scope: RequestListScope<'_>,
     filter: &RequestListFilter,
@@ -1000,7 +1061,7 @@ fn build_request_list_query_for_history(
     };
     let page_limit = filter.limit + i64::from(filter.lookahead);
     let mut query = PortableRequestListQuery::new(
-        "SELECT id, created_at, completed_at, operational_completed_at, operational_stage, financial_state, source_completed_at, protocol, model, upstream_model, upstream_account_id, route_id, status_code, generation_status, duration_ms, first_output_ms, generation_duration_ms, usage_basis, input_tokens, cached_input_tokens, cache_write_tokens, output_tokens, billed_units, billing_unit, cost_micros, currency, billable, error_code, terminal_cause_code, in_flight_stage, supplier_error_inline_json, native_terminal, archive_state, archive_reason, session_id, session_association, compaction, session_name, task_kind, agent_id, semantics_source, tenant_external_id, credential_key_id, key_alias, principal_external_id FROM (SELECT * FROM (SELECT r.id, r.created_at, r.completed_at, op.completed_at AS operational_completed_at, op.stage AS operational_stage, CASE WHEN financial.state = 'applied' THEN 'applied' WHEN financial.unknown_reason IS NOT NULL THEN 'unknown' WHEN financial.state = 'pending' THEN 'pending' ELSE NULL END AS financial_state, CAST(NULL AS BIGINT) AS source_completed_at, r.protocol, r.model, r.upstream_model, (CASE WHEN op.request_id IS NOT NULL THEN op.upstream_account_id ELSE r.upstream_account_id END) AS upstream_account_id, (CASE WHEN op.request_id IS NOT NULL THEN op.model_route_id ELSE r.model_route_id END) AS route_id, (CASE WHEN op.request_id IS NOT NULL THEN op.status_code ELSE r.status_code END) AS status_code, CAST(NULL AS TEXT) AS generation_status, (CASE WHEN op.request_id IS NOT NULL THEN op.duration_ms ELSE r.duration_ms END) AS duration_ms, (CASE WHEN op.request_id IS NOT NULL THEN op.first_output_ms ELSE r.first_output_ms END) AS first_output_ms, (CASE WHEN op.request_id IS NOT NULL THEN op.generation_duration_ms ELSE r.generation_duration_ms END) AS generation_duration_ms, r.usage_basis, CASE WHEN r.completed_at IS NULL THEN NULL ELSE r.input_tokens END AS input_tokens, CASE WHEN r.completed_at IS NULL THEN NULL ELSE r.cached_input_tokens END AS cached_input_tokens, CASE WHEN r.completed_at IS NULL THEN NULL ELSE r.cache_write_tokens END AS cache_write_tokens, CASE WHEN r.completed_at IS NULL THEN NULL ELSE r.output_tokens END AS output_tokens, CASE WHEN r.completed_at IS NULL THEN NULL ELSE r.billed_units END AS billed_units, CASE WHEN r.completed_at IS NULL THEN NULL ELSE NULLIF(r.billing_unit, '') END AS billing_unit, CASE WHEN r.completed_at IS NULL THEN NULL ELSE r.cost_micros END AS cost_micros, CASE WHEN r.completed_at IS NULL THEN NULL ELSE NULLIF(r.currency, '') END AS currency, CAST(1 AS BIGINT) AS billable, (CASE WHEN op.request_id IS NOT NULL THEN op.error_code ELSE r.error_code END) AS error_code, (CASE WHEN op.request_id IS NOT NULL THEN op.terminal_cause_code ELSE r.terminal_cause_code END) AS terminal_cause_code, r.in_flight_stage, CASE WHEN (r.completed_at IS NOT NULL OR op.request_id IS NOT NULL) AND (CASE WHEN op.request_id IS NOT NULL THEN op.status_code ELSE r.status_code END) >= 400 AND (CASE WHEN r.response_object IS NOT NULL AND r.response_object NOT LIKE 'gap://%' THEN r.response_object WHEN op.request_id IS NOT NULL THEN op.response_object ELSE r.response_object END) LIKE 'inline-json:%' AND LENGTH((CASE WHEN r.response_object IS NOT NULL AND r.response_object NOT LIKE 'gap://%' THEN r.response_object WHEN op.request_id IS NOT NULL THEN op.response_object ELSE r.response_object END)) <= 2048 THEN (CASE WHEN r.response_object IS NOT NULL AND r.response_object NOT LIKE 'gap://%' THEN r.response_object WHEN op.request_id IS NOT NULL THEN op.response_object ELSE r.response_object END) ELSE NULL END AS supplier_error_inline_json, CAST(1 AS BIGINT) AS native_terminal, CASE WHEN request_spool.state = 'uploading' OR spool.state = 'uploading' THEN 'uploading' WHEN request_spool.state = 'pending' OR spool.state = 'pending' THEN 'pending' WHEN request_spool.state = 'capturing' OR spool.state = 'capturing' OR (r.completed_at IS NULL AND op.request_id IS NULL) THEN 'capturing' WHEN request_spool.state IS NULL AND spool.state IS NULL AND r.request_object LIKE 'metadata-only-json:%' AND ((CASE WHEN r.response_object IS NOT NULL AND r.response_object NOT LIKE 'gap://%' THEN r.response_object WHEN op.request_id IS NOT NULL THEN op.response_object ELSE r.response_object END) LIKE 'metadata-only-json:%' OR (CASE WHEN r.response_object IS NOT NULL AND r.response_object NOT LIKE 'gap://%' THEN r.response_object WHEN op.request_id IS NOT NULL THEN op.response_object ELSE r.response_object END) LIKE 'provider-reference-json:%') THEN 'metadata_only' WHEN request_spool.state = 'gap' OR spool.state = 'gap' OR r.request_object LIKE 'gap://%' OR (CASE WHEN r.response_object IS NOT NULL AND r.response_object NOT LIKE 'gap://%' THEN r.response_object WHEN op.request_id IS NOT NULL THEN op.response_object ELSE r.response_object END) IS NULL OR (CASE WHEN r.response_object IS NOT NULL AND r.response_object NOT LIKE 'gap://%' THEN r.response_object WHEN op.request_id IS NOT NULL THEN op.response_object ELSE r.response_object END) LIKE 'gap://%' THEN 'gap' ELSE 'bound' END AS archive_state, CASE WHEN request_spool.state IN ('capturing', 'pending', 'uploading') OR spool.state IN ('capturing', 'pending', 'uploading') OR (r.completed_at IS NULL AND op.request_id IS NULL) THEN NULL WHEN request_spool.state = 'gap' THEN COALESCE(request_spool.gap_reason, request_spool.last_error_code, 'archive_object_unavailable') WHEN spool.state = 'gap' THEN COALESCE(spool.last_error_code, 'archive_object_unavailable') WHEN r.request_object LIKE 'gap://%' OR (CASE WHEN r.response_object IS NOT NULL AND r.response_object NOT LIKE 'gap://%' THEN r.response_object WHEN op.request_id IS NOT NULL THEN op.response_object ELSE r.response_object END) IS NULL OR (CASE WHEN r.response_object IS NOT NULL AND r.response_object NOT LIKE 'gap://%' THEN r.response_object WHEN op.request_id IS NOT NULL THEN op.response_object ELSE r.response_object END) LIKE 'gap://%' THEN 'archive_object_unavailable' ELSE NULL END AS archive_reason, r.conversation_cluster_id AS session_id, CASE WHEN r.conversation_cluster_id IS NULL THEN 'unlinked' ELSE 'confirmed' END AS session_association, observation.compaction, observation.session_name, observation.task_kind, observation.agent_id, observation.metadata_source AS semantics_source",
+        "SELECT id, created_at, completed_at, operational_completed_at, operational_stage, financial_state, source_completed_at, protocol, model, upstream_model, upstream_account_id, route_id, status_code, generation_status, duration_ms, first_output_ms, generation_duration_ms, usage_basis, input_tokens, cached_input_tokens, cache_write_tokens, output_tokens, billed_units, billing_unit, cost_micros, currency, billable, error_code, terminal_cause_code, in_flight_stage, supplier_error_inline_json, native_terminal, archive_state, archive_reason, session_id, session_association, compaction, session_name, task_kind, agent_id, semantics_source, tenant_external_id, credential_key_id, key_alias, principal_external_id FROM (SELECT * FROM (SELECT r.id, r.created_at, r.completed_at, op.completed_at AS operational_completed_at, op.stage AS operational_stage, CASE WHEN financial.state = 'applied' THEN 'applied' WHEN financial.unknown_reason IS NOT NULL THEN 'unknown' WHEN financial.state = 'pending' THEN 'pending' ELSE NULL END AS financial_state, CAST(NULL AS BIGINT) AS source_completed_at, r.protocol, r.model, r.upstream_model, __REQUEST_UPSTREAM_ACCOUNT_ID__ AS upstream_account_id, (CASE WHEN op.request_id IS NOT NULL THEN op.model_route_id ELSE r.model_route_id END) AS route_id, __REQUEST_STATUS_CODE__ AS status_code, CAST(NULL AS TEXT) AS generation_status, __REQUEST_DURATION_MS__ AS duration_ms, __REQUEST_FIRST_OUTPUT_MS__ AS first_output_ms, __REQUEST_GENERATION_DURATION_MS__ AS generation_duration_ms, r.usage_basis, CASE WHEN r.completed_at IS NULL THEN NULL ELSE r.input_tokens END AS input_tokens, CASE WHEN r.completed_at IS NULL THEN NULL ELSE r.cached_input_tokens END AS cached_input_tokens, CASE WHEN r.completed_at IS NULL THEN NULL ELSE r.cache_write_tokens END AS cache_write_tokens, CASE WHEN r.completed_at IS NULL THEN NULL ELSE r.output_tokens END AS output_tokens, CASE WHEN r.completed_at IS NULL THEN NULL ELSE r.billed_units END AS billed_units, CASE WHEN r.completed_at IS NULL THEN NULL ELSE NULLIF(r.billing_unit, '') END AS billing_unit, CASE WHEN r.completed_at IS NULL THEN NULL ELSE r.cost_micros END AS cost_micros, CASE WHEN r.completed_at IS NULL THEN NULL ELSE NULLIF(r.currency, '') END AS currency, CAST(1 AS BIGINT) AS billable, __REQUEST_ERROR_CODE__ AS error_code, __REQUEST_TERMINAL_CAUSE_CODE__ AS terminal_cause_code, r.in_flight_stage, __REQUEST_SUPPLIER_ERROR_INLINE_JSON__ AS supplier_error_inline_json, CAST(1 AS BIGINT) AS native_terminal, __REQUEST_ARCHIVE_STATE__ AS archive_state, CASE WHEN request_spool.state IN ('capturing', 'pending', 'uploading') OR spool.state IN ('capturing', 'pending', 'uploading') OR (r.completed_at IS NULL AND op.request_id IS NULL) THEN NULL WHEN request_spool.state = 'gap' THEN COALESCE(request_spool.gap_reason, request_spool.last_error_code, 'archive_object_unavailable') WHEN spool.state = 'gap' THEN COALESCE(spool.last_error_code, 'archive_object_unavailable') WHEN r.request_object LIKE 'gap://%' OR (CASE WHEN r.response_object IS NOT NULL AND r.response_object NOT LIKE 'gap://%' THEN r.response_object WHEN op.request_id IS NOT NULL THEN op.response_object ELSE r.response_object END) IS NULL OR (CASE WHEN r.response_object IS NOT NULL AND r.response_object NOT LIKE 'gap://%' THEN r.response_object WHEN op.request_id IS NOT NULL THEN op.response_object ELSE r.response_object END) LIKE 'gap://%' THEN 'archive_object_unavailable' ELSE NULL END AS archive_reason, r.conversation_cluster_id AS session_id, CASE WHEN r.conversation_cluster_id IS NULL THEN 'unlinked' ELSE 'confirmed' END AS session_association, observation.compaction, observation.session_name, observation.task_kind, observation.agent_id, observation.metadata_source AS semantics_source",
     );
     push_identity_projection(&mut query, scope, "r");
     query.push(" FROM (SELECT r.* FROM request_records r LEFT JOIN proxy_operational_terminals op ON op.request_id = r.id AND op.request_created_at = r.created_at AND op.tenant_id = r.tenant_id AND op.key_id = r.key_id AND op.reservation_id = r.reservation_id");
@@ -1055,6 +1116,7 @@ fn build_request_list_query_for_history(
 
     query.push(") AS all_requests ORDER BY created_at DESC, id DESC LIMIT ");
     query.bind_i64(page_limit);
+    query.statement = expand_request_read_model_sql(&query.statement);
     query
 }
 
@@ -2036,35 +2098,39 @@ fn request_session_context_from_row(
 /// ownership and receipt time constrain the partitioned history join.
 fn enriched_request_events_sql(events: &str) -> String {
     // Both callers supply closed SQL literals with tenant/key ownership.
-    format!(
+    expand_request_read_model_sql(&format!(
         r#"WITH events AS MATERIALIZED ({events})
 SELECT e.*, COALESCE(r.created_at, g.created_at) AS created_at,
+       CAST(CASE WHEN r.id IS NOT NULL THEN 1 ELSE 0 END AS BIGINT) AS native_terminal,
+       op.completed_at AS operational_completed_at, op.stage AS operational_stage,
+       CASE WHEN financial.state = 'applied' THEN 'applied' WHEN financial.unknown_reason IS NOT NULL THEN 'unknown' WHEN financial.state = 'pending' THEN 'pending' ELSE NULL END AS financial_state,
        COALESCE(r.completed_at, g.completed_at) AS completed_at,
        CAST(NULL AS BIGINT) AS source_completed_at,
-       r.first_output_ms, r.generation_duration_ms, r.usage_basis,
+       __REQUEST_FIRST_OUTPUT_MS__ AS first_output_ms,
+       __REQUEST_GENERATION_DURATION_MS__ AS generation_duration_ms, r.usage_basis,
        g.status AS generation_status,
        COALESCE(r.upstream_model, g.upstream_model) AS upstream_model,
-       COALESCE(r.upstream_account_id, g.upstream_account_id) AS upstream_account_id,
-       COALESCE(r.model_route_id, g.model_route_id) AS route_id,
-       COALESCE(r.status_code, CASE WHEN g.id IS NULL THEN e.status_code ELSE NULL END) AS current_status_code,
-       COALESCE(r.duration_ms, CASE WHEN g.completed_at IS NULL THEN NULL ELSE g.completed_at - g.created_at END, e.duration_ms) AS current_duration_ms,
-       CASE WHEN r.completed_at IS NOT NULL THEN r.input_tokens WHEN g.id IS NULL AND e.event_kind = 'finished' THEN e.input_tokens ELSE NULL END AS current_input_tokens,
+       CASE WHEN op.request_id IS NOT NULL THEN op.upstream_account_id ELSE COALESCE(r.upstream_account_id, g.upstream_account_id) END AS upstream_account_id,
+       CASE WHEN op.request_id IS NOT NULL THEN op.model_route_id ELSE COALESCE(r.model_route_id, g.model_route_id) END AS route_id,
+       CASE WHEN r.id IS NOT NULL THEN __REQUEST_STATUS_CODE__ WHEN g.id IS NULL THEN e.status_code ELSE NULL END AS current_status_code,
+       CASE WHEN r.id IS NOT NULL THEN __REQUEST_DURATION_MS__ ELSE COALESCE(CASE WHEN g.completed_at IS NULL THEN NULL ELSE g.completed_at - g.created_at END, e.duration_ms) END AS current_duration_ms,
+       CASE WHEN r.completed_at IS NOT NULL THEN r.input_tokens WHEN r.id IS NULL AND g.id IS NULL AND e.event_kind = 'finished' THEN e.input_tokens ELSE NULL END AS current_input_tokens,
        CASE WHEN r.completed_at IS NOT NULL THEN r.cached_input_tokens ELSE NULL END AS cached_input_tokens,
        CASE WHEN r.completed_at IS NOT NULL THEN r.cache_write_tokens ELSE NULL END AS cache_write_tokens,
-       CASE WHEN r.completed_at IS NOT NULL THEN r.output_tokens WHEN g.id IS NULL AND e.event_kind = 'finished' THEN e.output_tokens ELSE NULL END AS current_output_tokens,
+       CASE WHEN r.completed_at IS NOT NULL THEN r.output_tokens WHEN r.id IS NULL AND g.id IS NULL AND e.event_kind = 'finished' THEN e.output_tokens ELSE NULL END AS current_output_tokens,
        COALESCE(facts.billed_units, CASE WHEN r.completed_at IS NOT NULL THEN r.billed_units ELSE NULL END) AS billed_units,
        COALESCE(NULLIF(facts.billing_unit, ''), CASE WHEN r.completed_at IS NOT NULL THEN NULLIF(r.billing_unit, '') ELSE NULL END) AS billing_unit,
-       COALESCE(facts.cost_micros, CASE WHEN r.completed_at IS NOT NULL THEN r.cost_micros WHEN g.id IS NULL AND e.event_kind = 'finished' THEN e.cost_micros ELSE NULL END) AS current_cost_micros,
-       COALESCE(NULLIF(facts.currency, ''), NULLIF(r.currency, '')) AS currency,
-       COALESCE(r.error_code, g.error_code, e.error_code) AS current_error_code,
-       r.terminal_cause_code AS current_terminal_cause_code, r.in_flight_stage AS in_flight_stage,
-       CASE WHEN r.completed_at IS NOT NULL AND r.status_code >= 400 AND r.response_object LIKE 'inline-json:%' AND LENGTH(r.response_object) <= 131072 THEN r.response_object ELSE NULL END AS supplier_error_inline_json,
+       COALESCE(facts.cost_micros, CASE WHEN r.completed_at IS NOT NULL THEN r.cost_micros WHEN r.id IS NULL AND g.id IS NULL AND e.event_kind = 'finished' THEN e.cost_micros ELSE NULL END) AS current_cost_micros,
+       COALESCE(NULLIF(facts.currency, ''), CASE WHEN r.completed_at IS NOT NULL THEN NULLIF(r.currency, '') ELSE NULL END) AS currency,
+       CASE WHEN r.id IS NOT NULL THEN __REQUEST_ERROR_CODE__ ELSE COALESCE(g.error_code, e.error_code) END AS current_error_code,
+       __REQUEST_TERMINAL_CAUSE_CODE__ AS current_terminal_cause_code, r.in_flight_stage AS in_flight_stage,
+       __REQUEST_SUPPLIER_ERROR_INLINE_JSON__ AS supplier_error_inline_json,
        CASE WHEN g.id IS NOT NULL THEN
             CASE WHEN g.status IN ('preparing', 'queued') THEN 'pending'
                  WHEN g.status IN ('submitting', 'running', 'cancelling') THEN 'uploading'
                  WHEN g.request_object LIKE 'gap://%' OR (g.status = 'succeeded' AND g.result_json IS NULL) THEN 'gap'
                  ELSE 'bound' END
-            ELSE CASE WHEN request_spool.state = 'uploading' OR spool.state = 'uploading' THEN 'uploading' WHEN request_spool.state = 'pending' OR spool.state = 'pending' THEN 'pending' WHEN request_spool.state = 'capturing' OR spool.state = 'capturing' OR r.completed_at IS NULL THEN 'capturing' WHEN request_spool.state IS NULL AND spool.state IS NULL AND r.request_object LIKE 'metadata-only-json:%' AND (r.response_object LIKE 'metadata-only-json:%' OR r.response_object LIKE 'provider-reference-json:%') THEN 'metadata_only' WHEN request_spool.state = 'gap' OR spool.state = 'gap' OR r.request_object LIKE 'gap://%' OR r.response_object IS NULL OR r.response_object LIKE 'gap://%' THEN 'gap' ELSE 'bound' END
+            ELSE __REQUEST_ARCHIVE_STATE__
        END AS archive_state,
        r.conversation_cluster_id AS session_id,
        CASE WHEN r.id IS NULL THEN NULL
@@ -2083,6 +2149,12 @@ SELECT e.*, COALESCE(r.created_at, g.created_at) AS created_at,
   LEFT JOIN request_records r
     ON r.id = locator.id AND r.created_at = locator.created_at
    AND r.tenant_id = e.tenant_id AND r.key_id = e.key_id
+  LEFT JOIN proxy_operational_terminals op
+    ON op.request_id = r.id AND op.request_created_at = r.created_at
+   AND op.tenant_id = r.tenant_id AND op.key_id = r.key_id AND op.reservation_id = r.reservation_id
+  LEFT JOIN pending_proxy_settlements financial
+    ON financial.request_id = r.id AND financial.tenant_id = r.tenant_id
+   AND financial.key_id = r.key_id AND financial.reservation_id = r.reservation_id
   LEFT JOIN generation_jobs g
     ON r.id IS NULL AND e.protocol = 'generation' AND g.id = e.request_id
    AND g.tenant_id = e.tenant_id AND g.key_id = e.key_id
@@ -2103,7 +2175,7 @@ SELECT e.*, COALESCE(r.created_at, g.created_at) AS created_at,
   LEFT JOIN principals principal
     ON principal.id = key_record.principal_id AND principal.tenant_id = key_record.tenant_id
  ORDER BY e.event_at ASC, e.event_id ASC"#
-    )
+    ))
 }
 
 fn request_event_views(rows: Vec<AnyRow>) -> Result<Vec<RequestEventView>, AppError> {
@@ -2158,6 +2230,8 @@ fn request_event_views(rows: Vec<AnyRow>) -> Result<Vec<RequestEventView>, AppEr
                 },
             );
             Ok(RequestEventView {
+                operational_terminal: operational_terminal_view(&row)?,
+                egress: None,
                 usage_basis,
                 compaction: row
                     .try_get::<Option<i64>, _>("compaction")?

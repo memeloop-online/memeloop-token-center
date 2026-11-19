@@ -23,6 +23,21 @@ async fn postgres_event_enrichment_preserves_recorded_fields_and_tenant_ownershi
 }
 
 async fn assert_event_enrichment(database: &Database) {
+    let list_sql = build_request_list_query(
+        RequestListScope::Global,
+        &RequestListFilter {
+            limit: 10,
+            ..RequestListFilter::default()
+        },
+    );
+    let event_sql = enriched_request_events_sql("SELECT * FROM request_events WHERE 1 = 0");
+    for sql in [&list_sql.statement, &event_sql] {
+        assert!(
+            !sql.contains("__REQUEST_"),
+            "unexpanded request projection token"
+        );
+    }
+
     let tenant = Uuid::now_v7().to_string();
     let foreign_tenant = Uuid::now_v7().to_string();
     let external = format!("event-fields-{tenant}");
@@ -63,6 +78,9 @@ async fn assert_event_enrichment(database: &Database) {
         .execute(&database.pool).await.unwrap();
     sqlx::query("UPDATE request_records SET first_output_ms = 5, generation_duration_ms = 15 WHERE id = $1 AND created_at = $2")
         .bind(&request).bind(now).execute(&database.pool).await.unwrap();
+    sqlx::query("INSERT INTO request_egress_attempts (request_id, attempt_id, outbound_attempt, connect_attempt, route_id, upstream_account_id, credential_generation, transport_revision, observed_at, snapshot_json, transport_json, final_response) VALUES ($1, 'recorded-egress', 1, 1, $2, $3, 1, 1, $4, '{\"kind\":\"direct\"}', '{}', 1)")
+        .bind(&request).bind(route.to_string()).bind(upstream.to_string()).bind(now + 25)
+        .execute(&database.pool).await.unwrap();
     // The foreign event deliberately references the same request/key. It must
     // never inherit the first tenant's routing or conversation fields.
     for event_tenant in [&tenant, &foreign_tenant] {
@@ -175,6 +193,16 @@ async fn assert_event_enrichment(database: &Database) {
             "a foreign-tenant event cannot inherit even a true marker"
         );
     }
+    let own_events = database
+        .request_events_after(&external, now, None, 500)
+        .await
+        .unwrap();
+    let foreign_events = database
+        .request_events_after(&foreign_external, now, None, 500)
+        .await
+        .unwrap();
+    assert!(own_events[0].egress.is_some());
+    assert!(foreign_events[0].egress.is_none());
     // One persisted native inline channel feeds list/detail/enriched event JSON.
     // Old, unsafe and object-store bodies are never parsed by the projection.
     let safe = format!(
@@ -226,7 +254,8 @@ async fn assert_event_enrichment(database: &Database) {
     sqlx::query("UPDATE request_records SET status_code = 502, error_code = 'rate_limited', response_object = NULL, completed_at = $1 WHERE id = $2 AND created_at = $3")
         .bind(now + 25).bind(&request).bind(now).execute(&database.pool).await.unwrap();
     let rate_limited = serde_json::json!({
-        "code": "rate_limited", "message": "The upstream request rate limit was exceeded"
+        "code": "rate_limited", "message": "The upstream request rate limit was exceeded",
+        "category": "rate_limit", "retryable": true, "action": "retry_later"
     });
     let self_list = database.list_requests(key_id, 10).await.unwrap();
     let operator_list = database.list_all_requests(&external, 10).await.unwrap();
@@ -319,6 +348,90 @@ async fn assert_event_enrichment(database: &Database) {
         .bind(&request).bind(now).fetch_one(&mut *transaction).await.unwrap();
     assert_eq!(timing, (Some(7), Some(11)));
     transaction.rollback().await.unwrap();
+    // Execution has completed while financial projection has not: both read
+    // surfaces must use the same operational receipt, without inventing money.
+    sqlx::query("INSERT INTO proxy_operational_terminals (request_id, request_created_at, tenant_id, key_id, account_id, reservation_id, owner_token, fence, contract_digest, receipt_id, operational_digest, status_code, completed_at, duration_ms, response_object, recorded_at, upstream_account_id, model_route_id) SELECT id, created_at, tenant_id, key_id, $1, reservation_id, 'owner', 'fence', 'contract', 'receipt', 'digest', 200, created_at + 25, 25, 'gap://fixture', created_at + 30, upstream_account_id, model_route_id FROM request_records WHERE id = $2 AND created_at = $3")
+        .bind(&account).bind(&request).bind(now).execute(&database.pool).await.unwrap();
+    sqlx::query("INSERT INTO pending_proxy_settlements (request_id, tenant_id, key_id, account_id, reservation_id, owner_token, fence, contract_digest, contract_json, state, created_at, updated_at) SELECT id, tenant_id, key_id, $1, reservation_id, 'owner', 'fence', 'contract', '{}', 'pending', created_at, created_at + 30 FROM request_records WHERE id = $2 AND created_at = $3")
+        .bind(&account).bind(&request).bind(now).execute(&database.pool).await.unwrap();
+    sqlx::query("UPDATE request_records SET status_code = NULL, completed_at = NULL WHERE id = $1 AND created_at = $2")
+        .bind(&request).bind(now).execute(&database.pool).await.unwrap();
+    let rest = database.list_all_requests(&external, 10).await.unwrap();
+    let live = database
+        .request_events_after(&external, now, None, 500)
+        .await
+        .unwrap();
+    let rest = serde_json::to_value(&rest[0]).unwrap();
+    let live = serde_json::to_value(&live[0]).unwrap();
+    for field in [
+        "status_code",
+        "duration_ms",
+        "operational_terminal",
+        "egress",
+        "cost",
+        "usage",
+        "billing",
+    ] {
+        assert_eq!(
+            live[field], rest[field],
+            "operational pending field {field}"
+        );
+    }
+    assert_eq!(live["status_code"], 200);
+    assert_eq!(live["operational_terminal"]["financial_state"], "pending");
+    assert!(live["cost"].is_null());
+    sqlx::query("UPDATE request_records SET status_code = 200, completed_at = $1, input_tokens = 124319, output_tokens = 156, cost_micros = 2000000 WHERE id = $2 AND created_at = $3")
+        .bind(now + 80).bind(&request).bind(now).execute(&database.pool).await.unwrap();
+    sqlx::query("UPDATE pending_proxy_settlements SET state = 'applied', receipt_id = 'settled', receipt_digest = 'settled-digest', cost_micros = 2000000, status_code = 200, response_object = 'gap://fixture', applied_at = $1, updated_at = $1 WHERE request_id = $2")
+        .bind(now + 80).bind(&request).execute(&database.pool).await.unwrap();
+    let rest = database.list_all_requests(&external, 10).await.unwrap();
+    let live = database
+        .request_events_after(&external, now, None, 500)
+        .await
+        .unwrap();
+    let rest = serde_json::to_value(&rest[0]).unwrap();
+    let live = serde_json::to_value(&live[0]).unwrap();
+    for field in [
+        "status_code",
+        "duration_ms",
+        "operational_terminal",
+        "egress",
+        "cost",
+        "usage",
+        "billing",
+    ] {
+        assert_eq!(live[field], rest[field], "settled receipt field {field}");
+    }
+    assert_eq!(live["input_tokens"], 124319);
+    assert_eq!(live["operational_terminal"]["financial_state"], "applied");
+    // A separate operational failure remains authoritative before settlement,
+    // including its bounded safe error and valid response archive locator.
+    sqlx::query("UPDATE request_records SET status_code = NULL, completed_at = NULL, response_object = NULL, request_object = 'objects://fixture/request' WHERE id = $1 AND created_at = $2")
+        .bind(&request).bind(now).execute(&database.pool).await.unwrap();
+    sqlx::query("UPDATE proxy_operational_terminals SET status_code = 502, error_code = 'no_active_plan', response_object = $1 WHERE request_id = $2")
+        .bind(&safe).bind(&request).execute(&database.pool).await.unwrap();
+    let rest = database.list_all_requests(&external, 10).await.unwrap();
+    let live = database
+        .request_events_after(&external, now, None, 500)
+        .await
+        .unwrap();
+    let rest = serde_json::to_value(&rest[0]).unwrap();
+    let live = serde_json::to_value(&live[0]).unwrap();
+    for field in [
+        "status_code",
+        "duration_ms",
+        "archive_state",
+        "supplier_error",
+        "egress",
+    ] {
+        assert_eq!(
+            live[field], rest[field],
+            "operational failure field {field}"
+        );
+    }
+    assert_eq!(live["status_code"], 502);
+    assert_eq!(live["archive_state"], "bound");
+    assert_eq!(live["supplier_error"], fixed);
     // The SQLite fixture owns its pool. PostgreSQL CI shares its database
     // with concurrent high-volume tests, so a global first page is not ours.
     if matches!(database.backend, DatabaseBackend::Sqlite) {
