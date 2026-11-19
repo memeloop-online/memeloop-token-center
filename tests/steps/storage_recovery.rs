@@ -3,19 +3,24 @@ use super::*;
 #[path = "../support/recovery_object_proxy.rs"]
 mod recovery_object_proxy;
 use recovery_object_proxy::RecoveryObjectProxy;
+#[path = "../support/postgres_isolation.rs"]
+mod postgres_isolation;
 
 pub(super) struct RecoveryState {
-    proxy: RecoveryObjectProxy,
+    pub(super) proxy: RecoveryObjectProxy,
     failed_prefix: Option<String>,
+    isolated: postgres_isolation::IsolatedPostgres,
 }
 
 #[given("a recovery service backed by PostgreSQL and real object storage")]
-async fn start_recovery_service(world: &mut TokenCenterWorld) {
+pub(super) async fn start_recovery_service(world: &mut TokenCenterWorld) {
     let database = std::env::var("MTC_TEST_POSTGRES_URL").expect("PostgreSQL acceptance URL");
     let endpoint = std::env::var("MTC_RUSTFS_TEST_ENDPOINT").expect("real S3 acceptance endpoint");
     let proxy = RecoveryObjectProxy::start(&endpoint).await;
     let mock = MockServer::start().await;
-    let mut config = Config::for_test(database);
+    let isolated = postgres_isolation::IsolatedPostgres::create(&database).await;
+    let mut config = Config::for_test(isolated.url().to_owned());
+    config.archive_backend = memeloop_token_center::config::ArchiveBackend::S3;
     config.upstream_openai_url = Some(mock.uri());
     config.s3_endpoint = Some(proxy.endpoint().to_owned());
     config.s3_bucket = Some(std::env::var("MTC_RUSTFS_TEST_BUCKET").unwrap());
@@ -30,6 +35,7 @@ async fn start_recovery_service(world: &mut TokenCenterWorld) {
     world.recovery = Some(RecoveryState {
         proxy,
         failed_prefix: None,
+        isolated,
     });
 }
 
@@ -115,4 +121,23 @@ async fn exact_originals_and_once(world: &mut TokenCenterWorld) {
         assert_eq!(actual.as_ref(), expected.as_slice());
     }
     stats_contain_request(world, 1, 10).await;
+    assert_eq!(world.response["summary"]["total_cost"], "0.00001");
+    let pool = AnyPool::connect(&world.state.as_ref().unwrap().config.database_url)
+        .await
+        .unwrap();
+    let (count, amount): (i64, i64) = sqlx::query_as(
+        "SELECT COUNT(*), COALESCE(SUM(amount_micros), 0) FROM ledger_entries WHERE key_id = $1 AND kind = 'usage'"
+    ).bind(world.stable_key_id.unwrap().to_string()).fetch_one(&pool).await.unwrap();
+    assert_eq!((count, amount), (1, -10));
+    pool.close().await;
+}
+
+pub(super) async fn cleanup(world: &mut TokenCenterWorld) {
+    if let Some(recovery) = world.recovery.take() {
+        if let Some(task) = world.server_task.take() {
+            task.abort();
+            let _ = task.await;
+        }
+        recovery.isolated.cleanup().await;
+    }
 }

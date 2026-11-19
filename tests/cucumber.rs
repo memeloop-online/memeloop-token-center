@@ -373,6 +373,7 @@ async fn finish_scenario(world: Option<&mut TokenCenterWorld>) {
     // Stop and join it before inspecting mock expectations, so any failure belongs to this hook.
     stop_test_worker(world).await;
     verify_test_mocks(world).await;
+    storage_recovery::cleanup(world).await;
 }
 
 type PanicHook = dyn for<'a> Fn(&std::panic::PanicHookInfo<'a>) + Send + Sync + 'static;
@@ -3413,8 +3414,8 @@ async fn mock_sensitive_openai_image_rejection(world: &mut TokenCenterWorld) {
         .and(header_exists("idempotency-key"))
         .respond_with(ResponseTemplate::new(400).set_body_json(json!({
             "error": {
-                "message": "provider detail must-not-leak",
-                "signed_url": "https://images.example.invalid/result.png?token=must-not-leak"
+                "message": "provider detail remains available",
+                "signed_url": "https://images.example.invalid/result.png?token=image-credential-must-not-leak"
             }
         })))
         .expect(1)
@@ -4636,7 +4637,9 @@ async fn oversized_openai_image_is_unbilled(world: &mut TokenCenterWorld) {
 async fn sensitive_openai_image_rejection_is_sanitized(world: &mut TokenCenterWorld) {
     assert_eq!(world.status, Some(StatusCode::BAD_GATEWAY));
     let rendered = world.response.to_string();
-    assert!(!rendered.contains("must-not-leak"));
+    assert!(rendered.contains("provider detail remains available"));
+    assert!(!rendered.contains("image-credential-must-not-leak"));
+    assert!(!rendered.contains("image-secret"));
     assert_eq!(world.response["error"]["code"], "upstream_http_400");
     let request_id = world
         .synchronous_request_id
