@@ -79,7 +79,7 @@ async fn canonical_training_reads_complete_prefix_without_legacy_root_and_fails_
     }
     for node in &nodes {
         sqlx::query("INSERT INTO context_nodes (tenant_id,node_hash,parent_hash,atom_hash,depth,created_at) VALUES ($1,$2,$3,$4,$5,1) ON CONFLICT DO NOTHING")
-            .bind(key.tenant_id.to_string()).bind(&node.node_hash).bind(&node.parent_hash).bind(&node.atom_hash).bind(node.depth).execute(&inspection).await.unwrap();
+            .bind(key.tenant_id.to_string()).bind(&node.node_hash).bind(&node.parent_hash).bind(&node.atom_hash).bind(i64::try_from(node.depth).unwrap()).execute(&inspection).await.unwrap();
     }
     sqlx::query("UPDATE conversation_observations SET leaf_node_hash=$1 WHERE request_id=$2")
         .bind(&nodes.last().unwrap().node_hash)
