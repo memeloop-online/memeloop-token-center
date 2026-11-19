@@ -807,11 +807,14 @@ impl Database {
             DatabaseBackend::PostgreSql => "BEGIN",
             DatabaseBackend::Sqlite => "BEGIN IMMEDIATE",
         };
-        Box::pin(Transaction::begin(
+        let mut phase = self.pool.diagnostics().begin();
+        let result = Box::pin(Transaction::begin(
             connection.into_pool(),
             Some(sqlx::SqlStr::from_static(statement)),
         ))
-        .await
+        .await;
+        phase.finish(result.is_ok());
+        result
     }
 
     fn observe_pool_timeout(
@@ -824,6 +827,7 @@ impl Database {
             let pool_size = self.pool.size();
             let pool_idle = self.pool.num_idle();
             let diagnostics = self.pool.diagnostics();
+            diagnostics.observe_phases();
             let (waiters, initializing, cancelled, failed, returned, discarded) =
                 diagnostics.snapshot();
             tracing::warn!(
