@@ -1,6 +1,6 @@
 ARG NODE_IMAGE=node:24.18.0-bookworm-slim@sha256:6f7b03f7c2c8e2e784dcf9295400527b9b1270fd37b7e9a7285cf83b6951452d
 ARG RUST_IMAGE=rust:1.95.0-bookworm@sha256:6258907abe69656e41cd992e0b705cdcfabcbbe3db374f92ed2d47121282d4a1
-ARG GO_IMAGE=golang:1.27.3-bookworm@sha256:05237276236793ebedaf0b87dab86add9ec9adc66ebef2dbc3107c18254cde1c
+ARG GO_IMAGE=golang:1.27.4-bookworm@sha256:4fa7c968ba93f1635670522dbb01a2c78150443e1385746924566079f36570ea
 ARG RUNTIME_IMAGE=gcr.io/distroless/base-nossl-debian13:nonroot
 
 FROM ${GO_IMAGE} AS cosign-builder
@@ -20,7 +20,7 @@ RUN git apply --unidiff-zero --check /tmp/cosign-security.patch \
     && CGO_ENABLED=0 go build -mod=readonly -trimpath -tags=netgo,osusergo \
       -ldflags '-buildid= -X sigs.k8s.io/release-utils/version.gitVersion=v3.1.4-mtc.1 -X sigs.k8s.io/release-utils/version.gitCommit=0e48502cf5ef34e2e60bbd3617aa19945712f705 -X sigs.k8s.io/release-utils/version.gitTreeState=modified' \
       -o /tmp/cosign ./cmd/cosign \
-    && go version -m /tmp/cosign | grep -Eq 'go1\.27\.3$' \
+    && go version -m /tmp/cosign | grep -Eq 'go1\.27\.4$' \
     && go version -m /tmp/cosign | grep -Eq '[[:space:]]dep[[:space:]]+golang.org/x/net[[:space:]]+v0\.62\.0[[:space:]]' \
     && go version -m /tmp/cosign | grep -Eq '[[:space:]]dep[[:space:]]+github.com/klauspost/compress[[:space:]]+v1\.20\.1[[:space:]]' \
     && /tmp/cosign version --json \
