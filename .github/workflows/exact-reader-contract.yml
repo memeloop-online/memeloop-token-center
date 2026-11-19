@@ -100,6 +100,7 @@ jobs:
           cargo test --locked --lib --no-run
           for selector in \
             supplier_error::tests::shared_projection_preserves_explanation_and_removes_credentials \
+            supplier_error::tests::credential_echoes_include_authorization_payload_and_decoded_password \
             supplier_error::tests::credential_projection_handles_url_and_known_secret_echoes \
             supplier_error::tests::record_details_above_old_inline_limit_preserve_unknown_fields \
             supplier_error::tests::known_and_unknown_details_survive_http_stream_and_record_projection \

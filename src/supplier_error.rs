@@ -180,6 +180,19 @@ fn collect_credentials(value: &serde_json::Value, secrets: &mut Vec<String>) {
                 if credential_key(key) {
                     if let Some(secret) = value.as_str().filter(|secret| !secret.is_empty()) {
                         secrets.push(secret.to_owned());
+                        if matches!(
+                            key.to_ascii_lowercase().replace(['-', '_'], "").as_str(),
+                            "authorization" | "proxyauthorization"
+                        ) {
+                            if let Some((scheme, credential)) = secret.split_once(' ') {
+                                if (scheme.eq_ignore_ascii_case("bearer")
+                                    || scheme.eq_ignore_ascii_case("basic"))
+                                    && !credential.trim().is_empty()
+                                {
+                                    secrets.push(credential.trim().to_owned());
+                                }
+                            }
+                        }
                     }
                 }
                 collect_credentials(value, secrets);
@@ -195,6 +208,11 @@ fn collect_credentials(value: &serde_json::Value, secrets: &mut Vec<String>) {
                 if matches!(parsed.scheme(), "http" | "https") {
                     if let Some(password) = parsed.password().filter(|v| !v.is_empty()) {
                         secrets.push(password.to_owned());
+                        secrets.push(
+                            percent_encoding::percent_decode_str(password)
+                                .decode_utf8_lossy()
+                                .into_owned(),
+                        );
                     }
                     for (key, value) in parsed.query_pairs() {
                         if credential_key(&key) && !value.is_empty() {
@@ -316,6 +334,20 @@ pub(crate) fn upstream_error_value(value: &serde_json::Value) -> serde_json::Val
 mod tests {
     use super::*;
     use serde_json::json;
+
+    #[test]
+    fn credential_echoes_include_authorization_payload_and_decoded_password() {
+        let raw = json!({"error": {"authorization": "Bearer actual-secret", "url": "https://user:private%2Dpassword@provider.invalid/result", "message": "explanation actual-secret private-password"}});
+        let projected = upstream_error_value(&raw);
+        assert_eq!(projected["message"], "explanation [redacted] [redacted]");
+        assert_eq!(
+            projected["mtc_provider_details"]["error"]["url"],
+            "https://provider.invalid/result"
+        );
+        for secret in ["actual-secret", "private-password", "private%2Dpassword"] {
+            assert!(!projected.to_string().contains(secret));
+        }
+    }
 
     #[test]
     fn credential_projection_handles_url_and_known_secret_echoes() {
