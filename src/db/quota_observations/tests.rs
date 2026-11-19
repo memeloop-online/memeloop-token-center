@@ -627,6 +627,20 @@ async fn verify_scoped_supplier_usage_recovery(db: &Database, tenant: &str, pepp
         accepted, now,
         "older publication cannot replace newer authority"
     );
+    let accepted_json: String = sqlx::query_scalar(
+        "SELECT observation_json FROM upstream_quota_observations WHERE upstream_account_id=$1",
+    )
+    .bind(account.id.to_string())
+    .fetch_one(&db.pool)
+    .await
+    .unwrap();
+    let accepted_value: RoutingQuotaObservation = serde_json::from_str(&accepted_json).unwrap();
+    assert_eq!(accepted_value.started_at, newer.started_at);
+    assert_eq!(
+        accepted_value.windows[0].remaining_fraction,
+        Some(0.98),
+        "late older supplier read cannot overwrite newer manual windows"
+    );
     let rows = sqlx::query("SELECT upstream_model,failure_kind,capacity_scope,request_id FROM upstream_supplier_availability WHERE upstream_account_id=$1")
         .bind(account.id.to_string()).fetch_all(&db.pool).await.unwrap();
     assert_eq!(rows.len(), 7);

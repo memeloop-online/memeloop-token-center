@@ -503,6 +503,7 @@ mod tests {
         })).unwrap();
         let mut snapshot = super::super::QuotaSnapshot::empty(&account, "tenant", None);
         snapshot.status = "ready";
+        snapshot.read_started_at = Some(90);
         snapshot.observed_at = Some(100);
         snapshot.stale_after = Some(200);
         snapshot.freshness = "fresh";
@@ -595,6 +596,7 @@ mod tests {
         })).unwrap();
         let mut snapshot = super::super::QuotaSnapshot::empty(&account, "tenant", None);
         snapshot.status = "ready";
+        snapshot.read_started_at = Some(90);
         snapshot.observed_at = Some(100);
         snapshot.stale_after = Some(200);
         snapshot.freshness = "fresh";
