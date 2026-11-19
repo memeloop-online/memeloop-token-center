@@ -2587,6 +2587,32 @@ async fn postgres_exact_legacy_body_rebuild_preserves_incomplete_and_financial_r
     .await
     .unwrap();
     assert!(leaf.is_some());
+    let authority = fixture
+        .state
+        .archive
+        .semantic_archive_authority(
+            fixture.key.tenant_id,
+            fixture.request_id,
+            leaf.as_deref().unwrap(),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+    let manifest = fixture
+        .state
+        .archive
+        .get_semantic_manifest_streamed(fixture.key.tenant_id, &authority.publication.manifest)
+        .await
+        .unwrap();
+    assert!(!manifest.coverage.observed_terminal);
+    assert!(
+        manifest
+            .coverage
+            .gaps
+            .iter()
+            .any(|g| g == "response_protocol_incomplete")
+    );
+    assert!(manifest.raw_sources.is_some());
     let financial_after: String = sqlx::query_scalar(
         "SELECT row_to_json(t)::TEXT FROM terminal_projection_outbox t WHERE request_id = $1",
     )
