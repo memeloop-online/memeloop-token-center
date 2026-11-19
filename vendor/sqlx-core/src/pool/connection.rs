@@ -98,6 +98,10 @@ impl<DB: Database> PoolConnection<DB> {
         self.close_on_drop = true;
     }
 
+    pub(crate) fn replace_close_on_drop(&mut self, close: bool) -> bool {
+        std::mem::replace(&mut self.close_on_drop, close)
+    }
+
     /// Detach this connection from the pool, allowing it to open a replacement.
     ///
     /// Note that if your application uses a single shared pool, this

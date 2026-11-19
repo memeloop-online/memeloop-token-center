@@ -110,7 +110,20 @@ where
                 open: true,
             };
 
+            // A cancelled BEGIN can have reached the server before the driver
+            // confirms transaction depth. Keep its pooled socket out of reuse.
+            let original_close = match &mut tx.connection {
+                MaybePoolConnection::PoolConnection(connection) => {
+                    Some(connection.replace_close_on_drop(true))
+                }
+                MaybePoolConnection::Connection(_) => None,
+            };
             DB::TransactionManager::begin(&mut tx.connection, statement).await?;
+            if let (Some(original), MaybePoolConnection::PoolConnection(connection)) =
+                (original_close, &mut tx.connection)
+            {
+                connection.replace_close_on_drop(original);
+            }
 
             Ok(tx)
         })

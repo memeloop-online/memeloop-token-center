@@ -8,6 +8,11 @@ impl Drop for RelayGuard {
 }
 
 pub(super) async fn postgres_return_health_timeout_releases_slot(url: &str) {
+    run_return_health_case(url, false).await;
+    run_return_health_case(url, true).await;
+}
+
+async fn run_return_health_case(url: &str, cancel_begin: bool) {
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
     let mut endpoint = url::Url::parse(url).unwrap();
     let host = endpoint.host_str().unwrap().to_owned();
@@ -73,21 +78,33 @@ pub(super) async fn postgres_return_health_timeout_releases_slot(url: &str) {
         .await
         .unwrap();
     gate.send(true).unwrap();
-    connection.finish();
+    let pending_begin = if cancel_begin {
+        Some(tokio::spawn(async move {
+            Transaction::begin(connection.into_pool(), None).await
+        }))
+    } else {
+        connection.finish();
+        None
+    };
     tokio::time::timeout(Duration::from_secs(5), blocked.notified())
         .await
         .expect("real PostgreSQL ping response reached the relay gate");
-    assert_eq!(pool.diagnostics.direct_owned.load(Ordering::Relaxed), 0);
-    assert_eq!(pool.diagnostics.return_requested.load(Ordering::Relaxed), 1);
-    assert_eq!(pool.size(), 1);
-    assert_eq!(pool.num_idle(), 0);
-    tokio::time::timeout(Duration::from_secs(5), async {
-        while pool.size() != 0 {
-            tokio::time::sleep(Duration::from_millis(10)).await;
-        }
-    })
-    .await
-    .expect("return health budget releases the stalled slot");
+    if let Some(pending) = pending_begin {
+        pending.abort();
+        assert!(pending.await.unwrap_err().is_cancelled());
+    } else {
+        assert_eq!(pool.diagnostics.direct_owned.load(Ordering::Relaxed), 0);
+        assert_eq!(pool.diagnostics.return_requested.load(Ordering::Relaxed), 1);
+        assert_eq!(pool.size(), 1);
+        assert_eq!(pool.num_idle(), 0);
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while pool.size() != 0 {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("return health budget releases the stalled slot");
+    }
     gate.send(false).unwrap();
     let mut reused = tokio::time::timeout(Duration::from_secs(5), pool.acquire())
         .await
@@ -100,6 +117,15 @@ pub(super) async fn postgres_return_health_timeout_releases_slot(url: &str) {
     assert_ne!(
         reused_pid, pid,
         "a fresh backend replaces the stalled returned connection"
+    );
+    let status: String =
+        sqlx::query_scalar("SELECT state FROM pg_stat_activity WHERE pid = pg_backend_pid()")
+            .fetch_one(&mut *reused)
+            .await
+            .unwrap();
+    assert_eq!(
+        status, "active",
+        "replacement is outside the cancelled BEGIN transaction"
     );
     let same_pid: i32 = sqlx::query_scalar("SELECT pg_backend_pid()")
         .fetch_one(&mut *reused)
@@ -117,6 +143,42 @@ pub(super) async fn postgres_return_health_timeout_releases_slot(url: &str) {
         "healthy maintenance preserves backend reuse"
     );
     healthy.finish();
+    if cancel_begin {
+        let mut transaction = pool.begin().await.unwrap();
+        let transaction_pid: i32 = sqlx::query_scalar("SELECT pg_backend_pid()")
+            .fetch_one(&mut *transaction)
+            .await
+            .unwrap();
+        assert_eq!(transaction_pid, reused_pid);
+        transaction.commit().await.unwrap();
+        let mut normal = pool.acquire().await.unwrap();
+        let normal_pid: i32 = sqlx::query_scalar("SELECT pg_backend_pid()")
+            .fetch_one(&mut *normal)
+            .await
+            .unwrap();
+        assert_eq!(normal_pid, reused_pid, "confirmed BEGIN keeps normal reuse");
+        normal.close_on_drop();
+        let mut marked = Transaction::begin(normal.into_pool(), None).await.unwrap();
+        sqlx::query("SELECT 1").execute(&mut *marked).await.unwrap();
+        marked.commit().await.unwrap();
+        let mut replacement = pool.acquire().await.unwrap();
+        let marked_replacement: i32 = sqlx::query_scalar("SELECT pg_backend_pid()")
+            .fetch_one(&mut *replacement)
+            .await
+            .unwrap();
+        assert_ne!(
+            marked_replacement, normal_pid,
+            "successful BEGIN preserves caller close-on-drop"
+        );
+        let old_exists: bool =
+            sqlx::query_scalar("SELECT EXISTS (SELECT 1 FROM pg_stat_activity WHERE pid=$1)")
+                .bind(pid)
+                .fetch_one(&mut *replacement)
+                .await
+                .unwrap();
+        assert!(!old_exists, "cancelled BEGIN backend exited");
+        replacement.finish();
+    }
     pool.close().await;
     drop(relay);
 }
