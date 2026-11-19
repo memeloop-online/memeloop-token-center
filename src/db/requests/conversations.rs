@@ -484,7 +484,7 @@ impl Database {
         tenant_id: Uuid,
         key_id: Uuid,
         request_id: Uuid,
-        expected_projected_at: i64,
+        expected_projected_at: Option<i64>,
         request_locator: &str,
         response_locator: &str,
         lease_owner: Uuid,
@@ -505,7 +505,7 @@ impl Database {
              terminal_lease_owner = NULL, terminal_lease_expires_at = NULL,
              statistics_outcome = 'session_body', attempts = attempts + 1
              WHERE request_id = $3 AND tenant_id = $4 AND key_id = $5
-               AND projected_at = $6
+               AND (projected_at = $6 OR (projected_at IS NULL AND $6 IS NULL))
                AND semantic_snapshot_json IS NULL AND semantic_payload_snapshot_json IS NULL
                AND (lease_owner IS NULL OR lease_expires_at <= $7)
                AND (terminal_lease_owner IS NULL OR terminal_lease_expires_at <= $7)

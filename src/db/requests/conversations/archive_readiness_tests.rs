@@ -2533,7 +2533,7 @@ async fn postgres_exact_legacy_body_rebuild_preserves_incomplete_and_financial_r
             fixture.key.tenant_id,
             fixture.key.key_id,
             fixture.request_id,
-            41,
+            Some(41),
             &request_locator,
             &response_locator,
             owner
@@ -2546,7 +2546,7 @@ async fn postgres_exact_legacy_body_rebuild_preserves_incomplete_and_financial_r
             fixture.key.tenant_id,
             fixture.key.key_id,
             fixture.request_id,
-            42,
+            Some(42),
             &request_locator,
             &response_locator,
             owner
@@ -2559,7 +2559,7 @@ async fn postgres_exact_legacy_body_rebuild_preserves_incomplete_and_financial_r
             fixture.key.tenant_id,
             fixture.key.key_id,
             fixture.request_id,
-            42,
+            Some(42),
             &request_locator,
             &response_locator,
             Uuid::now_v7()
