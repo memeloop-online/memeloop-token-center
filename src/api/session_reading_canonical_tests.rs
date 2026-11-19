@@ -45,6 +45,14 @@ async fn canonical_training_reads_complete_prefix_without_legacy_root_and_fails_
         ]}),
         &crate::conversation::ConversationHints::default(), Some("canonical-training"),
     ).await.unwrap();
+    assert!(
+        state
+            .archive
+            .raw_capture_reference(key.tenant_id, request, "request")
+            .await
+            .unwrap()
+            .is_none()
+    );
     let service = state
         .db
         .create_service_token(
@@ -77,6 +85,18 @@ async fn canonical_training_reads_complete_prefix_without_legacy_root_and_fails_
     assert_eq!(records[2]["role"], "assistant");
     assert_eq!(records[3]["role"], "tool");
     assert_eq!(records[4]["role"], "assistant");
+    assert_eq!(records[2]["parts"][0]["tool_name"], "echo");
+    assert_eq!(
+        records[2]["parts"][0]["arguments"],
+        json!({"message":"完整"})
+    );
+    assert_eq!(records[3]["parts"][0]["result_content"], "完整工具结果");
+    assert_eq!(
+        records[2]["parts"][0]["call_id"],
+        records[3]["parts"][0]["tool_call_id"]
+    );
+    assert_eq!(records[4]["parts"][0]["text"], "完整答案");
+
     let dialogue_path = format!("/self/v1/sessions/{session}/requests/{request}/dialogue");
     let response = http(&state, "GET", &dialogue_path, &owner.key).await;
     assert_eq!(response.status(), StatusCode::OK);
@@ -101,15 +121,18 @@ async fn canonical_training_reads_complete_prefix_without_legacy_root_and_fails_
             .status(),
         StatusCode::NOT_FOUND
     );
+    let inspection = sqlx::AnyPool::connect(&state.config.database_url)
+        .await
+        .unwrap();
     let leaf: String = sqlx::query_scalar(
         "SELECT leaf_node_hash FROM conversation_observations WHERE request_id=$1",
     )
     .bind(request.to_string())
-    .fetch_one(&state.db.pool)
+    .fetch_one(&inspection)
     .await
     .unwrap();
     sqlx::query("DELETE FROM semantic_atoms WHERE tenant_id=$1 AND content_hash=(SELECT atom_hash FROM context_nodes WHERE tenant_id=$1 AND node_hash=$2)")
-        .bind(key.tenant_id.to_string()).bind(leaf).execute(&state.db.pool).await.unwrap();
+        .bind(key.tenant_id.to_string()).bind(leaf).execute(&inspection).await.unwrap();
     let response = http(&state, "GET", &route, &service.token).await;
     assert_eq!(response.status(), StatusCode::INTERNAL_SERVER_ERROR);
 }
