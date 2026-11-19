@@ -23,6 +23,21 @@ async fn postgres_event_enrichment_preserves_recorded_fields_and_tenant_ownershi
 }
 
 async fn assert_event_enrichment(database: &Database) {
+    let list_sql = build_request_list_query(
+        RequestListScope::Global,
+        &RequestListFilter {
+            limit: 10,
+            ..RequestListFilter::default()
+        },
+    );
+    let event_sql = enriched_request_events_sql("SELECT * FROM request_events WHERE 1 = 0");
+    for sql in [&list_sql.statement, &event_sql] {
+        assert!(
+            !sql.contains("__REQUEST_"),
+            "unexpanded request projection token"
+        );
+    }
+
     let tenant = Uuid::now_v7().to_string();
     let foreign_tenant = Uuid::now_v7().to_string();
     let external = format!("event-fields-{tenant}");
