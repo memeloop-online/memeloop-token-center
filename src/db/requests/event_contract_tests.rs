@@ -228,6 +228,26 @@ async fn assert_event_enrichment(database: &Database) {
         sqlx::query("UPDATE request_records SET response_object = $1, status_code = $2, completed_at = $3 WHERE id = $4 AND created_at = $5")
             .bind(body).bind(status).bind(completed).bind(&request).bind(now)
             .execute(&database.pool).await.unwrap();
+        // An unavailable/corrupt object summary must not block any overview
+        // reader. The object-backed detail channel still reports its error.
+        let archive = crate::archive::ArchiveStore::memory_for_test();
+        archive.put(
+            &format!("tenants/{tenant}/raw/v1/{request}/supplier-summary.json"),
+            bytes::Bytes::from_static(b"invalid summary"),
+        ).await.unwrap();
+        assert!(archive.supplier_summary(parse_uuid(tenant.clone()).unwrap(), request_id).await.is_err());
+        let overview = database.clone().with_archive(archive);
+        for value in [
+            serde_json::to_value(&overview.list_requests(key_id, 10).await.unwrap()[0]).unwrap(),
+            serde_json::to_value(&overview.list_all_requests(&external, 10).await.unwrap()[0]).unwrap(),
+            serde_json::to_value(&overview.request_events_after(&external, now, None, 500).await.unwrap()[0]).unwrap(),
+            serde_json::to_value(overview.all_request_events_after(now, None, 500).await.unwrap().iter().find(|event| event.request_id == request_id && event.created_at == Some(now)).unwrap()).unwrap(),
+        ] {
+            assert_eq!(value["supplier_error"], expected);
+            assert_eq!(value["status_code"], status);
+            assert_eq!(value["input_tokens"], 100);
+            assert_eq!(value["output_tokens"], 20);
+        }
         let list = database.list_requests(key_id, 10).await.unwrap();
         let operator = database.list_all_requests(&external, 10).await.unwrap();
         let detail = database.request_archive_refs(key_id, request_id).await.unwrap();
