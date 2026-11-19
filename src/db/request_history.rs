@@ -177,6 +177,14 @@ impl Database {
         &self,
         projected_updates_only: bool,
     ) -> Result<Vec<CaptureDefinition>, HistoryError> {
+        self.history_capture_definitions_with_projection_guards(projected_updates_only, true)
+    }
+
+    fn history_capture_definitions_with_projection_guards(
+        &self,
+        projected_updates_only: bool,
+        terminal_lease_guard: bool,
+    ) -> Result<Vec<CaptureDefinition>, HistoryError> {
         let sources = [
             ("request_events", Some(("event", "event_id", "event_at"))),
             ("request_records", Some(("native", "id", "created_at"))),
@@ -308,6 +316,12 @@ impl Database {
                     projected_updates_only && table == "upstream_accounts" && event == "UPDATE";
                 let projection_guard = if upstream_update {
                     "IF OLD.id IS NOT DISTINCT FROM NEW.id AND OLD.name IS NOT DISTINCT FROM NEW.name THEN RETURN NULL; END IF; "
+                } else if terminal_lease_guard
+                    && table == "terminal_projection_outbox"
+                    && event == "UPDATE"
+                    && matches!(self.backend, DatabaseBackend::PostgreSql)
+                {
+                    "IF (to_jsonb(OLD) - ARRAY['lease_owner','lease_expires_at','attempts']) IS NOT DISTINCT FROM (to_jsonb(NEW) - ARRAY['lease_owner','lease_expires_at','attempts']) THEN RETURN NULL; END IF; "
                 } else {
                     ""
                 };

@@ -102,7 +102,7 @@ impl Database {
         }
         Self::history_require_unprepared(&mut transaction).await?;
         let previous_definitions =
-            self.history_capture_definitions_with_upstream_projection(false)?;
+            self.history_capture_definitions_with_projection_guards(false, false)?;
         for definition in self.history_capture_definitions()? {
             if definition.matches(&mut transaction).await? {
                 continue;
@@ -191,6 +191,51 @@ impl Database {
         }
         tx.commit().await?;
         Ok(serde_json::json!({"mode":mode,"upstream_update_capture_upgraded":true}))
+    }
+
+    /// Replace only the known terminal UPDATE function. This changes no
+    /// projected business value, capture epoch, source trigger or pending work.
+    pub async fn history_upgrade_terminal_capture(&self) -> Result<Value, HistoryError> {
+        if !matches!(self.backend, DatabaseBackend::PostgreSql) {
+            return Err(HistoryError::Invalid(
+                "terminal capture upgrade requires PostgreSQL",
+            ));
+        }
+        let mut tx = self.pool.begin().await?;
+        Self::history_bootstrap_maintenance_lock(&mut tx).await?;
+        let mode: String = sqlx::query_scalar(
+            "SELECT mode FROM request_history_state WHERE id=1 FOR SHARE NOWAIT",
+        )
+        .fetch_one(&mut *tx)
+        .await?;
+        let next = self
+            .history_capture_definitions()?
+            .into_iter()
+            .find(|d| d.table == "terminal_projection_outbox" && d.event == "UPDATE")
+            .ok_or(HistoryError::Mismatch)?;
+        if !next.matches(&mut tx).await? {
+            let old = self
+                .history_capture_definitions_with_projection_guards(true, false)?
+                .into_iter()
+                .find(|d| d.name == next.name)
+                .ok_or(HistoryError::Mismatch)?;
+            if !old.matches(&mut tx).await? {
+                return Err(HistoryError::Verification(
+                    "unknown terminal update capture function",
+                ));
+            }
+            sqlx::raw_sql(sqlx::AssertSqlSafe(format!(
+                "CREATE OR REPLACE FUNCTION {}() RETURNS trigger LANGUAGE plpgsql VOLATILE SECURITY INVOKER AS $history${}$history$; COMMENT ON FUNCTION {}() IS '{}';",
+                next.name, next.body, next.name, next.manifest,
+            ))).execute(&mut *tx).await?;
+            if !next.matches(&mut tx).await? {
+                return Err(HistoryError::Verification(
+                    "terminal update capture upgrade",
+                ));
+            }
+        }
+        tx.commit().await?;
+        Ok(serde_json::json!({"mode":mode,"terminal_update_capture_upgraded":true}))
     }
 
     pub async fn history_activate_capture(&self) -> Result<(), HistoryError> {
@@ -532,3 +577,7 @@ mod tests {
 #[cfg(test)]
 #[path = "upstream_projection_tests.rs"]
 mod upstream_projection_tests;
+
+#[cfg(test)]
+#[path = "terminal_projection_guard_tests.rs"]
+mod terminal_projection_guard_tests;
