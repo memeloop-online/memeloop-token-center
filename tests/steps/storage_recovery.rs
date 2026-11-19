@@ -128,7 +128,7 @@ async fn exact_originals_and_once(world: &mut TokenCenterWorld) {
         .await
         .unwrap();
     let (count, amount): (i64, i64) = sqlx::query_as(
-        "SELECT COUNT(*), COALESCE(SUM(amount_micros), 0) FROM ledger_entries WHERE key_id = $1 AND kind = 'usage'"
+        "SELECT COUNT(*), CAST(COALESCE(SUM(amount_micros), 0) AS BIGINT) FROM ledger_entries WHERE key_id = $1 AND kind = 'usage'"
     ).bind(world.stable_key_id.unwrap().to_string()).fetch_one(&pool).await.unwrap();
     assert_eq!((count, amount), (1, -10));
     pool.close().await;
