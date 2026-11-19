@@ -216,13 +216,13 @@ impl Database {
         }
         let tenant_id: String = task.try_get("tenant_id")?;
         let key_id: String = task.try_get("key_id")?;
-        let already_finished: i64 = sqlx::query_scalar(
-            "SELECT COUNT(*) FROM request_events WHERE request_id = $1 AND event_kind = 'finished'",
+        let already_projected: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM request_events WHERE request_id = $1 AND event_kind = 'projected'",
         )
         .bind(&request_id)
         .fetch_one(&mut *transaction)
         .await?;
-        if already_finished == 0 {
+        if already_projected == 0 {
             let event = super::lifecycle::allocate_request_event_cursor(
                 &mut transaction,
                 task.try_get("completed_at")?,
@@ -233,7 +233,7 @@ impl Database {
             .await?;
             sqlx::query(
             "INSERT INTO request_events (event_id, tenant_id, key_id, request_id, event_at, event_kind, protocol, model, status_code, duration_ms, input_tokens, output_tokens, cost_micros, error_code)
-             SELECT $1, tenant_id, key_id, request_id, $2, 'finished', protocol, model, status_code, duration_ms, input_tokens, output_tokens, cost_micros, NULLIF(error_code, '') FROM terminal_projection_outbox WHERE request_id = $3",
+             SELECT $1, tenant_id, key_id, request_id, $2, 'projected', protocol, model, status_code, duration_ms, input_tokens, output_tokens, cost_micros, NULLIF(error_code, '') FROM terminal_projection_outbox WHERE request_id = $3",
         )
         .bind(&event.event_id)
         .bind(event.event_at)

@@ -219,6 +219,23 @@ impl Database {
             .bind(unix_millis())
             .execute(&mut *tx)
             .await?;
+            // Publish the execution receipt atomically, independently of archive
+            // permits and financial projection. Legacy storage requires numeric
+            // placeholders; the shared read model emits unknown usage until the
+            // authoritative financial source is complete.
+            let event = super::lifecycle::allocate_request_event_cursor(
+                &mut tx, terminal.completed_at, &claim.tenant_id.to_string(),
+                &claim.key_id.to_string(), &claim.request_id.to_string(),
+            ).await?;
+            sqlx::query("INSERT INTO request_events (event_id, tenant_id, key_id, request_id, event_at, event_kind, protocol, model, status_code, duration_ms, input_tokens, output_tokens, cost_micros, error_code) SELECT $1, tenant_id, key_id, id, $2, 'finished', protocol, model, $3, $4, 0, 0, 0, $5 FROM request_records WHERE id = $6 AND created_at = $7 AND tenant_id = $8 AND key_id = $9")
+                .bind(&event.event_id).bind(event.event_at).bind(terminal.status_code)
+                .bind(terminal.duration_ms).bind(&terminal.error_code)
+                .bind(claim.request_id.to_string()).bind(created_at)
+                .bind(claim.tenant_id.to_string()).bind(claim.key_id.to_string())
+                .execute(&mut *tx).await?;
+            super::super::history_immutable_outbox::capture_event_in_transaction(
+                &mut tx, &event.event_id.to_string(), event.event_at,
+            ).await?;
         }
         super::terminal_projection::enqueue_unknown_terminal_projection_in_transaction(
             &mut tx,

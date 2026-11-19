@@ -4,6 +4,7 @@ use crate::model::{RequestFinancialState, RequestLifecycleState, RequestUsageBas
 use rust_decimal::Decimal;
 
 mod conversation_projection;
+mod lifecycle_events;
 mod unknown_bridge;
 
 struct Fixture {

@@ -498,7 +498,7 @@ impl Database {
         upstream_model: Option<&str>,
         output_token_limit: Option<i64>,
     ) -> Result<UsageReservation, AppError> {
-        self.start_proxy_request_inner(input, None, false, upstream_model, output_token_limit)
+        self.start_proxy_request_inner(input, None, true, upstream_model, output_token_limit)
             .await
             .map(|started| started.reservation)
             .map_err(|error| match error {
@@ -526,6 +526,12 @@ impl Database {
         let Some(row) = row else {
             return Ok(());
         };
+        let published: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM request_events WHERE request_id = $1 AND tenant_id = $2 AND event_kind = 'started'")
+            .bind(identity.request_id.to_string()).bind(identity.tenant_id.to_string())
+            .fetch_one(&mut *transaction).await?;
+        if published != 0 {
+            return Ok(());
+        }
         let started = NewRequest {
             request_id: identity.request_id,
             tenant_id: identity.tenant_id,
