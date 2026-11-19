@@ -149,10 +149,76 @@ pub(crate) fn reason_from_value(value: &serde_json::Value) -> Option<SafeReason>
     )
 }
 
+/// Remove credential fields while preserving provider explanations and extensions.
+fn redact_credential_fields(value: &mut serde_json::Value) {
+    match value {
+        serde_json::Value::Object(fields) => {
+            fields.retain(|key, _| {
+                let normalized = key.to_ascii_lowercase().replace(['-', '_'], "");
+                !matches!(
+                    normalized.as_str(),
+                    "token"
+                        | "accesstoken"
+                        | "refreshtoken"
+                        | "idtoken"
+                        | "apikey"
+                        | "authorization"
+                        | "proxyauthorization"
+                        | "password"
+                        | "secret"
+                        | "clientsecret"
+                        | "credential"
+                        | "credentials"
+                        | "cookie"
+                        | "setcookie"
+                )
+            });
+            for value in fields.values_mut() {
+                redact_credential_fields(value);
+            }
+        }
+        serde_json::Value::Array(values) => {
+            for value in values {
+                redact_credential_fields(value);
+            }
+        }
+        serde_json::Value::String(text) => {
+            if let Ok(mut parsed) = url::Url::parse(text) {
+                if matches!(parsed.scheme(), "http" | "https") {
+                    let pairs: Vec<(String, String)> = parsed
+                        .query_pairs()
+                        .filter(|(key, _)| {
+                            let key = key.to_ascii_lowercase();
+                            !(matches!(
+                                key.as_str(),
+                                "token" | "key" | "api_key" | "access_token" | "signature" | "sig"
+                            ) || key.starts_with("x-amz-")
+                                || key.starts_with("x-goog-"))
+                        })
+                        .map(|(key, value)| (key.into_owned(), value.into_owned()))
+                        .collect();
+                    let original = parsed.query_pairs().count();
+                    if pairs.len() != original {
+                        parsed.set_query(None);
+                        if !pairs.is_empty() {
+                            parsed.query_pairs_mut().extend_pairs(pairs);
+                        }
+                        *text = parsed.into();
+                    }
+                }
+            }
+        }
+        _ => {}
+    }
+}
+
 /// Preserve the provider's explanation while attaching optional classification.
 /// Protocol adapters use this projection instead of maintaining allowlists.
 pub(crate) fn upstream_error_value(value: &serde_json::Value) -> serde_json::Value {
     use serde_json::{Value, json};
+    let mut redacted = value.clone();
+    redact_credential_fields(&mut redacted);
+    let value = &redacted;
     let error = value
         .pointer("/response/error")
         .filter(|error| !error.is_null())
@@ -191,6 +257,22 @@ pub(crate) fn upstream_error_value(value: &serde_json::Value) -> serde_json::Val
 mod tests {
     use super::*;
     use serde_json::json;
+
+    #[test]
+    fn shared_projection_preserves_explanation_and_removes_credentials() {
+        let value = json!({"error": {"message": "provider explanation", "token": "credential-fixture", "extension": "x".repeat(140_000), "nested": [{"authorization": "Bearer private", "signed_url": "https://provider.invalid/result?token=signed-secret&format=png"}]}});
+        let projected = upstream_error_value(&value);
+        assert_eq!(projected["message"], "provider explanation");
+        assert_eq!(
+            projected["mtc_provider_details"]["error"]["extension"],
+            "x".repeat(140_000)
+        );
+        let rendered = projected.to_string();
+        for secret in ["credential-fixture", "Bearer private", "signed-secret"] {
+            assert!(!rendered.contains(secret));
+        }
+        assert!(rendered.contains("format=png"));
+    }
 
     #[test]
     fn record_details_above_old_inline_limit_preserve_unknown_fields() {
