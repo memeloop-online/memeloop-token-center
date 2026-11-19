@@ -228,6 +228,27 @@ async fn assert_event_enrichment(database: &Database) {
         sqlx::query("UPDATE request_records SET response_object = $1, status_code = $2, completed_at = $3 WHERE id = $4 AND created_at = $5")
             .bind(body).bind(status).bind(completed).bind(&request).bind(now)
             .execute(&database.pool).await.unwrap();
+        // A blocked object summary must not block any overview reader.
+        let (archive, delayed_store) = crate::archive::ArchiveStore::memory_for_test().with_read_delay_for_test();
+        archive.publish_supplier_summary(parse_uuid(tenant.clone()).unwrap(), request_id, &safe).await.unwrap();
+        delayed_store.config_mut(|config| config.wait_get_per_call = std::time::Duration::from_secs(60));
+        assert!(tokio::time::timeout(std::time::Duration::from_millis(20), archive.supplier_summary(parse_uuid(tenant.clone()).unwrap(), request_id)).await.is_err());
+        let overview = database.clone().with_archive(archive);
+        for value in [
+            serde_json::to_value(&overview.list_requests(key_id, 10).await.unwrap()[0]).unwrap(),
+            serde_json::to_value(&overview.list_all_requests(&external, 10).await.unwrap()[0]).unwrap(),
+            serde_json::to_value(&overview.request_events_after(&external, now, None, 500).await.unwrap()[0]).unwrap(),
+            serde_json::to_value(overview.all_request_events_after(now, None, 500).await.unwrap().iter().find(|event| event.request_id == request_id && event.created_at == Some(now)).unwrap()).unwrap(),
+        ] {
+            assert_eq!(value["supplier_error"], expected);
+            assert_eq!(value["status_code"], status);
+            assert_eq!(value["input_tokens"], if completed.is_some() { serde_json::json!(100) } else { serde_json::Value::Null });
+            assert_eq!(value["output_tokens"], if completed.is_some() { serde_json::json!(20) } else { serde_json::Value::Null });
+            let baseline = serde_json::to_value(&database.list_requests(key_id, 10).await.unwrap()[0]).unwrap();
+            for field in ["status_code", "input_tokens", "output_tokens", "cost", "duration_ms", "supplier_error"] {
+                assert_eq!(value[field], baseline[field], "overview field {field}");
+            }
+        }
         let list = database.list_requests(key_id, 10).await.unwrap();
         let operator = database.list_all_requests(&external, 10).await.unwrap();
         let detail = database.request_archive_refs(key_id, request_id).await.unwrap();
