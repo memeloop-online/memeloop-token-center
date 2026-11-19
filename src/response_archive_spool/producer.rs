@@ -1267,11 +1267,20 @@ async fn run_response_archive_writer(
         return Ok(WriterOutcome::Abandoned);
     };
     let source = captured.source;
+    let publication_started = std::time::Instant::now();
+    let mut publication_attempt = 0_u64;
     let (staged, staging_owner) = loop {
         match stage_captured_response(&state, &source, captured.staging).await {
             Ok(staged) => break staged,
             Err(error @ AppError::Storage { .. }) => {
+                publication_attempt = publication_attempt.saturating_add(1);
+                let kind = match &error {
+                    AppError::Storage { facts, .. } => facts.kind.unwrap_or("operation_error"),
+                    _ => "operation_error",
+                };
                 tracing::warn!(request_id = %identity.request_id, error_category = error.diagnostic_category(),
+                    stage = "carrier_stage", error_kind = kind, attempt = publication_attempt,
+                    elapsed_ms = publication_started.elapsed().as_millis() as u64,
                     "complete carrier source awaits object storage publication");
                 tokio::time::sleep(std::time::Duration::from_millis(250)).await;
             }
@@ -1286,7 +1295,14 @@ async fn run_response_archive_writer(
         {
             Ok(object) => break object,
             Err(error @ AppError::Storage { .. }) => {
+                publication_attempt = publication_attempt.saturating_add(1);
+                let kind = match &error {
+                    AppError::Storage { facts, .. } => facts.kind.unwrap_or("operation_error"),
+                    _ => "operation_error",
+                };
                 tracing::warn!(request_id = %identity.request_id, error_category = error.diagnostic_category(),
+                    stage = "cas_promote", error_kind = kind, attempt = publication_attempt,
+                    elapsed_ms = publication_started.elapsed().as_millis() as u64,
                     "sealed original awaits immutable CAS promotion");
                 tokio::time::sleep(std::time::Duration::from_millis(250)).await;
             }
@@ -1297,7 +1313,14 @@ async fn run_response_archive_writer(
         match target.publish(&state.archive, identity, &object).await {
             Ok(publication) => break publication,
             Err(error @ AppError::Storage { .. }) => {
+                publication_attempt = publication_attempt.saturating_add(1);
+                let kind = match &error {
+                    AppError::Storage { facts, .. } => facts.kind.unwrap_or("operation_error"),
+                    _ => "operation_error",
+                };
                 tracing::warn!(request_id = %identity.request_id, error_category = error.diagnostic_category(),
+                    stage = "root_publish", error_kind = kind, attempt = publication_attempt,
+                    elapsed_ms = publication_started.elapsed().as_millis() as u64,
                     "immutable original awaits durable root publication");
                 tokio::time::sleep(std::time::Duration::from_millis(250)).await;
             }

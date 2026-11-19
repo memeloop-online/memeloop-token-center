@@ -1723,19 +1723,25 @@ impl From<sqlx::Error> for AppError {
     }
 }
 
+/// Classify typed storage failures without inspecting secret-bearing messages.
+pub(crate) fn object_store_error_kind(error: &object_store::Error) -> &'static str {
+    match error {
+        object_store::Error::PermissionDenied { .. } => "permission_denied",
+        object_store::Error::Unauthenticated { .. } => "unauthenticated",
+        object_store::Error::NotFound { .. } => "not_found",
+        object_store::Error::Generic { .. } => "transport_or_service",
+        _ => "operation_error",
+    }
+}
+
 impl From<object_store::Error> for AppError {
-    fn from(_error: object_store::Error) -> Self {
+    fn from(error: object_store::Error) -> Self {
+        let kind = object_store_error_kind(&error);
         // S3 errors may include the endpoint, access-key identifier, object
         // locator, or a signed URL. None of those belong in logs or in an
         // AppError that a higher layer could later log with Display.
-        tracing::error!(
-            error_kind = "object_store",
-            "object storage operation failed"
-        );
-        Self::storage_with(
-            "object_storage_failed",
-            ErrorFacts::new().kind("object_store"),
-        )
+        tracing::error!(error_kind = kind, "object storage operation failed");
+        Self::storage_with("object_storage_failed", ErrorFacts::new().kind(kind))
     }
 }
 
@@ -1919,6 +1925,35 @@ mod tests {
                 .unwrap();
         assert_eq!(body["error"]["code"], "service_overloaded");
         assert!(body["error"].get("reason").is_none());
+    }
+
+    #[test]
+    fn object_storage_classification_preserves_only_typed_safe_facts() {
+        let cases = [
+            (
+                object_store::Error::PermissionDenied {
+                    path: "SECRET_OBJECT".into(),
+                    source: Box::new(std::io::Error::other("SECRET_CREDENTIAL")),
+                },
+                "permission_denied",
+            ),
+            (
+                object_store::Error::Generic {
+                    store: "SECRET_ENDPOINT",
+                    source: Box::new(std::io::Error::other("SECRET_CREDENTIAL")),
+                },
+                "transport_or_service",
+            ),
+        ];
+        for (error, expected) in cases {
+            assert_eq!(object_store_error_kind(&error), expected);
+            let converted = AppError::from(error);
+            let AppError::Storage { facts, .. } = &converted else {
+                panic!("storage category must be preserved");
+            };
+            assert_eq!(facts.kind, Some(expected));
+            assert!(!format!("{converted:?}").contains("SECRET_"));
+        }
     }
 
     #[test]
