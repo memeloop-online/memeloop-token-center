@@ -577,7 +577,10 @@ async fn legacy_bound_archive_without_raw_root_remains_readable() {
         .await
         .unwrap();
     writer.write(response_bytes.clone()).await.unwrap();
-    assert_eq!(writer.finish().await.unwrap(), response_path);
+    assert_eq!(
+        writer.finish_staged().await.unwrap().object_locator,
+        response_path
+    );
     let mut refs = request_detail_refs(request);
     refs.request_object = request_path.clone();
     refs.response_object = Some(response_path.clone());
