@@ -51,6 +51,7 @@ pub enum HistoryCommand {
     PrepareActivation,
     /// Upgrade only the known account-update capture function, preserving capture state.
     UpgradeUpstreamCapture,
+    UpgradeTerminalCapture,
     /// Inspect the post-commit old-transaction cohort; Changed means still draining.
     CaptureHorizon,
     /// Re-export every retained source after upgrading the read-model contract.
@@ -92,6 +93,9 @@ pub async fn command(config: &Config, command: HistoryCommand) -> Result<Value, 
         }));
     }
     match &command {
+        HistoryCommand::UpgradeTerminalCapture => {
+            return database.history_upgrade_terminal_capture().await;
+        }
         HistoryCommand::UpgradeUpstreamCapture => {
             return database.history_upgrade_upstream_capture().await;
         }
@@ -250,6 +254,7 @@ pub async fn command(config: &Config, command: HistoryCommand) -> Result<Value, 
         }
         HistoryCommand::Rollback
         | HistoryCommand::Status
+        | HistoryCommand::UpgradeTerminalCapture
         | HistoryCommand::UpgradeUpstreamCapture
         | HistoryCommand::BackfillPage { .. }
         | HistoryCommand::FenceDelivery { .. }
