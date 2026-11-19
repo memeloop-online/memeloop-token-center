@@ -555,3 +555,140 @@ async fn retired_raw_detail_uses_lossless_semantic_identity_without_reading_old_
         assert!(!encoded.contains(forbidden));
     }
 }
+
+#[tokio::test]
+async fn legacy_bound_archive_without_raw_root_remains_readable() {
+    use crate::model::RequestArchiveState;
+    let (state, _directory) = test_state().await;
+    let tenant = Uuid::now_v7();
+    let request = Uuid::now_v7();
+    let request_bytes = Bytes::from_static(br#"{"input":"legacy question","stream":false}"#);
+    let response_bytes = Bytes::from_static(br#"{"object":"response","status":"incomplete","output":[],"incomplete_details":{"reason":"max_output_tokens"}}"#);
+    let request_path = format!("staging/proxy/{request}/request/{request}/body.json");
+    let response_path = format!("staging/proxy/{request}/response/{request}/body.mtcz1");
+    state
+        .archive
+        .put(&request_path, request_bytes.clone())
+        .await
+        .unwrap();
+    let mut writer = state
+        .archive
+        .start_compressed_writer(response_path.strip_suffix(".mtcz1").unwrap())
+        .await
+        .unwrap();
+    writer.write(response_bytes.clone()).await.unwrap();
+    assert_eq!(
+        writer.finish_staged().await.unwrap().object_locator,
+        response_path
+    );
+    let mut refs = request_detail_refs(request);
+    refs.request_object = request_path.clone();
+    refs.response_object = Some(response_path.clone());
+    refs.response_json = None;
+    assert!(
+        state
+            .archive
+            .raw_capture_reference(tenant, request, "request")
+            .await
+            .unwrap()
+            .is_none()
+    );
+    let resolved = state
+        .db
+        .resolve_raw_archive_roots_with_semantic_authority(tenant, refs.clone(), None)
+        .await
+        .unwrap();
+    assert_eq!(resolved.request_archive_state, RequestArchiveState::Bound);
+    assert_eq!(resolved.response_archive_state, RequestArchiveState::Bound);
+    for (side, expected) in [
+        (RequestArchiveSide::Request, request_bytes),
+        (RequestArchiveSide::Response, response_bytes),
+    ] {
+        let response = request_archive_content_response(&state, &HeaderMap::new(), &resolved, side)
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(
+            axum::body::to_bytes(response.into_body(), usize::MAX)
+                .await
+                .unwrap(),
+            expected
+        );
+    }
+    // Pending and unpublished CAS references must not inherit the legacy fallback.
+    let mut pending = refs.clone();
+    pending.request_archive_state = RequestArchiveState::Pending;
+    let pending = state
+        .db
+        .resolve_raw_archive_roots_with_semantic_authority(tenant, pending, None)
+        .await
+        .unwrap();
+    assert_eq!(pending.request_archive_state, RequestArchiveState::Pending);
+    let object = state
+        .archive
+        .put_tenant_content(tenant, Bytes::from_static(b"canonical body"))
+        .await
+        .unwrap();
+    let mut cas = refs.clone();
+    cas.request_object = object.object_locator.clone();
+    let cas = state
+        .db
+        .resolve_raw_archive_roots_with_semantic_authority(tenant, cas, None)
+        .await
+        .unwrap();
+    assert_eq!(cas.request_archive_state, RequestArchiveState::Pending);
+    for location in [
+        format!(
+            "stores/training/{}/{}",
+            "a".repeat(64),
+            object.object_locator
+        ),
+        format!(
+            "stores/staging/{}/staging/proxy/{request}/request/body.json",
+            "b".repeat(64)
+        ),
+    ] {
+        let mut qualified = refs.clone();
+        qualified.request_object = location;
+        let qualified = state
+            .db
+            .resolve_raw_archive_roots_with_semantic_authority(tenant, qualified, None)
+            .await
+            .unwrap();
+        assert_eq!(
+            qualified.request_archive_state,
+            RequestArchiveState::Pending
+        );
+    }
+    // A real canonical root takes precedence over the legacy source.
+    state
+        .archive
+        .publish_raw_capture(tenant, request, "request", &object)
+        .await
+        .unwrap();
+    let canonical = state
+        .db
+        .resolve_raw_archive_roots_with_semantic_authority(tenant, refs.clone(), None)
+        .await
+        .unwrap();
+    assert_eq!(canonical.request_object, object.object_locator);
+    // Failure fences retain authority even when an old object remains readable.
+    state
+        .archive
+        .publish_raw_capture_failure(tenant, request, "response")
+        .await
+        .unwrap();
+    let failed = state
+        .db
+        .resolve_raw_archive_roots_with_semantic_authority(tenant, refs.clone(), None)
+        .await
+        .unwrap();
+    assert_eq!(failed.response_archive_state, RequestArchiveState::Gap);
+    // A root for another tenant/request cannot override this authorized identity.
+    let other = state
+        .db
+        .resolve_raw_archive_roots_with_semantic_authority(Uuid::now_v7(), refs, None)
+        .await
+        .unwrap();
+    assert_eq!(other.request_object, request_path);
+}
