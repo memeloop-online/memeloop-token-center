@@ -238,6 +238,13 @@ export function mergeSessionContext(previous: RequestView['session_context'], ev
   return previous ?? incoming;
 }
 
+function preservesOperationalReceipt(incoming: Pick<RequestView, 'operational_terminal'>, previous?: RequestView): boolean {
+  const prior = previous?.operational_terminal;
+  const next = incoming.operational_terminal;
+  return !!prior && (!next || next.completed_at < prior.completed_at
+    || (next.completed_at === prior.completed_at && prior.financial_state === 'applied' && next.financial_state !== 'applied'));
+}
+
 /** Transport and confirmed session observations may arrive after financial settlement.
  * A sparse projection must not erase observations already displayed. */
 export function mergeRequestObservations<T extends RequestView>(incoming: T, previous?: RequestView): T {
@@ -249,7 +256,7 @@ export function mergeRequestObservations<T extends RequestView>(incoming: T, pre
     ? previousEgress : incomingEgress ?? previousEgress;
   const session = mergeSessionContext(previous?.session_context, incoming);
   return {
-    ...incoming,
+    ...(preservesOperationalReceipt(incoming, previous) ? previous : incoming),
     ...(egress !== undefined ? { egress } : {}),
     ...(session !== undefined ? { session_context: session } : {}),
   };
@@ -263,12 +270,8 @@ export function requestViewFromEvent(event: RequestEvent, previous?: RequestView
   if (createdAt === undefined) return previous;
   // An operational receipt is immutable. Legacy events have no receipt authority;
   // an applied financial receipt cannot return to pending settlement.
-  const priorTerminal = previous?.operational_terminal;
   const incomingTerminal = event.operational_terminal;
-  const preserveReceipt = priorTerminal && (!incomingTerminal
-    || incomingTerminal.completed_at < priorTerminal.completed_at
-    || (incomingTerminal.completed_at === priorTerminal.completed_at
-      && priorTerminal.financial_state === 'applied' && incomingTerminal.financial_state !== 'applied'));
+  const preserveReceipt = preservesOperationalReceipt(event, previous);
   const sparseLegacyTerminal = !incomingTerminal && previous?.status_code != null && event.status_code == null;
   if (previous && (preserveReceipt || sparseLegacyTerminal)) {
     return {
