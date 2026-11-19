@@ -698,6 +698,7 @@ jobs:
         run: |
           set -o pipefail
           test -n "$MTC_TEST_POSTGRES_URL"
+          cargo test --locked --lib --no-run
           for selector in \
             db::quota_observations::tests::sqlite_quota_observations_include_fenced_codex_recovery_and_opt_in_groups \
             db::quota_observations::tests::postgres_quota_observations_include_fenced_codex_recovery_and_opt_in_groups
