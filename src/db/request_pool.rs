@@ -473,6 +473,7 @@ mod tests {
         );
         pool.close().await;
         observer.close().await;
+        super::return_health_tests::postgres_return_health_timeout_releases_slot(&url).await;
     }
 
     #[tokio::test]
@@ -648,3 +649,6 @@ mod tests {
         ));
     }
 }
+
+#[cfg(test)]
+mod return_health_tests;
