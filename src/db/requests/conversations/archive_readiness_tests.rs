@@ -2378,3 +2378,109 @@ async fn postgres_coverage_read_does_not_block_body_worker() {
     coverage_read_does_not_block_body_worker_contract(isolated.url().to_owned()).await;
     isolated.cleanup().await;
 }
+
+#[tokio::test]
+async fn sqlite_admission_event_precedes_queued_archive_and_preserves_raw_body() {
+    let directory = tempfile::tempdir().unwrap();
+    queued_archive_event_contract(format!(
+        "sqlite://{}?mode=rwc",
+        directory.path().join("event-archive.db").display()
+    ))
+    .await;
+}
+
+#[tokio::test]
+async fn postgres_admission_event_precedes_queued_archive_and_preserves_raw_body() {
+    let url = std::env::var("MTC_TEST_POSTGRES_URL")
+        .expect("PostgreSQL archive event contract requires its service");
+    let isolated = PostgresTestDatabase::create(&url).await;
+    queued_archive_event_contract(isolated.url().to_owned()).await;
+    isolated.cleanup().await;
+}
+
+async fn queued_archive_event_contract(url: String) {
+    let fixture = Fixture::new(url, true).await;
+    let state = &fixture.state;
+    let price = state
+        .db
+        .upsert_model_price("queued-event-model", "USD", Decimal::ONE, Decimal::ONE)
+        .await
+        .unwrap();
+    let request_id = Uuid::now_v7();
+    let raw = Bytes::from_static(br#"{ "model": "queued-event-model", "messages": [{"role":"user","content":"full raw body retained"}], "custom": {"preserve":true} }"#);
+    let gate = state.db.saturate_gateway_persistence_for_test().await;
+    let request_locator = format!("gap://{request_id}/request");
+    let started = tokio::time::timeout(
+        std::time::Duration::from_secs(5),
+        state.db.start_proxy_request_with_deferred_archive(
+            StartProxyRequest {
+                request_id,
+                key: &fixture.key,
+                price: &price,
+                input_token_ceiling: 10,
+                output_token_ceiling: 10,
+                protocol: "openai",
+                model: "queued-event-model",
+                request_object: &request_locator,
+                upstream_account_id: None,
+                model_route_id: None,
+            },
+            &raw,
+            state.config.key_pepper.as_bytes(),
+            false,
+            None,
+            Some(10),
+        ),
+    )
+    .await
+    .expect("admission and started event are independent of queued archive permits")
+    .unwrap();
+    assert_eq!(started.archive_admission, RequestArchiveAdmission::Queued);
+    let tenant_external_id: String =
+        sqlx::query_scalar("SELECT external_id FROM tenants WHERE id = $1")
+            .bind(fixture.key.tenant_id.to_string())
+            .fetch_one(&state.db.pool)
+            .await
+            .unwrap();
+    let events = state
+        .db
+        .request_events_after(&tenant_external_id, 0, None, 500)
+        .await
+        .unwrap();
+    let event = events
+        .iter()
+        .find(|event| event.request_id == request_id)
+        .expect("the real deferred archive admission publishes started before its capture runs");
+    assert_eq!(event.event_kind, "started");
+    assert!(event.status_code.is_none());
+    let locator: String =
+        sqlx::query_scalar("SELECT request_object FROM request_records WHERE id = $1")
+            .bind(request_id.to_string())
+            .fetch_one(&state.db.pool)
+            .await
+            .unwrap();
+    assert_eq!(locator, request_locator);
+    drop(gate);
+    state.db.drain_gateway_persistence_for_test().await;
+    let locator = tokio::time::timeout(std::time::Duration::from_secs(10), async {
+        loop {
+            let locator: String =
+                sqlx::query_scalar("SELECT request_object FROM request_records WHERE id = $1")
+                    .bind(request_id.to_string())
+                    .fetch_one(&state.db.pool)
+                    .await
+                    .unwrap();
+            if !locator.starts_with("gap://") {
+                break locator;
+            }
+            response_archive_spool::process_one_for_test(state).await;
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("releasing archive capacity preserves the complete queued request");
+    assert_eq!(
+        state.archive.get(&locator).await.unwrap().as_ref(),
+        raw.as_ref()
+    );
+}

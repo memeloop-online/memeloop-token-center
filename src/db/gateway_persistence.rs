@@ -764,12 +764,6 @@ impl Database {
             .await?;
         }
         transaction.commit().await?;
-        if changed.rows_affected() == 1
-            && success.is_some()
-            && let Err(error) = self.publish_proxy_started_event(identity).await
-        {
-            tracing::warn!(request_id = %identity.request_id, reason = error.diagnostic_category(), "request started event omitted");
-        }
         Ok(true)
     }
 
@@ -918,9 +912,6 @@ impl Database {
                             "gateway_persistence_start_proxy_request_with_deferred_archive_1",
                         )
                     })?;
-                if let Err(error) = database.publish_proxy_started_event(identity).await {
-                    tracing::warn!(%request_id, reason = error.diagnostic_category(), "request started event omitted");
-                }
                 database
                     .capture_deferred_request_archive(identity, &body, &pepper, compression_enabled)
                     .await
