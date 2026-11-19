@@ -97,15 +97,38 @@ impl Database {
                 let failed = archive
                     .raw_capture_failed(tenant_id, request_id, side)
                     .await?;
-                (
-                    format!("gap://{request_id}/{side}"),
-                    if failed {
-                        crate::model::RequestArchiveState::Gap
-                    } else {
-                        crate::model::RequestArchiveState::Pending
-                    },
-                    failed.then(|| "capture_failed".to_owned()),
-                )
+                let (legacy_locator, legacy_state, legacy_reason) = if side == "request" {
+                    (
+                        Some(refs.request_object.as_str()),
+                        refs.request_archive_state,
+                        refs.request_archive_reason.as_ref(),
+                    )
+                } else {
+                    (
+                        refs.response_object.as_deref(),
+                        refs.response_archive_state,
+                        refs.response_archive_reason.as_ref(),
+                    )
+                };
+                if !failed && legacy_bound_object(legacy_state, legacy_locator) {
+                    // Pre-root captures retain their existing source ownership until
+                    // semantic migration completes. Reading still verifies the object.
+                    (
+                        legacy_locator.unwrap().to_owned(),
+                        legacy_state,
+                        legacy_reason.cloned(),
+                    )
+                } else {
+                    (
+                        format!("gap://{request_id}/{side}"),
+                        if failed {
+                            crate::model::RequestArchiveState::Gap
+                        } else {
+                            crate::model::RequestArchiveState::Pending
+                        },
+                        failed.then(|| "capture_failed".to_owned()),
+                    )
+                }
             };
             if side == "request" {
                 refs.request_object = locator;
@@ -482,4 +505,23 @@ mod tests {
         );
         assert_eq!(text_slice("甲乙丙丁", 1, 2).unwrap(), ("乙丙".into(), 4));
     }
+}
+
+// CAS and raw-v1 references require their durable publication roots. Only old
+// object paths may use the source locator already authorized by this read.
+fn legacy_bound_object(state: crate::model::RequestArchiveState, locator: Option<&str>) -> bool {
+    state == crate::model::RequestArchiveState::Bound
+        && locator.is_some_and(|path| {
+            !path.is_empty()
+                && !path.starts_with("tenants/")
+                && !path.starts_with("objects/blake3/")
+                && !path.starts_with("stores/training/")
+                && !path.starts_with("stores/staging/")
+                && path.bytes().all(|byte| {
+                    byte.is_ascii_alphanumeric() || matches!(byte, b'/' | b'.' | b'_' | b'-')
+                })
+                && !path
+                    .split('/')
+                    .any(|segment| segment.is_empty() || segment == "." || segment == "..")
+        })
 }
