@@ -119,6 +119,16 @@ impl RecoveryObjectProxy {
             faults.put_scopes.remove(&scope);
         }
     }
+    pub(crate) fn clear_faults(&self) {
+        let mut faults = self.state.faults.lock().unwrap();
+        faults.puts.clear();
+        faults.put_prefixes.clear();
+        faults.put_scopes.clear();
+        for gate in faults.gets.values() {
+            gate.release();
+        }
+        faults.gets.clear();
+    }
     pub(crate) fn failed_puts(&self) -> usize {
         self.state.failed_puts.load(Ordering::SeqCst)
     }

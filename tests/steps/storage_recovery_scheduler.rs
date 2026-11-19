@@ -16,6 +16,17 @@ impl Drop for SchedulerState {
 
 #[given("historical coverage receipt publication for this customer is unavailable")]
 async fn fail_coverage_receipt(world: &mut TokenCenterWorld) {
+    // This scenario requires a protocol terminal, not merely HTTP 200.
+    Mock::given(method("POST"))
+        .and(path("/v1/chat/completions"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "id":"chatcmpl-test",
+            "choices":[{"finish_reason":"stop","message":{"role":"assistant","content":"hello"}}],
+            "usage":{"prompt_tokens":7,"completion_tokens":3,"total_tokens":10}
+        })))
+        .with_priority(1)
+        .mount(world.mock.as_ref().unwrap())
+        .await;
     let state = world.state.as_ref().unwrap();
     let pool = AnyPool::connect(&state.config.database_url).await.unwrap();
     let tenant: String = sqlx::query_scalar("SELECT tenant_id FROM key_records WHERE id=$1")
@@ -93,7 +104,7 @@ async fn customer_requests(world: &TokenCenterWorld) -> Vec<Value> {
 async fn assert_originals(world: &TokenCenterWorld, id: Uuid) {
     wait_for_bound_proxy_archives(world, &[id]).await;
     let request = json!({"model":"gpt-test","messages":[{"role":"user","content":"hi"}]});
-    let response = json!({"id":"chatcmpl-test","choices":[{"message":{"role":"assistant","content":"hello"}}],"usage":{"prompt_tokens":7,"completion_tokens":3,"total_tokens":10}});
+    let response = json!({"id":"chatcmpl-test","choices":[{"finish_reason":"stop","message":{"role":"assistant","content":"hello"}}],"usage":{"prompt_tokens":7,"completion_tokens":3,"total_tokens":10}});
     for (side, expected) in [("request", request), ("response", response)] {
         let result = world
             .client
