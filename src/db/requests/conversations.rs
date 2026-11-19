@@ -483,6 +483,58 @@ impl Database {
     /// 这里同时清掉两份快照，并把主租约钉在 `session-body-rebuild` 上，直到新 worker 换成自己的领取。
     /// `statistics_outcome = session_body` 留在完成之后，避免同一行被反复重开。
     /// locator 缺一就不重开。不改 `request_object` / `response_object`。
+    /// Claim one independently verified historical body without claiming any other work.
+    /// Source locators and the previous acknowledgement are compared atomically.
+    #[allow(clippy::too_many_arguments)]
+    pub async fn claim_exact_session_body_rebuild(
+        &self,
+        tenant_id: Uuid,
+        key_id: Uuid,
+        request_id: Uuid,
+        expected_projected_at: i64,
+        request_locator: &str,
+        response_locator: &str,
+        lease_owner: Uuid,
+    ) -> Result<bool, AppError> {
+        let now = unix_millis();
+        let mut transaction = self.begin_write_transaction().await?;
+        if matches!(self.backend, DatabaseBackend::PostgreSql) {
+            sqlx::query("SET LOCAL lock_timeout = '1s'")
+                .execute(&mut *transaction)
+                .await?;
+            sqlx::query("SET LOCAL statement_timeout = '3s'")
+                .execute(&mut *transaction)
+                .await?;
+        }
+        let result = sqlx::query(
+            "UPDATE conversation_projection_outbox SET projected_at = NULL,
+             lease_owner = $1, lease_expires_at = $2,
+             terminal_lease_owner = NULL, terminal_lease_expires_at = NULL,
+             statistics_outcome = 'session_body', attempts = attempts + 1
+             WHERE request_id = $3 AND tenant_id = $4 AND key_id = $5
+               AND projected_at = $6
+               AND semantic_snapshot_json IS NULL AND semantic_payload_snapshot_json IS NULL
+               AND (lease_owner IS NULL OR lease_expires_at <= $7)
+               AND (terminal_lease_owner IS NULL OR terminal_lease_expires_at <= $7)
+               AND EXISTS (SELECT 1 FROM request_records r
+                 WHERE r.id = $3 AND r.tenant_id = $4 AND r.key_id = $5
+                   AND r.request_object = $8 AND r.response_object = $9)",
+        )
+        .bind(lease_owner.to_string())
+        .bind(now.saturating_add(CONVERSATION_PROJECTION_LEASE_MILLIS))
+        .bind(request_id.to_string())
+        .bind(tenant_id.to_string())
+        .bind(key_id.to_string())
+        .bind(expected_projected_at)
+        .bind(now)
+        .bind(request_locator)
+        .bind(response_locator)
+        .execute(&mut *transaction)
+        .await?;
+        transaction.commit().await?;
+        Ok(result.rows_affected() == 1)
+    }
+
     pub async fn reopen_session_body_rebuilds(&self, limit: i64) -> Result<u64, AppError> {
         let limit = limit;
         let mut transaction = self.begin_write_transaction().await?;
