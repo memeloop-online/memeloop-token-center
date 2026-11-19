@@ -116,7 +116,18 @@ impl Database {
             .bind(now)
             .bind(limit)
             .fetch_all(&mut *transaction)
-            .await?;
+            .await
+            .map_err(|error| {
+                let sqlstate = error.as_database_error().and_then(|db| db.code());
+                let sqlstate = sqlstate.as_deref().filter(|code| {
+                    code.len() == 5
+                        && code
+                            .bytes()
+                            .all(|byte| byte.is_ascii_uppercase() || byte.is_ascii_digit())
+                });
+                tracing::error!(sqlstate, "terminal projection claim database failure");
+                error
+            })?;
         transaction.commit().await?;
         rows.into_iter()
             .map(|row| parse_uuid(row.try_get("request_id")?))
