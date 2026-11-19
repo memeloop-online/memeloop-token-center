@@ -216,22 +216,17 @@ impl Database {
         }
         let tenant_id: String = task.try_get("tenant_id")?;
         let key_id: String = task.try_get("key_id")?;
-        let already_projected: i64 = sqlx::query_scalar(
-            "SELECT COUNT(*) FROM request_events WHERE request_id = $1 AND event_kind = 'projected'",
+        // The claimed outbox row and its acknowledgement are the financial
+        // publication fence; semantic projections also use this event kind.
+        let event = super::lifecycle::allocate_request_event_cursor(
+            &mut transaction,
+            task.try_get("completed_at")?,
+            &tenant_id,
+            &key_id,
+            &request_id,
         )
-        .bind(&request_id)
-        .fetch_one(&mut *transaction)
         .await?;
-        if already_projected == 0 {
-            let event = super::lifecycle::allocate_request_event_cursor(
-                &mut transaction,
-                task.try_get("completed_at")?,
-                &tenant_id,
-                &key_id,
-                &request_id,
-            )
-            .await?;
-            sqlx::query(
+        sqlx::query(
             "INSERT INTO request_events (event_id, tenant_id, key_id, request_id, event_at, event_kind, protocol, model, status_code, duration_ms, input_tokens, output_tokens, cost_micros, error_code)
              SELECT $1, tenant_id, key_id, request_id, $2, 'projected', protocol, model, status_code, duration_ms, input_tokens, output_tokens, cost_micros, NULLIF(error_code, '') FROM terminal_projection_outbox WHERE request_id = $3",
         )
@@ -240,13 +235,12 @@ impl Database {
         .bind(&request_id)
         .execute(&mut *transaction)
         .await?;
-            super::super::history_immutable_outbox::capture_event_in_transaction(
-                &mut transaction,
-                &event.event_id.to_string(),
-                event.event_at,
-            )
-            .await?;
-        }
+        super::super::history_immutable_outbox::capture_event_in_transaction(
+            &mut transaction,
+            &event.event_id.to_string(),
+            event.event_at,
+        )
+        .await?;
         let acknowledged = sqlx::query(
             "UPDATE terminal_projection_outbox SET projected_at = $1, statistics_outcome = $2, lease_owner = NULL, lease_expires_at = NULL WHERE request_id = $3 AND projected_at IS NULL AND lease_owner = $4 AND account_projected_at IS NOT NULL",
         )

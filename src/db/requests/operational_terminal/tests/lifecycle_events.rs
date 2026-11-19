@@ -15,7 +15,7 @@ async fn postgres_lifecycle_events_do_not_wait_for_archive_or_financial_projecti
 async fn lifecycle_events_contract(fixture: Fixture) {
     let archive_gate = fixture
         .database
-        .hold_gateway_archive_capacity_for_test()
+        .saturate_gateway_persistence_for_test()
         .await;
     let price = fixture
         .database
@@ -25,9 +25,8 @@ async fn lifecycle_events_contract(fixture: Fixture) {
     let request_id = Uuid::now_v7();
     let reservation = tokio::time::timeout(
         std::time::Duration::from_secs(5),
-        fixture
-            .database
-            .start_proxy_forwarding_request(StartProxyRequest {
+        fixture.database.start_proxy_forwarding_request(
+            StartProxyRequest {
                 request_id,
                 key: &fixture.key,
                 price: &price,
@@ -38,7 +37,9 @@ async fn lifecycle_events_contract(fixture: Fixture) {
                 request_object: "gap://blocked-archive/request",
                 upstream_account_id: None,
                 model_route_id: None,
-            }),
+            },
+            None,
+        ),
     )
     .await
     .expect("admission cannot wait for archive permits")
@@ -103,6 +104,37 @@ async fn lifecycle_events_contract(fixture: Fixture) {
     let json = serde_json::to_value(finished[0]).unwrap();
     assert_eq!(json["operational_terminal"]["financial_state"], "pending");
     fixture.assert_unsettled().await;
+    // The semantic projector uses the same public event kind while finance is
+    // still unknown. It must not suppress the later financial publication.
+    let mut transaction = fixture.database.begin_write_transaction().await.unwrap();
+    crate::db::requests::conversations::emit_conversation_projected_event_in_transaction(
+        &mut transaction,
+        fixture.claim.request_id,
+        fixture.key.tenant_id,
+        fixture.key.key_id,
+    )
+    .await
+    .unwrap();
+    transaction.commit().await.unwrap();
+    let semantic = fixture
+        .database
+        .request_events_after(
+            "operational-test",
+            finished_cursor.0,
+            Some(finished_cursor.1),
+            500,
+        )
+        .await
+        .unwrap();
+    let semantic = semantic
+        .iter()
+        .find(|event| {
+            event.request_id == fixture.claim.request_id && event.event_kind == "projected"
+        })
+        .unwrap();
+    assert!(semantic.billing.cost.is_none());
+    let semantic_cursor = (semantic.event_at, semantic.event_id);
+
     fixture.finish(receipt).await.unwrap();
     let owner = Uuid::now_v7();
     assert_eq!(
@@ -131,8 +163,8 @@ async fn lifecycle_events_contract(fixture: Fixture) {
         .database
         .request_events_after(
             "operational-test",
-            finished_cursor.0,
-            Some(finished_cursor.1),
+            semantic_cursor.0,
+            Some(semantic_cursor.1),
             500,
         )
         .await

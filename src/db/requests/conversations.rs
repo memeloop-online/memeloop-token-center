@@ -2275,7 +2275,7 @@ fn newest_conversation_candidate(
     }
 }
 
-async fn emit_conversation_projected_event_in_transaction(
+pub(super) async fn emit_conversation_projected_event_in_transaction(
     transaction: &mut Transaction<'_, Any>,
     request_id: Uuid,
     tenant_id: Uuid,

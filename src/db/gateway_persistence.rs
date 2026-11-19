@@ -824,16 +824,6 @@ impl Database {
     }
 
     #[cfg(test)]
-    pub(crate) async fn hold_gateway_archive_capacity_for_test(&self) -> OwnedSemaphorePermit {
-        self.gateway_persistence
-            .slots
-            .clone()
-            .acquire_many_owned(TASK_LIMIT as u32)
-            .await
-            .unwrap()
-    }
-
-    #[cfg(test)]
     pub(crate) async fn hold_gateway_archive_connection_for_test(
         &self,
     ) -> super::request_connection::RequestConnection {
