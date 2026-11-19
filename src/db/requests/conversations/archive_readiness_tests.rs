@@ -2258,6 +2258,19 @@ async fn postgres_semantic_coverage_recovers_committed_projection_and_failed_put
     isolated.cleanup().await;
 }
 
+struct CoverageWorkerGuard {
+    request: Uuid,
+    gate: std::sync::Arc<(tokio::sync::Notify, tokio::sync::Notify)>,
+    worker: tokio::task::AbortHandle,
+}
+impl Drop for CoverageWorkerGuard {
+    fn drop(&mut self) {
+        Database::clear_coverage_read_gate_for_test(self.request);
+        self.gate.1.notify_one();
+        self.worker.abort();
+    }
+}
+
 async fn coverage_read_does_not_block_body_worker_contract(database_url: String) {
     let historical = Fixture::new(database_url.clone(), true).await;
     historical.capture().await;
@@ -2297,6 +2310,11 @@ async fn coverage_read_does_not_block_body_worker_contract(database_url: String)
         fresh.state.clone(),
         shutdown,
     ));
+    let _cleanup = CoverageWorkerGuard {
+        request: historical.request_id,
+        gate: gate.clone(),
+        worker: worker.abort_handle(),
+    };
     tokio::time::timeout(std::time::Duration::from_secs(10), gate.0.notified())
         .await
         .expect("the real worker must enter historical manifest recovery");

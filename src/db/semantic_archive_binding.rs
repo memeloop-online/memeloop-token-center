@@ -31,6 +31,14 @@ impl Database {
     }
 
     #[cfg(test)]
+    pub(crate) fn clear_coverage_read_gate_for_test(request: Uuid) {
+        COVERAGE_READ_GATES
+            .lock()
+            .unwrap()
+            .remove(&request.to_string());
+    }
+
+    #[cfg(test)]
     pub(crate) async fn with_semantic_coverage_fault<T>(
         stage: &'static str,
         future: impl std::future::Future<Output = T>,
