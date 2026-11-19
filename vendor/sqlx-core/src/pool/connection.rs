@@ -94,6 +94,10 @@ impl<DB: Database> PoolConnection<DB> {
     /// to complete is unacceptable, but you still want the connection to be closed gracefully
     /// so that the server can clean up resources.
     #[inline(always)]
+    pub(crate) fn replace_close_on_drop(&mut self, close: bool) -> bool {
+        std::mem::replace(&mut self.close_on_drop, close)
+    }
+
     pub fn close_on_drop(&mut self) {
         self.close_on_drop = true;
     }
