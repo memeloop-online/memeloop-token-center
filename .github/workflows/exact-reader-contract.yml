@@ -33,6 +33,23 @@ on:
 permissions:
   contents: read
 jobs:
+  request-readmodel-web-contract:
+    if: inputs.contract == 'request-readmodel-994'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+        with:
+          ref: ${{ inputs.source_revision }}
+          persist-credentials: false
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020
+        with:
+          node-version: 24.18.0
+      - run: npm ci --ignore-scripts
+        working-directory: web
+      - name: Verify partial deltas and financial receipt revisions
+        run: node --import tsx --test e2e/request-live-fields-contract.test.ts e2e/request-refresh-cadence-contract.test.ts e2e/request-refresh-pause-contract.test.ts
+        working-directory: web
   request-readmodel-contract:
     if: inputs.contract == 'request-readmodel-994'
     runs-on: ubuntu-24.04
