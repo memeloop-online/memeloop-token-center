@@ -143,6 +143,42 @@ async fn run_return_health_case(url: &str, cancel_begin: bool) {
         "healthy maintenance preserves backend reuse"
     );
     healthy.finish();
+    if cancel_begin {
+        let mut transaction = pool.begin().await.unwrap();
+        let transaction_pid: i32 = sqlx::query_scalar("SELECT pg_backend_pid()")
+            .fetch_one(&mut *transaction)
+            .await
+            .unwrap();
+        assert_eq!(transaction_pid, reused_pid);
+        transaction.commit().await.unwrap();
+        let mut normal = pool.acquire().await.unwrap();
+        let normal_pid: i32 = sqlx::query_scalar("SELECT pg_backend_pid()")
+            .fetch_one(&mut *normal)
+            .await
+            .unwrap();
+        assert_eq!(normal_pid, reused_pid, "confirmed BEGIN keeps normal reuse");
+        normal.close_on_drop();
+        let mut marked = Transaction::begin(normal.into_pool(), None).await.unwrap();
+        sqlx::query("SELECT 1").execute(&mut *marked).await.unwrap();
+        marked.commit().await.unwrap();
+        let mut replacement = pool.acquire().await.unwrap();
+        let marked_replacement: i32 = sqlx::query_scalar("SELECT pg_backend_pid()")
+            .fetch_one(&mut *replacement)
+            .await
+            .unwrap();
+        assert_ne!(
+            marked_replacement, normal_pid,
+            "successful BEGIN preserves caller close-on-drop"
+        );
+        let old_exists: bool =
+            sqlx::query_scalar("SELECT EXISTS (SELECT 1 FROM pg_stat_activity WHERE pid=$1)")
+                .bind(pid)
+                .fetch_one(&mut *replacement)
+                .await
+                .unwrap();
+        assert!(!old_exists, "cancelled BEGIN backend exited");
+        replacement.finish();
+    }
     pool.close().await;
     drop(relay);
 }
