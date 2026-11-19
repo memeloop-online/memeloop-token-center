@@ -181,7 +181,9 @@ pub(super) async fn stream_response(input: StreamingResponse<'_>) -> Result<Resp
         ..
     } = buffered_request;
     tokio::spawn(async move {
-        let mut _sse_streaming_memory = None;
+        let mut _sse_streaming_memory: Option<
+            std::sync::Arc<crate::gateway_body::memory::SseAllocationBudget>,
+        > = None;
         let stream_owner = proxy_diagnostics::Phase::account(
             diagnostic_context,
             "stream_owner",
@@ -277,6 +279,20 @@ pub(super) async fn stream_response(input: StreamingResponse<'_>) -> Result<Resp
             // contents, usage, settlement, or the delivery transition.
             let mut progress_heartbeat_deadline = None;
             loop {
+                if let Some(budget) = _sse_streaming_memory.as_ref() {
+                    let retained = responses_streaming_sanitizer
+                        .as_ref()
+                        .map_or(0, |state| state.retained_capacity())
+                        + sse_capture
+                            .as_ref()
+                            .map_or(0, |state| state.retained_framing_capacity())
+                        + terminal_frames.metadata_capacity()
+                        + terminal_delivery.retained_bytes();
+                    if !budget.reconcile_retained(retained) {
+                        transport_error = Some("upstream_response_memory_capacity");
+                        break;
+                    }
+                }
                 let mut flushing_terminal = false;
                 let next = if let Some(chunk) = terminal_delivery.take_pending() {
                     flushing_terminal = true;
@@ -313,6 +329,15 @@ pub(super) async fn stream_response(input: StreamingResponse<'_>) -> Result<Resp
                             ) else {
                                 progress_heartbeat_deadline = None;
                                 continue;
+                            };
+                            let heartbeat = if let Some(budget) = _sse_streaming_memory.as_ref() {
+                                let Some(bytes) = budget.retain_output(heartbeat) else {
+                                    transport_error = Some("upstream_response_memory_capacity");
+                                    break;
+                                };
+                                bytes
+                            } else {
+                                heartbeat
                             };
                             match waits.downstream(body_sender.send(Ok(heartbeat))).await {
                                 Ok(()) => {
@@ -390,9 +415,7 @@ pub(super) async fn stream_response(input: StreamingResponse<'_>) -> Result<Resp
                             && !raw_chunk.is_empty()
                             && _sse_streaming_memory.is_none()
                         {
-                            let Some(memory) = request_memory
-                                .try_reserve_sse_streaming(sse_framing_limits.framed_bytes)
-                            else {
+                            let Some(memory) = request_memory.try_reserve_sse_streaming(0) else {
                                 transport_error = Some(transport_error_with_downstream_precedence(
                                     downstream_closed_observed || body_sender.is_closed(),
                                     "upstream_response_memory_capacity",
@@ -409,7 +432,17 @@ pub(super) async fn stream_response(input: StreamingResponse<'_>) -> Result<Resp
                                 .await;
                                 break;
                             };
-                            _sse_streaming_memory = Some(memory);
+                            let budget = std::sync::Arc::new(
+                                crate::gateway_body::memory::SseAllocationBudget::new(memory),
+                            );
+                            if let Some(sanitizer) = responses_streaming_sanitizer.as_mut() {
+                                sanitizer.set_allocation_budget(budget.clone());
+                            }
+                            if let Some(capture) = sse_capture.as_mut() {
+                                capture.set_allocation_budget(budget.clone());
+                            }
+                            terminal_frames.set_allocation_budget(budget.clone());
+                            _sse_streaming_memory = Some(budget);
                         }
                         let raw_chunk_len = raw_chunk.len();
                         if downstream_closed_observed && !flushing_terminal {
@@ -620,7 +653,15 @@ pub(super) async fn stream_response(input: StreamingResponse<'_>) -> Result<Resp
                         {
                             continue;
                         }
-                        for frame in delivery_frames {
+                        for mut frame in delivery_frames {
+                            if let Some(budget) = _sse_streaming_memory.as_ref() {
+                                let Some(bytes) = budget.retain_output(frame.bytes) else {
+                                    transport_error = Some("upstream_response_memory_capacity");
+                                    break;
+                                };
+                                frame.bytes = bytes;
+                            }
+
                             let frame = match terminal_frames.hold(frame) {
                                 Ok(Some(frame)) => frame,
                                 Ok(None) => {

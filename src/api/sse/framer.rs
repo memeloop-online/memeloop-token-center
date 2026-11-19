@@ -6,11 +6,22 @@ use super::super::limits::{
 };
 use crate::provider::SseFramingLimits;
 
+fn reserve<T>(
+    budget: &Option<std::sync::Arc<crate::gateway_body::memory::SseAllocationBudget>>,
+    buffer: &mut Vec<T>,
+    additional: usize,
+) -> bool {
+    budget
+        .as_ref()
+        .is_none_or(|budget| budget.reserve_vec(buffer, additional))
+}
+
 /// A bounded, stateful SSE framer. It preserves original wire bytes while
 /// treating CR, LF, and CRLF as line endings. EOF never turns an unterminated
 /// field block into an event.
 pub(in crate::api) struct BoundedSseFramer {
     limits: SseFramingLimits,
+    allocation_budget: Option<std::sync::Arc<crate::gateway_body::memory::SseAllocationBudget>>,
     event: Vec<u8>,
     line: Vec<u8>,
     lines: Vec<BoundedSseLine>,
@@ -34,17 +45,20 @@ pub(in crate::api) struct BoundedSseFrameBatch {
     pub(in crate::api) rejection: Option<SseFramerRejection>,
     framed_bytes: usize,
     metadata_items: usize,
+    allocation_budget: Option<std::sync::Arc<crate::gateway_body::memory::SseAllocationBudget>>,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(in crate::api) enum SseFramerRejection {
     EventLimit,
     BatchLimit,
+    MemoryCapacity,
 }
 
 impl SseFramerRejection {
     pub(in crate::api) fn error_code(self) -> &'static str {
         match self {
+            Self::MemoryCapacity => "upstream_response_memory_capacity",
             Self::EventLimit => "upstream_response_event_too_large",
             Self::BatchLimit => "upstream_response_event_batch_too_large",
         }
@@ -119,9 +133,33 @@ pub(in crate::api) enum SseIdleControl {
 }
 
 impl BoundedSseFramer {
+    pub(in crate::api) fn set_allocation_budget(
+        &mut self,
+        budget: std::sync::Arc<crate::gateway_body::memory::SseAllocationBudget>,
+    ) {
+        self.allocation_budget = Some(budget);
+    }
+
+    pub(in crate::api) fn retained_capacity(&self) -> usize {
+        fn lines_capacity(lines: &Vec<BoundedSseLine>) -> usize {
+            lines.capacity() * std::mem::size_of::<BoundedSseLine>()
+                + lines
+                    .iter()
+                    .map(|line| line.value.capacity() + line.ending.capacity())
+                    .sum::<usize>()
+        }
+        self.event.capacity()
+            + self.line.capacity()
+            + lines_capacity(&self.lines)
+            + self.completed_event.as_ref().map_or(0, |event| {
+                event.bytes.capacity() + event.terminator.capacity() + lines_capacity(&event.lines)
+            })
+    }
+
     pub(in crate::api) fn with_limits(limits: SseFramingLimits) -> Self {
         Self {
             limits,
+            allocation_budget: None,
             event: Vec::new(),
             line: Vec::new(),
             lines: Vec::new(),
@@ -141,12 +179,16 @@ impl BoundedSseFramer {
             rejection: None,
             framed_bytes: 0,
             metadata_items: 0,
+            allocation_budget: self.allocation_budget.clone(),
         };
         if self.batch_rejected {
             batch.reject(SseFramerRejection::BatchLimit);
             return batch;
         }
         for &byte in chunk {
+            if matches!(batch.rejection, Some(SseFramerRejection::MemoryCapacity)) {
+                break;
+            }
             // Once the per-network-chunk product ceiling is crossed, no
             // caller may safely use a partial prefix. Stop before allocating
             // or classifying the remaining tiny events in this raw chunk.
@@ -163,11 +205,21 @@ impl BoundedSseFramer {
                         batch.reject(SseFramerRejection::EventLimit);
                         continue;
                     }
+                    if !reserve(&self.allocation_budget, &mut completed.bytes, 1)
+                        || !reserve(&self.allocation_budget, &mut completed.terminator, 1)
+                    {
+                        batch.reject(SseFramerRejection::MemoryCapacity);
+                        break;
+                    }
                     completed.bytes.push(byte);
                     match completed.crlf_target {
                         CrLfTarget::Terminator => completed.terminator.push(byte),
                         CrLfTarget::LastLine => {
                             if let Some(line) = completed.lines.last_mut() {
+                                if !reserve(&self.allocation_budget, &mut line.ending, 1) {
+                                    batch.reject(SseFramerRejection::MemoryCapacity);
+                                    break;
+                                }
                                 line.ending.push(byte);
                             }
                         }
@@ -199,12 +251,26 @@ impl BoundedSseFramer {
                             batch.reject(SseFramerRejection::EventLimit);
                             continue;
                         }
+                        if !reserve(&self.allocation_budget, &mut line.ending, 1)
+                            || !reserve(&self.allocation_budget, &mut self.event, 1)
+                        {
+                            batch.reject(SseFramerRejection::MemoryCapacity);
+                            break;
+                        }
                         line.ending.push(byte);
                         self.event.push(byte);
                     } else if self.emit_lf_continuation {
                         if self.emitted_cr_event_bytes >= self.limits.event_bytes {
                             batch.reject(SseFramerRejection::EventLimit);
                         } else {
+                            if self
+                                .allocation_budget
+                                .as_ref()
+                                .is_some_and(|budget| !budget.reserve_allocation(2))
+                            {
+                                batch.reject(SseFramerRejection::MemoryCapacity);
+                                break;
+                            }
                             Self::emit(
                                 &mut batch,
                                 PendingSseEvent {
@@ -224,6 +290,15 @@ impl BoundedSseFramer {
                     continue;
                 }
                 self.emitted_cr_event_bytes = 0;
+            }
+            if matches!(byte, b'\n' | b'\r')
+                && self
+                    .allocation_budget
+                    .as_ref()
+                    .is_some_and(|budget| !budget.reserve_allocation(1))
+            {
+                batch.reject(SseFramerRejection::MemoryCapacity);
+                break;
             }
             match byte {
                 b'\n' => self.finish_line(vec![byte], &mut batch),
@@ -249,6 +324,12 @@ impl BoundedSseFramer {
         !self.discarding_event && self.event.is_empty() && self.line.is_empty()
     }
 
+    pub(in crate::api) fn allocation_budget(
+        &self,
+    ) -> Option<&std::sync::Arc<crate::gateway_body::memory::SseAllocationBudget>> {
+        self.allocation_budget.as_ref()
+    }
+
     pub(in crate::api) fn has_pending_crlf_continuation(&self) -> bool {
         self.skip_lf_after_cr
     }
@@ -265,6 +346,12 @@ impl BoundedSseFramer {
             self.line.clear();
             self.lines.clear();
             batch.reject(SseFramerRejection::EventLimit);
+            return;
+        }
+        if !reserve(&self.allocation_budget, &mut self.event, 1)
+            || !reserve(&self.allocation_budget, &mut self.line, 1)
+        {
+            batch.reject(SseFramerRejection::MemoryCapacity);
             return;
         }
         self.event.push(byte);
@@ -286,6 +373,10 @@ impl BoundedSseFramer {
             self.line.clear();
             self.lines.clear();
             batch.reject(SseFramerRejection::EventLimit);
+            return;
+        }
+        if !reserve(&self.allocation_budget, &mut self.event, ending.len()) {
+            batch.reject(SseFramerRejection::MemoryCapacity);
             return;
         }
         self.event.extend_from_slice(&ending);
@@ -324,6 +415,12 @@ impl BoundedSseFramer {
                 self.lines.clear();
                 return;
             }
+            if self.allocation_budget.as_ref().is_some_and(|budget| {
+                !budget.reserve_allocation(std::mem::size_of::<BoundedSseLine>())
+            }) {
+                batch.reject(SseFramerRejection::MemoryCapacity);
+                return;
+            }
             let completed = PendingSseEvent {
                 bytes: std::mem::take(&mut self.event),
                 lines: vec![BoundedSseLine {
@@ -348,6 +445,10 @@ impl BoundedSseFramer {
             self.lines.clear();
             return;
         }
+        if !reserve(&self.allocation_budget, &mut self.lines, 1) {
+            batch.reject(SseFramerRejection::MemoryCapacity);
+            return;
+        }
         self.lines.push(BoundedSseLine {
             value: line,
             ending,
@@ -365,6 +466,10 @@ impl BoundedSseFramer {
             return;
         }
         batch.framed_bytes = batch.framed_bytes.saturating_add(pending.bytes.len());
+        if !reserve(&batch.allocation_budget, &mut batch.events, 1) {
+            batch.reject(SseFramerRejection::MemoryCapacity);
+            return;
+        }
         batch.events.push(BoundedSseEvent {
             bytes: Bytes::from(pending.bytes),
             lines: pending.lines,
@@ -372,6 +477,30 @@ impl BoundedSseFramer {
             is_line_ending_continuation: pending.is_line_ending_continuation,
             idle_control: pending.idle_control,
         });
+    }
+}
+
+impl BoundedSseEvent {
+    pub(in crate::api) fn reserve_processing(
+        &self,
+        budget: &crate::gateway_body::memory::SseAllocationBudget,
+    ) -> bool {
+        let mut scanner = crate::gateway_body::memory::JsonMemoryScanner::default();
+        let mut nodes = 0;
+        for line in &self.lines {
+            nodes = scanner.observe(&line.value);
+        }
+        // Joined data, parsed strings, serialized data, sanitized output,
+        // capture output and terminal reconstruction coexist during conversion.
+        self.bytes
+            .len()
+            .checked_mul(6)
+            .and_then(|bytes| {
+                nodes
+                    .checked_mul(256)
+                    .and_then(|nodes| bytes.checked_add(nodes))
+            })
+            .is_some_and(|bytes| budget.reserve_allocation(bytes))
     }
 }
 
