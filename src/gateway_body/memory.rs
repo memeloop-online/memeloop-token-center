@@ -855,6 +855,25 @@ mod tests {
         assert!(!request.try_reserve_json(body.as_bytes()));
     }
 
+    #[tokio::test]
+    async fn queued_output_retains_charge_until_final_clone_is_released() {
+        let budget = ProxyMemoryBudget::new(1024 * 1024);
+        let request = budget.reservation();
+        let allocation = SseAllocationBudget::new(request.try_reserve_sse_streaming(0).unwrap());
+        let bytes = allocation
+            .retain_output(axum::body::Bytes::from(vec![0; 100_000]))
+            .unwrap();
+        let last_reference = bytes.clone();
+        let (sender, mut receiver) = tokio::sync::mpsc::channel(1);
+        sender.send(bytes).await.unwrap();
+        drop(allocation);
+        assert_eq!(budget.snapshot().0, 2 * UNIT_BYTES);
+        drop(receiver.recv().await.unwrap());
+        assert_eq!(budget.snapshot().0, 2 * UNIT_BYTES);
+        drop(last_reference);
+        assert_eq!(budget.snapshot().0, 0);
+    }
+
     #[test]
     fn streaming_resize_tracks_live_allocations_and_releases_on_cancel() {
         let budget = ProxyMemoryBudget::new(1024 * 1024);

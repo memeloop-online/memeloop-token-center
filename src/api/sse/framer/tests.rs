@@ -208,3 +208,51 @@ fn delivery_bytes_strip_untrusted_metadata_and_preserve_data_crlf() {
         Bytes::from_static(b"data: {\"safe\":true}\r\n: heartbeat\r\n\r\n")
     );
 }
+
+#[test]
+fn live_allocation_budget_admits_thirty_two_small_streams() {
+    let budget = crate::gateway_body::memory::ProxyMemoryBudget::new(1024 * 1024);
+    let request = budget.reservation();
+    let mut streams = Vec::new();
+    for _ in 0..32 {
+        let allocation =
+            std::sync::Arc::new(crate::gateway_body::memory::SseAllocationBudget::new(
+                request.try_reserve_sse_streaming(0).unwrap(),
+            ));
+        let mut framer = BoundedSseFramer::default();
+        framer.set_allocation_budget(allocation.clone());
+        let batch = framer.push(b"data: {\"type\":\"delta\"}\n\n");
+        assert_eq!(batch.rejection, None);
+        assert_eq!(batch.events.len(), 1);
+        drop(batch);
+        assert!(allocation.reconcile_retained(framer.retained_capacity()));
+        streams.push((framer, allocation));
+    }
+    assert!(budget.snapshot().0 < 128 * 1024);
+    drop(streams);
+    assert_eq!(budget.snapshot().0, 0);
+}
+
+#[test]
+fn fragmented_frame_processing_reserves_complete_json_nodes() {
+    let budget = crate::gateway_body::memory::ProxyMemoryBudget::new(1024 * 1024);
+    let request = budget.reservation();
+    let allocation = std::sync::Arc::new(crate::gateway_body::memory::SseAllocationBudget::new(
+        request.try_reserve_sse_streaming(0).unwrap(),
+    ));
+    let mut framer = BoundedSseFramer::default();
+    framer.set_allocation_budget(allocation.clone());
+    let data = format!("data: [{}0]\n", "0,".repeat(10_000));
+    let first = framer.push(data.as_bytes());
+    assert!(first.events.is_empty());
+    drop(first);
+    assert!(allocation.reconcile_retained(framer.retained_capacity()));
+    let completed = framer.push(b"\n");
+    assert_eq!(completed.rejection, None);
+    assert_eq!(completed.events.len(), 1);
+    assert!(!completed.events[0].reserve_processing(&allocation));
+    drop(completed);
+    drop(framer);
+    drop(allocation);
+    assert_eq!(budget.snapshot().0, 0);
+}
