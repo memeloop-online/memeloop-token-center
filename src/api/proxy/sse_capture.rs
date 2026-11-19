@@ -99,6 +99,10 @@ pub(super) struct ResponsesSseSummary {
 }
 
 impl ResponsesSseCapture {
+    pub(super) fn retained_framing_capacity(&self) -> usize {
+        self.framer.retained_capacity()
+    }
+
     #[cfg(test)]
     pub(super) fn for_responses() -> Self {
         Self::for_responses_with_limits(crate::provider::SseFramingLimits::default())

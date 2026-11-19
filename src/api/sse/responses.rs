@@ -187,6 +187,15 @@ impl Default for ResponsesStreamingSanitizer {
 }
 
 impl ResponsesStreamingSanitizer {
+    pub(in crate::api) fn retained_capacity(&self) -> usize {
+        self.framer.retained_capacity()
+            + match &self.terminal_hold.state {
+                ResponseTerminalHoldState::Idle => 0,
+                ResponseTerminalHoldState::Holding(bytes) => bytes.capacity(),
+            }
+            + self.progress_heartbeat.as_ref().map_or(0, Bytes::len)
+    }
+
     pub(in crate::api) fn with_limits(limits: SseFramingLimits) -> Self {
         Self {
             framer: BoundedSseFramer::with_limits(limits),

@@ -166,6 +166,22 @@ impl Drop for ArchiveOutputMemory {
     }
 }
 
+impl SseStreamingMemory {
+    /// Track allocated buffers owned by this stream, including transient peaks.
+    /// Callers retain the charge until the corresponding allocations are freed.
+    pub(crate) fn try_resize(&mut self, bytes: usize) -> bool {
+        if bytes > self.bytes {
+            if !self.reservation.try_grow(bytes - self.bytes, 1) {
+                return false;
+            }
+        } else {
+            self.reservation.release(self.bytes - bytes, 1);
+        }
+        self.bytes = bytes;
+        true
+    }
+}
+
 impl Drop for SseStreamingMemory {
     fn drop(&mut self) {
         self.reservation.release(self.bytes, 1);
@@ -765,6 +781,27 @@ mod tests {
         let body = format!("[{}0]", "0,".repeat(10_000));
         assert!(request.try_grow(body.len(), REQUEST_MEMORY_WEIGHT));
         assert!(!request.try_reserve_json(body.as_bytes()));
+    }
+
+    #[test]
+    fn streaming_resize_tracks_live_allocations_and_releases_on_cancel() {
+        let budget = ProxyMemoryBudget::new(1024 * 1024);
+        let request = budget.reservation();
+        let mut streams: Vec<_> = (0..32)
+            .map(|_| request.try_reserve_sse_streaming(0).unwrap())
+            .collect();
+        for stream in &mut streams {
+            assert!(stream.try_resize(1024));
+        }
+        assert_eq!(budget.snapshot().0, UNIT_BYTES);
+        assert!(streams[0].try_resize(256 * 1024));
+        let charged = budget.snapshot().0;
+        assert!(!streams[0].try_resize(2 * 1024 * 1024));
+        assert_eq!(budget.snapshot().0, charged);
+        assert!(streams[0].try_resize(1024));
+        assert_eq!(budget.snapshot().0, UNIT_BYTES);
+        drop(streams);
+        assert_eq!(budget.snapshot().0, 0);
     }
 
     #[tokio::test]

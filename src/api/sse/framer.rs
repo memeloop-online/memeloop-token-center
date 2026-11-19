@@ -119,6 +119,22 @@ pub(in crate::api) enum SseIdleControl {
 }
 
 impl BoundedSseFramer {
+    pub(in crate::api) fn retained_capacity(&self) -> usize {
+        fn lines_capacity(lines: &Vec<BoundedSseLine>) -> usize {
+            lines.capacity() * std::mem::size_of::<BoundedSseLine>()
+                + lines
+                    .iter()
+                    .map(|line| line.value.capacity() + line.ending.capacity())
+                    .sum::<usize>()
+        }
+        self.event.capacity()
+            + self.line.capacity()
+            + lines_capacity(&self.lines)
+            + self.completed_event.as_ref().map_or(0, |event| {
+                event.bytes.capacity() + event.terminator.capacity() + lines_capacity(&event.lines)
+            })
+    }
+
     pub(in crate::api) fn with_limits(limits: SseFramingLimits) -> Self {
         Self {
             limits,
