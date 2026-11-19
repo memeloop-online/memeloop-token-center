@@ -187,6 +187,10 @@ impl TerminalFrames {
         std::mem::take(&mut self.frames)
     }
 
+    pub(super) fn metadata_capacity(&self) -> usize {
+        self.frames.capacity() * std::mem::size_of::<SseDeliveryFrame>()
+    }
+
     pub(super) fn bytes(&self) -> usize {
         self.bytes
     }

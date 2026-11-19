@@ -187,8 +187,19 @@ impl Default for ResponsesStreamingSanitizer {
 }
 
 impl ResponsesStreamingSanitizer {
+    pub(in crate::api) fn set_allocation_budget(
+        &mut self,
+        budget: std::sync::Arc<crate::gateway_body::memory::SseAllocationBudget>,
+    ) {
+        self.framer.set_allocation_budget(budget);
+    }
+
     pub(in crate::api) fn retained_capacity(&self) -> usize {
-        self.framer.retained_capacity()
+        self.identity
+            .response_id
+            .as_ref()
+            .map_or(0, String::capacity)
+            + self.framer.retained_capacity()
             + match &self.terminal_hold.state {
                 ResponseTerminalHoldState::Idle => 0,
                 ResponseTerminalHoldState::Holding(bytes) => bytes.capacity(),
@@ -217,6 +228,14 @@ impl ResponsesStreamingSanitizer {
             return Err(rejection.error_code());
         }
         for event in batch.events {
+            if self
+                .framer
+                .allocation_budget()
+                .is_some_and(|budget| !event.reserve_processing(budget))
+            {
+                return Err("upstream_response_memory_capacity");
+            }
+
             if let Err(rejection) = self.sanitize_event(event, &mut output) {
                 self.last_rejection_stage = Some(rejection.stage);
                 return Err(rejection.code);

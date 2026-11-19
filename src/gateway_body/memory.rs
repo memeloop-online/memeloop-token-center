@@ -166,6 +166,78 @@ impl Drop for ArchiveOutputMemory {
     }
 }
 
+/// Shared allocation context for framing, sanitizing and capturing one stream.
+/// During a processing turn, released intermediates remain charged until all
+/// consumers finish; the owner then reconciles retained allocation capacity.
+pub(crate) struct SseAllocationBudget {
+    memory: Mutex<SseStreamingMemory>,
+}
+
+struct ChargedStreamBytes {
+    bytes: axum::body::Bytes,
+    _memory: ArchiveOutputMemory,
+}
+impl AsRef<[u8]> for ChargedStreamBytes {
+    fn as_ref(&self) -> &[u8] {
+        &self.bytes
+    }
+}
+
+impl SseAllocationBudget {
+    pub(crate) fn new(memory: SseStreamingMemory) -> Self {
+        Self {
+            memory: Mutex::new(memory),
+        }
+    }
+
+    pub(crate) fn retain_output(&self, bytes: axum::body::Bytes) -> Option<axum::body::Bytes> {
+        if bytes.is_empty() {
+            return Some(bytes);
+        }
+        let memory = self.memory.lock().ok()?;
+        let permit = memory.reservation.try_reserve_archive_output(bytes.len())?;
+        Some(axum::body::Bytes::from_owner(ChargedStreamBytes {
+            bytes,
+            _memory: permit,
+        }))
+    }
+
+    pub(crate) fn reserve_allocation(&self, bytes: usize) -> bool {
+        let Ok(mut memory) = self.memory.lock() else {
+            return false;
+        };
+        let Some(total) = memory.bytes.checked_add(bytes) else {
+            return false;
+        };
+        memory.try_resize(total)
+    }
+
+    pub(crate) fn reserve_vec<T>(&self, buffer: &mut Vec<T>, additional: usize) -> bool {
+        let Some(required) = buffer.len().checked_add(additional) else {
+            return false;
+        };
+        if required <= buffer.capacity() {
+            return true;
+        }
+        let target = required.max(buffer.capacity().saturating_mul(2)).max(8);
+        let Some(bytes) = target.checked_mul(std::mem::size_of::<T>()) else {
+            return false;
+        };
+        // Reallocation can temporarily retain the original backing allocation.
+        if !self.reserve_allocation(bytes) {
+            return false;
+        }
+        buffer.try_reserve_exact(target - buffer.len()).is_ok()
+    }
+
+    pub(crate) fn reconcile_retained(&self, bytes: usize) -> bool {
+        let Ok(mut memory) = self.memory.lock() else {
+            return false;
+        };
+        memory.try_resize(bytes)
+    }
+}
+
 impl SseStreamingMemory {
     /// Track allocated buffers owned by this stream, including transient peaks.
     /// Callers retain the charge until the corresponding allocations are freed.

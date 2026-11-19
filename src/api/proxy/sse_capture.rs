@@ -99,8 +99,33 @@ pub(super) struct ResponsesSseSummary {
 }
 
 impl ResponsesSseCapture {
+    pub(super) fn set_allocation_budget(
+        &mut self,
+        budget: std::sync::Arc<crate::gateway_body::memory::SseAllocationBudget>,
+    ) {
+        self.framer.set_allocation_budget(budget);
+    }
+
     pub(super) fn retained_framing_capacity(&self) -> usize {
         self.framer.retained_capacity()
+            + self.response_id.as_ref().map_or(0, String::capacity)
+            + self
+                .usage
+                .as_ref()
+                .and_then(|usage| usage.service_tier.as_ref())
+                .map_or(0, String::capacity)
+            + self
+                .chat_usage
+                .as_ref()
+                .map_or(0, ChatSseUsageState::retained_capacity)
+            + self.delivery.as_ref().map_or(0, |delivery| {
+                delivery.frames.capacity() * std::mem::size_of::<SseDeliveryFrame>()
+                    + delivery
+                        .frames
+                        .iter()
+                        .map(|frame| frame.bytes.len())
+                        .sum::<usize>()
+            })
     }
 
     #[cfg(test)]
@@ -199,6 +224,15 @@ impl ResponsesSseCapture {
             return Err(rejection);
         }
         for event in batch.events {
+            if self
+                .framer
+                .allocation_budget()
+                .is_some_and(|budget| !event.reserve_processing(budget))
+            {
+                self.framing_rejection = Some(crate::api::sse::SseFramerRejection::MemoryCapacity);
+                return Err(crate::api::sse::SseFramerRejection::MemoryCapacity);
+            }
+
             if self.saw_done {
                 if event.is_line_ending_continuation {
                     let bytes = self.delivery_event_bytes(&event);

@@ -74,6 +74,16 @@ impl Default for ChatSseUsageState {
 }
 
 impl ChatSseUsageState {
+    pub(super) fn retained_capacity(&self) -> usize {
+        self.model.as_ref().map_or(0, String::capacity)
+            + self.response_id.as_ref().map_or(0, String::capacity)
+            + self.service_tier.as_ref().map_or(0, String::capacity)
+            + self.usage.as_ref().and_then(|usage| usage.service_tier.as_ref()).map_or(0, String::capacity)
+            // The route accepts one choice. Account each set's leaf allocation.
+            + [&self.expected_choice_indices, &self.seen_choice_indices, &self.finished_choice_indices]
+                .iter().filter(|set| !set.is_empty()).count() * 128
+    }
+
     /// Kimi accepts usage on the terminal choice as well as a usage-only
     /// frame. Other Chat routes retain the strict usage-only contract.
     pub(super) fn for_kimi() -> Self {
