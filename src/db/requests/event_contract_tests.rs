@@ -63,6 +63,9 @@ async fn assert_event_enrichment(database: &Database) {
         .execute(&database.pool).await.unwrap();
     sqlx::query("UPDATE request_records SET first_output_ms = 5, generation_duration_ms = 15 WHERE id = $1 AND created_at = $2")
         .bind(&request).bind(now).execute(&database.pool).await.unwrap();
+    sqlx::query("INSERT INTO request_egress_attempts (request_id, attempt_id, outbound_attempt, connect_attempt, route_id, upstream_account_id, credential_generation, transport_revision, observed_at, snapshot_json, transport_json, final_response) VALUES ($1, 'recorded-egress', 1, 1, $2, $3, 1, 1, $4, '{\"kind\":\"direct\"}', '{}', 1)")
+        .bind(&request).bind(route.to_string()).bind(upstream.to_string()).bind(now + 25)
+        .execute(&database.pool).await.unwrap();
     // The foreign event deliberately references the same request/key. It must
     // never inherit the first tenant's routing or conversation fields.
     for event_tenant in [&tenant, &foreign_tenant] {
@@ -175,6 +178,16 @@ async fn assert_event_enrichment(database: &Database) {
             "a foreign-tenant event cannot inherit even a true marker"
         );
     }
+    let own_events = database
+        .request_events_after(&external, now, None, 500)
+        .await
+        .unwrap();
+    let foreign_events = database
+        .request_events_after(&foreign_external, now, None, 500)
+        .await
+        .unwrap();
+    assert!(own_events[0].egress.is_some());
+    assert!(foreign_events[0].egress.is_none());
     // One persisted native inline channel feeds list/detail/enriched event JSON.
     // Old, unsafe and object-store bodies are never parsed by the projection.
     let safe = format!(
@@ -338,6 +351,7 @@ async fn assert_event_enrichment(database: &Database) {
         "status_code",
         "duration_ms",
         "operational_terminal",
+        "egress",
         "cost",
         "usage",
         "billing",
@@ -365,6 +379,7 @@ async fn assert_event_enrichment(database: &Database) {
         "status_code",
         "duration_ms",
         "operational_terminal",
+        "egress",
         "cost",
         "usage",
         "billing",

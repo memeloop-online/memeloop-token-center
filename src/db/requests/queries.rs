@@ -144,11 +144,14 @@ impl Database {
         let mut events = request_event_views(rows)?;
         let ids = events
             .iter()
+            .filter(|event| event.created_at.is_some())
             .map(|event| event.request_id.to_string())
             .collect::<Vec<_>>();
         let observations = egress::request_list_egress(self, &ids).await?;
         for event in &mut events {
-            event.egress = observations.get(&event.request_id).cloned();
+            if event.created_at.is_some() {
+                event.egress = observations.get(&event.request_id).cloned();
+            }
         }
         if let Some(archive) = &self.archive {
             for (event, tenant) in events.iter_mut().zip(tenants) {
@@ -199,11 +202,14 @@ impl Database {
         let mut events = request_event_views(rows)?;
         let ids = events
             .iter()
+            .filter(|event| event.created_at.is_some())
             .map(|event| event.request_id.to_string())
             .collect::<Vec<_>>();
         let observations = egress::request_list_egress(self, &ids).await?;
         for event in &mut events {
-            event.egress = observations.get(&event.request_id).cloned();
+            if event.created_at.is_some() {
+                event.egress = observations.get(&event.request_id).cloned();
+            }
         }
         if let Some(archive) = &self.archive {
             for (event, tenant) in events.iter_mut().zip(tenants) {
@@ -232,9 +238,11 @@ impl Database {
         let Some(mut event) = request_event_views(rows)?.into_iter().next() else {
             return Ok(None);
         };
-        event.egress = egress::request_list_egress(self, &[event.request_id.to_string()])
-            .await?
-            .remove(&event.request_id);
+        if event.created_at.is_some() {
+            event.egress = egress::request_list_egress(self, &[event.request_id.to_string()])
+                .await?
+                .remove(&event.request_id);
+        }
         let row = sqlx::query("SELECT source, request_id, tenant_id, key_id, created_at FROM request_history_source_ids WHERE source IN ('native', 'generation') AND request_id = $1 AND key_id = $2 AND tenant_id = (SELECT tenant_id FROM request_events WHERE event_id = $3)")
             .bind(event.request_id.to_string()).bind(event.key_id.to_string()).bind(event_id.to_string()).fetch_optional(&self.pool).await?;
         if let Some(row) = row {
@@ -294,12 +302,14 @@ impl Database {
         let Some(mut event) = request_event_views(rows)?.into_iter().next() else {
             return Ok(None);
         };
-        event.egress = egress::request_list_egress_in_transaction(
-            transaction,
-            &[event.request_id.to_string()],
-        )
-        .await?
-        .remove(&event.request_id);
+        if event.created_at.is_some() {
+            event.egress = egress::request_list_egress_in_transaction(
+                transaction,
+                &[event.request_id.to_string()],
+            )
+            .await?
+            .remove(&event.request_id);
+        }
         let row = sqlx::query("SELECT source, request_id, tenant_id, key_id, created_at FROM request_history_source_ids WHERE source IN ('native', 'generation') AND request_id = $1 AND key_id = $2 AND tenant_id = $3")
             .bind(event.request_id.to_string()).bind(event.key_id.to_string()).bind(identity.tenant_id.to_string()).fetch_optional(&mut **transaction).await?;
         if let Some(row) = row {
