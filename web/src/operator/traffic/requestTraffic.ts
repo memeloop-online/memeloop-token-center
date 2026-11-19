@@ -273,7 +273,7 @@ export function requestViewFromEvent(event: RequestEvent, previous?: RequestView
   if (previous && (preserveReceipt || sparseLegacyTerminal)) {
     return {
       ...previous,
-      ...mergeRequestObservations({ ...previous, egress: event.egress }, previous),
+      ...mergeRequestObservations({ ...previous, ...(event.egress !== undefined ? { egress: event.egress } : {}) }, previous),
       archive_state: mergeArchiveState(previous.archive_state, event),
       session_context: mergeSessionContext(previous.session_context, event),
     };
@@ -332,7 +332,7 @@ export function requestViewFromEvent(event: RequestEvent, previous?: RequestView
       if (event[field] === undefined) Object.assign(request, { [field]: previous[field] });
     }
   }
-  return mergeRequestObservations({ ...request, egress: event.egress }, previous);
+  return mergeRequestObservations({ ...request, ...(event.egress !== undefined ? { egress: event.egress } : {}) }, previous);
 }
 
 export function mergeLiveRequestEvents(

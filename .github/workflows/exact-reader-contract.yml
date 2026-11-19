@@ -86,8 +86,8 @@ jobs:
           test -n "$MTC_TEST_POSTGRES_URL"
           cargo test --locked --lib --no-run
           for selector in \
-            db::requests::event_contract_tests::sqlite_event_enrichment_preserves_recorded_fields_and_tenant_ownership \
-            db::requests::event_contract_tests::postgres_event_enrichment_preserves_recorded_fields_and_tenant_ownership
+            db::requests::queries::event_contract_tests::sqlite_event_enrichment_preserves_recorded_fields_and_tenant_ownership \
+            db::requests::queries::event_contract_tests::postgres_event_enrichment_preserves_recorded_fields_and_tenant_ownership
           do
             echo "Contract: $selector"
             timeout 180s cargo test --locked --lib "$selector" -- --exact 2>&1 | tee /tmp/request-readmodel-contract.log
