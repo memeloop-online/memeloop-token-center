@@ -88,7 +88,9 @@ jobs:
           cargo test --locked --lib --no-run
           for selector in \
             db::requests::operational_terminal::tests::lifecycle_events::sqlite_lifecycle_events_do_not_wait_for_archive_or_financial_projection \
-            db::requests::operational_terminal::tests::lifecycle_events::postgres_lifecycle_events_do_not_wait_for_archive_or_financial_projection
+            db::requests::operational_terminal::tests::lifecycle_events::postgres_lifecycle_events_do_not_wait_for_archive_or_financial_projection \
+            db::requests::conversations::archive_readiness_tests::sqlite_admission_event_precedes_queued_archive_and_preserves_raw_body \
+            db::requests::conversations::archive_readiness_tests::postgres_admission_event_precedes_queued_archive_and_preserves_raw_body
           do
             echo "Contract: $selector"
             timeout 180s cargo test --locked --lib "$selector" -- --exact 2>&1 | tee /tmp/request-readmodel-contract.log
