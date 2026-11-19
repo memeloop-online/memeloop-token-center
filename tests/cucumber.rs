@@ -43,6 +43,12 @@ mod cloud_entitlements;
 mod logical_sessions;
 #[path = "steps/security_acceptance.rs"]
 mod security_acceptance;
+#[path = "steps/storage_recovery.rs"]
+mod storage_recovery;
+#[path = "steps/storage_recovery_legacy.rs"]
+mod storage_recovery_legacy;
+#[path = "steps/storage_recovery_scheduler.rs"]
+mod storage_recovery_scheduler;
 #[path = "steps/tkmarket_seedance.rs"]
 mod tkmarket_seedance;
 #[path = "steps/wasu_wan.rs"]
@@ -50,6 +56,7 @@ mod wasu_wan;
 
 #[derive(World)]
 struct TokenCenterWorld {
+    recovery: Option<storage_recovery::RecoveryState>,
     client: Client,
     service_url: String,
     state: Option<AppState>,
@@ -102,6 +109,7 @@ struct TokenCenterWorld {
 impl Default for TokenCenterWorld {
     fn default() -> Self {
         Self {
+            recovery: None,
             client: Client::new(),
             service_url: String::new(),
             state: None,
@@ -365,10 +373,13 @@ async fn finish_scenario(world: Option<&mut TokenCenterWorld>) {
         return;
     };
 
+    storage_recovery::release_faults(world);
+
     // A generation worker can still make an upstream request after a scenario's final step.
     // Stop and join it before inspecting mock expectations, so any failure belongs to this hook.
     stop_test_worker(world).await;
     verify_test_mocks(world).await;
+    storage_recovery::cleanup(world).await;
 }
 
 type PanicHook = dyn for<'a> Fn(&std::panic::PanicHookInfo<'a>) + Send + Sync + 'static;
@@ -465,6 +476,11 @@ async fn start_test_service(world: &mut TokenCenterWorld) {
     let state = AppState::initialize(config)
         .await
         .expect("initialize test service");
+    start_test_http_service(world, state, mock).await;
+    world.temp_dir = Some(temp_dir);
+}
+
+async fn start_test_http_service(world: &mut TokenCenterWorld, state: AppState, mock: MockServer) {
     let test_state = state.clone();
     let (worker_shutdown, worker_task) = spawn_test_worker(state.clone());
     let listener = TcpListener::bind("127.0.0.1:0")
@@ -480,7 +496,6 @@ async fn start_test_service(world: &mut TokenCenterWorld) {
     world.service_url = format!("http://{address}");
     world.state = Some(test_state);
     world.mock = Some(mock);
-    world.temp_dir = Some(temp_dir);
     world.server_task = Some(server_task);
     world.worker_shutdown = Some(worker_shutdown);
     world.worker_task = Some(worker_task);
@@ -3405,8 +3420,8 @@ async fn mock_sensitive_openai_image_rejection(world: &mut TokenCenterWorld) {
         .and(header_exists("idempotency-key"))
         .respond_with(ResponseTemplate::new(400).set_body_json(json!({
             "error": {
-                "message": "provider detail must-not-leak",
-                "signed_url": "https://images.example.invalid/result.png?token=must-not-leak"
+                "message": "provider detail remains available",
+                "signed_url": "https://images.example.invalid/result.png?token=image-credential-must-not-leak"
             }
         })))
         .expect(1)
@@ -4628,7 +4643,9 @@ async fn oversized_openai_image_is_unbilled(world: &mut TokenCenterWorld) {
 async fn sensitive_openai_image_rejection_is_sanitized(world: &mut TokenCenterWorld) {
     assert_eq!(world.status, Some(StatusCode::BAD_GATEWAY));
     let rendered = world.response.to_string();
-    assert!(!rendered.contains("must-not-leak"));
+    assert!(rendered.contains("provider detail remains available"));
+    assert!(!rendered.contains("image-credential-must-not-leak"));
+    assert!(!rendered.contains("image-secret"));
     assert_eq!(world.response["error"]["code"], "upstream_http_400");
     let request_id = world
         .synchronous_request_id
