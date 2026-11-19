@@ -1233,7 +1233,11 @@ async fn process_conversation_projection_batch(state: &AppState, lease_owner: Uu
 
 /// 读取原始请求/返回，正文写对象存储，CNPG 仅记录引用和投影元数据。
 /// locator 缺失或文档读不出来时记下原因并结束这条队列，不让客户端失败。
-pub(crate) async fn archive_session_body(
+/// Rebuild one already claimed conversation using the normal canonical writer.
+/// The caller must hold its durable projection lease; this does not claim work
+/// or apply financial projections. Missing/incomplete source remains governed
+/// by the same durable outcome and coverage contract as background recovery.
+pub async fn archive_session_body(
     state: &AppState,
     lease_owner: Uuid,
     request_id: Uuid,
