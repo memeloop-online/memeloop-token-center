@@ -488,6 +488,8 @@ impl Database {
         request_locator: &str,
         response_locator: &str,
         lease_owner: Uuid,
+        prepared_snapshot: Option<&str>,
+        previous_lease_owner: Option<Uuid>,
     ) -> Result<bool, AppError> {
         let now = unix_millis();
         let mut transaction = self.begin_write_transaction().await?;
@@ -506,7 +508,10 @@ impl Database {
              statistics_outcome = 'session_body', attempts = attempts + 1
              WHERE request_id = $3 AND tenant_id = $4 AND key_id = $5
                AND (projected_at = $6 OR (projected_at IS NULL AND $6 IS NULL))
-               AND semantic_snapshot_json IS NULL AND semantic_payload_snapshot_json IS NULL
+               AND semantic_payload_snapshot_json IS NULL
+               AND (semantic_snapshot_json IS NULL OR
+                    ($10 IS NOT NULL AND semantic_snapshot_json = $10
+                     AND lease_owner = $11 AND projected_at IS NULL))
                AND (lease_owner IS NULL OR lease_expires_at <= $7)
                AND (terminal_lease_owner IS NULL OR terminal_lease_expires_at <= $7)
                AND EXISTS (SELECT 1 FROM request_records r
@@ -522,6 +527,8 @@ impl Database {
         .bind(now)
         .bind(request_locator)
         .bind(response_locator)
+        .bind(prepared_snapshot)
+        .bind(previous_lease_owner.map(|owner| owner.to_string()))
         .execute(&mut *transaction)
         .await?;
         transaction.commit().await?;

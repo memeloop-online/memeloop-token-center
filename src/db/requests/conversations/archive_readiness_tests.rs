@@ -2536,7 +2536,9 @@ async fn postgres_exact_legacy_body_rebuild_preserves_incomplete_and_financial_r
             Some(41),
             &request_locator,
             &response_locator,
-            owner
+            owner,
+            None,
+            None
         )
         .await
         .unwrap()
@@ -2549,7 +2551,9 @@ async fn postgres_exact_legacy_body_rebuild_preserves_incomplete_and_financial_r
             Some(42),
             &request_locator,
             &response_locator,
-            owner
+            owner,
+            None,
+            None
         )
         .await
         .unwrap()
@@ -2562,11 +2566,80 @@ async fn postgres_exact_legacy_body_rebuild_preserves_incomplete_and_financial_r
             Some(42),
             &request_locator,
             &response_locator,
-            Uuid::now_v7()
+            Uuid::now_v7(),
+            None,
+            None
         )
         .await
         .unwrap()
     );
+    // Interrupt the real writer after durable prepare but before projection ACK.
+    let prepared = fixture
+        .state
+        .archive
+        .prepare_session_body_streamed(
+            fixture.key.tenant_id,
+            fixture.request_id,
+            ConversationHints::default(),
+            request_locator.clone(),
+            Some(response_locator.clone()),
+            true,
+        )
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(
+        db.prepare_archived_session_body_archive(
+            owner,
+            fixture.request_id,
+            prepared.atoms,
+            &prepared.nodes,
+            &prepared.media
+        )
+        .await
+        .unwrap()
+    );
+    let prepared_snapshot: String = sqlx::query_scalar(
+        "SELECT semantic_snapshot_json FROM conversation_projection_outbox WHERE request_id = $1",
+    )
+    .bind(fixture.request_id.to_string())
+    .fetch_one(&db.pool)
+    .await
+    .unwrap();
+    sqlx::query("UPDATE conversation_projection_outbox SET lease_expires_at = 0 WHERE request_id = $1 AND lease_owner = $2")
+        .bind(fixture.request_id.to_string()).bind(owner.to_string()).execute(&db.pool).await.unwrap();
+    let resumed_owner = Uuid::now_v7();
+    assert!(
+        !db.claim_exact_session_body_rebuild(
+            fixture.key.tenant_id,
+            fixture.key.key_id,
+            fixture.request_id,
+            None,
+            &request_locator,
+            &response_locator,
+            resumed_owner,
+            Some(&prepared_snapshot),
+            Some(Uuid::now_v7())
+        )
+        .await
+        .unwrap()
+    );
+    assert!(
+        db.claim_exact_session_body_rebuild(
+            fixture.key.tenant_id,
+            fixture.key.key_id,
+            fixture.request_id,
+            None,
+            &request_locator,
+            &response_locator,
+            resumed_owner,
+            Some(&prepared_snapshot),
+            Some(owner)
+        )
+        .await
+        .unwrap()
+    );
+    let owner = resumed_owner;
     assert!(
         crate::worker::archive_session_body(&fixture.state, owner, fixture.request_id)
             .await
