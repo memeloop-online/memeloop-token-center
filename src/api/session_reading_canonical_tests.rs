@@ -61,6 +61,34 @@ async fn canonical_training_reads_complete_prefix_without_legacy_root_and_fails_
         .await
         .unwrap();
     transaction.commit().await.unwrap();
+    // Persist the same canonical turns and immutable objects produced by the body worker.
+    // The observation above supplies the real tenant/key/session authorization boundary.
+    let body = crate::conversation::session_body_from_documents(&request_json, &json!({}));
+    let (atoms, nodes) = body.into_prefix();
+    let inspection = sqlx::AnyPool::connect(&state.config.database_url)
+        .await
+        .unwrap();
+    for atom in &atoms {
+        let reference = state
+            .db
+            .store_body_reference(key.tenant_id, atom.content.to_string())
+            .await
+            .unwrap();
+        sqlx::query("INSERT INTO semantic_atoms (tenant_id,content_hash,instance_hash,role,kind,content_json,created_at) VALUES ($1,$2,$3,$4,$5,$6,1) ON CONFLICT DO NOTHING")
+            .bind(key.tenant_id.to_string()).bind(&atom.content_hash).bind(&atom.instance_hash).bind(&atom.role).bind(&atom.kind).bind(reference).execute(&inspection).await.unwrap();
+    }
+    for node in &nodes {
+        sqlx::query("INSERT INTO context_nodes (tenant_id,node_hash,parent_hash,atom_hash,depth,created_at) VALUES ($1,$2,$3,$4,$5,1) ON CONFLICT DO NOTHING")
+            .bind(key.tenant_id.to_string()).bind(&node.node_hash).bind(&node.parent_hash).bind(&node.atom_hash).bind(node.depth).execute(&inspection).await.unwrap();
+    }
+    sqlx::query("UPDATE conversation_observations SET leaf_node_hash=$1 WHERE request_id=$2")
+        .bind(&nodes.last().unwrap().node_hash)
+        .bind(request.to_string())
+        .execute(&inspection)
+        .await
+        .unwrap();
+    inspection.close().await;
+
     assert!(
         state
             .archive
