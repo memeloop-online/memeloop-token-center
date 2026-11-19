@@ -10,7 +10,7 @@ use std::{
     collections::{HashMap, HashSet},
     sync::{
         Arc, Mutex,
-        atomic::{AtomicUsize, Ordering},
+        atomic::{AtomicBool, AtomicUsize, Ordering},
     },
 };
 use tokio::sync::Notify;
@@ -18,6 +18,7 @@ use tokio::sync::Notify;
 #[derive(Default)]
 pub(super) struct ObjectReadGate {
     entered: Notify,
+    released: AtomicBool,
     release: Notify,
 }
 impl ObjectReadGate {
@@ -25,6 +26,7 @@ impl ObjectReadGate {
         self.entered.notified().await;
     }
     pub(super) fn release(&self) {
+        self.released.store(true, Ordering::SeqCst);
         self.release.notify_waiters();
         self.release.notify_one();
     }
@@ -142,7 +144,9 @@ async fn forward(State(state): State<Arc<ProxyState>>, request: Request) -> Resp
         tokio::pin!(release);
         release.as_mut().enable();
         gate.entered.notify_one();
-        release.await;
+        if !gate.released.load(Ordering::SeqCst) {
+            release.await;
+        }
     }
     if fail_put {
         state.failed_puts.fetch_add(1, Ordering::SeqCst);
