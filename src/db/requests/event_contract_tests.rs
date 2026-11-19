@@ -328,15 +328,51 @@ async fn assert_event_enrichment(database: &Database) {
     sqlx::query("UPDATE request_records SET status_code = NULL, completed_at = NULL WHERE id = $1 AND created_at = $2")
         .bind(&request).bind(now).execute(&database.pool).await.unwrap();
     let rest = database.list_all_requests(&external, 10).await.unwrap();
-    let live = database.request_events_after(&external, now, None, 500).await.unwrap();
+    let live = database
+        .request_events_after(&external, now, None, 500)
+        .await
+        .unwrap();
     let rest = serde_json::to_value(&rest[0]).unwrap();
     let live = serde_json::to_value(&live[0]).unwrap();
-    for field in ["status_code", "duration_ms", "operational_terminal", "cost", "usage", "billing"] {
-        assert_eq!(live[field], rest[field], "operational pending field {field}");
+    for field in [
+        "status_code",
+        "duration_ms",
+        "operational_terminal",
+        "cost",
+        "usage",
+        "billing",
+    ] {
+        assert_eq!(
+            live[field], rest[field],
+            "operational pending field {field}"
+        );
     }
     assert_eq!(live["status_code"], 200);
     assert_eq!(live["operational_terminal"]["financial_state"], "pending");
     assert!(live["cost"].is_null());
+    sqlx::query("UPDATE request_records SET status_code = 200, completed_at = $1, input_tokens = 124319, output_tokens = 156, cost_micros = 2000000 WHERE id = $2 AND created_at = $3")
+        .bind(now + 80).bind(&request).bind(now).execute(&database.pool).await.unwrap();
+    sqlx::query("UPDATE pending_proxy_settlements SET state = 'applied', receipt_id = 'settled', receipt_digest = 'settled-digest', cost_micros = 2000000, status_code = 200, response_object = 'gap://fixture', applied_at = $1, updated_at = $1 WHERE request_id = $2")
+        .bind(now + 80).bind(&request).execute(&database.pool).await.unwrap();
+    let rest = database.list_all_requests(&external, 10).await.unwrap();
+    let live = database
+        .request_events_after(&external, now, None, 500)
+        .await
+        .unwrap();
+    let rest = serde_json::to_value(&rest[0]).unwrap();
+    let live = serde_json::to_value(&live[0]).unwrap();
+    for field in [
+        "status_code",
+        "duration_ms",
+        "operational_terminal",
+        "cost",
+        "usage",
+        "billing",
+    ] {
+        assert_eq!(live[field], rest[field], "settled receipt field {field}");
+    }
+    assert_eq!(live["input_tokens"], 124319);
+    assert_eq!(live["operational_terminal"]["financial_state"], "applied");
     // The SQLite fixture owns its pool. PostgreSQL CI shares its database
     // with concurrent high-volume tests, so a global first page is not ours.
     if matches!(database.backend, DatabaseBackend::Sqlite) {
