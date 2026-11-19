@@ -7,7 +7,29 @@ tokio::task_local! {
     static COVERAGE_FAULT: std::cell::Cell<Option<&'static str>>;
 }
 
+#[cfg(test)]
+static COVERAGE_READ_GATES: std::sync::LazyLock<
+    std::sync::Mutex<
+        std::collections::HashMap<
+            String,
+            std::sync::Arc<(tokio::sync::Notify, tokio::sync::Notify)>,
+        >,
+    >,
+> = std::sync::LazyLock::new(Default::default);
+
 impl Database {
+    #[cfg(test)]
+    pub(crate) fn gate_coverage_read_for_test(
+        request: Uuid,
+    ) -> std::sync::Arc<(tokio::sync::Notify, tokio::sync::Notify)> {
+        let gate = std::sync::Arc::new((tokio::sync::Notify::new(), tokio::sync::Notify::new()));
+        COVERAGE_READ_GATES
+            .lock()
+            .unwrap()
+            .insert(request.to_string(), gate.clone());
+        gate
+    }
+
     #[cfg(test)]
     pub(crate) async fn with_semantic_coverage_fault<T>(
         stage: &'static str,
@@ -83,6 +105,14 @@ impl Database {
                 || publication.request_id != parse_uuid(request.clone())?
             {
                 return Err(AppError::storage("semantic_publication_owner_mismatch"));
+            }
+            #[cfg(test)]
+            {
+                let gate = COVERAGE_READ_GATES.lock().unwrap().remove(&request);
+                if let Some(gate) = gate {
+                    gate.0.notify_one();
+                    gate.1.notified().await;
+                }
             }
             let manifest = archive
                 .get_semantic_manifest_streamed(publication.tenant_id, &publication.manifest)

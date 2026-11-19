@@ -2257,3 +2257,106 @@ async fn postgres_semantic_coverage_recovers_committed_projection_and_failed_put
     semantic_coverage_committed_recovery_contract(isolated.url().to_owned()).await;
     isolated.cleanup().await;
 }
+
+async fn coverage_read_does_not_block_body_worker_contract(database_url: String) {
+    let historical = Fixture::new(database_url.clone(), true).await;
+    historical.capture().await;
+    assert!(response_archive_spool::process_one_for_test(&historical.state).await);
+    assert!(response_archive_spool::process_one_for_test(&historical.state).await);
+    let owner = historical.claim().await;
+    assert!(
+        Database::with_semantic_coverage_fault(
+            "projection_commit_ack",
+            crate::worker::archive_session_body(&historical.state, owner, historical.request_id),
+        )
+        .await
+        .is_err()
+    );
+    let mut fresh = Fixture::new(database_url, true).await;
+    // Both tasks use exactly the same backing objects, without delaying any
+    // reads belonging to the fresh request.
+    fresh.state.archive = historical.state.archive.clone();
+    fresh.state.db = fresh
+        .state
+        .db
+        .clone()
+        .with_archive(fresh.state.archive.clone());
+    fresh.capture().await;
+    assert!(response_archive_spool::process_one_for_test(&fresh.state).await);
+    assert!(response_archive_spool::process_one_for_test(&fresh.state).await);
+    sqlx::query(
+        "UPDATE conversation_projection_outbox SET terminal_lease_expires_at=0 WHERE request_id=$1",
+    )
+    .bind(fresh.request_id.to_string())
+    .execute(&fresh.state.db.pool)
+    .await
+    .unwrap();
+    let gate = Database::gate_coverage_read_for_test(historical.request_id);
+    let (stop, shutdown) = tokio::sync::watch::channel(false);
+    let worker = tokio::spawn(crate::worker::run_until_shutdown(
+        fresh.state.clone(),
+        shutdown,
+    ));
+    tokio::time::timeout(std::time::Duration::from_secs(10), gate.0.notified())
+        .await
+        .expect("the real worker must enter historical manifest recovery");
+    tokio::time::timeout(std::time::Duration::from_secs(10), async {
+        loop {
+            let projected: Option<i64> = sqlx::query_scalar(
+                "SELECT projected_at FROM conversation_projection_outbox WHERE request_id=$1",
+            )
+            .bind(fresh.request_id.to_string())
+            .fetch_one(&fresh.state.db.pool)
+            .await
+            .unwrap();
+            if projected.is_some() {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+    })
+    .await
+    .expect("eligible body must complete while historical GET is blocked");
+    let attempts: i64 = sqlx::query_scalar(
+        "SELECT attempts FROM conversation_projection_outbox WHERE request_id=$1",
+    )
+    .bind(fresh.request_id.to_string())
+    .fetch_one(&fresh.state.db.pool)
+    .await
+    .unwrap();
+    assert_eq!(
+        attempts, 1,
+        "one projection owner must claim the fresh body"
+    );
+    gate.1.notify_one();
+    tokio::time::timeout(std::time::Duration::from_secs(10), async {
+        loop {
+            let owner: Option<String> = sqlx::query_scalar(
+                "SELECT lease_owner FROM conversation_projection_outbox WHERE request_id=$1",
+            )
+            .bind(historical.request_id.to_string())
+            .fetch_one(&fresh.state.db.pool)
+            .await
+            .unwrap();
+            if owner.as_deref() != Some("semantic-coverage-v2") {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+    })
+    .await
+    .expect("historical recovery must resume after release");
+    stop.send(true).unwrap();
+    tokio::time::timeout(std::time::Duration::from_secs(30), worker)
+        .await
+        .unwrap()
+        .unwrap();
+}
+
+#[tokio::test]
+async fn postgres_coverage_read_does_not_block_body_worker() {
+    let url = std::env::var("MTC_TEST_POSTGRES_URL").expect("requires CI PostgreSQL");
+    let isolated = PostgresTestDatabase::create(&url).await;
+    coverage_read_does_not_block_body_worker_contract(isolated.url().to_owned()).await;
+    isolated.cleanup().await;
+}
