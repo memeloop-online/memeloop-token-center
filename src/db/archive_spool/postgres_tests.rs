@@ -279,48 +279,52 @@ async fn postgres_response_writer_does_not_block_streaming_on_the_budget_lock() 
     .unwrap();
     let memory = state.proxy_memory_budget.reservation();
     let mut producer = ResponseArchiveProducer::begin(&state, fixture.id, memory).unwrap();
-    assert!(producer.append(vec![
-        bytes::Bytes::from(vec![b'x'; crate::response_archive_spool::CHUNK_BYTES]),
-        bytes::Bytes::from_static(b"tail"),
-    ]));
+    let chunk = bytes::Bytes::from(vec![b'x'; crate::response_archive_spool::CHUNK_BYTES]);
+    assert!(producer.append_with_backpressure(chunk).await);
+    assert!(
+        producer
+            .append_with_backpressure(bytes::Bytes::from_static(b"tail"))
+            .await
+    );
     let settlement = producer
         .seal()
         .expect("terminal handoff must not wait for the writer's budget lock");
-    tokio::time::timeout(Duration::from_secs(5), async {
-        loop {
-            let waiting: i64 = sqlx::query_scalar(
-                "SELECT COUNT(*) FROM pg_stat_activity WHERE application_name = $1 AND wait_event_type = 'Lock' AND query LIKE 'UPDATE response_archive_spool_budget SET cipher_bytes = cipher_bytes +%'",
-            )
-            .bind(&application_name)
-            .fetch_one(&fixture.admin)
-            .await
-            .unwrap();
-            if waiting == 1 {
-                break;
-            }
-            tokio::task::yield_now().await;
-        }
-    })
-    .await
-    .expect("the owned writer must independently wait at the real budget barrier");
-
-    budget_holder.commit().await.unwrap();
     tokio::time::timeout(Duration::from_secs(5), settlement.wait())
         .await
-        .expect("the supervised writer must finish after the budget barrier is released");
-    let row = sqlx::query(
-        "SELECT state, chunk_count, byte_count FROM response_archive_spools WHERE request_id = $1",
-    )
-    .bind(fixture.id.request_id.to_string())
-    .fetch_one(&fixture.db.pool)
-    .await
-    .unwrap();
-    assert_eq!(row.get::<String, _>("state"), "pending");
-    assert_eq!(row.get::<i64, _>("chunk_count"), 2);
+        .expect("CAS writer must finish while the legacy SQL budget remains locked");
+    let object = state
+        .archive
+        .raw_capture_reference(fixture.id.tenant_id, fixture.id.request_id, "response")
+        .await
+        .unwrap()
+        .unwrap();
+    let expected = [
+        vec![b'x'; crate::response_archive_spool::CHUNK_BYTES],
+        b"tail".to_vec(),
+    ]
+    .concat();
+    assert_eq!(object.size_bytes, expected.len() as u64);
     assert_eq!(
-        row.get::<i64, _>("byte_count"),
-        crate::response_archive_spool::CHUNK_BYTES as i64 + 4
+        object.blake3_digest,
+        blake3::hash(&expected).to_hex().to_string()
     );
+    assert_eq!(
+        state
+            .archive
+            .get_tenant_content(fixture.id.tenant_id, &object, expected.len())
+            .await
+            .unwrap()
+            .as_ref(),
+        expected.as_slice()
+    );
+    let spools: i64 =
+        sqlx::query_scalar("SELECT COUNT(*) FROM response_archive_spools WHERE request_id = $1")
+            .bind(fixture.id.request_id.to_string())
+            .fetch_one(&fixture.db.pool)
+            .await
+            .unwrap();
+    assert_eq!(spools, 0);
+    budget_holder.commit().await.unwrap();
     state.db.close().await;
     fixture.finish().await;
 }
@@ -450,21 +454,29 @@ async fn postgres_request_admission_lost_commit_ack_never_dispatches_and_orphan_
     }).await.expect("server finishes atomic admission after client loses COMMIT ACK");
     fixture.db.close().await;
     fixture.db = Database {
-        pool: schema_pool(&fixture.url, &fixture.schema).await,
+        archive: fixture.db.archive.clone(),
+        http_clients: fixture.db.http_clients.clone(),
+        pool: schema_pool(&fixture.url, &fixture.schema).await.into(),
         pool_role: "serve",
+        auxiliary_pool_max_connections: 2,
+        connection_profile: crate::db::ConnectionProfile::Serve,
         backend: DatabaseBackend::PostgreSql,
         terminal_projection_enabled: false,
         gateway_persistence: isolated_gateway_persistence(&fixture.url, &fixture.schema),
         oauth_refresh_write_phase_seam: std::sync::Arc::new(tokio::sync::Mutex::new(None)),
     };
-    assert!(
-        fixture
-            .db
-            .claim_archive_spool_if(Uuid::new_v4(), BufferedArchivePurpose::Request, || true)
-            .await
-            .unwrap()
-            .is_none()
-    );
+    let unsettled_task = fixture
+        .db
+        .claim_archive_spool_if(Uuid::new_v4(), BufferedArchivePurpose::Request, || true)
+        .await
+        .unwrap()
+        .expect("committed body is uploadable before orphan settlement");
+    assert!(!unsettled_task.successful_terminal);
+    sqlx::query("UPDATE request_archive_spools SET lease_expires_at = 0 WHERE request_id = $1")
+        .bind(request_id.to_string())
+        .execute(&fixture.db.pool)
+        .await
+        .unwrap();
     sqlx::query("UPDATE usage_reservations SET created_at = 0 WHERE id = (SELECT reservation_id FROM request_records WHERE id = $1)").bind(request_id.to_string()).execute(&fixture.db.pool).await.unwrap();
     assert_eq!(
         fixture.db.release_orphaned_reservations(32).await.unwrap(),
@@ -533,7 +545,10 @@ async fn postgres_request_admission_lost_commit_ack_never_dispatches_and_orphan_
     assert_eq!(killed, 1);
     assert!(matches!(
         disconnected.await.unwrap(),
-        Err(AppError::Overloaded)
+        Err(AppError::Capacity {
+            code: "request_archive_commit_failed",
+            ..
+        })
     ));
     sqlx::query("SELECT pg_advisory_unlock($1)")
         .bind(fixture.gate)
@@ -614,7 +629,10 @@ async fn postgres_durable_admission_rollback_ha_and_archive_bind() {
     assert!(matches!(
         db.start_proxy_request_with_archive(input(), &body, pepper)
             .await,
-        Err(AppError::Overloaded)
+        Err(AppError::Capacity {
+            code: "request_archive_capture_failed",
+            ..
+        })
     ));
     let reservations: i64 =
         sqlx::query_scalar("SELECT COUNT(*) FROM usage_reservations WHERE key_id = $1")
@@ -665,14 +683,6 @@ async fn postgres_durable_admission_rollback_ha_and_archive_bind() {
         reservation.id.to_string()
     );
     assert_eq!(row.get::<Option<i64>, _>("completed_at"), None);
-    assert!(
-        db.claim_archive_spool_if(Uuid::new_v4(), BufferedArchivePurpose::Request, || true)
-            .await
-            .unwrap()
-            .is_none()
-    );
-
-    sqlx::query("UPDATE request_records SET completed_at = created_at + 1, status_code = 200, cost_micros = 123 WHERE id = $1").bind(request_id.to_string()).execute(&db.pool).await.unwrap();
     let (left, right) = tokio::join!(
         db.claim_archive_spool_if(Uuid::new_v4(), BufferedArchivePurpose::Request, || true),
         db.claim_archive_spool_if(Uuid::new_v4(), BufferedArchivePurpose::Request, || true),
@@ -683,6 +693,8 @@ async fn postgres_durable_admission_rollback_ha_and_archive_bind() {
         .collect();
     assert_eq!(tasks.len(), 1, "exactly one HA worker acquires the request");
     let stale = &tasks[0];
+    assert!(!stale.successful_terminal);
+    sqlx::query("UPDATE request_records SET completed_at = created_at + 1, status_code = 200, cost_micros = 123 WHERE id = $1").bind(request_id.to_string()).execute(&db.pool).await.unwrap();
     sqlx::query("UPDATE request_archive_spools SET lease_expires_at = 0 WHERE request_id = $1")
         .bind(request_id.to_string())
         .execute(&db.pool)
@@ -738,14 +750,20 @@ async fn postgres_durable_admission_rollback_ha_and_archive_bind() {
     );
     assert_eq!(terminal.get::<i64, _>("status_code"), 200);
     assert_eq!(terminal.get::<i64, _>("cost_micros"), 123);
-    assert_eq!(db.cleanup_response_archive_spools(32).await.unwrap(), 1);
+    let retained: i64 = sqlx::query_scalar(
+        "SELECT request_cipher_bytes FROM response_archive_spool_budget WHERE singleton = 1",
+    )
+    .fetch_one(&db.pool)
+    .await
+    .unwrap();
+    assert_eq!(db.cleanup_response_archive_spools(32).await.unwrap(), 0);
     let outstanding: i64 = sqlx::query_scalar(
         "SELECT request_cipher_bytes FROM response_archive_spool_budget WHERE singleton = 1",
     )
     .fetch_one(&db.pool)
     .await
     .unwrap();
-    assert_eq!(outstanding, 0);
+    assert_eq!(outstanding, retained);
     fixture.finish().await;
 }
 use crate::archive_staging::{
@@ -817,8 +835,12 @@ impl PgFixture {
             .await
             .unwrap();
         let db = Database {
-            pool: schema_pool(&url, &schema).await,
+            archive: Some(crate::archive::ArchiveStore::memory_for_test()),
+            http_clients: std::sync::Arc::default(),
+            pool: schema_pool(&url, &schema).await.into(),
             pool_role: "serve",
+            auxiliary_pool_max_connections: 2,
+            connection_profile: crate::db::ConnectionProfile::Serve,
             backend: DatabaseBackend::PostgreSql,
             terminal_projection_enabled: false,
             gateway_persistence: isolated_gateway_persistence(&url, &schema),
@@ -861,6 +883,18 @@ impl PgFixture {
             .unwrap();
             sqlx::raw_sql(include_str!(
                 "../../../migrations/common/0106_archive_budget_reservations.sql"
+            ))
+            .execute(&db.pool)
+            .await
+            .unwrap();
+            sqlx::raw_sql(include_str!(
+                "../../../migrations/postgres/0143_archive_spool_storage_accounting.sql"
+            ))
+            .execute(&db.pool)
+            .await
+            .unwrap();
+            sqlx::raw_sql(include_str!(
+                "../../../migrations/common/0143_archive_spool_ready_indexes.sql"
             ))
             .execute(&db.pool)
             .await
@@ -1018,8 +1052,12 @@ async fn postgres_seal_precedes_terminal_delivery_and_survives_producer_loss() {
     fixture.wait_state("pending").await;
     fixture.db.close().await;
     fixture.db = Database {
-        pool: schema_pool(&fixture.url, &fixture.schema).await,
+        archive: fixture.db.archive.clone(),
+        http_clients: fixture.db.http_clients.clone(),
+        pool: schema_pool(&fixture.url, &fixture.schema).await.into(),
         pool_role: "serve",
+        auxiliary_pool_max_connections: 2,
+        connection_profile: crate::db::ConnectionProfile::Serve,
         backend: DatabaseBackend::PostgreSql,
         terminal_projection_enabled: false,
         gateway_persistence: isolated_gateway_persistence(&fixture.url, &fixture.schema),
@@ -1089,8 +1127,12 @@ async fn postgres_seal_cancelled_inside_commit_remains_recoverable_after_reconne
     fixture.wait_state("pending").await;
     fixture.db.close().await;
     fixture.db = Database {
-        pool: schema_pool(&fixture.url, &fixture.schema).await,
+        archive: fixture.db.archive.clone(),
+        http_clients: fixture.db.http_clients.clone(),
+        pool: schema_pool(&fixture.url, &fixture.schema).await.into(),
         pool_role: "serve",
+        auxiliary_pool_max_connections: 2,
+        connection_profile: crate::db::ConnectionProfile::Serve,
         backend: DatabaseBackend::PostgreSql,
         terminal_projection_enabled: false,
         gateway_persistence: isolated_gateway_persistence(&fixture.url, &fixture.schema),
@@ -1404,15 +1446,16 @@ async fn postgres_complete_cancelled_inside_commit_keeps_atomic_binding() {
     .await
     .unwrap();
     assert_eq!(bound, locator);
+    let retained = budget(&fixture.db).await;
     assert_eq!(
         fixture
             .db
             .cleanup_response_archive_spools(32)
             .await
             .unwrap(),
-        1
+        0
     );
-    assert_eq!(budget(&fixture.db).await, 0);
+    assert_eq!(budget(&fixture.db).await, retained);
     fixture.finish().await;
 }
 

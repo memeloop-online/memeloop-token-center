@@ -19,6 +19,6 @@ test('request rows render only confirmed server-projected session semantics', ()
 test('portal and operator can drill from a request into the exact session route', () => {
   assert.match(portal, /openSession\(sessionId: string\)/);
   assert.match(portal, /navigate\('sessions'\)/);
-  assert.match(operator, /openSessionById\(sessionId: string\)/);
+  assert.match(operator, /openSessionById\(sessionId: string, keyId\?: string, origin\?: string \| SessionRequestOrigin\)/);
   assert.match(operator, /navigate\('sessions'\)/);
 });

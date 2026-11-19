@@ -2,6 +2,7 @@ import { ApiError, api } from '../api.js';
 import { transportProxyGroupCopy } from './transportProxyGroupCopy.js';
 
 export interface TransportProxyMember {
+  proxy_url?: string;
   id: string;
   label: string;
   scheme: string;
@@ -18,6 +19,10 @@ export interface TransportProxyGroup {
   version: number;
   members: TransportProxyMember[];
   bound_account_count: number;
+  probe_url?: string | null;
+  probe_attempts?: number;
+  last_probe_status?: string | null;
+  last_probe_checked_at?: number | null;
 }
 
 export interface TransportProxyBinding {

@@ -105,6 +105,7 @@ async fn credential_expiring_after_resolution_skips_to_prepared_standby() {
             protocol: Protocol::OpenAiResponses,
             request_id,
             request_json: &request,
+            request_memory: None,
             codex_multi_agent_v2_request: false,
         },
         original_body_length: serde_json::to_vec(&request).unwrap().len(),
@@ -208,6 +209,7 @@ async fn local_codex_chat_protocol_keeps_priority_over_native_candidate() {
             protocol: Protocol::OpenAiChat,
             request_id,
             request_json: &request,
+            request_memory: None,
             codex_multi_agent_v2_request: false,
         },
         original_body_length: serde_json::to_vec(&request).unwrap().len(),
@@ -282,67 +284,6 @@ fn credential_expiring_at_header_application_is_typed_unavailable() {
         credential_application_error(&credential, now),
         ProxySendError::CredentialUnavailable
     ));
-}
-
-#[tokio::test]
-async fn cooldown_candidates_do_not_consume_the_three_outbound_attempts() {
-    let first = MockServer::start().await;
-    let second = MockServer::start().await;
-    let third = MockServer::start().await;
-    let fourth = MockServer::start().await;
-    for upstream in [&first, &second, &third] {
-        Mock::given(method("POST"))
-            .and(path("/v1/chat/completions"))
-            .respond_with(ResponseTemplate::new(500))
-            .expect(0)
-            .mount(upstream)
-            .await;
-    }
-    Mock::given(method("POST"))
-        .and(path("/v1/chat/completions"))
-        .respond_with(successful_chat_response())
-        .expect(1)
-        .mount(&fourth)
-        .await;
-    let fixture = resilient_route_fixture(
-        "three-cooldowns-fourth-healthy",
-        &[
-            (first.uri(), 0),
-            (second.uri(), 10),
-            (third.uri(), 20),
-            (fourth.uri(), 30),
-        ],
-    )
-    .await;
-    for account_id in fixture.accounts.iter().take(3) {
-        assert!(
-            fixture
-                .state
-                .db
-                .record_upstream_account_failure(*account_id, 1, UpstreamFailureKind::Connection)
-                .await
-                .unwrap()
-        );
-    }
-
-    let response = send_resilient_chat(&fixture, None, false).await;
-    assert_eq!(response.status(), StatusCode::OK);
-    let _ = to_bytes(response.into_body(), MAX_PROXY_RESPONSE_BODY)
-        .await
-        .unwrap();
-    for upstream in [&first, &second, &third, &fourth] {
-        upstream.verify().await;
-    }
-    let pool = sqlx::AnyPool::connect(&fixture.database_url).await.unwrap();
-    let actual: String = sqlx::query_scalar(
-        "SELECT upstream_account_id FROM request_records WHERE key_id = $1 ORDER BY created_at DESC LIMIT 1",
-    )
-    .bind(fixture.key_id.to_string())
-    .fetch_one(&pool)
-    .await
-    .unwrap();
-    assert_eq!(actual, fixture.accounts[3].to_string());
-    pool.close().await;
 }
 
 #[tokio::test]

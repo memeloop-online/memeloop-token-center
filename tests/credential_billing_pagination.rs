@@ -646,6 +646,163 @@ async fn exercise_filtered_credential_pages(state: &AppState) {
     assert_eq!(status, StatusCode::BAD_REQUEST);
 }
 
+async fn exercise_credential_value_replacement(state: &AppState) {
+    let tenant = format!("replace-{}", Uuid::now_v7());
+    let issued = create_credential(
+        state,
+        &tenant,
+        "owner",
+        "editable",
+        "7",
+        &format!("{tenant}-create"),
+    )
+    .await;
+    let other = create_credential(
+        state,
+        &format!("{tenant}-foreign"),
+        "owner",
+        "foreign",
+        "0",
+        &format!("{tenant}-other"),
+    )
+    .await;
+    let key_id = Uuid::parse_str(issued["key_id"].as_str().unwrap()).unwrap();
+    let original = issued["key"].as_str().unwrap();
+    let pepper = state.config.key_pepper.as_bytes();
+    let old_identity = state.db.authenticate_key(original, pepper).await.unwrap();
+    let account_id = old_identity.account_id;
+    let ledger_count = state
+        .db
+        .list_account_ledger(account_id, 100)
+        .await
+        .unwrap()
+        .len();
+    let path = format!("/internal/v1/keys/{key_id}/credential");
+    let replacement = format!("mtc_editable_{}", Uuid::now_v7());
+    let body = json!({"key": replacement, "expected_credential_generation": 1});
+    let foreign_token = service_token(
+        &state.db,
+        pepper,
+        "foreign editor".into(),
+        Some(format!("{tenant}-foreign")),
+    )
+    .await;
+    let (status, denied) =
+        json_request(state, "PUT", &path, &foreign_token, None, Some(&body)).await;
+    assert_eq!(status, StatusCode::FORBIDDEN);
+    assert!(denied.get("key").is_none());
+    let read_only = state
+        .db
+        .create_service_token(
+            CreateServiceTokenInput {
+                name: "read-only credential editor".into(),
+                scopes: vec!["keys:read".into()],
+                tenant_external_id: Some(tenant.clone()),
+            },
+            pepper,
+        )
+        .await
+        .unwrap();
+    let (status, denied) =
+        json_request(state, "PUT", &path, &read_only.token, None, Some(&body)).await;
+    assert_eq!(status, StatusCode::FORBIDDEN);
+    assert!(denied.get("key").is_none());
+    let response = api::router_for_role(state.clone(), RuntimeRole::Control)
+        .oneshot(
+            Request::put(&path)
+                .header(header::AUTHORIZATION, format!("Bearer {BOOTSTRAP_TOKEN}"))
+                .header(header::CONTENT_TYPE, "application/json")
+                .body(Body::from(serde_json::to_vec(&body).unwrap()))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    assert_eq!(response.headers()[header::CACHE_CONTROL], "no-store");
+    let saved: Value =
+        serde_json::from_slice(&to_bytes(response.into_body(), 4096).await.unwrap()).unwrap();
+    assert!(saved["key"].as_str() == Some(replacement.as_str()));
+    assert_eq!(saved["credential_generation"], 2);
+    assert!(state.db.authenticate_key(original, pepper).await.is_err());
+    let identity = state
+        .db
+        .authenticate_key(&replacement, pepper)
+        .await
+        .unwrap();
+    assert_eq!(identity.key_id, key_id);
+    assert_eq!(identity.account_id, account_id);
+    assert_eq!(identity.principal_id, old_identity.principal_id);
+    assert_eq!(identity.credential_generation, 2);
+    assert_eq!(
+        state
+            .db
+            .list_account_ledger(account_id, 100)
+            .await
+            .unwrap()
+            .len(),
+        ledger_count
+    );
+    let (status, replay) =
+        json_request(state, "PUT", &path, BOOTSTRAP_TOKEN, None, Some(&body)).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(replay["credential_generation"], 2);
+    let (status, unchanged) = json_request(
+        state,
+        "PUT",
+        &path,
+        BOOTSTRAP_TOKEN,
+        None,
+        Some(&json!({"key": replacement, "expected_credential_generation": 2})),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(unchanged["credential_generation"], 2);
+    let (status, _) = json_request(state, "PUT", &path, BOOTSTRAP_TOKEN, None,
+        Some(&json!({"key": format!("mtc_stale_{}", Uuid::now_v7()), "expected_credential_generation": 1}))).await;
+    assert_eq!(status, StatusCode::CONFLICT);
+    let (status, _) = json_request(
+        state,
+        "PUT",
+        &path,
+        BOOTSTRAP_TOKEN,
+        None,
+        Some(&json!({"key": other["key"], "expected_credential_generation": 2})),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CONFLICT);
+    assert!(
+        state
+            .db
+            .authenticate_key(&replacement, pepper)
+            .await
+            .is_ok(),
+        "duplicate value rolls back revocation"
+    );
+    let copied = state
+        .db
+        .copy_key_credential(key_id, pepper, Some(&tenant), true)
+        .await
+        .unwrap();
+    assert!(copied.key == replacement);
+    assert_eq!(copied.credential_generation, 2);
+    let (status, _) = json_request(
+        state,
+        "PATCH",
+        &format!("/internal/v1/keys/{key_id}/status"),
+        BOOTSTRAP_TOKEN,
+        None,
+        Some(&json!({"status":"suspended"})),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    let (status, _) = json_request(state, "PUT", &path, BOOTSTRAP_TOKEN, None, Some(&body)).await;
+    assert_eq!(
+        status,
+        StatusCode::FORBIDDEN,
+        "retry cannot reactivate a suspended key"
+    );
+}
+
 async fn exercise_credential_deletion(state: &AppState) {
     let tenant = format!("delete-{}", Uuid::now_v7());
     let body = json!({ "tenant_external_id": tenant, "principal_external_id": "manual-owner", "alias": "Preserved historical name", "creation_source": "manual", "initial_balance": "7" });
@@ -869,6 +1026,7 @@ async fn sqlite_create_reconciliation_and_paginated_tenant_billing_are_stable() 
         .unwrap();
     exercise_filtered_credential_pages(&state).await;
     exercise_credential_deletion(&state).await;
+    exercise_credential_value_replacement(&state).await;
     exercise_credential_and_ledger_acceptance(state, "sqlite").await;
 }
 
@@ -891,5 +1049,6 @@ async fn postgres_create_reconciliation_and_paginated_tenant_billing_are_stable(
     assert_eq!(cursor_indexes, 4);
     exercise_filtered_credential_pages(&state).await;
     exercise_credential_deletion(&state).await;
+    exercise_credential_value_replacement(&state).await;
     exercise_credential_and_ledger_acceptance(state, "postgres").await;
 }

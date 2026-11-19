@@ -31,6 +31,13 @@
 .multi-combobox-popover[popover] :is(.combobox-empty, .combobox-state) { color: var(--picker-muted); font-size: 12px; line-height: 1.5; padding: 12px; }
 .multi-combobox-popover[popover] .combobox-state.error { color: var(--picker-text); }
 .multi-combobox :focus-visible, .multi-combobox-popover :focus-visible { outline: 2px solid var(--picker-border); outline-offset: 2px; }
+/* The control owns the single visible focus frame (focus-within border). The
+   embedded editor input must not draw a second, oversized outline of its own,
+   including from the global :focus-visible rule. */
+.multi-combobox .multi-combobox-control input:focus-visible { outline: none; }
+.multi-combobox .multi-combobox-control { min-width: 0; }
+.multi-combobox .multi-combobox-control input:not([class*="fui-"]) { flex: 1 1 8ch; min-width: 0; }
+.multi-combobox .selection-chip { min-width: 0; }
 @media (max-width: 600px) {
   .multi-combobox .multi-combobox-control input { font-size: 16px; }
   .multi-combobox .selection-chip button { min-height: 32px; min-width: 32px; }

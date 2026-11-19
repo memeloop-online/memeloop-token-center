@@ -60,10 +60,9 @@ pub(in crate::api) async fn create_generation_for_modality(
             .get(&route.driver)
             .is_some_and(|provider| provider.modalities.iter().any(|value| value == modality));
         if !adapter.supports_modality(modality) || !provider_supports_modality {
-            return Err(AppError::Upstream(format!(
-                "generation route for {} does not support {} generation",
-                body.model, modality
-            )));
+            return Err(AppError::upstream(
+                "generation_route_for_does_not_support_generation",
+            ));
         }
     }
     adapter.normalize_input(&mut body.input)?;
@@ -99,6 +98,13 @@ pub(in crate::api) async fn create_generation_for_modality(
         .generation_price(&body.model, &key.currency)
         .await?;
     let estimated_units = adapter.estimated_units(&generation_price.billing_unit, &body.input)?;
+    if adapter == crate::generation::GenerationProtocolAdapter::TkmarketSeedanceV1
+        && key.policy.enforcement_mode != crate::model::EnforcementMode::MeteredUnlimited
+    {
+        return Err(AppError::BadRequest(
+            "tkmarket video requires metered_unlimited: the supplier publishes no guaranteed token bound".into(),
+        ));
+    }
     let mut reservation_price = generation_price
         .reservation_price()
         .ok_or_else(|| AppError::BadRequest("generation price is too large".into()))?;
@@ -113,7 +119,7 @@ pub(in crate::api) async fn create_generation_for_modality(
         "model": body.model,
         "input": body.input
     }))
-    .map_err(|_| AppError::Internal)?;
+    .map_err(|_| AppError::internal("jobs_create_generation_for_modality_1"))?;
     let key_id = key.key_id;
     let started = state
         .db

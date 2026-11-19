@@ -1,7 +1,47 @@
 use super::*;
 
-async fn recovery_contract(database_url: &str) {
-    let database = Database::connect(database_url).await.unwrap();
+/// Drops this worker's terminal lease and claims the task again.
+///
+/// Every projection attempt that declines or fails leaves the task unclaimable,
+/// so a test that wants to observe a *second* attempt has to re-claim it.
+/// `lease_owner` carries the `terminal-v118` sentinel and must survive; clearing
+/// it would send the next pass down the "empty snapshot, not pinned" branch,
+/// which answers `Ok(false)` before the payload is validated at all.
+async fn reclaim(database: &Database, request_id: Uuid) -> Uuid {
+    sqlx::query(
+        "UPDATE conversation_projection_outbox SET terminal_lease_owner = NULL, terminal_lease_expires_at = NULL WHERE request_id = $1",
+    )
+    .bind(request_id.to_string())
+    .execute(&database.pool)
+    .await
+    .unwrap();
+    let owner = Uuid::now_v7();
+    assert!(
+        database
+            .claim_conversation_projection_tasks(owner, 32)
+            .await
+            .unwrap()
+            .iter()
+            .any(|task| task.request_id == request_id),
+        "the projection task must be claimable again"
+    );
+    owner
+}
+
+async fn recovery_contract(database_url: &str, reference_v2: bool) {
+    let archive = if reference_v2 {
+        crate::archive::ArchiveStore::training_memory_for_test()
+    } else {
+        crate::archive::ArchiveStore::from_config(&crate::config::Config::for_test(
+            database_url.to_owned(),
+        ))
+        .await
+        .unwrap()
+    };
+    let database = Database::connect(database_url)
+        .await
+        .unwrap()
+        .with_archive(archive.clone());
     database.migrate().await.unwrap();
     let (key, reservation, request_id) = admitted(&database, true).await;
     let body =
@@ -30,6 +70,30 @@ async fn recovery_contract(database_url: &str) {
         .execute(&database.pool)
         .await
         .unwrap();
+    let mut legacy = database.begin_write_transaction().await.unwrap();
+    assert!(
+        Database::persist_legacy_conversation_payload_for_test(
+            &mut legacy,
+            request_id,
+            &key,
+            &body,
+        )
+        .await
+        .is_err()
+    );
+    legacy.rollback().await.unwrap();
+    let reject_enqueue = match database.backend {
+        DatabaseBackend::Sqlite => {
+            "CREATE TRIGGER reject_semantic_enqueue BEFORE INSERT ON conversation_projection_outbox BEGIN SELECT RAISE(ABORT, 'injected enqueue failure'); END;"
+        }
+        DatabaseBackend::PostgreSql => {
+            "CREATE FUNCTION reject_semantic_enqueue() RETURNS trigger LANGUAGE plpgsql AS $$ BEGIN RAISE EXCEPTION 'injected enqueue failure'; END $$; CREATE TRIGGER reject_semantic_enqueue BEFORE INSERT ON conversation_projection_outbox FOR EACH ROW EXECUTE FUNCTION reject_semantic_enqueue();"
+        }
+    };
+    sqlx::raw_sql(reject_enqueue)
+        .execute(&database.pool)
+        .await
+        .unwrap();
     assert!(
         database
             .finish_proxy_request_deferred(input.clone())
@@ -52,6 +116,16 @@ async fn recovery_contract(database_url: &str) {
         .execute(&database.pool)
         .await
         .unwrap();
+    let drop_enqueue = match database.backend {
+        DatabaseBackend::Sqlite => "DROP TRIGGER reject_semantic_enqueue",
+        DatabaseBackend::PostgreSql => {
+            "DROP TRIGGER reject_semantic_enqueue ON conversation_projection_outbox; DROP FUNCTION reject_semantic_enqueue();"
+        }
+    };
+    sqlx::raw_sql(drop_enqueue)
+        .execute(&database.pool)
+        .await
+        .unwrap();
     database
         .finish_proxy_request_deferred(input.clone())
         .await
@@ -60,6 +134,19 @@ async fn recovery_contract(database_url: &str) {
         database.finish_proxy_request_deferred(input).await.unwrap(),
         FinishProxyRequestResult::AlreadyFinished { .. }
     ));
+    let payloads: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM conversation_semantic_payloads WHERE request_id = $1",
+    )
+    .bind(request_id.to_string())
+    .fetch_one(&database.pool)
+    .await
+    .unwrap();
+    assert_eq!(payloads, 0, "new enqueue must not persist raw payloads");
+    let mut legacy = database.begin_write_transaction().await.unwrap();
+    Database::persist_legacy_conversation_payload_for_test(&mut legacy, request_id, &key, &body)
+        .await
+        .unwrap();
+    legacy.commit().await.unwrap();
     let payload = sqlx::query("SELECT request_json, encoded_bytes, digest FROM conversation_semantic_payloads WHERE request_id = $1")
         .bind(request_id.to_string()).fetch_one(&database.pool).await.unwrap();
     let encoded: String = payload.get("request_json");
@@ -71,16 +158,26 @@ async fn recovery_contract(database_url: &str) {
     assert!(encoded.len() <= 128 * 1024 * 1024);
     assert!(sqlx::query("UPDATE conversation_semantic_payloads SET encoded_bytes = 134217729 WHERE request_id = $1")
         .bind(request_id.to_string()).execute(&database.pool).await.is_err());
-    let marker = sqlx::query("SELECT semantic_snapshot_json, semantic_payload_snapshot_json FROM conversation_projection_outbox WHERE request_id = $1")
+    let marker = sqlx::query("SELECT request_json, semantic_snapshot_json, semantic_payload_snapshot_json, lease_owner, lease_expires_at FROM conversation_projection_outbox WHERE request_id = $1")
         .bind(request_id.to_string()).fetch_one(&database.pool).await.unwrap();
     assert_eq!(
-        marker.get::<Option<String>, _>("semantic_snapshot_json"),
+        serde_json::from_str::<serde_json::Value>(
+            &marker.get::<String, _>("semantic_snapshot_json")
+        )
+        .unwrap(),
+        serde_json::json!({"leaf": null, "atom_hashes": []})
+    );
+    assert_eq!(
+        marker.get::<Option<String>, _>("semantic_payload_snapshot_json"),
         None
     );
-    let snapshot: String = marker.get("semantic_payload_snapshot_json");
-    let legacy_claimable: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM conversation_projection_outbox WHERE request_id = $1 AND projected_at IS NULL AND (semantic_snapshot_json IS NOT NULL OR lease_expires_at IS NULL OR lease_expires_at <= 0)")
-        .bind(request_id.to_string()).fetch_one(&database.pool).await.unwrap();
-    assert_eq!(legacy_claimable, 0);
+    assert_eq!(
+        serde_json::from_str::<serde_json::Value>(&marker.get::<String, _>("request_json"))
+            .unwrap(),
+        serde_json::json!({})
+    );
+    assert_eq!(marker.get::<String, _>("lease_owner"), "terminal-v118");
+    assert_eq!(marker.get::<i64, _>("lease_expires_at"), i64::MAX);
     let atoms: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM semantic_atoms WHERE tenant_id = $1")
         .bind(key.tenant_id.to_string())
         .fetch_one(&database.pool)
@@ -101,6 +198,14 @@ async fn recovery_contract(database_url: &str) {
             .await
             .unwrap()
     );
+    // Exercise recovery from the reduced payload without an inline request body.
+    sqlx::query(
+        "UPDATE conversation_projection_outbox SET request_json = '{}' WHERE request_id = $1",
+    )
+    .bind(request_id.to_string())
+    .execute(&database.pool)
+    .await
+    .unwrap();
     for statement in [
         "DELETE FROM request_records WHERE id = $1",
         "DELETE FROM request_record_locators WHERE id = $1",
@@ -120,31 +225,30 @@ async fn recovery_contract(database_url: &str) {
             .iter()
             .any(|task| task.request_id == request_id)
     );
-    let mut invalid_snapshot: serde_json::Value = serde_json::from_str(&snapshot).unwrap();
-    invalid_snapshot["payload_digest"] = serde_json::Value::Null;
-    sqlx::query("UPDATE conversation_projection_outbox SET semantic_payload_snapshot_json = $1 WHERE request_id = $2")
-        .bind(invalid_snapshot.to_string()).bind(request_id.to_string()).execute(&database.pool).await.unwrap();
-    assert!(
-        database
-            .project_claimed_conversation_projection_task(stale, request_id)
-            .await
-            .is_err()
-    );
-    sqlx::query("UPDATE conversation_projection_outbox SET semantic_payload_snapshot_json = $1 WHERE request_id = $2")
-        .bind(&snapshot).bind(request_id.to_string()).execute(&database.pool).await.unwrap();
     sqlx::query("DELETE FROM conversation_semantic_payloads WHERE request_id = $1")
         .bind(request_id.to_string())
         .execute(&database.pool)
         .await
         .unwrap();
     assert!(
-        database
+        !database
             .project_claimed_conversation_projection_task(stale, request_id)
             .await
-            .is_err()
+            .unwrap()
     );
-    sqlx::query("INSERT INTO conversation_semantic_payloads (request_id, tenant_id, key_id, principal_id, format_version, encoded_bytes, digest, request_json) VALUES ($1, $2, $3, $4, 1, $5, $6, $7)")
-        .bind(request_id.to_string()).bind(key.tenant_id.to_string()).bind(key.key_id.to_string()).bind(key.principal_id.to_string()).bind(encoded.len() as i64).bind(payload.get::<String, _>("digest")).bind(&encoded).execute(&database.pool).await.unwrap();
+    let mut legacy = database.begin_write_transaction().await.unwrap();
+    Database::persist_legacy_conversation_payload_for_test(&mut legacy, request_id, &key, &body)
+        .await
+        .unwrap();
+    legacy.commit().await.unwrap();
+    assert!(
+        database
+            .claim_conversation_projection_tasks(stale, 32)
+            .await
+            .unwrap()
+            .iter()
+            .any(|task| task.request_id == request_id)
+    );
     for field in ["tenant_id", "key_id", "principal_id"] {
         let original = match field {
             "tenant_id" => key.tenant_id,
@@ -159,11 +263,13 @@ async fn recovery_contract(database_url: &str) {
             .execute(&database.pool)
             .await
             .unwrap();
+        let owner = reclaim(&database, request_id).await;
         assert!(
             database
-                .project_claimed_conversation_projection_task(stale, request_id)
+                .project_claimed_conversation_projection_task(owner, request_id)
                 .await
-                .is_err()
+                .is_err(),
+            "a payload whose {field} disagrees with the outbox row must not project"
         );
         sqlx::query(sqlx::AssertSqlSafe(statement))
             .bind(original.to_string())
@@ -174,11 +280,13 @@ async fn recovery_contract(database_url: &str) {
     }
     sqlx::query("UPDATE conversation_semantic_payloads SET request_json = '{}', encoded_bytes = 2 WHERE request_id = $1")
         .bind(request_id.to_string()).execute(&database.pool).await.unwrap();
+    let owner = reclaim(&database, request_id).await;
     assert!(
         database
-            .project_claimed_conversation_projection_task(stale, request_id)
+            .project_claimed_conversation_projection_task(owner, request_id)
             .await
-            .is_err()
+            .is_err(),
+        "a payload whose recorded length disagrees with its body must not project"
     );
     sqlx::query("UPDATE conversation_semantic_payloads SET request_json = $1, encoded_bytes = $2 WHERE request_id = $3")
         .bind(&encoded).bind(encoded.len() as i64).bind(request_id.to_string()).execute(&database.pool).await.unwrap();
@@ -188,6 +296,86 @@ async fn recovery_contract(database_url: &str) {
         .await
         .unwrap();
     assert_eq!(atoms, 0);
+    if reference_v2 {
+        let object = archive
+            .put_tenant_content(key.tenant_id, bytes::Bytes::from(encoded.clone()))
+            .await
+            .unwrap();
+        let reference = serde_json::to_string(&crate::archive::ConversationBodyReference {
+            conversation_body_v1: object,
+            chars: encoded.chars().count() as u64,
+        })
+        .unwrap();
+        sqlx::query("UPDATE conversation_semantic_payloads SET format_version = 2, request_json = $1 WHERE request_id = $2")
+            .bind(&reference).bind(request_id.to_string()).execute(&database.pool).await.unwrap();
+        // An unavailable object backend must leave pending and financial state intact.
+        let unavailable = database
+            .clone()
+            .with_archive(crate::archive::ArchiveStore::training_memory_for_test());
+        let owner = reclaim(&database, request_id).await;
+        assert!(
+            unavailable
+                .project_claimed_conversation_projection_task(owner, request_id)
+                .await
+                .is_err()
+        );
+        let retained: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM conversation_semantic_payloads WHERE request_id = $1 AND format_version = 2")
+            .bind(request_id.to_string()).fetch_one(&database.pool).await.unwrap();
+        assert_eq!(retained, 1);
+        assert_counts(&database, request_id, reservation.id, 1).await;
+    }
+    if reference_v2 {
+        // Mutate the persisted locator after the external read, while streamed
+        // materialization is running. The final source fence must fail without
+        // replacing the durable sentinel; a restarted worker must reload it.
+        let before: Option<String> = sqlx::query_scalar("SELECT semantic_snapshot_json FROM conversation_projection_outbox WHERE request_id = $1")
+            .bind(request_id.to_string()).fetch_one(&database.pool).await.unwrap();
+        let change_source = match database.backend {
+            DatabaseBackend::Sqlite => {
+                "CREATE TRIGGER change_semantic_source AFTER INSERT ON semantic_atoms BEGIN UPDATE conversation_semantic_payloads SET request_json = ' ' || request_json WHERE format_version = 2; END;"
+            }
+            DatabaseBackend::PostgreSql => {
+                "CREATE FUNCTION change_semantic_source() RETURNS trigger LANGUAGE plpgsql AS $$ BEGIN UPDATE conversation_semantic_payloads SET request_json = ' ' || request_json WHERE format_version = 2; RETURN NEW; END $$; CREATE TRIGGER change_semantic_source AFTER INSERT ON semantic_atoms FOR EACH ROW EXECUTE FUNCTION change_semantic_source();"
+            }
+        };
+        sqlx::raw_sql(change_source)
+            .execute(&database.pool)
+            .await
+            .unwrap();
+        let owner = reclaim(&database, request_id).await;
+        assert!(
+            database
+                .project_claimed_conversation_projection_task(owner, request_id)
+                .await
+                .is_err()
+        );
+        let after: Option<String> = sqlx::query_scalar("SELECT semantic_snapshot_json FROM conversation_projection_outbox WHERE request_id = $1")
+            .bind(request_id.to_string()).fetch_one(&database.pool).await.unwrap();
+        assert_eq!(
+            after, before,
+            "source conflict must not durably replace the recovery sentinel"
+        );
+        let pending: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM conversation_semantic_payloads WHERE request_id = $1",
+        )
+        .bind(request_id.to_string())
+        .fetch_one(&database.pool)
+        .await
+        .unwrap();
+        assert_eq!(pending, 1);
+        let drop_change = match database.backend {
+            DatabaseBackend::Sqlite => "DROP TRIGGER change_semantic_source",
+            DatabaseBackend::PostgreSql => {
+                "DROP TRIGGER change_semantic_source ON semantic_atoms; DROP FUNCTION change_semantic_source();"
+            }
+        };
+        sqlx::raw_sql(drop_change)
+            .execute(&database.pool)
+            .await
+            .unwrap();
+        // The following ACK-failure and reconnect exercise the real retry path
+        // using the changed, still valid locator rather than the stale proof.
+    }
     let reject_ack = match database.backend {
         DatabaseBackend::Sqlite => {
             "CREATE TRIGGER reject_semantic_ack BEFORE UPDATE OF projected_at ON conversation_projection_outbox BEGIN SELECT RAISE(ABORT, 'injected semantic ack failure'); END;"
@@ -200,11 +388,13 @@ async fn recovery_contract(database_url: &str) {
         .execute(&database.pool)
         .await
         .unwrap();
+    let owner = reclaim(&database, request_id).await;
     assert!(
         database
-            .project_claimed_conversation_projection_task(stale, request_id)
+            .project_claimed_conversation_projection_task(owner, request_id)
             .await
-            .is_err()
+            .is_err(),
+        "a failed semantic ACK must surface as an error, not a silent skip"
     );
     let state = sqlx::query("SELECT (SELECT COUNT(*) FROM semantic_atoms WHERE tenant_id = $1) AS atoms, (SELECT COUNT(*) FROM conversation_observations WHERE request_id = $2) AS observations, (SELECT COUNT(*) FROM conversation_semantic_payloads WHERE request_id = $2) AS payloads")
         .bind(key.tenant_id.to_string()).bind(request_id.to_string()).fetch_one(&database.pool).await.unwrap();
@@ -222,7 +412,10 @@ async fn recovery_contract(database_url: &str) {
         .await
         .unwrap();
     database.pool.close().await;
-    let database = Database::connect(database_url).await.unwrap();
+    let database = Database::connect(database_url)
+        .await
+        .unwrap()
+        .with_archive(archive);
     sqlx::query("UPDATE conversation_projection_outbox SET terminal_lease_expires_at = 0 WHERE request_id = $1")
         .bind(request_id.to_string()).execute(&database.pool).await.unwrap();
     let owner = Uuid::now_v7();
@@ -278,7 +471,13 @@ async fn recovery_contract(database_url: &str) {
             .await
             .unwrap();
     assert_eq!(
-        serde_json::from_str::<serde_json::Value>(&restored).unwrap(),
+        serde_json::from_str::<serde_json::Value>(
+            &database
+                .read_body_reference(key.tenant_id, &restored)
+                .await
+                .unwrap()
+        )
+        .unwrap(),
         crate::conversation::extract_atoms(&body)[0].content
     );
     let lifetime: i64 = sqlx::query_scalar(
@@ -295,10 +494,13 @@ async fn recovery_contract(database_url: &str) {
 #[tokio::test]
 async fn sqlite_semantic_payload_recovers_without_source_or_duplicate_finance() {
     let directory = tempfile::tempdir().unwrap();
-    recovery_contract(&format!(
-        "sqlite://{}?mode=rwc",
-        directory.path().join("semantic.db").display()
-    ))
+    recovery_contract(
+        &format!(
+            "sqlite://{}?mode=rwc",
+            directory.path().join("semantic.db").display()
+        ),
+        false,
+    )
     .await;
 }
 
@@ -317,7 +519,42 @@ async fn postgres_semantic_payload_recovers_without_source_or_duplicate_finance(
     isolated
         .query_pairs_mut()
         .append_pair("options", &format!("-csearch_path={schema}"));
-    recovery_contract(isolated.as_str()).await;
+    recovery_contract(isolated.as_str(), false).await;
+    sqlx::query(sqlx::AssertSqlSafe(format!("DROP SCHEMA {schema} CASCADE")))
+        .execute(&admin)
+        .await
+        .unwrap();
+    admin.close().await;
+}
+
+#[tokio::test]
+async fn sqlite_semantic_payload_v2_recovers_without_duplicate_finance() {
+    let directory = tempfile::tempdir().unwrap();
+    recovery_contract(
+        &format!(
+            "sqlite://{}?mode=rwc",
+            directory.path().join("semantic-v2.db").display()
+        ),
+        true,
+    )
+    .await;
+}
+
+#[tokio::test]
+#[ignore = "requires the configured CI PostgreSQL service"]
+async fn postgres_semantic_payload_v2_recovers_without_duplicate_finance() {
+    let url = std::env::var("MTC_TEST_POSTGRES_URL").expect("PostgreSQL CI fixture");
+    let admin = sqlx::PgPool::connect(&url).await.unwrap();
+    let schema = format!("semantic_v2_{}", Uuid::now_v7().simple());
+    sqlx::query(sqlx::AssertSqlSafe(format!("CREATE SCHEMA {schema}")))
+        .execute(&admin)
+        .await
+        .unwrap();
+    let mut isolated = url::Url::parse(&url).unwrap();
+    isolated
+        .query_pairs_mut()
+        .append_pair("options", &format!("-csearch_path={schema}"));
+    recovery_contract(isolated.as_str(), true).await;
     sqlx::query(sqlx::AssertSqlSafe(format!("DROP SCHEMA {schema} CASCADE")))
         .execute(&admin)
         .await

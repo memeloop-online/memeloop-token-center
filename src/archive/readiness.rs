@@ -318,15 +318,7 @@ impl CanaryFailure {
     }
 
     fn storage(stage: CanaryStage, error: object_store::Error) -> Self {
-        let error_class = match error {
-            object_store::Error::PermissionDenied { .. } => "permission_denied",
-            object_store::Error::Unauthenticated { .. } => "unauthenticated",
-            object_store::Error::NotFound { .. } => "not_found",
-            // Generic includes transport and service failures; do not infer a
-            // DNS/connect/TTFB cause by parsing possibly secret-bearing text.
-            object_store::Error::Generic { .. } => "transport_or_service",
-            _ => "operation_error",
-        };
+        let error_class = crate::error::object_store_error_kind(&error);
         Self {
             stage,
             timed_out: false,
@@ -374,7 +366,7 @@ impl super::ReadinessCache {
 }
 
 fn readiness_failure() -> AppError {
-    AppError::Storage("archive readiness canary failed".to_owned())
+    AppError::storage("archive_readiness_canary_failed")
 }
 
 impl ArchiveStore {
@@ -831,6 +823,9 @@ mod tests {
     fn memory_store() -> ArchiveStore {
         ArchiveStore {
             inner: Arc::new(InMemory::new()),
+            training: None,
+            training_cas_writes: false,
+            training_staging_writes: false,
             readiness: Arc::new(tokio::sync::Mutex::new(
                 super::super::ReadinessCache::default(),
             )),

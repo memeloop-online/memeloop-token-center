@@ -13,9 +13,7 @@ pub(super) fn tenant_cas_location(
     compressed: bool,
 ) -> Result<String, AppError> {
     if !is_lower_hex_digest(digest) {
-        return Err(AppError::Storage(
-            "archive content digest is invalid".into(),
-        ));
+        return Err(AppError::storage("local_storage_failed"));
     }
     Ok(format!(
         "tenants/{tenant_id}/cas/v1/blake3/{}/{}{}",
@@ -30,6 +28,11 @@ pub(super) fn tenant_cas_location(
 }
 
 pub(crate) fn is_tenant_cas_location(tenant_id: Uuid, location: &str) -> bool {
+    let location = match super::routing::split(location) {
+        Ok(Some((_, key))) => key,
+        Ok(None) => location,
+        Err(_) => return false,
+    };
     let prefix = format!("tenants/{tenant_id}/cas/v1/blake3/");
     let Some(rest) = location.strip_prefix(&prefix) else {
         return false;
@@ -54,6 +57,14 @@ fn is_lower_hex_digest(digest: &str) -> bool {
 }
 
 pub(super) fn is_any_v1_cas_location(location: &str) -> bool {
+    let location = if let Some(rest) = location.strip_prefix(super::routing::PREFIX) {
+        let Some((_, key)) = rest.split_once('/') else {
+            return true;
+        };
+        key
+    } else {
+        location
+    };
     let mut segments = location.split('/');
     matches!(
         (
@@ -79,12 +90,66 @@ pub(super) fn is_any_v1_cas_location(location: &str) -> bool {
     )
 }
 
-pub(super) fn may_include_v1_cas_location(location: &str) -> bool {
+pub(super) fn is_conversation_root_location(location: &str) -> bool {
     let mut segments = location.split('/');
-    if segments.next() != Some("tenants") || segments.next().is_none() {
+    matches!(
+        (
+            segments.next(),
+            segments.next(),
+            segments.next(),
+            segments.next()
+        ),
+        (
+            Some("tenants"),
+            Some(_),
+            Some("raw" | "conversations"),
+            Some("v1")
+        )
+    )
+}
+
+pub(super) fn is_history_root_location(location: &str) -> bool {
+    let mut segments = location.split('/');
+    matches!(
+        (
+            segments.next(),
+            segments.next(),
+            segments.next(),
+            segments.next()
+        ),
+        (Some("tenants"), Some(_), Some("history"), Some("v1"))
+    )
+}
+
+pub(super) fn is_durable_root_location(location: &str) -> bool {
+    is_conversation_root_location(location)
+        || is_history_root_location(location)
+        || matches!(
+            location.split('/').collect::<Vec<_>>().as_slice(),
+            ["tenants", _, "semantic", "v2", "requests", _, _]
+        )
+}
+
+pub(super) fn may_include_v1_cas_location(location: &str) -> bool {
+    let location = if let Some(rest) = location.strip_prefix(super::routing::PREFIX) {
+        let Some((_, key)) = rest.split_once('/') else {
+            return false;
+        };
+        key
+    } else {
+        location
+    };
+    let mut segments = location.split('/');
+    if segments.next() != Some("tenants") {
         return false;
     }
-    matches!(segments.next(), None | Some("cas"))
+    if segments.next().is_none() {
+        return true;
+    }
+    matches!(
+        segments.next(),
+        None | Some("cas" | "raw" | "conversations" | "history")
+    )
 }
 
 pub(super) fn archive_path(location: &str) -> Result<Path, AppError> {

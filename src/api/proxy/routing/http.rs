@@ -1,14 +1,8 @@
 use super::*;
+use crate::gateway_body::carrier::{BodyCarrier, CarrierCapture};
 use bytes::Bytes;
-
-const DEFAULT_TIMEOUT_SECONDS: u64 = 120;
-const MAX_COMPACT_RESPONSE_BYTES: usize = 64 * 1024 * 1024;
-
-#[derive(Clone, Copy)]
-struct RequestTimeout {
-    duration: std::time::Duration,
-    deadline: tokio::time::Instant,
-}
+#[cfg(test)]
+use tokio::io::{AsyncReadExt, AsyncSeekExt, AsyncWriteExt};
 
 fn log_preparation_failure(
     request_id: Uuid,
@@ -49,40 +43,14 @@ fn record_preparation_failure(
     );
 }
 
-/// `timeout_seconds` is a request-local transport policy. Read it once from
-/// the immutable route snapshot so a later candidate cannot refresh an
-/// already-dispatched attempt's deadline.
-fn configured_timeout(config: &Value) -> Result<RequestTimeout, ProxySendError> {
-    let seconds = match config.get("timeout_seconds") {
-        None => DEFAULT_TIMEOUT_SECONDS,
-        Some(value) => value
-            .as_u64()
-            .or_else(|| {
-                value
-                    .as_f64()
-                    .filter(|seconds| {
-                        seconds.fract() == 0.0 && *seconds > 0.0 && *seconds < u64::MAX as f64
-                    })
-                    .map(|seconds| seconds as u64)
-            })
-            .filter(|seconds| *seconds > 0)
-            .ok_or(ProxySendError::CandidateUnavailable)?,
-    };
-    let duration = std::time::Duration::from_secs(seconds);
-    let deadline = tokio::time::Instant::now()
-        .checked_add(duration)
-        .ok_or(ProxySendError::CandidateUnavailable)?;
-    Ok(RequestTimeout { duration, deadline })
-}
-
 pub(super) async fn send_reqwest_proxy_route(
     state: &AppState,
     headers: &HeaderMap,
     protocol: Protocol,
     request_id: Uuid,
     route: &PreparedProxyRoute,
+    outbound_attempt: usize,
 ) -> Result<ProxyRouteResponse, ProxySendError> {
-    let request_timeout = configured_timeout(&route.route.config)?;
     let managed =
         crate::oauth::authorization_code::supports_managed_transport(&route.route.credential);
     if !managed
@@ -99,7 +67,8 @@ pub(super) async fn send_reqwest_proxy_route(
             request_id,
             route,
             &route.route.credential,
-            request_timeout,
+            outbound_attempt,
+            None,
         )
         .await;
     }
@@ -113,57 +82,42 @@ pub(super) async fn send_reqwest_proxy_route(
         adapter,
     )
     .map_err(|_| ProxySendError::CandidateUnavailable)?;
-    let mut attempted = Vec::with_capacity(4);
-    loop {
-        let mut selection = state
-            .transport_proxy_groups
-            .select_config(
-                route.route.account_id,
-                route.route.credential_generation,
-                &route.route.credential,
-                &route.route.config,
-            )
-            .map_err(|_| ProxySendError::CandidateUnavailable)?;
-        if !selection
-            .select_unattempted(&attempted)
-            .map_err(|_| ProxySendError::CandidateUnavailable)?
-        {
-            return Err(ProxySendError::RetryableConnection("proxy_group_exhausted"));
-        }
-        if let Some(member) = selection.member() {
-            attempted.push(member);
-        }
-        let result = send_reqwest_proxy_route_once(
-            state,
-            headers,
-            protocol,
-            request_id,
-            route,
-            &selection.credential,
-            request_timeout,
+    let selection = state
+        .transport_proxy_groups
+        .select_config(
+            route.route.account_id,
+            route.route.credential_generation,
+            &route.route.credential,
+            &route.route.config,
         )
-        .await;
-        if advance_after_preconnect_failure(&selection, &attempted, &result)? {
-            continue;
-        }
-        return result;
+        .map_err(|_| ProxySendError::CandidateUnavailable)?;
+    let result = send_reqwest_proxy_route_once(
+        state,
+        headers,
+        protocol,
+        request_id,
+        route,
+        &selection.credential,
+        outbound_attempt,
+        selection.egress_snapshot(),
+    )
+    .await;
+    if matches!(result, Err(ProxySendError::RetryableConnection(_))) {
+        selection.request_independent_probe();
     }
+    result
 }
 
-fn advance_after_preconnect_failure(
-    selection: &crate::db::ProxySelection,
-    attempted: &[usize],
-    result: &Result<ProxyRouteResponse, ProxySendError>,
-) -> Result<bool, ProxySendError> {
-    if matches!(result, Err(ProxySendError::RetryableConnection(_)))
-        && attempted.len() < selection.member_count()
-    {
-        selection
-            .advance_after_connect_failure(attempted)
-            .map_err(|_| ProxySendError::CandidateUnavailable)?;
-        return Ok(true);
-    }
-    Ok(false)
+#[cfg(test)]
+tokio::task_local! {
+    static FAIL_PROBE_PREPARATION: bool;
+}
+
+#[cfg(test)]
+pub(in crate::api::proxy) async fn with_failed_probe_preparation<F: std::future::Future>(
+    future: F,
+) -> F::Output {
+    FAIL_PROBE_PREPARATION.scope(true, future).await
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -174,45 +128,64 @@ async fn send_reqwest_proxy_route_once(
     request_id: Uuid,
     route: &PreparedProxyRoute,
     transport_credential: &UpstreamCredential,
-    request_timeout: RequestTimeout,
+    outbound_attempt: usize,
+    selected: Option<crate::db::egress::SelectedEgress>,
 ) -> Result<ProxyRouteResponse, ProxySendError> {
+    let selected = selected.or_else(|| {
+        let mut selected = crate::db::egress::SelectedEgress::capture(
+            transport_credential.proxy().map(|value| value.0),
+        )
+        .ok()?;
+        if transport_credential.proxy().is_none() {
+            selected.kind = "direct".into();
+        }
+        Some(selected)
+    });
     send_reqwest_proxy_route_with_preparation(
         state,
         headers,
         protocol,
         request_id,
         route,
-        request_timeout,
-        network::client_for_config_url_no_retry(
-            &state.http,
-            &route.route.base_url,
-            &route.route.config,
-            transport_credential.proxy(),
-            state.config.allow_oauth_loopback,
-        ),
+        outbound_attempt,
+        selected,
+        async {
+            #[cfg(test)]
+            if FAIL_PROBE_PREPARATION
+                .try_with(|stall| *stall)
+                .unwrap_or(false)
+            {
+                return Err(AppError::BadRequest(
+                    "outbound host could not be resolved".into(),
+                ));
+            }
+            network::client_for_config_url_no_retry(
+                &crate::http_settings::inference(&state.http),
+                &route.route.base_url,
+                &route.route.config,
+                transport_credential.proxy(),
+                state.config.allow_oauth_loopback,
+            )
+            .await
+        },
     )
     .await
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn send_reqwest_proxy_route_with_preparation<F>(
     state: &AppState,
     headers: &HeaderMap,
     protocol: Protocol,
     request_id: Uuid,
     route: &PreparedProxyRoute,
-    request_timeout: RequestTimeout,
+    outbound_attempt: usize,
+    selected: Option<crate::db::egress::SelectedEgress>,
     preparation: F,
 ) -> Result<ProxyRouteResponse, ProxySendError>
 where
     F: std::future::Future<Output = Result<reqwest::Client, AppError>>,
 {
-    // Start the route timeout before endpoint validation/DNS. The deadline is
-    // local to this attempt; the caller's frozen outer attempt budget remains
-    // authoritative when it selects a standby candidate.
-    let RequestTimeout {
-        duration: timeout,
-        deadline: request_deadline,
-    } = request_timeout;
     let sse_framing_limits = crate::provider::SseFramingLimits::default();
     tracing::info!(
         %request_id,
@@ -226,15 +199,9 @@ where
         "upstream SSE framing policy frozen"
     );
     let outbound_base_url = route.route.base_url.clone();
-    let outbound_http = match tokio::time::timeout_at(request_deadline, preparation).await {
-        Ok(Ok(client)) => client,
-        // Endpoint validation and DNS happen before the POST leaves this
-        // process, so a route-budget expiry here is safe to fail over.
-        Err(_) => {
-            let failure_stage = log_preparation_failure(request_id, route.route.account_id, None);
-            return Err(ProxySendError::RetryableConnection(failure_stage));
-        }
-        Ok(Err(error)) => {
+    let outbound_http = match preparation.await {
+        Ok(client) => client,
+        Err(error) => {
             record_preparation_failure(state, request_id, &route.route, Some(&error));
             return Err(ProxySendError::CandidateUnavailable);
         }
@@ -242,10 +209,6 @@ where
     let target_url = network::upstream_api_url(&outbound_base_url, route.upstream_path);
     let mut request = outbound_http
         .post(target_url)
-        // Reqwest's per-request timeout covers connection/header acquisition;
-        // the absolute deadline below also covers DNS/client setup and body
-        // reads, so no phase can restart the configured attempt budget.
-        .timeout(timeout)
         .body(route.forwarded_body.clone());
     let accept = if ((route.responses_chat.is_some() || route.responses_anthropic.is_some())
         && route.upstream_stream)
@@ -306,7 +269,52 @@ where
     }
     let upstream_activity = state.metrics.active_upstream(&route.route.driver, "proxy");
     let upstream_started = Instant::now();
-    let upstream_result = send_until_request_deadline(request_deadline, request.send()).await;
+    let request_body = super::codex::send_diagnostics::BodyConsumption::default();
+    let mut egress_recorder = None;
+    let observe_error = |error: Option<&reqwest::Error>| {
+        let evidence = send_error_evidence(error);
+        tracing::warn!(
+            %request_id,
+            upstream_account_id = %route.route.account_id,
+            route_id = %route.route.route_id,
+            credential_generation = route.route.credential_generation,
+            transport_revision = route.route.transport_revision,
+            outbound_attempt,
+            stage = "http_json_send_failure",
+            failure_phase = evidence.phase,
+            timeout_source = evidence.timeout_source,
+            io_error_kind = evidence.io_kind,
+            io_raw_os_error = evidence.io_raw_os_error,
+            hyper_timeout = evidence.hyper_timeout,
+            reqwest_timeout = error.is_some_and(reqwest::Error::is_timeout),
+            response_headers_received = false,
+            elapsed_ms = upstream_started.elapsed().as_millis() as u64,
+            total_deadline_policy = "inference_completion_or_cancellation",
+            wire_delivery_state = "unknown",
+            "upstream send failed before response headers"
+        );
+    };
+    let upstream_result = async {
+        let (client, request) = request.build_split();
+        let mut request = request?;
+        request_body.attach(&mut request);
+        egress_recorder = super::codex::egress::AttemptRecorder::begin_http(
+            state,
+            &route.route,
+            request_id,
+            outbound_attempt,
+            selected,
+            request_body,
+        );
+        IndependentProbeTarget::dispatched(&route.route);
+        let response = client.execute(request).await.inspect_err(|error| {
+            observe_error(Some(error));
+        })?;
+        IndependentProbeTarget::response(response.status());
+        Ok(response)
+    }
+    .await
+    .map_err(classify_reqwest_send_error);
     state.metrics.observe_upstream(
         &route.route.driver,
         "proxy",
@@ -315,15 +323,47 @@ where
     );
     match upstream_result {
         Ok(response) => {
-            let response = if let Some(context) = route.responses_chat.clone() {
+            let (response, egress_selection) = super::codex::egress::observe_response(
+                UpstreamResponse::Reqwest(response),
+                egress_recorder,
+            );
+            let response = if route.compact_v2_bridge {
+                translate_compact_carrier(
+                    response,
+                    route.wrap_compact_as_sse,
+                    request_id,
+                    state.archive.clone(),
+                    Some(state.db.clone()),
+                    CarrierCapture::new(
+                        state.proxy_memory_budget.clone(),
+                        Some(state.archive.clone()),
+                        compact_staging(request_id)?,
+                    ),
+                )
+                .await?
+            } else {
+                response
+            };
+            let (response, preoutput_quota) =
+                if route.inspect_stream_rejection && response.validated_compact().is_none() {
+                    super::classify_stream_quota(
+                        response,
+                        sse_framing_limits,
+                        &state.proxy_memory_budget,
+                    )
+                    .await
+                } else {
+                    (response, None)
+                };
+            let response = if preoutput_quota.is_some() {
+                response
+            } else if let Some(context) = route.responses_chat.clone() {
                 super::kimi::translate(
                     response,
                     context,
                     route.upstream_stream,
                     sse_framing_limits,
                 )?
-            } else if route.compact_v2_bridge {
-                translate_new_api_compact_v2(response, route.wrap_compact_as_sse).await?
             } else if let Some(context) = route.responses_anthropic.clone() {
                 super::anthropic::translate(
                     response,
@@ -332,15 +372,12 @@ where
                     sse_framing_limits,
                 )?
             } else {
-                UpstreamResponse::Reqwest(response)
+                response
             };
             Ok(ProxyRouteResponse {
-                egress_selection: None,
-                // Keep one absolute deadline from before DNS through first
-                // byte and every subsequent streaming read. The inactivity
-                // window uses the same configured scalar and resets only on
-                // actual upstream progress.
-                response: response.with_body_timeouts(request_deadline, timeout),
+                preoutput_quota,
+                egress_selection,
+                response,
                 upstream_activity,
                 codex_retry: CodexRetryTerminalGuard::inactive(),
                 sse_framing_limits,
@@ -350,22 +387,73 @@ where
     }
 }
 
-async fn send_until_request_deadline<F>(
-    deadline: tokio::time::Instant,
-    send: F,
-) -> Result<reqwest::Response, ProxySendError>
-where
-    F: std::future::Future<Output = Result<reqwest::Response, reqwest::Error>>,
-{
-    tokio::pin!(send);
-    tokio::select! {
-        // A POST may have been accepted before the local deadline fired;
-        // preserve the ambiguous-delivery fence and never replay it.
-        biased;
-        _ = tokio::time::sleep_until(deadline) => Err(ProxySendError::NonRetryableTransport(
-            TransportFailureKind::Timeout,
-        )),
-        result = &mut send => result.map_err(classify_reqwest_send_error),
+#[derive(Debug, PartialEq, Eq)]
+struct SendErrorEvidence {
+    phase: &'static str,
+    timeout_source: &'static str,
+    io_kind: &'static str,
+    io_raw_os_error: Option<i32>,
+    hyper_timeout: bool,
+}
+
+fn send_error_evidence(error: Option<&reqwest::Error>) -> SendErrorEvidence {
+    let mut evidence = SendErrorEvidence {
+        phase: "before_response_headers",
+        timeout_source: "account_request_deadline",
+        io_kind: "none",
+        io_raw_os_error: None,
+        hyper_timeout: false,
+    };
+    let Some(error) = error else {
+        return evidence;
+    };
+    evidence.phase = if error.is_connect() {
+        "connect"
+    } else if error.is_body() {
+        "request_body"
+    } else {
+        // An unconsumed response head cannot prove whether sending or reading
+        // stalled. Body polling is not acknowledgement by the upstream.
+        "before_response_headers"
+    };
+    evidence.timeout_source = if error.is_timeout() {
+        "http_client_timeout_unresolved"
+    } else {
+        "not_timeout"
+    };
+    observe_error_sources(error, &mut evidence);
+    evidence
+}
+
+fn observe_error_sources(
+    error: &(dyn std::error::Error + 'static),
+    evidence: &mut SendErrorEvidence,
+) {
+    let mut source = Some(error);
+    while let Some(error) = source {
+        if let Some(error) = error.downcast_ref::<hyper::Error>() {
+            evidence.hyper_timeout |= error.is_timeout();
+        }
+        if let Some(error) = error.downcast_ref::<std::io::Error>() {
+            evidence.io_kind = match error.kind() {
+                std::io::ErrorKind::TimedOut => "timed_out",
+                std::io::ErrorKind::ConnectionReset => "connection_reset",
+                std::io::ErrorKind::ConnectionAborted => "connection_aborted",
+                std::io::ErrorKind::ConnectionRefused => "connection_refused",
+                std::io::ErrorKind::BrokenPipe => "broken_pipe",
+                std::io::ErrorKind::NotConnected => "not_connected",
+                std::io::ErrorKind::UnexpectedEof => "unexpected_eof",
+                _ => "other",
+            };
+            evidence.io_raw_os_error = error.raw_os_error();
+            if error.kind() == std::io::ErrorKind::TimedOut {
+                evidence.timeout_source = "io_timeout";
+            }
+        }
+        source = error.source();
+    }
+    if evidence.hyper_timeout && evidence.timeout_source == "http_client_timeout_unresolved" {
+        evidence.timeout_source = "hyper_timeout";
     }
 }
 
@@ -389,75 +477,462 @@ fn classify_reqwest_send_error(error: reqwest::Error) -> ProxySendError {
     ProxySendError::NonRetryableTransport(kind)
 }
 
-async fn translate_new_api_compact_v2(
-    response: reqwest::Response,
+async fn translate_compact_carrier(
+    response: UpstreamResponse,
     wrap_as_sse: bool,
+    request_id: Uuid,
+    scratch_archive: crate::archive::ArchiveStore,
+    scratch_database: Option<crate::db::Database>,
+    capture: CarrierCapture,
 ) -> Result<UpstreamResponse, ProxySendError> {
     let status = response.status();
+    // Only successful compact payloads require translation. Preserve an
+    // upstream rejection as a live response so ordinary error handling owns
+    // its body, accounting, and delivery without waiting for EOF here.
+    if !status.is_success() {
+        return Ok(response);
+    }
     let version = response.version();
     let mut headers = response.headers().clone();
-    let bytes = read_compact_body(response.bytes_stream(), MAX_COMPACT_RESPONSE_BYTES).await?;
-    if !status.is_success() {
-        let stream: crate::api::proxy::upstream_response::UpstreamByteStream =
-            Box::pin(futures_util::stream::once(async move { Ok(bytes) }));
-        return Ok(UpstreamResponse::Prefetched {
-            status,
-            headers,
-            version,
-            content_length: None,
-            stream,
-        });
+    let input = BodyCarrier::capture(
+        response
+            .bytes_stream()
+            .map(|chunk| chunk.map_err(|_| AppError::internal("compact_capture"))),
+        capture,
+    )
+    .await
+    .map_err(|_| ProxySendError::AmbiguousResponse("upstream_invalid_response"))?;
+    let runtime = tokio::runtime::Handle::current();
+    let staging = compact_staging(request_id)?;
+    let output_capture = CarrierCapture::derived_from(&input, staging);
+    let (plan_sender, plan_receiver) = tokio::sync::mpsc::channel::<Bytes>(2);
+    let plan_stream = futures_util::stream::unfold(plan_receiver, |mut receiver| async move {
+        receiver
+            .recv()
+            .await
+            .map(|bytes| (Ok::<_, AppError>(bytes), receiver))
+    });
+    let (sender, receiver) = tokio::sync::mpsc::channel::<Bytes>(2);
+    let output_stream = futures_util::stream::unfold(receiver, |mut receiver| async move {
+        receiver
+            .recv()
+            .await
+            .map(|bytes| (Ok::<_, AppError>(bytes), receiver))
+    });
+    struct CancelTranslation(
+        std::sync::Arc<std::sync::atomic::AtomicBool>,
+        std::sync::Arc<tokio::sync::Notify>,
+    );
+    impl Drop for CancelTranslation {
+        fn drop(&mut self) {
+            self.0.store(true, std::sync::atomic::Ordering::Release);
+            self.1.notify_waiters();
+        }
     }
-    let value = crate::api::sse::parse_unique_json(&bytes)
+    let cancellation = CancelTranslation(
+        std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
+        std::sync::Arc::new(tokio::sync::Notify::new()),
+    );
+    let cancelled = cancellation.0.clone();
+    let wake = cancellation.1.clone();
+    let key = compact_staging(request_id)?;
+    let scope = match scratch_database {
+        Some(database) => {
+            crate::archive::scratch_scope::ScratchScope::new(scratch_archive, database, key)
+                .map_err(|_| ProxySendError::AmbiguousResponse("upstream_invalid_response"))?
+        }
+        #[cfg(test)]
+        None => crate::archive::scratch_scope::ScratchScope::for_test(scratch_archive, key),
+        #[cfg(not(test))]
+        None => {
+            return Err(ProxySendError::AmbiguousResponse(
+                "upstream_invalid_response",
+            ));
+        }
+    };
+    let lease = input
+        .reserve_metadata_workspace(crate::json_source::pager::WORKSPACE_BYTES)
+        .await
         .map_err(|_| ProxySendError::AmbiguousResponse("upstream_invalid_response"))?;
-    let responses = crate::api::new_api_transport::compact_to_responses(&value)
+    let index = crate::json_source::index::Index::scratch(
+        scope,
+        lease,
+        runtime.clone(),
+        cancelled.clone(),
+        wake.clone(),
+        input.clone(),
+    )
+    .map_err(|_| ProxySendError::AmbiguousResponse("upstream_invalid_response"))?;
+    let worker = tokio::task::spawn_blocking(move || {
+        let translated = super::compact_file::prepare_carrier(
+            input,
+            CompactWriter {
+                sender,
+                position: 0,
+            },
+            wrap_as_sse,
+            cancelled,
+            runtime,
+            wake,
+            index,
+        )?;
+        Ok::<_, &'static str>(translated.close_output())
+    });
+    let capture = BodyCarrier::capture(output_stream, output_capture);
+    let (prepared, output) = tokio::join!(worker, capture);
+    let prepared = prepared
+        .map_err(|_| ProxySendError::AmbiguousResponse("upstream_invalid_response"))?
         .map_err(|_| ProxySendError::AmbiguousResponse("upstream_invalid_response"))?;
-    let (content_type, body) = if wrap_as_sse {
-        (
-            HeaderValue::from_static("text/event-stream"),
-            crate::api::new_api_transport::responses_to_sse(&responses)
-                .map_err(|_| ProxySendError::AmbiguousResponse("upstream_invalid_response"))?,
-        )
+    let output =
+        output.map_err(|_| ProxySendError::AmbiguousResponse("upstream_invalid_response"))?;
+    // Stages never compete while retaining an unfinished sibling carrier.
+    let plan_capture = CarrierCapture::derived_from(&output, compact_staging(request_id)?);
+    let cancelled = cancellation.0.clone();
+    let worker = tokio::task::spawn_blocking(move || {
+        let translated = prepared.finish(
+            CompactWriter {
+                sender: plan_sender,
+                position: 0,
+            },
+            wrap_as_sse,
+            &cancelled,
+        )?;
+        drop(translated.pieces);
+        Ok::<_, &'static str>((translated.evidence, translated.physical_body_bytes))
+    });
+    let (translated, pieces) =
+        tokio::join!(worker, BodyCarrier::capture(plan_stream, plan_capture));
+    let (evidence, physical_body_bytes) = translated
+        .map_err(|_| ProxySendError::AmbiguousResponse("upstream_invalid_response"))?
+        .map_err(|_| ProxySendError::AmbiguousResponse("upstream_invalid_response"))?;
+    let pieces =
+        pieces.map_err(|_| ProxySendError::AmbiguousResponse("upstream_invalid_response"))?;
+    let content_type = if wrap_as_sse {
+        HeaderValue::from_static("text/event-stream")
     } else {
-        (
-            HeaderValue::from_static("application/json"),
-            Bytes::from(
-                serde_json::to_vec(&responses)
-                    .map_err(|_| ProxySendError::AmbiguousResponse("upstream_invalid_response"))?,
-            ),
-        )
+        HeaderValue::from_static("application/json")
     };
     headers.remove(header::CONTENT_LENGTH);
     headers.remove(header::CONTENT_ENCODING);
     headers.insert(header::CONTENT_TYPE, content_type);
-    let stream: crate::api::proxy::upstream_response::UpstreamByteStream =
-        Box::pin(futures_util::stream::once(async move { Ok(body) }));
-    Ok(UpstreamResponse::Prefetched {
+    let stream = compact_carrier_stream(
+        output,
+        pieces,
+        physical_body_bytes,
+        evidence.expected_body_bytes(),
+    );
+    Ok(UpstreamResponse::ValidatedCompact {
         status,
         headers,
         version,
         content_length: None,
         stream,
+        evidence,
     })
 }
 
-async fn read_compact_body<Error>(
+fn compact_staging(
+    request: Uuid,
+) -> Result<crate::archive_staging::ArchiveStagingKey, ProxySendError> {
+    use crate::archive_staging::*;
+    ArchiveStagingKey::new(
+        ArchiveStagingOwner::ProxyRequest(request),
+        ArchiveStagingPurpose::Response,
+        Uuid::new_v4(),
+    )
+    .map_err(|_| ProxySendError::AmbiguousResponse("upstream_invalid_response"))
+}
+
+struct CompactWriter {
+    sender: tokio::sync::mpsc::Sender<Bytes>,
+    position: u64,
+}
+impl std::io::Write for CompactWriter {
+    fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+        let count = bytes.len().min(crate::json_source::CHUNK);
+        if count == 0 {
+            return Ok(0);
+        }
+        self.sender
+            .blocking_send(Bytes::copy_from_slice(&bytes[..count]))
+            .map_err(|_| std::io::Error::other("compact_capture_closed"))?;
+        self.position += count as u64;
+        Ok(count)
+    }
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
+}
+impl std::io::Seek for CompactWriter {
+    fn seek(&mut self, offset: std::io::SeekFrom) -> std::io::Result<u64> {
+        match offset {
+            std::io::SeekFrom::Current(0) => Ok(self.position),
+            // Translation initializes and finally rewinds its output. The sealed
+            // carrier is replayed separately; neither operation changes bytes.
+            std::io::SeekFrom::Start(0) => Ok(0),
+            _ => Err(std::io::Error::other("compact_output_seek")),
+        }
+    }
+}
+
+fn compact_carrier_stream(
+    output: std::sync::Arc<BodyCarrier>,
+    pieces: std::sync::Arc<BodyCarrier>,
+    physical_bytes: u64,
+    expected_bytes: u64,
+) -> crate::api::proxy::upstream_response::UpstreamByteStream {
+    Box::pin(futures_util::stream::try_unfold(
+        (output, pieces, 0u64, None::<std::ops::Range<u64>>, 0u64),
+        move |(output, pieces, mut plan_at, mut active, mut delivered)| async move {
+            loop {
+                if let Some(range) = active.as_mut() {
+                    let count =
+                        (range.end - range.start).min(crate::json_source::CHUNK as u64) as usize;
+                    let bytes = pieces
+                        .read_leased_source_chunk(&output, range.start, count)
+                        .await
+                        .map_err(|_| "upstream_invalid_response")?;
+                    range.start += count as u64;
+                    if range.start == range.end {
+                        active = None;
+                    }
+                    delivered += count as u64;
+                    if delivered > expected_bytes {
+                        return Err("upstream_invalid_response");
+                    }
+                    return Ok(Some((bytes, (output, pieces, plan_at, active, delivered))));
+                }
+                if plan_at == pieces.len() {
+                    if delivered != expected_bytes || output.len() != physical_bytes {
+                        return Err("upstream_invalid_response");
+                    }
+                    return Ok(None);
+                }
+                let mut header = [0; 9];
+                pieces
+                    .read_into(plan_at, &mut header)
+                    .await
+                    .map_err(|_| "upstream_invalid_response")?;
+                plan_at += 9;
+                let first = u64::from_le_bytes(header[1..].try_into().unwrap());
+                match header[0] {
+                    0 => {
+                        let mut word = [0; 8];
+                        pieces
+                            .read_into(plan_at, &mut word)
+                            .await
+                            .map_err(|_| "upstream_invalid_response")?;
+                        plan_at += 8;
+                        let end = u64::from_le_bytes(word);
+                        if first > end || end > physical_bytes {
+                            return Err("upstream_invalid_response");
+                        }
+                        if first != end {
+                            active = Some(first..end);
+                        }
+                    }
+                    1 => {
+                        if first > 256 {
+                            return Err("upstream_invalid_response");
+                        }
+                        if first == 0 {
+                            continue;
+                        }
+                        let bytes = pieces
+                            .read_leased_chunk(plan_at, first as usize)
+                            .await
+                            .map_err(|_| "upstream_invalid_response")?;
+                        plan_at += first;
+                        delivered += first;
+                        if delivered > expected_bytes {
+                            return Err("upstream_invalid_response");
+                        }
+                        return Ok(Some((bytes, (output, pieces, plan_at, active, delivered))));
+                    }
+                    _ => return Err("upstream_invalid_response"),
+                }
+            }
+        },
+    ))
+}
+
+#[cfg(test)]
+async fn translate_new_api_compact_v2(
+    response: UpstreamResponse,
+    sse: bool,
+    _path: &std::path::Path,
+) -> Result<UpstreamResponse, ProxySendError> {
+    let archive = crate::archive::ArchiveStore::memory_for_test();
+    translate_compact_carrier(
+        response,
+        sse,
+        Uuid::new_v4(),
+        archive.clone(),
+        None,
+        CarrierCapture::new(
+            std::sync::Arc::new(crate::gateway_body::memory::ProxyMemoryBudget::new(
+                256 * 1024 * 1024,
+            )),
+            Some(archive),
+            compact_staging(Uuid::new_v4())?,
+        ),
+    )
+    .await
+}
+
+#[cfg(test)]
+fn compact_file_stream(
+    output: std::fs::File,
+    pieces: std::fs::File,
+    physical_bytes: u64,
+    expected_bytes: u64,
+) -> crate::api::proxy::upstream_response::UpstreamByteStream {
+    let source: crate::api::proxy::upstream_response::UpstreamByteStream =
+        Box::pin(futures_util::stream::try_unfold(
+            (
+                tokio::fs::File::from_std(output),
+                tokio::fs::File::from_std(pieces),
+                None::<std::ops::Range<u64>>,
+            ),
+            move |(mut file, mut plan, mut active)| async move {
+                loop {
+                    if let Some(range) = active.as_mut() {
+                        let length = (range.end - range.start).min(64 * 1024) as usize;
+                        let mut bytes = vec![0; length];
+                        file.read_exact(&mut bytes)
+                            .await
+                            .map_err(|_| "upstream_compact_spool_read_failed")?;
+                        range.start += length as u64;
+                        if range.start == range.end {
+                            active = None;
+                        }
+                        return Ok(Some((Bytes::from(bytes), (file, plan, active))));
+                    }
+                    let mut tag = [0];
+                    if plan
+                        .read(&mut tag)
+                        .await
+                        .map_err(|_| "upstream_compact_spool_read_failed")?
+                        == 0
+                    {
+                        file.seek(std::io::SeekFrom::Start(physical_bytes))
+                            .await
+                            .map_err(|_| "upstream_compact_spool_read_failed")?;
+                        if file
+                            .read(&mut [0; 1])
+                            .await
+                            .map_err(|_| "upstream_compact_spool_read_failed")?
+                            != 0
+                        {
+                            return Err("upstream_compact_spool_read_failed");
+                        }
+                        return Ok(None);
+                    }
+                    let first = plan
+                        .read_u64_le()
+                        .await
+                        .map_err(|_| "upstream_compact_spool_read_failed")?;
+                    match tag[0] {
+                        0 => {
+                            let end = plan
+                                .read_u64_le()
+                                .await
+                                .map_err(|_| "upstream_compact_spool_read_failed")?;
+                            if first > end || end > physical_bytes {
+                                return Err("upstream_compact_spool_read_failed");
+                            }
+                            if first == end {
+                                continue;
+                            }
+                            file.seek(std::io::SeekFrom::Start(first))
+                                .await
+                                .map_err(|_| "upstream_compact_spool_read_failed")?;
+                            active = Some(first..end);
+                        }
+                        1 => {
+                            // Literals are generated protocol punctuation and event names,
+                            // never provider data. Their record has a fixed representation.
+                            let mut literal = [0; 256];
+                            let length = usize::try_from(first)
+                                .map_err(|_| "upstream_compact_spool_read_failed")?;
+                            let bytes = literal
+                                .get_mut(..length)
+                                .ok_or("upstream_compact_spool_read_failed")?;
+                            plan.read_exact(bytes)
+                                .await
+                                .map_err(|_| "upstream_compact_spool_read_failed")?;
+                            if bytes.is_empty() {
+                                continue;
+                            }
+                            return Ok(Some((Bytes::copy_from_slice(bytes), (file, plan, active))));
+                        }
+                        _ => return Err("upstream_compact_spool_read_failed"),
+                    }
+                }
+            },
+        ));
+    // Retain one chunk until the next read confirms progress or exact EOF. In
+    // particular a completed SSE event cannot escape before its file tail has
+    // been verified. These are chunk buffers, not whole-event buffers.
+    Box::pin(futures_util::stream::try_unfold(
+        (source, None::<Bytes>, 0u64, false),
+        move |(mut source, mut pending, mut read_bytes, finished)| async move {
+            if finished {
+                return Ok(None);
+            }
+            loop {
+                let Some(next) = source.next().await else {
+                    if read_bytes != expected_bytes {
+                        return Err("upstream_compact_spool_read_failed");
+                    }
+                    return Ok(pending
+                        .take()
+                        .map(|chunk| (chunk, (source, None, read_bytes, true))));
+                };
+                let next = next?;
+                read_bytes = read_bytes
+                    .checked_add(next.len() as u64)
+                    .filter(|count| *count <= expected_bytes)
+                    .ok_or("upstream_compact_spool_read_failed")?;
+                if let Some(chunk) = pending.replace(next) {
+                    return Ok(Some((chunk, (source, pending, read_bytes, false))));
+                }
+            }
+        },
+    ))
+}
+
+#[cfg(test)]
+async fn new_compact_file(spool_path: &std::path::Path) -> Result<tokio::fs::File, ProxySendError> {
+    tokio::fs::create_dir_all(spool_path)
+        .await
+        .map_err(|_| ProxySendError::AmbiguousResponse("upstream_compact_spool_unavailable"))?;
+    let directory = spool_path.to_owned();
+    let file = tokio::task::spawn_blocking(move || tempfile::tempfile_in(directory))
+        .await
+        .map_err(|_| ProxySendError::AmbiguousResponse("upstream_compact_spool_unavailable"))?
+        .map_err(|_| ProxySendError::AmbiguousResponse("upstream_compact_spool_unavailable"))?;
+    Ok(tokio::fs::File::from_std(file))
+}
+
+#[cfg(test)]
+async fn capture_compact_body<Error>(
     stream: impl futures_util::Stream<Item = Result<Bytes, Error>>,
-    limit: usize,
-) -> Result<Bytes, ProxySendError> {
+    spool_path: &std::path::Path,
+) -> Result<tokio::fs::File, ProxySendError> {
     tokio::pin!(stream);
-    let mut bytes = Vec::new();
+    let mut file = new_compact_file(spool_path).await?;
     while let Some(chunk) = stream.next().await {
         let chunk =
             chunk.map_err(|_| ProxySendError::AmbiguousResponse("upstream_invalid_response"))?;
-        if chunk.len() > limit.saturating_sub(bytes.len()) {
-            return Err(ProxySendError::AmbiguousResponse(
-                "upstream_invalid_response",
-            ));
-        }
-        bytes.extend_from_slice(&chunk);
+        file.write_all(&chunk).await.map_err(|_| {
+            ProxySendError::AmbiguousResponse("upstream_compact_spool_write_failed")
+        })?;
     }
-    Ok(Bytes::from(bytes))
+    file.flush()
+        .await
+        .map_err(|_| ProxySendError::AmbiguousResponse("upstream_compact_spool_write_failed"))?;
+    Ok(file)
 }
 
 #[cfg(test)]
@@ -466,8 +941,119 @@ mod tests {
     use serde_json::json;
     use std::time::Duration;
 
+    #[tokio::test]
+    async fn compact_ram_metadata_growth_ignores_unavailable_database_and_object_store() {
+        use crate::gateway_body::memory::ProxyMemoryBudget;
+        let database = crate::db::Database::connect("sqlite::memory:")
+            .await
+            .unwrap();
+        database.close().await;
+        let (archive, store) =
+            crate::archive::ArchiveStore::memory_for_test().with_read_delay_for_test();
+        store.config_mut(|config| {
+            config.wait_get_per_call = Duration::from_secs(60);
+            config.wait_put_per_call = Duration::from_secs(60);
+        });
+        let memory = std::sync::Arc::new(ProxyMemoryBudget::new(4 * 1024 * 1024));
+        let unknown_key = "unknown".repeat(20_000);
+        let mut fixture =
+            json!({"id":"ram-only","output":[{"type":"compaction","encrypted_content":"opaque"}]});
+        fixture
+            .as_object_mut()
+            .unwrap()
+            .insert(unknown_key.clone(), json!("preserved"));
+        let response: reqwest::Response = http::Response::builder()
+            .status(200)
+            .body(reqwest::Body::from(serde_json::to_vec(&fixture).unwrap()))
+            .unwrap()
+            .into();
+        let request_id = Uuid::new_v4();
+        let translated = tokio::time::timeout(
+            Duration::from_secs(2),
+            translate_compact_carrier(
+                response.into(),
+                false,
+                request_id,
+                archive.clone(),
+                Some(database),
+                CarrierCapture::new(
+                    memory.clone(),
+                    Some(archive),
+                    compact_staging(request_id).unwrap(),
+                ),
+            ),
+        )
+        .await
+        .expect("RAM-only compact must not wait for PostgreSQL or S3")
+        .unwrap();
+        let mut stream = translated.bytes_stream();
+        let mut bytes = Vec::new();
+        tokio::time::timeout(Duration::from_secs(2), async {
+            while let Some(chunk) = stream.next().await {
+                bytes.extend_from_slice(&chunk.unwrap());
+            }
+        })
+        .await
+        .expect("RAM replay must not force object publication");
+        let value: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(value[&unknown_key], "preserved");
+        assert_eq!(value["output"][0]["encrypted_content"], "opaque");
+        drop(stream);
+        assert_eq!(memory.snapshot().0, 0);
+    }
+
     #[test]
-    fn generic_group_advances_only_before_delivery_and_never_revisits_members() {
+    fn transport_timeout_evidence_distinguishes_local_deadline_from_io_without_error_text() {
+        let deadline = send_error_evidence(None);
+        assert_eq!(deadline.timeout_source, "account_request_deadline");
+        assert_eq!(deadline.phase, "before_response_headers");
+        let mut io = deadline;
+        let error = std::io::Error::new(
+            std::io::ErrorKind::TimedOut,
+            "sensitive upstream URL and authorization must never enter diagnostics",
+        );
+        observe_error_sources(&error, &mut io);
+        assert_eq!(io.timeout_source, "io_timeout");
+        assert_eq!(io.io_kind, "timed_out");
+        assert_eq!(io.io_raw_os_error, None);
+        assert!(!format!("{io:?}").contains("sensitive"));
+    }
+
+    #[tokio::test]
+    async fn real_http_client_timeout_retains_before_headers_phase_without_url_or_replay() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            let (socket, _) = listener.accept().await.unwrap();
+            // Keep the accepted socket alive without producing response headers.
+            std::future::pending::<()>().await;
+            drop(socket);
+        });
+        let client = reqwest::Client::builder()
+            .no_proxy()
+            .timeout(Duration::from_millis(50))
+            .build()
+            .unwrap();
+        let error = client
+            .get(format!("http://{address}/?token=diagnostic-secret"))
+            .send()
+            .await
+            .unwrap_err();
+        let evidence = send_error_evidence(Some(&error));
+        assert_eq!(evidence.phase, "before_response_headers");
+        assert_eq!(evidence.timeout_source, "http_client_timeout_unresolved");
+        assert_eq!(evidence.io_kind, "none");
+        assert!(!format!("{evidence:?}").contains("diagnostic-secret"));
+        assert!(matches!(
+            classify_reqwest_send_error(error),
+            ProxySendError::NonRetryableTransport(TransportFailureKind::Timeout)
+        ));
+        server.abort();
+        let _ = server.await;
+    }
+
+    #[test]
+    fn generic_group_connection_failure_keeps_the_sticky_exit() {
         let account_id = Uuid::now_v7();
         let groups = crate::db::TransportProxyGroups::parse(
             &json!([{
@@ -482,39 +1068,21 @@ mod tests {
             "type":"oauth", "access_token":"fixture", "proxy_url":"socks5h://10.20.30.40:1080", "proxy_network_scope":"private"
         })).unwrap();
         let selected = groups.select(account_id, 1, &credential).unwrap();
-        for error in [
-            ProxySendError::NonRetryableTransport(TransportFailureKind::Timeout),
-            ProxySendError::NonRetryableTransport(TransportFailureKind::Body),
-            ProxySendError::NonRetryableTransport(TransportFailureKind::Request),
-            ProxySendError::AmbiguousResponse("upstream_invalid_response"),
-            ProxySendError::CandidateUnavailable,
-            ProxySendError::Credential,
-        ] {
-            assert!(!advance_after_preconnect_failure(&selected, &[0], &Err(error)).unwrap());
-            assert_eq!(
-                groups.select(account_id, 1, &credential).unwrap().member(),
-                Some(0)
-            );
-        }
-        assert!(
-            advance_after_preconnect_failure(
-                &selected,
-                &[0],
-                &Err(ProxySendError::RetryableConnection("connect"))
-            )
-            .unwrap()
+        selected.request_independent_probe();
+        assert_eq!(
+            groups.select(account_id, 1, &credential).unwrap().member(),
+            Some(0)
         );
-        let mut backup = groups.select(account_id, 1, &credential).unwrap();
-        assert_eq!(backup.member(), Some(1));
-        assert!(
-            !advance_after_preconnect_failure(
-                &backup,
-                &[0, 1],
-                &Err(ProxySendError::RetryableConnection("connect"))
-            )
-            .unwrap()
+        assert!(groups.advance_sticky_after_probe(account_id));
+        assert_eq!(
+            groups.select(account_id, 1, &credential).unwrap().member(),
+            Some(1)
         );
-        assert!(!backup.select_unattempted(&[0, 1]).unwrap());
+        assert!(groups.advance_sticky_after_probe(account_id));
+        assert_eq!(
+            groups.select(account_id, 1, &credential).unwrap().member(),
+            Some(0)
+        );
     }
 
     fn compact_response(status: StatusCode, body: &'static str) -> reqwest::Response {
@@ -528,9 +1096,11 @@ mod tests {
 
     #[tokio::test]
     async fn compact_translation_preserves_upstream_error_status_headers_and_body() {
+        let directory = tempfile::tempdir().unwrap();
         let response = translate_new_api_compact_v2(
-            compact_response(StatusCode::TOO_MANY_REQUESTS, "private-canary error"),
+            compact_response(StatusCode::TOO_MANY_REQUESTS, "private-canary error").into(),
             true,
+            directory.path(),
         )
         .await
         .unwrap();
@@ -545,15 +1115,43 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn compact_rejection_returns_before_body_is_polled() {
+        let directory = tempfile::tempdir().unwrap();
+        for status in [StatusCode::TOO_MANY_REQUESTS, StatusCode::BAD_GATEWAY] {
+            let body = futures_util::stream::poll_fn(
+                |_| -> std::task::Poll<Option<Result<Bytes, std::io::Error>>> {
+                    panic!("compact translation must not poll an upstream rejection body")
+                },
+            );
+            let response: reqwest::Response = http::Response::builder()
+                .status(status)
+                .header(header::CONTENT_TYPE, "text/plain")
+                .header(header::RETRY_AFTER, "7")
+                .body(reqwest::Body::wrap_stream(body))
+                .unwrap()
+                .into();
+            let response = translate_new_api_compact_v2(response.into(), true, directory.path())
+                .await
+                .unwrap();
+            assert_eq!(response.status(), status);
+            assert_eq!(response.headers()[header::CONTENT_TYPE], "text/plain");
+            assert_eq!(response.headers()[header::RETRY_AFTER], "7");
+            assert!(matches!(response, UpstreamResponse::Reqwest(_)));
+        }
+    }
+
+    #[tokio::test]
     async fn compact_translation_never_returns_completed_for_failed_or_incomplete_body() {
+        let directory = tempfile::tempdir().unwrap();
         for body in [
             r#"{"status":"failed","output":[{"type":"compaction","encrypted_content":"opaque"}]}"#,
             r#"{"status":"incomplete","output":[{"type":"compaction","encrypted_content":"opaque"}]}"#,
         ] {
             for wrap_as_sse in [false, true] {
                 let result = translate_new_api_compact_v2(
-                    compact_response(StatusCode::OK, body),
+                    compact_response(StatusCode::OK, body).into(),
                     wrap_as_sse,
+                    directory.path(),
                 )
                 .await;
                 assert!(matches!(
@@ -567,51 +1165,107 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn compact_body_limit_accepts_exact_boundary_and_empty_chunks() {
+    async fn compact_file_validation_evidence_survives_body_timeout_wrapper() {
+        let directory = tempfile::tempdir().unwrap();
+        let response = translate_new_api_compact_v2(
+            compact_response(
+                StatusCode::OK,
+                r#"{"id":"response-compact","usage":{"input_tokens":11,"output_tokens":3},"output":[{"type":"compaction","encrypted_content":"opaque"}]}"#,
+            ).into(),
+            true,
+            directory.path(),
+        )
+        .await
+        .unwrap();
+        let evidence = response.validated_compact().expect("host evidence");
+        let length = evidence.expected_body_bytes();
+        assert_eq!(evidence.summary().usage.unwrap().input_tokens, 11);
+        let response = response.with_body_timeouts(
+            tokio::time::Instant::now() + Duration::from_secs(60),
+            Duration::from_secs(60),
+        );
+        let evidence = response.validated_compact().expect("preserved evidence");
+        assert_eq!(evidence.expected_body_bytes(), length);
+        assert_eq!(evidence.summary().usage.unwrap().output_tokens, 3);
+        let mut stream = response.bytes_stream();
+        let mut received = 0u64;
+        while let Some(chunk) = stream.next().await {
+            received += chunk.unwrap().len() as u64;
+        }
+        assert_eq!(received, length);
+    }
+
+    #[tokio::test]
+    async fn compact_body_capture_preserves_chunks_and_empty_chunks() {
+        let directory = tempfile::tempdir().unwrap();
         let stream = futures_util::stream::iter([
             Ok::<_, &'static str>(Bytes::from_static(b"ab")),
             Ok(Bytes::new()),
             Ok(Bytes::from_static(b"cd")),
         ]);
+        let mut file = capture_compact_body(stream, directory.path())
+            .await
+            .unwrap();
+        tokio::io::AsyncSeekExt::rewind(&mut file).await.unwrap();
+        let mut body = Vec::new();
+        file.read_to_end(&mut body).await.unwrap();
+        assert_eq!(body, b"abcd");
+    }
+
+    #[tokio::test]
+    async fn compact_body_capture_has_no_old_64_mib_cutoff() {
+        let directory = tempfile::tempdir().unwrap();
+        let chunk = Bytes::from(vec![b'x'; 64 * 1024]);
+        let count = 1025usize;
+        let stream =
+            futures_util::stream::iter((0..count).map(|_| Ok::<_, &'static str>(chunk.clone())));
+        let file = capture_compact_body(stream, directory.path())
+            .await
+            .unwrap();
         assert_eq!(
-            read_compact_body(stream, 4).await.unwrap(),
-            Bytes::from_static(b"abcd")
+            file.metadata().await.unwrap().len(),
+            (count * chunk.len()) as u64
         );
     }
 
     #[tokio::test]
-    async fn compact_body_limit_stops_on_first_overflow_chunk() {
-        for chunks in [
-            vec![b"abcde".as_slice()],
-            vec![b"ab".as_slice(), b"cde".as_slice()],
-        ] {
-            let stream = futures_util::stream::iter(
-                chunks
-                    .into_iter()
-                    .map(|chunk| Ok::<_, &'static str>(Bytes::from_static(chunk))),
-            )
-            .chain(futures_util::stream::poll_fn(|_| {
-                panic!("oversized compact body must stop before polling again")
-            }));
-            assert!(matches!(
-                read_compact_body(stream, 4).await,
-                Err(ProxySendError::AmbiguousResponse(
-                    "upstream_invalid_response"
-                ))
-            ));
-        }
-    }
-
-    #[tokio::test]
     async fn compact_body_read_failure_preserves_ambiguous_nonreplayable_error() {
+        let directory = tempfile::tempdir().unwrap();
         let stream =
             futures_util::stream::iter([Ok(Bytes::from_static(b"partial")), Err("private-canary")]);
         assert!(matches!(
-            read_compact_body(stream, 64).await,
+            capture_compact_body(stream, directory.path()).await,
             Err(ProxySendError::AmbiguousResponse(
                 "upstream_invalid_response"
             ))
         ));
+    }
+
+    #[tokio::test]
+    async fn compact_file_tail_requires_exact_eof_before_last_chunk() {
+        use std::io::{Seek as _, Write as _};
+        for (body, expected, expected_error) in [
+            (b"complete".as_slice(), 8u64, false),
+            (b"short".as_slice(), 8, true),
+            (b"unexpected-tail".as_slice(), 8, true),
+        ] {
+            let mut file = tempfile::tempfile().unwrap();
+            file.write_all(body).unwrap();
+            file.rewind().unwrap();
+            let mut plan = tempfile::tempfile().unwrap();
+            plan.write_all(&[0]).unwrap();
+            plan.write_all(&0u64.to_le_bytes()).unwrap();
+            plan.write_all(&expected.to_le_bytes()).unwrap();
+            plan.rewind().unwrap();
+            let mut stream = compact_file_stream(file, plan, expected, expected);
+            let first = stream.next().await.unwrap();
+            if expected_error {
+                assert_eq!(first.unwrap_err(), "upstream_compact_spool_read_failed");
+            } else {
+                assert_eq!(first.unwrap(), body);
+                assert!(stream.next().await.is_none());
+            }
+        }
     }
 
     #[test]
@@ -667,115 +1321,13 @@ mod tests {
         }
     }
 
-    #[test]
-    fn configured_timeout_preserves_explicit_seconds_and_rejects_invalid_values() {
-        assert_eq!(
-            configured_timeout(&json!({})).unwrap().duration,
-            Duration::from_secs(120)
-        );
-        for seconds in [1, 120, 600, 601, 900, 1261] {
-            assert_eq!(
-                configured_timeout(&json!({"timeout_seconds": seconds}))
-                    .unwrap()
-                    .duration,
-                Duration::from_secs(seconds)
-            );
-        }
-        assert_eq!(
-            configured_timeout(&json!({"timeout_seconds": 900.0}))
-                .unwrap()
-                .duration,
-            Duration::from_secs(900)
-        );
-        for invalid in [
-            json!(0),
-            json!(-1),
-            json!(1.5),
-            json!(null),
-            json!("900"),
-            json!(u64::MAX),
-        ] {
-            assert!(matches!(
-                configured_timeout(&json!({"timeout_seconds": invalid})),
-                Err(ProxySendError::CandidateUnavailable)
-            ));
-        }
-    }
-
-    #[tokio::test(start_paused = true)]
-    async fn explicit_timeout_remains_frozen_across_preparation_and_elapsed_stream_time() {
-        let request_timeout = configured_timeout(&json!({"timeout_seconds": 900})).unwrap();
-        let started = tokio::time::Instant::now();
-        tokio::time::advance(Duration::from_secs(601)).await;
-        assert_eq!(request_timeout.duration, Duration::from_secs(900));
-        assert_eq!(request_timeout.deadline, started + Duration::from_secs(900));
-        let response = send_until_request_deadline(request_timeout.deadline, async {
-            tokio::time::sleep(Duration::from_secs(250)).await;
-            Ok(compact_response(StatusCode::OK, "{}"))
-        })
-        .await;
-        assert!(response.is_ok());
-        let result =
-            send_until_request_deadline(request_timeout.deadline, std::future::pending()).await;
-        assert!(matches!(
-            result,
-            Err(ProxySendError::NonRetryableTransport(
-                TransportFailureKind::Timeout
-            ))
-        ));
-        assert_eq!(started.elapsed(), Duration::from_secs(900));
-    }
-
-    #[tokio::test(start_paused = true)]
-    async fn request_deadline_timeout_is_ambiguous_and_never_replayable() {
-        let deadline = tokio::time::Instant::now() + Duration::from_secs(1);
-        let result = send_until_request_deadline(deadline, std::future::pending()).await;
-        assert!(matches!(
-            result,
-            Err(ProxySendError::NonRetryableTransport(
-                TransportFailureKind::Timeout
-            ))
-        ));
-
-        tokio::time::advance(Duration::from_secs(1)).await;
-        let result = send_until_request_deadline(deadline, async {
-            std::future::pending::<Result<reqwest::Response, reqwest::Error>>().await
-        })
-        .await;
-        assert!(matches!(
-            result,
-            Err(ProxySendError::NonRetryableTransport(
-                TransportFailureKind::Timeout
-            ))
-        ));
-    }
-
-    #[tokio::test(start_paused = true)]
-    async fn explicit_900_second_request_remains_cancellable_past_600_seconds() {
-        let request_timeout = configured_timeout(&json!({"timeout_seconds": 900})).unwrap();
-        let (started, entered) = tokio::sync::oneshot::channel::<()>();
-        let (dropped, observed) = tokio::sync::oneshot::channel::<()>();
-        let send = tokio::spawn(async move {
-            send_until_request_deadline(request_timeout.deadline, async move {
-                let _dropped = dropped;
-                started.send(()).unwrap();
-                std::future::pending().await
-            })
-            .await
-        });
-        entered.await.unwrap();
-        tokio::time::advance(Duration::from_secs(601)).await;
-        assert!(!send.is_finished());
-        send.abort();
-        assert!(send.await.unwrap_err().is_cancelled());
-        assert!(observed.await.is_err());
-    }
-
-    async fn assert_preparation_timeout_has_one_terminal_writer(drain_before_terminal: bool) {
+    async fn assert_preparation_failure_has_one_terminal_writer(drain_before_terminal: bool) {
         let (state, _directory) = crate::api::tests::test_state().await;
         let request_id = Uuid::now_v7();
         let account_id = Uuid::now_v7();
         let route = PreparedProxyRoute {
+            request_workspace: None,
+            inspect_stream_rejection: false,
             route: ResolvedUpstream {
                 route_id: Uuid::now_v7(),
                 account_id,
@@ -788,6 +1340,7 @@ mod tests {
                 credential: UpstreamCredential::None,
             },
             forwarded_body: Bytes::from_static(b"{}"),
+            component_input_bytes: 0,
             upstream_stream: false,
             codex_downstream_stream: false,
             codex_store_disabled: false,
@@ -842,42 +1395,30 @@ mod tests {
             Protocol::OpenAiChat,
             request_id,
             &route,
-            configured_timeout(&route.route.config).unwrap(),
-            std::future::pending(),
+            1,
+            None,
+            async { Err(AppError::BadRequest("fixture rejected target".into())) },
         )
         .await;
-        assert!(matches!(
-            result,
-            Err(ProxySendError::RetryableConnection("preparation_timeout"))
-        ));
+        assert!(matches!(result, Err(ProxySendError::CandidateUnavailable)));
         assert_eq!(
-            failover_disposition(None, result.as_ref().err()),
-            super::super::outcome::FailoverDisposition::ConnectionNotDelivered
+            failover_disposition(None, result.as_ref().err(), None),
+            super::super::outcome::FailoverDisposition::CandidateNotDispatched
         );
         if drain_before_terminal {
             state.routing_persistence.drain_for_test().await;
-            assert!(
+            assert_eq!(
                 state
                     .db
                     .request_upstream_transport_diagnostics(request_id)
                     .await
                     .unwrap()
-                    .is_empty()
+                    .len(),
+                1
             );
         }
-        let (kind, reason) = classify_attempt_failure(&result, None).unwrap();
-        assert_eq!(kind, UpstreamFailureKind::Connection);
-        assert!(matches!(
-            reason,
-            crate::metrics::UpstreamHealthReason::Connection
-        ));
-        guard
-            .complete(UpstreamAttemptTerminal::Failed {
-                kind,
-                reason,
-                failure_stage: attempt_failure_stage(&result),
-            })
-            .await;
+        assert!(classify_attempt_failure(&result, None).is_none());
+        guard.complete(UpstreamAttemptTerminal::Inconclusive).await;
         state.routing_persistence.drain_for_test().await;
         let diagnostics = state
             .db
@@ -891,15 +1432,7 @@ mod tests {
         assert_eq!(diagnostic.credential_generation, 7);
         assert_eq!(diagnostic.transport_revision, 42);
         assert_eq!(diagnostic.failure_kind, "preparation");
-        assert_eq!(diagnostic.failure_stage, "preparation_timeout");
-        let health_stage: String = sqlx::query_scalar(
-            "SELECT failure_stage FROM upstream_connection_failure_domains WHERE last_request_id = $1",
-        )
-        .bind(request_id.to_string())
-        .fetch_one(&pool)
-        .await
-        .unwrap();
-        assert_eq!(health_stage, "dns");
+        assert_eq!(diagnostic.failure_stage, "destination_rejected");
         assert!(
             state.routing_persistence.render_routing().contains(
                 "memeloop_token_center_routing_persistence_total{outcome=\"accepted\"} 1\n"
@@ -909,12 +1442,15 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn preparation_timeout_immediate_terminal_preserves_diagnostic() {
-        assert_preparation_timeout_has_one_terminal_writer(false).await;
+    async fn preparation_failure_immediate_terminal_preserves_diagnostic() {
+        assert_preparation_failure_has_one_terminal_writer(false).await;
     }
 
     #[tokio::test]
-    async fn preparation_timeout_delayed_terminal_has_no_preparation_writer() {
-        assert_preparation_timeout_has_one_terminal_writer(true).await;
+    async fn preparation_failure_delayed_terminal_does_not_duplicate_diagnostic() {
+        assert_preparation_failure_has_one_terminal_writer(true).await;
     }
 }
+
+#[cfg(test)]
+mod inference_lifetime_tests;

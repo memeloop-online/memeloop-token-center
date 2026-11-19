@@ -5,7 +5,214 @@ import { fileURLToPath } from 'node:url';
 import test from 'node:test';
 import { chromium } from 'playwright';
 import { createServer } from 'vite';
-declare global { interface Window { requestLifecycleFixture: { finish: () => void; hold: () => void; release: () => void; switchScope: () => void; filter: () => void; failQuery: () => void; held: boolean; queryHeld: boolean; detailCalls: number; scopeCommits: { scope: string; drawers: number }[] }; } }
+declare global { interface Window { requestLifecycleFixture: { observe: () => void; finish: () => void; settle: (cost: string, kind: 'finished' | 'projected' | 'archive_bound') => void; replay: () => void; hold: () => void; release: () => void; switchScope: () => void; filter: () => void; failQuery: () => void; held: boolean; queryHeld: boolean; queryCalls: number; detailCalls: number; scopeCommits: { scope: string; drawers: number }[] }; } }
+
+test('low-volume terminal events reconcile operational money without opening details or overflowing', { timeout: 45_000 }, async (context) => {
+  if (!existsSync(chromium.executablePath())) {
+    if (process.env.MTC_REQUIRE_BROWSER === '1') throw new Error('Chromium is required');
+    context.skip('Chromium is not installed'); return;
+  }
+  const server = await createServer({ root: fileURLToPath(new URL('..', import.meta.url)), configFile: false, logLevel: 'silent', server: { host: '127.0.0.1', port: 0 } });
+  await server.listen();
+  const address = server.httpServer?.address(); assert.ok(address && typeof address !== 'string');
+  const origin = `http://127.0.0.1:${address.port}`;
+  const browser = await chromium.launch({ headless: true });
+  try {
+    for (const locale of ['en', 'zh-CN'] as const) {
+      const page = await browser.newPage();
+      await page.route('**/*', route => {
+        const url = new URL(route.request().url());
+        return url.origin === origin && !url.pathname.startsWith('/internal/') ? route.continue() : route.abort();
+      });
+      await page.addInitScript(locale => localStorage.setItem('mtc-locale', locale), locale);
+      for (const amount of ['0', '2.50']) {
+        for (const kind of ['finished', 'projected', 'archive_bound'] as const) {
+          await page.goto(`${origin}/e2e/fixtures/request-lifecycle.html?quiet-background-help&operational=499`);
+          const row = page.locator('tbody tr').filter({ has: page.getByText('model-a', { exact: true }) });
+          await row.locator('[data-outcome="cancelled"]').waitFor();
+          const cost = row.locator('.request-cost-cell .request-value-info');
+          assert.equal(await cost.innerText(), '—');
+          const queries = await page.evaluate(() => window.requestLifecycleFixture.queryCalls);
+          assert.equal(await page.evaluate(() => window.requestLifecycleFixture.detailCalls), 0);
+          await page.evaluate(({ amount, kind }) => window.requestLifecycleFixture.settle(amount, kind), { amount, kind });
+          if (kind === 'archive_bound') {
+            await page.locator('[data-request-fixture-event-kind="archive_bound"][data-request-fixture-completed-at="4000"]').waitFor();
+          }
+          await page.waitForFunction(() => {
+            const row = [...document.querySelectorAll('tbody tr')].find(row => row.textContent?.includes('model-a'));
+            return row?.querySelector('.request-cost-cell .request-value-info')?.getAttribute('aria-label') === null;
+          });
+          const settled = await cost.innerText();
+          assert.match(settled, amount === '0' ? /0/ : /2[.,]50?/);
+          assert.doesNotMatch(settled, /—|999/);
+          assert.match(await row.locator('[data-outcome="cancelled"]').innerText(), /499/);
+          assert.match(await row.locator('.request-status-cause').innerText(), locale === 'en' ? /The client disconnected/ : /客户端断开/);
+          assert.doesNotMatch(await row.locator('.request-token-total').innerText(), /—/);
+          assert.equal(await page.getByRole('dialog').count(), 0);
+          assert.equal(await page.evaluate(() => window.requestLifecycleFixture.queryCalls), queries);
+          assert.equal(await page.evaluate(() => window.requestLifecycleFixture.detailCalls), 1);
+          await page.evaluate(() => window.requestLifecycleFixture.replay());
+          await page.locator('[data-request-fixture-revision="2"]').waitFor();
+          await row.locator('[data-outcome="cancelled"]').waitFor();
+          assert.equal(await cost.innerText(), settled);
+          assert.equal(await page.evaluate(() => window.requestLifecycleFixture.detailCalls), 1);
+          assert.equal(await page.getByRole('dialog').count(), 0);
+        }
+      }
+      await page.close();
+    }
+  } finally { await browser.close(); await server.close(); }
+});
+
+test('operational reconciliation respects pause, history, filtering and scope cancellation', { timeout: 45_000 }, async (context) => {
+  if (!existsSync(chromium.executablePath())) {
+    if (process.env.MTC_REQUIRE_BROWSER === '1') throw new Error('Chromium is required');
+    context.skip('Chromium is not installed'); return;
+  }
+  const server = await createServer({ root: fileURLToPath(new URL('..', import.meta.url)), configFile: false, logLevel: 'silent', server: { host: '127.0.0.1', port: 0 } });
+  await server.listen();
+  const address = server.httpServer?.address(); assert.ok(address && typeof address !== 'string');
+  const origin = `http://127.0.0.1:${address.port}`;
+  const browser = await chromium.launch({ headless: true });
+  try {
+    const page = await browser.newPage();
+    await page.route('**/*', route => {
+      const url = new URL(route.request().url());
+      return url.origin === origin && !url.pathname.startsWith('/internal/') ? route.continue() : route.abort();
+    });
+    await page.addInitScript(() => localStorage.setItem('mtc-locale', 'en'));
+    const url = `${origin}/e2e/fixtures/request-lifecycle.html?quiet-background-help&operational=499`;
+    const row = page.locator('tbody tr').filter({ has: page.getByText('model-a', { exact: true }) });
+    const cost = row.locator('.request-cost-cell .request-value-info');
+    await page.goto(url);
+    await row.locator('[data-outcome="cancelled"]').waitFor();
+    await page.getByRole('button', { name: 'Pause updates', exact: true }).click();
+    await page.evaluate(() => { window.requestLifecycleFixture.hold(); window.requestLifecycleFixture.settle('2.50', 'finished'); });
+    await page.locator('[data-request-fixture-revision="1"]').waitFor();
+    assert.equal(await page.evaluate(() => window.requestLifecycleFixture.detailCalls), 0);
+    assert.equal(await cost.innerText(), '—');
+    await page.getByRole('button', { name: 'Resume updates', exact: true }).click();
+    await page.waitForFunction(() => window.requestLifecycleFixture.held);
+    await page.getByRole('button', { name: 'Pause updates', exact: true }).click();
+    await page.evaluate(() => window.requestLifecycleFixture.release());
+    await page.waitForFunction(() => !window.requestLifecycleFixture.held);
+    assert.equal(await cost.innerText(), '—', 'a response arriving after pause cannot update the list');
+    await page.getByRole('button', { name: 'Resume updates', exact: true }).click();
+    await cost.filter({ hasText: /2[.,]50?/ }).waitFor();
+    assert.equal(await page.evaluate(() => window.requestLifecycleFixture.detailCalls), 2);
+    assert.equal(await page.getByRole('dialog').count(), 0);
+
+    await page.goto(url);
+    await row.locator('[data-outcome="cancelled"]').waitFor();
+    await page.getByRole('button', { name: 'Load older requests', exact: true }).click();
+    await page.getByRole('button', { name: 'Return to latest requests', exact: true }).waitFor();
+    const queryCalls = await page.evaluate(() => window.requestLifecycleFixture.queryCalls);
+    const requestIds = await page.locator('tbody tr').allTextContents();
+    await page.evaluate(() => window.requestLifecycleFixture.settle('2.50', 'projected'));
+    await cost.filter({ hasText: /2[.,]50?/ }).waitFor();
+    assert.equal(await page.evaluate(() => window.requestLifecycleFixture.queryCalls), queryCalls);
+    assert.equal(await page.locator('tbody tr').count(), requestIds.length);
+    assert.equal(await row.locator('[data-outcome="cancelled"]').count(), 1);
+    assert.equal(await page.getByRole('button', { name: 'Return to latest requests', exact: true }).count(), 1);
+
+    await page.goto(url);
+    await row.locator('[data-outcome="cancelled"]').waitFor();
+    await page.evaluate(() => { window.requestLifecycleFixture.hold(); window.requestLifecycleFixture.settle('2.50', 'finished'); });
+    await page.waitForFunction(() => window.requestLifecycleFixture.held);
+    await page.evaluate(() => window.requestLifecycleFixture.switchScope());
+    await page.locator('[data-request-fixture-scope="tenant-b"] tbody tr').first().waitFor();
+    assert.equal(await cost.innerText(), '—');
+    await page.evaluate(() => window.requestLifecycleFixture.release());
+    await page.waitForFunction(() => !window.requestLifecycleFixture.held);
+    assert.equal(await cost.innerText(), '—', 'an old-scope response cannot apply money to a new scope');
+    assert.equal(await page.getByRole('dialog').count(), 0);
+
+    await page.goto(url);
+    await row.locator('[data-outcome="cancelled"]').waitFor();
+    await page.evaluate(() => window.requestLifecycleFixture.filter());
+    await page.waitForFunction(() => window.requestLifecycleFixture.queryHeld);
+    await page.evaluate(() => window.requestLifecycleFixture.failQuery());
+    await page.getByRole('alert').waitFor();
+    const filteredQueries = await page.evaluate(() => window.requestLifecycleFixture.queryCalls);
+    await page.evaluate(() => window.requestLifecycleFixture.settle('2.50', 'projected'));
+    await page.getByRole('button', { name: 'Refresh filtered results', exact: true }).waitFor();
+    assert.equal(await page.evaluate(() => window.requestLifecycleFixture.detailCalls), 0);
+    assert.equal(await page.evaluate(() => window.requestLifecycleFixture.queryCalls), filteredQueries);
+  } finally { await browser.close(); await server.close(); }
+});
+
+test('operational completion preserves bilingual outcomes and unknown costs across financial event replay', { timeout: 45_000 }, async (context) => {
+  if (!existsSync(chromium.executablePath())) {
+    if (process.env.MTC_REQUIRE_BROWSER === '1') throw new Error('Chromium is required');
+    context.skip('Chromium is not installed'); return;
+  }
+  const server = await createServer({ root: fileURLToPath(new URL('..', import.meta.url)), configFile: false, logLevel: 'silent', server: { host: '127.0.0.1', port: 0 } });
+  await server.listen();
+  const address = server.httpServer?.address(); assert.ok(address && typeof address !== 'string');
+  const origin = `http://127.0.0.1:${address.port}`;
+  const browser = await chromium.launch({ headless: true });
+  try {
+    for (const locale of ['en', 'zh-CN'] as const) {
+      const page = await browser.newPage();
+      await page.route('**/*', route => {
+        const url = new URL(route.request().url());
+        return url.origin === origin && !url.pathname.startsWith('/internal/') ? route.continue() : route.abort();
+      });
+      await page.addInitScript(locale => localStorage.setItem('mtc-locale', locale), locale);
+      for (const mode of ['200', '499', '502', 'zero'] as const) {
+        await page.goto(`${origin}/e2e/fixtures/request-lifecycle.html?quiet-background-help&operational=${mode}`);
+        const row = page.locator('tbody tr').filter({ has: page.getByText('model-a', { exact: true }) });
+        const outcome = mode === '499' ? 'cancelled' : mode === '502' ? 'failed' : 'completed';
+        const label = mode === '499' ? (locale === 'en' ? 'Client disconnected' : '客户端断开')
+          : mode === '502' ? (locale === 'en' ? 'Failed' : '失败') : (locale === 'en' ? 'Completed' : '已完成');
+        const reason = mode === '499' ? (locale === 'en' ? 'The client disconnected' : '客户端断开')
+          : mode === '502' ? (locale === 'en' ? 'The upstream connection was reset' : '上游连接被重置') : null;
+        await row.locator(`[data-outcome="${outcome}"]`).waitFor();
+        assert.ok((await row.locator(`[data-outcome="${outcome}"]`).innerText()).startsWith(label));
+        const cost = row.locator('.request-cost-cell .request-value-info');
+        const recordedCost = await cost.innerText();
+        if (mode === 'zero') {
+          assert.match(await cost.innerText(), /0/);
+          assert.doesNotMatch(await cost.innerText(), /—/);
+        } else {
+          assert.equal(await cost.innerText(), '—');
+          assert.equal(await cost.getAttribute('aria-label'), locale === 'en' ? 'Awaiting settlement' : '待结算');
+          assert.match(await row.locator('.request-token-total').innerText(), /—/);
+          await cost.focus();
+          await page.getByRole('tooltip').filter({ hasText: locale === 'en' ? 'Cost awaits confirmation' : '费用待确认' }).waitFor();
+        }
+        if (reason) {
+          await row.locator('.request-outcome').focus();
+          await page.getByRole('tooltip').filter({ hasText: reason }).waitFor();
+        }
+        await row.locator('.table-action').click();
+        const drawer = page.getByRole('dialog', { name: 'model-a' });
+        await drawer.locator(`[data-outcome="${outcome}"]`).waitFor();
+        if (reason) assert.ok((await drawer.innerText()).includes(reason));
+        if (mode !== 'zero') {
+          assert.equal(await drawer.getByText(locale === 'en' ? 'Awaiting settlement' : '待结算', { exact: true }).count(), 1);
+        }
+        const detailCalls = await page.evaluate(() => window.requestLifecycleFixture.detailCalls);
+        await page.evaluate(() => window.requestLifecycleFixture.finish());
+        await page.waitForFunction(count => window.requestLifecycleFixture.detailCalls > count, detailCalls);
+        await drawer.locator(`[data-outcome="${outcome}"]`).waitFor();
+        assert.equal(await row.locator(`[data-outcome="${outcome}"]`).count(), 1);
+        assert.equal(await cost.innerText(), recordedCost);
+        if (reason) assert.ok((await drawer.innerText()).includes(reason));
+        assert.doesNotMatch(await drawer.innerText(), /http_499|http_502/, 'duplicate HTTP wrappers stay out of details');
+        if (reason) {
+          assert.equal(await drawer.locator('.request-status-cause').count(), 1, 'the drawer shows one localized terminal cause');
+          assert.ok((await drawer.locator('.request-status-cause').innerText()).includes(reason), 'the visible cause uses localized copy');
+          const detailText = await drawer.locator('.request-supplier-detail span').innerText();
+          const terminalCode = mode === '499' ? 'client_disconnected' : 'upstream_transport_connection_reset';
+          assert.ok(detailText.includes(`${locale === 'en' ? 'Terminal cause code' : '终态原因码'}: ${terminalCode}`), 'the recorded terminal code is labeled');
+          assert.ok(detailText.includes(`${locale === 'en' ? 'Recorded status' : '记录状态码'}: ${mode}`), 'the recorded status is labeled');
+        }
+      }
+      await page.close();
+    }
+  } finally { await browser.close(); await server.close(); }
+});
 
 test('request error details distinguish active delivery from recorded terminal failure', { timeout: 45_000 }, async (context) => {
   if (!existsSync(chromium.executablePath())) {
@@ -51,13 +258,23 @@ test('request error details distinguish active delivery from recorded terminal f
         assert.doesNotMatch(text, /The request failed|delivery_started/);
         assert.equal(await drawer.getByText('Error', { exact: true }).count(), 0, 'a progress marker must not create an error detail row');
       } else {
-        const cause = mode === 'terminal' ? 'The upstream connection was reset' : 'No specific cause was captured at the time';
+        const cause = mode === 'terminal' ? 'The upstream connection was reset' : 'This record has no stored cause';
         assert.equal(text.split(cause).length - 1, 1);
-        assert.doesNotMatch(text, /upstream_transport_connection_reset|upstream_stream/);
+        assert.equal(await drawer.locator('.request-status-cause').count(), 1, 'detail shows one recorded cause');
+        assert.equal(await drawer.locator('.request-status-cause').innerText(), `Recorded cause: ${cause}`);
+        const detailText = await drawer.locator('.request-supplier-detail span').innerText();
+        assert.ok(detailText.includes('Recorded status: 502'), 'technical details include the recorded status');
+        if (mode === 'terminal') {
+          assert.ok(detailText.includes('Error code: upstream_stream'), 'technical details preserve the raw error code');
+          assert.ok(detailText.includes('Terminal cause code: upstream_transport_connection_reset'), 'technical details preserve the terminal cause code');
+        } else {
+          assert.doesNotMatch(detailText, /upstream_transport_connection_reset|upstream_stream/, 'unknown outcomes do not invent technical causes');
+        }
         await drawer.locator('.request-outcome').focus();
         const tooltip = page.getByRole('tooltip').filter({ hasText: cause });
         await tooltip.waitFor();
-        assert.equal(await tooltip.innerText(), `Recorded cause: ${cause}`);
+        assert.equal(await tooltip.locator('.request-status-tooltip-reason').innerText(), `Recorded cause: ${cause}`);
+        assert.ok((await tooltip.locator('.request-status-tooltip-details dd').allInnerTexts()).includes('502'), 'tooltip technical details include the recorded status');
       }
       await drawer.getByRole('button', { name: 'Close', exact: true }).click();
     }
@@ -77,13 +294,9 @@ test('request detail follows terminal events and fences late responses after sel
     const page = await browser.newPage({ hasTouch: true });
     await page.addInitScript(() => localStorage.setItem('mtc-locale', 'en'));
     await page.goto(`http://127.0.0.1:${address.port}/e2e/fixtures/request-lifecycle.html`);
-    const imageReviewEntry = page.locator('.request-page-surface').getByRole('button', { name: 'Image requests requiring review', exact: true });
-    await imageReviewEntry.click();
-    await page.getByRole('button', { name: 'Open image request review', exact: true }).waitFor();
-    assert.equal(await imageReviewEntry.getAttribute('aria-expanded'), 'true');
-    await imageReviewEntry.click();
-    assert.equal(await page.getByRole('button', { name: 'Open image request review', exact: true }).count(), 0,
-      'request reconciliation is available from Requests and remains closed until explicitly opened');
+    assert.equal(await page.locator('.request-page-surface').getByRole('button', { name: 'Image requests requiring review', exact: true }).count(), 0,
+      'empty image reconciliation management does not label ordinary live requests as abnormal');
+    await page.locator('.traffic-heading-actions').getByRole('button', { name: 'Refresh', exact: true }).waitFor();
     const first = page.locator('tbody tr').filter({ has: page.getByText('model-a', { exact: true }) });
     await page.getByRole('tooltip').filter({ hasText: 'Background scope help' }).waitFor();
     await first.locator('.table-action').click();
@@ -146,6 +359,10 @@ test('request detail follows terminal events and fences late responses after sel
     await page.waitForFunction(() => window.requestLifecycleFixture.held);
     await page.getByRole('button', { name: 'Close', exact: true }).click();
     await page.getByRole('tooltip').filter({ hasText: 'Background scope help' }).waitFor();
+    // The live-added tooltip positioned itself while the modal held the scroll
+    // lock, so it only reappears after the next position recompute; revealing
+    // its trigger is the user action that triggers one.
+    await page.getByRole('button', { name: 'Live-added helper', exact: true }).scrollIntoViewIfNeeded();
     await page.getByRole('tooltip').filter({ hasText: 'Live-added background help' }).waitFor();
     assert.equal(await liveHelp.evaluate(element => !!element.closest('[inert], [aria-hidden="true"]')), false, 'new background portal regains its original accessibility on close');
     assert.deepEqual(await page.locator('#already-inert-background').evaluate(element => ({ inert: element instanceof HTMLElement && element.inert, hidden: element.getAttribute('aria-hidden') })), { inert: true, hidden: 'false' }, 'cleanup restores original attributes, not generic accessibility defaults');
@@ -222,19 +439,23 @@ test('supplier cause stays shared through list, keyboard tooltip, detail and ter
   const browser = await chromium.launch({ headless: true });
   try {
     for (const [locale, reason, prefix, close, label] of [
-      ['zh-CN', '当前上游账号没有可用套餐，需在提供商处开通或更换账号。', '已记录原因', '关闭', '失败'],
-      ['en', 'The upstream account has no active plan. Activate a plan with the provider or use another account.', 'Recorded cause', 'Close', 'Failed'],
+      ['zh-CN', '当前上游账号没有可用套餐', '已记录原因', '关闭', '失败'],
+      ['en', 'The upstream account has no active plan', 'Recorded cause', 'Close', 'Failed'],
     ] as const) {
+      const action = locale === 'zh-CN' ? '在提供商处开通套餐或更换上游账号' : 'Activate a plan with the provider or switch the upstream account';
       const page = await browser.newPage();
       await page.route('**/*', route => new URL(route.request().url()).origin === origin ? route.continue() : route.abort());
       await page.addInitScript(value => localStorage.setItem('mtc-locale', value), locale);
       await page.goto(`${origin}/e2e/fixtures/request-lifecycle.html?supplier-error`);
       await page.setViewportSize({ width: 390, height: 844 });
-      const detail = locale === 'zh-CN' ? '供应商错误码: 402 · 供应商说明: 当前账号没有可用套餐' : 'Provider error code: 402 · Provider message: 当前账号没有可用套餐';
-      const hint = `${prefix}: ${reason} · ${detail}`;
+      // Raw legacy fields stay viewable as one deduplicated technical block.
+      const detail = locale === 'zh-CN'
+        ? '供应商错误码: no_active_plan · 供应商说明: 当前账号没有可用套餐; provider code: 402; provider message: 当前账号没有可用套餐'
+        : 'Provider error code: no_active_plan · Provider message: 当前账号没有可用套餐; provider code: 402; provider message: 当前账号没有可用套餐';
+      const hint = `${prefix}: ${reason} · ${action} · ${detail}`;
       const row = page.locator('tbody tr').filter({ has: page.getByText('model-a', { exact: true }) });
       await row.locator('[data-outcome="failed"]').waitFor();
-      assert.equal(await row.locator('.request-outcome').getAttribute('aria-label'), `${label}. ${hint}`);
+      assert.equal(await row.locator('.request-outcome').getAttribute('aria-label'), `${label} 402`, 'the trigger stays concise; the full explanation arrives through the tooltip description');
       assert.equal((await row.innerText()).split(reason).length - 1, 0);
       await row.locator('.request-outcome').scrollIntoViewIfNeeded();
       await row.locator('.table-action').hover();
@@ -264,7 +485,7 @@ test('supplier cause stays shared through list, keyboard tooltip, detail and ter
       let observed: unknown;
       try {
         const handle = await page.waitForFunction(`(() => {
-          const expected = ${JSON.stringify(hint)};
+          const expectedParts = ${JSON.stringify([`${prefix}: ${reason}`, action, '402'])};
           const active = document.activeElement;
           if (!(active instanceof HTMLElement)) return false;
           const described = (active.getAttribute('aria-describedby') || '').split(/\\s+/);
@@ -273,14 +494,13 @@ test('supplier cause stays shared through list, keyboard tooltip, detail and ter
             const style = getComputedStyle(node);
             const rect = node.getBoundingClientRect();
             if (style.display === 'none' || style.visibility === 'hidden' || rect.width === 0 || rect.height === 0) continue;
-            if (node.innerText === expected) return node.innerText;
+            if (expectedParts.every((part) => node.innerText.includes(part))) return node.innerText;
           }
           return false;
         })()`);
         observed = await handle.jsonValue();
       } catch (error) {
         const diagnostics = await page.evaluate(`(() => {
-          const expected = ${JSON.stringify(hint)};
           const active = document.activeElement;
           return {
             focus: active instanceof HTMLElement ? active.className : String(active),
@@ -296,8 +516,8 @@ test('supplier cause stays shared through list, keyboard tooltip, detail and ter
                 visibility: style.visibility,
                 width: Math.round(rect.width),
                 height: Math.round(rect.height),
-                exactText: node.textContent === expected,
-                exactInnerText: node.innerText === expected,
+                text: node.textContent,
+                innerText: node.innerText,
                 described: active instanceof HTMLElement && (active.getAttribute('aria-describedby') || '').split(/\\s+/).indexOf(node.id) !== -1,
               };
             }),
@@ -309,8 +529,13 @@ test('supplier cause stays shared through list, keyboard tooltip, detail and ter
         await page.screenshot({ path: `${artifactRoot}/supplier-error-${locale}-tooltip-failure.png`, fullPage: true });
         throw new Error(`keyboard tooltip diagnostics: ${JSON.stringify(diagnostics)}`, { cause: error });
       }
-      assert.equal(typeof observed, 'string', 'the atomic keyboard tooltip observation is its visible text');
-      assert.equal(observed, hint);
+      assert.ok(typeof observed === 'string', 'the atomic keyboard tooltip observation is its visible text');
+      for (const part of [`${prefix}: ${reason}`, action, locale === 'zh-CN' ? '技术细节' : 'Technical details', '402']) {
+        assert.ok(observed.includes(part), `keyboard tooltip includes ${part}`);
+      }
+      assert.match(observed, new RegExp(`^${prefix}: ${reason}`), 'the tooltip leads with the reason');
+      assert.ok(observed.includes('input.tools'), 'provider parameter is available in the summary');
+      assert.ok(!observed.includes('unmapped-provider-field'), 'full provider JSON stays out of row tooltips');
       assert.equal(await page.evaluate(() => window.requestLifecycleFixture.detailCalls), 0, 'list reason and keyboard tooltip need no detail fetch');
       await row.locator('.table-action').click();
       const drawer = page.getByRole('dialog', { name: 'model-a' });
@@ -320,19 +545,27 @@ test('supplier cause stays shared through list, keyboard tooltip, detail and ter
       await visibleCause.waitFor();
       assert.equal(await visibleCause.count(), 1);
       assert.equal((await drawer.innerText()).split(reason).length - 1, 1);
-      assert.equal(await drawer.locator('.request-supplier-detail span').innerText(), detail);
+      const supplierDetailText = await drawer.locator('.request-supplier-detail span').innerText();
+      for (const part of locale === 'zh-CN' ? ['供应商错误码: no_active_plan', '供应商说明: 当前账号没有可用套餐; provider code: 402'] : ['Provider error code: no_active_plan', 'Provider message: 当前账号没有可用套餐; provider code: 402']) {
+        assert.ok(supplierDetailText.includes(part), `technical block includes ${part}`);
+      }
       assert.equal(await drawer.locator('.request-supplier-detail').evaluate(element => element.scrollWidth <= element.clientWidth + 1), true, 'provider details wrap on narrow screens');
       assert.equal(await drawer.locator('.request-outcome small').count(), 1, 'status appears once');
+      const payload = drawer.locator('.request-provider-payload');
+      assert.equal(await payload.getAttribute('open'), null, 'complete provider JSON is an explicit disclosure');
+      await payload.locator('summary').click();
+      assert.deepEqual(JSON.parse(await payload.locator('pre').innerText()), { error: { param: 'input.tools', vendor_extra: ['unmapped-provider-field', 17] } });
       const artifactRoot = fileURLToPath(new URL('../e2e-artifacts/request-diagnostics/', import.meta.url));
       await mkdir(artifactRoot, { recursive: true });
       await page.screenshot({ path: `${artifactRoot}/supplier-error-${locale}-narrow.png`, fullPage: true });
-      assert.doesNotMatch(await drawer.innerText(), /http_402|no_active_plan|请求失败|The request failed/);
+      assert.doesNotMatch(await drawer.innerText(), /http_402|请求失败|The request failed/);
       await drawer.locator('.request-outcome').scrollIntoViewIfNeeded();
       await drawer.locator('.request-outcome').press('Shift+Tab');
       await page.keyboard.press('Tab');
       assert.equal(await drawer.locator('.request-outcome').evaluate(element => element === document.activeElement), true, 'keyboard navigation focuses the detail status');
       await tooltip.waitFor();
-      assert.equal(await tooltip.innerText(), hint);
+      const drawerTooltipText = await tooltip.innerText();
+      for (const part of [`${prefix}: ${reason}`, action, '402']) assert.ok(drawerTooltipText.includes(part), `detail tooltip includes ${part}`);
       assert.equal(await page.evaluate(() => window.requestLifecycleFixture.detailCalls), 1);
       await page.evaluate(() => window.requestLifecycleFixture.finish());
       await page.waitForFunction(() => window.requestLifecycleFixture.detailCalls === 2);
@@ -340,7 +573,7 @@ test('supplier cause stays shared through list, keyboard tooltip, detail and ter
       await tooltip.waitFor({ state: 'hidden' });
       await visibleCause.waitFor();
       assert.equal(await visibleCause.count(), 1);
-      assert.equal(await row.locator('.request-outcome').getAttribute('aria-label'), `${label}. ${hint}`, 'enriched event preserves the list cause after detail refresh');
+      assert.equal(await row.locator('.request-outcome').getAttribute('aria-label'), `${label} 402`, 'enriched event preserves the list cause after detail refresh');
       assert.equal((await row.innerText()).split(reason).length - 1, 0);
       assert.equal((await drawer.innerText()).split(reason).length - 1, 1);
       await drawer.locator('.close').focus();
@@ -349,7 +582,7 @@ test('supplier cause stays shared through list, keyboard tooltip, detail and ter
       await page.keyboard.press('Tab');
       assert.equal(await drawer.locator('.request-outcome').evaluate(element => element === document.activeElement), true);
       await tooltip.waitFor();
-      assert.equal(await tooltip.innerText(), hint);
+      for (const part of [`${prefix}: ${reason}`, action]) assert.ok((await tooltip.innerText()).includes(part));
       assert.equal(await page.evaluate(() => window.requestLifecycleFixture.detailCalls), 2, 'status interaction adds no fetch beyond existing terminal refresh');
       await drawer.getByRole('button', { name: close, exact: true }).click();
       await page.close();
@@ -369,9 +602,9 @@ test('typed failure diagnostic replaces the repeated unknown cause in list and d
   const browser = await chromium.launch({ headless: true });
   try {
     for (const [locale, param, reason, prefix, close, label] of [
-      ['zh-CN', 'downstream', '客户端在响应交付完成前断开了连接', '已记录原因', '关闭', '失败'],
+      ['zh-CN', 'downstream', '上游已经开始返回，客户端在收完之前断开', '已记录原因', '关闭', '失败'],
       ['zh-CN', 'supplier', '上游服务在响应开始时返回了错误状态', '已记录原因', '关闭', '失败'],
-      ['en', 'downstream', 'The client disconnected before response delivery completed', 'Recorded cause', 'Close', 'Failed'],
+      ['en', 'downstream', 'The upstream had started returning, and the client disconnected before the response finished', 'Recorded cause', 'Close', 'Failed'],
       ['en', 'supplier', 'The upstream service returned an error status at the start of its response', 'Recorded cause', 'Close', 'Failed'],
     ] as const) {
       const page = await browser.newPage();
@@ -382,19 +615,52 @@ test('typed failure diagnostic replaces the repeated unknown cause in list and d
       const hint = `${prefix}: ${reason}`;
       const row = page.locator('tbody tr').filter({ has: page.getByText('model-a', { exact: true }) });
       await row.locator('[data-outcome="failed"]').waitFor();
-      assert.equal(await row.locator('.request-outcome').getAttribute('aria-label'), `${label}. ${hint}`);
-      assert.doesNotMatch(await row.innerText(), /http_499|client_disconnected|upstream_http_status|未知（未记录具体原因）|Unknown \(no specific cause recorded\)/);
+      assert.equal(await row.locator('.request-outcome').getAttribute('aria-label'), `${label} 499`, 'the trigger stays concise; the typed explanation arrives through the tooltip description');
+      assert.doesNotMatch(await row.innerText(), /client_disconnected|upstream_http_status|未知（未记录具体原因）|Unknown \(no specific cause recorded\)/);
       await row.locator('.table-action').click();
       const drawer = page.getByRole('dialog', { name: 'model-a' });
       const visibleCause = drawer.locator('.request-status-cause').and(drawer.getByText(hint, { exact: true }));
       await visibleCause.waitFor();
       assert.equal(await visibleCause.count(), 1, 'list and detail reuse the same typed explanation');
-      assert.doesNotMatch(await drawer.innerText(), /http_499|client_disconnected|upstream_http_status|未知（未记录具体原因）|Unknown \(no specific cause recorded\)/);
+      const drawerText = await drawer.innerText();
+      assert.doesNotMatch(drawerText, /未知（未记录具体原因）|Unknown \(no specific cause recorded\)/);
+      for (const [term, value] of [[locale === 'zh-CN' ? '失败阶段' : 'Failure stage', 'client_disconnected'], [locale === 'zh-CN' ? '失败阶段' : 'Failure stage', 'upstream_http_status']] as const) {
+        if (drawerText.includes(value)) assert.ok(drawerText.includes(term), `${value} only appears under its ${term} label`);
+      }
+      assert.doesNotMatch(drawerText, /http_499/, 'an http_NNN wrapper duplicating the recorded status is omitted');
       const artifactRoot = fileURLToPath(new URL('../e2e-artifacts/request-diagnostics/', import.meta.url));
       await mkdir(artifactRoot, { recursive: true });
       await page.screenshot({ path: `${artifactRoot}/failure-diagnostic-${param}-${locale}-detail.png`, fullPage: true });
       await drawer.getByRole('button', { name: close, exact: true }).click();
       await page.close();
     }
+  } finally { await browser.close(); await server.close(); }
+});
+
+
+test('manual refresh updates the selected drawer and row from the same observation without closing it', { timeout: 45_000 }, async context => {
+  if (!existsSync(chromium.executablePath())) {
+    if (process.env.MTC_REQUIRE_BROWSER === '1') throw new Error('Chromium is required');
+    context.skip('Chromium is not installed'); return;
+  }
+  const server = await createServer({ root: fileURLToPath(new URL('..', import.meta.url)), configFile: false, logLevel: 'silent', server: { host: '127.0.0.1', port: 0 } });
+  await server.listen();
+  const address = server.httpServer?.address(); assert.ok(address && typeof address !== 'string');
+  const browser = await chromium.launch({ headless: true });
+  try {
+    const page = await browser.newPage();
+    await page.addInitScript(() => localStorage.setItem('mtc-locale', 'en'));
+    await page.goto(`http://127.0.0.1:${address.port}/e2e/fixtures/request-lifecycle.html?quiet-background-help&operational=zero`);
+    const row = page.locator('tbody tr').filter({ has: page.getByText('model-a', { exact: true }) });
+    await row.locator('.table-action').click();
+    await page.locator('.drawer').waitFor();
+    const detailCalls = await page.evaluate(() => window.requestLifecycleFixture.detailCalls);
+    await page.evaluate(() => window.requestLifecycleFixture.observe());
+    await page.locator('.drawer').getByRole('button', { name: 'Refresh', exact: true }).click();
+    await row.getByText('Late recorded session', { exact: true }).waitFor();
+    await page.locator('.drawer').getByText('Late recorded session', { exact: true }).waitFor();
+    assert.equal(await page.locator('.drawer').count(), 1);
+    assert.equal(await page.evaluate(() => window.requestLifecycleFixture.detailCalls), detailCalls,
+      'refresh reuses the loaded detail body rather than reopening the drawer');
   } finally { await browser.close(); await server.close(); }
 });

@@ -53,7 +53,11 @@ pub(super) async fn authenticate_control_before_body(
         .await
         {
             Ok(Ok(permit)) => permit,
-            Ok(Err(_)) => return Err(AppError::Internal),
+            Ok(Err(_)) => {
+                return Err(AppError::internal(
+                    "auth_authenticate_control_before_body_1",
+                ));
+            }
             Err(_) => {
                 return Ok(control_body_rejection(
                     StatusCode::TOO_MANY_REQUESTS,
@@ -79,12 +83,11 @@ pub(super) async fn authenticate_control_before_body(
             // The control-plane reader has its own permit, but preserve the
             // service-capacity classification if that implementation changes.
             Err(crate::gateway_body::GatewayBodyAdmissionError::CapacityExhausted) => {
-                return Err(AppError::Overloaded);
+                return Err(AppError::capacity_error("control_request_body_capacity"));
             }
-            Err(
-                crate::gateway_body::GatewayBodyAdmissionError::RequestSpoolCapacityExhausted
-                | crate::gateway_body::GatewayBodyAdmissionError::RequestSpoolUnavailable,
-            ) => return Err(AppError::Overloaded),
+            Err(crate::gateway_body::GatewayBodyAdmissionError::RequestSpoolUnavailable) => {
+                return Err(AppError::capacity_error("request_spool_unavailable"));
+            }
             Err(crate::gateway_body::GatewayBodyAdmissionError::Timeout) => {
                 return Ok(control_body_rejection(
                     StatusCode::REQUEST_TIMEOUT,
@@ -95,12 +98,8 @@ pub(super) async fn authenticate_control_before_body(
             Err(crate::gateway_body::GatewayBodyAdmissionError::UnsupportedEncoding) => {
                 return Ok(StatusCode::UNSUPPORTED_MEDIA_TYPE.into_response());
             }
-            Err(crate::gateway_body::GatewayBodyAdmissionError::Rejected(_)) => {
-                return Ok(control_body_rejection(
-                    StatusCode::PAYLOAD_TOO_LARGE,
-                    "request_body_too_large",
-                    "request body exceeds the supported limit",
-                ));
+            Err(crate::gateway_body::GatewayBodyAdmissionError::Rejected(rejection)) => {
+                return Ok(classified_body_rejection(rejection));
             }
         };
         // Keep the permit through parsing and handler execution. Releasing it
@@ -148,6 +147,30 @@ fn control_body_rejection(
         .into_response()
 }
 
+fn classified_body_rejection(rejection: crate::gateway_body::GatewayBodyRejection) -> Response {
+    let (status, code, message) = match rejection.reason {
+        crate::gateway_body::GatewayBodyRejectionReason::BodyReadRejected => (
+            StatusCode::BAD_REQUEST,
+            "request_body_read_failed",
+            "request body could not be read",
+        ),
+        crate::gateway_body::GatewayBodyRejectionReason::DeclaredContentLengthExceedsLimit
+        | crate::gateway_body::GatewayBodyRejectionReason::BodyLimitExceeded => (
+            StatusCode::PAYLOAD_TOO_LARGE,
+            "request_body_too_large",
+            "request body exceeds the supported limit",
+        ),
+        crate::gateway_body::GatewayBodyRejectionReason::CapacityExhausted => {
+            return gateway_body_capacity_rejection();
+        }
+    };
+    let mut response = control_body_rejection(status, code, message);
+    response
+        .extensions_mut()
+        .insert(crate::error::PublicErrorCode(code));
+    response
+}
+
 pub(super) async fn authenticate_gateway_before_body(
     State(state): State<AppState>,
     request: Request,
@@ -187,16 +210,21 @@ async fn admit_authenticated_gateway_body(
 ) -> Result<Response, AppError> {
     let audio_request = request.method() == axum::http::Method::POST
         && request.uri().path() == "/v1/audio/transcriptions";
+    let image_request = request.method() == axum::http::Method::POST
+        && request.uri().path() == "/v1/images/generations";
     let mut media_lifecycle_permit = if matches!(
         request.uri().path(),
         "/v1/images/generations" | "/v1/audio/transcriptions"
     ) {
+        // Wait before reading the upload. Contention is not a request failure;
+        // dropping the caller cancels its queue entry without starting media work.
         Some(
             state
                 .image_response_permits
                 .clone()
-                .try_acquire_owned()
-                .map_err(|_| AppError::Overloaded)?,
+                .acquire_owned()
+                .await
+                .map_err(|_| AppError::capacity_error("media_concurrency_permit"))?,
         )
     } else {
         None
@@ -205,6 +233,11 @@ async fn admit_authenticated_gateway_body(
         let request_id = diagnostic_context
             .map(|context| context.request_id.to_string())
             .unwrap_or_else(|| safe_gateway_request_id(request.headers()));
+        if uuid::Uuid::parse_str(&request_id).is_ok() {
+            request.extensions_mut().insert(
+                crate::gateway_body::request_spool::RequestBodyObjectKey(request_id.clone()),
+            );
+        }
         let body_read = diagnostic_context
             .map(|context| proxy_diagnostics::Phase::new(context, "gateway_request_body"));
         let _body_read_activity =
@@ -238,12 +271,45 @@ async fn admit_authenticated_gateway_body(
         .get::<std::sync::Arc<crate::gateway_body::memory::ProxyMemoryReservation>>()
         .cloned();
     if audio_request {
+        let request_id = request
+            .extensions()
+            .get::<crate::gateway_body::request_spool::RequestBodyObjectKey>()
+            .and_then(|key| uuid::Uuid::parse_str(&key.0).ok())
+            .unwrap_or_else(uuid::Uuid::now_v7);
+        let raw_request = request
+            .extensions()
+            .get::<crate::gateway_body::RawAudioRequestBody>()
+            .ok_or(AppError::internal("audio_original_request_missing"))?
+            .0
+            .clone();
         request.extensions_mut().insert(AudioRequestResources {
-            lifecycle: std::sync::Arc::new(
-                media_lifecycle_permit.take().ok_or(AppError::Internal)?,
-            ),
-            memory: memory.clone().ok_or(AppError::Internal)?,
+            request_id,
+            raw_request,
+            lifecycle: std::sync::Arc::new(media_lifecycle_permit.take().ok_or(
+                AppError::internal("auth_admit_authenticated_gateway_body_1"),
+            )?),
+            memory: memory.clone().ok_or(AppError::internal(
+                "auth_admit_authenticated_gateway_body_2",
+            ))?,
         });
+    }
+    if image_request {
+        request.extensions_mut().insert(ImageRequestResources {
+            lifecycle: std::sync::Arc::new(
+                media_lifecycle_permit
+                    .take()
+                    .ok_or(AppError::internal("image_request_lifecycle_missing"))?,
+            ),
+            memory: memory.clone(),
+        });
+    }
+    if matches!(
+        request.uri().path(),
+        "/v1/videos/generations" | "/v1/generations"
+    ) {
+        // Asynchronous job handlers own their job/financial terminal records.
+        // Synchronous image/audio mark admission when their record is created.
+        super::early_request::mark_admitted();
     }
     let response = next.run(request).await;
     if super::early_request::is_pre_admission_failure(response.status()) {
@@ -276,18 +342,6 @@ fn gateway_body_admission_rejection(
                 .record_proxy_memory_rejection(crate::metrics::ProxyMemoryRejectionStage::Ingress);
             gateway_body_capacity_rejection()
         }
-        crate::gateway_body::GatewayBodyAdmissionError::RequestSpoolCapacityExhausted => {
-            tracing::warn!(
-                request_id = %request_id,
-                route_class = "responses",
-                reason = "request_spool_capacity_exhausted",
-                "gateway request spool admission rejected"
-            );
-            gateway_request_spool_rejection(
-                "request_spool_capacity_exhausted",
-                "request spool capacity is temporarily exhausted",
-            )
-        }
         crate::gateway_body::GatewayBodyAdmissionError::RequestSpoolUnavailable => {
             tracing::error!(
                 request_id = %request_id,
@@ -315,26 +369,24 @@ fn gateway_body_admission_rejection(
             // any part of the rejected request body.
             tracing::warn!(
                 request_id = %request_id,
+                stage = "gateway_request_body",
                 route_class = rejection.route_class.label(),
                 declared_content_length = ?rejection.declared_content_length,
                 limit_bytes = rejection.limit_bytes,
                 reason = rejection.reason.label(),
                 "gateway request body rejected"
             );
-            (
-                StatusCode::PAYLOAD_TOO_LARGE,
-                Json(json!({"error": {
-                    "code": "request_body_too_large",
-                    "message": "request body exceeds the supported limit"
-                }})),
-            )
-                .into_response()
+            let mut response = classified_body_rejection(rejection);
+            response
+                .extensions_mut()
+                .insert(crate::server::RejectedUpload);
+            response
         }
     }
 }
 
 fn gateway_body_capacity_rejection() -> Response {
-    AppError::Overloaded.into_response()
+    AppError::capacity_error("proxy_memory_ingress").into_response()
 }
 
 fn gateway_request_spool_rejection(code: &'static str, message: &'static str) -> Response {
@@ -386,8 +438,16 @@ where
 
 #[derive(Clone)]
 pub(super) struct AudioRequestResources {
+    pub(super) request_id: uuid::Uuid,
+    pub(super) raw_request: bytes::Bytes,
     pub(super) lifecycle: std::sync::Arc<tokio::sync::OwnedSemaphorePermit>,
     pub(super) memory: std::sync::Arc<crate::gateway_body::memory::ProxyMemoryReservation>,
+}
+
+#[derive(Clone)]
+pub(super) struct ImageRequestResources {
+    pub(super) lifecycle: std::sync::Arc<tokio::sync::OwnedSemaphorePermit>,
+    pub(super) memory: Option<std::sync::Arc<crate::gateway_body::memory::ProxyMemoryReservation>>,
 }
 
 pub(super) async fn admit_cloud_webhook_before_body(
@@ -410,12 +470,11 @@ pub(super) async fn admit_cloud_webhook_before_body(
         // This path has an independent webhook permit. See the same note on
         // the control-plane reader above.
         Err(crate::gateway_body::GatewayBodyAdmissionError::CapacityExhausted) => {
-            return Err(AppError::Overloaded);
+            return Err(AppError::capacity_error("cloud_webhook_body_capacity"));
         }
-        Err(
-            crate::gateway_body::GatewayBodyAdmissionError::RequestSpoolCapacityExhausted
-            | crate::gateway_body::GatewayBodyAdmissionError::RequestSpoolUnavailable,
-        ) => return Err(AppError::Overloaded),
+        Err(crate::gateway_body::GatewayBodyAdmissionError::RequestSpoolUnavailable) => {
+            return Err(AppError::capacity_error("request_spool_unavailable"));
+        }
         Err(crate::gateway_body::GatewayBodyAdmissionError::Timeout) => {
             return Ok(control_body_rejection(
                 StatusCode::REQUEST_TIMEOUT,
@@ -426,12 +485,8 @@ pub(super) async fn admit_cloud_webhook_before_body(
         Err(crate::gateway_body::GatewayBodyAdmissionError::UnsupportedEncoding) => {
             return Ok(StatusCode::UNSUPPORTED_MEDIA_TYPE.into_response());
         }
-        Err(crate::gateway_body::GatewayBodyAdmissionError::Rejected(_)) => {
-            return Ok(control_body_rejection(
-                StatusCode::PAYLOAD_TOO_LARGE,
-                "request_body_too_large",
-                "request body exceeds the supported limit",
-            ));
+        Err(crate::gateway_body::GatewayBodyAdmissionError::Rejected(rejection)) => {
+            return Ok(classified_body_rejection(rejection));
         }
     };
     Ok(next.run(request).await)
@@ -498,18 +553,61 @@ mod response_body_guard_tests {
         let body = axum::body::to_bytes(response.into_body(), 1024)
             .await
             .expect("error body");
-        assert!(
-            std::str::from_utf8(&body)
-                .expect("UTF-8 error")
-                .contains("service_overloaded")
-        );
+        let body = std::str::from_utf8(&body).expect("UTF-8 error");
+        assert!(body.contains("proxy_memory_ingress"));
+        assert!(body.contains(
+            "gateway memory is currently insufficient to receive the request body; retry later"
+        ));
     }
 
     #[tokio::test]
-    async fn request_spool_capacity_exhaustion_is_retryable_and_explainable() {
+    async fn media_capacity_waits_without_reading_upload_or_rejecting_request() {
+        use tower::ServiceExt;
+        let (mut state, _directory) = crate::api::tests::test_state().await;
+        state.image_response_permits = Arc::new(tokio::sync::Semaphore::new(1));
+        let held = state
+            .image_response_permits
+            .clone()
+            .acquire_owned()
+            .await
+            .unwrap();
+        let polls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let observed = polls.clone();
+        let app = axum::Router::new()
+            .route(
+                "/v1/images/generations",
+                axum::routing::post(|| async { StatusCode::OK }),
+            )
+            .layer(axum::middleware::from_fn_with_state(
+                state,
+                |State(state): State<AppState>, request: Request, next: Next| async move {
+                    admit_authenticated_gateway_body(&state, request, next, None).await
+                },
+            ));
+        let task = tokio::spawn(
+            app.oneshot(
+                Request::post("/v1/images/generations")
+                    .body(Body::from_stream(futures_util::stream::once(async move {
+                        observed.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                        Ok::<_, std::io::Error>(Bytes::from_static(b"{}"))
+                    })))
+                    .unwrap(),
+            ),
+        );
+        tokio::task::yield_now().await;
+        assert!(!task.is_finished());
+        assert_eq!(polls.load(std::sync::atomic::Ordering::SeqCst), 0);
+        drop(held);
+        let response = task.await.unwrap().unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(polls.load(std::sync::atomic::Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn request_spool_unavailable_is_retryable_and_explainable() {
         let response = gateway_request_spool_rejection(
-            "request_spool_capacity_exhausted",
-            "request spool capacity is temporarily exhausted",
+            "request_spool_unavailable",
+            "request spool is temporarily unavailable",
         );
         assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
         assert_eq!(
@@ -520,8 +618,8 @@ mod response_body_guard_tests {
             .await
             .expect("error body");
         let body = std::str::from_utf8(&body).expect("UTF-8 error");
-        assert!(body.contains("request_spool_capacity_exhausted"));
-        assert!(body.contains("temporarily exhausted"));
+        assert!(body.contains("request_spool_unavailable"));
+        assert!(body.contains("temporarily unavailable"));
     }
 
     #[test]
@@ -637,11 +735,20 @@ pub(super) async fn authenticate_downstream(
     headers: &HeaderMap,
     state: &AppState,
 ) -> Result<AuthenticatedKey, AppError> {
+    use tracing::Instrument;
+
     let provided = downstream_credential(headers).ok_or(AppError::Unauthorized)?;
-    state
+    let authentication = state
         .db
-        .authenticate_key(provided, state.config.key_pepper.as_bytes())
-        .await
+        .authenticate_key(provided, state.config.key_pepper.as_bytes());
+    match proxy_diagnostics::CONTEXT.try_with(|context| context.request_id) {
+        Ok(request_id) => {
+            authentication
+                .instrument(tracing::info_span!("downstream_key_authentication", %request_id))
+                .await
+        }
+        Err(_) => authentication.await,
+    }
 }
 
 fn bearer(headers: &HeaderMap) -> Option<&str> {
@@ -668,6 +775,9 @@ fn single_header(headers: &HeaderMap, name: impl axum::http::header::AsHeaderNam
     }
     Some(value)
 }
+
+#[cfg(test)]
+mod http1_rejection_tests;
 
 #[cfg(test)]
 mod tests {

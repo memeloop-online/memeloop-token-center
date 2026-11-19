@@ -1,13 +1,36 @@
 use super::super::*;
 
+pub(super) async fn enqueue_unknown_terminal_projection_in_transaction(
+    transaction: &mut Transaction<'_, Any>,
+    request_id: &str,
+) -> Result<(), AppError> {
+    sqlx::query(
+        "INSERT INTO terminal_projection_outbox (request_id, reservation_id, tenant_id, key_id, account_id, created_at, completed_at, model, protocol, status_code, error_code, upstream_account_id, model_route_id, duration_ms, input_tokens, output_tokens, cached_input_tokens, cache_write_tokens, cache_known_read_tokens, cache_known_input_tokens, generation_units, billing_unit, service_tier, currency, cost_micros, usage_basis, session_id, terminal_cause_code, response_object, account_projected_at)
+         SELECT r.id, p.reservation_id, p.tenant_id, p.key_id, p.account_id, r.created_at, o.completed_at, r.model, r.protocol, o.status_code, COALESCE(o.error_code, ''), COALESCE(o.upstream_account_id, ''), COALESCE(o.model_route_id, ''), o.duration_ms, 0, 0, 0, 0, NULL, NULL, 0, '', r.service_tier, r.currency, 0, 'not_observed', COALESCE(r.conversation_cluster_id, 'unlinked:' || r.key_id), o.terminal_cause_code, o.response_object, o.completed_at
+         FROM pending_proxy_settlements p
+         JOIN request_records r ON r.id = p.request_id AND r.tenant_id = p.tenant_id AND r.key_id = p.key_id AND r.reservation_id = p.reservation_id
+         JOIN proxy_operational_terminals o ON o.request_id = p.request_id AND o.request_created_at = r.created_at AND o.tenant_id = p.tenant_id AND o.key_id = p.key_id AND o.account_id = p.account_id AND o.reservation_id = p.reservation_id AND o.owner_token = p.owner_token AND o.fence = p.fence AND o.contract_digest = p.contract_digest
+         WHERE p.request_id = $1 AND p.state = 'pending' AND p.unknown_reason IS NOT NULL AND r.completed_at IS NULL
+         ON CONFLICT(request_id) DO NOTHING",
+    )
+    .bind(request_id)
+    .execute(&mut **transaction)
+    .await?;
+    Ok(())
+}
+
 pub(super) async fn enqueue_terminal_projection_in_transaction(
     transaction: &mut Transaction<'_, Any>,
     request_id: &str,
 ) -> Result<(), AppError> {
     let inserted = sqlx::query(
         "INSERT INTO terminal_projection_outbox (request_id, reservation_id, tenant_id, key_id, account_id, created_at, completed_at, model, protocol, status_code, error_code, upstream_account_id, model_route_id, duration_ms, input_tokens, output_tokens, cached_input_tokens, cache_write_tokens, cache_known_read_tokens, cache_known_input_tokens, generation_units, billing_unit, service_tier, currency, cost_micros, usage_basis, session_id, terminal_cause_code, response_object, account_projected_at)
-         SELECT r.id, r.reservation_id, r.tenant_id, r.key_id, u.account_id, r.created_at, r.completed_at, r.model, r.protocol, r.status_code, COALESCE(r.error_code, ''), COALESCE(r.upstream_account_id, ''), COALESCE(r.model_route_id, ''), COALESCE(r.duration_ms, 0), r.input_tokens, r.output_tokens, r.cached_input_tokens, r.cache_write_tokens, r.cache_known_read_tokens, r.cache_known_input_tokens, r.billed_units, r.billing_unit, r.service_tier, r.currency, r.cost_micros, COALESCE(r.usage_basis, ''), COALESCE(r.conversation_cluster_id, 'unlinked:' || r.key_id), r.terminal_cause_code, r.response_object, CASE WHEN u.enforcement_mode = 'prepaid' THEN r.completed_at ELSE m.projected_at END
-         FROM request_records r JOIN usage_reservations u ON u.id = r.reservation_id LEFT JOIN metered_usage_projection_outbox m ON m.reservation_id = u.id WHERE r.id = $1 AND r.completed_at IS NOT NULL",
+         SELECT r.id, r.reservation_id, r.tenant_id, r.key_id, u.account_id, r.created_at, COALESCE(o.completed_at, r.completed_at), r.model, r.protocol, COALESCE(o.status_code, r.status_code), COALESCE(o.error_code, r.error_code, ''), COALESCE(o.upstream_account_id, r.upstream_account_id, ''), COALESCE(o.model_route_id, r.model_route_id, ''), COALESCE(o.duration_ms, r.duration_ms, 0), r.input_tokens, r.output_tokens, r.cached_input_tokens, r.cache_write_tokens, r.cache_known_read_tokens, r.cache_known_input_tokens, r.billed_units, r.billing_unit, r.service_tier, r.currency, r.cost_micros, COALESCE(r.usage_basis, ''), COALESCE(r.conversation_cluster_id, 'unlinked:' || r.key_id), COALESCE(o.terminal_cause_code, r.terminal_cause_code), COALESCE(o.response_object, r.response_object), CASE WHEN u.enforcement_mode = 'prepaid' THEN r.completed_at ELSE m.projected_at END
+         FROM request_records r JOIN usage_reservations u ON u.id = r.reservation_id LEFT JOIN metered_usage_projection_outbox m ON m.reservation_id = u.id LEFT JOIN proxy_operational_terminals o ON o.request_id = r.id AND o.request_created_at = r.created_at AND o.tenant_id = r.tenant_id AND o.key_id = r.key_id AND o.reservation_id = r.reservation_id
+         WHERE r.id = $1 AND r.completed_at IS NOT NULL
+         ON CONFLICT(request_id) DO UPDATE SET completed_at = excluded.completed_at, status_code = excluded.status_code, error_code = excluded.error_code, upstream_account_id = excluded.upstream_account_id, model_route_id = excluded.model_route_id, duration_ms = excluded.duration_ms, input_tokens = excluded.input_tokens, output_tokens = excluded.output_tokens, cached_input_tokens = excluded.cached_input_tokens, cache_write_tokens = excluded.cache_write_tokens, cache_known_read_tokens = excluded.cache_known_read_tokens, cache_known_input_tokens = excluded.cache_known_input_tokens, generation_units = excluded.generation_units, billing_unit = excluded.billing_unit, service_tier = excluded.service_tier, cost_micros = excluded.cost_micros, usage_basis = excluded.usage_basis, session_id = excluded.session_id, terminal_cause_code = excluded.terminal_cause_code, response_object = excluded.response_object, account_projected_at = excluded.account_projected_at, projected_at = NULL, statistics_outcome = NULL, lease_owner = NULL, lease_expires_at = NULL
+         WHERE terminal_projection_outbox.tenant_id = excluded.tenant_id AND terminal_projection_outbox.key_id = excluded.key_id AND terminal_projection_outbox.account_id = excluded.account_id AND terminal_projection_outbox.reservation_id = excluded.reservation_id AND terminal_projection_outbox.currency = excluded.currency AND terminal_projection_outbox.usage_basis = 'not_observed'
+           AND EXISTS (SELECT 1 FROM pending_proxy_settlements p WHERE p.request_id = excluded.request_id AND p.state = 'pending' AND p.unknown_reason IS NOT NULL)",
     )
     .bind(request_id)
     .execute(&mut **transaction)
@@ -36,6 +59,43 @@ pub(super) async fn statistics_pruned_in_transaction(
 }
 
 impl Database {
+    pub(crate) async fn recover_unknown_terminal_projections(
+        &self,
+        after: Option<&str>,
+    ) -> Result<Option<String>, AppError> {
+        let rows = sqlx::query(
+            "SELECT p.request_id,
+                    CAST(CASE WHEN p.state = 'pending' AND p.unknown_reason IS NOT NULL
+                         AND NOT EXISTS (SELECT 1 FROM terminal_projection_outbox t WHERE t.request_id = p.request_id)
+                         THEN 1 ELSE 0 END AS BIGINT) AS missing
+             FROM pending_proxy_settlements p
+             WHERE p.request_id > $1 ORDER BY p.request_id LIMIT 32",
+        )
+        .bind(after.unwrap_or(""))
+        .fetch_all(&self.pool)
+        .await?;
+        let next = if rows.len() == 32 {
+            rows.last()
+                .map(|row| row.try_get::<String, _>("request_id"))
+                .transpose()?
+        } else {
+            None
+        };
+        for row in rows {
+            if row.try_get::<i64, _>("missing")? == 0 {
+                continue;
+            }
+            let request_id: String = row.try_get("request_id")?;
+            let mut transaction = self.begin_write_transaction().await?;
+            sqlx::query("UPDATE request_records SET completed_at = completed_at WHERE id = $1 AND completed_at IS NULL")
+                .bind(&request_id).execute(&mut *transaction).await?;
+            enqueue_unknown_terminal_projection_in_transaction(&mut transaction, &request_id)
+                .await?;
+            transaction.commit().await?;
+        }
+        Ok(next)
+    }
+
     pub async fn claim_terminal_projection_tasks(
         &self,
         lease_owner: Uuid,
@@ -54,9 +114,20 @@ impl Database {
             .bind(lease_owner.to_string())
             .bind(now.saturating_add(300_000))
             .bind(now)
-            .bind(limit.clamp(1, 32))
+            .bind(limit)
             .fetch_all(&mut *transaction)
-            .await?;
+            .await
+            .map_err(|error| {
+                let sqlstate = error.as_database_error().and_then(|db| db.code());
+                let sqlstate = sqlstate.as_deref().filter(|code| {
+                    code.len() == 5
+                        && code
+                            .bytes()
+                            .all(|byte| byte.is_ascii_uppercase() || byte.is_ascii_digit())
+                });
+                tracing::error!(sqlstate, "terminal projection claim database failure");
+                error
+            })?;
         transaction.commit().await?;
         rows.into_iter()
             .map(|row| parse_uuid(row.try_get("request_id")?))
@@ -93,11 +164,39 @@ impl Database {
         };
         let created_at: i64 = task.try_get("created_at")?;
         let pruned = statistics_pruned_in_transaction(&mut transaction, created_at).await?;
+        sqlx::query(
+            "UPDATE request_stats_facts SET cost_micros = cost_micros WHERE request_id = $1",
+        )
+        .bind(&request_id)
+        .execute(&mut *transaction)
+        .await?;
+        let previous = sqlx::query("SELECT f.tenant_id, f.key_id, f.currency, f.session_id FROM request_stats_facts f JOIN pending_proxy_settlements p ON p.request_id = f.request_id AND p.tenant_id = f.tenant_id AND p.key_id = f.key_id WHERE f.request_id = $1 AND p.unknown_reason IS NOT NULL AND f.input_tokens = 0 AND f.output_tokens = 0 AND f.cached_input_tokens = 0 AND f.cache_write_tokens = 0 AND f.cost_micros = 0")
+            .bind(&request_id).fetch_optional(&mut *transaction).await?;
+        let fact_exists: i64 =
+            sqlx::query_scalar("SELECT COUNT(*) FROM request_stats_facts WHERE request_id = $1")
+                .bind(&request_id)
+                .fetch_one(&mut *transaction)
+                .await?;
+        if fact_exists != i64::from(previous.is_some()) {
+            return Err(AppError::Conflict(
+                "unacknowledged terminal projection already has a fact".into(),
+            ));
+        }
         if !pruned {
+            if previous.is_some() {
+                super::metered_projection::project_metered_request_fact_in_transaction(
+                    &mut transaction,
+                    &request_id,
+                    true,
+                    -1,
+                )
+                .await?;
+            }
             let inserted = sqlx::query(
                 "INSERT INTO request_stats_facts (request_id, tenant_id, key_id, created_at, model, protocol, status_class, error_code, upstream_account_id, model_route_id, duration_ms, input_tokens, output_tokens, cached_input_tokens, cache_write_tokens, cache_known_read_tokens, cache_known_input_tokens, generation_units, billing_unit, service_tier, currency, cost_micros, session_id)
                  SELECT request_id, tenant_id, key_id, created_at, model, protocol, CASE WHEN status_code BETWEEN 200 AND 399 AND error_code = '' THEN 'success' ELSE 'failure' END, error_code, upstream_account_id, model_route_id, duration_ms, input_tokens, output_tokens, cached_input_tokens, cache_write_tokens, cache_known_read_tokens, cache_known_input_tokens, generation_units, billing_unit, service_tier, currency, CASE WHEN (status_code < 200 OR status_code >= 400 OR error_code <> '') AND usage_basis <> 'provider_reported' THEN 0 ELSE cost_micros END, session_id
-                 FROM terminal_projection_outbox WHERE request_id = $1 ON CONFLICT(request_id) DO NOTHING",
+                 FROM terminal_projection_outbox WHERE request_id = $1 ON CONFLICT(request_id) DO UPDATE SET status_class = excluded.status_class, error_code = excluded.error_code, upstream_account_id = excluded.upstream_account_id, model_route_id = excluded.model_route_id, duration_ms = excluded.duration_ms, input_tokens = excluded.input_tokens, output_tokens = excluded.output_tokens, cached_input_tokens = excluded.cached_input_tokens, cache_write_tokens = excluded.cache_write_tokens, cache_known_read_tokens = excluded.cache_known_read_tokens, cache_known_input_tokens = excluded.cache_known_input_tokens, generation_units = excluded.generation_units, billing_unit = excluded.billing_unit, service_tier = excluded.service_tier, cost_micros = excluded.cost_micros
+                 WHERE request_stats_facts.tenant_id = excluded.tenant_id AND request_stats_facts.key_id = excluded.key_id AND request_stats_facts.currency = excluded.currency AND EXISTS (SELECT 1 FROM pending_proxy_settlements p WHERE p.request_id = excluded.request_id AND p.unknown_reason IS NOT NULL)",
             )
             .bind(&request_id)
             .execute(&mut *transaction)
@@ -111,11 +210,14 @@ impl Database {
                 &mut transaction,
                 &request_id,
                 true,
+                1,
             )
             .await?;
         }
         let tenant_id: String = task.try_get("tenant_id")?;
         let key_id: String = task.try_get("key_id")?;
+        // The claimed outbox row and its acknowledgement are the financial
+        // publication fence; semantic projections also use this event kind.
         let event = super::lifecycle::allocate_request_event_cursor(
             &mut transaction,
             task.try_get("completed_at")?,
@@ -126,12 +228,18 @@ impl Database {
         .await?;
         sqlx::query(
             "INSERT INTO request_events (event_id, tenant_id, key_id, request_id, event_at, event_kind, protocol, model, status_code, duration_ms, input_tokens, output_tokens, cost_micros, error_code)
-             SELECT $1, tenant_id, key_id, request_id, $2, 'finished', protocol, model, status_code, duration_ms, input_tokens, output_tokens, cost_micros, NULLIF(error_code, '') FROM terminal_projection_outbox WHERE request_id = $3",
+             SELECT $1, tenant_id, key_id, request_id, $2, 'projected', protocol, model, status_code, duration_ms, input_tokens, output_tokens, cost_micros, NULLIF(error_code, '') FROM terminal_projection_outbox WHERE request_id = $3",
         )
         .bind(&event.event_id)
         .bind(event.event_at)
         .bind(&request_id)
         .execute(&mut *transaction)
+        .await?;
+        super::super::history_immutable_outbox::capture_event_in_transaction(
+            &mut transaction,
+            &event.event_id.to_string(),
+            event.event_at,
+        )
         .await?;
         let acknowledged = sqlx::query(
             "UPDATE terminal_projection_outbox SET projected_at = $1, statistics_outcome = $2, lease_owner = NULL, lease_expires_at = NULL WHERE request_id = $3 AND projected_at IS NULL AND lease_owner = $4 AND account_projected_at IS NOT NULL",
@@ -147,6 +255,11 @@ impl Database {
                 "terminal projection owner changed".into(),
             ));
         }
+        super::super::history_immutable_outbox::capture_native_in_transaction(
+            &mut transaction,
+            &request_id,
+        )
+        .await?;
         transaction.commit().await?;
         Ok(true)
     }

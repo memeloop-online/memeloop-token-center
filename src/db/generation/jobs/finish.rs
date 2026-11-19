@@ -26,6 +26,91 @@ impl Database {
         .await
     }
 
+    /// Persist terminal cost evidence before result validation or delivery can
+    /// fail. The task, lease and immutable customer price belong to this job;
+    /// a different receipt cannot replace the first one on retry/restart.
+    pub(crate) async fn record_generation_provider_receipt(
+        &self,
+        job_id: Uuid,
+        worker_id: &str,
+        receipt: &crate::model::GenerationProviderReceipt,
+    ) -> Result<(), AppError> {
+        if !matches!(receipt.status.as_str(), "SUCCESS" | "FAILURE")
+            || receipt.total_tokens.is_some_and(|v| v < 0)
+            || receipt.quota.is_some_and(|v| v < 0)
+            || receipt.supplier_usd_micros != receipt.quota.and_then(|v| v.checked_mul(2))
+            || receipt
+                .provider_model_name
+                .as_ref()
+                .is_some_and(|v| v.is_empty() || v.len() > 500)
+        {
+            return Err(AppError::BadRequest(
+                "invalid generation supplier receipt".into(),
+            ));
+        }
+        let mut tx = self.begin_write_transaction().await?;
+        let select = match self.backend {
+            DatabaseBackend::PostgreSql => {
+                "SELECT upstream_job_id, lease_owner, status, billing_unit_snapshot, micros_per_unit_snapshot, result_json FROM generation_jobs WHERE id = $1 FOR UPDATE"
+            }
+            DatabaseBackend::Sqlite => {
+                "SELECT upstream_job_id, lease_owner, status, billing_unit_snapshot, micros_per_unit_snapshot, result_json FROM generation_jobs WHERE id = $1"
+            }
+        };
+        let row = sqlx::query(select)
+            .bind(job_id.to_string())
+            .fetch_optional(&mut *tx)
+            .await?
+            .ok_or(AppError::NotFound)?;
+        if row
+            .try_get::<Option<String>, _>("upstream_job_id")?
+            .as_deref()
+            != Some(receipt.task_id.as_str())
+            || row.try_get::<String, _>("billing_unit_snapshot")? != "million_tokens"
+        {
+            return Err(AppError::Conflict(
+                "supplier receipt does not match generation task".into(),
+            ));
+        }
+        let expected = serde_json::json!({
+            "provider_usage": receipt,
+            "customer_price": {
+                "billing_unit": "million_tokens", "usage_unit": "token",
+                "micros_per_unit": row.try_get::<i64, _>("micros_per_unit_snapshot")?
+            }
+        });
+        let existing = row
+            .try_get::<Option<String>, _>("result_json")?
+            .map(|v| serde_json::from_str::<serde_json::Value>(&v))
+            .transpose()
+            .map_err(|_| AppError::internal("generation_receipt_json"))?;
+        if let Some(existing) = existing {
+            if existing.get("provider_usage") != expected.get("provider_usage")
+                || existing.get("customer_price") != expected.get("customer_price")
+            {
+                return Err(AppError::Conflict(
+                    "generation supplier receipt is immutable".into(),
+                ));
+            }
+        } else {
+            if row.try_get::<Option<String>, _>("lease_owner")?.as_deref() != Some(worker_id)
+                || !matches!(
+                    row.try_get::<String, _>("status")?.as_str(),
+                    "running" | "cancelling"
+                )
+            {
+                return Err(AppError::NotFound);
+            }
+            sqlx::query("UPDATE generation_jobs SET result_json = $1 WHERE id = $2")
+                .bind(expected.to_string())
+                .bind(job_id.to_string())
+                .execute(&mut *tx)
+                .await?;
+        }
+        tx.commit().await?;
+        Ok(())
+    }
+
     #[cfg(test)]
     pub(crate) async fn finish_generation_job_before_write_for_test<F>(
         &self,
@@ -152,10 +237,14 @@ impl Database {
             .try_get::<Option<String>, _>("staged_assets_json")?
             .map(|value| serde_json::from_str::<GenerationStagedAssets>(&value))
             .transpose()
-            .map_err(|_| AppError::Internal)?;
+            .map_err(|_| AppError::internal("finish_site_1"))?;
         let driver: String = job.try_get("driver")?;
         let estimated_units: i64 = job.try_get("estimated_units")?;
-        if input.billed_units > estimated_units {
+        let billing_unit: String = job.try_get("billing_unit_snapshot")?;
+        let unbounded_tokens = billing_unit == "million_tokens"
+            && estimated_units == 0
+            && job.try_get::<String, _>("enforcement_mode")? == "metered_unlimited";
+        if input.billed_units > estimated_units && !unbounded_tokens {
             return Err(AppError::BadRequest(
                 "generation billed units exceed the reserved estimate".into(),
             ));
@@ -193,15 +282,18 @@ impl Database {
             enforcement_mode: EnforcementMode::from_storage(
                 job.try_get::<String, _>("enforcement_mode")?.as_str(),
             )
-            .ok_or(AppError::Internal)?,
+            .ok_or(AppError::internal("finish_site_1"))?,
             reserved_micros: job.try_get("reserved_micros")?,
             input_micros_per_million: 0,
-            output_micros_per_million: if billing_unit == "megapixel" {
+            output_micros_per_million: if matches!(
+                billing_unit.as_str(),
+                "megapixel" | "million_tokens"
+            ) {
                 micros_per_unit
             } else {
                 micros_per_unit
                     .checked_mul(1_000_000)
-                    .ok_or(AppError::Internal)?
+                    .ok_or(AppError::internal("finish_site_2"))?
             },
             price_tiers: Vec::new(),
             rate_window_start: job.try_get("rate_window_start")?,
@@ -212,7 +304,7 @@ impl Database {
             ..TokenUsage::default()
         };
         let expected_cost_micros = price_token_usage(&reservation, &usage)?;
-        let result = if input.status == "succeeded" {
+        let mut result = if input.status == "succeeded" {
             Some(safe_generation_result(
                 input.job_id,
                 &driver,
@@ -224,11 +316,44 @@ impl Database {
         } else {
             None
         };
+        // Keep supplier evidence even when customer policy refunds a failed
+        // job (including unavailable assets and malformed terminal payloads).
+        let persisted_result = job
+            .try_get::<Option<String>, _>("result_json")?
+            .map(|v| serde_json::from_str::<serde_json::Value>(&v))
+            .transpose()
+            .map_err(|_| AppError::internal("generation_receipt_json"))?;
+        if billing_unit == "million_tokens"
+            && input.status == "succeeded"
+            && persisted_result.as_ref().is_none_or(|value| {
+                value
+                    .pointer("/provider_usage/total_tokens")
+                    .and_then(serde_json::Value::as_i64)
+                    != Some(input.billed_units)
+                    || value
+                        .pointer("/provider_usage/status")
+                        .and_then(serde_json::Value::as_str)
+                        != Some("SUCCESS")
+            })
+        {
+            return Err(AppError::Conflict(
+                "token settlement requires matching supplier usage".into(),
+            ));
+        }
+        if let Some(persisted) = persisted_result
+            .as_ref()
+            .filter(|v| v.get("provider_usage").is_some())
+        {
+            let result = result.get_or_insert_with(|| serde_json::json!({}));
+            for field in ["provider_usage", "customer_price"] {
+                result[field] = persisted[field].clone();
+            }
+        }
         let result_json = result
             .as_ref()
             .map(serde_json::to_string)
             .transpose()
-            .map_err(|_| AppError::Internal)?;
+            .map_err(|_| AppError::internal("finish_site_2"))?;
 
         if matches!(
             current_status.as_str(),
@@ -241,7 +366,7 @@ impl Database {
                 .as_deref()
                 .map(serde_json::from_str)
                 .transpose()
-                .map_err(|_| AppError::Internal)?;
+                .map_err(|_| AppError::internal("finish_site_3"))?;
             let existing_error_code: Option<String> = job.try_get("error_code")?;
             let reservation_status: String = job.try_get("reservation_status")?;
             let actual_micros: Option<i64> = job.try_get("actual_micros")?;
@@ -256,7 +381,7 @@ impl Database {
                     result.as_ref(),
                     input.job_id,
                     provider_assets,
-                    provider_key_material.ok_or(AppError::Internal)?,
+                    provider_key_material.ok_or(AppError::internal("finish_site_3"))?,
                 )?,
                 None => existing_result == result,
             };
@@ -287,7 +412,7 @@ impl Database {
             current_status.as_str(),
             "queued" | "running" | "submitting" | "cancelling"
         ) {
-            return Err(AppError::Internal);
+            return Err(AppError::internal("finish_site_4"));
         }
         let lease_owner: Option<String> = job.try_get("lease_owner")?;
         if lease_owner.as_deref() != Some(input.worker_id) {
@@ -309,7 +434,7 @@ impl Database {
             .staged_assets
             .map(serde_json::to_string)
             .transpose()
-            .map_err(|_| AppError::Internal)?;
+            .map_err(|_| AppError::internal("finish_site_5"))?;
         let updated = sqlx::query("UPDATE generation_jobs SET status = $1, billed_units = $2, cost_micros = $3, result_json = $4, error_code = $5, completed_at = $6, updated_at = $7, lease_owner = NULL, lease_expires_at = NULL, staged_assets_json = CASE WHEN $1 = 'succeeded' THEN staged_assets_json ELSE NULL END WHERE id = $8 AND lease_owner = $9 AND status IN ('queued', 'running', 'submitting', 'cancelling') AND ((staged_assets_json IS NULL AND $10 IS NULL) OR staged_assets_json = $10)")
             .bind(input.status)
             .bind(input.billed_units)
@@ -335,7 +460,7 @@ impl Database {
         .execute(&mut *transaction)
         .await?;
         if metadata_only.rows_affected() != 1 {
-            return Err(AppError::Internal);
+            return Err(AppError::internal("finish_site_4"));
         }
         if input.status == "succeeded" {
             insert_generation_assets_in_transaction(
@@ -398,9 +523,20 @@ impl Database {
         .bind(&request_id)
         .execute(&mut *transaction)
         .await?;
+        super::super::super::history_immutable_outbox::capture_event_in_transaction(
+            &mut transaction,
+            &event.event_id.to_string(),
+            event.event_at,
+        )
+        .await?;
         if inserted.rows_affected() != 1 {
-            return Err(AppError::Internal);
+            return Err(AppError::internal("finish_site_5"));
         }
+        super::super::super::history_immutable_outbox::capture_generation_in_transaction(
+            &mut transaction,
+            &request_id,
+        )
+        .await?;
         transaction.commit().await?;
         Ok(cost_micros)
     }
@@ -429,6 +565,8 @@ fn is_allowed_generation_error_code(error_code: &str) -> bool {
             | "siliconflow_video_asset_limit_exceeded"
             | "siliconflow_video_invalid_asset"
             | "wasu_wan_generation_failed"
+            | "tkmarket_video_generation_failed"
+            | "tkmarket_video_invalid_terminal"
             | "wasu_wan_invalid_usage"
             | "wasu_wan_missing_asset"
             | "wasu_wan_invalid_asset"
@@ -437,12 +575,12 @@ fn is_allowed_generation_error_code(error_code: &str) -> bool {
 }
 
 fn safe_generation_result(
-    job_id: Uuid,
+    _job_id: Uuid,
     driver: &str,
     billed_units: i64,
     assets: &[ArchivedGenerationAsset],
     provider_assets: Option<&[ProviderGenerationAsset]>,
-    provider_key_material: Option<&[u8]>,
+    _provider_key_material: Option<&[u8]>,
 ) -> Result<serde_json::Value, AppError> {
     let provider = match driver {
         "volcengine-seedance" => {
@@ -483,12 +621,8 @@ fn safe_generation_result(
                     })
                 })
                 .collect::<Vec<_>>();
-            let provider_reference = crate::generation::seal_provider_asset_reference(
-                "job",
-                job_id,
-                provider_assets,
-                provider_key_material.ok_or(AppError::Internal)?,
-            )?;
+            let provider_reference =
+                crate::generation::seal_provider_asset_reference(provider_assets)?;
             Ok(serde_json::json!({
                 "provider": provider,
                 "assets": assets,
@@ -504,9 +638,9 @@ fn safe_generation_result(
 fn provider_generation_result_matches(
     existing: Option<&serde_json::Value>,
     expected: Option<&serde_json::Value>,
-    job_id: Uuid,
+    _job_id: Uuid,
     provider_assets: &[ProviderGenerationAsset],
-    key_material: &[u8],
+    _key_material: &[u8],
 ) -> Result<bool, AppError> {
     let (Some(mut existing), Some(mut expected)) = (existing.cloned(), expected.cloned()) else {
         return Ok(false);
@@ -515,17 +649,16 @@ fn provider_generation_result_matches(
         .as_object_mut()
         .and_then(|value| value.remove("provider_reference"))
         .and_then(|value| value.as_str().map(str::to_owned))
-        .ok_or(AppError::Internal)?;
+        .ok_or(AppError::internal(
+            "finish_provider_generation_result_matches_1",
+        ))?;
     expected
         .as_object_mut()
         .and_then(|value| value.remove("provider_reference"))
-        .ok_or(AppError::Internal)?;
-    let existing_assets = crate::generation::open_provider_asset_reference(
-        "job",
-        job_id,
-        &existing_reference,
-        key_material,
-    )?;
+        .ok_or(AppError::internal(
+            "finish_provider_generation_result_matches_2",
+        ))?;
+    let existing_assets = crate::generation::open_provider_asset_reference(&existing_reference)?;
     Ok(existing == expected && existing_assets == provider_assets)
 }
 

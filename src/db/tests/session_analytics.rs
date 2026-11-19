@@ -14,6 +14,113 @@ use crate::{AppState, api, config::Config};
 const PEPPER: &[u8] = b"session candidate-first test pepper is long enough";
 
 #[test]
+fn unlinked_detail_pages_sources_before_spool_enrichment() {
+    let source = include_str!("../session_analytics.rs")
+        .split("async fn unlinked_session_detail(")
+        .nth(1)
+        .unwrap();
+    assert_eq!(
+        source
+            .matches("FROM (SELECT * FROM request_records")
+            .count(),
+        2
+    );
+    assert_eq!(
+        source
+            .matches("FROM (SELECT * FROM session_archive_unlinked_requests")
+            .count(),
+        2
+    );
+    for branch in source.split("FROM (SELECT * FROM request_records").skip(1) {
+        let bounded = branch
+            .split("LEFT JOIN request_archive_spools")
+            .next()
+            .unwrap();
+        assert!(bounded.contains("conversation_cluster_id IS NULL"));
+        assert!(bounded.contains("ORDER BY created_at DESC, id DESC LIMIT"));
+    }
+}
+
+#[tokio::test]
+async fn unlinked_bucket_keeps_identity_and_pages_mixed_sources_without_gaps() {
+    let directory = tempfile::tempdir().unwrap();
+    let db = Database::connect(&format!(
+        "sqlite://{}?mode=rwc",
+        directory.path().join("unlinked-page.db").display()
+    ))
+    .await
+    .unwrap();
+    db.migrate().await.unwrap();
+    let owner =
+        crate::db::requests::conversations::prefix_storage::tests::key(&db, "unlinked-pages").await;
+    let mut expected = Vec::new();
+    for index in 0..8_i64 {
+        let request_id = Uuid::from_u128(100 + index as u128);
+        let created_at = 1 + index / 3;
+        if index % 2 == 0 {
+            sqlx::query("INSERT INTO request_records (id,tenant_id,key_id,created_at,completed_at,protocol,model,status_code,duration_ms,input_tokens,output_tokens,cost_micros,request_object,response_object,reservation_id) VALUES ($1,$2,$3,$4,$4,'openai-responses','fixture',200,1,2,3,7,'memory://request','memory://response',$1)")
+                .bind(request_id.to_string()).bind(owner.tenant_id.to_string()).bind(owner.key_id.to_string()).bind(created_at)
+                .execute(&db.pool).await.unwrap();
+        } else {
+            sqlx::query("INSERT INTO session_archive_unlinked_requests (tenant_id,source,external_request_id,archive_request_id,key_id,principal_id,source_started_at,protocol,model,input_tokens,output_tokens,imported_at) VALUES ($1,'fixture',$2,$2,$3,$4,$5,'openai-responses','fixture',2,3,$5)")
+                .bind(owner.tenant_id.to_string()).bind(request_id.to_string()).bind(owner.key_id.to_string()).bind(owner.principal_id.to_string()).bind(created_at)
+                .execute(&db.pool).await.unwrap();
+        }
+        expected.push((created_at, request_id));
+    }
+    expected.sort_unstable();
+    expected.reverse();
+    let bucket = format!("unlinked:{}", owner.key_id);
+    let mut filter = ConversationDetailFilter {
+        limit: 3,
+        before_created_at: None,
+        before_request_id: None,
+    };
+    let mut actual = Vec::new();
+    for page in 0..3 {
+        let detail = db
+            .logical_session_detail(owner.tenant_id, owner.key_id, &bucket, filter.clone())
+            .await
+            .unwrap();
+        assert_eq!(detail.session_id, bucket);
+        assert!(detail.unlinked);
+        assert_eq!(detail.cluster_id, None);
+        assert!(detail.edges.is_empty());
+        assert!(detail.requests.iter().all(|request| {
+            request.unlinked
+                && request
+                    .request
+                    .session_context
+                    .as_ref()
+                    .is_some_and(|context| context.session_id.is_none())
+        }));
+        actual.extend(
+            detail
+                .requests
+                .iter()
+                .rev()
+                .map(|entry| (entry.request.created_at, entry.request.request_id)),
+        );
+        assert_eq!(detail.has_more, page < 2);
+        if let Some(cursor) = detail.next_cursor {
+            filter.before_created_at = Some(cursor.before_created_at);
+            filter.before_request_id = Some(cursor.before_request_id);
+        }
+    }
+    assert_eq!(actual, expected);
+    for (tenant, session) in [
+        (owner.tenant_id, format!("unlinked:{}", Uuid::now_v7())),
+        (Uuid::now_v7(), bucket),
+    ] {
+        assert!(matches!(
+            db.logical_session_detail(tenant, owner.key_id, &session, filter.clone())
+                .await,
+            Err(AppError::NotFound)
+        ));
+    }
+}
+
+#[test]
 fn candidate_first_dispatch_is_only_the_unfiltered_first_page() {
     use super::super::session_analytics::should_use_candidate_first_page;
 
@@ -125,6 +232,67 @@ async fn sqlite_operator_sessions_keep_a_stable_retired_credential_identity() {
     assert_eq!(sessions[0].key_id, key.key_id);
     assert_eq!(sessions[0].key_alias, "__retired_credential__");
     assert!(!sessions[0].key_alias.contains("API2"));
+
+    database
+        .request_session_title(key.tenant_id, key.key_id, cluster_id)
+        .await
+        .unwrap();
+    let title_job = database
+        .claim_session_title(Uuid::now_v7())
+        .await
+        .unwrap()
+        .unwrap();
+    database
+        .finish_session_title(&title_job, Some("Session reading diagnosis"), None)
+        .await
+        .unwrap();
+    let title_filter = LogicalSessionListFilter {
+        limit: 10,
+        state: "all".into(),
+        query: Some("session reading".into()),
+        ..Default::default()
+    };
+    let named = database
+        .operator_recent_sessions("retired-session-tenant", title_filter.clone())
+        .await
+        .unwrap();
+    assert_eq!(
+        named.len(),
+        1,
+        "generated titles participate in filtered session lists"
+    );
+    assert_eq!(
+        named[0].session_name.as_deref(),
+        Some("Session reading diagnosis")
+    );
+    let named_batch = database
+        .operator_session_summaries(
+            "retired-session-tenant",
+            &[(key.key_id, cluster_id.to_string())],
+            title_filter,
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        named_batch.len(),
+        1,
+        "realtime summary filtering uses the same generated-title search"
+    );
+    assert!(
+        database
+            .operator_recent_sessions(
+                "retired-session-tenant",
+                LogicalSessionListFilter {
+                    limit: 10,
+                    state: "all".into(),
+                    query: Some("unrelated title".into()),
+                    ..Default::default()
+                }
+            )
+            .await
+            .unwrap()
+            .is_empty()
+    );
 
     let detail = database
         .operator_logical_session_detail(

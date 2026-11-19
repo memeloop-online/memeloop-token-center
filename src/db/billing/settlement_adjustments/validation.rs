@@ -69,6 +69,7 @@ fn valid_namespace_part(value: &str) -> bool {
 }
 
 pub(super) fn request_hash(input: &ReconcileSettlementAdjustmentInput) -> Result<String, AppError> {
-    let canonical = serde_json::to_vec(input).map_err(|_| AppError::Internal)?;
+    let canonical =
+        serde_json::to_vec(input).map_err(|_| AppError::internal("validation_request_hash_1"))?;
     Ok(format!("{:x}", Sha256::digest(canonical)))
 }

@@ -23,8 +23,6 @@ struct Observation {
     completed: AtomicBool,
     final_response: AtomicBool,
     pending: Mutex<Pending>,
-    #[cfg(feature = "h2-attempt-binding")]
-    binding: Option<wreq_proto::ext::H2AttemptObserver>,
 }
 
 #[derive(Default)]
@@ -48,21 +46,6 @@ impl Observation {
         attempt.completed = self.completed.load(Ordering::Relaxed);
         attempt.final_response = self.final_response.load(Ordering::Relaxed);
         attempt.response_body_complete = self.response_body_complete.load(Ordering::Relaxed);
-        #[cfg(feature = "h2-attempt-binding")]
-        {
-            attempt.connection_binding = self
-                .binding
-                .as_ref()
-                .and_then(|observer| observer.snapshot())
-                .map(|binding| {
-                    serde_json::json!({
-                        "connection_id": binding.connection_id,
-                        "stream_id": binding.stream_id,
-                        "stream_ordinal": binding.stream_ordinal,
-                        "scope": "process_local_connection_not_wire_delivery"
-                    })
-                });
-        }
         attempt
     }
 
@@ -102,7 +85,7 @@ impl Observation {
     }
 }
 
-pub(super) struct AttemptRecorder(Arc<Observation>);
+pub(in crate::api::proxy) struct AttemptRecorder(Arc<Observation>);
 
 impl AttemptRecorder {
     pub(super) fn begin(
@@ -112,10 +95,8 @@ impl AttemptRecorder {
         identity: send_diagnostics::TransportIdentity,
         context: CodexAttemptContext,
         request_body: send_diagnostics::BodyConsumption,
-        http2_evidence: &send_diagnostics::Http2AttemptEvidence,
+        _http2_evidence: &send_diagnostics::Http2AttemptEvidence,
     ) -> Option<Self> {
-        #[cfg(not(feature = "h2-attempt-binding"))]
-        let _ = http2_evidence;
         let Some(selected) = selected else {
             state.routing_persistence.record_failure_gap();
             return None;
@@ -152,6 +133,52 @@ impl AttemptRecorder {
             response_body_complete: false,
             measurement_basis: "application_payload_estimate",
         };
+        Some(Self::from_attempt(state, attempt, request_body))
+    }
+
+    pub(in crate::api::proxy) fn begin_http(
+        state: &AppState,
+        route: &ResolvedUpstream,
+        request_id: Uuid,
+        outbound_attempt: usize,
+        selected: Option<SelectedEgress>,
+        request_body: send_diagnostics::BodyConsumption,
+    ) -> Option<Self> {
+        let Some(selected) = selected else {
+            state.routing_persistence.record_failure_gap();
+            return None;
+        };
+        let attempt = RequestEgressAttempt {
+            request_id,
+            attempt_id: Uuid::now_v7(),
+            outbound_attempt: outbound_attempt as i64,
+            connect_attempt: 1,
+            route_id: route.route_id,
+            upstream_account_id: route.account_id,
+            credential_generation: route.credential_generation,
+            transport_revision: route.transport_revision,
+            observed_at: chrono::Utc::now().timestamp_millis(),
+            selected,
+            transport: serde_json::json!({
+                "transport_family": "reqwest_no_retry",
+                "wire_delivery_state": "unknown"
+            }),
+            connection_binding: None,
+            request_payload_bytes: None,
+            response_payload_bytes: None,
+            completed: false,
+            final_response: false,
+            response_body_complete: false,
+            measurement_basis: "application_payload_estimate",
+        };
+        Some(Self::from_attempt(state, attempt, request_body))
+    }
+
+    fn from_attempt(
+        state: &AppState,
+        attempt: RequestEgressAttempt,
+        request_body: send_diagnostics::BodyConsumption,
+    ) -> Self {
         let recorder = Self(Arc::new(Observation {
             database: state.routing_persistence_db.clone(),
             queue: state.routing_persistence.clone(),
@@ -163,11 +190,9 @@ impl AttemptRecorder {
             completed: AtomicBool::new(false),
             final_response: AtomicBool::new(false),
             pending: Mutex::new(Pending::default()),
-            #[cfg(feature = "h2-attempt-binding")]
-            binding: http2_evidence.binding_observer(),
         }));
         recorder.0.submit();
-        Some(recorder)
+        recorder
     }
 
     fn finish(&self) {
@@ -192,7 +217,7 @@ impl FinalSelection {
     }
 }
 
-pub(super) fn observe_response(
+pub(in crate::api::proxy) fn observe_response(
     response: UpstreamResponse,
     recorder: Option<AttemptRecorder>,
 ) -> (UpstreamResponse, Option<FinalSelection>) {
@@ -200,6 +225,7 @@ pub(super) fn observe_response(
         return (response, None);
     };
     recorder.0.response_started.store(true, Ordering::Relaxed);
+    recorder.0.submit();
     let selection = FinalSelection(recorder.0.clone());
     let parts = response.into_parts();
     (

@@ -134,7 +134,7 @@ async fn require_members_tenant(
         "key_records" => {
             "SELECT COUNT(*) AS found FROM key_records WHERE tenant_id = $1 AND id IN "
         }
-        _ => return Err(AppError::Internal),
+        _ => return Err(AppError::internal("members_require_members_tenant_1")),
     };
     for chunk in ids.chunks(MEMBERSHIP_CHUNK_SIZE) {
         let sql = format!("{prefix}{}", placeholder_tuple(2, chunk.len()));
@@ -143,7 +143,10 @@ async fn require_members_tenant(
             query = query.bind(id.to_string());
         }
         let found: i64 = query.fetch_one(&mut **tx).await?.try_get("found")?;
-        if found != i64::try_from(chunk.len()).map_err(|_| AppError::Internal)? {
+        if found
+            != i64::try_from(chunk.len())
+                .map_err(|_| AppError::internal("members_require_members_tenant_1"))?
+        {
             return Err(AppError::NotFound);
         }
     }

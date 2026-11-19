@@ -74,17 +74,14 @@ export function summarizeVisibleRequests(requests: readonly RequestView[]): Visi
         cachedTokens += cachedInput;
       }
     }
-    // Local settlement amounts follow the shared displayed-cost policy: failed
-    // requests retain cost only when usage is provider-reported. The policy
-    // amount is only parsed when a currency is recorded, and totals stay grouped
-    // per currency.
     const currency = typeof request.currency === 'string' && request.currency.trim() ? request.currency : undefined;
-    if (currency) {
-      const cost = Number(requestDisplayedCost(request));
+    const displayedCost = requestDisplayedCost(request);
+    if (currency && displayedCost !== '') {
+      const cost = Number(displayedCost);
       if (Number.isFinite(cost)) localCosts.set(currency, (localCosts.get(currency) ?? 0) + cost);
     }
     const outcome = requestOutcome(request);
-    if (outcome === 'running' || outcome === 'delivering') {
+    if (outcome === 'running' || outcome === 'waiting_upstream' || outcome === 'reading_body' || outcome === 'delivering') {
       running += 1;
       continue;
     }
@@ -148,10 +145,11 @@ export function typedRequestQueryBody(tenant: string, ast: TypedFilterAst, befor
  */
 export function mergeRefreshedRequestPage(current: readonly RequestView[], refreshed: RequestListResponse, preserveOlder = false) {
   const cursor = refreshed.next_cursor;
-  if (!cursor || !preserveOlder) return refreshed.requests;
+  const observed = refreshed.requests.map(request => mergeRequestObservations(request, current.find(row => row.request_id === request.request_id)));
+  if (!cursor || !preserveOlder) return observed;
   const older = current.filter((request) => request.created_at < cursor.before_created_at
     || (request.created_at === cursor.before_created_at && request.request_id < cursor.before_id));
-  const merged = new Map(refreshed.requests.map((request) => [request.request_id, request]));
+  const merged = new Map(observed.map((request) => [request.request_id, request]));
   for (const request of older) merged.set(request.request_id, request);
   return [...merged.values()].sort((left, right) => right.created_at - left.created_at
     || right.request_id.localeCompare(left.request_id));
@@ -211,7 +209,7 @@ export function filtersActive(filters: RequestFilters) {
   return Object.values(filters).some(Boolean);
 }
 
-function mergeArchiveState(previous: RequestView['archive_state'], event: RequestEvent): RequestView['archive_state'] {
+function mergeArchiveState(previous: RequestView['archive_state'], event: Pick<RequestView, 'archive_state'>): RequestView['archive_state'] {
   const incoming = event.archive_state;
   // A REST snapshot can be newer than the event retained in liveEventsRef.
   // Archive terminal states are monotonic, and gap dominates bound when the
@@ -221,7 +219,7 @@ function mergeArchiveState(previous: RequestView['archive_state'], event: Reques
   return incoming;
 }
 
-function mergeSessionContext(previous: RequestView['session_context'], event: RequestEvent) {
+export function mergeSessionContext(previous: RequestView['session_context'], event: Pick<RequestEvent, 'session_context'>) {
   const incoming = event.session_context;
   // Confirmation is a one-way ownership projection. An older started or
   // unlinked event retained in the live map must not undo a newer REST
@@ -240,51 +238,104 @@ function mergeSessionContext(previous: RequestView['session_context'], event: Re
   return previous ?? incoming;
 }
 
+function preservesOperationalReceipt(incoming: Pick<RequestView, 'operational_terminal'>, previous?: RequestView): boolean {
+  const prior = previous?.operational_terminal;
+  const next = incoming.operational_terminal;
+  return !!prior && (!next || next.completed_at < prior.completed_at
+    || (next.completed_at === prior.completed_at && prior.financial_state === 'applied' && next.financial_state !== 'applied'));
+}
+
+const receiptFields = ['operational_terminal', 'completed_at', 'status_code', 'duration_ms',
+  'upstream_account_id', 'route_id', 'currency', 'input_tokens', 'cached_input_tokens',
+  'cache_write_tokens', 'output_tokens', 'cost', 'error_code', 'terminal_cause_code',
+  'first_output_ms', 'generation_duration_ms', 'usage_basis', 'in_flight_stage',
+  'supplier_error', 'failure_diagnostic'] as const;
+
+function observedValue<T>(value: T | undefined, previous: T | undefined, authoritative: boolean): T | undefined {
+  return value === undefined || (value === null && !authoritative) ? previous : value;
+}
+
+/** Transport and confirmed session observations may arrive after financial settlement.
+ * A sparse projection must not erase observations already displayed. */
+export function mergeRequestObservations<T extends RequestView>(incoming: T, previous?: RequestView, authority: Pick<RequestView, 'operational_terminal' | 'status_code'> = incoming): T {
+  const incomingEgress = incoming.egress;
+  const previousEgress = previous?.egress;
+  const egress = incomingEgress && previousEgress
+    && typeof incomingEgress.observed_at === 'number' && typeof previousEgress.observed_at === 'number'
+    && incomingEgress.observed_at < previousEgress.observed_at
+    ? previousEgress : incomingEgress ?? previousEgress;
+  const session = mergeSessionContext(previous?.session_context, incoming);
+  const request = { ...incoming };
+  const sparseLegacyTerminal = !authority.operational_terminal && previous?.status_code != null && authority.status_code == null;
+  if (previous && (preservesOperationalReceipt(authority, previous) || sparseLegacyTerminal)) {
+    for (const field of receiptFields) {
+      if (field in previous) Object.assign(request, { [field]: previous[field] });
+      else Reflect.deleteProperty(request, field);
+    }
+  }
+  return {
+    ...request,
+    archive_state: mergeArchiveState(previous?.archive_state ?? incoming.archive_state, incoming),
+    ...(egress !== undefined ? { egress } : {}),
+    ...(session !== undefined ? { session_context: session } : {}),
+  };
+}
+
 export function requestViewFromEvent(event: RequestEvent, previous?: RequestView): RequestView | undefined {
   // A terminal event's time is not its receipt time. Retained legacy events
   // without a request record must wait for history rather than invent a date.
   const createdAt = event.created_at ?? previous?.created_at
     ?? (event.event_kind === 'started' ? event.event_at : undefined);
   if (createdAt === undefined) return previous;
-  // Replayed starts must not regress an authoritative terminal history row.
-  if (event.event_kind === 'started' && previous?.status_code != null) return previous;
+  const authoritative = event.operational_terminal != null;
   const request: RequestView = {
     ...previous,
     request_id: event.request_id,
     created_at: createdAt,
-    completed_at: event.completed_at ?? previous?.completed_at,
-    upstream_account_id: event.upstream_account_id ?? previous?.upstream_account_id,
-    route_id: event.route_id ?? previous?.route_id,
-    currency: event.currency ?? previous?.currency,
+    completed_at: observedValue(event.completed_at, previous?.completed_at, authoritative),
+    upstream_account_id: observedValue(event.upstream_account_id, previous?.upstream_account_id, authoritative),
+    route_id: observedValue(event.route_id, previous?.route_id, authoritative),
+    currency: observedValue(event.currency, previous?.currency, authoritative),
     protocol: event.protocol,
     model: event.model,
     status_code: event.status_code,
     duration_ms: event.duration_ms,
     input_tokens: event.input_tokens,
-    cached_input_tokens: event.cached_input_tokens ?? previous?.cached_input_tokens,
-    cache_write_tokens: event.cache_write_tokens ?? previous?.cache_write_tokens,
+    cached_input_tokens: observedValue(event.cached_input_tokens, previous?.cached_input_tokens, authoritative),
+    cache_write_tokens: observedValue(event.cache_write_tokens, previous?.cache_write_tokens, authoritative),
     output_tokens: event.output_tokens,
     cost: event.cost,
     error_code: event.error_code,
-    terminal_cause_code: event.terminal_cause_code ?? previous?.terminal_cause_code ?? null,
+    terminal_cause_code: observedValue(event.terminal_cause_code, previous?.terminal_cause_code, authoritative) ?? null,
     archive_state: mergeArchiveState(previous?.archive_state, event),
     session_context: mergeSessionContext(previous?.session_context, event),
   };
-  const supplierError = event.supplier_error ?? previous?.supplier_error;
+  const inFlightStage = observedValue(event.in_flight_stage, previous?.in_flight_stage, authoritative);
+  if (inFlightStage !== undefined) request.in_flight_stage = inFlightStage;
+  if (event.operational_terminal !== undefined) request.operational_terminal = event.operational_terminal;
+  const supplierError = observedValue(event.supplier_error, previous?.supplier_error, authoritative);
   if (supplierError !== undefined || event.supplier_error === null) request.supplier_error = supplierError ?? null;
-  const failureDiagnostic = event.failure_diagnostic ?? previous?.failure_diagnostic;
+  const failureDiagnostic = observedValue(event.failure_diagnostic, previous?.failure_diagnostic, authoritative);
   if (failureDiagnostic !== undefined || event.failure_diagnostic === null) request.failure_diagnostic = failureDiagnostic ?? null;
-  const credentialIdentity = event.credential_identity ?? previous?.credential_identity;
-  const firstOutput = event.first_output_ms ?? previous?.first_output_ms;
-  const generationDuration = event.generation_duration_ms ?? previous?.generation_duration_ms;
+  const credentialIdentity = observedValue(event.credential_identity, previous?.credential_identity, authoritative);
+  const firstOutput = observedValue(event.first_output_ms, previous?.first_output_ms, authoritative);
+  const generationDuration = observedValue(event.generation_duration_ms, previous?.generation_duration_ms, authoritative);
   if (firstOutput !== undefined) request.first_output_ms = firstOutput;
   if (generationDuration !== undefined) request.generation_duration_ms = generationDuration;
-  const compaction = event.compaction ?? previous?.compaction;
+  const compaction = observedValue(event.compaction, previous?.compaction, authoritative);
   if (compaction !== undefined) request.compaction = compaction;
   const usageBasis = event.usage_basis === undefined ? previous?.usage_basis : event.usage_basis;
   if (usageBasis !== undefined) request.usage_basis = usageBasis;
   if (credentialIdentity !== undefined) request.credential_identity = credentialIdentity;
-  return request;
+  // Absence in a partial delta means unchanged. Explicit null remains a value
+  // from the authoritative producer, rather than an absent property.
+  if (previous) {
+    for (const field of ['protocol', 'model', 'status_code', 'duration_ms', 'input_tokens',
+      'output_tokens', 'cost', 'error_code'] as const) {
+      if (event[field] === undefined) Object.assign(request, { [field]: previous[field] });
+    }
+  }
+  return mergeRequestObservations({ ...request, ...(event.egress !== undefined ? { egress: event.egress } : {}) }, previous, event);
 }
 
 export function mergeLiveRequestEvents(

@@ -12,6 +12,7 @@ use std::{
 mod codex;
 pub(crate) mod memory_admission;
 pub(crate) mod plugin_execution;
+pub(crate) mod upstream_concurrency;
 
 pub(crate) use codex::{CodexBadRequestClassification, CodexBadRequestRetry};
 
@@ -39,6 +40,7 @@ pub struct Metrics {
 }
 
 struct MetricsInner {
+    concurrency: upstream_concurrency::Observer,
     memory_admission: memory_admission::Counters,
     plugin_execution: plugin_execution::Counters,
     proxy_memory_rejections: [AtomicU64; 6],
@@ -69,6 +71,7 @@ struct MetricsInner {
 impl Default for MetricsInner {
     fn default() -> Self {
         Self {
+            concurrency: upstream_concurrency::Observer::default(),
             memory_admission: memory_admission::Counters::default(),
             plugin_execution: plugin_execution::Counters::default(),
             proxy_memory_rejections: std::array::from_fn(|_| AtomicU64::new(0)),
@@ -476,6 +479,14 @@ impl Metrics {
     ) {
         self.inner.plugin_execution.observe(phase, outcome);
     }
+    pub(crate) fn start_upstream_concurrency(&self, database: crate::db::Database) {
+        self.inner.concurrency.start(database);
+    }
+
+    pub(crate) fn upstream_concurrency_snapshot(&self, tenant: Option<&str>) -> serde_json::Value {
+        self.inner.concurrency.snapshot(tenant)
+    }
+
     pub fn process_runtime_metrics(&self) -> ProcessRuntimeMetrics {
         process_runtime_metrics(self.inner.process_started)
     }
@@ -529,6 +540,7 @@ impl Metrics {
         self.inner.proxy_memory_rejections[stage as usize].fetch_add(1, Ordering::Relaxed);
     }
 
+    #[cfg(test)]
     pub(crate) fn record_request_archive_gap(&self, reason: RequestArchiveGapReason) {
         self.inner.request_archive_gaps[reason.index()].fetch_add(1, Ordering::Relaxed);
     }
@@ -542,19 +554,21 @@ impl Metrics {
             .fetch_add(1, Ordering::Relaxed);
     }
 
-    pub(crate) fn proxy_memory_wait(
-        &self,
-        stage: memory_admission::Stage,
-    ) -> memory_admission::WaitGuard {
-        self.inner.memory_admission.wait(stage)
-    }
-
     pub(crate) fn observe_proxy_memory_error(
         &self,
         stage: ProxyMemoryRejectionStage,
         error: crate::error::AppError,
     ) -> crate::error::AppError {
-        if matches!(&error, crate::error::AppError::Overloaded) {
+        let memory_rejection = match &error {
+            crate::error::AppError::Overloaded => true,
+            crate::error::AppError::Capacity { code, .. } => {
+                code.starts_with("proxy_memory")
+                    || *code == "upstream_response_memory_capacity"
+                    || *code == "response_archive_too_large"
+            }
+            _ => false,
+        };
+        if memory_rejection {
             self.record_proxy_memory_rejection(stage);
         }
         error
@@ -919,7 +933,8 @@ pub struct DatabaseRuntimeMetrics {
 pub struct RuntimeMetrics {
     pub database: Option<DatabaseRuntimeMetrics>,
     pub request_event_streams: usize,
-    pub gateway_body_rejections: [[u64; 3]; 4],
+    pub gateway_body_rejections: [[u64; crate::gateway_body::GATEWAY_BODY_REJECTION_REASON_COUNT];
+        crate::gateway_body::GATEWAY_BODY_ROUTE_CLASS_COUNT],
     pub proxy_memory_used_bytes: usize,
     pub proxy_memory_limit_bytes: usize,
     pub retained_request_memory_used_bytes: usize,
@@ -927,8 +942,6 @@ pub struct RuntimeMetrics {
     pub gateway_body_reads: usize,
     pub responses_request_spools: usize,
     pub responses_request_spool_used_bytes: usize,
-    pub responses_request_spool_limit_bytes: usize,
-    pub responses_request_spool_capacity_rejections: u64,
     pub proxy_lifecycles: usize,
     pub proxy_archive_streams: usize,
     pub plugin_cache_entries: usize,
@@ -1186,28 +1199,13 @@ fn render_runtime(output: &mut String, runtime: &RuntimeMetrics) {
         }
     }
     output.push_str(
-        "# HELP memeloop_token_center_request_spool_bytes Process-local node-disk request spool bytes.\n",
+        "# HELP memeloop_token_center_request_spool_bytes Bytes retained in memory for live request uploads.\n",
     );
     output.push_str("# TYPE memeloop_token_center_request_spool_bytes gauge\n");
     let _ = writeln!(
         output,
         "memeloop_token_center_request_spool_bytes{{measure=\"used\"}} {}",
         runtime.responses_request_spool_used_bytes
-    );
-    let _ = writeln!(
-        output,
-        "memeloop_token_center_request_spool_bytes{{measure=\"limit\"}} {}",
-        runtime.responses_request_spool_limit_bytes
-    );
-    output.push_str(
-        "# HELP memeloop_token_center_request_spool_capacity_rejections_total Responses request spools rejected by the fixed process-local disk budget.\n",
-    );
-    output
-        .push_str("# TYPE memeloop_token_center_request_spool_capacity_rejections_total counter\n");
-    let _ = writeln!(
-        output,
-        "memeloop_token_center_request_spool_capacity_rejections_total {}",
-        runtime.responses_request_spool_capacity_rejections
     );
     output.push_str("# HELP memeloop_token_center_proxy_memory_bytes Actual weighted memory admission permits by fixed pool and measure.\n");
     output.push_str("# TYPE memeloop_token_center_proxy_memory_bytes gauge\n");
@@ -1799,8 +1797,6 @@ mod tests {
         let rendered = Metrics::default().render(&RuntimeMetrics {
             responses_request_spools: 2,
             responses_request_spool_used_bytes: 25_788_305,
-            responses_request_spool_limit_bytes: 134_217_728,
-            responses_request_spool_capacity_rejections: 3,
             ..RuntimeMetrics::default()
         });
         assert!(rendered.contains(
@@ -1810,13 +1806,8 @@ mod tests {
             rendered
                 .contains("memeloop_token_center_request_spool_bytes{measure=\"used\"} 25788305")
         );
-        assert!(
-            rendered
-                .contains("memeloop_token_center_request_spool_bytes{measure=\"limit\"} 134217728")
-        );
-        assert!(
-            rendered.contains("memeloop_token_center_request_spool_capacity_rejections_total 3")
-        );
+        assert!(!rendered.contains("request_spool_bytes{measure=\"limit\"}"));
+        assert!(!rendered.contains("request_spool_capacity_rejections_total"));
     }
 
     #[test]
@@ -1846,8 +1837,13 @@ mod tests {
                     metrics.observe_proxy_memory_error(stage, crate::error::AppError::Overloaded);
                 assert!(matches!(error, crate::error::AppError::Overloaded));
             }
-            let error = metrics.observe_proxy_memory_error(stage, crate::error::AppError::Internal);
-            assert!(matches!(error, crate::error::AppError::Internal));
+            let error = metrics.observe_proxy_memory_error(
+                stage,
+                crate::error::AppError::internal(
+                    "metrics_memory_rejection_stages_render_exactly_six_fixed_series",
+                ),
+            );
+            assert!(matches!(error, crate::error::AppError::Internal { .. }));
         }
         assert_eq!(
             series(&metrics),

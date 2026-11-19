@@ -32,7 +32,11 @@ test('sessions are a first-class operator route and all page keys are explicit',
   assert.match(operator, /case 'tenants': page = <IdentityPage tab="tenants"/);
   assert.match(operator, /case 'service-credentials': page = <IdentityPage tab="service-credentials"/);
   assert.match(operator, /case 'proxy-groups': page = <ProxyGroupsPage/);
-  assert.doesNotMatch(operator, /trafficMode|onModeChange/);
+  // Requests and generations share one RequestWorkspace; its mode switch only
+  // navigates between those two routes, so sessions keep an independent page.
+  assert.match(operator, /case 'requests':/);
+  assert.match(operator, /case 'generations': page = <RequestWorkspace mode=\{activeRoute === 'generations' \? 'generations' : 'requests'\}/);
+  assert.match(operator, /onModeChange=\{\(mode\) => navigate\(mode\)\}/);
 });
 
 test('credential authentication discovers only tenants before a page mounts', () => {
@@ -58,14 +62,11 @@ test('mutation scopes remain explicit and shared local filters retain their pref
 });
 
 test('request filters use current scoped routing metadata without upstream model enumeration', () => {
-  assert.match(requestsPage, /<TypedFilterBuilder ast=\{filters\} disabled=\{loading\} onApply=\{onApply\} onClear=\{onClear\} scope="requests" token=\{token\} tenant=\{tenant\} upstreams=\{upstreams\} \/>/);
-  assert.match(typedFilterBuilder, /api<ModelRouteView\[\]>\(`\/internal\/v1\/model-routes\?\$\{params\}`/);
-  assert.match(typedFilterBuilder, /loadFilterModelRoutes/);
-  assert.match(typedFilterBuilder, /limit: String\(filterModelPageSize\)/);
-  assert.match(typedFilterBuilder, /params\.set\('tenant_external_id', tenant\)/);
-  assert.match(typedFilterBuilder, /params\.set\('before_created_at', String\(cursor\.created_at\)\)/);
-  assert.match(typedFilterBuilder, /params\.set\('before_id', cursor\.id\)/);
-  assert.match(typedFilterBuilder, /routeModelOptions\(routes, upstreams, groups/);
+  // Only a missing token disables the filter builder; an in-flight query keeps
+  // the current filters editable so a follow-up search can be prepared.
+  assert.match(requestsPage, /<TypedFilterBuilder ast=\{filters\} disabled=\{!token\.trim\(\)\} onApply=\{onApply\} onClear=\{onClear\} scope="requests" token=\{token\} tenant=\{tenant\} upstreams=\{upstreams\} \/>/);
+  assert.doesNotMatch(typedFilterBuilder, /loadFilterModelRoutes|routeModelOptions|api<ModelRouteView/);
+  assert.match(typedFilterBuilder, /groupBy="none"/);
   assert.match(typedFilterBuilder, /<ModelPicker/);
   assert.doesNotMatch(typedFilterBuilder, /\/internal\/v1\/upstream-models/);
   assert.match(typedFilterBuilder, /upstreams\.filter\(\(account\) => account\.status === 'active'\)\.map\(\(account\) => <option value=\{account\.id\}/);

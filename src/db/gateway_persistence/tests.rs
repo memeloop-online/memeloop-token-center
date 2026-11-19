@@ -14,6 +14,186 @@ struct Fixture {
 
 const PEPPER: &[u8] = b"gateway-persistence-acceptance-pepper-over-32-bytes";
 
+/// Delay only the TCP startup. Real PostgreSQL still performs authentication,
+/// session initialization and queries, including after a forced reconnect.
+struct DelayedPostgres {
+    url: url::Url,
+    task: tokio::task::JoinHandle<()>,
+}
+
+impl DelayedPostgres {
+    async fn new() -> Self {
+        let database_url = std::env::var("MTC_TEST_POSTGRES_URL")
+            .expect("archive pool regression requires the CI PostgreSQL service");
+        let mut url = url::Url::parse(&database_url).unwrap();
+        let host = url.host_str().unwrap().to_owned();
+        let port = url.port().unwrap_or(5432);
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        url.set_host(Some("127.0.0.1")).unwrap();
+        url.set_port(Some(listener.local_addr().unwrap().port()))
+            .unwrap();
+        let task = tokio::spawn(async move {
+            let mut connections = tokio::task::JoinSet::new();
+            loop {
+                let (mut client, _) = listener.accept().await.unwrap();
+                let host = host.clone();
+                connections.spawn(async move {
+                    let mut server = tokio::net::TcpStream::connect((host.as_str(), port))
+                        .await
+                        .unwrap();
+                    tokio::time::sleep(Duration::from_millis(350)).await;
+                    let _ = tokio::io::copy_bidirectional(&mut client, &mut server).await;
+                });
+            }
+        });
+        Self { url, task }
+    }
+}
+
+impl Drop for DelayedPostgres {
+    fn drop(&mut self) {
+        self.task.abort();
+    }
+}
+
+#[tokio::test]
+async fn postgres_archive_pool_cold_reconnect_and_wait_preserve_session_policy() {
+    let proxy = DelayedPostgres::new().await;
+    sqlx::any::install_default_drivers();
+    let persistence =
+        GatewayPersistence::new(proxy.url.as_str(), DatabaseBackend::PostgreSql).unwrap();
+    assert_eq!(persistence.pool.options().get_max_connections(), 1);
+    assert_eq!(persistence.pool.size(), 0, "the pool remains lazy");
+    for _ in 0..2 {
+        let started = tokio::time::Instant::now();
+        let mut connection = persistence.pool.acquire().await.unwrap();
+        assert!(started.elapsed() >= Duration::from_millis(350));
+        for (setting, expected) in [
+            ("statement_timeout", "0"),
+            ("lock_timeout", "0"),
+            ("idle_in_transaction_session_timeout", "30s"),
+            ("client_connection_check_interval", "1s"),
+        ] {
+            let value: String = sqlx::query_scalar("SELECT current_setting($1)")
+                .bind(setting)
+                .fetch_one(&mut *connection)
+                .await
+                .unwrap();
+            assert_eq!(value, expected);
+        }
+        // A healthy statement above the old 250ms limit must finish.
+        sqlx::raw_sql("SELECT pg_sleep(0.35)")
+            .execute(&mut *connection)
+            .await
+            .unwrap();
+        let pid: i32 = sqlx::query_scalar("SELECT pg_backend_pid()")
+            .fetch_one(&mut *connection)
+            .await
+            .unwrap();
+        let (waiting, ()) = tokio::join!(persistence.pool.acquire(), async {
+            tokio::time::sleep(Duration::from_millis(350)).await;
+            connection.finish();
+        });
+        let mut reused = waiting.unwrap();
+        assert_eq!(
+            sqlx::query_scalar::<_, i32>("SELECT pg_backend_pid()")
+                .fetch_one(&mut *reused)
+                .await
+                .unwrap(),
+            pid,
+            "waiting for metadata must reuse the connection, not grow the pool"
+        );
+        reused.close().await.unwrap();
+    }
+    persistence.pool.close().await;
+}
+
+#[tokio::test]
+async fn source_metadata_waits_past_two_seconds_without_cancellation_or_replay() {
+    let fixture =
+        Database::with_source_pool_timeout_for_test(Duration::from_secs(10), Fixture::new()).await;
+    let request_id = Uuid::new_v4();
+    let locator =
+        crate::gateway_body::request_spool::request_body_object_key(&request_id.to_string())
+            .unwrap();
+    let body = b"{\"input\":\"metadata queue must not cancel a transaction\"}";
+    let digest = *blake3::hash(body).as_bytes();
+    let reservation = fixture
+        .database
+        .start_proxy_forwarding_request_with_output_limit(
+            StartProxyRequest {
+                request_id,
+                key: &fixture.key,
+                price: &fixture.price,
+                input_token_ceiling: 7,
+                output_token_ceiling: 11,
+                protocol: "openai",
+                model: "isolation",
+                request_object: &locator,
+                upstream_account_id: None,
+                model_route_id: None,
+            },
+            None,
+            Some(11),
+        )
+        .await
+        .unwrap();
+    let identity = ArchiveSpoolIdentity {
+        request_id,
+        tenant_id: fixture.key.tenant_id,
+        reservation_id: reservation.id,
+    };
+    let held = fixture
+        .database
+        .hold_gateway_archive_connection_for_test()
+        .await;
+    let pending = fixture.database.persist_request_source(
+        identity,
+        &locator,
+        body.len(),
+        digest,
+        Some(true),
+        false,
+    );
+    let (result, ()) = tokio::join!(pending, async {
+        tokio::time::sleep(Duration::from_millis(2200)).await;
+        drop(held);
+    });
+    assert_eq!(result, Some(true), "the first attempt must reach COMMIT");
+    assert_eq!(fixture.database.request_source_write_failures_for_test(), 0);
+    assert_eq!(
+        fixture
+            .database
+            .persist_request_source(identity, &locator, body.len(), digest, Some(true), false)
+            .await,
+        Some(false),
+        "a completed staging attempt must not be replayed"
+    );
+    let row = sqlx::query("SELECT state, bound_locator, body_byte_count, body_blake3 FROM request_archive_spools WHERE request_id = $1")
+        .bind(request_id.to_string()).fetch_one(&fixture.database.pool).await.unwrap();
+    assert_eq!(row.get::<String, _>("state"), "bound");
+    assert_eq!(row.get::<String, _>("bound_locator"), locator);
+    assert_eq!(row.get::<i64, _>("body_byte_count"), body.len() as i64);
+    assert_eq!(
+        row.get::<String, _>("body_blake3"),
+        blake3::hash(body).to_hex().to_string()
+    );
+    assert_eq!(
+        sqlx::query_scalar::<_, i64>("SELECT COUNT(*) FROM request_events WHERE request_id = $1 AND event_kind = 'archive_bound'")
+            .bind(request_id.to_string()).fetch_one(&fixture.database.pool).await.unwrap(),
+        1
+    );
+    assert_eq!(
+        sqlx::query_scalar::<_, String>("SELECT status FROM usage_reservations WHERE id = $1")
+            .bind(reservation.id.to_string())
+            .fetch_one(&fixture.database.pool)
+            .await
+            .unwrap(),
+        "reserved",
+        "optional metadata must not change financial responsibility"
+    );
+}
+
 impl Fixture {
     async fn new() -> Self {
         let directory = tempfile::tempdir().unwrap();
@@ -91,6 +271,329 @@ impl Fixture {
             .fetch_one(&self.database.pool).await.unwrap();
         assert_eq!(count, 1);
     }
+
+    fn archive_database(&self) -> Database {
+        let mut database = self.database.clone();
+        database.pool = self.database.gateway_persistence.pool.clone();
+        database.pool_role = "gateway_archive";
+        database
+    }
+
+    async fn wait_for_busy_retry(&self) {
+        tokio::time::timeout(Duration::from_secs(1), async {
+            while self
+                .database
+                .gateway_persistence
+                .busy_retries
+                .load(Ordering::Relaxed)
+                == 0
+            {
+                tokio::time::sleep(Duration::from_millis(1)).await;
+            }
+        })
+        .await
+        .expect("the real competing SQLite writer must cause a BEGIN retry");
+    }
+}
+
+#[tokio::test]
+async fn sqlite_busy_begin_recovers_without_replaying_capture_or_capacity_reservation() {
+    let fixture = Fixture::new().await;
+    sqlx::raw_sql(
+        "CREATE TABLE reservation_audit (request_id TEXT NOT NULL);
+         CREATE TRIGGER audit_reservation AFTER INSERT ON archive_budget_reservations
+         BEGIN INSERT INTO reservation_audit VALUES (NEW.request_id); END;",
+    )
+    .execute(&fixture.database.pool)
+    .await
+    .unwrap();
+    let request_id = Uuid::new_v4();
+    let (entered, release, _registration) =
+        crate::response_archive_spool::scoped_request_preseal_pause_for_test(request_id);
+    let admitted = fixture.admit(request_id).await.unwrap();
+    assert_eq!(admitted.archive_admission, RequestArchiveAdmission::Queued);
+    tokio::time::timeout(Duration::from_secs(1), entered)
+        .await
+        .unwrap()
+        .unwrap();
+    let held = fixture.database.begin_write_transaction().await.unwrap();
+    release.send(()).unwrap();
+    fixture.wait_for_busy_retry().await;
+    held.rollback().await.unwrap();
+    fixture.database.drain_gateway_persistence_for_test().await;
+
+    let metrics = fixture.database.gateway_persistence_metrics();
+    assert!(metrics.contains("request_persistence_total{outcome=\"accepted\"} 1\n"));
+    assert!(metrics.contains("request_persistence_total{outcome=\"failed\"} 0\n"));
+    assert!(metrics.contains("request_persistence_total{outcome=\"capacity\"} 0\n"));
+    assert!(metrics.contains("request_persistence_jobs 0\n"));
+    assert!(metrics.contains("request_persistence_bytes 0\n"));
+    for statement in [
+        "SELECT COUNT(*) FROM reservation_audit",
+        "SELECT COUNT(*) FROM request_archive_spools WHERE state = 'pending'",
+        "SELECT COUNT(*) FROM request_archive_spool_chunks",
+        "SELECT COUNT(*) FROM request_events WHERE event_kind = 'started'",
+    ] {
+        assert_eq!(
+            sqlx::query_scalar::<_, i64>(statement)
+                .fetch_one(&fixture.database.pool)
+                .await
+                .unwrap(),
+            1,
+            "{statement}"
+        );
+    }
+    assert_eq!(
+        sqlx::query_scalar::<_, i64>("SELECT COUNT(*) FROM archive_budget_reservations")
+            .fetch_one(&fixture.database.pool)
+            .await
+            .unwrap(),
+        0
+    );
+    let stored: i64 = sqlx::query_scalar("SELECT cipher_bytes FROM request_archive_spools")
+        .fetch_one(&fixture.database.pool)
+        .await
+        .unwrap();
+    let budget: (i64, i64) = sqlx::query_as(
+        "SELECT cipher_bytes, request_cipher_bytes FROM response_archive_spool_budget WHERE singleton = 1",
+    )
+    .fetch_one(&fixture.database.pool)
+    .await
+    .unwrap();
+    assert!(stored > 0);
+    assert_eq!(budget, (stored, stored));
+}
+
+#[tokio::test]
+async fn sqlite_busy_retry_keeps_the_original_queued_job_deadline_and_reports_failure() {
+    let fixture = Fixture::new().await;
+    let writer = fixture
+        .database
+        .gateway_persistence
+        .writer
+        .acquire()
+        .await
+        .unwrap();
+    let started = tokio::time::Instant::now();
+    let request_id = Uuid::new_v4();
+    fixture.admit(request_id).await.unwrap();
+    tokio::time::sleep(JOB_TIMEOUT * 3 / 4).await;
+    let held = fixture.database.begin_write_transaction().await.unwrap();
+    drop(writer);
+    fixture.wait_for_busy_retry().await;
+    tokio::time::timeout_at(
+        started + JOB_TIMEOUT + Duration::from_secs(1),
+        fixture.database.drain_gateway_persistence_for_test(),
+    )
+    .await
+    .expect("BEGIN retry must not restart the queued job's two-second deadline");
+    held.rollback().await.unwrap();
+    fixture.assert_reserved(request_id).await;
+    let metrics = fixture.database.gateway_persistence_metrics();
+    assert!(metrics.contains("request_persistence_total{outcome=\"failed\"} 1\n"));
+    assert!(metrics.contains("request_persistence_jobs 0\n"));
+    assert!(metrics.contains("request_persistence_bytes 0\n"));
+    for statement in [
+        "SELECT COUNT(*) FROM archive_budget_reservations",
+        "SELECT COUNT(*) FROM request_archive_spools",
+        "SELECT cipher_bytes FROM response_archive_spool_budget WHERE singleton = 1",
+        "SELECT request_cipher_bytes FROM response_archive_spool_budget WHERE singleton = 1",
+    ] {
+        assert_eq!(
+            sqlx::query_scalar::<_, i64>(statement)
+                .fetch_one(&fixture.database.pool)
+                .await
+                .unwrap(),
+            0
+        );
+    }
+}
+
+#[tokio::test]
+async fn cancelled_busy_begin_releases_the_optional_connection_without_late_writes() {
+    let fixture = Fixture::new().await;
+    let archive = fixture.archive_database();
+    let held = fixture.database.begin_write_transaction().await.unwrap();
+    let deadline = tokio::time::Instant::now() + JOB_TIMEOUT;
+    let owner = archive.gateway_persistence.clone();
+    let pending = tokio::spawn(ARCHIVE_DEADLINE.scope((owner, deadline), async move {
+        archive.begin_write_transaction().await
+    }));
+    fixture.wait_for_busy_retry().await;
+    pending.abort();
+    match pending.await {
+        Err(error) => assert!(error.is_cancelled()),
+        Ok(_) => panic!("the blocked BEGIN must be cancelled"),
+    }
+    held.rollback().await.unwrap();
+    let archive = fixture.archive_database();
+    let transaction =
+        tokio::time::timeout(Duration::from_secs(1), archive.begin_write_transaction())
+            .await
+            .expect("cancelled BEGIN must return its only pool connection")
+            .unwrap();
+    transaction.rollback().await.unwrap();
+}
+
+#[tokio::test]
+async fn cancellation_after_begin_rolls_back_without_replaying_the_transaction() {
+    let fixture = Fixture::new().await;
+    sqlx::query("CREATE TABLE cancellation_probe (value INTEGER NOT NULL)")
+        .execute(&fixture.database.pool)
+        .await
+        .unwrap();
+    let archive = fixture.archive_database();
+    let deadline = tokio::time::Instant::now() + JOB_TIMEOUT;
+    let owner = archive.gateway_persistence.clone();
+    let (entered, ready) = tokio::sync::oneshot::channel();
+    let pending = tokio::spawn(ARCHIVE_DEADLINE.scope((owner, deadline), async move {
+        let mut transaction = archive.begin_write_transaction().await.unwrap();
+        sqlx::query("INSERT INTO cancellation_probe VALUES (1)")
+            .execute(&mut *transaction)
+            .await
+            .unwrap();
+        entered.send(()).unwrap();
+        std::future::pending::<()>().await;
+        transaction.commit().await
+    }));
+    tokio::time::timeout(Duration::from_secs(1), ready)
+        .await
+        .unwrap()
+        .unwrap();
+    pending.abort();
+    assert!(pending.await.unwrap_err().is_cancelled());
+    let archive = fixture.archive_database();
+    let mut transaction =
+        tokio::time::timeout(Duration::from_secs(1), archive.begin_write_transaction())
+            .await
+            .expect("the cancelled transaction must release the writer")
+            .unwrap();
+    assert_eq!(
+        sqlx::query_scalar::<_, i64>("SELECT COUNT(*) FROM cancellation_probe")
+            .fetch_one(&mut *transaction)
+            .await
+            .unwrap(),
+        0
+    );
+    transaction.rollback().await.unwrap();
+    assert_eq!(
+        archive
+            .gateway_persistence
+            .busy_retries
+            .load(Ordering::Relaxed),
+        0
+    );
+}
+
+#[tokio::test]
+async fn archive_begin_retry_scope_excludes_other_tasks_databases_roles_and_backends() {
+    let fixture = Fixture::new().await;
+    let other = Fixture::new().await;
+    let archive = fixture.archive_database();
+    let deadline = tokio::time::Instant::now() + JOB_TIMEOUT;
+    assert!(archive.gateway_archive_retry_deadline().is_none());
+    ARCHIVE_DEADLINE
+        .scope((archive.gateway_persistence.clone(), deadline), async {
+            assert_eq!(archive.gateway_archive_retry_deadline(), Some(deadline));
+            assert!(fixture.database.gateway_archive_retry_deadline().is_none());
+            assert!(
+                other
+                    .archive_database()
+                    .gateway_archive_retry_deadline()
+                    .is_none()
+            );
+            let mut postgres = archive.clone();
+            postgres.backend = DatabaseBackend::PostgreSql;
+            assert!(postgres.gateway_archive_retry_deadline().is_none());
+            let spawned = archive.clone();
+            assert!(
+                tokio::spawn(async move { spawned.gateway_archive_retry_deadline() })
+                    .await
+                    .unwrap()
+                    .is_none()
+            );
+            let mut connection = archive.pool.acquire().await.unwrap();
+            sqlx::query("PRAGMA query_only = ON")
+                .execute(&mut *connection)
+                .await
+                .unwrap();
+            drop(connection);
+            assert!(matches!(
+                archive.begin_write_transaction().await,
+                Err(sqlx::Error::Database(error)) if error.code().as_deref() == Some("8")
+            ));
+            archive.pool.close().await;
+            assert!(matches!(
+                archive.begin_write_transaction().await,
+                Err(sqlx::Error::PoolClosed)
+            ));
+            assert!(matches!(
+                ARCHIVE_DEADLINE
+                    .scope(
+                        (
+                            archive.gateway_persistence.clone(),
+                            tokio::time::Instant::now()
+                        ),
+                        archive.begin_write_transaction(),
+                    )
+                    .await,
+                Err(sqlx::Error::PoolTimedOut)
+            ));
+            assert_eq!(
+                archive
+                    .gateway_persistence
+                    .busy_retries
+                    .load(Ordering::Relaxed),
+                0
+            );
+        })
+        .await;
+}
+
+#[tokio::test]
+async fn sqlite_busy_commit_is_not_replayed_after_begin_has_succeeded() {
+    let fixture = Fixture::new().await;
+    sqlx::query("PRAGMA journal_mode = DELETE")
+        .execute(&fixture.database.pool)
+        .await
+        .unwrap();
+    sqlx::query("CREATE TABLE commit_probe (value INTEGER NOT NULL)")
+        .execute(&fixture.database.pool)
+        .await
+        .unwrap();
+    let mut reader = fixture.database.pool.begin().await.unwrap();
+    sqlx::query("SELECT * FROM commit_probe")
+        .fetch_all(&mut *reader)
+        .await
+        .unwrap();
+    let archive = fixture.archive_database();
+    let deadline = tokio::time::Instant::now() + JOB_TIMEOUT;
+    let error = ARCHIVE_DEADLINE
+        .scope((archive.gateway_persistence.clone(), deadline), async {
+            let mut transaction = archive.begin_write_transaction().await.unwrap();
+            sqlx::query("INSERT INTO commit_probe VALUES (1)")
+                .execute(&mut *transaction)
+                .await
+                .unwrap();
+            transaction.commit().await.unwrap_err()
+        })
+        .await;
+    assert!(matches!(error, sqlx::Error::Database(error) if error.code().as_deref() == Some("5")));
+    assert_eq!(
+        archive
+            .gateway_persistence
+            .busy_retries
+            .load(Ordering::Relaxed),
+        0
+    );
+    reader.rollback().await.unwrap();
+    assert_eq!(
+        sqlx::query_scalar::<_, i64>("SELECT COUNT(*) FROM commit_probe")
+            .fetch_one(&archive.pool)
+            .await
+            .unwrap(),
+        0
+    );
 }
 
 #[tokio::test]
@@ -251,7 +754,7 @@ async fn unavailable_optional_pool_keeps_reservation_and_durable_gap() {
 }
 
 #[tokio::test]
-async fn saturated_slots_and_bytes_degrade_without_waiting_or_losing_safety_state() {
+async fn saturated_memory_permits_queue_the_raw_request_without_blocking_admission() {
     let fixture = Fixture::new().await;
     for by_bytes in [false, true] {
         let permits = if by_bytes {
@@ -276,14 +779,29 @@ async fn saturated_slots_and_bytes_degrade_without_waiting_or_losing_safety_stat
         let request_id = Uuid::new_v4();
         let admitted = tokio::time::timeout(Duration::from_secs(1), fixture.admit(request_id))
             .await
-            .expect("saturation must never await capacity")
+            .expect("memory permits must not block admission")
             .unwrap();
-        assert_eq!(
-            admitted.archive_admission,
-            RequestArchiveAdmission::GapCapacity
-        );
+        assert_eq!(admitted.archive_admission, RequestArchiveAdmission::Queued);
         fixture.assert_reserved(request_id).await;
         drop(permits);
+        tokio::time::timeout(Duration::from_secs(5), async {
+            loop {
+                let count: i64 = sqlx::query_scalar(
+                    "SELECT COUNT(*) FROM request_archive_spools WHERE request_id = $1 AND state = 'pending'",
+                )
+                .bind(request_id.to_string())
+                .fetch_one(&fixture.database.pool)
+                .await
+                .unwrap();
+                if count == 1 {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("memory permits must still archive the raw request JSON");
+        fixture.database.drain_gateway_persistence_for_test().await;
     }
     assert_eq!(
         fixture
@@ -302,7 +820,8 @@ async fn saturated_slots_and_bytes_degrade_without_waiting_or_losing_safety_stat
         BYTE_LIMIT
     );
     let metrics = fixture.database.gateway_persistence_metrics();
-    assert!(metrics.contains("request_persistence_total{outcome=\"capacity\"} 2\n"));
+    assert!(metrics.contains("request_persistence_total{outcome=\"accepted\"} 2\n"));
+    assert!(metrics.contains("request_persistence_total{outcome=\"capacity\"} 0\n"));
     assert!(metrics.contains("request_persistence_total{outcome=\"failed\"} 0\n"));
     assert!(metrics.contains("request_persistence_jobs 0\n"));
     assert!(metrics.contains("request_persistence_bytes 0\n"));
@@ -397,7 +916,10 @@ async fn safety_database_failure_never_enqueues_archive_work() {
         .execute(&fixture.database.pool).await.unwrap();
     assert!(matches!(
         fixture.admit(Uuid::new_v4()).await,
-        Err(AppError::Overloaded)
+        Err(AppError::Capacity {
+            code: "request_record_persist_failed",
+            ..
+        })
     ));
     assert_eq!(
         fixture

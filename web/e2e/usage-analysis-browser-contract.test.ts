@@ -12,6 +12,21 @@ const webRoot = fileURLToPath(new URL('..', import.meta.url));
 const artifactRoot = join(webRoot, 'e2e-artifacts', 'usage-analysis');
 const viewports = [320, 390, 768, 1024, 1440, 1920, 2560] as const;
 
+/** Mirrors the handle installed by e2e/fixtures/usage-analysis.tsx, which is served by Vite and never type-checked with this program. */
+interface UsageAnalysisFixtureState {
+  calls: string[];
+  failSaves: boolean;
+  holdProjection?: string;
+  failProjection?: string;
+  releaseProjection?: () => void;
+  aborted: number;
+  presets: { named: Array<{ name: string; ast: unknown; updated_at: number }>; recent: unknown[] };
+}
+
+declare global {
+  interface Window { usageAnalysisFixture: UsageAnalysisFixtureState }
+}
+
 async function localChromiumExecutable() {
   const defaultExecutable = chromium.executablePath();
   if (existsSync(defaultExecutable)) return defaultExecutable;
@@ -120,8 +135,10 @@ test('usage filter period, credential, saved AST, drilldown, and clear stay sync
     const panelMarkup = await page.locator('.typed-filter-dialog').evaluate((panel) => ({ html: panel.innerHTML, open: panel.matches(':popover-open') }));
     assert.equal(panelMarkup.open, true, 'the filter popover opens');
     assert.match(panelMarkup.html, /Last 7 days/, 'the unified period controls render in the filter popover');
+    await dialog.getByRole('button', { name: 'Add condition' }).click();
+    await dialog.locator('.typed-filter-row').last().getByRole('combobox', { name: 'Field', exact: true }).selectOption('key_alias');
     const credentialBox = dialog.getByRole('combobox', { name: 'Client credential' });
-    const credentialCalls = () => page.evaluate(() => (window as unknown as { usageAnalysisFixture: { calls: string[] } }).usageAnalysisFixture.calls.filter((path) => path.startsWith('/internal/v1/keys?')));
+    const credentialCalls = () => page.evaluate(() => window.usageAnalysisFixture.calls.filter((path) => path.startsWith('/internal/v1/keys?')));
     await credentialBox.click();
     await page.getByRole('option', { name: 'client-a' }).waitFor();
     assert.equal(await page.getByRole('option', { name: 'late-client' }).count(), 0, 'the first page stops before the look-ahead row');
@@ -148,26 +165,26 @@ test('usage filter period, credential, saved AST, drilldown, and clear stay sync
     await page.getByRole('option', { name: 'client-a' }).click();
     assert.equal(await credentialBox.inputValue(), 'client-a');
     await dialog.getByRole('button', { name: 'Add condition' }).click();
-    await dialog.locator('.typed-filter-row select').first().selectOption('protocol');
+    await dialog.locator('.typed-filter-row').last().getByRole('combobox', { name: 'Field', exact: true }).selectOption('protocol');
     await dialog.locator('.typed-filter-row [data-filter-field="protocol"] select').selectOption('anthropic');
     await dialog.getByPlaceholder('Filter name').fill('week-client');
     await dialog.getByRole('button', { name: 'Save filter' }).click();
     await dialog.getByRole('button', { name: 'Apply filters' }).click();
-    const calls = () => page.evaluate(() => (window as unknown as { usageAnalysisFixture: { calls: string[] } }).usageAnalysisFixture.calls.filter((path) => path.startsWith('/internal/v1/usage-analysis?')));
-    await page.waitForFunction(() => (window as unknown as { usageAnalysisFixture: { calls: string[] } }).usageAnalysisFixture.calls.filter((path) => path.includes('/usage-analysis?')).length >= 2);
+    const calls = () => page.evaluate(() => window.usageAnalysisFixture.calls.filter((path) => path.startsWith('/internal/v1/usage-analysis?') && path.includes('projection=overview')));
+    await page.waitForFunction(() => window.usageAnalysisFixture.calls.filter((path) => path.includes('/usage-analysis?') && path.includes('projection=overview')).length >= 2);
     const presetQuery = new URLSearchParams(new URL((await calls()).at(-1)!, 'http://fixture').search);
     assert.equal(presetQuery.get('key_alias'), 'client-a');
     assert.equal(presetQuery.get('protocol'), 'anthropic');
     assert.equal(Number(presetQuery.get('to_created_at')) - Number(presetQuery.get('from_created_at')), 7 * 86_400_000);
-    const saved = await page.evaluate(() => (window as unknown as { usageAnalysisFixture: { presets: { named: Array<{ name: string; ast: unknown }> } } }).usageAnalysisFixture.presets.named);
+    const saved = await page.evaluate(() => window.usageAnalysisFixture.presets.named);
     assert.equal((saved[0].ast as { conditions: Array<{ field: string }> }).conditions.filter((condition) => condition.field === 'created_at').length, 1);
     await filter.click();
     await dialog.getByRole('button', { name: 'Custom' }).click();
-    await dialog.locator('.usage-custom-range input').first().fill('2026-09-01T00:00');
-    await dialog.locator('.usage-custom-range input').last().fill('2026-09-02T00:00');
+    await dialog.locator('.typed-filter-row [data-filter-field="created_at"] input').first().fill('2026-09-01T00:00');
+    await dialog.locator('.typed-filter-row [data-filter-field="created_at"] input').last().fill('2026-09-02T00:00');
     await dialog.getByRole('button', { name: 'Apply filters' }).click();
-    await page.waitForFunction(() => (window as unknown as { usageAnalysisFixture: { calls: string[] } }).usageAnalysisFixture.calls.filter((path) => path.includes('/usage-analysis?')).length >= 3);
-    await page.evaluate(() => { (window as unknown as { usageAnalysisFixture: { presets: { named: Array<{ name: string; ast: unknown; updated_at: number }> } } }).usageAnalysisFixture.presets.named.push({ name: 'unsupported-filter', ast: { logical_operator: 'and', conditions: [{ field: 'model', operator: 'contains', value: { type: 'model', value: 'public-model' } }] }, updated_at: Date.now() }); });
+    await page.waitForFunction(() => window.usageAnalysisFixture.calls.filter((path) => path.includes('/usage-analysis?') && path.includes('projection=overview')).length >= 3);
+    await page.evaluate(() => { window.usageAnalysisFixture.presets.named.push({ name: 'unsupported-filter', ast: { logical_operator: 'and', conditions: [{ field: 'model', operator: 'contains', value: { type: 'model', value: 'public-model' } }] }, updated_at: Date.now() }); });
     await filter.click();
     await dialog.getByRole('button', { name: 'unsupported-filter' }).click();
     await dialog.getByRole('alert').getByText('Usage analysis cannot apply duplicate fields or unsupported conditions.').waitFor();
@@ -175,7 +192,7 @@ test('usage filter period, credential, saved AST, drilldown, and clear stay sync
     assert.equal(await dialog.getByRole('button', { name: 'Custom' }).getAttribute('aria-pressed'), 'true');
     assert.equal(await credentialBox.inputValue(), 'client-a');
     await dialog.getByRole('button', { name: 'Apply filters' }).click();
-    await page.waitForFunction(() => (window as unknown as { usageAnalysisFixture: { calls: string[] } }).usageAnalysisFixture.calls.filter((path) => path.includes('/usage-analysis?')).length >= 4);
+    await page.waitForFunction(() => window.usageAnalysisFixture.calls.filter((path) => path.includes('/usage-analysis?') && path.includes('projection=overview')).length >= 4);
     const reopenedQuery = new URLSearchParams(new URL((await calls()).at(-1)!, 'http://fixture').search);
     assert.equal(reopenedQuery.get('from_created_at'), presetQuery.get('from_created_at'));
     assert.equal(reopenedQuery.get('to_created_at'), presetQuery.get('to_created_at'));
@@ -184,11 +201,14 @@ test('usage filter period, credential, saved AST, drilldown, and clear stay sync
     await page.locator('.usage-overview-chart-grid .usage-chart-card').first().locator('.usage-chart-table button').first().click();
     await filter.click();
     assert.equal(await dialog.getByRole('button', { name: 'Custom' }).getAttribute('aria-pressed'), 'true');
-    await dialog.getByRole('button', { name: 'Clear' }).click();
+    await dialog.getByRole('button', { name: 'Close', exact: true }).click();
+    await page.locator('.typed-filter-actions').getByRole('button', { name: 'Clear', exact: true }).click();
     await filter.click();
     assert.equal(await dialog.getByRole('button', { name: 'Last 24 hours' }).getAttribute('aria-pressed'), 'true');
+    assert.equal(await dialog.locator('.typed-filter-row').count(), 1);
+    await dialog.getByRole('button', { name: 'Add condition' }).click();
+    await dialog.locator('.typed-filter-row').last().getByRole('combobox', { name: 'Field', exact: true }).selectOption('key_alias');
     assert.equal(await credentialBox.inputValue(), '');
-    assert.equal(await dialog.locator('.typed-filter-row').count(), 0);
     await credentialBox.fill('late');
     await credentialBox.press('ArrowDown');
     await page.getByRole('option', { name: 'late-client' }).waitFor();
@@ -198,20 +218,21 @@ test('usage filter period, credential, saved AST, drilldown, and clear stay sync
     await dialog.getByRole('button', { name: 'Apply filters' }).click();
     await filter.click();
     await dialog.getByPlaceholder('Filter name').fill('failed-save');
-    await page.evaluate(() => { (window as unknown as { usageAnalysisFixture: { failSaves: boolean } }).usageAnalysisFixture.failSaves = true; });
+    await page.evaluate(() => { window.usageAnalysisFixture.failSaves = true; });
     await dialog.getByRole('button', { name: 'Save filter' }).click();
     await dialog.getByRole('alert').getByText('Preset storage failed').waitFor();
-    await page.evaluate(() => { (window as unknown as { usageAnalysisFixture: { failSaves: boolean } }).usageAnalysisFixture.failSaves = false; });
+    await page.evaluate(() => { window.usageAnalysisFixture.failSaves = false; });
     for (let condition = 0; condition < 10; condition += 1) await dialog.getByRole('button', { name: 'Add condition' }).click();
-    assert.equal(await dialog.getByRole('button', { name: 'Add condition' }).isDisabled(), true, 'period and credential reserve two AST slots');
+    assert.equal(await dialog.getByRole('button', { name: 'Add condition' }).isDisabled(), true, 'all conditions, including period and credential, share the 12-row limit');
     const beforeClearCount = (await calls()).length;
-    await dialog.getByRole('button', { name: 'Clear' }).click();
-    await page.waitForFunction((previousCount) => (window as unknown as { usageAnalysisFixture: { calls: string[] } }).usageAnalysisFixture.calls.filter((path) => path.includes('/usage-analysis?')).length > previousCount, beforeClearCount);
+    await dialog.getByRole('button', { name: 'Close', exact: true }).click();
+    await page.locator('.typed-filter-actions').getByRole('button', { name: 'Clear', exact: true }).click();
+    await page.waitForFunction((previousCount) => window.usageAnalysisFixture.calls.filter((path) => path.includes('/usage-analysis?') && path.includes('projection=overview')).length > previousCount, beforeClearCount);
     const beforeRefresh = new URLSearchParams(new URL((await calls()).at(-1)!, 'http://fixture').search);
     const callCount = (await calls()).length;
     await page.clock.fastForward(60_000);
     await page.getByRole('button', { name: 'Refresh' }).click();
-    await page.waitForFunction((previousCount) => (window as unknown as { usageAnalysisFixture: { calls: string[] } }).usageAnalysisFixture.calls.filter((path) => path.includes('/usage-analysis?')).length > previousCount, callCount);
+    await page.waitForFunction((previousCount) => window.usageAnalysisFixture.calls.filter((path) => path.includes('/usage-analysis?') && path.includes('projection=overview')).length > previousCount, callCount);
     const refreshed = new URLSearchParams(new URL((await calls()).at(-1)!, 'http://fixture').search);
     // The fake clock advances when page timers fire, so Fluent's scheduled
     // work can add a few milliseconds to the fast-forwarded minute.
@@ -251,8 +272,8 @@ test('Usage analysis publishes completed data while the lazy chart module is pau
     assert.equal(await page.locator('.usage-echart canvas').count(), 0, 'paused chart code must not fabricate a ready chart');
     await page.getByRole('tab', { name: 'Dimensions', exact: true }).click();
     await page.locator('.usage-dimension-picker').waitFor();
-    const callsWhilePaused = await page.evaluate(() => (window as unknown as { usageAnalysisFixture: { calls: string[] } }).usageAnalysisFixture.calls);
-    assert.equal(callsWhilePaused.filter((path) => path.startsWith('/internal/v1/usage-analysis?')).length, 1, 'progressive rendering must not repeat the usage read');
+    const callsWhilePaused = await page.evaluate(() => window.usageAnalysisFixture.calls);
+    assert.equal(callsWhilePaused.filter((path) => path.startsWith('/internal/v1/usage-analysis?') && path.includes('projection=overview')).length, 1, 'progressive rendering must not repeat the usage read');
 
     await page.getByRole('tab', { name: 'Overview', exact: true }).click();
     releaseChart();
@@ -262,4 +283,164 @@ test('Usage analysis publishes completed data while the lazy chart module is pau
     await browser.close();
     await server.close();
   }
+});
+
+test('usage overview renders before precise output speed and loads only the selected analysis', { timeout: 45_000 }, async () => {
+  const executablePath = await localChromiumExecutable();
+  if (!executablePath) {
+    if (process.env.MTC_REQUIRE_BROWSER === '1') throw new Error('Chromium is required for usage projection assertions');
+    return test.skip('a local Chromium runtime is required');
+  }
+  const server = await createServer({ root: webRoot, configFile: false, logLevel: 'silent', server: { host: '127.0.0.1', port: 0 } });
+  await server.listen();
+  const address = server.httpServer?.address();
+  assert.ok(address && typeof address !== 'string');
+  const browser = await chromium.launch({ executablePath, headless: true });
+  try {
+    const page = await browser.newPage();
+    await page.addInitScript(() => localStorage.setItem('mtc-locale', 'en'));
+    await page.goto(`http://127.0.0.1:${address.port}/e2e/fixtures/usage-analysis.html?holdProjection=output_rate`);
+    await page.locator('.usage-metrics').waitFor();
+    await page.waitForFunction(() => Boolean(window.usageAnalysisFixture.releaseProjection));
+    const calls = () => page.evaluate(() => window.usageAnalysisFixture.calls.filter(path => path.startsWith('/internal/v1/usage-analysis?')).map(path => new URL(path, location.origin).searchParams.get('projection')));
+    assert.deepEqual(await calls(), ['overview', 'output_rate']);
+    assert.equal(await page.locator('.usage-metrics [role="status"]').count(), 1, 'only output speed remains pending');
+    await page.getByRole('button', { name: 'Filter', exact: true }).click();
+    assert.equal(await page.getByRole('button', { name: 'Last 30 days', exact: true }).isEnabled(), true, 'a slow secondary query never disables filters');
+    await page.locator('.typed-filter-dialog').getByRole('button', { name: 'Close', exact: true }).click();
+    await page.evaluate(() => window.usageAnalysisFixture.releaseProjection?.());
+    await page.waitForFunction(() => !document.querySelector('.usage-metrics [role="status"]'));
+    const summary = page.locator('.usage-metrics');
+    assert.ok((await summary.innerText()).includes('44.44%'), 'TPS placeholders never replace overview totals');
+    await page.getByRole('tab', { name: 'Dimensions', exact: true }).click();
+    await page.waitForFunction(() => window.usageAnalysisFixture.calls.some(path => path.includes('projection=dimensions')));
+    await page.locator('.usage-dimension-picker').getByRole('button', { name: 'Sessions', exact: true }).click();
+    await page.waitForFunction(() => window.usageAnalysisFixture.calls.some(path => path.includes('projection=sessions')));
+    // The tab label comes from central i18n ('Usage heatmap'); use the stable
+    // tab id and let the projection call below prove the semantic navigation.
+    await page.locator('#usage-tab-heatmap').click();
+    await page.waitForFunction(() => window.usageAnalysisFixture.calls.some(path => path.includes('projection=heatmap')));
+    await page.getByRole('tab', { name: 'Overview', exact: true }).click();
+    await page.locator('.usage-metrics').waitFor();
+    assert.deepEqual(await calls(), ['overview', 'output_rate', 'dimensions', 'sessions', 'heatmap'], 'completed projections are reused within the exact applied scope');
+  } finally { await browser.close(); await server.close(); }
+});
+
+test('usage overview skips the precise output speed whenever the applied range spans seven days or more', { timeout: 45_000 }, async () => {
+  const executablePath = await localChromiumExecutable();
+  if (!executablePath) {
+    if (process.env.MTC_REQUIRE_BROWSER === '1') throw new Error('Chromium is required for usage projection assertions');
+    return test.skip('a local Chromium runtime is required');
+  }
+  const server = await createServer({ root: webRoot, configFile: false, logLevel: 'silent', server: { host: '127.0.0.1', port: 0 } });
+  await server.listen();
+  const address = server.httpServer?.address();
+  assert.ok(address && typeof address !== 'string');
+  const browser = await chromium.launch({ executablePath, headless: true });
+  try {
+    const page = await browser.newPage();
+    await page.clock.install({ time: new Date('2026-10-02T12:00:00Z') });
+    await page.addInitScript(() => localStorage.setItem('mtc-locale', 'en'));
+    await page.goto(`http://127.0.0.1:${address.port}/e2e/fixtures/usage-analysis.html`);
+    await page.locator('.usage-metrics').waitFor();
+    const overviewCalls = () => page.evaluate(() => window.usageAnalysisFixture.calls.filter((path) => path.includes('/usage-analysis?') && path.includes('projection=overview')).length);
+    const rateCalls = () => page.evaluate(() => window.usageAnalysisFixture.calls.filter((path) => path.includes('/usage-analysis?') && path.includes('projection=output_rate')).length);
+    const tpsCard = page.locator('.usage-metrics .analytics-metric').filter({ hasText: 'Average TPS' });
+
+    // The default 24-hour range still loads the precise rate independently.
+    await page.waitForFunction(() => window.usageAnalysisFixture.calls.some((path) => path.includes('projection=output_rate')));
+    await tpsCard.locator('.metric-exact').waitFor();
+    assert.equal(await rateCalls(), 1);
+    assert.equal(await tpsCard.locator('.metric-exact').innerText(), '0.21');
+
+    const applyRange = async (pick: () => Promise<void>) => {
+      const before = await overviewCalls();
+      await page.getByRole('button', { name: 'Filter', exact: true }).click();
+      const dialog = page.getByRole('dialog');
+      await pick();
+      await dialog.getByRole('button', { name: 'Apply filters' }).click();
+      await page.waitForFunction((count) => window.usageAnalysisFixture.calls.filter((path) => path.includes('/usage-analysis?') && path.includes('projection=overview')).length > count, before);
+    };
+    const fillCustomRange = async (from: string, to: string) => {
+      const dialog = page.getByRole('dialog');
+      await dialog.getByRole('button', { name: 'Custom' }).click();
+      await dialog.locator('.typed-filter-row [data-filter-field="created_at"] input').first().fill(from);
+      await dialog.locator('.typed-filter-row [data-filter-field="created_at"] input').last().fill(to);
+    };
+
+    // Exactly seven days meets the threshold: no precise query, no stale value.
+    await applyRange(() => page.getByRole('dialog').getByRole('button', { name: 'Last 7 days' }).click());
+    await tpsCard.locator('.analytics-metric-note').waitFor();
+    assert.equal(await rateCalls(), 1, 'the 7-day preset must not request the precise output rate');
+    assert.equal((await tpsCard.locator('.metric-value').innerText()).trim(), '—', 'the previous TPS value must not leak into the longer range');
+    assert.match(await tpsCard.locator('.analytics-metric-note').innerText(), /not calculated for long ranges/);
+    assert.equal(await tpsCard.locator('.metric-exact').count(), 0, 'an omitted TPS never fabricates an exact value');
+    assert.equal(await tpsCard.locator('svg').count(), 0, 'an omitted TPS renders no trend');
+
+    // The 30-day preset follows the same rule.
+    await applyRange(() => page.getByRole('dialog').getByRole('button', { name: 'Last 30 days' }).click());
+    await tpsCard.locator('.analytics-metric-note').waitFor();
+    assert.equal(await rateCalls(), 1, 'the 30-day preset must not request the precise output rate');
+
+    // A custom range longer than seven days is covered by the same span rule.
+    await applyRange(() => fillCustomRange('2026-09-01T00:00', '2026-09-10T00:00'));
+    await tpsCard.locator('.analytics-metric-note').waitFor();
+    assert.equal(await rateCalls(), 1, 'a custom range of seven days or more must not request the precise output rate');
+
+    // Narrowing below seven days restores the precise query and value.
+    await applyRange(() => fillCustomRange('2026-09-01T00:00', '2026-09-07T23:59:59.999'));
+    await page.waitForFunction(() => window.usageAnalysisFixture.calls.filter((path) => path.includes('projection=output_rate')).length >= 2);
+    await tpsCard.locator('.metric-exact').waitFor();
+    assert.equal(await rateCalls(), 2, 'narrowing back below seven days restores exactly one precise read');
+    assert.equal(await tpsCard.locator('.metric-exact').innerText(), '0.21');
+    assert.equal(await tpsCard.locator('.analytics-metric-note').count(), 0, 'the omission note disappears once TPS is available again');
+  } finally { await browser.close(); await server.close(); }
+});
+
+test('usage dimension picker stays usable while a projection is pending or failed', { timeout: 45_000 }, async () => {
+  const executablePath = await localChromiumExecutable();
+  if (!executablePath) {
+    if (process.env.MTC_REQUIRE_BROWSER === '1') throw new Error('Chromium is required for usage projection assertions');
+    return test.skip('a local Chromium runtime is required');
+  }
+  const server = await createServer({ root: webRoot, configFile: false, logLevel: 'silent', server: { host: '127.0.0.1', port: 0 } });
+  await server.listen();
+  const address = server.httpServer?.address();
+  assert.ok(address && typeof address !== 'string');
+  const browser = await chromium.launch({ executablePath, headless: true });
+  try {
+    const page = await browser.newPage();
+    await page.addInitScript(() => localStorage.setItem('mtc-locale', 'en'));
+    const pickerButton = (name: string) => page.locator('.usage-dimension-picker').getByRole('button', { name, exact: true });
+
+    // A held sessions projection must not strand the picker: switching back to
+    // the cached models dimension aborts the stale request.
+    await page.goto(`http://127.0.0.1:${address.port}/e2e/fixtures/usage-analysis.html?holdProjection=sessions`);
+    await page.locator('.usage-metrics').waitFor();
+    await page.getByRole('tab', { name: 'Dimensions', exact: true }).click();
+    await page.locator('.usage-dimension').waitFor();
+    await pickerButton('Sessions').click();
+    await page.waitForFunction(() => window.usageAnalysisFixture.calls.some((path) => path.includes('projection=sessions')));
+    assert.equal(await pickerButton('Models').isVisible(), true, 'the picker survives the pending sessions projection');
+    await pickerButton('Models').click();
+    await page.waitForFunction(() => window.usageAnalysisFixture.aborted >= 1);
+    await page.locator('.usage-dimension').waitFor();
+    assert.equal(await pickerButton('Models').getAttribute('aria-pressed'), 'true');
+    const projections = () => page.evaluate(() => window.usageAnalysisFixture.calls.filter((path) => path.startsWith('/internal/v1/usage-analysis?')).map((path) => new URL(path, location.origin).searchParams.get('projection')));
+    assert.equal((await projections()).filter((projection) => projection === 'dimensions').length, 1, 'returning to the cached dimension repeats no read');
+    await page.evaluate(() => window.usageAnalysisFixture.releaseProjection?.());
+
+    // A failed projection keeps the picker visible so the cached dimension is
+    // one click away and dismisses the error by showing its data.
+    await page.goto(`http://127.0.0.1:${address.port}/e2e/fixtures/usage-analysis.html?failProjection=sessions`);
+    await page.locator('.usage-metrics').waitFor();
+    await page.getByRole('tab', { name: 'Dimensions', exact: true }).click();
+    await page.locator('.usage-dimension').waitFor();
+    await pickerButton('Sessions').click();
+    await page.getByRole('alert').waitFor();
+    assert.equal(await pickerButton('Models').isVisible(), true, 'the picker survives the failed sessions projection');
+    await pickerButton('Models').click();
+    await page.locator('.usage-dimension').waitFor();
+    assert.equal(await page.getByRole('alert').count(), 0, 'showing the cached dimension clears the projection error');
+  } finally { await browser.close(); await server.close(); }
 });

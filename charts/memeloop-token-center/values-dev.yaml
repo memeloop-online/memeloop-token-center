@@ -14,5 +14,9 @@ roles:
     autoscaling: { enabled: false }
     podDisruptionBudget: { enabled: false }
 
+config:
+  # Keep the development all-in-one budget within its existing 2Gi memory limit.
+  proxyMemoryBudgetBytes: 536870912
+
 networkPolicy:
   enabled: false

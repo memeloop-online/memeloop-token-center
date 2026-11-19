@@ -33,6 +33,11 @@ test('UTC bucket epochs display in the browser zone while local day queries keep
    const first=page.locator('.usage-metrics [role="slider"]').first();await first.focus();
    assert.match(await first.getAttribute('aria-valuetext')??'',new RegExp(hour));
    assert.match(await first.getAttribute('aria-valuetext')??'',new RegExp(timezoneId));
+   // The precise output_rate projection only starts once the overview is
+   // usable, so the chart can appear while that second read is still in
+   // flight. Wait for both overview projections by count before capturing the
+   // baseline; otherwise the read assertions below race output_rate.
+   await page.waitForFunction(()=>window.timeFixture.reads()>=2);
    const reads=await page.evaluate(()=>window.timeFixture.reads());
    const card=page.locator('.usage-chart-card').first();
    const chartTab=card.getByRole('tab',{name:'图表',exact:true});
@@ -48,9 +53,16 @@ test('UTC bucket epochs display in the browser zone while local day queries keep
    await page.locator('#usage-tab-heatmap').click();
    const heatmap=page.locator('.usage-heatmap-panel');
    await heatmap.getByRole('tab',{name:'数据',exact:true}).click();
+   // The heatmap is its own on-demand projection: the first visit reads it
+   // exactly once. The data table only renders after that read settles.
+   await heatmap.locator('.usage-heatmap-table tbody button').first().waitFor();
+   assert.equal(await page.evaluate(()=>window.timeFixture.reads()),reads+1,'the first heatmap view reads its projection exactly once');
    await heatmap.locator('.usage-heatmap-table tbody button').first().click();
    assert.match(await heatmap.locator('.usage-heatmap-selection').innerText(),/已选择/);
-   assert.equal(await page.evaluate(()=>window.timeFixture.reads()),reads,'heatmap view and row selection also reuse the loaded projection');
+   assert.equal(await page.evaluate(()=>window.timeFixture.reads()),reads+1,'heatmap view and row selection are presentation only');
+   await page.locator('#usage-tab-overview').click();
+   await page.locator('.usage-metrics').waitFor();
+   assert.equal(await page.evaluate(()=>window.timeFixture.reads()),reads+1,'returning to the overview reuses the cached projections');
    const range=await page.evaluate(()=>{const params=new URLSearchParams(window.timeFixture.todayQuery());const start=Number(params.get('from_created_at'));const local=new Date(start);return {hour:local.getHours(),minute:local.getMinutes(),epoch:window.timeFixture.epoch};});
    assert.equal(range.hour,0);assert.equal(range.minute,0);assert.equal(range.epoch,497103*3600000);
    await page.close();

@@ -1,4 +1,4 @@
-use std::{collections::BTreeMap, time::Duration};
+use std::collections::BTreeMap;
 
 use axum::{
     Json,
@@ -10,7 +10,7 @@ use axum::{
 use serde_json::Value;
 use uuid::Uuid;
 
-use super::{MAX_IMAGE_REQUEST_BODY, MAX_REPORTED_TOKENS};
+use super::MAX_REPORTED_TOKENS;
 use crate::{
     AppState,
     error::AppError,
@@ -23,6 +23,9 @@ use crate::{
 };
 
 use super::plugin_execution::{self, Phase};
+
+#[cfg(test)]
+mod tests;
 
 #[cfg(test)]
 tokio::task_local! {
@@ -45,10 +48,32 @@ pub(super) async fn proxy_openai_chat(
     axum::Extension(memory): axum::Extension<
         std::sync::Arc<crate::gateway_body::memory::ProxyMemoryReservation>,
     >,
+    spool: Option<
+        axum::Extension<std::sync::Arc<crate::gateway_body::request_spool::RequestSpool>>,
+    >,
     headers: HeaderMap,
     body: Bytes,
 ) -> Result<Response, AppError> {
-    super::proxy::proxy(state, headers, body, Protocol::OpenAiChat, memory).await
+    proxy_source_or_body(state, headers, body, Protocol::OpenAiChat, memory, spool).await
+}
+
+async fn proxy_source_or_body(
+    state: AppState,
+    headers: HeaderMap,
+    body: Bytes,
+    protocol: Protocol,
+    memory: std::sync::Arc<crate::gateway_body::memory::ProxyMemoryReservation>,
+    spool: Option<
+        axum::Extension<std::sync::Arc<crate::gateway_body::request_spool::RequestSpool>>,
+    >,
+) -> Result<Response, AppError> {
+    match spool {
+        Some(axum::Extension(spool)) => {
+            super::proxy::proxy_spooled_responses(state, headers, body, memory, spool, protocol)
+                .await
+        }
+        None => super::proxy::proxy(state, headers, body, protocol, memory).await,
+    }
 }
 
 pub(super) async fn proxy_openai_responses(
@@ -61,27 +86,10 @@ pub(super) async fn proxy_openai_responses(
     >,
     headers: HeaderMap,
 ) -> Result<Response, AppError> {
-    if !memory.try_grow(
-        spool.len(),
-        crate::gateway_body::memory::REQUEST_MEMORY_WEIGHT,
-    ) {
-        state
-            .metrics
-            .record_proxy_memory_rejection(crate::metrics::ProxyMemoryRejectionStage::Ingress);
-        return Err(AppError::Overloaded);
-    }
-    let body = spool.read_all().await.map_err(|_| {
-        tracing::error!(
-            stage = "request_spool_read",
-            bytes = spool.len(),
-            "authenticated Responses request spool could not be replayed"
-        );
-        AppError::Overloaded
-    })?;
     super::proxy::proxy_spooled_responses(
         state,
         headers,
-        body,
+        Bytes::new(),
         memory,
         spool,
         Protocol::OpenAiResponses,
@@ -99,27 +107,10 @@ pub(super) async fn proxy_openai_responses_compact(
     >,
     headers: HeaderMap,
 ) -> Result<Response, AppError> {
-    if !memory.try_grow(
-        spool.len(),
-        crate::gateway_body::memory::REQUEST_MEMORY_WEIGHT,
-    ) {
-        state
-            .metrics
-            .record_proxy_memory_rejection(crate::metrics::ProxyMemoryRejectionStage::Ingress);
-        return Err(AppError::Overloaded);
-    }
-    let body = spool.read_all().await.map_err(|_| {
-        tracing::error!(
-            stage = "request_spool_read",
-            bytes = spool.len(),
-            "authenticated Responses compact request spool could not be replayed"
-        );
-        AppError::Overloaded
-    })?;
     super::proxy::proxy_spooled_responses(
         state,
         headers,
-        body,
+        Bytes::new(),
         memory,
         spool,
         Protocol::OpenAiResponsesCompact,
@@ -132,10 +123,21 @@ pub(super) async fn proxy_openai_alpha_search(
     axum::Extension(memory): axum::Extension<
         std::sync::Arc<crate::gateway_body::memory::ProxyMemoryReservation>,
     >,
+    spool: Option<
+        axum::Extension<std::sync::Arc<crate::gateway_body::request_spool::RequestSpool>>,
+    >,
     headers: HeaderMap,
     body: Bytes,
 ) -> Result<Response, AppError> {
-    super::proxy::proxy(state, headers, body, Protocol::OpenAiAlphaSearch, memory).await
+    proxy_source_or_body(
+        state,
+        headers,
+        body,
+        Protocol::OpenAiAlphaSearch,
+        memory,
+        spool,
+    )
+    .await
 }
 
 /// Temporary transport negotiation for clients that probe the Responses
@@ -164,10 +166,21 @@ pub(super) async fn proxy_openai_embeddings(
     axum::Extension(memory): axum::Extension<
         std::sync::Arc<crate::gateway_body::memory::ProxyMemoryReservation>,
     >,
+    spool: Option<
+        axum::Extension<std::sync::Arc<crate::gateway_body::request_spool::RequestSpool>>,
+    >,
     headers: HeaderMap,
     body: Bytes,
 ) -> Result<Response, AppError> {
-    super::proxy::proxy(state, headers, body, Protocol::OpenAiEmbeddings, memory).await
+    proxy_source_or_body(
+        state,
+        headers,
+        body,
+        Protocol::OpenAiEmbeddings,
+        memory,
+        spool,
+    )
+    .await
 }
 
 pub(super) async fn proxy_anthropic(
@@ -175,10 +188,21 @@ pub(super) async fn proxy_anthropic(
     axum::Extension(memory): axum::Extension<
         std::sync::Arc<crate::gateway_body::memory::ProxyMemoryReservation>,
     >,
+    spool: Option<
+        axum::Extension<std::sync::Arc<crate::gateway_body::request_spool::RequestSpool>>,
+    >,
     headers: HeaderMap,
     body: Bytes,
 ) -> Result<Response, AppError> {
-    super::proxy::proxy(state, headers, body, Protocol::AnthropicMessages, memory).await
+    proxy_source_or_body(
+        state,
+        headers,
+        body,
+        Protocol::AnthropicMessages,
+        memory,
+        spool,
+    )
+    .await
 }
 
 pub(super) async fn proxy_anthropic_count_tokens(
@@ -186,10 +210,21 @@ pub(super) async fn proxy_anthropic_count_tokens(
     axum::Extension(memory): axum::Extension<
         std::sync::Arc<crate::gateway_body::memory::ProxyMemoryReservation>,
     >,
+    spool: Option<
+        axum::Extension<std::sync::Arc<crate::gateway_body::request_spool::RequestSpool>>,
+    >,
     headers: HeaderMap,
     body: Bytes,
 ) -> Result<Response, AppError> {
-    super::proxy::proxy(state, headers, body, Protocol::AnthropicCountTokens, memory).await
+    proxy_source_or_body(
+        state,
+        headers,
+        body,
+        Protocol::AnthropicCountTokens,
+        memory,
+        spool,
+    )
+    .await
 }
 
 #[derive(Clone, Copy)]
@@ -441,27 +476,10 @@ async fn apply_traffic_plugin(
             request_rewrite_supplied: false,
         });
     }
-    let temporary_memory = if memory.is_some() {
-        let input_length =
-            crate::gateway_body::memory::json_encoded_length(&original_request_json)?;
-        Some(
-            state
-                .proxy_memory_budget
-                .temporary(64 * 1024 * 1024 + input_length.max(16 * 1024 * 1024).saturating_mul(5))
-                .map_err(|error| {
-                    state.metrics.observe_proxy_memory_error(
-                        crate::metrics::ProxyMemoryRejectionStage::Plugin,
-                        error,
-                    )
-                })?,
-        )
-    } else {
-        None
-    };
     let plugin_configurations = plugins
         .resolved_traffic_configurations(key.tenant_id)
         .await?;
-    let plugin_request = original_request_json.clone();
+    let plugin_request = original_request_json;
     #[cfg(feature = "experimental-plugin-revisions")]
     let application_snapshot = state.pinned_application_plugins.clone();
     let plugin_context = RequestContext {
@@ -473,32 +491,35 @@ async fn apply_traffic_plugin(
         config_json: "{}".to_owned(),
     };
     let metrics = state.metrics.clone();
-    let plugin_decision =
+    let (plugin_decision, original_request_json) =
         plugin_execution::run(state.metrics.clone(), Phase::PostAuth, move || {
-            let _temporary_memory = temporary_memory;
+            let _memory = memory;
             let result = (|| {
                 #[cfg(feature = "experimental-plugin-revisions")]
                 if let Some(snapshot) = application_snapshot {
-                    return snapshot.runtime.apply_traffic_with_config_and_memory(
+                    return snapshot.runtime.apply_traffic_with_config(
                         plugin_context,
                         &plugin_request,
                         &plugin_configurations,
-                        memory.as_deref(),
                     );
                 }
-                plugins.apply_traffic_with_config_and_memory(
+                plugins.apply_traffic_with_config(
                     plugin_context,
                     &plugin_request,
                     &plugin_configurations,
-                    memory.as_deref(),
                 )
             })();
-            result.map_err(|error| {
-                metrics.observe_proxy_memory_error(
-                    crate::metrics::ProxyMemoryRejectionStage::Plugin,
-                    error,
-                )
-            })
+            result
+                .map(|decision| (decision, plugin_request))
+                .map_err(|error| {
+                    named_memory_rejection(
+                        "proxy_memory_plugin",
+                        metrics.observe_proxy_memory_error(
+                            crate::metrics::ProxyMemoryRejectionStage::Plugin,
+                            error,
+                        ),
+                    )
+                })
         })
         .await?;
     if !plugin_decision.allow {
@@ -511,8 +532,9 @@ async fn apply_traffic_plugin(
         .request_json
         .unwrap_or(original_request_json);
     if !request_json.is_object() {
-        return Err(AppError::Upstream(
-            "plugin returned a request that is not a JSON object".into(),
+        return Err(AppError::upstream_with(
+            "upstream_unavailable",
+            crate::error::ErrorFacts::new().stage("traffic_apply_traffic_plugin"),
         ));
     }
     let rewritten_model = request_json
@@ -525,22 +547,21 @@ async fn apply_traffic_plugin(
         .or(rewritten_model)
         .unwrap_or_else(|| requested_model.clone());
     if model.trim().is_empty() || model.len() > 200 {
-        return Err(AppError::Upstream(
-            "plugin returned an invalid model".into(),
+        return Err(AppError::upstream_with(
+            "upstream_unavailable",
+            crate::error::ErrorFacts::new().stage("traffic_apply_traffic_plugin"),
         ));
     }
     request_json["model"] = Value::String(model.clone());
-    if crate::gateway_body::memory::json_encoded_length(&request_json)? > MAX_IMAGE_REQUEST_BODY {
-        return Err(AppError::Upstream(
-            "plugin-rewritten request exceeds 16 MiB".into(),
-        ));
-    }
+    // Request size is enforced once, by ingress body admission. Re-checking it
+    // here with the image-generation ceiling rejected large Codex contexts with
+    // a misleading 502 "upstream_unavailable" even though the upstream was
+    // reachable and the body had already been admitted.
     let upstream_account_hint = plugin_decision
         .upstream_account_id
         .map(|value| {
-            Uuid::parse_str(&value).map_err(|_| {
-                AppError::Upstream("plugin returned an invalid upstream account id".into())
-            })
+            Uuid::parse_str(&value)
+                .map_err(|_| AppError::upstream("plugin_returned_an_invalid_upstream_account_id"))
         })
         .transpose()?;
     Ok(AppliedTraffic {
@@ -571,9 +592,7 @@ pub(super) async fn prepare_component_provider(
         plugins.prepare_provider_request(&provider_id, context, &config, &request_json)
     })
     .await?
-    .ok_or_else(|| {
-        AppError::Upstream("component provider adapter is declared but unavailable".into())
-    })
+    .ok_or_else(|| AppError::upstream("component_provider_adapter_is_declared_but_unavailable"))
 }
 
 pub(super) async fn normalize_component_provider(
@@ -583,45 +602,42 @@ pub(super) async fn normalize_component_provider(
     status: u16,
     headers: BTreeMap<String, String>,
     body: Vec<u8>,
+    memory: std::sync::Arc<crate::gateway_body::memory::ProxyMemoryReservation>,
 ) -> Result<NormalizedProviderResponse, AppError> {
-    let temporary_memory = state
-        .proxy_memory_budget
-        .temporary(64 * 1024 * 1024 + body.len().saturating_mul(6))
-        .map_err(|error| {
-            state.metrics.observe_proxy_memory_error(
-                crate::metrics::ProxyMemoryRejectionStage::Plugin,
-                error,
-            )
-        })?;
+    // The blocking guest can outlive this future. Its input must own a lease
+    // independently of the request, whose error response may be finalized
+    // while the guest still holds its raw/enveloped input. Transfer the permit
+    // back on success without releasing it to competing requests.
+    let input_memory = memory
+        .take_response_envelope()
+        .ok_or_else(|| AppError::capacity_error("upstream_response_memory_capacity"))?;
     let plugins = state.plugins.clone();
     let provider_id = provider_id.to_owned();
     plugin_execution::run(state.metrics.clone(), Phase::Normalize, move || {
-        let _temporary_memory = temporary_memory;
-        plugins.normalize_provider_response(&provider_id, context, status, &headers, &body)
+        let _memory = memory;
+        let mut normalized =
+            plugins.normalize_provider_response(&provider_id, context, status, &headers, &body)?;
+        if let Some(normalized) = normalized.as_mut() {
+            normalized.input_memory = Some(input_memory);
+        }
+        Ok(normalized)
     })
     .await?
-    .ok_or_else(|| {
-        AppError::Upstream("component provider adapter is declared but unavailable".into())
-    })
+    .ok_or_else(|| AppError::upstream("component_provider_adapter_is_declared_but_unavailable"))
 }
 
 pub(super) fn component_provider_url(base_url: &str, path: &str) -> Result<String, AppError> {
     let base = network::checked_http_url(base_url)?;
     let target = network::checked_http_url(&format!("{}{}", base_url.trim_end_matches('/'), path))?;
     if target.origin() != base.origin() {
-        return Err(AppError::Upstream(
-            "component provider path changed the configured upstream origin".into(),
+        return Err(AppError::upstream_with(
+            "upstream_unavailable",
+            crate::error::ErrorFacts::new().stage("traffic_component_provider_url"),
         ));
     }
     Ok(target.into())
 }
 
-pub(super) fn component_provider_timeout(config: &Value) -> Duration {
-    Duration::from_secs(
-        config
-            .get("timeout_seconds")
-            .and_then(Value::as_u64)
-            .unwrap_or(120)
-            .clamp(1, 120),
-    )
+fn named_memory_rejection(stage: &'static str, error: AppError) -> AppError {
+    error.name_if_overloaded(stage)
 }

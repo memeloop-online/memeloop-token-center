@@ -139,8 +139,8 @@ impl SessionPreferences {
         let protocol = protocol.to_owned();
         state.routing_persistence.submit(INPUT_LIMIT + 4096, async move {
             let value = tokio::time::timeout(Duration::from_millis(250), database.latest_session_transport_route_to_avoid_for_identity(key_identity, &session, &model, &protocol))
-                .await.map_err(|_| AppError::Internal)??;
-            let mut entries = cache.entries.lock().map_err(|_| AppError::Internal)?;
+                .await.map_err(|_| AppError::internal("session_preferences_lookup_1"))??;
+            let mut entries = cache.entries.lock().map_err(|_| AppError::internal("session_preferences_lookup_2"))?;
             if let Some(entry) = entries.iter_mut().find(|entry| entry.identity == identity && entry.version == version) {
                 entry.value = value;
             }

@@ -575,7 +575,7 @@ async fn postgres_output_rate_30d_prunes_history_and_plans_dense_set_join() {
 }
 
 async fn explain_usage_query(
-    pool: &sqlx::AnyPool,
+    pool: &crate::db::request_pool::RequestPool,
     sql: &str,
     plan: UsageAnalysisBucketPlan,
 ) -> String {

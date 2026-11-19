@@ -21,6 +21,11 @@ const TENANT_HAS_DEPENDENCIES: &str = r#"
         UNION ALL SELECT 1 FROM plugin_configurations WHERE tenant_id = $1
         UNION ALL SELECT 1 FROM routing_relation_write_locks WHERE tenant_id = $1
         UNION ALL SELECT 1 FROM session_archive_import_checkpoints WHERE tenant_id = $1
+        UNION ALL SELECT 1 FROM conversation_clusters WHERE tenant_id = $1
+        UNION ALL SELECT 1 FROM session_generated_titles WHERE tenant_id = $1
+        UNION ALL SELECT 1 FROM session_response_summaries WHERE tenant_id = $1
+        UNION ALL SELECT 1 FROM semantic_atoms WHERE tenant_id = $1
+        UNION ALL SELECT 1 FROM context_nodes WHERE tenant_id = $1
     ) AS has_dependencies
 "#;
 
@@ -256,7 +261,7 @@ async fn tenant_for_lifecycle(
         .ok_or(AppError::NotFound)?;
     let id = row.try_get::<String, _>("id")?;
     Ok((
-        Uuid::parse_str(&id).map_err(|_| AppError::Internal)?,
+        Uuid::parse_str(&id).map_err(|_| AppError::internal("tenants_tenant_for_lifecycle_1"))?,
         row.try_get("status")?,
         row.try_get("created_at")?,
     ))

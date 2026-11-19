@@ -208,7 +208,7 @@ async fn postgres_principal_ensure_is_concurrent_stable_and_subscription_preserv
         .unwrap();
     assert_eq!(managed.len(), 1);
     assert_eq!(managed[0].available_balance, "10");
-    assert_eq!(managed[0].policy.requests_per_minute, 17);
+    assert_eq!(managed[0].policy.requests_per_minute, Some(17));
     let account_count_after_subscription: i64 = sqlx::query_scalar(
         "SELECT count(*) FROM credit_accounts a JOIN principals p ON p.id = a.principal_id JOIN tenants t ON t.id = a.tenant_id WHERE t.external_id = $1 AND p.external_id = $2",
     )
@@ -341,7 +341,7 @@ async fn postgres_first_ensure_and_subscription_interleave_without_forking_ident
     assert_eq!(managed[0].key_id, key_id);
     assert_eq!(managed[0].account_id, account_id);
     assert_eq!(managed[0].available_balance, "10");
-    assert_eq!(managed[0].policy.requests_per_minute, 17);
+    assert_eq!(managed[0].policy.requests_per_minute, Some(17));
     assert_eq!(
         state
             .db

@@ -7,148 +7,39 @@ pub(super) struct CapturedSseDelivery {
 
 pub(super) struct FrameDelivery<'a> {
     pub waits: &'a mut wait_diagnostics::WaitDiagnostics,
-    pub state: &'a AppState,
     pub sender: &'a tokio::sync::mpsc::Sender<Result<Bytes, std::io::Error>>,
-    pub request_id: Uuid,
-    pub diagnostic_context: proxy_diagnostics::Context,
-    pub tenant_id: Uuid,
-    pub reservation: &'a crate::model::UsageReservation,
-    pub input_token_ceiling: i64,
-    pub output_token_ceiling: i64,
-    pub requested_service_tier: Option<&'a str>,
-    pub confirmed: &'a mut bool,
+    pub queued: &'a mut bool,
     pub probe: Option<&'a mut UpstreamAttemptGuard>,
 }
 
-/// The held terminal and ordinary frames use exactly the same durable
-/// delivery-start transition, including a terminal containing the only output.
 pub(super) async fn send_frame(
     input: FrameDelivery<'_>,
     frame: SseDeliveryFrame,
 ) -> Result<bool, &'static str> {
+    // Backpressure is flow control, not evidence of a failed request. Keep the
+    // bounded channel and wait until it has room or its receiver disconnects.
     let SseDeliveryFrame {
         bytes, billable, ..
     } = frame;
-    if billable && !*input.confirmed {
+    if billable && !*input.queued {
         let permit = input
             .waits
-            .downstream(tokio::time::timeout(
-                MAX_DOWNSTREAM_SEND_WAIT,
-                input.sender.reserve(),
-            ))
+            .downstream(input.sender.reserve())
             .await
-            .map_err(|_| "downstream_backpressure")?
             .map_err(|_| "downstream_disconnected")?;
-        if let Err(error) = observe_delivery_transition(
-            input.diagnostic_context,
-            "delivery_prepare",
-            prepare_proxy_delivery_with_retry(
-                &input.state.db,
-                input.request_id,
-                input.tenant_id,
-                input.reservation,
-                input.input_token_ceiling,
-                input.output_token_ceiling,
-                input.requested_service_tier,
-            ),
-        )
-        .await
-        {
-            log_delivery_state_failure(input.request_id, "delivery_prepare", &error);
-            return Err("delivery_state");
-        }
-        if let Err(error) = observe_delivery_transition(
-            input.diagnostic_context,
-            "delivery_confirm",
-            confirm_proxy_delivery_with_retry(
-                &input.state.db,
-                input.request_id,
-                input.tenant_id,
-                input.reservation,
-            ),
-        )
-        .await
-        {
-            log_delivery_state_failure(input.request_id, "delivery_confirm", &error);
-            return Err("delivery_state");
-        }
-        *input.confirmed = true;
         permit.send(Ok(bytes));
+        *input.queued = true;
     } else {
         input
             .waits
-            .downstream(tokio::time::timeout(
-                MAX_DOWNSTREAM_SEND_WAIT,
-                input.sender.send(Ok(bytes)),
-            ))
+            .downstream(input.sender.send(Ok(bytes)))
             .await
-            .map_err(|_| "downstream_backpressure")?
             .map_err(|_| "downstream_disconnected")?;
     }
     if billable && let Some(probe) = input.probe {
         probe.delivered_validated_output().await;
     }
     Ok(billable)
-}
-
-async fn observe_delivery_transition<T, F>(
-    context: proxy_diagnostics::Context,
-    phase_name: &'static str,
-    operation: F,
-) -> Result<T, AppError>
-where
-    F: std::future::Future<Output = Result<T, AppError>>,
-{
-    // Spawned owners do not inherit task-local request clocks. The frame owner
-    // passes the original ingress context, for ordinary and held terminal frames.
-    let request_id = context.request_id;
-    let phase = proxy_diagnostics::Phase::new(context, phase_name);
-    let result = tracing::Instrument::instrument(
-        operation,
-        tracing::info_span!(
-            "proxy_delivery_database", %request_id, phase = phase_name,
-        ),
-    )
-    .await;
-    phase.finish(
-        match &result {
-            Ok(_) => "completed",
-            Err(error) => delivery_error_class(error),
-        },
-        None,
-        None,
-    );
-    result
-}
-
-fn log_delivery_state_failure(request_id: Uuid, stage: &'static str, error: &AppError) {
-    tracing::error!(
-        %request_id,
-        stage,
-        error_class = delivery_error_class(error),
-        "proxy delivery state transition failed"
-    );
-}
-
-fn delivery_error_class(error: &AppError) -> &'static str {
-    match error {
-        AppError::Internal => "internal",
-        AppError::Storage(_) => "storage",
-        AppError::DatabaseUnavailable(failure) => failure.code(),
-        AppError::Conflict(_) | AppError::ProxyGroupConflict(_) => "state_conflict",
-        AppError::NotFound => "owner_missing",
-        AppError::BadRequest(_) | AppError::CompactionProducerUnavailable => "invalid_state",
-        AppError::Overloaded => "overloaded",
-        AppError::NoAuthorizedUpstreamCandidate => "no_authorized_upstream_candidate",
-        AppError::Unauthorized | AppError::Forbidden => "authorization",
-        AppError::UnpricedModel
-        | AppError::QuotaExceeded
-        | AppError::RateLimited
-        | AppError::LimitExceeded { .. }
-        | AppError::SchemaSecretAnalysisTooComplex
-        | AppError::Upstream(_)
-        | AppError::OAuthRefresh(_) => "unexpected",
-    }
 }
 
 /// Keep only the bounded terminal tail, never the streamed response body.
@@ -221,13 +112,13 @@ impl Default for TerminalFrames {
 pub(super) fn invalid_terminal_failure(protocol: Protocol) -> Bytes {
     match protocol {
         Protocol::OpenAiResponses | Protocol::OpenAiResponsesCompact => {
-            crate::api::sse::safe_failure_event()
+            crate::api::sse::safe_failure_event("upstream_incomplete_response", "invalid_terminal")
         }
         Protocol::AnthropicMessages => Bytes::from_static(
-            b"event: error\ndata: {\"type\":\"error\",\"error\":{\"type\":\"api_error\",\"message\":\"upstream stream did not complete\"}}\n\n",
+            "event: error\ndata: {\"type\":\"error\",\"error\":{\"type\":\"api_error\",\"code\":\"upstream_incomplete_response\",\"message\":\"上游响应流没有完整结束。失败阶段 invalid_terminal。\",\"message_en\":\"upstream stream did not complete. failure stage invalid_terminal.\"}}\n\n".as_bytes(),
         ),
         _ => Bytes::from_static(
-            b"data: {\"error\":{\"type\":\"upstream_error\",\"message\":\"upstream stream did not complete\"}}\n\n",
+            "data: {\"error\":{\"code\":\"upstream_incomplete_response\",\"message\":\"上游响应流没有完整结束。失败阶段 invalid_terminal。\",\"message_en\":\"upstream stream did not complete. failure stage invalid_terminal.\",\"type\":\"upstream_error\"}}\n\n".as_bytes(),
         ),
     }
 }
@@ -252,7 +143,13 @@ pub(super) fn downstream_stream_failure(
         {
             Ok(Bytes::new())
         } else {
-            Ok(crate::api::sse::safe_failure_event())
+            let code = sanitizer
+                .map(crate::api::sse::ResponsesStreamingSanitizer::last_rejection_code)
+                .unwrap_or("upstream_incomplete_response");
+            let stage = sanitizer
+                .map(crate::api::sse::ResponsesStreamingSanitizer::last_rejection_stage)
+                .unwrap_or("unknown");
+            Ok(crate::api::sse::safe_failure_event(code, stage))
         }
     } else {
         Err(std::io::Error::other(message))
@@ -285,3 +182,73 @@ pub(super) fn capture_sse_delivery(
 #[cfg(test)]
 #[path = "delivery_log_tests.rs"]
 mod delivery_log_tests;
+
+#[cfg(test)]
+mod backpressure_tests {
+    use super::*;
+
+    #[tokio::test(start_paused = true)]
+    async fn slow_reader_receives_first_and_later_frames_after_old_deadline() {
+        for queued_before in [false, true] {
+            let (sender, mut receiver) = tokio::sync::mpsc::channel(1);
+            sender
+                .send(Ok(Bytes::from_static(b"previous")))
+                .await
+                .unwrap();
+            let task = tokio::spawn(async move {
+                let mut waits = wait_diagnostics::WaitDiagnostics::default();
+                let mut queued = queued_before;
+                send_frame(
+                    FrameDelivery {
+                        waits: &mut waits,
+                        sender: &sender,
+                        queued: &mut queued,
+                        probe: None,
+                    },
+                    SseDeliveryFrame {
+                        bytes: Bytes::from_static(b"next"),
+                        billable: true,
+                        terminal: false,
+                    },
+                )
+                .await
+            });
+            tokio::task::yield_now().await;
+            tokio::time::advance(Duration::from_secs(31)).await;
+            assert!(!task.is_finished());
+            assert_eq!(receiver.recv().await.unwrap().unwrap(), "previous");
+            assert!(task.await.unwrap().unwrap());
+            assert_eq!(receiver.recv().await.unwrap().unwrap(), "next");
+        }
+    }
+
+    #[tokio::test]
+    async fn disconnected_reader_releases_pending_send() {
+        let (sender, receiver) = tokio::sync::mpsc::channel(1);
+        sender
+            .send(Ok(Bytes::from_static(b"previous")))
+            .await
+            .unwrap();
+        let task = tokio::spawn(async move {
+            let mut waits = wait_diagnostics::WaitDiagnostics::default();
+            let mut queued = false;
+            send_frame(
+                FrameDelivery {
+                    waits: &mut waits,
+                    sender: &sender,
+                    queued: &mut queued,
+                    probe: None,
+                },
+                SseDeliveryFrame {
+                    bytes: Bytes::from_static(b"next"),
+                    billable: true,
+                    terminal: false,
+                },
+            )
+            .await
+        });
+        tokio::task::yield_now().await;
+        drop(receiver);
+        assert_eq!(task.await.unwrap(), Err("downstream_disconnected"));
+    }
+}

@@ -24,14 +24,58 @@ const runtimeFlags = [
   '--set', 'plugins.runtimeInventory.registrySecrets[0].keys[1]=password',
 ];
 
+test('dedicated RustFS is isolated and archive routing requires explicit cutover', () => {
+  const render = (flags: string[] = []): any[] => parseAllDocuments(run(helm, ['template', 'rustfs-test', chart, '--namespace', 'token-center', ...flags])).map(document => document.toJSON()).filter(Boolean);
+  const flags = ['--values', join(chart, 'values-rustfs-test.yaml')];
+  assert.equal(render().some(document => document.metadata?.name?.endsWith('-rustfs')), false);
+  const prepared = render(flags);
+  const storage = prepared.find(document => document.kind === 'Deployment' && document.metadata.name.endsWith('-rustfs'));
+  assert.equal(storage.spec.replicas, 1);
+  assert.equal(storage.spec.strategy.type, 'Recreate');
+  assert.equal(storage.spec.template.spec.automountServiceAccountToken, false);
+  assert.equal(storage.spec.template.spec.securityContext.runAsUser, 10001);
+  assert.equal(storage.spec.template.spec.containers[0].image, 'rustfs/rustfs@sha256:ed9210d6411d77ffceb70d94b964a3cb7d225983368bc25bebe01e995293dcc2');
+  assert.deepEqual(storage.spec.template.spec.volumes.find((volume: any) => volume.name === 'tmp').emptyDir, {});
+  assert.equal(storage.spec.template.spec.volumes.some((volume: any) => volume.name === 'logs'), false);
+  assert.equal(storage.spec.template.spec.containers[0].env.find((entry: any) => entry.name === 'RUSTFS_OBS_LOG_DIRECTORY').value, '');
+  const tuned = render([...flags, '--set', 'rustfs.terminationGracePeriodSeconds=180', '--set', 'rustfs.probes.readiness.timeoutSeconds=7']);
+  const tunedStorage = tuned.find(document => document.kind === 'Deployment' && document.metadata.name.endsWith('-rustfs'));
+  assert.equal(tunedStorage.spec.template.spec.terminationGracePeriodSeconds, 180);
+  assert.equal(tunedStorage.spec.template.spec.containers[0].readinessProbe.timeoutSeconds, 7);
+  assert.throws(() => render([...flags, '--set', 'rustfs.probes.startup.periodSeconds=0']));
+  const claim = prepared.find(document => document.kind === 'PersistentVolumeClaim' && document.metadata.name.endsWith('-rustfs'));
+  assert.equal(claim.spec.storageClassName, 'longhorn-large-single');
+  assert.equal(claim.metadata.annotations['helm.sh/resource-policy'], 'keep');
+  const service = prepared.find(document => document.kind === 'Service' && document.metadata.name.endsWith('-rustfs'));
+  assert.equal(service.spec.type, 'ClusterIP');
+  assert.deepEqual(service.spec.selector, storage.spec.selector.matchLabels);
+  assert.equal(service.spec.ports.length, 1);
+  const policy = prepared.find(document => document.kind === 'NetworkPolicy' && document.metadata.name.endsWith('-rustfs'));
+  assert.deepEqual(policy.spec.egress, []);
+  for (const document of prepared.filter(document => document.kind === 'Deployment' && document !== storage)) {
+    assert.equal(document.spec.template.spec.containers[0].env.find((entry: any) => entry.name === 'MTC_S3_ENDPOINT').value, '');
+  }
+  const connected = render([...flags, '--set', 'rustfs.connectArchive=true']);
+  for (const document of connected.filter(document => document.kind === 'Deployment' && !document.metadata.name.endsWith('-rustfs'))) {
+    const environment = document.spec.template.spec.containers[0].env;
+    assert.equal(environment.find((entry: any) => entry.name === 'MTC_S3_ENDPOINT').value, 'http://rustfs-test-memeloop-token-center-rustfs:9000');
+    assert.equal(environment.find((entry: any) => entry.name === 'MTC_S3_ALLOW_HTTP').value, 'true');
+  }
+  assert.equal(render([...flags, '--set', 'rustfs.persistence.existingClaim=retained-archive']).some(document => document.kind === 'PersistentVolumeClaim' && document.metadata.name.endsWith('-rustfs')), false);
+  assert.throws(() => render(['--set', 'rustfs.connectArchive=true']));
+  const pinned = render([...flags, '--set-string', `rustfs.image.digest=${reviewed}`]);
+  assert.equal(pinned.find(document => document.kind === 'Deployment' && document.metadata.name.endsWith('-rustfs')).spec.template.spec.containers[0].image, `rustfs/rustfs@${reviewed}`);
+  if (process.env.KUBECONFORM_BIN) run(process.env.KUBECONFORM_BIN, ['-strict', '-summary', '-ignore-missing-schemas'], { input: run(helm, ['template', 'rustfs-test', chart, ...flags]), stdio: ['pipe', 'pipe', 'pipe'] });
+});
+
 interface RuntimeDeployment {
   kind: string;
   metadata: { annotations: Record<string, string> };
   spec: { template: { metadata: { labels: Record<string, string> }; spec: {
     securityContext: { runAsUser: number; runAsGroup: number; fsGroup: number };
-    containers: Array<{ image: string; env: Array<{ name: string; value?: string }>; volumeMounts: Array<{ name: string; readOnly?: boolean; subPath?: string }> }>;
+    containers: Array<{ image: string; env: Array<{ name: string; value?: string }>; resources: { requests: Record<string, string>; limits: Record<string, string> }; volumeMounts: Array<{ name: string; mountPath?: string; readOnly?: boolean; subPath?: string }> }>;
     initContainers: Array<{ name: string; image: string; args: string[]; volumeMounts: Array<{ readOnly?: boolean }> }>;
-    volumes: Array<{ name: string; emptyDir?: { sizeLimit?: string; medium?: string }; persistentVolumeClaim?: { claimName: string; readOnly: boolean }; secret?: { secretName: string } }>;
+    volumes: Array<{ name: string; emptyDir?: { sizeLimit?: string; medium?: string }; hostPath?: { path: string; type: string }; persistentVolumeClaim?: { claimName: string; readOnly: boolean }; secret?: { secretName: string } }>;
   } } };
 }
 
@@ -41,14 +85,27 @@ test('Helm chart packaging, security, ingress, and schema contracts', () => {
     run(helm, ['lint', '--strict', chart]);
     run(helm, ['lint', '--strict', chart, '--values', join(chart, 'values-dev.yaml')]);
     const render = (name: string, flags: string[] = []): string => run(helm, ['template', `token-center-${name}`, chart, '--namespace', 'token-center', ...flags]);
+    // Runtime inventory and the legacy OCI installer are deliberately exclusive.
+    assert.throws(() => render('runtime-gateway-cache-oci', [
+        ...runtimeFlags, '--set-string', 'plugins.runtimeInventory.gatewayCachePath=/var/lib/memeloop-token-center/gateway-plugin-cache',
+        '--set', 'plugins.enabled=true', '--set', 'plugins.ociInstaller.enabled=true',
+        '--set-string', `plugins.ociInstaller.image.digest=${installer}`,
+        '--set-string', `plugins.ociInstaller.artifacts[0].reference=ghcr.io/example/plugin@${artifact}`,
+        '--set-string', 'plugins.ociInstaller.artifacts[0].allowedSource=ghcr.io/example/plugin',
+        '--set-string', 'plugins.ociInstaller.cosignPublicKeysSecret.name=plugin-cosign-keys',
+        '--set-string', 'plugins.ociInstaller.cosignPublicKeysSecret.keys[0]=cosign.pub',
+        '--set-string', 'plugins.ociInstaller.registryAuthSecret.name=plugin-registry-auth',
+      ]), /runtimeInventory cannot be combined/);
     const output: Record<string, string> = {
       default: render('default'),
       terminalProjectionDisabled: render('default', ['--set', 'config.terminalProjectionEnabled=false']),
       terminalProjectionEnabled: render('default', ['--set', 'config.terminalProjectionEnabled=true']),
-      terminalProjectionAll: render('terminal-projection-all', ['--set', 'config.terminalProjectionEnabled=true', '--set', 'roles.all.enabled=true', '--set', 'roles.gateway.enabled=false', '--set', 'roles.control.enabled=false', '--set', 'roles.worker.enabled=false']),
+      terminalProjectionAll: render('terminal-projection-all', ['--set', 'config.terminalProjectionEnabled=true', '--set', 'config.proxyMemoryBudgetBytes=536870912', '--set', 'roles.all.enabled=true', '--set', 'roles.gateway.enabled=false', '--set', 'roles.control.enabled=false', '--set', 'roles.worker.enabled=false']),
       runtime: render('runtime', runtimeFlags),
+      runtimeGatewayCache: render('runtime-gateway-cache', [...runtimeFlags, '--set-string', 'plugins.runtimeInventory.gatewayCachePath=/var/lib/memeloop-token-center/gateway-plugin-cache']),
       runtimeReaders: render('runtime-readers', runtimeFlags.slice(0, 4)),
       runtimeCreated: render('runtime-created', ['--set', 'plugins.runtimeInventory.enabled=true', '--set', 'plugins.runtimeInventory.persistence.create=true', '--set', 'plugins.runtimeInventory.persistence.storageClass=reviewed-rwx']),
+      runtimeAll: render('runtime-all', [...runtimeFlags, '--set', 'config.proxyMemoryBudgetBytes=536870912', '--set', 'roles.all.enabled=true', '--set', 'roles.gateway.enabled=false', '--set', 'roles.control.enabled=false', '--set', 'roles.worker.enabled=false']),
       dev: render('dev', ['--values', join(chart, 'values-dev.yaml')]),
       observed: render('observed', ['--set', 'serviceMonitor.enabled=true', '--set', 'roles.gateway.autoscaling.enabled=true']),
       gatewayMetrics: render('gateway-metrics', ['--show-only', 'templates/servicemonitor.yaml', '--set', 'serviceMonitor.enabled=true', '--set', 'roles.control.enabled=false']),
@@ -78,7 +135,7 @@ test('Helm chart packaging, security, ingress, and schema contracts', () => {
       recreate: render('recreate', ['--set', 'deploymentStrategy=Recreate']),
       archiveReadyBoundary: render('archive-ready-boundary', ['--set', 'config.s3.readinessDeadlineMillis=5001', '--set', 'probes.readiness.timeoutSeconds=8']),
       proxyMemory: render('proxy-memory', ['--set', 'config.proxyMemoryBudgetBytes=536870912', '--set', 'roles.gateway.resources.requests.memory=512Mi', '--set', 'roles.gateway.resources.limits.memory=768Mi']),
-      fractionalMemory: render('fractional-memory', ['--set', 'roles.gateway.resources.limits.memory=0.75Gi']),
+      fractionalMemory: render('fractional-memory', ['--set', 'config.proxyMemoryBudgetBytes=536870912', '--set', 'roles.gateway.resources.limits.memory=0.75Gi']),
       maximumBodyMemory: render('maximum-body-memory', ['--set', 'config.responsesBodyMaxBytes=67108864', '--set', 'config.proxyMemoryBudgetBytes=1073741824', '--set', 'roles.gateway.resources.requests.memory=1Gi', '--set', 'roles.gateway.resources.limits.memory=1280Mi']),
     };
     const has = (key: string, needle: string): void => assert.ok(output[key]!.includes(needle), `${key} render lacks ${needle}`);
@@ -86,7 +143,7 @@ test('Helm chart packaging, security, ingress, and schema contracts', () => {
     const count = (key: string, pattern: string | RegExp, expected: number): void => assert.equal(occurrences(output[key]!, pattern), expected, `${key} count for ${String(pattern)}`);
 
     assert.equal(output.terminalProjectionDisabled, output.default);
-    count('default', 'name: MTC_TERMINAL_PROJECTION_ENABLED', 0);
+    count('default', /name: MTC_TERMINAL_PROJECTION_ENABLED\n\s+value: "false"/, 1);
     count('terminalProjectionEnabled', /name: MTC_TERMINAL_PROJECTION_ENABLED\n\s+value: "true"/, 1);
     count('terminalProjectionAll', /name: MTC_TERMINAL_PROJECTION_ENABLED\n\s+value: "true"/, 1);
     const enabledProjectionDocuments = parseAllDocuments(output.terminalProjectionEnabled!).map(document => document.toJSON() as RuntimeDeployment);
@@ -95,7 +152,7 @@ test('Helm chart packaging, security, ingress, and schema contracts', () => {
       const container = deployment.spec.template.spec.containers[0]!;
       const flag = container.env.filter(variable => variable.name === 'MTC_TERMINAL_PROJECTION_ENABLED');
       assert.deepEqual(flag, role === 'gateway' ? [{ name: 'MTC_TERMINAL_PROJECTION_ENABLED', value: 'true' }] : []);
-      container.env = container.env.filter(variable => variable.name !== 'MTC_TERMINAL_PROJECTION_ENABLED');
+      for (const variable of flag) variable.value = 'false';
     }
     assert.deepEqual(enabledProjectionDocuments, parseAllDocuments(output.default!).map(document => document.toJSON()));
     const allProjectionDeployment = parseAllDocuments(output.terminalProjectionAll!).map(document => document.toJSON() as RuntimeDeployment).find(document => document?.kind === 'Deployment')!;
@@ -109,6 +166,22 @@ test('Helm chart packaging, security, ingress, and schema contracts', () => {
     count('runtime', 'name: MTC_PLUGIN_INVENTORY_FILE', 3);
     count('runtime', 'name: MTC_PLUGIN_INSTALL_POLICY_FILE', 1);
     count('runtimeReaders', 'name: MTC_PLUGIN_INSTALL_POLICY_FILE', 0);
+    for (const deployment of parseAllDocuments(output.runtimeGatewayCache!).map(document => document.toJSON() as RuntimeDeployment).filter(document => document?.kind === 'Deployment')) {
+      const role = deployment.spec.template.metadata.labels['app.kubernetes.io/component'];
+      const pod = deployment.spec.template.spec;
+      const volume = pod.volumes.find(item => item.name === 'plugin-runtime-inventory')!;
+      if (role === 'gateway') {
+        assert.deepEqual(volume.hostPath, { path: '/var/lib/memeloop-token-center/gateway-plugin-cache', type: 'DirectoryOrCreate' });
+        assert.equal(volume.persistentVolumeClaim, undefined);
+        assert.equal(pod.initContainers?.some(item => item.name === 'prepare-plugin-inventory') ?? false, false);
+        assert.equal(pod.containers[0]!.volumeMounts.find(item => item.name === 'plugin-runtime-inventory')!.readOnly, true);
+        assert.equal(deployment.metadata.annotations['argocd.argoproj.io/sync-wave'], '0');
+        assert.equal(pod.containers[0]!.env.some(item => item.name === 'MTC_PLUGIN_INSTALL_POLICY_FILE'), false);
+      } else {
+        assert.equal(volume.hostPath, undefined);
+        assert.equal(volume.persistentVolumeClaim?.claimName, 'shared-plugin-inventories');
+      }
+    }
     lacks('runtimeReaders', 'secretName:');
     lacks('runtime', 'subPath:');
     lacks('runtime', 'MTC_PLUGIN_DIR');
@@ -116,10 +189,38 @@ test('Helm chart packaging, security, ingress, and schema contracts', () => {
     has('runtimeCreated', 'helm.sh/resource-policy: keep');
     has('runtimeCreated', 'storage: "1Gi"');
     has('runtimeCreated', 'storageClassName: "reviewed-rwx"');
+    for (const key of ['runtime', 'runtimeReaders', 'runtimeCreated', 'runtimeAll', 'retainedWorker']) {
+      const runtimeDeployments = parseAllDocuments(output[key]!).map(document => document.toJSON() as RuntimeDeployment).filter(document => document?.kind === 'Deployment');
+      const writer = runtimeDeployments.find(deployment => ['control', 'all'].includes(deployment.spec.template.metadata.labels['app.kubernetes.io/component']!))!;
+      const writerWave = Number(writer.metadata.annotations['argocd.argoproj.io/sync-wave']);
+      const writerClaim = writer.spec.template.spec.volumes.find(volume => volume.name === 'plugin-runtime-inventory')!.persistentVolumeClaim!.claimName;
+      for (const deployment of runtimeDeployments) {
+        const role = deployment.spec.template.metadata.labels['app.kubernetes.io/component'];
+        const claim = deployment.spec.template.spec.volumes.find(volume => volume.name === 'plugin-runtime-inventory')!;
+        assert.equal(claim.persistentVolumeClaim?.claimName, writerClaim, `${key}/${role}: image or role changes must retain the shared PVC`);
+        assert.equal(claim.emptyDir, undefined, `${key}/${role}: runtime state must never fall back to Pod storage`);
+        if (role === 'gateway' || role === 'worker') {
+          assert.ok(writerWave < Number(deployment.metadata.annotations['argocd.argoproj.io/sync-wave']), `${key}/${role}: empty-PVC initialization must precede read-only startup`);
+        }
+      }
+    }
     for (const deployment of parseAllDocuments(output.runtime!).map(document => document.toJSON() as RuntimeDeployment).filter(document => document?.kind === 'Deployment')) {
       const role = deployment.spec.template.metadata.labels['app.kubernetes.io/component'];
       const writer = role === 'control';
       const pod = deployment.spec.template.spec;
+      const resources = pod.containers[0]!.resources;
+      const spoolMount = pod.containers[0]!.volumeMounts?.find(item => item.name === 'request-spool');
+      const spoolVolume = pod.volumes?.find(item => item.name === 'request-spool');
+      if (role === 'gateway' || role === 'control' || role === 'all') {
+        assert.equal(spoolMount?.mountPath, '/var/lib/memeloop-token-center/request-spool');
+        assert.deepEqual(spoolVolume?.emptyDir, {});
+        assert.equal(resources.requests['ephemeral-storage'], '2Gi');
+        assert.equal(resources.limits['ephemeral-storage'], undefined);
+        assert.equal(pod.containers[0]!.env.find(item => item.name === 'MTC_RESPONSES_REQUEST_SPOOL_PATH')?.value, spoolMount?.mountPath);
+      } else {
+        assert.equal(spoolMount, undefined);
+        assert.equal(spoolVolume, undefined);
+      }
       const container = pod.containers[0]!;
       assert.equal(pod.securityContext.runAsUser, 10001);
       assert.equal(pod.securityContext.runAsGroup, 10001);
@@ -130,6 +231,7 @@ test('Helm chart packaging, security, ingress, and schema contracts', () => {
       assert.equal(volume.persistentVolumeClaim?.claimName, 'shared-plugin-inventories');
       assert.equal(volume.persistentVolumeClaim?.readOnly, !writer);
       const prepare = pod.initContainers.find(item => item.name === 'prepare-plugin-inventory')!;
+      assert.equal(prepare.args.includes('--allow-unavailable'), true, `${role}: optional inventory must not block startup`);
       assert.equal(prepare.args.includes('--read-only'), !writer, `${role}: readers never initialize`);
       assert.equal(prepare.volumeMounts[0]!.readOnly, !writer);
       assert.equal(pod.volumes.some(item => item.secret?.secretName === 'publisher-trust'), writer);
@@ -138,29 +240,28 @@ test('Helm chart packaging, security, ingress, and schema contracts', () => {
     }
 
     has('default', 'kind: NetworkPolicy'); has('default', 'kind: PodDisruptionBudget');
-    count('default', /name: MTC_PROXY_MEMORY_BUDGET_BYTES\n\s+value: "536870912"/, 3);
+    count('default', /name: MTC_PROXY_MEMORY_BUDGET_BYTES\n\s+value: "2147483648"/, 3);
     count('proxyMemory', /name: MTC_PROXY_MEMORY_BUDGET_BYTES\n\s+value: "536870912"/, 3);
+    count('dev', /name: MTC_PROXY_MEMORY_BUDGET_BYTES\n\s+value: "536870912"/, 1);
     const gatewayDeployment = output.default!.split(/^---$/m).find((document) => document.includes('kind: Deployment') && document.includes('app.kubernetes.io/component: gateway'))!;
-    assert.match(gatewayDeployment, /limits:\s+cpu: [^\n]+\s+ephemeral-storage: 256Mi\s+memory: 1Gi/);
-    assert.match(gatewayDeployment, /requests:\s+cpu: [^\n]+\s+ephemeral-storage: 64Mi\s+memory: 256Mi/);
+    assert.match(gatewayDeployment, /limits:\s+cpu: [^\n]+\s+memory: 8Gi/);
+    assert.match(gatewayDeployment, /requests:\s+cpu: [^\n]+\s+ephemeral-storage: 2Gi\s+memory: 512Mi/);
     has('fractionalMemory', 'memory: 0.75Gi');
-    count('default', /name: MTC_RESPONSES_REQUEST_SPOOL_BYTES\n\s+value: "134217728"/, 3);
-    count('default', /name: MTC_RESPONSES_REQUEST_SPOOL_PATH\n\s+value: "\/var\/lib\/memeloop-token-center\/request-spool"/, 3);
+    assert.ok(!output.default!.includes('MTC_RESPONSES_REQUEST_SPOOL_BYTES'));
+    count('default', /name: MTC_RESPONSES_REQUEST_SPOOL_PATH\n\s+value: \/var\/lib\/memeloop-token-center\/request-spool/, 2);
+    assert.ok(!output.default!.includes('responses-request-spool'));
     const deployments = parseAllDocuments(output.default!).map(document => document.toJSON() as RuntimeDeployment).filter(document => document?.kind === 'Deployment');
+    const defaultMemory: Record<string, string[]> = { gateway: ['512Mi', '8Gi'], control: ['128Mi', '256Mi'], worker: ['192Mi', '384Mi'] };
     for (const deployment of deployments) {
       const role = deployment.spec.template.metadata.labels['app.kubernetes.io/component'];
+      const expectedMemory = defaultMemory[role!];
+      assert.ok(expectedMemory, `${role}: expected default role`);
+      const resources = deployment.spec.template.spec.containers[0]!.resources;
+      assert.deepEqual([resources.requests.memory, resources.limits.memory], expectedMemory, `${role}: default memory request and limit`);
       assert.equal(deployment.metadata.annotations['argocd.argoproj.io/sync-wave'], role === 'gateway' || role === 'control' ? '1' : '0');
       const pod = deployment.spec.template.spec;
-      const spoolMount = pod.containers[0]!.volumeMounts?.find(item => item.name === 'responses-request-spool');
-      const spoolVolume = pod.volumes?.find(item => item.name === 'responses-request-spool');
-      if (role === 'gateway' || role === 'all') {
-        assert.equal(spoolMount?.readOnly, false, `${role}: request spool mount must be writable`);
-        assert.equal(spoolVolume?.emptyDir?.sizeLimit, '160Mi', `${role}: request spool must use bounded emptyDir`);
-        assert.equal(spoolVolume?.emptyDir?.medium, undefined, `${role}: request spool must use node disk`);
-      } else {
-        assert.equal(spoolMount, undefined, `${role}: does not accept Responses bodies`);
-        assert.equal(spoolVolume, undefined, `${role}: does not accept Responses bodies`);
-      }
+      assert.equal(pod.containers[0]!.volumeMounts?.find(item => item.name === 'responses-request-spool'), undefined, `${role}: request bodies do not get a temp directory`);
+      assert.equal(pod.volumes?.find(item => item.name === 'responses-request-spool'), undefined, `${role}: request bodies do not get a temp directory`);
     }
     for (const deployment of output.default!.split(/^---$/m).filter((document) => document.includes('kind: Deployment'))) {
       for (const [name, value] of [['CONNECT_TIMEOUT', '5000'], ['REQUEST_TIMEOUT', '30000'], ['READINESS_DEADLINE', '5000']]) {
@@ -191,6 +292,8 @@ test('Helm chart packaging, security, ingress, and schema contracts', () => {
       assert.equal(deployment.spec.template.spec.initContainers.find(item => item.name === 'prepare-plugin-inventory')!.image, expected, `${role}: init/runtime image compatibility`);
     }
     count('default', 'type: RollingUpdate', 3); count('recreate', 'type: Recreate', 3); lacks('recreate', 'rollingUpdate:');
+    count('default', 'maxUnavailable: 0', 1);
+    count('default', 'maxSurge: 1', 1);
     count('default', /readinessProbe:\s+httpGet: \{ path: "?\/readyz"?, port: http \}/g, 3);
     const services = parseAllDocuments(output.default!).map(document => document.toJSON()).filter(document => document?.kind === 'Service');
     for (const role of ['gateway', 'control']) {
@@ -262,7 +365,7 @@ test('Helm chart packaging, security, ingress, and schema contracts', () => {
       ['config.archiveSpoolCompression.enabled=not-a-boolean'], ['config.archiveSpoolCompression.unknown=true'],
       ['config.archiveObjectCompression.enabled=not-a-boolean'], ['config.archiveObjectCompression.unknown=true'],
       ['config.proxyMemoryBudgetBytes=268435455'], ['config.proxyMemoryBudgetBytes=2147483649'],
-      ['config.responsesRequestSpoolBytes=4194303'], ['config.responsesRequestSpoolBytes=2147483649'], ['requestSpool.mountPath=relative/path'], ['requestSpool.mountPath=/'],
+      ['config.responsesRequestSpoolBytes=134217728'], ['requestSpool.mountPath=/var/lib/memeloop-token-center/request-spool'],
     ];
     for (const [index, values] of invalid.entries()) {
       const args = ['template', `invalid-${index}`, chart, ...values!.flatMap((value) => ['--set-string', value])];
@@ -280,34 +383,23 @@ test('Helm chart packaging, security, ingress, and schema contracts', () => {
     }
     const oldSchema = spawnSync(helm, ['template', 'invalid-old-schema', chart, '--set', 'migration.schemaVersion=58'], { cwd: repository, encoding: 'utf8', shell: false });
     for (const values of [
-      ['roles.gateway.resources.limits.memory=767Mi'],
+      ['roles.gateway.resources.limits.memory=1Gi'],
+      ['roles.gateway.resources.limits.memory=2303Mi'],
       ['roles.all.enabled=true', 'roles.gateway.enabled=false', 'roles.control.enabled=false', 'roles.worker.enabled=false', 'roles.all.resources.limits.memory=767Mi'],
-      ['config.proxyMemoryBudgetBytes=805306369'],
+      ['config.proxyMemoryBudgetBytes=1879048193', 'roles.gateway.resources.limits.memory=2Gi'],
     ]) {
       const result = spawnSync(helm, ['template', 'invalid-workload-budget', chart, ...values.flatMap((value) => ['--set', value])], { cwd: repository, encoding: 'utf8', shell: false });
       assert.notEqual(result.status, 0, `memory cross-field gate accepted ${values.join(',')}`);
       assert.match(result.stderr, /memory must cover config.proxyMemoryBudgetBytes plus 256Mi/);
     }
-    for (const values of [
-      ['config.responsesRequestSpoolBytes=33554431'],
-      ['requestSpool.sizeLimit=127Mi'],
-      ['requestSpool.mountPath=/var/lib/../request-spool'],
-      ['roles.gateway.resources.limits.ephemeral-storage=223Mi'],
-      ['roles.all.enabled=true', 'roles.gateway.enabled=false', 'roles.control.enabled=false', 'roles.worker.enabled=false', 'roles.all.resources.limits.ephemeral-storage=223Mi'],
-    ]) {
-      const result = spawnSync(helm, ['template', 'invalid-spool-budget', chart, ...values.flatMap((value) => ['--set', value])], { cwd: repository, encoding: 'utf8', shell: false });
-      assert.notEqual(result.status, 0, `request spool cross-field gate accepted ${values.join(',')}`);
-      assert.match(result.stderr, /responsesRequestSpoolBytes must cover|requestSpool.sizeLimit must cover|requestSpool.mountPath must be|ephemeral-storage must cover/);
-    }
     assert.notEqual(oldSchema.status, 0, 'release values schema accepted migration.schemaVersion=58');
     for (const budget of ['268435456', '805306368']) {
-      const result = spawnSync(helm, ['template', 'invalid-body-memory-budget', chart,
+      const result = spawnSync(helm, ['template', 'body-memory-budget', chart,
         '--set', 'config.responsesBodyMaxBytes=67108864',
         '--set', `config.proxyMemoryBudgetBytes=${budget}`,
         '--set', 'roles.gateway.resources.limits.memory=1280Mi'],
       { cwd: repository, encoding: 'utf8', shell: false });
-      assert.notEqual(result.status, 0, '64Mi body accepted insufficient retained-memory headroom');
-      assert.match(result.stderr, /responsesBodyMaxBytes times 12 plus 1Mi/);
+      assert.equal(result.status, 0, `body size must not force a 12x memory budget: ${result.stderr}`);
     }
 
     if (process.env.KUBECONFORM_BIN) {
@@ -315,4 +407,22 @@ test('Helm chart packaging, security, ingress, and schema contracts', () => {
       assert.equal(result.status, 0, result.stderr);
     }
   } finally { rmSync(workspace, { recursive: true, force: true }); }
+});
+
+
+test('worker shares bootstrap grant authority while gateway keeps its role sentinel', () => {
+  const documents = parseAllDocuments(run(helm, ['template', 'grant-authority', chart,
+    '--set', 'config.serviceTokenSecret.name=grant-authority-secret',
+    '--set', 'config.serviceTokenSecret.key=authority-token',
+  ])).map(document => document.toJSON()).filter(Boolean);
+  for (const role of ['control', 'worker', 'gateway']) {
+    const deployment = documents.find(document => document.kind === 'Deployment'
+      && document.metadata.name.endsWith(`-${role}`));
+    assert.ok(deployment, `${role} deployment is rendered`);
+    const environment = deployment.spec.template.spec.containers[0].env;
+    const token = environment.find((entry: any) => entry.name === 'MTC_SERVICE_TOKEN');
+    if (role === 'gateway') assert.equal(token.value, 'bootstrap-disabled-for-this-role');
+    else assert.deepEqual(token.valueFrom.secretKeyRef, { name: 'grant-authority-secret', key: 'authority-token' });
+    if (role === 'worker') assert.equal(environment.some((entry: any) => entry.name === 'MTC_RUNTIME_PROFILING_ENABLED'), false);
+  }
 });

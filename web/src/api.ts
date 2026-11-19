@@ -4,6 +4,7 @@ export class ApiError extends Error {
     public readonly status: number,
     public readonly code?: string,
     public readonly requestId?: string,
+    public readonly messageEn?: string,
   ) {
     super(message);
   }
@@ -39,9 +40,9 @@ export async function api<T>(
   });
   const requestId = responseRequestId(response);
   const text = await response.text();
-  let body: T | { error?: { code?: string; message?: string } } = {} as T;
+  let body: T | { error?: { code?: string; message?: string; message_en?: string } } = {} as T;
   if (text) {
-    try { body = JSON.parse(text) as T | { error?: { code?: string; message?: string } }; }
+    try { body = JSON.parse(text) as T | { error?: { code?: string; message?: string; message_en?: string } }; }
     catch {
       if (!response.ok) throw new ApiError(`HTTP ${response.status}`, response.status, undefined, requestId);
       throw new ApiError(`HTTP ${response.status}: invalid JSON response`, response.status, undefined, requestId);
@@ -49,7 +50,7 @@ export async function api<T>(
   }
   if (!response.ok) {
     const error = typeof body === 'object' && body && 'error' in body ? body.error : undefined;
-    throw new ApiError(error?.message ?? `HTTP ${response.status}`, response.status, error?.code, requestId);
+    throw new ApiError(error?.message ?? `HTTP ${response.status}`, response.status, error?.code, requestId, error?.message_en);
   }
   return body as T;
 }

@@ -151,6 +151,17 @@ export function quotaHighestUsageWindow(windows: UpstreamQuotaSnapshot['windows'
   }, undefined);
 }
 
+/** Display preferences never change admission or the supplier's other limits. */
+export function quotaSummaryWindow(snapshot: UpstreamQuotaSnapshot, preferredId?: string | null) {
+  const preferred = preferredId ? snapshot.windows.find(window => window.id === preferredId) : undefined;
+  if (preferred) return preferred;
+  if (snapshot.provider === 'kimi-oauth') {
+    const weekly = snapshot.windows.find(window => window.period_seconds === 604_800);
+    if (weekly) return weekly;
+  }
+  return quotaHighestUsageWindow(snapshot.windows);
+}
+
 /** Unitless normalized amounts are not evidence of absolute quota units. */
 export function quotaRemaining(window: UpstreamQuotaSnapshot['windows'][number]):
   { kind: 'percent'; percent: number } | { kind: 'amount'; amount: number; limit: number | null; unit: string } | null {
@@ -185,7 +196,7 @@ export function quotaCreditPresentation(snapshot: UpstreamQuotaSnapshot, locale:
   return {
     state,
     message: prefix + message,
-    explanation: zh ? '额外点数与套餐窗口分别统计；单位未说明，不代表请求一定可用。' : 'Extra credits are separate from plan windows; units are unspecified and requests are not guaranteed.',
+    explanation: zh ? '额外点数和套餐窗口分开统计。单位尚未说明。能否发起请求，以路由和账号状态为准。' : 'Extra credits are counted apart from plan windows. The unit is not stated yet. Whether a request can be sent depends on the route and account.',
   };
 }
 
@@ -275,14 +286,14 @@ export interface QuotaSummaryPresentation {
   usedPercent: number | null;
 }
 
-export function quotaSummaryPresentation(snapshot: UpstreamQuotaSnapshot | undefined, now = Date.now(), refreshFailed = false): QuotaSummaryPresentation {
+export function quotaSummaryPresentation(snapshot: UpstreamQuotaSnapshot | undefined, now = Date.now(), refreshFailed = false, preferredWindowId?: string | null): QuotaSummaryPresentation {
   if (!snapshot) return { key: refreshFailed ? 'providerDirectory.readFailed' : 'providerDirectory.notChecked', usedPercent: null };
   if (snapshot.status === 'unsupported') return { key: 'providerDirectory.unsupported', usedPercent: null };
   const observation = quotaObservationState(snapshot, now, refreshFailed);
   const readFailed = refreshFailed || snapshot.status === 'error' || Boolean(snapshot.error_code);
   if (observation === 'unobserved') return { key: readFailed ? 'providerDirectory.readFailed' : 'providerDirectory.usageUnavailable', usedPercent: null };
-  const percents = snapshot.windows.map(quotaUsedPercent).filter((percent): percent is number => percent !== null);
-  const usedPercent = percents.length ? Math.max(...percents) : null;
+  const window = quotaSummaryWindow(snapshot, preferredWindowId);
+  const usedPercent = window ? quotaUsedPercent(window) : null;
   if (readFailed) return { key: usedPercent === null ? 'providerDirectory.refreshFailedRetained' : 'providerDirectory.refreshFailedUsed', usedPercent };
   if (observation === 'historical') return { key: usedPercent === null ? 'providerDirectory.lastObservedUnavailable' : 'providerDirectory.lastObservedUsed', usedPercent };
   return { key: usedPercent === null ? 'providerDirectory.usageUnavailable' : 'providerDirectory.used', usedPercent };
@@ -317,7 +328,7 @@ function quotaPeriodKey(periodSeconds: number | null, role: string | undefined) 
  * Codex names durations from the supplier's window length (matching the official
  * Codex status surface); primary/secondary are only fallbacks when no duration exists.
  */
-export function quotaWindowPresentation(provider: string, window: UpstreamQuotaSnapshot['windows'][number]): QuotaWindowPresentation {
+export function quotaWindowPresentation(provider: string, window: Pick<UpstreamQuotaSnapshot['windows'][number], 'id' | 'label' | 'period_seconds'>): QuotaWindowPresentation {
   const match = /^([^:]+):(primary_window|secondary_window)$/.exec(window.id);
   const role = match?.[2];
   // Kimi's usages API defines `usage` (normalized id `summary`) as the

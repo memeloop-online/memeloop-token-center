@@ -236,10 +236,11 @@ pub(in crate::api) async fn rotate_key(
 #[serde(deny_unknown_fields)]
 pub(in crate::api) struct StoreClientCredentialRequest {
     key: String,
+    expected_credential_generation: Option<i64>,
 }
 
-/// Stores an authorized caller's already-existing credential for direct copy.
-/// It never changes the credential generation or returns the supplied secret.
+/// Without a generation this restores the existing original value. With a
+/// generation fence it replaces the active value while preserving key identity.
 pub(in crate::api) async fn store_key_credential(
     State(state): State<AppState>,
     headers: HeaderMap,
@@ -250,11 +251,27 @@ pub(in crate::api) async fn store_key_credential(
     if let Some(tenant) = service.tenant_external_id.as_deref() {
         state.db.require_key_tenant(key_id, tenant).await?;
     }
+    if let Some(generation) = body.expected_credential_generation {
+        let updated = state
+            .db
+            .replace_key_credential_plaintext(
+                key_id,
+                &body.key,
+                generation,
+                state.config.key_pepper.as_bytes(),
+            )
+            .await?;
+        let mut response = Json(updated).into_response();
+        response
+            .headers_mut()
+            .insert(header::CACHE_CONTROL, HeaderValue::from_static("no-store"));
+        return Ok(response);
+    }
     state
         .db
         .store_key_credential_plaintext(key_id, &body.key, state.config.key_pepper.as_bytes())
         .await?;
-    Ok(StatusCode::NO_CONTENT)
+    Ok(StatusCode::NO_CONTENT.into_response())
 }
 
 /// Explicitly returns the active credential's stored plaintext for copying.

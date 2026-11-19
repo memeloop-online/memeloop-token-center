@@ -16,7 +16,13 @@ export function manualHealthLabel(health: UpstreamHealth) {
     case 'proxy_connection_failed': return 'providers.healthProxyConnectionFailed';
     case 'destination_invalid': return 'providers.healthDestinationInvalid';
     case 'connection_failed': return 'providers.healthConnectionFailed';
-    default: return health.status === 'healthy' ? 'providers.healthy' : 'providers.unhealthy';
+    case 'probe_billing_unavailable': return 'providers.healthProbeBillingMissing';
+    case 'probe_model_unavailable': return 'providers.healthProbeModelMissing';
+    case 'probe_route_unavailable': return 'providers.healthProbeRouteMissing';
+    case 'probe_admission_skipped': return 'providers.healthProbeAdmissionSkipped';
+    case 'probe_state_unavailable':
+    case 'probe_account_unavailable': return 'providers.healthStateUnavailable';
+    default: return health.status === 'healthy' ? 'providers.healthy' : health.status === 'skipped' ? 'providers.healthProbeSkipped' : 'providers.unhealthy';
   }
 }
 
@@ -25,14 +31,14 @@ function ManualHealthCheck({ health }: { health?: UpstreamHealth }) {
   return <section className="provider-manual-health" aria-label={t('providers.manualHealthCheck')}>
     <small>{t('providers.manualHealthCheck')}</small>
     {!health ? <span className="muted">{t('providers.manualHealthNotRun')}</span> : <div className="provider-manual-health-result">
-      <span className={`status ${health.status === 'healthy' ? 'ok' : 'bad'}`}>{t(manualHealthLabel(health))}</span>
+      <span className={`status ${health.status === 'healthy' ? 'ok' : health.status === 'skipped' ? '' : 'bad'}`}>{t(manualHealthLabel(health))}</span>
       <span>{t('providers.checkedAt', { time: new Date(health.checked_at).toLocaleString(locale) })}</span>
       {health.upstream_status !== undefined && <span>HTTP {formatNumber(health.upstream_status, locale)}</span>}
       {health.latency_ms !== undefined && <span>{formatMilliseconds(health.latency_ms, locale)}</span>}
       {health.retry_at !== undefined && <span>{t('providers.healthRetryAt', { time: new Date(health.retry_at).toLocaleString(locale) })}</span>}
       {health.source === 'routing_state' && <span>{t('providers.healthSuppressed')}</span>}
       {health.source === 'local_state' && <span>{t('providers.healthStateNotChecked')}</span>}
-      {health.status === 'healthy' && <span>{t('providers.healthConnectionOnly')}</span>}
+      {health.status === 'healthy' && <span>{t('providers.healthModelProbePassed')}</span>}
       {health.error_code && <code>{health.error_code}</code>}
     </div>}
   </section>;

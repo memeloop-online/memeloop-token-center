@@ -324,7 +324,11 @@ export async function applyUsageTypedFilter(
   await setValue(row, dialog);
   const responsePromise = page.waitForResponse((response) => {
     if (!response.url().includes('/internal/v1/usage-analysis?')) return false;
-    return new URL(response.url()).searchParams.get(parameter) === expectedValue;
+    const url = new URL(response.url());
+    // Lock the primary overview read: the output_rate sample carries the same
+    // filter parameters but only a zero placeholder summary.
+    if (url.searchParams.get('projection') !== 'overview') return false;
+    return url.searchParams.get(parameter) === expectedValue;
   });
   await dialog.getByRole('button', { name: '应用筛选', exact: true }).click();
   const response = await responsePromise;
@@ -335,13 +339,20 @@ export async function applyUsageTypedFilter(
 
 export async function clearUsageFilters(page: Page): Promise<void> {
   const builder = usageFilterBuilder(page);
-  const dialog = await openTypedFilterDialog(builder);
+  // Clear lives in the builder actions above the dialog and only renders
+  // while a filter is active; the dialog itself no longer offers it.
+  const clear = builder.getByRole('button', { name: '清除', exact: true });
+  await assertVisible(clear);
+  // The token assertion reads the overview summary, so make overview the
+  // visible tab before clearing; its refetch is then the observed response.
+  await page.getByRole('tab', { name: '总览', exact: true }).click();
   const responsePromise = page.waitForResponse((response) => {
     if (!response.url().includes('/internal/v1/usage-analysis?')) return false;
     const query = new URL(response.url()).searchParams;
+    if (query.get('projection') !== 'overview') return false;
     return !query.has('model') && !query.has('key_id') && !query.has('upstream_account_id') && !query.has('status');
   });
-  await dialog.getByRole('button', { name: '清除', exact: true }).click();
+  await clear.click();
   const response = await responsePromise;
   assert.equal(response.status(), 200);
   await assertUsageTotalTokens(page, response);
@@ -358,23 +369,58 @@ export function requireStrictUsageObservation(world: DogfoodWorld) {
   return observation;
 }
 
-export async function nextStrictUsageUrl(observation: StrictUsageObservation, previousCount: number) {
+export interface StrictUsageExpectation {
+  /** Primary projection of the visible tab; never the output_rate sample. */
+  projection: string;
+  parameter?: string;
+  value?: string;
+}
+
+export async function nextStrictUsageUrl(observation: StrictUsageObservation, previousCount: number, expectation: StrictUsageExpectation) {
+  let matched = '';
   await eventually(
-    () => assert.ok(observation.requestUrls.length > previousCount),
+    () => {
+      const candidate = observation.requestUrls.slice(previousCount).find((raw) => {
+        const url = new URL(raw);
+        if (url.searchParams.get('projection') !== expectation.projection) return false;
+        return expectation.parameter === undefined || url.searchParams.get(expectation.parameter) === expectation.value;
+      });
+      assert.ok(candidate, `recorded after #${previousCount}: ${JSON.stringify(observation.requestUrls.slice(previousCount))}`);
+      matched = candidate;
+    },
     10_000,
-    'strict usage fixture did not receive the dimension drilldown request',
+    `strict usage fixture did not receive the projection=${expectation.projection} request`,
   );
-  return new URL(observation.requestUrls.at(-1)!);
+  return new URL(matched);
+}
+
+/** Primary projection refetched by the currently visible usage tab. */
+async function currentUsagePrimaryProjection(page: Page): Promise<string> {
+  const tabId = await page.locator('.usage-tabs [role="tab"][aria-selected="true"]').getAttribute('id');
+  const tab = (tabId ?? 'usage-tab-overview').replace('usage-tab-', '');
+  if (tab === 'trend') return 'trends';
+  if (tab === 'dimensions') {
+    // The picker mirrors the `dimensions` order in UsageAnalysis; only the
+    // sessions dimension reads its own projection.
+    const pressed = page.locator('.usage-dimension-picker [aria-pressed="true"]');
+    const index = await pressed.evaluate((element) => Array.prototype.indexOf.call(element.parentElement?.children ?? [], element));
+    return index === 2 ? 'sessions' : 'dimensions';
+  }
+  return tab;
 }
 
 export async function clearStrictUsageFilters(world: DogfoodWorld, expectedTotalTokens: number) {
   const page = world.requirePage();
   const observation = requireStrictUsageObservation(world);
-  const previousCount = observation.requestUrls.length;
   const builder = usageFilterBuilder(page);
-  const dialog = await openTypedFilterDialog(builder);
-  await dialog.getByRole('button', { name: '清除', exact: true }).click();
-  const requestUrl = await nextStrictUsageUrl(observation, previousCount);
+  // Clear lives in the builder actions above the dialog and only renders
+  // while a filter is active; the dialog itself no longer offers it.
+  const clear = builder.getByRole('button', { name: '清除', exact: true });
+  await assertVisible(clear);
+  const projection = await currentUsagePrimaryProjection(page);
+  const previousCount = observation.requestUrls.length;
+  await clear.click();
+  const requestUrl = await nextStrictUsageUrl(observation, previousCount, { projection });
   assert.equal(requestUrl.searchParams.has('status'), false);
   assert.equal(requestUrl.searchParams.has('upstream_account_id'), false);
   assert.equal(requestUrl.searchParams.has('model'), false);

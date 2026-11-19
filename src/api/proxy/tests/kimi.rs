@@ -3,7 +3,7 @@ use super::*;
 mod buffered_usage;
 
 #[tokio::test]
-async fn native_kimi_rejections_keep_safe_reasons_and_bounded_private_fallbacks() {
+async fn native_kimi_rejections_preserve_classification_and_original_explanation() {
     let canary = "kimi-upstream-token-prompt-canary";
     let cases = [
         (
@@ -78,43 +78,6 @@ async fn native_kimi_rejections_keep_safe_reasons_and_bounded_private_fallbacks(
                 .send()
                 .await
                 .unwrap();
-            let mut parts = UpstreamResponse::from(raw).into_parts();
-            if *slow_body {
-                parts.stream = Box::pin(parts.stream.then(|chunk| async move {
-                    tokio::time::sleep(Duration::from_millis(250)).await;
-                    chunk
-                }));
-            }
-            let (retained, rejection) = read_safe_proxy_rejection(
-                UpstreamResponse::Prefetched {
-                    status: parts.status,
-                    headers: parts.headers,
-                    version: parts.version,
-                    content_length: parts.content_length,
-                    stream: parts.stream,
-                },
-                protocol,
-                false,
-                crate::oauth::managed::kimi::PROVIDER_DRIVER,
-            )
-            .await;
-            assert!(retained.is_none());
-            let rejection = rejection.expect("native Kimi non-success uses the safe reader");
-            let delivered: Value = serde_json::from_slice(&rejection.body).unwrap();
-            assert!(!String::from_utf8_lossy(&rejection.body).contains(canary));
-            assert_eq!(
-                rejection.terminal_cause,
-                Some(crate::model::RequestTerminalCause::UpstreamHttpStatus)
-            );
-            if let Some(reason) = expected_reason {
-                assert_eq!(delivered["error"]["code"].as_str(), Some(*reason));
-                assert_eq!(
-                    delivered["error"]["mtc_safe_reason"].as_str(),
-                    Some(*reason)
-                );
-            } else {
-                assert_eq!(rejection.body, upstream_error::fallback_body());
-            }
             let key = fixture
                 .state
                 .db
@@ -154,7 +117,7 @@ async fn native_kimi_rejections_keep_safe_reasons_and_bounded_private_fallbacks(
                 })
                 .await
                 .unwrap();
-            let request = BufferedRequest {
+            let mut request = BufferedRequest {
                 session_preference: None,
                 state: &fixture.state,
                 reservation,
@@ -167,12 +130,48 @@ async fn native_kimi_rejections_keep_safe_reasons_and_bounded_private_fallbacks(
                 conversation: None,
                 protocol,
                 tenant_id: key.tenant_id,
+                original_response_capture: false,
                 memory: fixture.state.proxy_memory_budget.reservation(),
             };
-            let stored_response = format!(
-                "inline-json:{}",
-                std::str::from_utf8(&rejection.body).unwrap()
+            let mut parts = UpstreamResponse::from(raw).into_parts();
+            if *slow_body {
+                parts.stream = Box::pin(parts.stream.then(|chunk| async move {
+                    tokio::time::sleep(Duration::from_millis(250)).await;
+                    chunk
+                }));
+            }
+            let (retained, rejection) = read_safe_proxy_rejection(
+                request
+                    .capture_original_response(UpstreamResponse::Prefetched {
+                        status: parts.status,
+                        headers: parts.headers,
+                        version: parts.version,
+                        content_length: parts.content_length,
+                        stream: parts.stream,
+                    })
+                    .await,
+                protocol,
+                false,
+                crate::oauth::managed::kimi::PROVIDER_DRIVER,
+            )
+            .await;
+            assert!(retained.is_none());
+            let rejection = rejection.expect("native Kimi non-success uses the safe reader");
+            let delivered: Value = serde_json::from_slice(&rejection.body).unwrap();
+            assert!(!String::from_utf8_lossy(&rejection.body).contains(canary));
+            assert_eq!(
+                rejection.terminal_cause,
+                Some(crate::model::RequestTerminalCause::UpstreamHttpStatus)
             );
+            if let Some(reason) = expected_reason {
+                assert_eq!(delivered["error"]["code"].as_str(), Some(*reason));
+                assert_eq!(
+                    delivered["error"]["mtc_safe_reason"].as_str(),
+                    Some(*reason)
+                );
+            } else {
+                assert_eq!(rejection.body, upstream_error::fallback_body());
+            }
             let response = finish_buffered_request_with_upstream_attribution_and_response_object(
                 &request,
                 StatusCode::FORBIDDEN,
@@ -185,7 +184,6 @@ async fn native_kimi_rejections_keep_safe_reasons_and_bounded_private_fallbacks(
                 Some("http_403".to_owned()),
                 BufferedFinishPolicy {
                     upstream_attribution: ProxyRequestUpstreamAttribution::KeepSelected,
-                    response_storage: BufferedResponseStorage::InlineLocalJson(stored_response),
                     terminal_cause: rejection.terminal_cause,
                 },
             )
@@ -196,6 +194,8 @@ async fn native_kimi_rejections_keep_safe_reasons_and_bounded_private_fallbacks(
                 .await
                 .unwrap();
             assert_eq!(serde_json::from_slice::<Value>(&bytes).unwrap(), delivered);
+            wait_for_request_settlement(&fixture, 1).await;
+            drain_completed_response_archive(&fixture).await;
             let records = fixture
                 .state
                 .db
@@ -220,16 +220,44 @@ async fn native_kimi_rejections_keep_safe_reasons_and_bounded_private_fallbacks(
                 .await
                 .unwrap();
             assert_eq!(
-                refs.response_object
-                    .as_deref()
+                fixture
+                    .state
+                    .archive
+                    .get(refs.response_object.as_deref().unwrap())
+                    .await
                     .unwrap()
-                    .strip_prefix("inline-json:")
+                    .as_ref(),
+                body.as_bytes()
+            );
+            let content = crate::api::request_detail::request_archive_content_response(
+                &fixture.state,
+                &HeaderMap::new(),
+                &refs,
+                crate::api::request_detail::RequestArchiveSide::Response,
+            )
+            .await
+            .unwrap();
+            assert_eq!(content.status(), StatusCode::OK);
+            assert_eq!(
+                to_bytes(content.into_body(), usize::MAX)
+                    .await
                     .unwrap()
-                    .as_bytes(),
-                bytes.as_ref()
+                    .as_ref(),
+                body.as_bytes()
             );
             let detail = crate::api::request_detail::request_detail(&fixture.state, refs).await;
-            assert_eq!(detail.response_body, delivered);
+            if let Ok(original) = serde_json::from_str::<Value>(body) {
+                if body.len() <= crate::api::request_detail::MAX_ARCHIVE_DETAIL_BODY
+                    && crate::api::request_detail::json_value_structure_is_bounded(&original)
+                {
+                    assert_eq!(detail.response_body, original);
+                } else {
+                    assert_eq!(detail.response_body, Value::Null);
+                    assert!(!detail.archive.response.complete);
+                }
+            } else {
+                assert_eq!(detail.response_body, Value::String(body.clone()));
+            }
             assert!(
                 !serde_json::to_string(&record.supplier_error)
                     .unwrap()
@@ -295,6 +323,14 @@ async fn native_kimi_safe_rejection_keeps_other_response_paths_untouched() {
             driver,
         )
         .await;
+        if !status.is_success() && !protocol.is_anthropic() && !anthropic_bridge {
+            assert!(upstream.is_none());
+            let diagnostic = rejection.expect("compatible HTTP errors retain their explanation");
+            assert!(
+                String::from_utf8_lossy(&diagnostic.body).contains("unmodified provider response")
+            );
+            continue;
+        }
         assert!(rejection.is_none());
         let upstream = upstream.unwrap();
         assert_eq!(upstream.status(), status);
@@ -481,7 +517,8 @@ async fn kimi_translation_clears_length_and_uses_complete_unknown_length_memory_
         serde_json::from_slice::<Value>(&body).unwrap()["output"][0]["content"][0]["text"],
         "translated"
     );
-    assert_eq!(budget.snapshot().0, 192 * 1024 * 1024);
+    assert_eq!(budget.snapshot().0, 64 * 1024);
+    assert!(memory.response_json_fits(&body));
     drop(memory);
     assert_eq!(budget.snapshot().0, 0);
     upstream.verify().await;
@@ -534,7 +571,7 @@ async fn send_official_codex_responses_to_endpoint(
 }
 
 #[tokio::test]
-async fn native_codex_responses_preserves_v1_and_v2_collaboration_schemas_on_the_wire() {
+async fn native_codex_responses_preserves_reserved_collaboration_schemas_and_opaque_input() {
     let upstream = MockServer::start().await;
     let fixture = codex_route_fixture("native-collaboration-wire").await;
     Mock::given(method("POST"))
@@ -1375,9 +1412,9 @@ async fn compaction_candidates_all_disabled_return_precise_400_without_dispatch(
             .unwrap(),
     )
     .unwrap();
-    assert_eq!(body["error"]["code"], "invalid_request");
+    assert_eq!(body["error"]["code"], "compaction_producer_unavailable");
     assert_eq!(
-        body["error"]["message"],
+        body["error"]["message_en"],
         "invalid request: no available authorized upstream supports Responses compaction production"
     );
     assert!(preferred.received_requests().await.unwrap().is_empty());
@@ -1511,7 +1548,7 @@ async fn malformed_compaction_requests_are_not_swallowed_by_candidate_skipping()
             )
             .unwrap();
             assert_eq!(body["error"]["code"], "invalid_request");
-            assert_eq!(body["error"]["message"], expected);
+            assert_eq!(body["error"]["message_en"], expected);
             assert!(preferred.received_requests().await.unwrap().is_empty());
             assert!(standby.received_requests().await.unwrap().is_empty());
             assert_no_compaction_candidate_health_failure(&fixture).await;

@@ -11,36 +11,19 @@
 {{- if gt (int .Values.config.s3.connectTimeoutMillis) (int .Values.config.s3.requestTimeoutMillis) -}}
 {{- fail "config.s3.connectTimeoutMillis must not exceed requestTimeoutMillis" -}}
 {{- end -}}
-{{- if lt (int64 .Values.config.proxyMemoryBudgetBytes) (add (mul (int64 .Values.config.responsesBodyMaxBytes) 12) 1048576) -}}
-{{- fail "config.proxyMemoryBudgetBytes must cover responsesBodyMaxBytes times 12 plus 1Mi" -}}
-{{- end -}}
-{{- if lt (int64 .Values.config.responsesRequestSpoolBytes) (int64 .Values.config.responsesBodyMaxBytes) -}}
-{{- fail "config.responsesRequestSpoolBytes must cover config.responsesBodyMaxBytes" -}}
-{{- end -}}
-{{- if or (eq .Values.requestSpool.mountPath "/") (contains ".." .Values.requestSpool.mountPath) -}}
-{{- fail "requestSpool.mountPath must be a dedicated absolute path without traversal components" -}}
-{{- end -}}
-{{- $requestSpoolSizeBytes := include "memeloop-token-center.memoryBytes" .Values.requestSpool.sizeLimit | int64 -}}
-{{- if lt $requestSpoolSizeBytes (int64 .Values.config.responsesRequestSpoolBytes) -}}
-{{- fail "requestSpool.sizeLimit must cover config.responsesRequestSpoolBytes" -}}
-{{- end -}}
 {{- include "memeloop-token-center.runtimeInventory.validate" . -}}
 {{- range $role := list "gateway" "control" "worker" "all" }}
 {{- $roleConfig := index $.Values.roles $role }}
 {{- if $roleConfig.enabled }}
 {{- $runtimeWriter := or (eq $role "control") (eq $role "all") }}
+{{- $gatewayCache := and (eq $role "gateway") $.Values.plugins.runtimeInventory.enabled (ne ($.Values.plugins.runtimeInventory.gatewayCachePath | default "") "") }}
+{{- $spoolRole := or (eq $role "gateway") (eq $role "control") (eq $role "all") }}
 {{- if or (eq $role "gateway") (eq $role "all") -}}
 {{- $memoryLimit := dig "resources" "limits" "memory" "" $roleConfig -}}
 {{- $memoryBytes := include "memeloop-token-center.memoryBytes" $memoryLimit | int64 -}}
 {{- $requiredMemory := add (int64 $.Values.config.proxyMemoryBudgetBytes) 268435456 -}}
 {{- if lt $memoryBytes $requiredMemory -}}
 {{- fail (printf "roles.%s.resources.limits.memory must cover config.proxyMemoryBudgetBytes plus 256Mi (%d bytes required)" $role $requiredMemory) -}}
-{{- end -}}
-{{- $ephemeralStorageLimit := dig "resources" "limits" "ephemeral-storage" "" $roleConfig -}}
-{{- $ephemeralStorageBytes := include "memeloop-token-center.memoryBytes" $ephemeralStorageLimit | int64 -}}
-{{- $requiredEphemeralStorage := add $requestSpoolSizeBytes 67108864 -}}
-{{- if lt $ephemeralStorageBytes $requiredEphemeralStorage -}}
-{{- fail (printf "roles.%s.resources.limits.ephemeral-storage must cover requestSpool.sizeLimit plus 64Mi headroom" $role) -}}
 {{- end -}}
 {{- end }}
 ---
@@ -49,9 +32,18 @@ kind: Deployment
 metadata:
   name: {{ include "memeloop-token-center.roleName" (dict "root" $ "role" $role) }}
   annotations:
+    {{- if $gatewayCache }}
+    # Cached Gateway readers do not depend on shared-volume initialization.
+    argocd.argoproj.io/sync-wave: "0"
+    {{- else if $.Values.plugins.runtimeInventory.enabled }}
+    # Writers initialize an empty shared PVC before read-only worker startup.
+    # Gateway follows the worker so producers retain their drain dependency.
+    argocd.argoproj.io/sync-wave: {{ if $runtimeWriter }}"0"{{ else if eq $role "worker" }}"1"{{ else }}"2"{{ end }}
+    {{- else }}
     # Worker joins ServiceAccount/PVC creation in wave 0. Argo waits for it
     # before applying split-role producers, including on a fresh installation.
     argocd.argoproj.io/sync-wave: {{ ternary "1" "0" (or (eq $role "gateway") (eq $role "control")) | quote }}
+    {{- end }}
   labels:
     {{- include "memeloop-token-center.labels" $ | nindent 4 }}
     app.kubernetes.io/component: {{ $role }}
@@ -59,6 +51,11 @@ spec:
   revisionHistoryLimit: {{ $.Values.revisionHistoryLimit }}
   strategy:
     type: {{ $.Values.deploymentStrategy }}
+    {{- if and $runtimeWriter (eq $.Values.deploymentStrategy "RollingUpdate") }}
+    rollingUpdate:
+      maxUnavailable: 0
+      maxSurge: 1
+    {{- end }}
   {{- if not $roleConfig.autoscaling.enabled }}
   replicas: {{ $roleConfig.replicaCount }}
   {{- end }}
@@ -100,14 +97,15 @@ spec:
       hostAliases:
         {{- toYaml . | nindent 8 }}
       {{- end }}
-      {{- if or $.Values.plugins.ociInstaller.enabled $.Values.plugins.runtimeInventory.enabled }}
+      {{- if or $.Values.plugins.ociInstaller.enabled (and $.Values.plugins.runtimeInventory.enabled (not $gatewayCache)) }}
       initContainers:
-        {{- if $.Values.plugins.runtimeInventory.enabled }}
+        {{- if and $.Values.plugins.runtimeInventory.enabled (not $gatewayCache) }}
         - name: prepare-plugin-inventory
           image: {{ include "memeloop-token-center.roleImage" (dict "root" $ "role" $role) | quote }}
           imagePullPolicy: {{ $.Values.image.pullPolicy }}
           args:
             - prepare-plugin-inventory
+            - --allow-unavailable
             - --directory
             - /var/lib/memeloop-token-center/plugin-runtime
             {{- if not $runtimeWriter }}
@@ -184,9 +182,13 @@ spec:
               containerPort: 8080
           env:
             {{- include "memeloop-token-center.env" $ | nindent 12 }}
-            {{- if and $.Values.config.terminalProjectionEnabled (or (eq $role "gateway") (eq $role "all")) }}
+            {{- if $spoolRole }}
+            - name: MTC_RESPONSES_REQUEST_SPOOL_PATH
+              value: /var/lib/memeloop-token-center/request-spool
+            {{- end }}
+            {{- if or (eq $role "gateway") (eq $role "all") }}
             - name: MTC_TERMINAL_PROJECTION_ENABLED
-              value: "true"
+              value: {{ $.Values.config.terminalProjectionEnabled | default false | quote }}
             {{- end }}
             {{- include "memeloop-token-center.runtimeInventory.env" (dict "root" $ "writer" $runtimeWriter) | nindent 12 }}
             - name: MTC_GATEWAY_POD_NAME
@@ -219,9 +221,15 @@ spec:
                   name: {{ $.Values.config.memeloopCloudWebhookSecret.name }}
                   key: {{ $.Values.config.memeloopCloudWebhookSecret.key }}
             {{- end }}
+            {{- else if eq $role "worker" }}
+            - name: MTC_SERVICE_TOKEN
+              valueFrom:
+                secretKeyRef:
+                  name: {{ $.Values.config.serviceTokenSecret.name }}
+                  key: {{ $.Values.config.serviceTokenSecret.key }}
             {{- else }}
             - name: MTC_SERVICE_TOKEN
-              # Non-authenticating 32-byte sentinel that satisfies config parsing.
+              # Gateway roles use a sentinel; control and worker share grant authority.
               value: "bootstrap-disabled-for-this-role"
             {{- end }}
           startupProbe:
@@ -245,12 +253,11 @@ spec:
             capabilities: { drop: ["ALL"] }
           resources:
             {{- toYaml $roleConfig.resources | nindent 12 }}
-          {{- if or (or $.Values.plugins.enabled $.Values.plugins.runtimeInventory.enabled) (or (eq $role "gateway") (eq $role "all")) }}
+          {{- if or $spoolRole $.Values.plugins.enabled $.Values.plugins.runtimeInventory.enabled }}
           volumeMounts:
-            {{- if or (eq $role "gateway") (eq $role "all") }}
-            - name: responses-request-spool
-              mountPath: {{ $.Values.requestSpool.mountPath | quote }}
-              readOnly: false
+            {{- if $spoolRole }}
+            - name: request-spool
+              mountPath: /var/lib/memeloop-token-center/request-spool
             {{- end }}
             {{- if or $.Values.plugins.enabled $.Values.plugins.runtimeInventory.enabled }}
             {{- include "memeloop-token-center.runtimeInventory.mounts" (dict "root" $ "writer" $runtimeWriter) | nindent 12 }}
@@ -261,15 +268,14 @@ spec:
             {{- end }}
             {{- end }}
           {{- end }}
-      {{- if or (or $.Values.plugins.enabled $.Values.plugins.runtimeInventory.enabled) (or (eq $role "gateway") (eq $role "all")) }}
+      {{- if or $spoolRole $.Values.plugins.enabled $.Values.plugins.runtimeInventory.enabled }}
       volumes:
-        {{- if or (eq $role "gateway") (eq $role "all") }}
-        - name: responses-request-spool
-          emptyDir:
-            sizeLimit: {{ $.Values.requestSpool.sizeLimit | quote }}
+        {{- if $spoolRole }}
+        - name: request-spool
+          emptyDir: {}
         {{- end }}
         {{- if or $.Values.plugins.enabled $.Values.plugins.runtimeInventory.enabled }}
-        {{- include "memeloop-token-center.runtimeInventory.volumes" (dict "root" $ "writer" $runtimeWriter) | nindent 8 }}
+        {{- include "memeloop-token-center.runtimeInventory.volumes" (dict "root" $ "writer" $runtimeWriter "gatewayCache" $gatewayCache) | nindent 8 }}
         {{- if $.Values.plugins.enabled }}
         - name: plugins
           {{- if $.Values.plugins.ociInstaller.enabled }}

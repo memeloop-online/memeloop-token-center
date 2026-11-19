@@ -1,26 +1,31 @@
-# syntax=docker/dockerfile:1.7
-ARG NODE_IMAGE=node:24.18.0-bookworm-slim
-ARG RUST_IMAGE=rust:1.95.0-bookworm
-ARG GO_IMAGE=golang:1.26.9-bookworm
+ARG NODE_IMAGE=node:24.18.0-bookworm-slim@sha256:6f7b03f7c2c8e2e784dcf9295400527b9b1270fd37b7e9a7285cf83b6951452d
+ARG RUST_IMAGE=rust:1.95.0-bookworm@sha256:6258907abe69656e41cd992e0b705cdcfabcbbe3db374f92ed2d47121282d4a1
+ARG GO_IMAGE=golang:1.27.4-bookworm@sha256:4fa7c968ba93f1635670522dbb01a2c78150443e1385746924566079f36570ea
 ARG RUNTIME_IMAGE=gcr.io/distroless/base-nossl-debian13:nonroot
 
 FROM ${GO_IMAGE} AS cosign-builder
-ADD --checksum=sha256:3a718446bac51466efff6853639e1ca108b456ecbf07cd92938f548715d22d6b \
-    https://codeload.github.com/sigstore/cosign/tar.gz/11926fa5bbbbde47e88fc006b625a17769b743b2 \
-    /tmp/cosign.tar.gz
-RUN mkdir -p /build/cosign \
+# Pin the upstream source and authenticate the single security module update
+# against the public Go checksum database before compiling the reviewed graph.
+ADD --checksum=sha256:04215e967f12c2388c9179b0f18097626a4f1d370cf315f404bebe16218f4cb1 \
+    https://api.github.com/repos/sigstore/cosign/tarball/0e48502cf5ef34e2e60bbd3617aa19945712f705 /tmp/cosign.tar.gz
+RUN mkdir -p /build/cosign /tmp/module-auth \
     && tar -xzf /tmp/cosign.tar.gz -C /build/cosign --strip-components=1
+COPY packaging/cosign/v3.1.4-xnet-security.patch /tmp/cosign-security.patch
 WORKDIR /build/cosign
-COPY packaging/cosign/v3.1.3-security.patch /tmp/v3.1.3-security.patch
-RUN git apply --unidiff-zero --check /tmp/v3.1.3-security.patch \
-    && git apply --unidiff-zero /tmp/v3.1.3-security.patch \
-    && GOTOOLCHAIN=local go mod verify \
-    && GODEBUG=http2client=0 CGO_ENABLED=0 GOTOOLCHAIN=local go build -trimpath \
-      -ldflags '-buildid= -X sigs.k8s.io/release-utils/version.gitVersion=v3.1.3-mtc.4 -X sigs.k8s.io/release-utils/version.gitCommit=11926fa5bbbbde47e88fc006b625a17769b743b2 -X sigs.k8s.io/release-utils/version.gitTreeState=clean -X sigs.k8s.io/release-utils/version.buildDate=2026-08-06T00:10:15Z' \
+RUN git apply --unidiff-zero --check /tmp/cosign-security.patch \
+    && git apply --unidiff-zero /tmp/cosign-security.patch \
+    && cd /tmp/module-auth \
+    && GOWORK=off GOPROXY=https://proxy.golang.org GOSUMDB=sum.golang.org go mod download -json golang.org/x/net@v0.62.0 \
+    && cd /build/cosign \
+    && CGO_ENABLED=0 go build -mod=readonly -trimpath -tags=netgo,osusergo \
+      -ldflags '-buildid= -X sigs.k8s.io/release-utils/version.gitVersion=v3.1.4-mtc.1 -X sigs.k8s.io/release-utils/version.gitCommit=0e48502cf5ef34e2e60bbd3617aa19945712f705 -X sigs.k8s.io/release-utils/version.gitTreeState=modified' \
       -o /tmp/cosign ./cmd/cosign \
-    && go version -m /tmp/cosign | grep -Eq '[[:space:]]dep[[:space:]]+golang.org/x/net[[:space:]]+v0\.60\.0[[:space:]]' \
+    && go version -m /tmp/cosign | grep -Eq 'go1\.27\.4$' \
+    && go version -m /tmp/cosign | grep -Eq '[[:space:]]dep[[:space:]]+golang.org/x/net[[:space:]]+v0\.62\.0[[:space:]]' \
+    && go version -m /tmp/cosign | grep -Eq '[[:space:]]dep[[:space:]]+github.com/klauspost/compress[[:space:]]+v1\.20\.1[[:space:]]' \
     && /tmp/cosign version --json \
-      | grep -Eq '"gitVersion"[[:space:]]*:[[:space:]]*"v3\.1\.3-mtc\.4"'
+      | grep -Eq '"gitVersion"[[:space:]]*:[[:space:]]*"v3\.1\.4-mtc\.1"'
+WORKDIR /
 
 FROM ${NODE_IMAGE} AS web-builder
 ARG NPM_REGISTRY=https://registry.npmjs.org
@@ -47,7 +52,7 @@ RUN mkdir -p src/bin tests \
     && printf 'fn main() {}\n' > src/bin/install-plugin-oci.rs \
     && printf 'fn main() {}\n' > tests/cucumber.rs \
     && printf 'fn main() {}\n' > tests/postgres.rs \
-    && cargo build --locked --release --features experimental-plugin-revisions,plugin-distribution,h2-attempt-binding --bin memeloop-token-center --bin install-plugin-oci \
+    && cargo build --locked --release --features experimental-plugin-revisions,plugin-distribution --bin memeloop-token-center --bin install-plugin-oci \
     && cargo clean --release --package memeloop-token-center \
     && rm -rf src
 COPY build.rs ./build.rs
@@ -63,7 +68,7 @@ FROM builder AS release-input
 RUN MTC_BUILD_GIT_SHA="${MTC_BUILD_GIT_SHA_INPUT}" \
     MTC_BUILD_TIMESTAMP="${MTC_BUILD_TIMESTAMP_INPUT}" \
     MTC_BUILD_TARGET="${MTC_BUILD_TARGET_INPUT}" \
-    cargo build --locked --release --features experimental-plugin-revisions,plugin-distribution,h2-attempt-binding --bin memeloop-token-center --bin install-plugin-oci \
+    cargo build --locked --release --features experimental-plugin-revisions,plugin-distribution --bin memeloop-token-center --bin install-plugin-oci \
     && install -D -m 0555 target/release/memeloop-token-center /release-input/memeloop-token-center \
     && install -D -m 0555 target/release/install-plugin-oci /release-input/install-plugin-oci \
     && install -D -m 0644 "$(gcc -print-file-name=libgcc_s.so.1)" /release-input/libgcc_s.so.1 \
@@ -75,6 +80,7 @@ COPY --from=cosign-builder /build/cosign/LICENSE /release-input/third-party-lice
 COPY --from=web-builder /build/web/dist /release-input/web
 COPY LICENSE THIRD_PARTY_NOTICES.md /release-input/
 COPY vendor/rust_decimal/LICENSE /release-input/third-party-licenses/rust_decimal-LICENSE
+COPY vendor/wreq-util/LICENSE /release-input/third-party-licenses/wreq-util-LICENSE
 
 FROM ${RUNTIME_IMAGE} AS release-input-smoke
 # SQLite copies every bound archive ciphertext through libc. Keep those

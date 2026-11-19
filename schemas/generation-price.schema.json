@@ -6,7 +6,7 @@
   "additionalProperties": false,
   "required": ["billing_unit", "price_per_unit"],
   "properties": {
-    "billing_unit": { "enum": ["job", "second", "image", "megapixel"] },
+    "billing_unit": { "enum": ["job", "second", "image", "megapixel", "million_tokens"] },
     "price_per_unit": { "type": "string", "pattern": "^[0-9]+(?:\\.[0-9]{1,6})?$" }
   }
 }

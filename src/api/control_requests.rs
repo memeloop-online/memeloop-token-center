@@ -54,7 +54,7 @@ pub(super) async fn configuration_schemas(
 ) -> Result<impl IntoResponse, AppError> {
     require_service(&headers, &state, "schemas:read").await?;
     fn schema(source: &str) -> Result<Value, AppError> {
-        serde_json::from_str(source).map_err(|_| AppError::Internal)
+        serde_json::from_str(source).map_err(|_| AppError::internal("control_requests_schema_1"))
     }
     Ok(Json(json!({
         "core_config": schema(include_str!("../../schemas/core-config.schema.json"))?,
@@ -116,13 +116,19 @@ pub(super) async fn internal_requests(
     let service = require_service(&headers, &state, "requests:read").await?;
     let tenant = management_tenant(&service, query.tenant_external_id.clone())?;
     let filter = query.to_filter(true)?;
-    let limit = filter.limit.clamp(1, 500) as usize;
+    let limit = filter.limit as usize;
     let paged = query.requests_page_requested();
     // The database fetches one bounded extra row only for clients that opted
     // into the envelope. Existing clients retain their exact requested array
     // length and wire format.
     let mut query_filter = filter;
     query_filter.lookahead = paged;
+    let scope = state.db.history_scope(tenant.as_deref()).await?;
+    if let Some(value) =
+        crate::request_history_api::list_if_enabled(&state, scope, &query_filter, paged).await?
+    {
+        return Ok(Json(value));
+    }
     let values = match tenant {
         Some(tenant) => {
             state
@@ -179,7 +185,7 @@ pub(super) async fn typed_internal_requests(
     let service = require_service(&headers, &state, "requests:read").await?;
     let tenant = management_tenant(&service, body.tenant_external_id)?;
     body.ast.validate()?;
-    let limit = body.limit.clamp(1, 100) as usize;
+    let limit = body.limit as usize;
     let filter = crate::db::RequestListFilter {
         limit: limit as i64,
         lookahead: body.paged,
@@ -188,6 +194,12 @@ pub(super) async fn typed_internal_requests(
         typed_ast: Some(body.ast),
         ..crate::db::RequestListFilter::default()
     };
+    let scope = state.db.history_scope(tenant.as_deref()).await?;
+    if let Some(value) =
+        crate::request_history_api::list_if_enabled(&state, scope, &filter, body.paged).await?
+    {
+        return Ok(Json(value));
+    }
     let mut values = match tenant {
         Some(tenant) => state.db.list_all_requests_filtered(&tenant, filter).await?,
         None => state.db.list_global_requests_filtered(filter).await?,
@@ -383,6 +395,15 @@ pub(super) async fn put_filter_assistant_settings(
     require_global_service(&service)?;
     let tenant = required_filter_tenant(&service, body.tenant_external_id)?;
     require_service(&headers, &state, "keys:write").await?;
+    if state
+        .db
+        .health_probe_credential_in_use(&tenant, body.billing_key_id)
+        .await?
+    {
+        return Err(AppError::BadRequest(
+            "system AI and health probes require different credentials".into(),
+        ));
+    }
     let previous = load_filter_assistant_settings(&state, &tenant).await?;
     if previous.as_ref().map(|value| value.updated_at) != body.expected_updated_at {
         return Err(AppError::Conflict(
@@ -405,7 +426,7 @@ pub(super) async fn put_filter_assistant_settings(
         .as_deref()
         .map(serde_json::from_slice::<FilterAssistantSettings>)
         .transpose()
-        .map_err(|_| AppError::Internal)?
+        .map_err(|_| AppError::internal("control_requests_put_filter_assistant_settings_1"))?
         .map(|value| value.updated_at)
         != body.expected_updated_at
     {
@@ -413,7 +434,8 @@ pub(super) async fn put_filter_assistant_settings(
             "filter assistant settings changed; reload before saving".into(),
         ));
     }
-    let value = serde_json::to_vec(&settings).map_err(|_| AppError::Internal)?;
+    let value = serde_json::to_vec(&settings)
+        .map_err(|_| AppError::internal("control_requests_put_filter_assistant_settings_2"))?;
     state
         .db
         .replace_filter_assistant_settings(
@@ -494,7 +516,8 @@ async fn load_filter_preset_state(
     else {
         return Ok(FilterPresetState::default());
     };
-    serde_json::from_slice(&value).map_err(|_| AppError::Internal)
+    serde_json::from_slice(&value)
+        .map_err(|_| AppError::internal("control_requests_load_filter_preset_state_1"))
 }
 
 async fn store_filter_preset_state(
@@ -503,7 +526,8 @@ async fn store_filter_preset_state(
     tenant: Option<&str>,
     stored: &FilterPresetState,
 ) -> Result<(), AppError> {
-    let value = serde_json::to_vec(stored).map_err(|_| AppError::Internal)?;
+    let value = serde_json::to_vec(stored)
+        .map_err(|_| AppError::internal("control_requests_store_filter_preset_state_1"))?;
     state
         .db
         .plugin_kv_put(
@@ -514,7 +538,7 @@ async fn store_filter_preset_state(
         .await
 }
 
-async fn load_filter_assistant_settings(
+pub(in crate::api) async fn load_filter_assistant_settings(
     state: &AppState,
     tenant: &str,
 ) -> Result<Option<FilterAssistantSettings>, AppError> {
@@ -530,10 +554,10 @@ async fn load_filter_assistant_settings(
     };
     serde_json::from_slice(&value)
         .map(Some)
-        .map_err(|_| AppError::Internal)
+        .map_err(|_| AppError::internal("control_requests_load_filter_assistant_settings_1"))
 }
 
-async fn assistant_execution_context(
+pub(super) async fn assistant_execution_context(
     state: &AppState,
     tenant: &str,
     route_id: Uuid,
@@ -821,6 +845,12 @@ pub(super) async fn internal_stats(
     let service = require_service(&headers, &state, "requests:read").await?;
     let tenant = management_tenant(&service, query.tenant_external_id.clone())?;
     let filter = query.to_filter(true, None)?;
+    let scope = state.db.history_scope(tenant.as_deref()).await?;
+    if let Some(stats) =
+        crate::request_history_api::statistics_if_enabled(&state, scope, &filter).await?
+    {
+        return Ok(Json(stats));
+    }
     let stats = match tenant {
         Some(tenant) => state.db.operator_stats_filtered(&tenant, filter).await?,
         None => state.db.global_operator_stats_filtered(filter).await?,
@@ -883,17 +913,14 @@ pub(super) async fn internal_request_events(
 ) -> Result<Response, AppError> {
     let service = require_service(&headers, &state, "requests:read").await?;
     let tenant = management_tenant(&service, query.tenant_external_id)?;
-    let stream_permit = state
-        .request_event_streams
-        .try_acquire(service.service_id)
-        .ok_or(AppError::RateLimited)?;
+    let stream_owner = state.request_event_streams.start();
     let stream_activity = state
         .metrics
         .active_stream(crate::metrics::ActiveStreamKind::RequestEvents);
     let database = state.db.clone();
     let (sender, receiver) = tokio::sync::mpsc::channel::<Result<Event, Infallible>>(64);
     tokio::spawn(async move {
-        let _stream_permit = stream_permit;
+        let _stream_owner = stream_owner;
         let _stream_activity = stream_activity;
         let mut event_at = query
             .after_event_at

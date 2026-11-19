@@ -49,6 +49,19 @@ export function usageRange(selection: Pick<UsageSelection, 'preset' | 'customFro
   return { from, to };
 }
 
+/**
+ * The precise output-rate (TPS) projection joins per-request samples over the
+ * whole applied range; production analysis shows that join exceeds the latency
+ * budget once the range spans a week, for presets and custom ranges alike.
+ */
+const usageTpsRangeLimitMs = 7 * 86_400_000;
+
+/** Eligibility must follow the applied range, never the unapplied selection draft. */
+export function usageOutputRateEligible(selection: Pick<UsageSelection, 'preset' | 'customFrom' | 'customTo' | 'resolvedAt'>) {
+  const range = usageRange(selection);
+  return range !== undefined && range.to - range.from < usageTpsRangeLimitMs;
+}
+
 export function usageAstIssue(ast: TypedFilterAst): 'duplicate' | 'unsupported' | undefined {
   if (ast.logical_operator !== 'and') return 'unsupported';
   const expectedTypes: Partial<Record<TypedFilterCondition['field'], TypedFilterCondition['value']['type']>> = { created_at: 'timestamp', model: 'model', key_id: 'uuid', key_alias: 'text', upstream_account_id: 'uuid', protocol: 'protocol', status: 'status', error_code: 'text' };
@@ -66,7 +79,11 @@ export function usageAstIssue(ast: TypedFilterAst): 'duplicate' | 'unsupported' 
 
 export function usageSelectionFromAst(current: UsageSelection, ast: TypedFilterAst, readPeriod = true): UsageSelection | undefined {
   if (usageAstIssue(ast) || (!readPeriod && ast.conditions.some((condition) => condition.field === 'created_at' || condition.field === 'key_alias'))) return undefined;
-  const filters = { ...emptyUsageFilters, keyAlias: current.filters.keyAlias, upstreamId: current.filters.upstreamId === 'unassigned' ? 'unassigned' : '' };
+  // A full draft (readPeriod) is authoritative: deleting the key_alias row
+  // clears the alias instead of resurrecting the previously applied one.  The
+  // legacy readPeriod=false path never carries key_alias rows, so it keeps the
+  // current alias for compatibility.
+  const filters = { ...emptyUsageFilters, keyAlias: readPeriod ? '' : current.filters.keyAlias, upstreamId: current.filters.upstreamId === 'unassigned' ? 'unassigned' : '' };
   let period = { preset: current.preset, customFrom: current.customFrom, customTo: current.customTo };
   for (const condition of ast.conditions) {
     if (readPeriod && condition.field === 'created_at' && condition.operator === 'between' && condition.value.type === 'timestamp' && condition.upper?.type === 'timestamp') {
@@ -80,6 +97,30 @@ export function usageSelectionFromAst(current: UsageSelection, ast: TypedFilterA
     else if (condition.operator === 'equals' && condition.field === 'error_code' && condition.value.type === 'text') filters.errorCode = condition.value.value;
   }
   return { ...current, ...period, filters };
+}
+
+/**
+ * Fold the filter builder's draft AST into a usage selection.  A quick-range
+ * preset keeps its semantics only while the single created_at window still
+ * matches the range that preset resolved to; a manual edit or a loaded preset
+ * becomes an explicit custom range.  Usage queries cannot be open-ended, so a
+ * draft without a created_at condition falls back to the last 24 hours rather
+ * than silently dropping the period.
+ */
+export function usageSelectionFromDraft(current: UsageSelection, draft: TypedFilterAst, now = Date.now()): UsageSelection | undefined {
+  const parsed = usageSelectionFromAst(current, draft);
+  if (!parsed) return undefined;
+  const period = draft.conditions.find((condition) => condition.field === 'created_at');
+  if (!period) {
+    return { ...parsed, preset: '24h', resolvedAt: now, customFrom: localDateTimeInput(now - 86_400_000), customTo: localDateTimeInput(now) };
+  }
+  if (current.preset !== 'custom' && period.operator === 'between' && period.value.type === 'timestamp' && period.upper?.type === 'timestamp') {
+    const expected = usageRange(current);
+    if (expected && Number(period.value.value) === expected.from && Number(period.upper.value) === expected.to) {
+      return { ...parsed, preset: current.preset, resolvedAt: current.resolvedAt ?? now };
+    }
+  }
+  return parsed;
 }
 
 export function usageAstFromSelection(ast: TypedFilterAst, selection: UsageSelection): TypedFilterAst | undefined {

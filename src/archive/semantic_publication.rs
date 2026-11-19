@@ -1,0 +1,330 @@
+//! Publication primitives for the single semantic body authority. Publishing
+//! objects is not acknowledgement of SQL binding or permission to delete raw.
+use bytes::Bytes;
+use serde::{Deserialize, Serialize};
+use uuid::Uuid;
+
+use super::{ArchiveStore, CasArchiveObject, SemanticInstancePage, SemanticManifestV2};
+use crate::error::AppError;
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct SemanticPublication {
+    pub format_version: u32,
+    pub tenant_id: Uuid,
+    pub request_id: Uuid,
+    pub projection_version: u32,
+    pub revision: u64,
+    pub manifest: CasArchiveObject,
+}
+
+/// A permanent semantic authority for metadata consumers such as history.
+/// Raw provenance is deliberately excluded from this durable ownership view.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct SemanticArchiveAuthority {
+    pub publication: SemanticPublication,
+    pub semantic_head: super::SemanticHead,
+    pub coverage: super::SemanticCoverage,
+}
+
+impl ArchiveStore {
+    /// The caller obtains `leaf` from its already authorized SQL observation.
+    /// This performs metadata reads only; atom bytes remain in the single
+    /// semantic body store and are read through the verified semantic reader.
+    pub async fn semantic_archive_authority(
+        &self,
+        tenant: Uuid,
+        request: Uuid,
+        leaf: &str,
+    ) -> Result<Option<SemanticArchiveAuthority>, AppError> {
+        let Some(revision) = self
+            .published_semantic_revision(tenant, request, leaf)
+            .await?
+        else {
+            return Ok(None);
+        };
+        let bytes = self
+            .get_bounded(
+                &format!("tenants/{tenant}/semantic/v2/requests/{request}/{revision}.json"),
+                4096,
+            )
+            .await?;
+        let publication: SemanticPublication = serde_json::from_slice(&bytes)
+            .map_err(|_| AppError::storage("semantic_publication_invalid"))?;
+        if publication.format_version != 2
+            || publication.tenant_id != tenant
+            || publication.request_id != request
+            || publication.revision != revision
+        {
+            return Err(AppError::storage("semantic_publication_identity_mismatch"));
+        }
+        let manifest = self
+            .get_semantic_manifest_streamed(tenant, &publication.manifest)
+            .await?;
+        let head = manifest
+            .semantic_head
+            .ok_or_else(|| AppError::storage("semantic_head_missing"))?;
+        if head.node_hash != leaf
+            || manifest.request_id != request
+            || manifest.revision != revision
+            || manifest.projection_version != publication.projection_version
+        {
+            return Err(AppError::storage("semantic_publication_identity_mismatch"));
+        }
+        Ok(Some(SemanticArchiveAuthority {
+            publication,
+            semantic_head: head,
+            coverage: manifest.coverage,
+        }))
+    }
+
+    /// Store exactly the existing relational prefix identity as recoverable
+    /// metadata, not another body/event tree. Conflicts are never overwritten.
+    pub async fn put_semantic_prefix_node(
+        &self,
+        manifest: &SemanticManifestV2,
+        node: &super::SemanticNode,
+    ) -> Result<(), AppError> {
+        use object_store::{PutMode, PutOptions, PutPayload};
+        manifest.validate(manifest.tenant_id)?;
+        node.validate(&super::SemanticHead {
+            node_hash: node.node_hash.clone(),
+            depth: node.depth,
+        })?;
+        let store = match manifest.backend_identity.as_deref() {
+            None => &self.inner,
+            Some(identity) => {
+                &self
+                    .training
+                    .as_ref()
+                    .filter(|training| training.identity == identity)
+                    .ok_or_else(|| AppError::storage("semantic_manifest_backend_mismatch"))?
+                    .store
+            }
+        };
+        let path = super::path::archive_path(&format!(
+            "tenants/{}/semantic/v2/nodes/{}.json",
+            manifest.tenant_id, node.node_hash,
+        ))?;
+        let bytes = Bytes::from(
+            serde_json::to_vec(node).map_err(|_| AppError::internal("semantic_prefix_encode"))?,
+        );
+        match store
+            .put_opts(
+                &path,
+                PutPayload::from_bytes(bytes),
+                PutOptions {
+                    mode: PutMode::Create,
+                    ..Default::default()
+                },
+            )
+            .await
+        {
+            Ok(_) | Err(object_store::Error::AlreadyExists { .. }) => {}
+            Err(error) => return Err(error.into()),
+        }
+        let read = self
+            .get_semantic_prefix_node(
+                manifest,
+                &super::SemanticHead {
+                    node_hash: node.node_hash.clone(),
+                    depth: node.depth,
+                },
+            )
+            .await?;
+        if read.atom_hash != node.atom_hash || read.parent_hash != node.parent_hash {
+            return Err(AppError::storage("semantic_prefix_identity_conflict"));
+        }
+        Ok(())
+    }
+
+    /// Publish an immutable metadata page only after its referenced payloads
+    /// are readable. This does not duplicate their bytes in the page.
+    pub async fn put_semantic_instance_page(
+        &self,
+        manifest: &SemanticManifestV2,
+        page: &SemanticInstancePage,
+    ) -> Result<CasArchiveObject, AppError> {
+        manifest.validate(manifest.tenant_id)?;
+        page.validate(manifest)?;
+        for instance in &page.instances {
+            self.verify_tenant_content(manifest.tenant_id, &instance.body)
+                .await?;
+        }
+        if let Some(previous) = &page.previous {
+            let previous_page = self.get_semantic_instance_page(manifest, previous).await?;
+            if previous_page
+                .first_ordinal
+                .checked_add(previous_page.instances.len() as u64)
+                != Some(page.first_ordinal)
+            {
+                return Err(AppError::storage("semantic_instance_sequence_invalid"));
+            }
+        } else if page.first_ordinal != 0 {
+            return Err(AppError::storage("semantic_instance_sequence_invalid"));
+        }
+        let encoded =
+            serde_json::to_vec(page).map_err(|_| AppError::internal("semantic_instance_encode"))?;
+        // Same metadata bound as the reader; never a cap on body contents.
+        if encoded.len() > 256 * 1024 {
+            return Err(AppError::storage("semantic_instance_page_invalid"));
+        }
+        self.put_tenant_content(manifest.tenant_id, Bytes::from(encoded))
+            .await
+    }
+
+    /// The durable index pins a manifest before any optional SQL handoff. It
+    /// contains references only. A separate exact binding/coverage receipt is
+    /// still required before releasing temporary extraction/retry sources.
+    pub async fn publish_semantic_manifest(
+        &self,
+        manifest: &SemanticManifestV2,
+    ) -> Result<SemanticPublication, AppError> {
+        manifest.validate(manifest.tenant_id)?;
+        let mut page_ref = manifest.instances_head.clone();
+        let mut expected_end = None;
+        let mut expected_node = manifest.semantic_head.clone();
+        while let Some(reference) = page_ref {
+            let page = self
+                .get_semantic_instance_page(manifest, &reference)
+                .await?;
+            let end = page
+                .first_ordinal
+                .checked_add(page.instances.len() as u64)
+                .ok_or_else(|| AppError::storage("semantic_instance_sequence_invalid"))?;
+            if expected_end.is_some_and(|expected| expected != end) {
+                return Err(AppError::storage("semantic_instance_sequence_invalid"));
+            }
+            if page.previous.is_some() && page.first_ordinal == 0 {
+                return Err(AppError::storage("semantic_instance_sequence_invalid"));
+            }
+            // Instance order and canonical prefix order must describe the same
+            // atoms. A valid CAS body or page alone is not coverage proof.
+            for instance in page.instances.iter().rev() {
+                let head = expected_node
+                    .as_ref()
+                    .ok_or_else(|| AppError::storage("semantic_instance_prefix_mismatch"))?;
+                if head.node_hash != instance.node_hash {
+                    return Err(AppError::storage("semantic_instance_prefix_mismatch"));
+                }
+                let node = self.get_semantic_prefix_node(manifest, head).await?;
+                if node.atom_hash != instance.atom_hash
+                    || Some(node.depth) != instance.ordinal.checked_add(1)
+                {
+                    return Err(AppError::storage("semantic_instance_prefix_mismatch"));
+                }
+                expected_node = node.parent_hash.map(|node_hash| super::SemanticHead {
+                    node_hash,
+                    depth: node.depth - 1,
+                });
+            }
+            expected_end = Some(page.first_ordinal);
+            page_ref = page.previous;
+        }
+        if expected_node.is_some() || expected_end.is_some_and(|first| first != 0) {
+            return Err(AppError::storage("semantic_instance_sequence_invalid"));
+        }
+        if manifest.semantic_head.is_some() != manifest.instances_head.is_some() {
+            return Err(AppError::storage("semantic_manifest_invalid"));
+        }
+        if let Some(head) = &manifest.semantic_head {
+            self.get_semantic_prefix_node(manifest, head).await?;
+        }
+        let encoded = serde_json::to_vec(manifest)
+            .map_err(|_| AppError::internal("semantic_manifest_encode"))?;
+        let object = self
+            .put_tenant_content(manifest.tenant_id, Bytes::from(encoded))
+            .await?;
+        // Validate actual selected backend rather than trusting write flags.
+        self.get_semantic_manifest_streamed(manifest.tenant_id, &object)
+            .await?;
+        let publication = SemanticPublication {
+            format_version: 2,
+            tenant_id: manifest.tenant_id,
+            request_id: manifest.request_id,
+            projection_version: manifest.projection_version,
+            revision: manifest.revision,
+            manifest: object,
+        };
+        self.restore_durable_root(
+            &format!(
+                "tenants/{}/semantic/v2/requests/{}/{}.json",
+                manifest.tenant_id, manifest.request_id, manifest.revision,
+            ),
+            Bytes::from(
+                serde_json::to_vec(&publication)
+                    .map_err(|_| AppError::internal("semantic_publication_encode"))?,
+            ),
+        )
+        .await?;
+        Ok(publication)
+    }
+}
+
+/// An exact observation of the committed SQL handoff. Construction stays in
+/// Database; a caller cannot substitute an object-exists boolean for binding.
+#[derive(Serialize)]
+pub(crate) struct SemanticBindingProof {
+    pub(crate) tenant_id: Uuid,
+    pub(crate) request_id: Uuid,
+    pub(crate) node_hash: String,
+    pub(crate) projected_at: i64,
+}
+
+impl ArchiveStore {
+    pub(crate) async fn confirm_semantic_coverage(
+        &self,
+        publication: &SemanticPublication,
+        proof: &SemanticBindingProof,
+    ) -> Result<(), AppError> {
+        let manifest = self
+            .get_semantic_manifest_streamed(publication.tenant_id, &publication.manifest)
+            .await?;
+        if manifest.request_id != proof.request_id
+            || manifest.tenant_id != proof.tenant_id
+            || publication.request_id != proof.request_id
+            || publication.projection_version != manifest.projection_version
+            || publication.revision != manifest.revision
+            || manifest.coverage.projection_state != super::SemanticProjectionState::Complete
+            || !manifest.coverage.observed_terminal
+            || !manifest.coverage.gaps.is_empty()
+            || manifest
+                .semantic_head
+                .as_ref()
+                .map(|head| head.node_hash.as_str())
+                != Some(proof.node_hash.as_str())
+        {
+            return Err(AppError::storage("semantic_coverage_binding_mismatch"));
+        }
+        #[derive(Serialize)]
+        struct Receipt<'a> {
+            format_version: u32,
+            publication: &'a SemanticPublication,
+            binding: &'a SemanticBindingProof,
+            coverage: &'a super::SemanticCoverage,
+            #[serde(skip_serializing_if = "Option::is_none")]
+            raw_sources: Option<&'a super::semantic_manifest::SemanticRawSources>,
+        }
+        let receipt = Receipt {
+            format_version: 2,
+            publication,
+            binding: proof,
+            coverage: &manifest.coverage,
+            raw_sources: manifest.raw_sources.as_ref(),
+        };
+        #[cfg(test)]
+        crate::db::Database::semantic_coverage_test_boundary("coverage_put")?;
+        self.restore_durable_root(
+            &format!(
+                "tenants/{}/semantic/v2/requests/{}/{}-coverage.json",
+                proof.tenant_id, proof.request_id, publication.revision,
+            ),
+            Bytes::from(
+                serde_json::to_vec(&receipt)
+                    .map_err(|_| AppError::internal("semantic_coverage_encode"))?,
+            ),
+        )
+        .await
+    }
+}

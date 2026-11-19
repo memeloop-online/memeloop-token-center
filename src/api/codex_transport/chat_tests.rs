@@ -292,18 +292,29 @@ fn workbuddy_chat_refusal_history_named_tool_results_and_empty_stop_are_preserve
 }
 
 #[test]
-fn workbuddy_chat_stream_bounds_total_retained_tool_arguments() {
+fn workbuddy_chat_stream_does_not_retain_forwarded_tool_arguments() {
     let mut translator = CodexChatStreamTranslator::new(Uuid::nil(), "public".into(), false);
     translator
         .translate_frame(&frame(
             &json!({"type": "response.output_item.added", "output_index": 0, "item": call(0, "")}),
         ))
         .unwrap();
-    translator.retained_bytes = MAX_PROXY_RESPONSE_BODY;
-    let event = json!({"type": "response.function_call_arguments.delta", "output_index": 0, "item_id": "fc_0", "delta": "{"});
+    let retained_before = translator.retained_bytes;
+    let event = frame(
+        &json!({"type": "response.function_call_arguments.delta", "output_index": 0, "item_id": "fc_0", "delta": "x".repeat(64 * 1024)}),
+    );
+    // Cross the former cumulative 64 MiB gate with individually small frames.
+    // Each result is delivered/dropped, while only prefix evidence is retained.
+    for _ in 0..1025 {
+        assert!(translator.translate_frame(&event).unwrap().is_some());
+        assert_eq!(translator.retained_bytes, retained_before);
+    }
+    let mismatched_terminal = frame(
+        &json!({"type": "response.function_call_arguments.done", "output_index": 0, "item_id": "fc_0", "arguments": "x"}),
+    );
     assert_eq!(
-        translator.translate_frame(&frame(&event)),
-        Err("upstream_response_too_large")
+        translator.translate_frame(&mismatched_terminal),
+        Err("upstream_invalid_response")
     );
 }
 

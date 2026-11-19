@@ -124,7 +124,9 @@ impl Database {
                 // Transport settings are independently managed. Omitting a
                 // source proxy must not erase an already installed account proxy.
                 let credential = input.credential.clone().preserve_proxy_from(&current);
-                let next = generation.checked_add(1).ok_or(AppError::Internal)?;
+                let next = generation.checked_add(1).ok_or(AppError::internal(
+                    "native_oauth_sources_import_native_cursor_source_1",
+                ))?;
                 let revoked = sqlx::query("UPDATE upstream_credentials SET revoked_at = $1 WHERE upstream_account_id = $2 AND generation = $3 AND revoked_at IS NULL")
                     .bind(now).bind(&id).bind(generation).execute(&mut *tx).await?;
                 if revoked.rows_affected() != 1 {
@@ -181,7 +183,7 @@ impl Database {
             &input.source_identity_hash,
         )
         .await?
-        .ok_or(AppError::Internal)?;
+        .ok_or(AppError::internal("native_oauth_sources_site_1"))?;
         let account = upstream_account_view_with_transport(row, key_material)?;
         debug_assert_eq!(account.id.to_string(), account_id);
         tx.commit().await?;

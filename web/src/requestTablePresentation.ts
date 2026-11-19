@@ -1,23 +1,25 @@
-import type { RequestView } from './types.js';
+import { formatMilliseconds } from './format.js';
+import type { Locale } from './i18n.js';
 import { RETIRED_CREDENTIAL } from './identityPresentation.js';
+import type { RequestView } from './types.js';
 
 const tokenCount = (value: unknown): value is number => typeof value === 'number' && Number.isSafeInteger(value) && value >= 0;
 
 /** Nonnegative finite safe milliseconds; fractional, negative or unsafe timing telemetry is unusable. */
 const timingMs = (value: unknown): value is number => typeof value === 'number' && Number.isSafeInteger(value) && value >= 0;
 
-/** Live status is written atomically with settlement; imported history may lack completed_at. */
 export function requestIsPending(request: RequestView): boolean {
-  return request.status_code === null;
+  return request.operational_terminal == null && request.status_code === null;
+}
+
+export function requestSettlementPending(request: RequestView): boolean {
+  return requestIsPending(request)
+    || (request.operational_terminal != null && request.operational_terminal.financial_state !== 'applied');
 }
 
 /** Recorded terminal failure evidence, including client disconnects recorded as 499. */
 export function requestFailed(request: RequestView): boolean {
   return !requestIsPending(request) && (Boolean(request.error_code) || (request.status_code ?? 0) >= 400);
-}
-
-function failedCostDefaultsToZero(request: RequestView): boolean {
-  return requestFailed(request) && request.usage_basis !== 'provider_reported';
 }
 
 /**
@@ -27,7 +29,7 @@ function failedCostDefaultsToZero(request: RequestView): boolean {
  * stay in details instead of being presented as actual consumption.
  */
 export function requestUsageIsActual(request: RequestView): boolean {
-  if (requestIsPending(request)) return false;
+  if (requestSettlementPending(request) || !tokenCount(request.input_tokens) || !tokenCount(request.output_tokens)) return false;
   return request.usage_basis !== 'provider_estimated'
     && request.usage_basis !== 'contract_ceiling'
     && request.usage_basis !== 'not_observed'
@@ -36,7 +38,7 @@ export function requestUsageIsActual(request: RequestView): boolean {
 
 /** Stored input includes both cache components, including normalized Anthropic usage. */
 export function nonCachedRequestInput(request: RequestView): number | null {
-  if (requestIsPending(request)) return null;
+  if (requestSettlementPending(request)) return null;
   const { input_tokens: input, cached_input_tokens: cached, cache_write_tokens: written } = request;
   if (!tokenCount(input) || !tokenCount(cached) || !tokenCount(written) || cached + written > input) return null;
   return input - cached - written;
@@ -44,7 +46,7 @@ export function nonCachedRequestInput(request: RequestView): number | null {
 
 /** End-to-end output throughput for successful provider-reported requests, not an inferred model decoding speed. */
 export function averageRequestOutputTps(request: RequestView): number | null {
-  if (request.usage_basis !== 'provider_reported' || request.compaction === true || requestIsPending(request) || requestFailed(request) || !tokenCount(request.output_tokens)
+  if (request.usage_basis !== 'provider_reported' || request.compaction === true || requestSettlementPending(request) || requestFailed(request) || !tokenCount(request.output_tokens)
     || !timingMs(request.duration_ms) || request.duration_ms <= 0) return null;
   const rate = request.output_tokens * 1000 / request.duration_ms;
   return Number.isFinite(rate) ? rate : null;
@@ -54,7 +56,7 @@ export function averageRequestOutputTps(request: RequestView): number | null {
 export function generationRequestOutputTps(request: RequestView): number | null {
   const first = request.first_output_ms;
   const generation = request.generation_duration_ms;
-  if (request.usage_basis !== 'provider_reported' || request.compaction === true || requestIsPending(request) || requestFailed(request) || !tokenCount(request.output_tokens)
+  if (request.usage_basis !== 'provider_reported' || request.compaction === true || requestSettlementPending(request) || requestFailed(request) || !tokenCount(request.output_tokens)
     || !timingMs(first) || !timingMs(generation) || generation <= 0) return null;
   if (!timingMs(request.duration_ms) || request.duration_ms < first + generation) return null;
   const rate = request.output_tokens * 1000 / generation;
@@ -63,6 +65,10 @@ export function generationRequestOutputTps(request: RequestView): number | null 
 
 export function requestUsageCopy(request: RequestView, locale: string) {
   const zh = locale === 'zh-CN';
+  if (requestSettlementPending(request)) return {
+    label: zh ? '用量待确认' : 'Usage awaiting confirmation',
+    hint: zh ? '实际用量尚未确认。' : 'Actual usage is awaiting confirmation.',
+  };
   switch (request.usage_basis) {
     case 'provider_reported': return { label: zh ? '上游报告用量' : 'Provider-reported usage', hint: zh ? '词元数量由上游报告；速率使用网关记录的时间。' : 'Token counts reported by the provider; throughput uses gateway-recorded timing.' };
     case 'provider_estimated': return { label: zh ? '估算用量' : 'Estimated usage', hint: zh ? '词元数量为估算值，实际输出速率未知。' : 'Token counts are estimated; actual output throughput is unknown.' };
@@ -76,24 +82,22 @@ export function requestCostCopy(request: RequestView, locale: string) {
   const zh = locale === 'zh-CN';
   /** Recorded local ledger amounts stay visible in details, explicitly labelled as local settlement rather than supplier usage. */
   const ledgerLabel = zh ? '本地账本金额' : 'Local ledger amount';
-  if (requestIsPending(request)) return {
+  if (requestSettlementPending(request)) return {
     unknown: true,
     ledgerLabel,
     label: zh ? '待结算' : 'Awaiting settlement',
-    hint: zh ? '请求仍在进行中，费用尚未结算。' : 'The request is still in progress; cost has not been settled.',
+    hint: requestIsPending(request)
+      ? (zh ? '请求仍在进行中，费用尚未结算。' : 'The request is still in progress; cost has not been settled.')
+      : (zh ? '请求已结束，费用待确认。' : 'The request has ended. Cost awaits confirmation.'),
   };
-  if (failedCostDefaultsToZero(request)) return {
-    unknown: false,
-    ledgerLabel,
-    label: zh ? '费用按 0 计算' : 'Cost set to 0',
-    hint: zh
-      ? '请求失败，费用按 0 计算。供应商回传用量时，以对应结算金额为准。'
-      : 'The request failed, so its cost is 0. A provider-reported usage record keeps its settled amount.',
-  };
-  if (!requestUsageIsActual(request)) return {
+  if (requestDisplayedCost(request) === '') return {
     unknown: true, ledgerLabel,
-    label: zh ? '需核对' : 'Review required',
-    hint: zh ? '实际用量尚未确认；已记账金额可用于核对。' : 'Actual usage is pending confirmation; the recorded ledger amount is available for review.',
+    label: zh ? '费用待确认' : 'Cost awaiting confirmation',
+    hint: zh ? '尚无已确认的费用。' : 'No confirmed cost is available yet.',
+  };
+  if (request.operational_terminal?.financial_state === 'applied') return {
+    unknown: false, ledgerLabel, label: '',
+    hint: zh ? '费用已结算；请求结果独立记录。' : 'Cost is settled; the request outcome is recorded separately.',
   };
   if (request.usage_basis === 'contract_ceiling') return {
     unknown: false,
@@ -113,9 +117,27 @@ export function requestCostCopy(request: RequestView, locale: string) {
   };
 }
 
-/** Failed requests require provider-reported usage evidence to retain a settled amount. */
+/** Total time, the wait until the upstream starts returning, and the output interval after that. */
+export function requestDurationTooltip(request: RequestView, locale: Locale): string {
+  const zh = locale === 'zh-CN';
+  const lines: string[] = [];
+  const push = (label: string, value: number | null | undefined) => {
+    if (!timingMs(value)) return;
+    lines.push(`${label}: ${formatMilliseconds(value, locale)}`);
+  };
+  push(zh ? '总耗时' : 'Total', request.duration_ms);
+  push(zh ? '等待上游开始返回' : 'Waiting for the upstream to start', request.first_output_ms);
+  push(zh ? '上游返回内容' : 'Upstream output', request.generation_duration_ms);
+  if (timingMs(request.duration_ms) && timingMs(request.first_output_ms) && timingMs(request.generation_duration_ms)) {
+    const local = request.duration_ms - request.first_output_ms - request.generation_duration_ms;
+    if (local > 0) push(zh ? '网关本地处理' : 'Gateway local work', local);
+  }
+  return lines.join(' · ');
+}
+
 export function requestDisplayedCost(request: RequestView): string {
-  return failedCostDefaultsToZero(request) ? '0' : request.cost;
+  if (requestSettlementPending(request) || typeof request.cost !== 'string' || !request.cost.trim()) return '';
+  return request.cost;
 }
 
 export function requestCredentialLabel(request: RequestView, fallback: string | undefined): { label: string } | { key: 'request.unnamedCredential' | 'request.missingCredential' | 'request.retiredCredential' } {

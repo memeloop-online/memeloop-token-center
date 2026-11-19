@@ -25,13 +25,17 @@ pub use descriptor_export::{ExportPluginDescriptor, PluginDescriptorExport};
 #[cfg(feature = "plugin-distribution")]
 pub mod descriptor_import;
 mod empty;
+pub mod uninstall;
 pub use empty::RegisterEmptyInventory;
 pub mod installation;
+mod inventory_lock;
 pub mod prepare;
+mod request_dependencies;
+mod retained_installation;
 const ADMISSION_WAIT: Duration = Duration::from_secs(5);
 const COMPILATION_DEADLINE: Duration = Duration::from_secs(35);
 const PIN_DEADLINE: Duration = Duration::from_secs(45);
-// Shared by request pinning and administrative staging across all AppStates.
+// Shared by lifecycle loading and administrative staging across all AppStates.
 // An abandoned blocking compilation retains its permit until it really ends.
 static COMPILATION_PERMITS: LazyLock<Arc<tokio::sync::Semaphore>> =
     LazyLock::new(|| Arc::new(tokio::sync::Semaphore::new(1)));
@@ -60,6 +64,7 @@ pub struct ApplicationRevision {
 pub struct ApplicationPluginStatus {
     pub current: Option<ApplicationRevision>,
     pub candidates: Vec<ApplicationPluginCandidate>,
+    pub runtime: serde_json::Value,
 }
 
 #[derive(Serialize)]
@@ -93,9 +98,14 @@ pub struct RollbackApplicationPlugin {
 
 pub struct ApplicationPlugins {
     db: Database,
+    current: std::sync::RwLock<CurrentSnapshot>,
+    baseline_provider_ids: std::collections::BTreeSet<String>,
+    request_dependencies: tokio::sync::Mutex<Option<(ApplicationRevision, bool)>>,
+    refresh: tokio::sync::Mutex<()>,
     inventory: tokio::sync::RwLock<BTreeMap<String, PreinstalledInventory>>,
     inventory_file: Option<PathBuf>,
     installation_policy_file: Option<PathBuf>,
+    installer_network_key: Option<Vec<u8>>,
     inventory_stamp: tokio::sync::Mutex<Option<InventoryStamp>>,
     #[cfg(test)]
     inventory_reads: std::sync::atomic::AtomicUsize,
@@ -108,6 +118,32 @@ pub struct ApplicationPlugins {
     compilations: std::sync::atomic::AtomicUsize,
     #[cfg(test)]
     compile_gate: std::sync::Mutex<Option<CompileGate>>,
+    #[cfg(test)]
+    snapshot_cache_waiting: std::sync::Mutex<Option<tokio::sync::oneshot::Sender<()>>>,
+}
+
+#[derive(Default)]
+struct CurrentSnapshot {
+    snapshot: Option<Arc<ApplicationPluginSnapshot>>,
+    initialized: bool,
+    error: Option<&'static str>,
+    inventory_error: Option<&'static str>,
+}
+
+struct RefreshAttempt<'a> {
+    current: &'a std::sync::RwLock<CurrentSnapshot>,
+    completed: bool,
+}
+
+impl Drop for RefreshAttempt<'_> {
+    fn drop(&mut self) {
+        if !self.completed
+            && let Ok(mut current) = self.current.write()
+        {
+            current.error = Some("snapshot_refresh_cancelled");
+            tracing::error!("application plugin snapshot refresh cancelled");
+        }
+    }
 }
 
 #[derive(PartialEq, Eq)]
@@ -125,7 +161,9 @@ impl InventoryStamp {
         }
         Ok(Self {
             length: metadata.len(),
-            modified: metadata.modified().map_err(|_| AppError::Internal)?,
+            modified: metadata
+                .modified()
+                .map_err(|_| AppError::internal("application_from_metadata_1"))?,
             #[cfg(unix)]
             inode: {
                 use std::os::unix::fs::MetadataExt;
@@ -162,35 +200,58 @@ type LoadResult = Result<Arc<ApplicationPluginSnapshot>, LoadFailure>;
 #[derive(Clone, Copy)]
 enum LoadFailure {
     Forbidden,
-    Overloaded,
-    Internal,
+    Capacity {
+        code: &'static str,
+        facts: crate::error::ErrorFacts,
+    },
+    Upstream {
+        code: &'static str,
+        facts: crate::error::ErrorFacts,
+    },
+    Internal {
+        code: &'static str,
+        facts: crate::error::ErrorFacts,
+    },
 }
 
 impl LoadFailure {
     fn from_error(error: AppError) -> Self {
         match error {
             AppError::Forbidden => Self::Forbidden,
-            AppError::Overloaded => Self::Overloaded,
-            _ => Self::Internal,
+            AppError::Capacity { code, facts } => Self::Capacity { code, facts },
+            AppError::Overloaded => Self::Capacity {
+                code: "service_overloaded",
+                facts: crate::error::ErrorFacts::new().stage("plugin_snapshot"),
+            },
+            AppError::Internal { code, facts } => Self::Internal { code, facts },
+            AppError::Upstream { code, facts } => Self::Upstream { code, facts },
+            other => Self::Internal {
+                code: "plugin_snapshot_load_failed",
+                facts: crate::error::ErrorFacts::new().stage(other.diagnostic_category()),
+            },
         }
     }
 
     fn into_error(self) -> AppError {
         match self {
             Self::Forbidden => AppError::Forbidden,
-            Self::Overloaded => AppError::Overloaded,
-            Self::Internal => AppError::Internal,
+            Self::Capacity { code, facts } => AppError::capacity(code, facts),
+            Self::Upstream { code, facts } => AppError::upstream_with(code, facts),
+            Self::Internal { code, facts } => AppError::Internal { code, facts },
         }
     }
 }
 
 impl ApplicationPlugins {
     pub async fn status(&self) -> Result<ApplicationPluginStatus, AppError> {
-        self.refresh_inventory().await?;
+        // The installation page must remain available to explain and recover
+        // an unavailable inventory. Keep its last validated candidate list.
+        let _ = self.refresh_inventory().await;
         let current = self.db.optional_application_plugin_head().await?;
         let staged = self.db.staged_application_plugin_ids().await?;
         Ok(ApplicationPluginStatus {
             current,
+            runtime: self.refresh_status(),
             candidates: self
                 .inventory
                 .read()
@@ -217,7 +278,7 @@ impl ApplicationPlugins {
     pub fn new(
         db: Database,
         inventory: BTreeMap<String, PreinstalledInventory>,
-        _baseline: &PluginRuntime,
+        baseline: &PluginRuntime,
     ) -> Result<Self, AppError> {
         for (id, entry) in &inventory {
             validate_inventory_id(id)?;
@@ -227,9 +288,18 @@ impl ApplicationPlugins {
         }
         Ok(Self {
             db,
+            current: std::sync::RwLock::new(CurrentSnapshot::default()),
+            baseline_provider_ids: baseline
+                .provider_types()
+                .into_iter()
+                .map(|provider| provider.id)
+                .collect(),
+            request_dependencies: tokio::sync::Mutex::new(None),
+            refresh: tokio::sync::Mutex::new(()),
             inventory: tokio::sync::RwLock::new(inventory),
             inventory_file: None,
             installation_policy_file: None,
+            installer_network_key: None,
             inventory_stamp: tokio::sync::Mutex::new(None),
             #[cfg(test)]
             inventory_reads: std::sync::atomic::AtomicUsize::new(0),
@@ -242,6 +312,8 @@ impl ApplicationPlugins {
             compilations: std::sync::atomic::AtomicUsize::new(0),
             #[cfg(test)]
             compile_gate: std::sync::Mutex::new(None),
+            #[cfg(test)]
+            snapshot_cache_waiting: std::sync::Mutex::new(None),
         })
     }
 
@@ -257,11 +329,23 @@ impl ApplicationPlugins {
         }
         let mut authority = Self::new(db, BTreeMap::new(), baseline)?;
         authority.inventory_file = Some(path);
-        authority.refresh_inventory().await?;
+        // Keep the authority even when optional distribution files are absent
+        // or invalid. Request dependency classification still consults the
+        // published receipt; required policies cannot fall back to baseline.
+        let _ = authority.refresh_inventory().await;
         Ok(authority)
     }
 
     async fn refresh_inventory(&self) -> Result<(), AppError> {
+        let result = self.refresh_inventory_inner().await;
+        self.current
+            .write()
+            .map_err(|_| AppError::internal("application_inventory_status"))?
+            .inventory_error = result.as_ref().err().map(|_| "inventory_unavailable");
+        result
+    }
+
+    async fn refresh_inventory_inner(&self) -> Result<(), AppError> {
         #[cfg(test)]
         self.inventory_refreshes
             .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
@@ -276,9 +360,13 @@ impl ApplicationPlugins {
         let mut cached_stamp = self.inventory_stamp.lock().await;
         let file = tokio::fs::File::open(path)
             .await
-            .map_err(|_| AppError::Internal)?;
-        let stamp =
-            InventoryStamp::from_metadata(&file.metadata().await.map_err(|_| AppError::Internal)?)?;
+            .map_err(|_| AppError::internal("application_refresh_inventory_1"))?;
+        let stamp = InventoryStamp::from_metadata(
+            &file
+                .metadata()
+                .await
+                .map_err(|_| AppError::internal("application_refresh_inventory_2"))?,
+        )?;
         if cached_stamp.as_ref() == Some(&stamp) {
             return Ok(());
         }
@@ -292,7 +380,7 @@ impl ApplicationPlugins {
         file.take(MAX_INVENTORY_BYTES + 1)
             .read_to_end(&mut bytes)
             .await
-            .map_err(|_| AppError::Internal)?;
+            .map_err(|_| AppError::internal("application_refresh_inventory_3"))?;
         if bytes.len() as u64 > MAX_INVENTORY_BYTES {
             return Err(AppError::Forbidden);
         }
@@ -309,8 +397,10 @@ impl ApplicationPlugins {
         // are immutable, including grants; changing a contract needs a new ID.
         for (id, old) in inventory.iter() {
             let new = incoming.get(id).ok_or(AppError::Forbidden)?;
-            if serde_json::to_value(old).map_err(|_| AppError::Internal)?
-                != serde_json::to_value(new).map_err(|_| AppError::Internal)?
+            if serde_json::to_value(old)
+                .map_err(|_| AppError::internal("application_refresh_inventory_4"))?
+                != serde_json::to_value(new)
+                    .map_err(|_| AppError::internal("application_refresh_inventory_5"))?
             {
                 return Err(AppError::Forbidden);
             }
@@ -349,8 +439,8 @@ impl ApplicationPlugins {
         let permit =
             tokio::time::timeout(ADMISSION_WAIT, COMPILATION_PERMITS.clone().acquire_owned())
                 .await
-                .map_err(|_| AppError::Overloaded)?
-                .map_err(|_| AppError::Internal)?;
+                .map_err(|_| AppError::capacity_error("plugin_compilation_capacity"))?
+                .map_err(|_| AppError::internal("application_load_entry_1"))?;
         #[cfg(test)]
         self.compilations
             .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
@@ -363,22 +453,25 @@ impl ApplicationPlugins {
             #[cfg(test)]
             if let Some((entered, release)) = gate {
                 let _ = entered.send(());
-                release.recv().map_err(|_| AppError::Internal)?;
+                release
+                    .recv()
+                    .map_err(|_| AppError::internal("application_load_entry_2"))?;
             }
-            let metadata =
-                std::fs::symlink_metadata(&entry.root).map_err(|_| AppError::Internal)?;
+            let metadata = std::fs::symlink_metadata(&entry.root)
+                .map_err(|_| AppError::internal("application_load_entry_3"))?;
             if !metadata.is_dir() || metadata.file_type().is_symlink() {
                 return Err(AppError::Forbidden);
             }
             let root = entry.root.to_str().ok_or(AppError::Forbidden)?;
-            let runtime = PluginRuntime::load(Some(root), db).map_err(|_| AppError::Internal)?;
+            let runtime = PluginRuntime::load(Some(root), db)
+                .map_err(|_| AppError::internal("application_load_entry_4"))?;
             lifecycle::validate_grants(&runtime, &entry.grants)?;
             Ok::<_, AppError>(runtime)
         });
         let runtime = tokio::time::timeout(COMPILATION_DEADLINE, task)
             .await
-            .map_err(|_| AppError::Overloaded)?
-            .map_err(|_| AppError::Internal)??;
+            .map_err(|_| AppError::capacity_error("plugin_compilation_capacity"))?
+            .map_err(|_| AppError::internal("application_load_entry_5"))??;
         let contract_digest = contract_digest(&runtime)?;
         runtime.validate_stored_configurations().await?;
         let identity_digest = super::plugin_configuration_schema_digest(&json!({
@@ -390,7 +483,7 @@ impl ApplicationPlugins {
             "initial" => RevisionReason::Initial,
             "reload" => RevisionReason::Reload,
             "rollback" => RevisionReason::Rollback,
-            _ => return Err(AppError::Internal),
+            _ => return Err(AppError::internal("application_load_entry_1")),
         };
         Ok(ApplicationPluginSnapshot {
             receipt: ApplicationRevision {
@@ -402,7 +495,9 @@ impl ApplicationPlugins {
             },
             runtime: lifecycle::snapshot(
                 runtime,
-                revision.try_into().map_err(|_| AppError::Internal)?,
+                revision
+                    .try_into()
+                    .map_err(|_| AppError::internal("application_load_entry_6"))?,
                 revision_reason,
             ),
             providers,
@@ -435,6 +530,16 @@ impl ApplicationPlugins {
         actor: &str,
     ) -> Result<ApplicationRevision, AppError> {
         validate_operation(input.expected_revision, key)?;
+        if let Some(base) = self
+            .db
+            .plugin_release_base_revision(&input.inventory_id)
+            .await?
+            && input.expected_revision != base
+        {
+            return Err(AppError::Conflict(
+                "release installation was prepared against another runtime revision".into(),
+            ));
+        }
         let reason = if input.expected_revision == 0 {
             "initial"
         } else {
@@ -542,10 +647,127 @@ impl ApplicationPlugins {
         }
     }
 
+    pub fn current_snapshot(&self) -> Result<Option<Arc<ApplicationPluginSnapshot>>, AppError> {
+        let current = self
+            .current
+            .read()
+            .map_err(|_| AppError::internal("application_current_snapshot_1"))?;
+        if !current.initialized {
+            return Err(AppError::capacity_error("plugin_snapshot_unavailable"));
+        }
+        Ok(current.snapshot.clone())
+    }
+
+    /// A cold background refresh is not request admission. Resolve the actual
+    /// published dependency instead: an empty head uses the startup runtime,
+    /// while a published policy must still be loaded and validated. Warm
+    /// requests retain the last verified atomic runtime/catalog without I/O.
+    pub async fn request_snapshot(
+        self: &Arc<Self>,
+    ) -> Result<Option<Arc<ApplicationPluginSnapshot>>, AppError> {
+        {
+            let current = self
+                .current
+                .read()
+                .map_err(|_| AppError::internal("application_current_snapshot_1"))?;
+            if current.initialized {
+                return Ok(current.snapshot.clone());
+            }
+        }
+        if self.baseline_is_independent().await? {
+            return Ok(None);
+        }
+        self.refresh_current_inner(true).await?;
+        self.current_snapshot()
+    }
+
+    pub fn refresh_status(&self) -> serde_json::Value {
+        let Ok(current) = self.current.read() else {
+            return json!({"ready": false, "error": "snapshot_lock_failed"});
+        };
+        json!({
+            "ready": current.initialized,
+            "revision": current.snapshot.as_ref().map(|snapshot| &snapshot.receipt),
+            "error": current.error.or(current.inventory_error),
+        })
+    }
+
+    pub async fn refresh_current(self: &Arc<Self>) -> Result<(), AppError> {
+        self.refresh_current_inner(false).await
+    }
+
+    async fn refresh_current_inner(self: &Arc<Self>, only_if_cold: bool) -> Result<(), AppError> {
+        let _refresh = self.refresh.lock().await;
+        if only_if_cold
+            && self
+                .current
+                .read()
+                .map_err(|_| AppError::internal("application_current_snapshot_1"))?
+                .initialized
+        {
+            return Ok(());
+        }
+        let mut attempt = RefreshAttempt {
+            current: &self.current,
+            completed: false,
+        };
+        let result = tokio::time::timeout(PIN_DEADLINE, async {
+            let head = self.db.optional_application_plugin_head().await?;
+            {
+                let current = self
+                    .current
+                    .read()
+                    .map_err(|_| AppError::internal("application_refresh_current_1"))?;
+                if head.is_none() && current.snapshot.is_some() {
+                    return Err(AppError::Forbidden);
+                }
+            }
+            if head.is_none() && !self.db.application_plugin_history(None).await?.is_empty() {
+                return Err(AppError::Forbidden);
+            }
+            let snapshot = match head.as_ref() {
+                Some(head) => Some(self.pin_revision(head.clone()).await?),
+                None => None,
+            };
+            if self.db.optional_application_plugin_head().await? != head {
+                return Err(AppError::Conflict(
+                    "plugin head changed during refresh".into(),
+                ));
+            }
+            let mut current = self
+                .current
+                .write()
+                .map_err(|_| AppError::internal("application_refresh_current_2"))?;
+            let previous = std::mem::replace(&mut current.snapshot, snapshot);
+            current.initialized = true;
+            current.error = None;
+            drop(current);
+            drop(previous);
+            Ok(())
+        })
+        .await
+        .unwrap_or(Err(AppError::capacity_error(
+            "plugin_snapshot_refresh_timeout",
+        )));
+        if let Err(error) = &result {
+            self.current
+                .write()
+                .map_err(|_| AppError::internal("application_refresh_current_3"))?
+                .error = Some("snapshot_refresh_failed");
+            tracing::error!(%error, "application plugin snapshot refresh failed");
+        }
+        attempt.completed = true;
+        result
+    }
+
     async fn pin_revision(
         self: &Arc<Self>,
         head: ApplicationRevision,
     ) -> Result<Arc<ApplicationPluginSnapshot>, AppError> {
+        #[cfg(test)]
+        if let Some(waiting) = self.snapshot_cache_waiting.lock().unwrap().take() {
+            let _ = waiting.send(());
+        }
         {
             let cache = self.snapshots.lock().await;
             if let Some(snapshot) = cache
@@ -572,13 +794,13 @@ impl ApplicationPlugins {
             .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         let metadata = tokio::fs::symlink_metadata(&entry.root)
             .await
-            .map_err(|_| AppError::Internal)?;
+            .map_err(|_| AppError::internal("application_pin_revision_1"))?;
         if !metadata.is_dir() || metadata.file_type().is_symlink() {
             return Err(AppError::Forbidden);
         }
         tokio::time::timeout(PIN_DEADLINE, self.pin_head(head))
             .await
-            .map_err(|_| AppError::Overloaded)?
+            .map_err(|_| AppError::capacity_error("plugin_pin_timeout"))?
     }
 
     async fn pin_head(
@@ -620,7 +842,7 @@ impl ApplicationPlugins {
                             Ok::<_, AppError>(Arc::new(snapshot))
                         })
                         .await
-                        .unwrap_or(Err(AppError::Overloaded))
+                        .unwrap_or(Err(AppError::capacity_error("plugin_pin_timeout")))
                         .map_err(LoadFailure::from_error);
                         let mut cache = authority.snapshots.lock().await;
                         if let Ok(snapshot) = &loaded {
@@ -649,7 +871,7 @@ impl ApplicationPlugins {
                     {
                         cache.in_flight = None;
                     }
-                    return Err(AppError::Internal);
+                    return Err(AppError::internal("application_pin_head_1"));
                 }
             };
             if flight.revision == head.revision {
@@ -710,5 +932,7 @@ fn validate_operation(expected: i64, key: &str) -> Result<(), AppError> {
     Ok(())
 }
 
+#[cfg(test)]
+mod hot_snapshot_tests;
 #[cfg(test)]
 mod tests;

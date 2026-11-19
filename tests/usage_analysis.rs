@@ -126,6 +126,160 @@ fn assert_trends_match_full(full: &Value, trends: &Value) {
     }
 }
 
+fn without_output_rates(mut value: Value) -> Value {
+    match &mut value {
+        Value::Object(object) => {
+            object.remove("output_rate");
+        }
+        Value::Array(points) => {
+            for point in points {
+                point.as_object_mut().unwrap().remove("output_rate");
+            }
+        }
+        _ => {}
+    }
+    value
+}
+
+async fn assert_explicit_usage_projections(
+    state: &AppState,
+    path: &str,
+    token: &str,
+    full: &Value,
+) {
+    let cases: [(&str, &[&str], u64); 6] = [
+        (
+            "overview",
+            &[
+                "summary",
+                "time_series",
+                "generation_units_by_modality",
+                "generation_units_by_billing_unit",
+            ],
+            2,
+        ),
+        ("trends", &["summary", "time_series"], 1),
+        (
+            "dimensions",
+            &[
+                "summary",
+                "time_series",
+                "by_model",
+                "by_key",
+                "by_upstream",
+                "by_protocol",
+                "by_status",
+                "errors",
+            ],
+            1,
+        ),
+        ("sessions", &["by_session"], 1),
+        ("heatmap", &["heatmap"], 1),
+        ("output_rate", &[], 1),
+    ];
+    // Two live dispatchers avoid tracing's single-dispatch interest caching
+    // across parallel tests which do not install a subscriber.
+    let keepalive = LogCapture::default().dispatch();
+    for (projection, fields, statement_count) in cases {
+        let capture = LogCapture::default();
+        let dispatch = capture.dispatch();
+        let (status, body) = get_json(state, &format!("{path}&projection={projection}"), token)
+            .with_subscriber(dispatch.clone())
+            .await;
+        assert_eq!(status, StatusCode::OK, "{projection}: {body}");
+        let events = capture.analysis_events();
+        assert_eq!(events.len(), 1, "{projection}: {}", capture.rendered());
+        assert_eq!(events[0]["projection"], projection);
+        assert_eq!(events[0]["business_statement_count"], statement_count);
+        for field in [
+            "from_created_at",
+            "to_created_at",
+            "granularity",
+            "time_zone",
+        ] {
+            assert_eq!(body[field], full[field], "{projection}/{field}");
+        }
+        for field in fields {
+            assert_eq!(
+                without_output_rates(body[*field].clone()),
+                without_output_rates(full[*field].clone()),
+                "{projection}/{field}",
+            );
+        }
+        for field in [
+            "time_series",
+            "generation_units_by_modality",
+            "generation_units_by_billing_unit",
+            "by_model",
+            "by_key",
+            "by_upstream",
+            "by_protocol",
+            "by_status",
+            "errors",
+            "by_session",
+            "heatmap",
+        ] {
+            if !(fields.contains(&field) || projection == "output_rate" && field == "time_series") {
+                assert_eq!(body[field], serde_json::json!([]), "{projection}/{field}");
+            }
+        }
+        if projection == "output_rate" {
+            assert_eq!(
+                body["summary"]["output_rate"],
+                full["summary"]["output_rate"]
+            );
+            assert_eq!(
+                body["summary"]["requests"], 0,
+                "TPS shell must not claim usage totals"
+            );
+            for point in body["time_series"].as_array().unwrap() {
+                let full_point = full["time_series"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .find(|candidate| candidate["bucket_start"] == point["bucket_start"])
+                    .unwrap();
+                assert_eq!(point["output_rate"], full_point["output_rate"]);
+            }
+        } else {
+            assert!(body["summary"]["output_rate"].is_null(), "{projection}");
+            assert!(
+                body["time_series"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .all(|point| point["output_rate"].is_null())
+            );
+        }
+    }
+    drop(keepalive);
+    let trends_path = path.replacen("/usage-analysis?", "/usage-analysis/trends?", 1);
+    let (status, fast_trends) =
+        get_json(state, &format!("{trends_path}&projection=trends"), token).await;
+    assert_eq!(status, StatusCode::OK, "{fast_trends}");
+    assert_eq!(
+        without_output_rates(fast_trends["summary"].clone()),
+        without_output_rates(full["summary"].clone())
+    );
+    assert!(fast_trends["summary"]["output_rate"].is_null());
+    let (status, _) = get_json(state, &format!("{trends_path}&projection=heatmap"), token).await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+    for suffix in [
+        "projection=invalid",
+        "projection=overview&tenant_external_id=forbidden-projection-tenant",
+    ] {
+        let (status, _) = get_json(state, &format!("{path}&{suffix}"), token).await;
+        assert_eq!(
+            status,
+            if suffix == "projection=invalid" {
+                StatusCode::BAD_REQUEST
+            } else {
+                StatusCode::FORBIDDEN
+            }
+        );
+    }
+}
+
 async fn issue(
     state: &AppState,
     tenant: &str,
@@ -338,6 +492,30 @@ async fn assert_output_rate_provenance(database_url: String) {
         serde_json::to_value(&full.summary.output_rate).unwrap(),
         serde_json::to_value(&initial.summary.output_rate).unwrap()
     );
+    let standalone = state
+        .db
+        .projected_usage_analysis(
+            Some(&tenant),
+            filter.clone(),
+            memeloop_token_center::db::UsageAnalysisProjection::OutputRate,
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        serde_json::to_value(&standalone.summary.output_rate).unwrap(),
+        serde_json::to_value(&initial.summary.output_rate).unwrap()
+    );
+    assert_eq!(standalone.time_series.len(), 1);
+    assert_eq!(
+        standalone.time_series[0]
+            .metrics
+            .output_rate
+            .as_ref()
+            .unwrap()
+            .requests,
+        1
+    );
+    assert_eq!(standalone.summary.requests, 0);
     let failed = state
         .db
         .operator_usage_analysis_trends(
@@ -383,6 +561,17 @@ async fn assert_output_rate_provenance(database_url: String) {
         .unwrap();
     assert_eq!(late.summary.output_rate.unwrap().requests, 0);
     assert_eq!(late.summary.requests, 7);
+    let late_standalone = state
+        .db
+        .projected_usage_analysis(
+            Some(&tenant),
+            filter.clone(),
+            memeloop_token_center::db::UsageAnalysisProjection::OutputRate,
+        )
+        .await
+        .unwrap();
+    assert_eq!(late_standalone.summary.output_rate.unwrap().requests, 0);
+    assert!(late_standalone.time_series.is_empty());
     assert!(
         late.time_series
             .iter()
@@ -953,6 +1142,14 @@ async fn assert_multibucket_usage_analysis(database_url: String, tenant: String)
         .await;
         assert_eq!(status, StatusCode::OK, "{body}");
         assert_multibucket_metrics(&body);
+        assert_explicit_usage_projections(
+            &state,
+            &format!(
+                "/internal/v1/usage-analysis?from_created_at={from}&to_created_at={to}&granularity={granularity}"
+            ),
+            &service.token,
+            &body,
+        ).await;
         if granularity == "day" {
             assert_eq!(body["time_series"].as_array().unwrap().len(), 3, "{body}");
         }
@@ -1393,6 +1590,7 @@ async fn sqlite_usage_analysis_keeps_currency_cache_scope_and_prefix_filters_exa
     let (trends_status, trends) = get_json(&state, &trends_path, &scoped.token).await;
     assert_eq!(trends_status, StatusCode::OK, "{trends}");
     assert_trends_match_full(&body, &trends);
+    assert_explicit_usage_projections(&state, &path, &scoped.token, &body).await;
     assert_eq!(body["granularity"], "hour");
     assert_eq!(body["time_zone"], "UTC");
     assert_eq!(body["p95_is_approximate"], true);
@@ -1774,6 +1972,7 @@ async fn postgres_usage_analysis_grouping_sets_match_currency_safe_contract() {
     assert_eq!(analysis_events[0]["projection"], "trends");
     assert_eq!(analysis_events[0]["business_statement_count"], 2);
     drop((full_dispatch, trends_dispatch));
+    assert_explicit_usage_projections(&state, &path, &service.token, &body).await;
     assert_eq!(body["summary"]["requests"], 2);
     assert_eq!(body["summary"]["input_tokens"], 40);
     assert_eq!(body["summary"]["cached_input_tokens"], 14);

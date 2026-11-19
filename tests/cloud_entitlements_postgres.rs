@@ -271,7 +271,7 @@ async fn postgres_cloud_events_serialize_versions_and_replay_stable_identity() {
         .authenticate_key(&key, test_state.config.key_pepper.as_bytes())
         .await
         .unwrap();
-    assert_eq!(authenticated.policy.requests_per_minute, 30);
+    assert_eq!(authenticated.policy.requests_per_minute, Some(30));
     assert_eq!(
         test_state
             .db
@@ -481,7 +481,7 @@ async fn postgres_cloud_events_serialize_versions_and_replay_stable_identity() {
         .unwrap();
     assert_eq!(atomic_keys.len(), 1);
     assert_eq!(atomic_keys[0].available_balance, "10");
-    assert_eq!(atomic_keys[0].policy.requests_per_minute, 10);
+    assert_eq!(atomic_keys[0].policy.requests_per_minute, Some(10));
     let atomic_entitlement = test_state
         .db
         .list_entitlements(

@@ -282,7 +282,7 @@ test('shared page action contexts retain Fluent geometry, labels, keyboard focus
     const pages = [
       { name: 'providers', fixture: 'form-journey.html?workflows', ready: '.provider-directory-actions .fui-Button', controls: '.provider-directory-actions .fui-Button', native: false },
       { name: 'routes', fixture: 'form-journey.html?workflows&view=routes', ready: '.model-route-list .row-actions button', controls: '.model-route-list .row-actions button', native: true },
-      { name: 'usage', fixture: 'usage-analysis.html', ready: '.usage-heading .fui-Button', controls: '.usage-heading .fui-Button, .usage-presets .fui-Button, .usage-tabs .fui-Button', native: false },
+      { name: 'usage', fixture: 'usage-analysis.html', ready: '.usage-heading .fui-Button', controls: '.usage-heading .fui-Button, .usage-tabs .fui-Button', native: false },
     ];
     for (const route of pages) for (const theme of ['light', 'dark'] as const) for (const width of [390, 1440]) {
       const page = await browser.newPage({ viewport: { width, height: 900 } });

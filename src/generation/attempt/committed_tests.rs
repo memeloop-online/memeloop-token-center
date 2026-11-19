@@ -6,51 +6,8 @@ use uuid::Uuid;
 const TEST_PROBE_LEASE_MILLIS: i64 = 1_000;
 const TEST_PROBE_HEARTBEAT_MILLIS: i64 = 25;
 
-async fn wait_for_heartbeat_beyond_deadline(
-    pool: &sqlx::AnyPool,
-    account: Uuid,
-    initial_deadline: i64,
-) -> i64 {
-    tokio::time::timeout(Duration::from_secs(5), async {
-        while unix_millis() <= initial_deadline {
-            tokio::time::sleep(Duration::from_millis(5)).await;
-        }
-        let post_deadline_lease = loop {
-            let now = unix_millis();
-            let lease_until: i64 = sqlx::query_scalar(
-                "SELECT probe_lease_until FROM upstream_account_health WHERE upstream_account_id=$1",
-            )
-            .bind(account.to_string())
-            .fetch_one(pool)
-            .await
-            .unwrap();
-            if lease_until > now {
-                break lease_until;
-            }
-            tokio::time::sleep(Duration::from_millis(5)).await;
-        };
-        // Prove that the detached committed task renews again after the lease
-        // that existed at caller cancellation has elapsed.
-        loop {
-            let lease_until: i64 = sqlx::query_scalar(
-                "SELECT probe_lease_until FROM upstream_account_health WHERE upstream_account_id=$1",
-            )
-            .bind(account.to_string())
-            .fetch_one(pool)
-            .await
-            .unwrap();
-            if lease_until > post_deadline_lease && lease_until > unix_millis() {
-                return lease_until;
-            }
-            tokio::time::sleep(Duration::from_millis(5)).await;
-        }
-    })
-    .await
-    .expect("committed completion must outlive the caller's original probe deadline")
-}
-
 #[tokio::test]
-async fn committed_observation_survives_caller_cancellation_and_keeps_probe_heartbeat() {
+async fn committed_customer_success_does_not_heal_the_breaker() {
     let directory = tempfile::tempdir().unwrap();
     let url = format!(
         "sqlite://{}?mode=rwc",
@@ -87,7 +44,6 @@ async fn committed_observation_survives_caller_cancellation_and_keeps_probe_hear
         .unwrap();
     assert!(matches!(admission, UpstreamAttemptAdmission::Probe { .. }));
     let request = Uuid::now_v7();
-    let gate = crate::group_routing::test_observe_gate::install(request);
     let guard = MediaAttemptGuard::new(
         &state,
         request,
@@ -98,31 +54,23 @@ async fn committed_observation_survives_caller_cancellation_and_keeps_probe_hear
         admission,
         None,
     );
-    // This is the exact helper used only after a successful job CAS. Cancel
-    // its caller while the actual observed completion is demonstrably live.
-    let caller = tokio::spawn(complete_committed(guard, MediaAttemptTerminal::Succeeded));
-    tokio::time::timeout(Duration::from_secs(5), gate.entered.notified())
-        .await
-        .unwrap();
-    caller.abort();
-    assert!(caller.await.unwrap_err().is_cancelled());
-    let initial_deadline: i64 = sqlx::query_scalar(
-        "SELECT probe_lease_until FROM upstream_account_health WHERE upstream_account_id=$1",
+    tokio::time::timeout(
+        Duration::from_secs(1),
+        complete_committed(guard, MediaAttemptTerminal::Succeeded),
+    )
+    .await
+    .expect("committed customer success must not wait on a plugin observe hook");
+    state.routing_persistence.drain_for_test().await;
+    let failures: i64 = sqlx::query_scalar(
+        "SELECT consecutive_failures FROM upstream_account_health WHERE upstream_account_id=$1",
     )
     .bind(account.to_string())
     .fetch_one(&pool)
     .await
     .unwrap();
-    let renewed = wait_for_heartbeat_beyond_deadline(&pool, account, initial_deadline).await;
-    assert!(renewed > unix_millis());
-    gate.release.notify_one();
-    tokio::time::timeout(Duration::from_secs(5), async {
-        loop {
-            let failures: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM upstream_account_health WHERE upstream_account_id=$1 AND consecutive_failures>0")
-                .bind(account.to_string()).fetch_one(&pool).await.unwrap();
-            if failures == 0 { break; }
-            tokio::time::sleep(Duration::from_millis(10)).await;
-        }
-    }).await.unwrap();
+    assert!(
+        failures > 0,
+        "a committed customer success is not an account health sample"
+    );
     pool.close().await;
 }

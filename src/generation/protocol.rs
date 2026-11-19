@@ -22,16 +22,13 @@ pub(crate) enum GenerationProtocolAdapter {
     ComfyUi,
     SiliconFlowVideoV1,
     WasuWanV1,
+    TkmarketSeedanceV1,
 }
 
 impl GenerationProtocolAdapter {
     pub(crate) fn for_route(route: &ResolvedUpstream) -> Result<Self, AppError> {
-        Self::detect(&route.driver, &route.config, &route.upstream_model).ok_or_else(|| {
-            AppError::Upstream(format!(
-                "generation driver {} cannot execute asynchronous jobs",
-                route.driver
-            ))
-        })
+        Self::detect(&route.driver, &route.config, &route.upstream_model)
+            .ok_or_else(|| AppError::upstream("generation_driver_cannot_execute_asynchronous_jobs"))
     }
 
     pub(crate) fn detect(driver: &str, config: &Value, upstream_model: &str) -> Option<Self> {
@@ -52,6 +49,21 @@ impl GenerationProtocolAdapter {
             {
                 Some(Self::WasuWanV1)
             }
+            "http-json"
+                if config.get("video_api").and_then(Value::as_str)
+                    == Some(super::tkmarket_seedance::PROFILE)
+                    && super::tkmarket_seedance::MODELS.contains(&upstream_model)
+                    && config
+                        .get("video_models")
+                        .and_then(Value::as_array)
+                        .is_some_and(|models| {
+                            models
+                                .iter()
+                                .any(|model| model.as_str() == Some(upstream_model))
+                        }) =>
+            {
+                Some(Self::TkmarketSeedanceV1)
+            }
             "http-json" if is_siliconflow_video_profile(config, upstream_model) => {
                 Some(Self::SiliconFlowVideoV1)
             }
@@ -61,7 +73,10 @@ impl GenerationProtocolAdapter {
 
     pub(crate) fn supports_modality(self, modality: &str) -> bool {
         match self {
-            Self::SeedanceV3 | Self::SiliconFlowVideoV1 | Self::WasuWanV1 => {
+            Self::SeedanceV3
+            | Self::SiliconFlowVideoV1
+            | Self::WasuWanV1
+            | Self::TkmarketSeedanceV1 => {
                 matches!(modality, "video")
             }
             Self::ComfyUi => matches!(modality, "image" | "video"),
@@ -74,7 +89,7 @@ impl GenerationProtocolAdapter {
     pub(crate) const fn catalog_modalities(self) -> &'static [&'static str] {
         match self {
             Self::SeedanceV3 => &["video"],
-            Self::WasuWanV1 => &["video"],
+            Self::WasuWanV1 | Self::TkmarketSeedanceV1 => &["video"],
             Self::ComfyUi => &["image", "video"],
             Self::SiliconFlowVideoV1 => &["image", "video"],
         }
@@ -83,6 +98,7 @@ impl GenerationProtocolAdapter {
     pub(crate) fn normalize_input(self, input: &mut Value) -> Result<(), AppError> {
         match self {
             Self::WasuWanV1 => super::wasu_wan::validate_input(input),
+            Self::TkmarketSeedanceV1 => super::tkmarket_seedance::validate_input(input),
             Self::SeedanceV3 => {
                 normalize_seedance_duration(input)?;
                 Ok(())
@@ -103,6 +119,15 @@ impl GenerationProtocolAdapter {
         input: &Value,
     ) -> Result<i64, AppError> {
         match (self, billing_unit) {
+            // Zero means no supplier-guaranteed token ceiling. Admission requires
+            // the existing metered-unlimited policy, never a guessed hard cap.
+            (Self::TkmarketSeedanceV1, "million_tokens") => {
+                super::tkmarket_seedance::validate_input(input)?;
+                Ok(0)
+            }
+            (Self::TkmarketSeedanceV1, _) => Err(AppError::BadRequest(
+                "tkmarket video requires million_tokens customer pricing".into(),
+            )),
             (Self::WasuWanV1, "second") => {
                 super::wasu_wan::validate_input(input)?;
                 Ok(5)
@@ -114,9 +139,9 @@ impl GenerationProtocolAdapter {
                 let units = input
                     .get("duration")
                     .and_then(Value::as_i64)
-                    .ok_or(AppError::Internal)?;
+                    .ok_or(AppError::internal("protocol_estimated_units_1"))?;
                 if !(1..=60).contains(&units) {
-                    return Err(AppError::Internal);
+                    return Err(AppError::internal("protocol_estimated_units_2"));
                 }
                 Ok(units)
             }
@@ -137,6 +162,7 @@ impl GenerationProtocolAdapter {
     pub(crate) fn parameter_schema(self, config: &Value) -> Option<Value> {
         match self {
             Self::WasuWanV1 => Some(super::wasu_wan::input_schema()),
+            Self::TkmarketSeedanceV1 => Some(super::tkmarket_seedance::input_schema()),
             Self::ComfyUi => super::comfyui_parameter_schema(config).ok(),
             Self::SiliconFlowVideoV1 => Some(super::siliconflow_video_parameter_schema()),
             Self::SeedanceV3 => None,

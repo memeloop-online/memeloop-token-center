@@ -1,5 +1,5 @@
-import { api } from '../api.js';
-import type { OperatorUiApiRequestV1 } from '../../operator-ui-sdk/index.js';
+import { api, ApiError } from '../api.js';
+import type { OperatorUiApiRequestV1, OperatorUiApiStreamV1 } from '../../operator-ui-sdk/index.js';
 
 type SchemaObject = Record<string, unknown>;
 
@@ -55,7 +55,7 @@ function bodyUsesTenant(document: SchemaObject, pathname: string, method: string
 /** Credentials and transport options are owned by the host, never by a plugin request. */
 export function createOperatorApiBridge(credential: string, tenantExternalId: string) {
   let discoveredSchema: SchemaObject | undefined;
-  return async function requestApi<T = unknown>(request: OperatorUiApiRequestV1): Promise<T> {
+  async function prepare(request: OperatorUiApiRequestV1): Promise<{ path: string; init: RequestInit }> {
     const { path, signal } = request;
     // Reject ambiguous URL forms before URL normalization can reinterpret them.
     if (typeof path !== 'string' || (!/^\/(?:internal|self)\/v1\//.test(path) && !/^\/v1\//.test(path))
@@ -96,12 +96,39 @@ export function createOperatorApiBridge(credential: string, tenantExternalId: st
       body = { ...body, tenant_external_id: tenantExternalId };
     }
     if ((method === 'GET' || method === 'HEAD') && body !== undefined) throw new Error('Read requests cannot include a body');
-    return api<T>(`${url.pathname}${url.search}`, credential, {
+    return { path: `${url.pathname}${url.search}`, init: {
       method,
       ...(body === undefined ? {} : { body: JSON.stringify(body) }),
       signal,
       redirect: 'error',
       credentials: 'same-origin',
-    });
-  };
+    } };
+  }
+  async function requestApi<T = unknown>(request: OperatorUiApiRequestV1): Promise<T> {
+    const { path, init } = await prepare(request);
+    return api<T>(path, credential, init);
+  }
+  async function requestApiStream(request: OperatorUiApiRequestV1): Promise<OperatorUiApiStreamV1> {
+    const { path, init } = await prepare(request);
+    const response = await fetch(path, { ...init, headers: {
+      Authorization: `Bearer ${credential}`,
+      Accept: 'text/event-stream',
+      ...(init.body === undefined ? {} : { 'Content-Type': 'application/json' }),
+    } });
+    const id = response.headers.get('x-mtc-request-id');
+    const requestId = id && /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(id) ? id : undefined;
+    if (!response.ok) {
+      let error: { message?: string; code?: string; message_en?: string } | undefined;
+      try { error = (await response.json())?.error; } catch { /* Preserve HTTP diagnostics for non-JSON errors. */ }
+      throw new ApiError(error?.message ?? `HTTP ${response.status}`, response.status, error?.code, requestId, error?.message_en);
+    }
+    if (response.headers.get('content-type')?.split(';')[0].trim().toLowerCase() !== 'text/event-stream' || !response.body) {
+      await response.body?.cancel();
+      throw new ApiError('The server did not return an event stream.', response.status, 'invalid_stream_response', requestId);
+    }
+    // Return the original stream: consumers control reads/backpressure and cancel it
+    // on early exit. Fetch owns signal propagation; no reader or background queue here.
+    return { body: response.body, requestId };
+  }
+  return Object.assign(requestApi, { requestApiStream });
 }

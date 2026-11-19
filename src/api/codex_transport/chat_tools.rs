@@ -5,7 +5,7 @@ pub(super) struct StreamingTool {
     item_id: String,
     call_id: String,
     name: String,
-    arguments: String,
+    arguments: EmittedText,
     done: bool,
 }
 
@@ -63,17 +63,17 @@ impl CodexChatStreamTranslator {
             {
                 return Err("upstream_invalid_response");
             }
-            let remaining = arguments
-                .strip_prefix(&tool.arguments)
+            let remaining = tool
+                .arguments
+                .remaining(arguments)
                 .ok_or("upstream_invalid_response")?
                 .to_owned();
             if tool.done && !remaining.is_empty() {
                 return Err("upstream_invalid_response");
             }
-            tool.arguments = arguments.to_owned();
+            tool.arguments.observe(&remaining)?;
             tool.done = true;
             let index = tool.index;
-            self.retain_bytes(remaining.len())?;
             return if remaining.is_empty() {
                 Ok(None)
             } else {
@@ -94,8 +94,7 @@ impl CodexChatStreamTranslator {
             item_id
                 .len()
                 .saturating_add(identity(item, "call_id")?.len())
-                .saturating_add(identity(item, "name")?.len())
-                .saturating_add(arguments.len()),
+                .saturating_add(identity(item, "name")?.len()),
         )?;
         self.tools.insert(
             position,
@@ -104,7 +103,7 @@ impl CodexChatStreamTranslator {
                 item_id: item_id.into(),
                 call_id: identity(item, "call_id")?.into(),
                 name: identity(item, "name")?.into(),
-                arguments: arguments.into(),
+                arguments: EmittedText::from_text(arguments),
                 done,
             },
         );
@@ -126,8 +125,8 @@ impl CodexChatStreamTranslator {
         }
         let arguments = string(event, if done { "arguments" } else { "delta" })?;
         let delta = if done {
-            arguments
-                .strip_prefix(&tool.arguments)
+            tool.arguments
+                .remaining(arguments)
                 .ok_or("upstream_invalid_response")?
         } else {
             if tool.done {
@@ -138,14 +137,10 @@ impl CodexChatStreamTranslator {
         if tool.done && !delta.is_empty() {
             return Err("upstream_invalid_response");
         }
-        if tool.arguments.len().saturating_add(delta.len()) > MAX_PROXY_RESPONSE_BODY {
-            return Err("upstream_response_too_large");
-        }
         let delta = delta.to_owned();
-        tool.arguments.push_str(&delta);
+        tool.arguments.observe(&delta)?;
         tool.done = done;
         let index = tool.index;
-        self.retain_bytes(delta.len())?;
         if delta.is_empty() {
             return Ok(None);
         }

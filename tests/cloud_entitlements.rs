@@ -616,7 +616,7 @@ async fn signed_cloud_lifecycle_is_idempotent_ordered_and_keeps_stable_history()
         .unwrap();
     assert_eq!(authenticated.key_id.to_string(), key_id);
     assert_eq!(authenticated.account_id.to_string(), account_id);
-    assert_eq!(authenticated.policy.requests_per_minute, 300);
+    assert_eq!(authenticated.policy.requests_per_minute, Some(300));
 
     let renewed = fixture
         .send(
@@ -713,7 +713,7 @@ async fn signed_cloud_lifecycle_is_idempotent_ordered_and_keeps_stable_history()
         .unwrap();
     assert_eq!(rotated_auth.key_id.to_string(), key_id);
     assert_eq!(rotated_auth.account_id.to_string(), account_id);
-    assert_eq!(rotated_auth.policy.requests_per_minute, 90);
+    assert_eq!(rotated_auth.policy.requests_per_minute, Some(90));
 
     let replay_after_rotation = fixture.send("cloud-event-1", &first_body).await;
     assert_eq!(replay_after_rotation.status(), StatusCode::CREATED);
@@ -937,7 +937,7 @@ async fn late_audit_conflict_rolls_back_entitlement_policy_routing_and_replay_st
         .unwrap();
     assert_eq!(keys.len(), 1);
     assert_eq!(keys[0].available_balance, "10");
-    assert_eq!(keys[0].policy.requests_per_minute, 10);
+    assert_eq!(keys[0].policy.requests_per_minute, Some(10));
     let entitlement = fixture
         .state
         .db
@@ -1215,7 +1215,7 @@ async fn suspended_and_revoked_cloud_identity_rejects_active_refills_but_allows_
         .unwrap();
     assert_eq!(suspended[0].status, "suspended");
     assert_eq!(suspended[0].available_balance, "10");
-    assert_eq!(suspended[0].policy.requests_per_minute, 10);
+    assert_eq!(suspended[0].policy.requests_per_minute, Some(10));
     let entitlement = fixture
         .state
         .db
@@ -1262,7 +1262,7 @@ async fn suspended_and_revoked_cloud_identity_rejects_active_refills_but_allows_
         .unwrap();
     assert_eq!(revoked[0].status, "revoked");
     assert_eq!(revoked[0].available_balance, "0");
-    assert_eq!(revoked[0].policy.requests_per_minute, 10);
+    assert_eq!(revoked[0].policy.requests_per_minute, Some(10));
     assert_eq!(
         fixture
             .send(

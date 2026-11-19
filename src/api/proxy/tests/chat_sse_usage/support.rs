@@ -145,23 +145,29 @@ pub(super) async fn fragmented_sse_upstream(
         let (mut stream, _) = listener.accept().await.unwrap();
         let mut request = [0_u8; 4096];
         assert!(stream.read(&mut request).await.unwrap() > 0);
-        stream
+        if stream
             .write_all(
                 b"HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nTransfer-Encoding: chunked\r\nConnection: close\r\n\r\n",
             )
             .await
-            .unwrap();
+            .is_err()
+        {
+            return;
+        }
         for chunk in chunks {
-            stream
+            if stream
                 .write_all(format!("{:X}\r\n", chunk.len()).as_bytes())
                 .await
-                .unwrap();
-            stream.write_all(&chunk).await.unwrap();
-            stream.write_all(b"\r\n").await.unwrap();
-            stream.flush().await.unwrap();
+                .is_err()
+                || stream.write_all(&chunk).await.is_err()
+                || stream.write_all(b"\r\n").await.is_err()
+                || stream.flush().await.is_err()
+            {
+                return;
+            }
             tokio::task::yield_now().await;
         }
-        stream.write_all(b"0\r\n\r\n").await.unwrap();
+        let _ = stream.write_all(b"0\r\n\r\n").await;
     });
     (uri, server)
 }

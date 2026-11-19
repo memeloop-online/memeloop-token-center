@@ -105,7 +105,9 @@ impl Database {
         let mut prepared = Vec::with_capacity(2);
         for input in inputs {
             prepared.push((
-                serde_json::to_string(&input.config).map_err(|_| AppError::Internal)?,
+                serde_json::to_string(&input.config).map_err(|_| {
+                    AppError::internal("native_oauth_imports_import_native_kimi_oauth_cohort_1")
+                })?,
                 seal_credential(&input.credential, key_material)?,
                 input,
             ));
@@ -269,7 +271,7 @@ impl Database {
                     &input.source_identity_hash,
                 )
                 .await?
-                .ok_or(AppError::Internal)?;
+                .ok_or(AppError::internal("native_oauth_imports_site_1"))?;
                 if !changed[index] {
                     accounts.push(upstream_account_view_with_transport(row, key_material)?);
                     continue;
@@ -293,7 +295,7 @@ impl Database {
                     &input.source_identity_hash,
                 )
                 .await?
-                .ok_or(AppError::Internal)?;
+                .ok_or(AppError::internal("native_oauth_imports_site_2"))?;
                 accounts.push(upstream_account_view_with_transport(updated, key_material)?);
                 rotated += 1;
                 continue;
@@ -367,7 +369,7 @@ impl Database {
                 &input.source_identity_hash,
             )
             .await?
-            .ok_or(AppError::Internal)?;
+            .ok_or(AppError::internal("native_oauth_imports_site_3"))?;
             accounts.push(upstream_account_view_with_transport(
                 inserted,
                 key_material,
@@ -499,7 +501,7 @@ fn validate_existing_kimi_account(
 ) -> Result<(), AppError> {
     let account_id: String = row.try_get("id")?;
     let config: Value = serde_json::from_str(&row.try_get::<String, _>("config_json")?)
-        .map_err(|_| AppError::Internal)?;
+        .map_err(|_| AppError::internal("native_oauth_imports_validate_existing_kimi_account_1"))?;
     if row.try_get::<i64, _>("ordinal")? != input.ordinal
         || row.try_get::<String, _>("driver")? != crate::oauth::managed::kimi::PROVIDER_DRIVER
         || row.try_get::<String, _>("auth_kind")? != "oauth"
@@ -605,9 +607,9 @@ async fn rotate_native_kimi_credential(
             "native Kimi OAuth refresh is in progress; retry the import".into(),
         ));
     }
-    let generation = current_generation
-        .checked_add(1)
-        .ok_or(AppError::Internal)?;
+    let generation = current_generation.checked_add(1).ok_or(AppError::internal(
+        "native_oauth_imports_rotate_native_kimi_credential_1",
+    ))?;
     let updated_at = now.max(current_updated_at.saturating_add(1));
     let revoked = sqlx::query(
         "UPDATE upstream_credentials SET revoked_at = $1 WHERE upstream_account_id = $2 AND generation = $3 AND revoked_at IS NULL",

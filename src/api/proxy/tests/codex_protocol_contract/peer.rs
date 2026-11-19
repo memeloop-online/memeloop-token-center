@@ -36,7 +36,7 @@ pub(super) struct Post {
 }
 
 pub(super) struct Peer {
-    pub(super) client: wreq::Client,
+    pub(super) client: reqwest::Client,
     pub(super) accepted: mpsc::UnboundedReceiver<Post>,
     pub(super) cancelled: mpsc::UnboundedReceiver<()>,
     pub(super) posts: Arc<AtomicUsize>,
@@ -60,7 +60,8 @@ impl Peer {
                 policy,
                 crate::CODEX_HTTP2_KEEP_ALIVE_INTERVAL,
                 version,
-            ),
+            )
+            .unwrap(),
         )
         .await
     }
@@ -87,13 +88,13 @@ impl Peer {
         .await
     }
 
-    async fn with_builder(version: http::Version, builder: wreq::ClientBuilder) -> Self {
+    async fn with_builder(version: http::Version, builder: reqwest::ClientBuilder) -> Self {
         let fixture = TlsFixture::for_host(HOST).await;
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let proxy =
-            wreq::Proxy::all(format!("socks5h://{}", listener.local_addr().unwrap())).unwrap();
+            reqwest::Proxy::all(format!("socks5h://{}", listener.local_addr().unwrap())).unwrap();
         let client = builder
-            .tls_cert_store(fixture.roots)
+            .add_root_certificate(fixture.root_certificate())
             .proxy(proxy)
             .build()
             .unwrap();

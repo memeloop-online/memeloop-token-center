@@ -56,3 +56,9 @@ If a request reports an unsupported parameter, have the client omit that paramet
 `max_tokens`, `max_completion_tokens`, and `max_output_tokens` are not sent to Codex. The default setting accepts one positive integer hint within the supported range, but **does not cap output at that value**. For example, setting 16 does not restrict generation to 16 tokens. Do not send conflicting limit fields, null or invalid values, or your own reservation metadata.
 
 A smaller limit hint does not reduce the quota MTC reserves using the operator's model bound. Final charges use observed upstream usage; cancelling a request does not guarantee that upstream generation stops or that incurred charges disappear. Unknown usage is not treated as zero. If you need an enforced output limit, including for cost control, choose a route that supports one instead of relying on Codex compatibility hints.
+
+## Upstream model health probes
+
+Scheduled model probes are configured per upstream and are disabled by default. Enable them with a dedicated billing credential distinct from the system AI credential; it must be authorized for the upstream and model routes. The interval is at least one hour. Leave the model empty to select by the estimated input and output cost of a short request, excluding models whose names explicitly identify embedding or reranking; alternatively specify the upstream model and prompt.
+
+Disabling scheduled probes stops automatic probe requests. Real request observations and manual checks remain available. Manual checks also require the dedicated billing credential and can incur charges. Background recovery checks verify exhausted supplier models one at a time at the same interval, so confirming recovery can take longer. After deployment, explicitly configure and enable each upstream that needs scheduled probing; the system AI credential is not reused automatically.

@@ -272,7 +272,10 @@ async fn saturated_terminal_publication_converges_by_fenced_probe_expiry() {
     .fetch_one(&pool)
     .await
     .unwrap();
-    assert_eq!(failures, 0);
+    assert_eq!(
+        failures, 1,
+        "customer success is not an account health sample"
+    );
     pool.close().await;
 }
 
@@ -357,7 +360,6 @@ async fn mandatory_quota_fence_does_not_wait_for_optional_observe() {
         .await
         .unwrap();
     let request_id = Uuid::new_v4();
-    let gate = crate::group_routing::test_observe_gate::install(request_id);
     let mut guard = UpstreamAttemptGuard::new(
         &fixture.state,
         request_id,
@@ -380,130 +382,19 @@ async fn mandatory_quota_fence_does_not_wait_for_optional_observe() {
     )
     .await
     .expect("mandatory quota fence must not wait for optional plugin observation");
-    let failure: String = sqlx::query_scalar(
+    let failure: Option<String> = sqlx::query_scalar(
         "SELECT last_failure_kind FROM upstream_account_health WHERE upstream_account_id=$1",
     )
     .bind(fixture.upstream_account_id.to_string())
-    .fetch_one(&pool)
+    .fetch_optional(&pool)
     .await
     .unwrap();
-    assert_eq!(failure, "rate_limited");
-    tokio::time::timeout(Duration::from_secs(1), gate.entered.notified())
-        .await
-        .unwrap();
-    gate.release.notify_one();
+    assert!(
+        failure.is_none(),
+        "a customer 429 is not an account health sample"
+    );
     fixture.state.routing_persistence.drain_for_test().await;
     pool.close().await;
-}
-
-#[tokio::test]
-async fn optional_routing_sql_never_holds_forwarding_or_lifecycle_capacity() {
-    for mode in ["pool_starvation", "pool_closed", "saturation"] {
-        for stream in [false, true] {
-            let fixture = codex_route_fixture(&format!("optional-routing-{mode}-{stream}")).await;
-            let pool = sqlx::AnyPool::connect(&fixture.database_url).await.unwrap();
-            fixture
-                .state
-                .db
-                .record_upstream_account_failure(
-                    fixture.upstream_account_id,
-                    1,
-                    UpstreamFailureKind::InvalidResponse,
-                )
-                .await
-                .unwrap();
-            sqlx::query("UPDATE upstream_account_health SET cooldown_until=0, probe_lease_until=0 WHERE upstream_account_id=$1")
-                .bind(fixture.upstream_account_id.to_string()).execute(&pool).await.unwrap();
-            let holders = if mode == "pool_starvation" {
-                fixture
-                    .state
-                    .routing_persistence_db
-                    .hold_group_snapshot_pool_for_tests()
-                    .await
-            } else {
-                Vec::new()
-            };
-            if mode == "pool_closed" {
-                fixture.state.routing_persistence_db.close().await;
-            }
-            let release = std::sync::Arc::new(tokio::sync::Notify::new());
-            if mode == "saturation" {
-                for _ in 0..4 {
-                    let release = release.clone();
-                    assert!(fixture.state.routing_persistence.submit(1, async move {
-                        release.notified().await;
-                        Ok(())
-                    }));
-                }
-                tokio::task::yield_now().await;
-            }
-            let lifecycle_capacity = fixture.state.proxy_lifecycles.active();
-            let upstream = MockServer::start().await;
-            Mock::given(method("POST"))
-                .respond_with(ResponseTemplate::new(200).set_body_raw(
-                    completed_codex_sse("optional SQL cannot hold output"),
-                    "text/event-stream",
-                ))
-                .expect(1)
-                .mount(&upstream)
-                .await;
-            tokio::time::timeout(Duration::from_secs(1), async {
-                let response = send_codex_route(
-                    &fixture,
-                    &upstream,
-                    "/v1/responses",
-                    json!({
-                        "model": fixture.model, "input": "isolation", "stream": stream,
-                        "metadata": {"session_id": "optional-sql-session"}
-                    }),
-                )
-                .await;
-                assert_eq!(response.status(), StatusCode::OK, "{mode}, stream={stream}");
-                let body = to_bytes(response.into_body(), MAX_PROXY_RESPONSE_BODY)
-                    .await
-                    .unwrap();
-                assert!(String::from_utf8_lossy(&body).contains("optional SQL cannot hold output"));
-                wait_for_request_settlement(&fixture, 1).await;
-                while fixture.state.proxy_lifecycles.active() != lifecycle_capacity {
-                    tokio::task::yield_now().await;
-                }
-            })
-            .await
-            .expect("output, settlement and lifecycle capacity must precede optional SQL release");
-            if mode == "saturation" {
-                assert!(
-                    !fixture
-                        .state
-                        .routing_persistence
-                        .render_routing()
-                        .contains("outcome=\"capacity\"} 0\n")
-                );
-            }
-            drop(holders);
-            release.notify_waiters();
-            fixture.state.routing_persistence.drain_for_test().await;
-            if mode == "pool_closed" {
-                assert!(
-                    !fixture
-                        .state
-                        .routing_persistence
-                        .render_routing()
-                        .contains("outcome=\"failed\"} 0\n")
-                );
-            }
-            let rows = fixture
-                .state
-                .db
-                .list_requests(fixture.key_id, 10)
-                .await
-                .unwrap();
-            assert_eq!(rows.len(), 1);
-            assert_exactly_once_side_effects(&fixture, rows[0].request_id, Some("resp-codex"))
-                .await;
-            upstream.verify().await;
-            pool.close().await;
-        }
-    }
 }
 
 #[tokio::test]

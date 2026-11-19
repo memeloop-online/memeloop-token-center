@@ -72,7 +72,12 @@ async fn verify_group_selection(config: Config) {
         ));
     }
     let (tenant, route, account, key) = candidates[0];
-    assert!(!db.has_group_routing_strategies(tenant).await.unwrap());
+    assert!(
+        db.candidate_group_strategy(tenant, route, account)
+            .await
+            .unwrap()
+            .is_none()
+    );
     // Insert in descending UUID order to prove selection is not insertion order.
     for (id, kind, priority, included) in [
         (40, "provider", 999, false),
@@ -109,7 +114,6 @@ async fn verify_group_selection(config: Config) {
                 .bind(tenant.to_string()).bind(&id).bind(route.to_string()).execute(&db.pool).await.unwrap();
         }
     }
-    assert!(db.has_group_routing_strategies(tenant).await.unwrap());
     let selected = db
         .candidate_group_strategy(tenant, route, account)
         .await
@@ -206,11 +210,6 @@ async fn verify_group_selection(config: Config) {
     assert!(grants.effective_route_ids.is_empty());
     assert!(grants.route_group_ids.is_empty());
     let (foreign_tenant, foreign_route, foreign_account, _) = candidates[1];
-    assert!(
-        !db.has_group_routing_strategies(foreign_tenant)
-            .await
-            .unwrap()
-    );
     for (t, r, a) in [
         (foreign_tenant, route, account),
         (tenant, foreign_route, account),
@@ -224,4 +223,22 @@ async fn verify_group_selection(config: Config) {
                 .is_none()
         );
     }
+    // Clearing both kinds of strategy is represented by an empty candidate
+    // batch; no tenant-wide preflight is needed to discover native policy.
+    for statement in [
+        "UPDATE provider_groups SET routing_strategy = NULL WHERE tenant_id = $1",
+        "UPDATE route_groups SET routing_strategy = NULL WHERE tenant_id = $1",
+    ] {
+        sqlx::query(statement)
+            .bind(tenant.to_string())
+            .execute(&db.pool)
+            .await
+            .unwrap();
+    }
+    assert!(
+        db.candidate_group_strategies(tenant, &tuples)
+            .await
+            .unwrap()
+            .is_empty()
+    );
 }

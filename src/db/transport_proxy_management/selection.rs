@@ -28,7 +28,7 @@ pub(super) async fn rebase_selection(
         epoch = row
             .try_get::<i64, _>("selection_generation")?
             .checked_add(1)
-            .ok_or(AppError::Internal)?;
+            .ok_or(AppError::internal("selection_rebase_selection_1"))?;
         let version: i64 = row.try_get("group_version")?;
         let expected = TransportProxyGroups::fingerprint(
             account,
@@ -41,7 +41,7 @@ pub(super) async fn rebase_selection(
         )?;
         if row.try_get::<String, _>("group_fingerprint")? == expected {
             let index = usize::try_from(row.try_get::<i64, _>("selected_index")?)
-                .map_err(|_| AppError::Internal)?;
+                .map_err(|_| AppError::internal("selection_rebase_selection_1"))?;
             selected = previous
                 .get(index)
                 .and_then(|old| {

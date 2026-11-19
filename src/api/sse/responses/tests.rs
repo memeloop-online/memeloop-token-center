@@ -12,7 +12,7 @@ fn event_with_field_count(fields: usize) -> Vec<u8> {
 }
 
 #[test]
-fn sanitizer_redacts_failures_and_rejects_terminal_conflicts() {
+fn sanitizer_preserves_failure_explanation_and_rejects_terminal_conflicts() {
     let failed = concat!(
         "event: response.failed\n",
         "data: {\"type\":\"response.failed\",\"response\":{\"error\":{\"message\":\"provider-secret\",\"token\":\"secret-token\"}}}\n\n",
@@ -26,9 +26,8 @@ fn sanitizer_redacts_failures_and_rejects_terminal_conflicts() {
         output.extend_from_slice(&sanitizer.push(&[*byte]).unwrap());
     }
     let output = String::from_utf8(output).unwrap();
-    assert!(output.contains("upstream request failed"));
+    assert!(output.contains("provider-secret"));
     for secret in [
-        "provider-secret",
         "secret-token",
         "failure-comment-secret",
         "post-terminal-secret",
@@ -101,7 +100,7 @@ fn sanitizer_redacts_failures_and_rejects_terminal_conflicts() {
 #[test]
 fn safe_failure_is_an_explicit_failed_terminal_without_a_fabricated_identity() {
     let mut framer = BoundedSseFramer::default();
-    let batch = framer.push(&safe_failure_event());
+    let batch = framer.push(&safe_failure_event("upstream_rejected", "response_failed"));
     assert!(batch.rejection.is_none());
     assert_eq!(batch.events.len(), 1);
     let (event_name, data) = parse_sse_event(&batch.events[0]).unwrap();
@@ -109,16 +108,131 @@ fn safe_failure_is_an_explicit_failed_terminal_without_a_fabricated_identity() {
     let payload: Value = serde_json::from_slice(&data.unwrap()).unwrap();
     assert_eq!(payload["type"], "response.failed");
     assert_eq!(payload["response"]["status"], "failed");
-    assert_eq!(payload["response"]["error"]["code"], "server_error");
-    assert_eq!(
-        payload["response"]["error"]["message"],
-        "upstream request failed"
+    assert_eq!(payload["response"]["error"]["code"], "upstream_rejected");
+    assert!(
+        payload["response"]["error"]["message"]
+            .as_str()
+            .unwrap()
+            .contains("上游")
+    );
+    assert!(
+        payload["response"]["error"]["message_en"]
+            .as_str()
+            .unwrap()
+            .contains("upstream request failed")
+    );
+    assert!(
+        payload["response"]["error"]["message_en"]
+            .as_str()
+            .unwrap()
+            .contains("response_failed")
     );
     assert!(payload.pointer("/response/id").is_none());
 }
 
 #[test]
-fn sanitizer_mints_progress_heartbeats_until_downstream_terminal_release() {
+fn sanitizer_preserves_client_recovery_codes_and_original_provider_details() {
+    for code in [
+        "context_length_exceeded",
+        "insufficient_quota",
+        "usage_not_included",
+        "invalid_prompt",
+        "misalignment_policy_violation",
+        "cyber_policy",
+        "bio_policy",
+        "server_is_overloaded",
+        "slow_down",
+        "rate_limit_exceeded",
+    ] {
+        for event_type in ["response.failed", "response.error", "error"] {
+            let error = serde_json::json!({
+                "code": code,
+                "type": "provider-secret-type",
+                "message": "Authorization: Bearer provider-secret",
+                "param": "secret-param",
+                "token": "secret-token",
+            });
+            let event = if event_type == "error" {
+                serde_json::json!({"type": event_type, "error": error})
+            } else {
+                serde_json::json!({"type": event_type, "response": {"error": error}})
+            };
+            let input = format!("event: {event_type}\ndata: {event}\n\n");
+            let mut sanitizer = ResponsesStreamingSanitizer::default();
+            let mut output = Vec::new();
+            for byte in input.bytes() {
+                output.extend_from_slice(&sanitizer.push(&[byte]).unwrap());
+            }
+            output.extend_from_slice(&sanitizer.finish().unwrap());
+            let mut framer = BoundedSseFramer::default();
+            let batch = framer.push(&output);
+            assert!(batch.rejection.is_none());
+            assert_eq!(batch.events.len(), 1);
+            let (_, data) = parse_sse_event(&batch.events[0]).unwrap();
+            let payload: Value = serde_json::from_slice(&data.unwrap()).unwrap();
+            assert_eq!(payload["type"], "response.failed");
+            assert_eq!(payload["response"]["status"], "failed");
+            assert_eq!(payload["response"]["error"]["code"], code);
+            assert!(payload.pointer("/response/id").is_none());
+            let text = String::from_utf8(output).unwrap();
+            assert!(text.contains("secret-token"));
+            assert!(text.contains("Authorization"));
+            assert_eq!(payload["response"]["error"]["mtc_provider_details"], event);
+        }
+    }
+}
+
+#[test]
+fn sanitizer_does_not_copy_unknown_or_malformed_provider_codes() {
+    for code in [
+        serde_json::json!("secret_token"),
+        serde_json::json!("context_length_exceeded_secret"),
+        serde_json::json!("CONTEXT_LENGTH_EXCEEDED"),
+        serde_json::json!({"context_length_exceeded": "secret"}),
+        Value::Null,
+    ] {
+        let event = serde_json::json!({
+            "type": "response.failed",
+            "response": {"error": {"code": code, "message": "provider-secret"}},
+        });
+        let mut sanitizer = ResponsesStreamingSanitizer::default();
+        let output = sanitizer
+            .push(format!("data: {event}\n\n").as_bytes())
+            .unwrap();
+        let text = String::from_utf8(output.to_vec()).unwrap();
+        assert!(text.contains("\"code\":\"upstream_rejected\""));
+        assert!(!text.contains("secret"));
+    }
+}
+
+#[test]
+fn real_policy_rejection_after_progress_remains_a_terminal_client_policy_error() {
+    // Real production replay: created -> in_progress -> metadata -> error.
+    // Codex recognizes this exact code as MisalignmentPolicyViolation. A generic
+    // upstream_rejected instead becomes a retryable Stream error.
+    let input = concat!(
+        "data: {\"type\":\"response.created\",\"response\":{\"id\":\"resp-policy\"}}\n\n",
+        "data: {\"type\":\"response.in_progress\",\"response\":{\"id\":\"resp-policy\"}}\n\n",
+        "data: {\"type\":\"response.metadata\",\"response_id\":\"resp-policy\"}\n\n",
+        "event: error\n",
+        "data: {\"type\":\"error\",\"error\":{\"code\":\"misalignment_policy_violation\",",
+        "\"type\":\"invalid_request_error\",\"message\":\"This request was blocked by our safety systems. Reason: Potentially unintended activity.\",",
+        "\"misalignment\":{\"private\":\"provider-secret\"}}}\n\n",
+        "data: {\"type\":\"response.output_text.delta\",\"delta\":\"post-terminal-secret\"}\n\n"
+    );
+    let mut sanitizer = ResponsesStreamingSanitizer::default();
+    let mut output = sanitizer.push(input.as_bytes()).unwrap().to_vec();
+    output.extend_from_slice(&sanitizer.finish().unwrap());
+    let text = String::from_utf8(output).unwrap();
+    assert_eq!(text.matches("\"type\":\"response.failed\"").count(), 1);
+    assert!(text.contains("\"code\":\"misalignment_policy_violation\""));
+    assert!(!text.contains("\"code\":\"upstream_rejected\""));
+    assert!(!text.contains("secret"));
+    assert!(!text.contains("\"misalignment\":"));
+}
+
+#[test]
+fn sanitizer_sends_connection_comments_until_downstream_terminal_release() {
     let mut sanitizer = ResponsesStreamingSanitizer::default();
     assert!(sanitizer.progress_heartbeat().is_none());
 
@@ -128,22 +242,9 @@ fn sanitizer_mints_progress_heartbeats_until_downstream_terminal_release() {
         )
         .unwrap();
     let heartbeat = sanitizer.progress_heartbeat().unwrap();
-    let mut heartbeat_framer = BoundedSseFramer::default();
-    let event = heartbeat_framer
-        .push(&heartbeat)
-        .events
-        .into_iter()
-        .next()
-        .unwrap();
-    let (event_name, data) = parse_sse_event(&event).unwrap();
-    assert_eq!(event_name.as_deref(), Some("response.in_progress"));
-    let payload: Value = serde_json::from_slice(&data.unwrap()).unwrap();
-    assert_eq!(payload["type"], "response.in_progress");
-    assert_eq!(payload["response"]["id"], "resp-heartbeat");
-    assert_eq!(payload["response"]["status"], "in_progress");
-    assert_eq!(payload["response"]["output"], json!([]));
-    assert!(payload.pointer("/response/model").is_none());
-    assert!(payload.pointer("/response/metadata").is_none());
+    assert_eq!(heartbeat.as_ref(), b": keep-alive\n\n");
+    assert!(!String::from_utf8_lossy(&heartbeat).contains("response.in_progress"));
+    assert!(!String::from_utf8_lossy(&heartbeat).contains("resp-heartbeat"));
 
     sanitizer
         .push(
@@ -164,7 +265,7 @@ fn sanitizer_mints_progress_heartbeats_until_downstream_terminal_release() {
             .is_empty()
     );
     let heartbeat = terminal_only.progress_heartbeat().unwrap();
-    assert!(String::from_utf8_lossy(&heartbeat).contains("resp-terminal-only"));
+    assert_eq!(heartbeat.as_ref(), b": keep-alive\n\n");
     assert!(!terminal_only.finish().unwrap().is_empty());
     assert!(terminal_only.progress_heartbeat().is_none());
 
@@ -198,9 +299,8 @@ fn failed_terminal_drops_a_bare_secret_event_before_done() {
     }
     output.extend_from_slice(&sanitizer.finish().unwrap());
     let output = String::from_utf8(output).unwrap();
-    assert!(output.contains("upstream request failed"));
+    assert!(output.contains("provider-secret"));
     assert!(output.contains("data: [DONE]"));
-    assert!(!output.contains("provider-secret"));
     assert!(!output.contains("bare-event-secret"));
 }
 

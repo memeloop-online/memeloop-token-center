@@ -148,6 +148,13 @@ pub(super) async fn readiness_snapshot(state: AppState) -> (StatusCode, Value) {
         })
         .await;
     let (status, mut body) = readiness_contract(database_ready, archive_ready);
+    #[cfg(feature = "experimental-plugin-revisions")]
+    if let Some(authority) = &state.application_plugins {
+        // Optional application runtime refresh does not determine whether the
+        // core gateway can receive traffic. Required plugin dependencies are
+        // resolved by their request path.
+        body["application_plugins"] = authority.refresh_status();
+    }
     if !database_ready.is_ready() {
         let code = match database_ready {
             crate::metrics::DatabaseReadiness::SchemaOutdated { .. } => "database_schema_outdated",
@@ -191,8 +198,6 @@ pub(super) async fn prometheus_metrics(
             .load(std::sync::atomic::Ordering::Acquire),
         responses_request_spools: request_spool.active_files,
         responses_request_spool_used_bytes: request_spool.used_bytes,
-        responses_request_spool_limit_bytes: request_spool.limit_bytes,
-        responses_request_spool_capacity_rejections: request_spool.capacity_rejections,
         proxy_lifecycles: state.proxy_lifecycles.active(),
         proxy_archive_streams: crate::PROXY_ARCHIVE_STREAM_CONCURRENCY
             .saturating_sub(state.proxy_archive_stream_permits.available_permits()),
@@ -269,14 +274,31 @@ pub(super) async fn observe_http(
                 .get("x-request-id")
                 .and_then(|value| value.to_str().ok()),
         );
+        // Parse only UUID-shaped client identifiers. These are declarations,
+        // not authorization, and remain separate from the server-owned id.
+        // Recording them before admission also covers failures without a
+        // durable request record; no request body or arbitrary header is logged.
+        let client_thread_id = request
+            .headers()
+            .get("thread-id")
+            .and_then(|value| value.to_str().ok())
+            .and_then(|value| Uuid::parse_str(value).ok());
+        let client_session_id = request
+            .headers()
+            .get("session-id")
+            .and_then(|value| value.to_str().ok())
+            .and_then(|value| Uuid::parse_str(value).ok());
         proxy_diagnostics::CONTEXT.scope(context, async move {
-            tracing::info!(request_id = %context.request_id, ?ingress_request_id, route_class, phase = "gateway_entry", "proxy request entered gateway");
+            tracing::info!(request_id = %context.request_id, ?ingress_request_id, ?client_thread_id, ?client_session_id, route_class, phase = "gateway_entry", "proxy request entered gateway");
             let phase = proxy_diagnostics::Phase::new(context, "gateway_response_headers");
             let mut response = next.run(request).await;
             phase.finish("completed", Some(response.status().as_u16()), None);
             // The same server-owned ID is used by durable proxy admission.
             // Also return it on failures before a request record can exist.
-            if let Ok(value) = HeaderValue::from_str(&context.request_id.to_string()) {
+            let response_request_id = response.extensions()
+                .get::<proxy_diagnostics::ReplayRequestIdentity>()
+                .map_or(context.request_id, |identity| identity.0);
+            if let Ok(value) = HeaderValue::from_str(&response_request_id.to_string()) {
                 response.headers_mut().insert(REQUEST_ID_HEADER, value);
             }
             proxy_diagnostics::observe_response(response, context)

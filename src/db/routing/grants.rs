@@ -153,7 +153,7 @@ async fn require_members_tenant(
         "model_routes" => {
             "SELECT 1 FROM model_routes WHERE archived_at IS NULL AND tenant_id = $1 AND id = $2"
         }
-        _ => return Err(AppError::Internal),
+        _ => return Err(AppError::internal("grants_require_members_tenant_1")),
     };
     for id in ids {
         if sqlx::query(sql)
@@ -170,7 +170,7 @@ async fn require_members_tenant(
 }
 
 async fn select_key_grant_ids(
-    pool: &sqlx::AnyPool,
+    pool: &crate::db::request_pool::RequestPool,
     tenant_id: &str,
     key_id: Uuid,
     exact: bool,

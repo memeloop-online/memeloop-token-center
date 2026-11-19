@@ -1,10 +1,14 @@
-use std::pin::Pin;
+use std::{
+    future::Future,
+    pin::Pin,
+    task::{Context, Poll},
+};
 
 use bytes::Bytes;
 use futures_util::{Stream, StreamExt, stream};
 use http::{HeaderMap, StatusCode, Version};
 
-pub(super) type UpstreamByteStream =
+pub(in crate::api) type UpstreamByteStream =
     Pin<Box<dyn Stream<Item = Result<Bytes, &'static str>> + Send + 'static>>;
 
 pub(super) const UPSTREAM_STREAM_ERROR: &str = "upstream_stream_read_error";
@@ -52,6 +56,129 @@ pub(super) async fn rejected_response_terminal_cause(
         .flatten()
 }
 
+// The delivery reader may reject an oversized/non-JSON error or stop after a
+// terminal event. Keep ownership of its original, deadline-bearing stream so
+// that dropping that reader cannot turn the retained original into a prefix.
+type CaptureAppend = Pin<
+    Box<
+        dyn Future<
+                Output = (
+                    Option<crate::response_archive_spool::ResponseArchiveProducer>,
+                    Option<Bytes>,
+                ),
+            > + Send,
+    >,
+>;
+type CaptureAdmission = Pin<
+    Box<dyn Future<Output = Option<crate::response_archive_spool::ResponseArchiveProducer>> + Send>,
+>;
+
+struct CapturedUpstream {
+    upstream: Option<UpstreamByteStream>,
+    capture: Option<crate::response_archive_spool::ResponseArchiveProducer>,
+    admission: Option<CaptureAdmission>,
+    pending: Option<CaptureAppend>,
+}
+
+impl Stream for CapturedUpstream {
+    type Item = Result<Bytes, &'static str>;
+
+    fn poll_next(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
+        let this = self.get_mut();
+        loop {
+            if let Some(pending) = this.pending.as_mut() {
+                let (writer, bytes) = match pending.as_mut().poll(cx) {
+                    Poll::Pending => return Poll::Pending,
+                    Poll::Ready(value) => value,
+                };
+                this.pending.take();
+                this.capture = writer;
+                return Poll::Ready(bytes.map(Ok));
+            }
+            let Some(upstream) = this.upstream.as_mut() else {
+                return Poll::Ready(None);
+            };
+            match upstream.as_mut().poll_next(cx) {
+                Poll::Ready(Some(Ok(bytes))) => {
+                    let writer = this.capture.take();
+                    let admission = this.admission.take();
+                    if writer.is_none() && admission.is_none() {
+                        return Poll::Ready(Some(Ok(bytes)));
+                    }
+                    // The bounded queue applies backpressure to this one
+                    // upstream chunk. A fast or large response must never
+                    // turn into a missing archive merely because the upload
+                    // queue temporarily filled.
+                    this.pending = Some(Box::pin(async move {
+                        let writer = match admission {
+                            Some(admission) => admission.await,
+                            None => writer,
+                        };
+                        let Some(mut writer) = writer else {
+                            return (None, Some(bytes));
+                        };
+                        let retained = writer.append_with_backpressure(bytes.clone()).await;
+                        (retained.then_some(writer), Some(bytes))
+                    }));
+                }
+                Poll::Ready(Some(Err(error))) => {
+                    this.upstream.take();
+                    this.capture.take();
+                    this.admission.take();
+                    return Poll::Ready(Some(Err(error)));
+                }
+                Poll::Ready(None) => {
+                    this.upstream.take();
+                    if let Some(writer) = this.capture.take() {
+                        drop(writer.seal());
+                    }
+                    if let Some(admission) = this.admission.take() {
+                        // A genuinely empty supplier body still has an exact
+                        // immutable original, acquired without holding a large
+                        // upload envelope during header-only silence.
+                        this.pending = Some(Box::pin(async move {
+                            if let Some(writer) = admission.await {
+                                drop(writer.seal());
+                            }
+                            (None, None)
+                        }));
+                        continue;
+                    }
+                    return Poll::Ready(None);
+                }
+                Poll::Pending => return Poll::Pending,
+            }
+        }
+    }
+}
+
+impl Drop for CapturedUpstream {
+    fn drop(&mut self) {
+        let upstream = self.upstream.take();
+        let pending = self.pending.take();
+        let capture = self.capture.take();
+        let admission = self.admission.take();
+        if pending.is_none() && capture.is_none() && admission.is_none() {
+            return;
+        }
+        if let Ok(runtime) = tokio::runtime::Handle::try_current() {
+            runtime.spawn(async move {
+                let mut reader = CapturedUpstream {
+                    upstream,
+                    pending,
+                    capture,
+                    admission,
+                };
+                while let Some(chunk) = reader.next().await {
+                    if chunk.is_err() {
+                        break;
+                    }
+                }
+            });
+        }
+    }
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(super) enum CodexHttp2Failure {
     Reset,
@@ -64,6 +191,37 @@ impl CodexHttp2Failure {
             Self::Reset => UPSTREAM_HTTP2_RESET,
             Self::GoAway => UPSTREAM_HTTP2_GOAWAY,
         }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(super) struct CodexHttp2Evidence {
+    reset: bool,
+    go_away: bool,
+    remote: bool,
+    library: bool,
+    reason: Option<u32>,
+}
+
+impl CodexHttp2Evidence {
+    pub(super) const fn is_reset(self) -> bool {
+        self.reset
+    }
+
+    pub(super) const fn is_go_away(self) -> bool {
+        self.go_away
+    }
+
+    pub(super) const fn is_remote(self) -> bool {
+        self.remote
+    }
+
+    pub(super) const fn is_library(self) -> bool {
+        self.library
+    }
+
+    pub(super) const fn reason(self) -> Option<u32> {
+        self.reason
     }
 }
 
@@ -80,15 +238,13 @@ pub(super) fn codex_http2_failure(
     }
 }
 
-pub(super) fn codex_http2_error<'a>(
-    error: &'a (dyn std::error::Error + 'static),
-) -> Option<&'a http2::Error> {
+pub(super) fn codex_http2_error(
+    error: &(dyn std::error::Error + 'static),
+) -> Option<CodexHttp2Evidence> {
     let mut source = Some(error);
     while let Some(current) = source {
-        if let Some(http2) = current.downcast_ref::<http2::Error>()
-            && (http2.is_reset() || http2.is_go_away())
-        {
-            return Some(http2);
+        if let Some(evidence) = http2_frame_evidence(current) {
+            return Some(evidence);
         }
         if let Some(inner) = current
             .downcast_ref::<std::io::Error>()
@@ -102,25 +258,75 @@ pub(super) fn codex_http2_error<'a>(
     None
 }
 
+fn http2_frame_evidence(error: &(dyn std::error::Error + 'static)) -> Option<CodexHttp2Evidence> {
+    if let Some(frame) = error.downcast_ref::<http2::Error>() {
+        return frame_evidence(
+            frame.is_reset(),
+            frame.is_go_away(),
+            frame.is_remote(),
+            frame.is_library(),
+            frame.reason().map(u32::from),
+        );
+    }
+    if let Some(frame) = error.downcast_ref::<h2::Error>() {
+        return frame_evidence(
+            frame.is_reset(),
+            frame.is_go_away(),
+            frame.is_remote(),
+            frame.is_library(),
+            frame.reason().map(u32::from),
+        );
+    }
+    None
+}
+
+fn frame_evidence(
+    reset: bool,
+    go_away: bool,
+    remote: bool,
+    library: bool,
+    reason: Option<u32>,
+) -> Option<CodexHttp2Evidence> {
+    if reset || go_away {
+        Some(CodexHttp2Evidence {
+            reset,
+            go_away,
+            remote,
+            library,
+            reason,
+        })
+    } else {
+        None
+    }
+}
+
 pub(super) struct UpstreamResponseParts {
     pub(super) status: StatusCode,
     pub(super) headers: HeaderMap,
     pub(super) version: Version,
     pub(super) content_length: Option<u64>,
     pub(super) stream: UpstreamByteStream,
+    pub(super) validated_compact: Option<super::routing::ValidatedCompact>,
 }
 
-/// A small client-neutral response surface. Native Codex uses wreq for its
-/// TLS/HTTP2 fingerprint; all other upstreams remain on reqwest.
-pub(super) enum UpstreamResponse {
+/// A small response surface. Native Codex and every other upstream use reqwest.
+pub(in crate::api) enum UpstreamResponse {
     Reqwest(reqwest::Response),
-    Codex(wreq::Response),
+    Codex(reqwest::Response),
     Prefetched {
         status: StatusCode,
         headers: HeaderMap,
         version: Version,
         content_length: Option<u64>,
         stream: UpstreamByteStream,
+    },
+    ValidatedCompact {
+        status: StatusCode,
+        headers: HeaderMap,
+        version: Version,
+        content_length: Option<u64>,
+        stream: UpstreamByteStream,
+        evidence: super::routing::ValidatedCompact,
     },
 }
 
@@ -148,7 +354,7 @@ impl UpstreamResponse {
         match self {
             Self::Reqwest(response) => response.status(),
             Self::Codex(response) => response.status(),
-            Self::Prefetched { status, .. } => *status,
+            Self::Prefetched { status, .. } | Self::ValidatedCompact { status, .. } => *status,
         }
     }
 
@@ -156,7 +362,7 @@ impl UpstreamResponse {
         match self {
             Self::Reqwest(response) => response.headers(),
             Self::Codex(response) => response.headers(),
-            Self::Prefetched { headers, .. } => headers,
+            Self::Prefetched { headers, .. } | Self::ValidatedCompact { headers, .. } => headers,
         }
     }
 
@@ -164,15 +370,23 @@ impl UpstreamResponse {
         match self {
             Self::Reqwest(response) => response.version(),
             Self::Codex(response) => response.version(),
-            Self::Prefetched { version, .. } => *version,
+            Self::Prefetched { version, .. } | Self::ValidatedCompact { version, .. } => *version,
         }
     }
 
-    pub(super) fn content_length(&self) -> Option<u64> {
+    pub(in crate::api) fn content_length(&self) -> Option<u64> {
         match self {
             Self::Reqwest(response) => response.content_length(),
             Self::Codex(response) => response.content_length(),
-            Self::Prefetched { content_length, .. } => *content_length,
+            Self::Prefetched { content_length, .. }
+            | Self::ValidatedCompact { content_length, .. } => *content_length,
+        }
+    }
+
+    pub(super) fn validated_compact(&self) -> Option<&super::routing::ValidatedCompact> {
+        match self {
+            Self::ValidatedCompact { evidence, .. } => Some(evidence),
+            _ => None,
         }
     }
 
@@ -181,14 +395,97 @@ impl UpstreamResponse {
         let headers = self.headers().clone();
         let version = self.version();
         let content_length = self.content_length();
-        let stream = self.bytes_stream();
+        let validated_compact = self.validated_compact().cloned();
+        // Inspectors may consume EOF before replaying their retained prefix.
+        // Never poll an exhausted upstream again when that prefix is drained.
+        let stream = Box::pin(self.bytes_stream().fuse());
         UpstreamResponseParts {
             status,
             headers,
             version,
             content_length,
             stream,
+            validated_compact,
         }
+    }
+
+    #[cfg(test)]
+    pub(in crate::api) fn with_archive_capture(
+        self,
+        capture: Option<crate::response_archive_spool::ResponseArchiveProducer>,
+    ) -> Self {
+        let parts = self.into_parts();
+        let captured = CapturedUpstream {
+            upstream: Some(parts.stream),
+            capture,
+            admission: None,
+            pending: None,
+        };
+        Self::from_parts_stream(
+            parts.status,
+            parts.headers,
+            parts.version,
+            parts.content_length,
+            Box::pin(captured),
+            parts.validated_compact,
+        )
+    }
+
+    pub(in crate::api) fn with_original_archive_capture(
+        self,
+        state: &crate::AppState,
+        identity: crate::db::ArchiveSpoolIdentity,
+    ) -> Self {
+        self.with_archive_target(
+            state,
+            identity,
+            crate::response_archive_spool::CaptureTarget::Response,
+        )
+    }
+
+    pub(super) fn with_discarded_attempt_capture(
+        self,
+        state: &crate::AppState,
+        identity: crate::db::ArchiveSpoolIdentity,
+        attempt: crate::archive::RawResponseAttempt,
+    ) -> Self {
+        self.with_archive_target(
+            state,
+            identity,
+            crate::response_archive_spool::CaptureTarget::DiscardedAttempt(attempt),
+        )
+    }
+
+    fn with_archive_target(
+        self,
+        state: &crate::AppState,
+        identity: crate::db::ArchiveSpoolIdentity,
+        target: crate::response_archive_spool::CaptureTarget,
+    ) -> Self {
+        let parts = self.into_parts();
+        // Register before returning headers. The waiting capture must remain
+        // owned during shutdown even before it needs an upload envelope.
+        let activity = state.persistence.register_archive();
+        let admission = crate::response_archive_spool::ResponseArchiveProducer::admit_target(
+            state, identity, target,
+        );
+        Self::from_parts_stream(
+            parts.status,
+            parts.headers,
+            parts.version,
+            parts.content_length,
+            Box::pin(CapturedUpstream {
+                upstream: Some(parts.stream),
+                capture: None,
+                pending: None,
+                admission: Some(Box::pin(async move {
+                    let producer = admission.await;
+                    drop(activity);
+                    producer
+                })),
+            }),
+            parts.validated_compact,
+        )
     }
 
     pub(super) fn from_prefetched_parts(
@@ -200,12 +497,40 @@ impl UpstreamResponse {
             .headers
             .insert(http::header::CONTENT_TYPE, content_type);
         let prefixed = stream::iter(prefetched.into_iter().map(Ok)).chain(parts.stream);
+        Self::from_parts_stream(
+            parts.status,
+            parts.headers,
+            parts.version,
+            parts.content_length,
+            Box::pin(prefixed),
+            parts.validated_compact,
+        )
+    }
+
+    fn from_parts_stream(
+        status: StatusCode,
+        headers: HeaderMap,
+        version: Version,
+        content_length: Option<u64>,
+        stream: UpstreamByteStream,
+        evidence: Option<super::routing::ValidatedCompact>,
+    ) -> Self {
+        if let Some(evidence) = evidence {
+            return Self::ValidatedCompact {
+                status,
+                headers,
+                version,
+                content_length,
+                stream,
+                evidence,
+            };
+        }
         Self::Prefetched {
-            status: parts.status,
-            headers: parts.headers,
-            version: parts.version,
-            content_length: parts.content_length,
-            stream: Box::pin(prefixed),
+            status,
+            headers,
+            version,
+            content_length,
+            stream,
         }
     }
 
@@ -213,7 +538,7 @@ impl UpstreamResponse {
     /// starts only after response headers have arrived. The absolute deadline
     /// is created before `send()` and is deliberately carried into the body;
     /// it is never restarted at the header/body boundary.
-    pub(super) fn with_body_timeouts(
+    pub(in crate::api) fn with_body_timeouts(
         self,
         request_deadline: tokio::time::Instant,
         read_timeout: std::time::Duration,
@@ -267,29 +592,31 @@ impl UpstreamResponse {
                 }
             },
         );
-        Self::Prefetched {
-            status: parts.status,
-            headers: parts.headers,
-            version: parts.version,
-            content_length: parts.content_length,
-            stream: Box::pin(timed),
-        }
+        Self::from_parts_stream(
+            parts.status,
+            parts.headers,
+            parts.version,
+            parts.content_length,
+            Box::pin(timed),
+            parts.validated_compact,
+        )
     }
 
-    pub(super) fn bytes_stream(self) -> UpstreamByteStream {
+    pub(in crate::api) fn bytes_stream(self) -> UpstreamByteStream {
         match self {
-            Self::Reqwest(response) => Box::pin(
-                response
-                    .bytes_stream()
-                    .map(|chunk| chunk.map_err(|_| UPSTREAM_STREAM_ERROR)),
-            ),
+            Self::Reqwest(response) => Box::pin(response.bytes_stream().map(|chunk| {
+                chunk.map_err(|error| {
+                    codex_http2_failure(&error)
+                        .map_or(UPSTREAM_STREAM_ERROR, CodexHttp2Failure::error_code)
+                })
+            })),
             Self::Codex(response) => Box::pin(response.bytes_stream().map(|chunk| {
                 chunk.map_err(|error| {
                     codex_http2_failure(&error)
                         .map_or(UPSTREAM_STREAM_ERROR, CodexHttp2Failure::error_code)
                 })
             })),
-            Self::Prefetched { stream, .. } => stream,
+            Self::Prefetched { stream, .. } | Self::ValidatedCompact { stream, .. } => stream,
         }
     }
 }
@@ -303,6 +630,26 @@ impl From<reqwest::Response> for UpstreamResponse {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn upstream_headers_cannot_assert_validated_compact_provenance() {
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            "x-mtc-validated-compact",
+            http::HeaderValue::from_static("true"),
+        );
+        headers.insert(
+            http::header::CONTENT_TYPE,
+            http::HeaderValue::from_static("text/event-stream"),
+        );
+        let response = UpstreamResponse::for_test(
+            headers,
+            Version::HTTP_11,
+            vec![Ok(Bytes::from_static(b"data: unvalidated\n\n"))],
+        );
+        assert!(response.validated_compact().is_none());
+        assert!(response.into_parts().validated_compact.is_none());
+    }
 
     #[tokio::test(start_paused = true)]
     async fn diagnostic_observation_limits_do_not_invent_terminal_causes() {
@@ -384,7 +731,7 @@ mod tests {
         assert!(!error.is_library());
         assert_eq!(
             codex_http2_error(&error).unwrap().reason(),
-            Some(http2::Reason::CANCEL)
+            Some(u32::from(http2::Reason::CANCEL))
         );
         assert_eq!(codex_http2_failure(&error), Some(CodexHttp2Failure::Reset));
         let wrapped = std::io::Error::other(error);
@@ -425,7 +772,7 @@ mod tests {
         assert!(error.is_remote());
         assert_eq!(
             codex_http2_error(&error).unwrap().reason(),
-            Some(http2::Reason::INTERNAL_ERROR)
+            Some(u32::from(http2::Reason::INTERNAL_ERROR))
         );
         assert_eq!(codex_http2_failure(&error), Some(CodexHttp2Failure::GoAway));
         driver.abort();
@@ -541,7 +888,7 @@ mod tests {
         assert!(evidence.is_reset());
         assert!(!evidence.is_remote());
         assert!(!evidence.is_library());
-        assert_eq!(evidence.reason(), Some(http2::Reason::CANCEL));
+        assert_eq!(evidence.reason(), Some(u32::from(http2::Reason::CANCEL)));
         assert_eq!(codex_http2_failure(&error), Some(CodexHttp2Failure::Reset));
         driver.abort();
         server.abort();

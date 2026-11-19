@@ -1,8 +1,9 @@
 export function isExpectedResourceAbort(method: string, requestUrl: string, failure: string): boolean {
-  if (method !== 'GET' || failure !== 'net::ERR_ABORTED') return false;
+  if (failure !== 'net::ERR_ABORTED') return false;
   try {
     const path = new URL(requestUrl).pathname;
-    return path === '/internal/v1/upstream-models' || path === '/internal/v1/monitoring-snapshot';
+    if (method === 'POST') return path === '/internal/v1/requests/query';
+    return method === 'GET' && (path === '/internal/v1/upstream-models' || path === '/internal/v1/monitoring-snapshot');
   } catch {
     return false;
   }

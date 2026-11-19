@@ -147,6 +147,13 @@ impl Database {
         tenant_external_id: Option<&str>,
         filter: StatsFilter,
     ) -> Result<Vec<(String, i64, i64, i64)>, AppError> {
+        if let Some(client) = self.history_reader().await? {
+            let query = crate::request_history_api::query_from_stats_filter(
+                self.history_scope(tenant_external_id).await?,
+                &filter,
+            )?;
+            return Ok(client.pricing_usage(query).await?);
+        }
         validate_stats_filter(&filter)?;
         let from = filter.from_created_at.expect("validated start");
         let to = filter.to_created_at.expect("validated end");

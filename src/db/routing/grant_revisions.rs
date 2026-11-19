@@ -1,4 +1,5 @@
-use sqlx::{Any, AnyPool, Row, Transaction};
+use crate::db::request_pool::RequestPool as AnyPool;
+use sqlx::{Any, Row, Transaction};
 use uuid::Uuid;
 
 use crate::error::AppError;
@@ -215,7 +216,9 @@ async fn ensure_relation_revision(
     } else if subject_kind == ROUTE_SUBJECT {
         (None, Some(subject_id.to_string()))
     } else {
-        return Err(AppError::Internal);
+        return Err(AppError::internal(
+            "grant_revisions_ensure_relation_revision_1",
+        ));
     };
     sqlx::query(
         "INSERT INTO routing_grant_relation_revisions \

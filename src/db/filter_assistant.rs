@@ -21,7 +21,7 @@ impl Database {
             currency: row.try_get("currency")?,
             credential_generation: row.try_get("credential_generation")?,
             policy: serde_json::from_str(&row.try_get::<String, _>("policy_json")?)
-                .map_err(|_| AppError::Internal)?,
+                .map_err(|_| AppError::internal("filter_assistant_filter_assistant_identity_1"))?,
         })
     }
 
@@ -59,7 +59,7 @@ impl Database {
                 "filter assistant settings changed; reload before saving".into(),
             ));
         }
-        let audit = serde_json::to_vec(&serde_json::json!({"actor_service_id": actor, "settings": serde_json::from_slice::<Value>(value).map_err(|_| AppError::Internal)?, "created_at": now})).map_err(|_| AppError::Internal)?;
+        let audit = serde_json::to_vec(&serde_json::json!({"actor_service_id": actor, "settings": serde_json::from_slice::<Value>(value).map_err(|_| AppError::internal("filter_assistant_replace_filter_assistant_settings_1"))?, "created_at": now})).map_err(|_| AppError::internal("filter_assistant_replace_filter_assistant_settings_2"))?;
         sqlx::query("INSERT INTO plugin_kv (plugin_id, key, value, updated_at) VALUES ('filter-assistant-audit', $1, $2, $3)")
             .bind(Uuid::now_v7().to_string()).bind(audit).bind(now).execute(&mut *tx).await?;
         tx.commit().await?;

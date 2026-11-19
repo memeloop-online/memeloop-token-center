@@ -70,7 +70,10 @@ SELECT r.id, r.tenant_id, r.key_id, r.created_at, r.model, r.protocol,
        COALESCE(r.error_code, ''), COALESCE(r.upstream_account_id, ''),
        COALESCE(r.model_route_id, ''), COALESCE(r.duration_ms, 0),
        r.input_tokens, r.output_tokens, r.cached_input_tokens, r.cache_write_tokens, r.cache_known_read_tokens, r.cache_known_input_tokens,
-       r.service_tier, COALESCE(NULLIF(r.currency, ''), k.currency), r.cost_micros
+       r.service_tier, COALESCE(NULLIF(r.currency, ''), k.currency),
+       COALESCE((SELECT c.corrected_fact_cost_micros FROM request_cost_projection_corrections c
+                  WHERE c.request_id = r.id ORDER BY c.applied_at DESC, c.correction_version DESC LIMIT 1),
+                r.cost_micros)
   FROM request_records r
   JOIN key_records k ON k.id = r.key_id AND k.tenant_id = r.tenant_id
   CROSS JOIN mtc_reconcile_day_bounds b

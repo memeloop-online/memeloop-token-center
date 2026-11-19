@@ -3,7 +3,9 @@ use crate::api::tests::test_state;
 
 fn request_detail_refs(request_id: Uuid) -> crate::model::RequestArchiveRefs {
     crate::model::RequestArchiveRefs {
+        semantic_archive: None,
         view: crate::model::RequestView {
+            operational_terminal: None,
             egress: None,
             usage_basis: None,
             compaction: None,
@@ -43,6 +45,7 @@ fn request_detail_refs(request_id: Uuid) -> crate::model::RequestArchiveRefs {
             },
             error_code: None,
             terminal_cause_code: None,
+            in_flight_stage: None,
             supplier_error: None,
             archive_state: crate::model::RequestArchiveState::Bound,
             credential_identity: None,
@@ -286,67 +289,51 @@ async fn request_archive_content_does_not_expose_policy_metadata_as_body() {
 }
 
 #[tokio::test]
-async fn invalid_native_supplier_envelopes_cannot_escape_detail_or_archive_content() {
+async fn unfamiliar_supplier_details_remain_visible_and_downloadable() {
     let (state, _directory) = test_state().await;
-    let valid = json!({"error": {
-        "type": "upstream_error", "code": "model_unavailable",
-        "message": "The requested upstream model is unavailable",
-        "mtc_safe_reason": "model_unavailable",
-        "mtc_provider_code": "model_not_found",
-        "mtc_provider_message": "Model not found"
+    let value = json!({"error": {
+        "type": "upstream_error", "code": "new_provider_error",
+        "message": "Schema validation failed: tools[3].parameters",
+        "mtc_provider_code": "new_provider_error",
+        "mtc_provider_message": "Schema validation failed: tools[3].parameters",
+        "future_diagnostic": "additional upstream field"
     }});
-    let mut invalid = Vec::new();
-    for field in ["mtc_provider_code", "mtc_provider_message", "unknown_field"] {
-        let mut tampered = valid.clone();
-        tampered["error"][field] = json!("Authorization: Bearer token=private-canary");
-        invalid.push(tampered.to_string());
-    }
-    invalid.extend([
-        r#"{"error":{"mtc_safe_reason":"model_unavailable","mtc_provider_message":"Authorization: Bearer private-canary"}} trailing"#,
-        r#"{"error":{"mtc_safe_reason":"model_unavailable","mtc_provider_message":"Authorization: Bearer private-canary"},"error":{"message":"legacy"}}"#,
-        r#"{"\u0065rror":{"\u006dtc_safe_reason":"model_unavailable","mtc_provider_message":"Authorization: Bearer private-canary"}} trailing"#,
-        r#"{"error":{"mtc_provider_message":"Authorization: Bearer private-canary","mtc_provider_message":"Model not found","type":"upstream_error","code":"model_unavailable","message":"The requested upstream model is unavailable","mtc_safe_reason":"model_unavailable"}}"#,
-        r#"{"error":"legacy","error":{"mtc_safe_reason":"model_unavailable","mtc_provider_message":"Authorization: Bearer private-canary"}}"#,
-    ].into_iter().map(str::to_owned));
-    for raw in invalid {
-        let mut refs = request_detail_refs(Uuid::now_v7());
-        refs.response_object = Some(format!("inline-json:{raw}"));
-        refs.view.status_code = Some(400);
-        refs.view.error_code = Some("http_400".to_owned());
-        refs.view.supplier_error =
-            crate::supplier_error::supplier_error_from_inline_json(refs.response_object.as_deref());
-        assert!(refs.view.supplier_error.is_none());
-        let download = request_archive_content_response(
-            &state,
-            &HeaderMap::new(),
-            &refs,
-            RequestArchiveSide::Response,
-        )
+    let raw = value.to_string();
+    let mut refs = request_detail_refs(Uuid::now_v7());
+    refs.response_object = Some(format!("inline-json:{raw}"));
+    refs.view.status_code = Some(400);
+    refs.view.error_code = Some("http_400".to_owned());
+    refs.view.supplier_error =
+        crate::supplier_error::supplier_error_from_inline_json(refs.response_object.as_deref());
+    assert_eq!(
+        refs.view
+            .supplier_error
+            .as_ref()
+            .unwrap()
+            .provider_code
+            .as_deref(),
+        Some("new_provider_error")
+    );
+    let download = request_archive_content_response(
+        &state,
+        &HeaderMap::new(),
+        &refs,
+        RequestArchiveSide::Response,
+    )
+    .await
+    .unwrap();
+    assert_eq!(download.status(), StatusCode::OK);
+    let downloaded = axum::body::to_bytes(download.into_body(), MAX_ARCHIVE_DETAIL_RESPONSE)
         .await
         .unwrap();
-        assert_eq!(download.status(), StatusCode::CONFLICT);
-        let download = axum::body::to_bytes(download.into_body(), MAX_ARCHIVE_DETAIL_RESPONSE)
-            .await
-            .unwrap();
-        assert!(!String::from_utf8_lossy(&download).contains("private-canary"));
-        let download: Value = serde_json::from_slice(&download).unwrap();
-        assert_eq!(download["error"]["reason"], "archive_payload_invalid");
-        let response = request_detail_response(&state, refs).await.unwrap();
-        let body = axum::body::to_bytes(response.into_body(), MAX_ARCHIVE_DETAIL_RESPONSE)
-            .await
-            .unwrap();
-        assert!(!String::from_utf8_lossy(&body).contains("private-canary"));
-        let detail: Value = serde_json::from_slice(&body).unwrap();
-        assert!(detail["response_body"].is_null());
-        assert!(detail["supplier_error"].is_null());
-        assert_eq!(detail["archive"]["response"]["complete"], false);
-        assert_eq!(
-            detail["archive"]["response"]["reason"],
-            "archive_payload_invalid"
-        );
-        assert_eq!(detail["status_code"], 400);
-        assert_eq!(detail["error_code"], "http_400");
-    }
+    assert_eq!(downloaded.as_ref(), raw.as_bytes());
+    let response = request_detail_response(&state, refs).await.unwrap();
+    let body = axum::body::to_bytes(response.into_body(), MAX_ARCHIVE_DETAIL_RESPONSE)
+        .await
+        .unwrap();
+    let detail: Value = serde_json::from_slice(&body).unwrap();
+    assert_eq!(detail["response_body"], value);
+    assert_eq!(detail["archive"]["response"]["complete"], true);
 }
 
 #[tokio::test]
@@ -399,6 +386,12 @@ async fn request_detail_serializes_the_shared_supplier_reason_at_the_top_level()
     refs.view.supplier_error = Some(crate::supplier_error::SupplierError {
         code: "no_active_plan".to_owned(),
         message: "当前账号没有可用套餐".to_owned(),
+        category: "quota".to_owned(),
+        retryable: false,
+        action: "check_plan".to_owned(),
+        provider_code: None,
+        provider_message: None,
+        provider_details: None,
     });
     let response = request_detail_response(&state, refs).await.unwrap();
     let body = axum::body::to_bytes(response.into_body(), MAX_ARCHIVE_DETAIL_RESPONSE)
@@ -407,7 +400,8 @@ async fn request_detail_serializes_the_shared_supplier_reason_at_the_top_level()
     let detail: Value = serde_json::from_slice(&body).unwrap();
     assert_eq!(
         detail["supplier_error"],
-        json!({"code": "no_active_plan", "message": "当前账号没有可用套餐"})
+        json!({"code": "no_active_plan", "message": "当前账号没有可用套餐",
+            "category": "quota", "retryable": false, "action": "check_plan"})
     );
     assert_eq!(detail["status_code"], 402);
     assert_eq!(detail["error_code"], "http_402");
@@ -415,4 +409,286 @@ async fn request_detail_serializes_the_shared_supplier_reason_at_the_top_level()
         detail.get("view").is_none(),
         "RequestDetail flattens the manual RequestView serializer"
     );
+}
+
+#[tokio::test]
+async fn readable_stream_archives_are_not_reported_as_missing_or_invalid() {
+    let (state, _directory) = test_state().await;
+    let small = b"data: {\"choices\":[{\"delta\":{\"content\":\"original\"}}]}\n\ndata: [DONE]\n\n";
+    let small_location = format!("detail-preview/{}.body", Uuid::now_v7());
+    state
+        .archive
+        .put(&small_location, small.as_slice().into())
+        .await
+        .unwrap();
+    let mut small_refs = request_detail_refs(Uuid::now_v7());
+    small_refs.response_object = Some(small_location);
+    let small_detail = crate::api::request_detail::request_detail(&state, small_refs).await;
+    assert!(small_detail.archive_complete);
+    assert_eq!(
+        small_detail.response_body,
+        Value::String(String::from_utf8(small.to_vec()).unwrap())
+    );
+    assert!(small_detail.archive.response.preview.is_none());
+    let cases = [
+        ("data: {\"choices\":[{\"delta\":{\"content\":\"original\"}}]}\n\n".repeat(6000)
+            + "data: [DONE]\n\n")
+            .into_bytes(),
+        format!(
+            "data: {{\"content\":\"{}\"}}\n\ndata: [DONE]\n\n",
+            "x".repeat(2 * 1024 * 1024)
+        )
+        .into_bytes(),
+        format!(
+            "[{}]",
+            std::iter::repeat_n("0", 17000)
+                .collect::<Vec<_>>()
+                .join(",")
+        )
+        .into_bytes(),
+    ];
+    for body in cases {
+        let location = format!("detail-preview/{}.body", Uuid::now_v7());
+        state
+            .archive
+            .put(&location, body.clone().into())
+            .await
+            .unwrap();
+        let mut refs = request_detail_refs(Uuid::now_v7());
+        refs.response_object = Some(location);
+        let download = request_archive_content_response(
+            &state,
+            &HeaderMap::new(),
+            &refs,
+            RequestArchiveSide::Response,
+        )
+        .await
+        .unwrap();
+        assert_eq!(download.status(), StatusCode::OK);
+        let downloaded = axum::body::to_bytes(download.into_body(), body.len())
+            .await
+            .unwrap();
+        assert_eq!(downloaded.as_ref(), body.as_slice());
+        let detail = crate::api::request_detail::request_detail(&state, refs).await;
+        assert!(detail.archive_complete);
+        assert!(detail.archive.response.complete);
+        assert_eq!(detail.archive.response.reason, None);
+        assert!(detail.response_body.is_null());
+        assert_eq!(
+            serde_json::to_value(detail.archive.response.preview).unwrap(),
+            json!({"kind":"stream", "bytes":body.len()})
+        );
+    }
+    let mut refs = request_detail_refs(Uuid::now_v7());
+    refs.response_object = Some(format!("detail-preview/{}.missing", Uuid::now_v7()));
+    let detail = crate::api::request_detail::request_detail(&state, refs).await;
+    assert!(!detail.archive.response.complete);
+    assert_eq!(
+        detail.archive.response.reason.as_deref(),
+        Some("archive_object_unavailable")
+    );
+    assert!(detail.archive.response.preview.is_none());
+}
+
+#[tokio::test]
+async fn retired_raw_detail_uses_lossless_semantic_identity_without_reading_old_body() {
+    let (state, _directory) = test_state().await;
+    let request = Uuid::now_v7();
+    let mut refs = request_detail_refs(request);
+    refs.request_object = "must-not-read-retired-request".into();
+    refs.response_object = Some("must-not-read-retired-response".into());
+    refs.request_archive_state = crate::model::RequestArchiveState::MetadataOnly;
+    refs.response_archive_state = crate::model::RequestArchiveState::MetadataOnly;
+    refs.request_archive_reason = Some("raw_retired_semantic_archive".into());
+    refs.response_archive_reason = Some("raw_retired_semantic_archive".into());
+    refs.semantic_archive = Some(crate::archive::SemanticArchiveAuthority {
+        publication: crate::archive::SemanticPublication {
+            format_version: 2,
+            tenant_id: Uuid::now_v7(),
+            request_id: request,
+            projection_version: 2,
+            revision: u64::MAX,
+            manifest: crate::archive::CasArchiveObject {
+                object_locator: "internal-manifest-must-not-leak".into(),
+                blake3_digest: "a".repeat(64),
+                size_bytes: 1,
+            },
+        },
+        semantic_head: crate::archive::SemanticHead {
+            node_hash: "a".repeat(64),
+            depth: 1,
+        },
+        coverage: crate::archive::SemanticCoverage {
+            observed_terminal: true,
+            projection_state: crate::archive::SemanticProjectionState::Complete,
+            omissions: Vec::new(),
+            gaps: Vec::new(),
+        },
+    });
+    let raw = crate::api::request_detail::request_archive_content_response(
+        &state,
+        &HeaderMap::new(),
+        &refs,
+        crate::api::request_detail::RequestArchiveSide::Request,
+    )
+    .await
+    .unwrap();
+    assert_eq!(raw.status(), StatusCode::CONFLICT);
+    let response = request_detail_response(&state, refs).await.unwrap();
+    let body = axum::body::to_bytes(response.into_body(), MAX_ARCHIVE_DETAIL_RESPONSE)
+        .await
+        .unwrap();
+    let detail: Value = serde_json::from_slice(&body).unwrap();
+    assert_eq!(
+        detail["semantic_archive"]["manifest_revision"],
+        u64::MAX.to_string()
+    );
+    assert_eq!(detail["request_body"]["semantic_archive_available"], true);
+    assert_eq!(detail["response_body"]["semantic_archive_available"], true);
+    assert_eq!(detail["archive_complete"], true);
+    let encoded = std::str::from_utf8(&body).unwrap();
+    for forbidden in [
+        "must-not-read",
+        "internal-manifest-must-not-leak",
+        "object_locator",
+    ] {
+        assert!(!encoded.contains(forbidden));
+    }
+}
+
+#[tokio::test]
+async fn legacy_bound_archive_without_raw_root_remains_readable() {
+    use crate::model::RequestArchiveState;
+    let (state, _directory) = test_state().await;
+    let tenant = Uuid::now_v7();
+    let request = Uuid::now_v7();
+    let request_bytes = Bytes::from_static(br#"{"input":"legacy question","stream":false}"#);
+    let response_bytes = Bytes::from_static(br#"{"object":"response","status":"incomplete","output":[],"incomplete_details":{"reason":"max_output_tokens"}}"#);
+    let request_path = format!("staging/proxy/{request}/request/{request}/body.json");
+    let response_path = format!("staging/proxy/{request}/response/{request}/body.mtcz1");
+    state
+        .archive
+        .put(&request_path, request_bytes.clone())
+        .await
+        .unwrap();
+    let mut writer = state
+        .archive
+        .start_compressed_writer(response_path.strip_suffix(".mtcz1").unwrap())
+        .await
+        .unwrap();
+    writer.write(response_bytes.clone()).await.unwrap();
+    assert_eq!(
+        writer.finish_staged().await.unwrap().object_locator,
+        response_path
+    );
+    let mut refs = request_detail_refs(request);
+    refs.request_object = request_path.clone();
+    refs.response_object = Some(response_path.clone());
+    refs.response_json = None;
+    assert!(
+        state
+            .archive
+            .raw_capture_reference(tenant, request, "request")
+            .await
+            .unwrap()
+            .is_none()
+    );
+    let resolved = state
+        .db
+        .resolve_raw_archive_roots_with_semantic_authority(tenant, refs.clone(), None)
+        .await
+        .unwrap();
+    assert_eq!(resolved.request_archive_state, RequestArchiveState::Bound);
+    assert_eq!(resolved.response_archive_state, RequestArchiveState::Bound);
+    for (side, expected) in [
+        (RequestArchiveSide::Request, request_bytes),
+        (RequestArchiveSide::Response, response_bytes),
+    ] {
+        let response = request_archive_content_response(&state, &HeaderMap::new(), &resolved, side)
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(
+            axum::body::to_bytes(response.into_body(), usize::MAX)
+                .await
+                .unwrap(),
+            expected
+        );
+    }
+    // Pending and unpublished CAS references must not inherit the legacy fallback.
+    let mut pending = refs.clone();
+    pending.request_archive_state = RequestArchiveState::Pending;
+    let pending = state
+        .db
+        .resolve_raw_archive_roots_with_semantic_authority(tenant, pending, None)
+        .await
+        .unwrap();
+    assert_eq!(pending.request_archive_state, RequestArchiveState::Pending);
+    let object = state
+        .archive
+        .put_tenant_content(tenant, Bytes::from_static(b"canonical body"))
+        .await
+        .unwrap();
+    let mut cas = refs.clone();
+    cas.request_object = object.object_locator.clone();
+    let cas = state
+        .db
+        .resolve_raw_archive_roots_with_semantic_authority(tenant, cas, None)
+        .await
+        .unwrap();
+    assert_eq!(cas.request_archive_state, RequestArchiveState::Pending);
+    for location in [
+        format!(
+            "stores/training/{}/{}",
+            "a".repeat(64),
+            object.object_locator
+        ),
+        format!(
+            "stores/staging/{}/staging/proxy/{request}/request/body.json",
+            "b".repeat(64)
+        ),
+    ] {
+        let mut qualified = refs.clone();
+        qualified.request_object = location;
+        let qualified = state
+            .db
+            .resolve_raw_archive_roots_with_semantic_authority(tenant, qualified, None)
+            .await
+            .unwrap();
+        assert_eq!(
+            qualified.request_archive_state,
+            RequestArchiveState::Pending
+        );
+    }
+    // A real canonical root takes precedence over the legacy source.
+    state
+        .archive
+        .publish_raw_capture(tenant, request, "request", &object)
+        .await
+        .unwrap();
+    let canonical = state
+        .db
+        .resolve_raw_archive_roots_with_semantic_authority(tenant, refs.clone(), None)
+        .await
+        .unwrap();
+    assert_eq!(canonical.request_object, object.object_locator);
+    // Failure fences retain authority even when an old object remains readable.
+    state
+        .archive
+        .publish_raw_capture_failure(tenant, request, "response")
+        .await
+        .unwrap();
+    let failed = state
+        .db
+        .resolve_raw_archive_roots_with_semantic_authority(tenant, refs.clone(), None)
+        .await
+        .unwrap();
+    assert_eq!(failed.response_archive_state, RequestArchiveState::Gap);
+    // A root for another tenant/request cannot override this authorized identity.
+    let other = state
+        .db
+        .resolve_raw_archive_roots_with_semantic_authority(Uuid::now_v7(), refs, None)
+        .await
+        .unwrap();
+    assert_eq!(other.request_object, request_path);
 }

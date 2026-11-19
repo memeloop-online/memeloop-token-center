@@ -20,7 +20,6 @@ pub use types::{ModelPriceSyncResult, SyncCandidate, SyncCandidateSet, SyncSourc
 pub const MAX_SYNC_MODELS: usize = 500;
 pub(crate) static MODEL_PRICE_SYNC_PERMITS: tokio::sync::Semaphore =
     tokio::sync::Semaphore::const_new(2);
-const MAX_SOURCE_BYTES: usize = 8 * 1024 * 1024;
 const MAX_SOURCE_PRICES: usize = 20_000;
 const MAX_CANDIDATES_PER_MODEL: usize = 8;
 
@@ -34,7 +33,7 @@ pub fn model_price_sources(config: &Config) -> [(&'static str, &str); 3] {
 
 pub async fn sync_model_prices(
     db: &Database,
-    http: &reqwest::Client,
+    http: &dyn crate::http_settings::HttpClientSource,
     models: Vec<String>,
     currency: &str,
     source_specs: &[(&'static str, &str)],
@@ -53,7 +52,7 @@ pub async fn sync_model_prices(
 
 async fn sync_model_prices_with_sources(
     db: &Database,
-    http: &reqwest::Client,
+    http: &dyn crate::http_settings::HttpClientSource,
     models: Vec<String>,
     currency: &str,
     source_specs: &[(&'static str, &str)],
@@ -75,7 +74,7 @@ async fn sync_model_prices_with_sources(
 /// fetching each source once and chunking database reads, not network requests.
 pub(crate) async fn sync_catalog_model_prices(
     db: &Database,
-    http: &reqwest::Client,
+    http: &dyn crate::http_settings::HttpClientSource,
     models: Vec<String>,
     source_specs: &[(&'static str, &str)],
     allow_test_loopback: bool,
@@ -83,7 +82,7 @@ pub(crate) async fn sync_catalog_model_prices(
     let _permit = MODEL_PRICE_SYNC_PERMITS
         .acquire()
         .await
-        .map_err(|_| AppError::Internal)?;
+        .map_err(|_| AppError::internal("pricing_mod_sync_catalog_model_prices_1"))?;
     run_price_sync(
         db,
         http,
@@ -98,7 +97,7 @@ pub(crate) async fn sync_catalog_model_prices(
 
 async fn run_price_sync(
     db: &Database,
-    http: &reqwest::Client,
+    http: &dyn crate::http_settings::HttpClientSource,
     mut models: Vec<String>,
     currency: &str,
     source_specs: &[(&'static str, &str)],
@@ -151,8 +150,8 @@ async fn run_price_sync(
         }
     }
     if fetched.is_empty() {
-        return Err(AppError::Upstream(
-            "all configured model price sources are unavailable".into(),
+        return Err(AppError::upstream(
+            "all_configured_model_price_sources_are_unavailable",
         ));
     }
 

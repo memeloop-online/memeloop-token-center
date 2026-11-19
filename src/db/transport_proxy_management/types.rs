@@ -5,6 +5,12 @@ pub(crate) struct Member {
     pub id: Uuid,
     pub label: String,
     pub proxy_url: String,
+    #[serde(default = "initial_proxy_version")]
+    pub version: i64,
+}
+
+fn initial_proxy_version() -> i64 {
+    1
 }
 
 #[derive(Deserialize)]
@@ -20,7 +26,12 @@ pub(crate) struct MemberInput {
 pub(crate) struct CreateGroup {
     pub tenant_external_id: String,
     pub name: String,
+    #[serde(alias = "proxy_ids", deserialize_with = "deserialize_member_inputs")]
     pub members: Vec<MemberInput>,
+    #[serde(default)]
+    pub probe_url: Option<String>,
+    #[serde(default)]
+    pub probe_attempts: Option<u8>,
 }
 
 #[derive(Deserialize)]
@@ -29,8 +40,43 @@ pub(crate) struct UpdateGroup {
     pub tenant_external_id: String,
     pub expected_version: i64,
     pub name: String,
+    #[serde(alias = "proxy_ids", deserialize_with = "deserialize_member_inputs")]
     pub members: Vec<MemberInput>,
     pub replacement_member_id: Option<Uuid>,
+    #[serde(default)]
+    pub probe_url: Option<String>,
+    #[serde(default)]
+    pub probe_attempts: Option<u8>,
+}
+
+fn deserialize_member_inputs<'input, Deserializer>(
+    deserializer: Deserializer,
+) -> Result<Vec<MemberInput>, Deserializer::Error>
+where
+    Deserializer: serde::Deserializer<'input>,
+{
+    let values = Vec::<Value>::deserialize(deserializer)?;
+    let references = values.first().is_some_and(Value::is_string);
+    values
+        .into_iter()
+        .map(|value| {
+            if value.is_string() != references {
+                return Err(serde::de::Error::custom(
+                    "members and proxy_ids must not be mixed",
+                ));
+            }
+            if references {
+                let id = serde_json::from_value::<Uuid>(value).map_err(serde::de::Error::custom)?;
+                Ok(MemberInput {
+                    id: Some(id),
+                    label: String::new(),
+                    proxy_url: None,
+                })
+            } else {
+                serde_json::from_value(value).map_err(serde::de::Error::custom)
+            }
+        })
+        .collect()
 }
 
 #[derive(Deserialize)]
@@ -40,8 +86,18 @@ pub(crate) struct DeleteGroup {
     pub expected_version: i64,
 }
 
+#[derive(Clone, Copy, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub(crate) enum TransportPolicyMode {
+    Manual,
+    Auto,
+    Plugin,
+}
+
 #[derive(Clone, Deserialize, Serialize, PartialEq, Eq)]
 pub(crate) struct BindingStamp {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub mode: Option<TransportPolicyMode>,
     pub selection_version: i64,
     pub binding_version: i64,
     pub group_id: Option<Uuid>,
@@ -112,7 +168,7 @@ pub(super) fn members(
     input: Vec<MemberInput>,
     previous: &[Member],
 ) -> Result<Vec<Member>, AppError> {
-    if !(1..=4).contains(&input.len()) {
+    if input.is_empty() {
         return Err(invalid());
     }
     let mut output: Vec<Member> = Vec::new();
@@ -143,20 +199,56 @@ pub(super) fn members(
             id,
             label: item.label,
             proxy_url,
+            version: old.map(|member| member.version).unwrap_or(1),
         });
     }
     Ok(output)
 }
 
-pub(super) fn view(row: &AnyRow, tenant_external_id: &str, key: &[u8]) -> Result<Value, AppError> {
-    let members = open_members(row, key)?.into_iter().map(|member| {
-        let parsed = url::Url::parse(&member.proxy_url).map_err(|_| AppError::Internal)?;
-        Ok(serde_json::json!({"id":member.id,"label":member.label,"scheme":parsed.scheme(),"host":parsed.host_str(),"port":parsed.port().unwrap_or(1080),"remote_dns":true,"has_auth":!parsed.username().is_empty() || parsed.password().is_some()}))
+pub(crate) fn probe_settings(
+    url: Option<String>,
+    attempts: Option<u8>,
+) -> Result<(Option<String>, i64), AppError> {
+    let attempts = i64::from(attempts.unwrap_or(2));
+    if !(1..=8).contains(&attempts) {
+        return Err(invalid());
+    }
+    let url = url.and_then(|value| {
+        let trimmed = value.trim().to_owned();
+        (!trimmed.is_empty()).then_some(trimmed)
+    });
+    if let Some(url) = &url {
+        if url.len() > 200 {
+            return Err(invalid());
+        }
+        let parsed = url::Url::parse(url).map_err(|_| invalid())?;
+        if !matches!(parsed.scheme(), "http" | "https")
+            || parsed.host_str().is_none()
+            || !parsed.username().is_empty()
+        {
+            return Err(invalid());
+        }
+    }
+    Ok((url, attempts))
+}
+
+pub(super) fn view(
+    row: &AnyRow,
+    tenant_external_id: &str,
+    members: Vec<Member>,
+) -> Result<Value, AppError> {
+    let members = members.into_iter().map(|member| {
+        let parsed = url::Url::parse(&member.proxy_url).map_err(|_| AppError::internal("types_view_1"))?;
+        Ok(serde_json::json!({"id":member.id,"label":member.label,"proxy_url":member.proxy_url,"scheme":parsed.scheme(),"host":parsed.host_str(),"port":parsed.port_or_known_default().unwrap_or(1080),"remote_dns":true,"has_auth":!parsed.username().is_empty() || parsed.password().is_some()}))
     }).collect::<Result<Vec<_>, AppError>>()?;
     Ok(serde_json::json!({
         "id":row.try_get::<String,_>("id")?, "tenant_external_id":tenant_external_id,
         "name":row.try_get::<String,_>("name")?, "version":row.try_get::<i64,_>("version")?,
         "members":members, "bound_account_count":row.try_get::<i64,_>("bound_account_count")?,
+        "probe_url":row.try_get::<Option<String>,_>("probe_url")?,
+        "probe_attempts":row.try_get::<i64,_>("probe_attempts")?,
+        "last_probe_status":row.try_get::<Option<String>,_>("last_probe_status")?,
+        "last_probe_checked_at":row.try_get::<Option<i64>,_>("last_probe_checked_at")?,
         "created_at":row.try_get::<i64,_>("created_at")?,"updated_at":row.try_get::<i64,_>("updated_at")?
     }))
 }

@@ -24,6 +24,39 @@ pub(in crate::api) struct QuotaBatchRequest {
     trigger: crate::upstream_quota::QuotaRequestTrigger,
 }
 
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(in crate::api) struct QuotaWindowMetadataRequest {
+    account_ids: Vec<Uuid>,
+    tenant_external_id: String,
+}
+
+pub(in crate::api) async fn upstream_quota_windows(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Json(body): Json<QuotaWindowMetadataRequest>,
+) -> Result<impl IntoResponse, AppError> {
+    let service = require_service(&headers, &state, "providers:read").await?;
+    let tenant = body.tenant_external_id.trim();
+    if tenant.is_empty()
+        || body.account_ids.is_empty()
+        || body.account_ids.len() > MAX_QUOTA_BATCH_ACCOUNTS
+    {
+        return Err(AppError::BadRequest(
+            "quota window metadata requires a tenant and 1 to 100 account_ids".into(),
+        ));
+    }
+    require_service_tenant(&service, tenant)?;
+    let results = state
+        .db
+        .quota_window_metadata(&body.account_ids, tenant)
+        .await?;
+    Ok((
+        [(header::CACHE_CONTROL, "no-store")],
+        Json(serde_json::json!({"results": results})),
+    ))
+}
+
 #[derive(Serialize)]
 struct QuotaBatchResponse {
     contract_version: &'static str,
@@ -199,6 +232,12 @@ pub(in crate::api) struct ResetConfirmation {
     confirmation: String,
 }
 
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(in crate::api) struct ResetRecovery {
+    confirmation: String,
+}
+
 fn quota_reset_idempotency_key(headers: &HeaderMap) -> Result<&str, AppError> {
     let mut values = headers.get_all("idempotency-key").iter();
     let value = values.next().ok_or_else(|| {
@@ -304,17 +343,25 @@ pub(in crate::api) async fn confirm_quota_reset(
         ));
     }
     let (account, credential, actor) = reset_account(&state, &headers, account_id, &query).await?;
-    let result = crate::upstream_quota::reset::confirm(
-        &state,
-        &account,
-        &credential,
-        query.tenant_external_id.trim(),
-        &actor,
-        &operation_id.to_string(),
-        &body.confirmation_token,
-        idempotency_key,
-    )
-    .await?;
+    let idempotency_key = idempotency_key.to_owned();
+    // A browser disconnect must not cancel an already authorized consumption
+    // or its durable result. Dropping the JoinHandle detaches this single task;
+    // the database claim still permits exactly one supplier dispatch.
+    let result = tokio::spawn(async move {
+        crate::upstream_quota::reset::confirm(
+            &state,
+            &account,
+            &credential,
+            query.tenant_external_id.trim(),
+            &actor,
+            &operation_id.to_string(),
+            &body.confirmation_token,
+            &idempotency_key,
+        )
+        .await
+    })
+    .await
+    .map_err(|_| AppError::internal("quota_reset_dispatch_task"))??;
     Ok(([(header::CACHE_CONTROL, "no-store")], Json(result)))
 }
 
@@ -359,6 +406,31 @@ pub(in crate::api) async fn get_quota_reset(
             &operation_id.to_string(),
         )
         .await?;
+    Ok(([(header::CACHE_CONTROL, "no-store")], Json(result)))
+}
+
+pub(in crate::api) async fn recover_quota_reset(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path((account_id, operation_id)): Path<(Uuid, Uuid)>,
+    Query(query): Query<QuotaQuery>,
+    Json(body): Json<ResetRecovery>,
+) -> Result<impl IntoResponse, AppError> {
+    if body.confirmation != "release_unknown_reset_without_consuming" {
+        return Err(AppError::BadRequest(
+            "confirmation must acknowledge release of an unknown reset without consuming".into(),
+        ));
+    }
+    let (account, credential, actor) = reset_account(&state, &headers, account_id, &query).await?;
+    let result = crate::upstream_quota::reset::recover(
+        &state,
+        &account,
+        &credential,
+        query.tenant_external_id.trim(),
+        &actor,
+        &operation_id.to_string(),
+    )
+    .await?;
     Ok(([(header::CACHE_CONTROL, "no-store")], Json(result)))
 }
 

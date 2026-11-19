@@ -7,6 +7,7 @@ use std::{
 
 use memeloop_token_center::{
     db::Database,
+    error::AppError,
     plugin::{PluginRuntime, memeloop::token_center::types::RequestContext},
     provider::ProviderCatalog,
 };
@@ -512,12 +513,17 @@ async fn fuel_exhaustion_and_guest_traps_fail_closed() {
         let plugins = directory.path().join("plugins");
         fs::create_dir(&plugins).unwrap();
         write_policy_package(&plugins, id, body);
-        let runtime = PluginRuntime::load(plugins.to_str(), database(directory.path()).await)
+        let mut runtime = PluginRuntime::load(plugins.to_str(), database(directory.path()).await)
             .expect("load failure fixture");
+        runtime.set_execution_limits_for_tests(Duration::from_secs(2), 1_000_000);
         let error = runtime
             .apply_traffic(context(), &json!({"model": "test"}))
             .expect_err("plugin failure must reject the request");
-        assert!(error.to_string().contains(id));
+        assert_eq!(
+            error.to_string(),
+            "configured upstream is unavailable: plugin_execution_failed",
+            "{id}"
+        );
     }
 }
 
@@ -553,14 +559,18 @@ async fn revision_policy_failures_open_only_their_own_circuit() {
         let decision = pinned
             .apply_traffic_with_config(context(), &json!({"model": "test"}), &BTreeMap::new())
             .unwrap();
-        assert!(!decision.allow);
-        assert!(format!("{decision:?}").contains("policy_execution_failed"));
+        assert!(decision.allow, "unavailable policy must fail open");
+        assert!(decision.request_json.is_none());
+        assert!(decision.model.is_none());
+        assert!(decision.upstream_account_id.is_none());
     }
     let decision = pinned
         .apply_traffic_with_config(context(), &json!({"model": "test"}), &BTreeMap::new())
         .unwrap();
-    assert!(!decision.allow);
-    assert!(format!("{decision:?}").contains("policy_circuit_open"));
+    assert!(decision.allow, "open circuit must fail open");
+    assert!(decision.request_json.is_none());
+    assert!(decision.model.is_none());
+    assert!(decision.upstream_account_id.is_none());
     assert!(revisions.replace(1, PluginRuntime::default()).is_err());
     fs::write(
         plugins.join("trap-policy/plugin.wasm"),
@@ -691,7 +701,10 @@ async fn epoch_timeout_interrupts_a_guest_even_with_effectively_unlimited_fuel()
     let error = runtime
         .apply_traffic(context(), &json!({"model": "test"}))
         .expect_err("execution timeout must reject the request");
-    assert!(error.to_string().contains("timeout-policy"));
+    assert_eq!(
+        error.to_string(),
+        "configured upstream is unavailable: plugin_execution_failed"
+    );
     assert!(
         started.elapsed() < Duration::from_secs(1),
         "epoch deadline was not enforced"
@@ -699,7 +712,7 @@ async fn epoch_timeout_interrupts_a_guest_even_with_effectively_unlimited_fuel()
 }
 
 #[tokio::test]
-async fn component_prepare_trap_fuel_and_32_mib_memory_limit_fail_closed() {
+async fn component_prepare_traps_and_explicit_test_fuel_fail_closed() {
     for (id, body) in [
         ("prepare-trap", "unreachable"),
         (
@@ -707,24 +720,17 @@ async fn component_prepare_trap_fuel_and_32_mib_memory_limit_fail_closed() {
             "(loop $forever (br $forever))\ni32.const 768",
         ),
         (
-            "prepare-memory",
-            r#"
-            i32.const 600
-            memory.grow
-            drop
-            i32.const 40000000
-            i32.load
-            drop
-            i32.const 768
-            "#,
+            "prepare-out-of-bounds",
+            "i32.const 600 memory.grow drop\ni32.const 40000000 i32.load drop\ni32.const 768",
         ),
     ] {
         let directory = tempfile::tempdir().unwrap();
         let plugins = directory.path().join("plugins");
         fs::create_dir(&plugins).unwrap();
         write_component_provider_package(&plugins, id, &core_wat_with_body("PREPARE", body), 1024);
-        let runtime = PluginRuntime::load(plugins.to_str(), database(directory.path()).await)
+        let mut runtime = PluginRuntime::load(plugins.to_str(), database(directory.path()).await)
             .expect("load component failure fixture");
+        runtime.set_execution_limits_for_tests(Duration::from_secs(2), 1_000_000);
         let error = runtime
             .prepare_provider_request(
                 &format!("{id}-provider"),
@@ -733,7 +739,11 @@ async fn component_prepare_trap_fuel_and_32_mib_memory_limit_fail_closed() {
                 &json!({"model": "test"}),
             )
             .expect_err("component failure must reject the request");
-        assert!(error.to_string().contains(id), "{id}: {error}");
+        assert_eq!(
+            error.to_string(),
+            "configured upstream is unavailable: plugin_execution_failed",
+            "{id}"
+        );
     }
 }
 
@@ -760,7 +770,10 @@ async fn component_prepare_epoch_deadline_fails_closed_with_unlimited_fuel() {
             &json!({"model": "test"}),
         )
         .expect_err("epoch timeout must reject component provider prepare");
-    assert!(error.to_string().contains("prepare-timeout"));
+    assert_eq!(
+        error.to_string(),
+        "configured upstream is unavailable: plugin_execution_failed"
+    );
     assert!(started.elapsed() < Duration::from_secs(1));
 }
 
@@ -798,19 +811,26 @@ async fn component_streaming_normalize_trap_and_oversize_boundaries_fail_closed(
     );
     let runtime = PluginRuntime::load(plugins.to_str(), database(directory.path()).await.clone())
         .expect("load normalize trap fixture");
-    assert!(
-        runtime
-            .normalize_provider_response(
-                "normalize-trap-provider",
-                context(),
-                200,
-                &BTreeMap::new(),
-                b"{}",
-            )
-            .expect_err("normalize trap must reject the response")
-            .to_string()
-            .contains("normalize-trap")
-    );
+    let error = runtime
+        .normalize_provider_response(
+            "normalize-trap-provider",
+            context(),
+            200,
+            &BTreeMap::new(),
+            b"normalize-response-secret",
+        )
+        .expect_err("normalize trap must reject the response");
+    assert!(matches!(
+        &error,
+        AppError::Upstream {
+            code: "plugin_execution_failed",
+            ..
+        }
+    ));
+    let text = error.to_string();
+    assert!(!text.contains("normalize-trap"));
+    assert!(!text.contains("normalize-response-secret"));
+    assert!(!text.contains(plugins.to_str().unwrap()));
 
     fs::remove_dir_all(&plugins).unwrap();
     fs::create_dir(&plugins).unwrap();
@@ -822,32 +842,32 @@ async fn component_streaming_normalize_trap_and_oversize_boundaries_fail_closed(
     );
     let runtime = PluginRuntime::load(plugins.to_str(), database(directory.path()).await)
         .expect("load oversize fixture");
-    assert!(
-        runtime
-            .normalize_provider_response(
-                "oversize-provider",
-                context(),
-                200,
-                &BTreeMap::new(),
-                b"nine-byte",
-            )
-            .expect_err("oversize upstream response must be rejected")
-            .to_string()
-            .contains("declared limit")
-    );
-    assert!(
-        runtime
-            .normalize_provider_response(
-                "oversize-provider",
-                context(),
-                200,
-                &BTreeMap::new(),
-                b"{}",
-            )
-            .expect_err("oversize normalized body must be rejected")
-            .to_string()
-            .contains("declared limit")
-    );
+    let error = runtime
+        .normalize_provider_response(
+            "oversize-provider",
+            context(),
+            200,
+            &BTreeMap::new(),
+            b"nine-byte",
+        )
+        .expect_err("oversize upstream response must be rejected");
+    assert!(matches!(
+        error,
+        AppError::Upstream {
+            code: "plugin_upstream_response_exceeds_its_declared_limit",
+            ..
+        }
+    ));
+    let error = runtime
+        .normalize_provider_response("oversize-provider", context(), 200, &BTreeMap::new(), b"{}")
+        .expect_err("oversize normalized body must be rejected");
+    assert!(matches!(
+        error,
+        AppError::Upstream {
+            code: "plugin_normalized_response_body_exceeds_its_declared_limit",
+            ..
+        }
+    ));
 }
 
 #[cfg(all(

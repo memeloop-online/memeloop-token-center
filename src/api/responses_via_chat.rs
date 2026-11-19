@@ -21,11 +21,34 @@ pub(in crate::api) fn prepare_with_dialect(
     // item is rejected as unsupported.
     translate_compaction: bool,
 ) -> Result<Context, AppError> {
-    let context = Context::with_dialect(request, dialect);
+    let (converted, context) =
+        prepare_owned_with_dialect(model, request.clone(), dialect, translate_compaction)?;
+    *request = converted;
+    Ok(context)
+}
+
+/// Routing already owns its candidate tree. Consume it so large input strings
+/// can become Chat content without an intermediate cloned Responses history.
+pub(in crate::api) fn prepare_owned_with_dialect(
+    model: &str,
+    request: Value,
+    dialect: ResponsesViaChatDialect,
+    translate_compaction: bool,
+) -> Result<(Value, Context), AppError> {
+    let context = Context::with_dialect(&request, dialect);
     let producer_unavailable = context.is_compaction()
         && dialect == ResponsesViaChatDialect::KimiV1
         && !translate_compaction;
-    let mut converted = super::kimi_transport::responses_request::convert_with_dialect(
+    let unavailable_index = producer_unavailable
+        .then(|| {
+            request["input"].as_array().and_then(|items| {
+                items
+                    .iter()
+                    .position(|item| item["type"] == "compaction_trigger")
+            })
+        })
+        .flatten();
+    let mut converted = super::kimi_transport::responses_request::convert_owned_with_dialect(
         request,
         dialect,
         translate_compaction || producer_unavailable,
@@ -46,23 +69,17 @@ pub(in crate::api) fn prepare_with_dialect(
         options.insert("include_usage".into(), Value::Bool(true));
     }
     if producer_unavailable {
-        if let Some((input_index, item)) = request["input"].as_array().and_then(|items| {
-            items
-                .iter()
-                .enumerate()
-                .find(|(_, item)| item["type"] == "compaction_trigger")
-        }) {
+        if let Some(index) = unavailable_index {
             super::kimi_transport::responses_request::report_input_rejection(
-                input_index,
-                item,
+                index,
+                &json!({"type":"compaction_trigger"}),
                 dialect,
                 false,
             );
         }
         return Err(AppError::CompactionProducerUnavailable);
     }
-    *request = converted;
-    Ok(context)
+    Ok((converted, context))
 }
 
 #[cfg(test)]

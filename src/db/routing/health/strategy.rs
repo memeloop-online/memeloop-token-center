@@ -2,6 +2,7 @@ use super::*;
 
 pub(crate) const TRANSIENT_EWMA_SCALE: i64 = 1_000_000;
 
+#[cfg(test)]
 const RECORD_TRANSIENT_HEALTH_SAMPLE_SQL: &str =
     "INSERT INTO group_routing_v2_transient_health_signals (
          upstream_account_id, credential_generation, policy_scope, sample_count,
@@ -129,6 +130,7 @@ impl Database {
     /// Persist one conclusive success/failure sample independently of circuit
     /// state. Cancelled and otherwise inconclusive attempts never call this
     /// method. The account generation and active status fence stale requests.
+    #[cfg(test)]
     pub(crate) async fn record_transient_health_sample(
         &self,
         upstream_account_id: Uuid,
@@ -148,6 +150,7 @@ impl Database {
         .await
     }
 
+    #[cfg(test)]
     pub(crate) async fn record_transient_health_sample_at(
         &self,
         upstream_account_id: Uuid,
@@ -162,12 +165,15 @@ impl Database {
             || !(1_000..=crate::plugin::routing::MAX_TRANSIENT_HEALTH_WINDOW_MS)
                 .contains(&window_ms)
         {
-            return Err(AppError::Internal);
+            return Err(AppError::internal(
+                "strategy_record_transient_health_sample_at_1",
+            ));
         }
         let window_ms = window_ms as i64;
         let window_started_at =
-            crate::plugin::routing::transient_health_window_start(now, window_ms as u64)
-                .ok_or(AppError::Internal)?;
+            crate::plugin::routing::transient_health_window_start(now, window_ms as u64).ok_or(
+                AppError::internal("strategy_record_transient_health_sample_at_2"),
+            )?;
         let sample = if transient_failure {
             TRANSIENT_EWMA_SCALE
         } else {
@@ -201,6 +207,7 @@ impl Database {
     /// A valid probe that has not yet met an explicitly active v2 recovery
     /// threshold releases only its exact lease. It leaves hard state intact
     /// and schedules the next bounded probe without replaying this request.
+    #[cfg(test)]
     pub(crate) async fn defer_upstream_account_probe_recovery_at_revision(
         &self,
         upstream_account_id: Uuid,

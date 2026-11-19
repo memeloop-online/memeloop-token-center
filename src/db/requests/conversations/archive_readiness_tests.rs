@@ -1,0 +1,2486 @@
+use super::*;
+use crate::{
+    AppState,
+    config::Config,
+    db::test_support::PostgresTestDatabase,
+    response_archive_spool::{self, BufferedArchive, BufferedArchivePurpose},
+};
+use bytes::Bytes;
+
+async fn fair_projection_queue_contract(database_url: String) {
+    let fixture = Fixture::new(database_url, true).await;
+    let db = &fixture.state.db;
+    sqlx::query("UPDATE conversation_projection_outbox SET projected_at = 1, statistics_outcome = NULL WHERE request_id = $1")
+        .bind(fixture.request_id.to_string()).execute(&db.pool).await.unwrap();
+    let mut fresh = Vec::new();
+    let mut retries = Vec::new();
+    let mut rebuilds = Vec::new();
+    for lane in 0..3 {
+        for index in 0..32 {
+            let id = Uuid::now_v7();
+            let terminal = lane != 2 && index % 2 == 0;
+            sqlx::query(
+                "INSERT INTO conversation_projection_outbox
+                 (request_id, tenant_id, key_id, principal_id, request_json, hints_json,
+                  observed_at, attempts, lease_owner, lease_expires_at,
+                  semantic_snapshot_json, statistics_outcome)
+                 SELECT $1, tenant_id, key_id, principal_id, request_json, hints_json,
+                    $2, $3, $4, $5, $6, $7
+                 FROM conversation_projection_outbox WHERE request_id = $8",
+            )
+            .bind(id.to_string())
+            // Historical work predates all new requests.
+            .bind(if lane == 0 { 1000_i64 + index } else { index })
+            .bind(if lane == 1 { 106950_i64 } else { 0 })
+            .bind(if lane == 2 {
+                Some(SESSION_BODY_REBUILD_LEASE_OWNER)
+            } else if terminal {
+                Some("terminal-v118")
+            } else {
+                None
+            })
+            .bind(if lane == 2 || terminal {
+                Some(i64::MAX)
+            } else {
+                None
+            })
+            .bind(if terminal { Some("{}") } else { None })
+            .bind(if lane == 2 {
+                Some(SESSION_BODY_REBUILD_OUTCOME)
+            } else {
+                None
+            })
+            .bind(fixture.request_id.to_string())
+            .execute(&db.pool)
+            .await
+            .unwrap();
+            match lane {
+                0 => fresh.push(id),
+                1 => retries.push(id),
+                _ => rebuilds.push(id),
+            }
+        }
+    }
+    assert_eq!(db.reopen_session_body_rebuilds(8).await.unwrap(), 0);
+    let owner = Uuid::now_v7();
+    let first = db
+        .claim_conversation_projection_tasks(owner, 32)
+        .await
+        .unwrap();
+    assert_eq!(first.len(), 32);
+    for (ids, expected) in [(&fresh, 16), (&retries, 8), (&rebuilds, 8)] {
+        assert_eq!(
+            first
+                .iter()
+                .filter(|task| ids.contains(&task.request_id))
+                .count(),
+            expected
+        );
+    }
+    let terminal_claims: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM conversation_projection_outbox WHERE terminal_lease_owner = $1",
+    )
+    .bind(owner.to_string())
+    .fetch_one(&db.pool)
+    .await
+    .unwrap();
+    assert_eq!(
+        terminal_claims, 12,
+        "terminal sentinels must sort by their terminal deadline, not their permanent primary lease"
+    );
+    let second = db
+        .claim_conversation_projection_tasks(Uuid::now_v7(), 32)
+        .await
+        .unwrap();
+    assert_eq!(second.len(), 32);
+    assert!(second.iter().all(|task| {
+        first
+            .iter()
+            .all(|prior| prior.request_id != task.request_id)
+    }));
+    for (ids, expected) in [(&fresh, 16), (&retries, 8), (&rebuilds, 8)] {
+        assert_eq!(
+            second
+                .iter()
+                .filter(|task| ids.contains(&task.request_id))
+                .count(),
+            expected
+        );
+    }
+    // With the first-attempt lane drained, its slots are borrowed.
+    let third = db
+        .claim_conversation_projection_tasks(Uuid::now_v7(), 32)
+        .await
+        .unwrap();
+    assert_eq!(third.len(), 32);
+    assert!(third.iter().all(|task| {
+        first
+            .iter()
+            .chain(&second)
+            .all(|prior| prior.request_id != task.request_id)
+    }));
+    assert!(
+        third
+            .iter()
+            .filter(|task| retries.contains(&task.request_id))
+            .count()
+            >= 8
+    );
+    assert!(
+        third
+            .iter()
+            .filter(|task| rebuilds.contains(&task.request_id))
+            .count()
+            >= 8
+    );
+
+    let retry = first
+        .iter()
+        .find(|task| retries.contains(&task.request_id))
+        .unwrap()
+        .request_id;
+    let before = unix_millis();
+    db.defer_session_body_archive(owner, retry).await.unwrap();
+    let deadline: i64 = sqlx::query_scalar("SELECT terminal_lease_expires_at FROM conversation_projection_outbox WHERE request_id = $1")
+        .bind(retry.to_string()).fetch_one(&db.pool).await.unwrap();
+    assert!(deadline >= before + 300000 && deadline <= unix_millis() + 300000);
+    // A stale worker cannot shorten the retry deadline or change its owner.
+    db.defer_session_body_archive(Uuid::now_v7(), retry)
+        .await
+        .unwrap();
+    assert_eq!(deadline, sqlx::query_scalar::<_, i64>("SELECT terminal_lease_expires_at FROM conversation_projection_outbox WHERE request_id = $1")
+        .bind(retry.to_string()).fetch_one(&db.pool).await.unwrap());
+    assert!(
+        db.claim_conversation_projection_tasks(Uuid::now_v7(), 32)
+            .await
+            .unwrap()
+            .is_empty()
+    );
+    let mut transaction = db.begin_write_transaction().await.unwrap();
+    wake_session_body_archive_in_transaction(&mut transaction, retry)
+        .await
+        .unwrap();
+    transaction.commit().await.unwrap();
+    let woken = db
+        .claim_conversation_projection_tasks(Uuid::now_v7(), 32)
+        .await
+        .unwrap();
+    assert_eq!(woken.len(), 1);
+    assert_eq!(woken[0].request_id, retry);
+
+    // Repeated reopen scans do not accumulate unclaimed historical tasks.
+    sqlx::query(
+        "UPDATE conversation_projection_outbox SET projected_at = 1 WHERE request_id <> $1",
+    )
+    .bind(fixture.request_id.to_string())
+    .execute(&db.pool)
+    .await
+    .unwrap();
+    assert_eq!(db.reopen_session_body_rebuilds(8).await.unwrap(), 1);
+    assert_eq!(db.reopen_session_body_rebuilds(8).await.unwrap(), 0);
+}
+
+#[tokio::test]
+async fn sqlite_projection_queue_fairness_and_source_retry_wake() {
+    let directory = tempfile::tempdir().unwrap();
+    fair_projection_queue_contract(format!(
+        "sqlite://{}?mode=rwc",
+        directory.path().join("fairness.db").display()
+    ))
+    .await;
+}
+
+#[tokio::test]
+async fn postgres_projection_queue_fairness_and_source_retry_wake() {
+    let database_url = std::env::var("MTC_TEST_POSTGRES_URL")
+        .expect("projection fairness PostgreSQL regression must not silently skip");
+    let isolated = PostgresTestDatabase::create(&database_url).await;
+    fair_projection_queue_contract(isolated.url().to_owned()).await;
+    isolated.cleanup().await;
+}
+
+#[tokio::test]
+async fn postgres_rebuild_replenishment_does_not_wait_for_another_worker() {
+    let database_url = std::env::var("MTC_TEST_POSTGRES_URL")
+        .expect("rebuild serialization regression requires PostgreSQL");
+    let isolated = PostgresTestDatabase::create(&database_url).await;
+    let fixture = Fixture::new(isolated.url().to_owned(), true).await;
+    let mut owner = fixture.state.db.pool.begin().await.unwrap();
+    sqlx::query("SELECT pg_advisory_xact_lock(82420261105)")
+        .execute(&mut *owner)
+        .await
+        .unwrap();
+    let replenished = tokio::time::timeout(
+        std::time::Duration::from_secs(2),
+        fixture.state.db.reopen_session_body_rebuilds(8),
+    )
+    .await
+    .expect("another replenisher must not block the worker")
+    .unwrap();
+    assert_eq!(replenished, 0);
+    owner.rollback().await.unwrap();
+    // The transaction-scoped lock is released and normal replenishment resumes.
+    fixture
+        .state
+        .db
+        .reopen_session_body_rebuilds(8)
+        .await
+        .unwrap();
+    drop(fixture);
+    isolated.cleanup().await;
+}
+
+struct Fixture {
+    state: AppState,
+    key: AuthenticatedKey,
+    request_id: Uuid,
+    identity: ArchiveSpoolIdentity,
+    source: Option<std::sync::Arc<crate::gateway_body::request_spool::RequestSpool>>,
+}
+
+async fn body_enrichment_preserves_relations(fixture: &Fixture) {
+    let short = serde_json::json!({"messages":[{"role":"user","content":"question"}]});
+    let long = serde_json::json!({"messages":[
+        {"role":"user","content":"question"},
+        {"role":"assistant","content":"answer"},
+        {"role":"user","content":"followup"}
+    ]});
+    for (name, first, second, reverse, compaction, expected) in [
+        ("prefix", &short, &long, false, false, "continues"),
+        ("reverse-prefix", &long, &short, true, false, "continues"),
+        ("compaction", &long, &short, false, true, "compacts"),
+    ] {
+        let mut results = Vec::new();
+        for pending in [false, true] {
+            let session = format!("{name}-{pending}");
+            let first_id = Uuid::now_v7();
+            let second_id = Uuid::now_v7();
+            let now = unix_millis();
+            let mut transaction = fixture.state.db.pool.begin().await.unwrap();
+            for (request_id, body, observed_at, compact) in [
+                (first_id, first, now + i64::from(reverse), false),
+                (second_id, second, now + i64::from(!reverse), compaction),
+            ] {
+                let hints = ConversationHints {
+                    session_id: Some(session.clone()),
+                    compaction: compact,
+                    ..Default::default()
+                };
+                let empty = serde_json::json!({});
+                let bodies = if pending && request_id == second_id {
+                    vec![&empty, body]
+                } else {
+                    vec![body]
+                };
+                for body in bodies {
+                    fixture
+                        .state
+                        .db
+                        .record_conversation_observation_with_snapshot_in_transaction(
+                            &mut transaction,
+                            ConversationObservationInput {
+                                key: &fixture.key,
+                                request_id,
+                                request_json: body,
+                                hints: &hints,
+                                client_name: Some("codex"),
+                                upstream_response_id: None,
+                                observed_at,
+                                attach_request_record: false,
+                                content_materialized: false,
+                            },
+                            None,
+                        )
+                        .await
+                        .unwrap();
+                }
+            }
+            transaction.commit().await.unwrap();
+            let edges = sqlx::query(
+                "SELECT e.relation_kind, a.request_id AS source_request FROM conversation_edges e JOIN conversation_observations a ON a.id = e.from_observation_id JOIN conversation_observations b ON b.id = e.to_observation_id WHERE a.explicit_session_id = $1 AND b.explicit_session_id = $1",
+            )
+            .bind(&session).fetch_all(&fixture.state.db.pool).await.unwrap();
+            assert_eq!(edges.len(), 1, "{name} pending={pending}");
+            results.push((
+                edges[0].get::<String, _>("relation_kind"),
+                edges[0].get::<String, _>("source_request") == first_id.to_string(),
+            ));
+            let count: i64 = sqlx::query_scalar(
+                "SELECT request_count FROM conversation_key_clusters WHERE key_id = $1 AND explicit_session_id = $2",
+            )
+            .bind(fixture.key.key_id.to_string()).bind(&session)
+            .fetch_one(&fixture.state.db.pool).await.unwrap();
+            assert_eq!(count, 2, "{name} pending={pending}");
+        }
+        assert_eq!(results[0], results[1], "{name} must survive early identity");
+        assert_eq!(results[1].0, expected);
+        assert_eq!(results[1].1, !reverse);
+    }
+}
+
+async fn declared_identity_before_body_contract(database_url: String) {
+    let malformed = Fixture::new(database_url.clone(), false).await;
+    sqlx::query("UPDATE conversation_projection_outbox SET hints_json = $1 WHERE request_id = $2")
+        .bind("{invalid hints")
+        .bind(malformed.request_id.to_string())
+        .execute(&malformed.state.db.pool)
+        .await
+        .unwrap();
+    let unclaimed = Fixture::new(database_url.clone(), false).await;
+    sqlx::query("UPDATE conversation_projection_outbox SET hints_json = $1 WHERE request_id = $2")
+        .bind(
+            serde_json::to_string(&ConversationHints {
+                session_id: Some("unclaimed-declared-thread".into()),
+                ..Default::default()
+            })
+            .unwrap(),
+        )
+        .bind(unclaimed.request_id.to_string())
+        .execute(&unclaimed.state.db.pool)
+        .await
+        .unwrap();
+    let unclaimed_before: (Option<String>, Option<i64>, i64, Option<String>, Option<i64>) =
+        sqlx::query_as("SELECT lease_owner, lease_expires_at, attempts, terminal_lease_owner, terminal_lease_expires_at FROM conversation_projection_outbox WHERE request_id = $1")
+            .bind(unclaimed.request_id.to_string()).fetch_one(&unclaimed.state.db.pool).await.unwrap();
+    assert_eq!(unclaimed_before.2, 0);
+    let fixture = Fixture::new(database_url, false).await;
+    body_enrichment_preserves_relations(&fixture).await;
+    let mut hints = ConversationHints {
+        session_id: Some("declared-client-thread".into()),
+        ..Default::default()
+    };
+    hints.labels.insert(
+        "mtc_session_identity_source".into(),
+        "header:thread-id".into(),
+    );
+    sqlx::query("UPDATE conversation_projection_outbox SET hints_json = $1 WHERE request_id = $2")
+        .bind(serde_json::to_string(&hints).unwrap())
+        .bind(fixture.request_id.to_string())
+        .execute(&fixture.state.db.pool)
+        .await
+        .unwrap();
+    let terminal_projected: i64 = sqlx::query_scalar(
+        "SELECT projected_at FROM terminal_projection_outbox WHERE request_id = $1",
+    )
+    .bind(fixture.request_id.to_string())
+    .fetch_one(&fixture.state.db.pool)
+    .await
+    .unwrap();
+    sqlx::query("UPDATE terminal_projection_outbox SET projected_at = NULL WHERE request_id = $1")
+        .bind(fixture.request_id.to_string())
+        .execute(&fixture.state.db.pool)
+        .await
+        .unwrap();
+    fixture
+        .state
+        .db
+        .project_declared_conversation_identities(None, 32)
+        .await
+        .unwrap();
+    let absent: i64 =
+        sqlx::query_scalar("SELECT COUNT(*) FROM conversation_observations WHERE request_id = $1")
+            .bind(fixture.request_id.to_string())
+            .fetch_one(&fixture.state.db.pool)
+            .await
+            .unwrap();
+    assert_eq!(absent, 0, "unprojected terminal cannot publish identity");
+    let unclaimed_after: (Option<String>, Option<i64>, i64, Option<String>, Option<i64>) =
+        sqlx::query_as("SELECT lease_owner, lease_expires_at, attempts, terminal_lease_owner, terminal_lease_expires_at FROM conversation_projection_outbox WHERE request_id = $1")
+            .bind(unclaimed.request_id.to_string()).fetch_one(&unclaimed.state.db.pool).await.unwrap();
+    assert_eq!(unclaimed_before, unclaimed_after);
+    let unclaimed_visible: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM conversation_observations WHERE request_id = $1 AND explicit_session_id = $2")
+        .bind(unclaimed.request_id.to_string()).bind("unclaimed-declared-thread").fetch_one(&unclaimed.state.db.pool).await.unwrap();
+    assert_eq!(
+        unclaimed_visible, 1,
+        "metadata progresses before any body claim"
+    );
+
+    sqlx::query("UPDATE terminal_projection_outbox SET projected_at = $1 WHERE request_id = $2")
+        .bind(terminal_projected)
+        .bind(fixture.request_id.to_string())
+        .execute(&fixture.state.db.pool)
+        .await
+        .unwrap();
+    let malformed_pending: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM conversation_projection_outbox WHERE request_id = $1 AND projected_at IS NULL AND attempts = 0")
+        .bind(malformed.request_id.to_string()).fetch_one(&fixture.state.db.pool).await.unwrap();
+    assert_eq!(
+        malformed_pending, 1,
+        "bad metadata remains retryable without blocking the next identity"
+    );
+
+    let owner = fixture.claim().await;
+    fixture
+        .state
+        .db
+        .project_claimed_conversation_identity(Uuid::now_v7(), fixture.request_id)
+        .await
+        .unwrap();
+    let before: i64 =
+        sqlx::query_scalar("SELECT COUNT(*) FROM conversation_observations WHERE request_id = $1")
+            .bind(fixture.request_id.to_string())
+            .fetch_one(&fixture.state.db.pool)
+            .await
+            .unwrap();
+    assert_eq!(before, 0, "stale worker cannot publish identity");
+    let lease_before: (Option<String>, Option<i64>, i64, Option<String>, Option<i64>) =
+        sqlx::query_as("SELECT lease_owner, lease_expires_at, attempts, terminal_lease_owner, terminal_lease_expires_at FROM conversation_projection_outbox WHERE request_id = $1")
+            .bind(fixture.request_id.to_string()).fetch_one(&fixture.state.db.pool).await.unwrap();
+    // Metadata publication does not call body/archive IO or claim its lease.
+    let cursor = fixture
+        .state
+        .db
+        .project_declared_conversation_identities(None, 32)
+        .await
+        .unwrap();
+    assert_eq!(
+        cursor.as_deref(),
+        Some(fixture.request_id.to_string().as_str())
+    );
+    fixture
+        .state
+        .db
+        .project_declared_conversation_identities(None, 32)
+        .await
+        .unwrap();
+    let lease_after: (Option<String>, Option<i64>, i64, Option<String>, Option<i64>) =
+        sqlx::query_as("SELECT lease_owner, lease_expires_at, attempts, terminal_lease_owner, terminal_lease_expires_at FROM conversation_projection_outbox WHERE request_id = $1")
+            .bind(fixture.request_id.to_string()).fetch_one(&fixture.state.db.pool).await.unwrap();
+    assert_eq!(
+        lease_before, lease_after,
+        "identity cannot take or release the body lease"
+    );
+    let pending: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM conversation_projection_outbox WHERE request_id = $1 AND projected_at IS NULL AND statistics_outcome IS NULL")
+        .bind(fixture.request_id.to_string()).fetch_one(&fixture.state.db.pool).await.unwrap();
+    assert_eq!(pending, 1, "identity does not acknowledge body completion");
+    assert!(
+        !crate::worker::archive_session_body(&fixture.state, owner, fixture.request_id)
+            .await
+            .unwrap()
+    );
+    let row = sqlx::query("SELECT o.id, o.cluster_id, o.explicit_session_id, o.leaf_node_hash, r.conversation_cluster_id FROM conversation_observations o JOIN request_records r ON r.id = o.request_id WHERE o.request_id = $1")
+        .bind(fixture.request_id.to_string()).fetch_one(&fixture.state.db.pool).await.unwrap();
+    assert_eq!(
+        row.get::<String, _>("explicit_session_id"),
+        "declared-client-thread"
+    );
+    assert_eq!(
+        row.get::<String, _>("cluster_id"),
+        row.get::<String, _>("conversation_cluster_id")
+    );
+    assert!(
+        row.get::<Option<String>, _>("leaf_node_hash").is_none(),
+        "identity publication must not invent body content"
+    );
+    let filtered = fixture
+        .state
+        .db
+        .source_history_list(&RequestListFilter {
+            limit: 10,
+            typed_ast: Some(crate::filter_ast::TypedFilterAst {
+                conditions: vec![crate::filter_ast::TypedFilterCondition {
+                    field: crate::filter_ast::TypedFilterField::ClientSessionId,
+                    operator: crate::filter_ast::TypedFilterOperator::Equals,
+                    value: crate::filter_ast::TypedFilterValue::Text(
+                        "declared-client-thread".into(),
+                    ),
+                    upper: None,
+                }],
+                ..Default::default()
+            }),
+            ..Default::default()
+        })
+        .await
+        .unwrap();
+    assert!(
+        filtered
+            .iter()
+            .any(|request| request.request_id == fixture.request_id)
+    );
+    let observation = row.get::<String, _>("id");
+    fixture.capture().await;
+    assert!(response_archive_spool::process_one_for_test(&fixture.state).await);
+    assert!(response_archive_spool::process_one_for_test(&fixture.state).await);
+    fixture.assert_completed(true).await;
+    let rows = sqlx::query(
+        "SELECT id, leaf_node_hash FROM conversation_observations WHERE request_id = $1",
+    )
+    .bind(fixture.request_id.to_string())
+    .fetch_all(&fixture.state.db.pool)
+    .await
+    .unwrap();
+    assert_eq!(rows.len(), 1);
+    assert_eq!(rows[0].get::<String, _>("id"), observation);
+    assert!(rows[0].get::<Option<String>, _>("leaf_node_hash").is_some());
+    let count: i64 = sqlx::query_scalar(
+        "SELECT request_count FROM conversation_key_clusters WHERE cluster_id = $1",
+    )
+    .bind(row.get::<String, _>("cluster_id"))
+    .fetch_one(&fixture.state.db.pool)
+    .await
+    .unwrap();
+    assert_eq!(count, 1, "body completion must not count identity twice");
+}
+
+#[tokio::test]
+async fn sqlite_declared_identity_is_readable_while_body_is_pending() {
+    let directory = tempfile::tempdir().unwrap();
+    declared_identity_before_body_contract(format!(
+        "sqlite://{}?mode=rwc",
+        directory.path().join("identity.db").display()
+    ))
+    .await;
+}
+
+#[tokio::test]
+async fn postgres_declared_identity_is_readable_while_body_is_pending() {
+    let url =
+        std::env::var("MTC_TEST_POSTGRES_URL").expect("identity regression requires CI PostgreSQL");
+    let isolated = PostgresTestDatabase::create(&url).await;
+    declared_identity_before_body_contract(isolated.url().to_owned()).await;
+    isolated.cleanup().await;
+}
+
+async fn seed_identity_page_task(fixture: &Fixture, id: Uuid, session: Option<&str>, ready: bool) {
+    let hints = serde_json::to_string(&ConversationHints {
+        session_id: session.map(str::to_owned),
+        ..Default::default()
+    })
+    .unwrap();
+    sqlx::query("INSERT INTO conversation_projection_outbox (request_id, tenant_id, key_id, principal_id, request_json, hints_json, observed_at, key_snapshot_json, semantic_snapshot_json, lease_owner, lease_expires_at) SELECT $1, tenant_id, key_id, principal_id, '{}', $2, observed_at, key_snapshot_json, semantic_snapshot_json, 'terminal-v118', 9223372036854775807 FROM conversation_projection_outbox WHERE request_id = $3")
+        .bind(id.to_string()).bind(hints).bind(fixture.request_id.to_string()).execute(&fixture.state.db.pool).await.unwrap();
+    sqlx::query("INSERT INTO terminal_projection_outbox (request_id, reservation_id, tenant_id, key_id, account_id, created_at, completed_at, model, protocol, status_code, error_code, upstream_account_id, model_route_id, duration_ms, input_tokens, output_tokens, cached_input_tokens, cache_write_tokens, generation_units, billing_unit, service_tier, currency, cost_micros, usage_basis, session_id, response_object, projected_at) SELECT $1, $2, tenant_id, key_id, account_id, created_at, completed_at, model, protocol, status_code, error_code, upstream_account_id, model_route_id, duration_ms, input_tokens, output_tokens, cached_input_tokens, cache_write_tokens, generation_units, billing_unit, service_tier, currency, cost_micros, usage_basis, session_id, response_object, $3 FROM terminal_projection_outbox WHERE request_id = $4")
+        .bind(id.to_string()).bind(Uuid::now_v7().to_string()).bind(ready.then_some(1_i64)).bind(fixture.request_id.to_string()).execute(&fixture.state.db.pool).await.unwrap();
+}
+
+async fn identity_page_scheduler_contract(database_url: String) {
+    let fixture = Fixture::new(database_url, false).await;
+    let db = &fixture.state.db;
+    let base = 0x00000000000070008000000000000000_u128;
+    let id = |offset: u128| Uuid::from_u128(base + offset);
+    for index in 0..64_u128 {
+        seed_identity_page_task(&fixture, id(index * 2), None, true).await;
+    }
+    let ready_later = id(64);
+    sqlx::query("UPDATE conversation_projection_outbox SET hints_json = $1 WHERE request_id = $2")
+        .bind(
+            serde_json::to_string(&ConversationHints {
+                session_id: Some("later-ready".into()),
+                ..Default::default()
+            })
+            .unwrap(),
+        )
+        .bind(ready_later.to_string())
+        .execute(&db.pool)
+        .await
+        .unwrap();
+    sqlx::query("UPDATE terminal_projection_outbox SET projected_at = NULL WHERE request_id = $1")
+        .bind(ready_later.to_string())
+        .execute(&db.pool)
+        .await
+        .unwrap();
+    sqlx::query(
+        "UPDATE conversation_projection_outbox SET hints_json = '{invalid' WHERE request_id = $1",
+    )
+    .bind(id(100).to_string())
+    .execute(&db.pool)
+    .await
+    .unwrap();
+    sqlx::query("UPDATE conversation_projection_outbox SET hints_json = $1 WHERE request_id = $2")
+        .bind(
+            serde_json::to_string(&ConversationHints {
+                session_id: Some("latest-ready".into()),
+                ..Default::default()
+            })
+            .unwrap(),
+        )
+        .bind(fixture.request_id.to_string())
+        .execute(&db.pool)
+        .await
+        .unwrap();
+    let mut cursor = db
+        .project_declared_conversation_identity_pages(None, None, 8)
+        .await
+        .unwrap();
+    let count = |request: Uuid| async move {
+        sqlx::query_scalar::<_, i64>(
+            "SELECT COUNT(*) FROM conversation_observations WHERE request_id = $1",
+        )
+        .bind(request.to_string())
+        .fetch_one(&db.pool)
+        .await
+        .unwrap()
+    };
+    assert_eq!(
+        count(fixture.request_id).await,
+        1,
+        "cold startup must publish the latest identity ahead of old ineligible pages"
+    );
+    let live = id(u128::MAX - base - 1);
+    seed_identity_page_task(&fixture, live, Some("new-live"), true).await;
+    let previous_history = cursor.1.clone();
+    cursor = db
+        .project_declared_conversation_identity_pages(cursor.0.as_deref(), cursor.1.as_deref(), 8)
+        .await
+        .unwrap();
+    assert_eq!(
+        count(live).await,
+        1,
+        "live lane must advance while history remains"
+    );
+    assert!(
+        cursor.1 < previous_history,
+        "an ineligible history page must advance"
+    );
+    // Arrives behind the history cursor: only a later wrap can discover it.
+    let late = id(125);
+    seed_identity_page_task(&fixture, late, Some("late-insert"), true).await;
+    for _ in 0..10 {
+        cursor = db
+            .project_declared_conversation_identity_pages(
+                cursor.0.as_deref(),
+                cursor.1.as_deref(),
+                8,
+            )
+            .await
+            .unwrap();
+    }
+    assert_eq!(count(ready_later).await, 0);
+    sqlx::query("UPDATE terminal_projection_outbox SET projected_at = 1 WHERE request_id = $1")
+        .bind(ready_later.to_string())
+        .execute(&db.pool)
+        .await
+        .unwrap();
+    for _ in 0..80 {
+        cursor = db
+            .project_declared_conversation_identity_pages(
+                cursor.0.as_deref(),
+                cursor.1.as_deref(),
+                8,
+            )
+            .await
+            .unwrap();
+    }
+    assert_eq!(count(late).await, 1, "history wrap must revisit late IDs");
+    assert_eq!(
+        count(ready_later).await,
+        1,
+        "later readiness must be retried without changing its body lease"
+    );
+    assert_eq!(count(id(100)).await, 0, "bad metadata remains isolated");
+    let unchanged: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM conversation_projection_outbox WHERE attempts <> 0 OR lease_owner <> 'terminal-v118' OR lease_expires_at <> 9223372036854775807 OR projected_at IS NOT NULL OR terminal_lease_owner IS NOT NULL OR terminal_lease_expires_at IS NOT NULL")
+        .fetch_one(&db.pool).await.unwrap();
+    assert_eq!(
+        unchanged, 0,
+        "metadata scheduling cannot consume body ownership"
+    );
+    assert_eq!(count(fixture.request_id).await, 1);
+    assert_eq!(count(live).await, 1);
+    if matches!(db.backend, DatabaseBackend::PostgreSql) {
+        let mut transaction = db.pool.begin().await.unwrap();
+        // Tiny test databases may prefer a sequential scan. This checks the
+        // bounded PK range is available, not the production optimizer choice
+        // (which is recorded separately from read-only production EXPLAIN).
+        sqlx::query("SET LOCAL enable_seqscan = off")
+            .execute(&mut *transaction)
+            .await
+            .unwrap();
+        let plan: Vec<String> = sqlx::query_scalar("EXPLAIN (COSTS OFF) SELECT request_id FROM conversation_projection_outbox WHERE request_id > $1 ORDER BY request_id ASC LIMIT $2")
+            .bind(id(40).to_string()).bind(4_i64).fetch_all(&mut *transaction).await.unwrap();
+        let plan = plan.join("\n");
+        assert!(
+            plan.contains("Limit") && plan.contains("conversation_projection_outbox_pkey"),
+            "ID page must support the PK range: {plan}"
+        );
+        assert!(!plan.contains("Join") && !plan.contains("conversation_observations"));
+        transaction.rollback().await.unwrap();
+    }
+}
+
+#[tokio::test]
+async fn sqlite_identity_scheduler_bounds_pages_and_revisits_delayed_evidence() {
+    let directory = tempfile::tempdir().unwrap();
+    identity_page_scheduler_contract(format!(
+        "sqlite://{}?mode=rwc",
+        directory.path().join("identity-pages.db").display()
+    ))
+    .await;
+}
+
+#[tokio::test]
+async fn postgres_identity_scheduler_bounds_pages_and_revisits_delayed_evidence() {
+    let url = std::env::var("MTC_TEST_POSTGRES_URL")
+        .expect("identity scheduler regression requires CI PostgreSQL");
+    let isolated = PostgresTestDatabase::create(&url).await;
+    identity_page_scheduler_contract(isolated.url().to_owned()).await;
+    isolated.cleanup().await;
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum ArchiveBeforeTerminal {
+    Pending,
+    Bound,
+    UnownedResponse,
+}
+
+impl Fixture {
+    async fn new(database_url: String, inline_request: bool) -> Self {
+        Self::new_with_protocol(database_url, inline_request, None).await
+    }
+
+    async fn new_with_protocol(
+        database_url: String,
+        inline_request: bool,
+        protocol: Option<&str>,
+    ) -> Self {
+        Self::new_with_source(database_url, inline_request, protocol, None).await
+    }
+
+    async fn new_with_source(
+        database_url: String,
+        inline_request: bool,
+        protocol: Option<&str>,
+        admission: Option<crate::gateway_body::request_spool::RequestSpoolAdmission>,
+    ) -> Self {
+        Self::new_with_source_order(
+            database_url,
+            inline_request,
+            protocol,
+            admission,
+            ArchiveBeforeTerminal::Pending,
+        )
+        .await
+    }
+
+    async fn new_with_source_order(
+        database_url: String,
+        inline_request: bool,
+        protocol: Option<&str>,
+        admission: Option<crate::gateway_body::request_spool::RequestSpoolAdmission>,
+        archive_before_terminal: ArchiveBeforeTerminal,
+    ) -> Self {
+        let mut state = AppState::initialize(Config::for_test(database_url))
+            .await
+            .unwrap();
+        if let Some(admission) = admission {
+            state.responses_request_spool = admission;
+        }
+        let unique = Uuid::now_v7().to_string();
+        let pepper = state.config.key_pepper.as_bytes();
+        let issued = state
+            .db
+            .create_key(
+                CreateKeyInput {
+                    tenant_external_id: unique.clone(),
+                    principal_external_id: "member".into(),
+                    alias: unique.clone(),
+                    currency: "USD".into(),
+                    policy: KeyPolicy::default(),
+                    initial_balance: Decimal::TEN,
+                    idempotency_key: None,
+                },
+                pepper,
+            )
+            .await
+            .unwrap();
+        let key = state
+            .db
+            .authenticate_key(&issued.key, pepper)
+            .await
+            .unwrap();
+        let price = state
+            .db
+            .upsert_model_price(&unique, "USD", Decimal::ONE, Decimal::ONE)
+            .await
+            .unwrap();
+        let request_id = Uuid::now_v7();
+        let memory = state.proxy_memory_budget.reservation();
+        let source = if protocol.is_some() {
+            let body = match protocol {
+                Some("openai-responses") => Bytes::from_static(br#"{"input":[{"role":"user","content":[{"type":"input_text","text":"archive question"}]}],"provider_secret_field":"kept only in original object"}"#),
+                _ => Bytes::from_static(br#"{"messages":[{"role":"user","content":"archive question"}],"provider_secret_field":"kept only in original object"}"#),
+            };
+            Some(std::sync::Arc::new(
+                state
+                    .responses_request_spool
+                    .capture_with_memory(
+                        axum::body::Body::from(body.clone()),
+                        body.len(),
+                        Some(body.len()),
+                        Some(&memory),
+                        0,
+                        Some(&request_id.to_string()),
+                    )
+                    .await
+                    .unwrap(),
+            ))
+        } else {
+            None
+        };
+        let request_locator = source
+            .as_ref()
+            .and_then(|source| source.object_locator())
+            .map(str::to_owned)
+            .unwrap_or_else(|| format!("gap://{request_id}/request"));
+        let response_locator = if source.is_some() {
+            let object = state.archive.put_tenant_content(
+                key.tenant_id,
+                Bytes::from_static(br#"{"choices":[{"message":{"role":"assistant","content":"archive assistant answer"},"finish_reason":"stop"}]}"#),
+            ).await.unwrap();
+            state
+                .archive
+                .publish_raw_capture(key.tenant_id, request_id, "response", &object)
+                .await
+                .unwrap();
+            object.object_locator
+        } else {
+            format!("gap://{request_id}/response")
+        };
+        let input = StartProxyRequest {
+            request_id,
+            key: &key,
+            price: &price,
+            input_token_ceiling: 10,
+            output_token_ceiling: 10,
+            protocol: protocol.unwrap_or("openai"),
+            model: &unique,
+            request_object: &request_locator,
+            upstream_account_id: None,
+            model_route_id: None,
+        };
+        let reservation = if let Some(source) = source.as_ref() {
+            let held = state.db.saturate_gateway_persistence_for_test().await;
+            let admitted = tokio::time::timeout(
+                std::time::Duration::from_secs(2),
+                state
+                    .db
+                    .start_proxy_request_with_source(input, source, None, Some(10)),
+            )
+            .await
+            .expect("source admission must not wait for the old archive queue")
+            .unwrap();
+            drop(held);
+            admitted.reservation
+        } else {
+            state.db.start_proxy_request(input).await.unwrap()
+        };
+        let identity = ArchiveSpoolIdentity {
+            request_id,
+            tenant_id: key.tenant_id,
+            reservation_id: reservation.id,
+        };
+        if archive_before_terminal == ArchiveBeforeTerminal::Bound {
+            for (purpose, body) in archive_bodies() {
+                assert!(
+                    response_archive_spool::capture_buffered(&state, identity, purpose, body).await
+                );
+            }
+            assert!(response_archive_spool::process_one_for_test(&state).await);
+            assert!(response_archive_spool::process_one_for_test(&state).await);
+        } else if archive_before_terminal == ArchiveBeforeTerminal::UnownedResponse {
+            sqlx::query(
+                "UPDATE request_records SET response_object = 'inline-json:{}' WHERE id = $1",
+            )
+            .bind(request_id.to_string())
+            .execute(&state.db.pool)
+            .await
+            .unwrap();
+        }
+        let request = if inline_request {
+            serde_json::json!({"messages": [{"role": "user", "content": "archive question"}]})
+        } else {
+            serde_json::json!({})
+        };
+        let hints = ConversationHints::default();
+        state
+            .db
+            .finish_proxy_request_deferred(FinishProxyRequest {
+                terminal_cause: None,
+                usage_basis: None,
+                first_output_ms: None,
+                generation_duration_ms: None,
+                request_id,
+                tenant_id: key.tenant_id,
+                reservation: &reservation,
+                input_token_ceiling: 10,
+                output_token_ceiling: 10,
+                requested_service_tier: None,
+                status_code: 200,
+                duration_ms: 10,
+                usage: TokenUsage {
+                    input_tokens: 1,
+                    output_tokens: 1,
+                    ..TokenUsage::default()
+                },
+                error_code: None,
+                response_object: &response_locator,
+                routing_session_id: None,
+                routing_terminal_observed_at: None,
+                conversation: Some(ProxyConversationInput {
+                    key: &key,
+                    request_json: &request,
+                    hints: &hints,
+                    client_name: None,
+                    upstream_response_id: None,
+                }),
+            })
+            .await
+            .unwrap();
+        let terminal_owner = Uuid::now_v7();
+        assert!(
+            state
+                .db
+                .claim_terminal_projection_tasks(terminal_owner, 32)
+                .await
+                .unwrap()
+                .contains(&request_id)
+        );
+        assert!(
+            state
+                .db
+                .project_claimed_terminal_projection_task(terminal_owner, request_id)
+                .await
+                .unwrap()
+        );
+        Self {
+            state,
+            key,
+            request_id,
+            identity,
+            source,
+        }
+    }
+
+    async fn claim(&self) -> Uuid {
+        sqlx::query("UPDATE conversation_projection_outbox SET terminal_lease_expires_at = 0 WHERE request_id = $1")
+            .bind(self.request_id.to_string()).execute(&self.state.db.pool).await.unwrap();
+        self.claim_ready().await
+    }
+
+    async fn claim_ready(&self) -> Uuid {
+        let owner = Uuid::now_v7();
+        assert!(
+            self.state
+                .db
+                .claim_conversation_projection_tasks(owner, 32)
+                .await
+                .unwrap()
+                .iter()
+                .any(|task| task.request_id == self.request_id)
+        );
+        owner
+    }
+
+    async fn assert_deferred(&self) -> Uuid {
+        let owner = self.claim().await;
+        let started_at = unix_millis();
+        assert!(
+            !crate::worker::archive_session_body(&self.state, owner, self.request_id)
+                .await
+                .unwrap()
+        );
+        let row = sqlx::query("SELECT lease_owner, lease_expires_at, terminal_lease_owner, terminal_lease_expires_at, projected_at, statistics_outcome, attempts FROM conversation_projection_outbox WHERE request_id = $1")
+            .bind(self.request_id.to_string()).fetch_one(&self.state.db.pool).await.unwrap();
+        assert_eq!(row.get::<String, _>("lease_owner"), "terminal-v118");
+        assert_eq!(row.get::<i64, _>("lease_expires_at"), i64::MAX);
+        assert!(
+            row.get::<Option<String>, _>("terminal_lease_owner")
+                .is_none()
+        );
+        // Repeated readiness deferrals follow the bounded retry contract from
+        // PR824; they do not reset every retry to the first-attempt delay.
+        let retry_delay = match row.get::<i64, _>("attempts") {
+            0 | 1 => 5_000,
+            2 => 10_000,
+            3 => 20_000,
+            4 => 40_000,
+            5 => 80_000,
+            6 => 160_000,
+            _ => 300_000,
+        };
+        let deadline = row.get::<i64, _>("terminal_lease_expires_at");
+        assert!(deadline >= started_at + retry_delay);
+        assert!(deadline <= unix_millis() + retry_delay);
+        assert!(row.get::<Option<i64>, _>("projected_at").is_none());
+        assert_ne!(
+            row.get::<Option<String>, _>("statistics_outcome")
+                .as_deref(),
+            Some("session_body")
+        );
+        let observations: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM conversation_observations WHERE request_id = $1",
+        )
+        .bind(self.request_id.to_string())
+        .fetch_one(&self.state.db.pool)
+        .await
+        .unwrap();
+        assert_eq!(observations, 0);
+        assert!(
+            self.state
+                .db
+                .claim_conversation_projection_tasks(Uuid::now_v7(), 32)
+                .await
+                .unwrap()
+                .is_empty()
+        );
+        owner
+    }
+
+    async fn capture(&self) {
+        for (purpose, body) in [
+            (BufferedArchivePurpose::Request, Bytes::from_static(br#"{"messages":[{"role":"user","content":"archive question"}]}"#)),
+            (BufferedArchivePurpose::Response, Bytes::from_static(br#"{"choices":[{"message":{"role":"assistant","content":"archive assistant answer"},"finish_reason":"stop"}]}"#)),
+        ] {
+            let archive = BufferedArchive::new(
+                self.identity,
+                purpose,
+                &body,
+                self.state.config.key_pepper.as_bytes(),
+                self.state.config.archive_spool_compression_enabled,
+            )
+            .unwrap();
+            let mut transaction = self.state.db.begin_write_transaction().await.unwrap();
+            assert!(
+                self.state
+                    .db
+                    .capture_buffered_archive_body_in_transaction(
+                        &mut transaction, unix_millis(), &archive, None,
+                    )
+                    .await
+                    .unwrap()
+            );
+            transaction.commit().await.unwrap();
+        }
+    }
+
+    async fn assert_completed(&self, assistant: bool) {
+        let owner = self.claim().await;
+        self.assert_completed_by(owner, assistant).await;
+    }
+
+    async fn assert_completed_by(&self, owner: Uuid, assistant: bool) {
+        assert!(
+            crate::worker::archive_session_body(&self.state, owner, self.request_id)
+                .await
+                .unwrap()
+        );
+        assert!(
+            !crate::worker::archive_session_body(&self.state, owner, self.request_id)
+                .await
+                .unwrap()
+        );
+        let leaf: String = sqlx::query_scalar(
+            "SELECT leaf_node_hash FROM conversation_observations WHERE request_id = $1",
+        )
+        .bind(self.request_id.to_string())
+        .fetch_one(&self.state.db.pool)
+        .await
+        .unwrap();
+        let turns = self
+            .state
+            .db
+            .export_training_dialogue(self.identity.tenant_id, &leaf)
+            .await
+            .unwrap();
+        let encoded = turns
+            .iter()
+            .flat_map(|turn| &turn.parts)
+            .map(serde_json::Value::to_string)
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(encoded.contains("archive question"), "{encoded}");
+        assert_eq!(
+            encoded.contains("archive assistant answer"),
+            assistant,
+            "{encoded}"
+        );
+        let events: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM request_events WHERE request_id = $1 AND event_kind = 'projected'")
+            .bind(self.request_id.to_string()).fetch_one(&self.state.db.pool).await.unwrap();
+        assert_eq!(events, 1);
+    }
+}
+
+async fn pending_archive_wake_contract(database_url: String) {
+    for bind_before_defer in [true, false] {
+        let fixture = Fixture::new(database_url.clone(), false).await;
+        let owner = fixture.claim_ready().await;
+        let pending = fixture
+            .state
+            .db
+            .session_body_locators(fixture.request_id)
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(pending.pending);
+        fixture.capture().await;
+        if bind_before_defer {
+            // The worker already read pending; both bind wakes now encounter
+            // its active claim and must leave that claim intact.
+            assert!(response_archive_spool::process_one_for_test(&fixture.state).await);
+            assert!(response_archive_spool::process_one_for_test(&fixture.state).await);
+            let stored_owner: String = sqlx::query_scalar(
+                "SELECT terminal_lease_owner FROM conversation_projection_outbox WHERE request_id = $1",
+            )
+            .bind(fixture.request_id.to_string())
+            .fetch_one(&fixture.state.db.pool)
+            .await
+            .unwrap();
+            assert_eq!(stored_owner, owner.to_string());
+            fixture
+                .state
+                .db
+                .defer_pending_session_body_archive(owner, fixture.request_id)
+                .await
+                .unwrap();
+        } else {
+            let before = unix_millis();
+            assert!(
+                !crate::worker::archive_session_body(&fixture.state, owner, fixture.request_id)
+                    .await
+                    .unwrap()
+            );
+            let row = sqlx::query("SELECT lease_owner, lease_expires_at, terminal_lease_owner, terminal_lease_expires_at FROM conversation_projection_outbox WHERE request_id = $1")
+                .bind(fixture.request_id.to_string()).fetch_one(&fixture.state.db.pool).await.unwrap();
+            assert_eq!(row.get::<String, _>("lease_owner"), "terminal-v118");
+            assert_eq!(row.get::<i64, _>("lease_expires_at"), i64::MAX);
+            assert!(
+                row.get::<Option<String>, _>("terminal_lease_owner")
+                    .is_none()
+            );
+            let expires_at = row.get::<i64, _>("terminal_lease_expires_at");
+            assert!(expires_at >= before + 5000);
+            assert!(expires_at <= unix_millis() + 5000);
+            assert!(
+                fixture
+                    .state
+                    .db
+                    .claim_conversation_projection_tasks(Uuid::now_v7(), 32)
+                    .await
+                    .unwrap()
+                    .is_empty(),
+                "still-pending archives must retain their retry backoff"
+            );
+            assert!(response_archive_spool::process_one_for_test(&fixture.state).await);
+            assert!(response_archive_spool::process_one_for_test(&fixture.state).await);
+        }
+        assert!(
+            !fixture
+                .state
+                .db
+                .session_body_locators(fixture.request_id)
+                .await
+                .unwrap()
+                .unwrap()
+                .pending
+        );
+        let row = sqlx::query("SELECT lease_owner, lease_expires_at, terminal_lease_owner, terminal_lease_expires_at FROM conversation_projection_outbox WHERE request_id = $1")
+            .bind(fixture.request_id.to_string()).fetch_one(&fixture.state.db.pool).await.unwrap();
+        assert_eq!(row.get::<String, _>("lease_owner"), "terminal-v118");
+        assert_eq!(row.get::<i64, _>("lease_expires_at"), i64::MAX);
+        assert!(
+            row.get::<Option<String>, _>("terminal_lease_owner")
+                .is_none()
+        );
+        assert!(
+            row.get::<Option<i64>, _>("terminal_lease_expires_at")
+                .is_none()
+        );
+        // Neither claim_ready nor assert_completed_by changes lease deadlines:
+        // reclaim must succeed immediately after the real archive binds.
+        let replacement = fixture.claim_ready().await;
+        let expires_at: i64 = sqlx::query_scalar(
+            "SELECT terminal_lease_expires_at FROM conversation_projection_outbox WHERE request_id = $1",
+        )
+        .bind(fixture.request_id.to_string())
+        .fetch_one(&fixture.state.db.pool)
+        .await
+        .unwrap();
+        fixture
+            .state
+            .db
+            .defer_pending_session_body_archive(owner, fixture.request_id)
+            .await
+            .unwrap();
+        let row = sqlx::query("SELECT terminal_lease_owner, terminal_lease_expires_at FROM conversation_projection_outbox WHERE request_id = $1")
+            .bind(fixture.request_id.to_string()).fetch_one(&fixture.state.db.pool).await.unwrap();
+        assert_eq!(
+            row.get::<String, _>("terminal_lease_owner"),
+            replacement.to_string()
+        );
+        assert_eq!(row.get::<i64, _>("terminal_lease_expires_at"), expires_at);
+        fixture.assert_completed_by(replacement, true).await;
+        let receipts: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM conversation_projection_outbox WHERE request_id = $1 AND projected_at IS NOT NULL AND statistics_outcome = 'session_body' AND COALESCE(semantic_payload_snapshot_json, semantic_snapshot_json) IS NOT NULL")
+            .bind(fixture.request_id.to_string()).fetch_one(&fixture.state.db.pool).await.unwrap();
+        assert_eq!(receipts, 1);
+        let observations: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM conversation_observations WHERE request_id = $1",
+        )
+        .bind(fixture.request_id.to_string())
+        .fetch_one(&fixture.state.db.pool)
+        .await
+        .unwrap();
+        assert_eq!(observations, 1);
+    }
+}
+
+#[tokio::test]
+async fn sqlite_pending_archive_defer_preserves_bind_wakes_and_claim_ownership() {
+    let directory = tempfile::tempdir().unwrap();
+    pending_archive_wake_contract(format!(
+        "sqlite://{}?mode=rwc",
+        directory.path().join("pending-wake.db").display()
+    ))
+    .await;
+}
+
+#[tokio::test]
+async fn postgres_pending_archive_defer_preserves_bind_wakes_and_claim_ownership() {
+    let database_url = std::env::var("MTC_TEST_POSTGRES_URL")
+        .expect("pending archive wake PostgreSQL regression must not silently skip");
+    // Projection advisory locks are database scoped, so a private schema
+    // still shares contention with other PostgreSQL regression tests.
+    let isolated = PostgresTestDatabase::create(&database_url).await;
+    pending_archive_wake_contract(isolated.url().to_owned()).await;
+    isolated.cleanup().await;
+}
+
+async fn readiness_contract(database_url: String) {
+    let fixture = Fixture::new(database_url, false).await;
+    let stale_owner = fixture.assert_deferred().await;
+    let replacement = fixture.claim().await;
+    fixture
+        .state
+        .db
+        .defer_session_body_archive(stale_owner, fixture.request_id)
+        .await
+        .unwrap();
+    let stored_owner: String = sqlx::query_scalar(
+        "SELECT terminal_lease_owner FROM conversation_projection_outbox WHERE request_id = $1",
+    )
+    .bind(fixture.request_id.to_string())
+    .fetch_one(&fixture.state.db.pool)
+    .await
+    .unwrap();
+    assert_eq!(stored_owner, replacement.to_string());
+    assert!(
+        !crate::worker::archive_session_body(&fixture.state, replacement, fixture.request_id)
+            .await
+            .unwrap()
+    );
+    fixture.capture().await;
+    fixture.assert_deferred().await;
+    for state in ["capturing", "uploading"] {
+        sqlx::query("UPDATE response_archive_spools SET state = $1, attempts = 10, lease_expires_at = $2 WHERE request_id = $3")
+            .bind(state).bind(unix_millis() + 60_000).bind(fixture.request_id.to_string())
+            .execute(&fixture.state.db.pool).await.unwrap();
+        fixture.assert_deferred().await;
+    }
+    sqlx::query("UPDATE response_archive_spools SET state = 'pending', attempts = 0, lease_expires_at = NULL WHERE request_id = $1")
+        .bind(fixture.request_id.to_string()).execute(&fixture.state.db.pool).await.unwrap();
+    assert!(response_archive_spool::process_one_for_test(&fixture.state).await);
+    fixture.assert_deferred().await;
+    assert!(response_archive_spool::process_one_for_test(&fixture.state).await);
+    fixture.assert_completed(true).await;
+}
+
+#[tokio::test]
+async fn sqlite_session_body_waits_for_capture_and_both_uploads() {
+    let directory = tempfile::tempdir().unwrap();
+    readiness_contract(format!(
+        "sqlite://{}?mode=rwc",
+        directory.path().join("readiness.db").display()
+    ))
+    .await;
+}
+
+#[tokio::test]
+async fn sqlite_final_archive_gap_keeps_request_turn() {
+    let directory = tempfile::tempdir().unwrap();
+    let fixture = Fixture::new(
+        format!(
+            "sqlite://{}?mode=rwc",
+            directory.path().join("gap.db").display()
+        ),
+        true,
+    )
+    .await;
+    fixture.capture().await;
+    // This fixture knows the original request. Persist those exact bytes;
+    // the empty SQL outbox cannot stand in for a missing original.
+    let object = fixture
+        .state
+        .archive
+        .put_tenant_content(
+            fixture.identity.tenant_id,
+            Bytes::from_static(br#"{"messages":[{"role":"user","content":"archive question"}]}"#),
+        )
+        .await
+        .unwrap();
+    fixture
+        .state
+        .archive
+        .publish_raw_capture(
+            fixture.identity.tenant_id,
+            fixture.request_id,
+            "request",
+            &object,
+        )
+        .await
+        .unwrap();
+    sqlx::query("UPDATE request_archive_spools SET state = 'gap' WHERE request_id = $1")
+        .bind(fixture.request_id.to_string())
+        .execute(&fixture.state.db.pool)
+        .await
+        .unwrap();
+    sqlx::query("UPDATE response_archive_spools SET state = 'gap' WHERE request_id = $1")
+        .bind(fixture.request_id.to_string())
+        .execute(&fixture.state.db.pool)
+        .await
+        .unwrap();
+    fixture.assert_completed(false).await;
+}
+
+#[tokio::test]
+async fn sqlite_missing_capture_never_becomes_final_from_elapsed_time() {
+    let directory = tempfile::tempdir().unwrap();
+    let fixture = Fixture::new(
+        format!(
+            "sqlite://{}?mode=rwc",
+            directory.path().join("missing.db").display()
+        ),
+        true,
+    )
+    .await;
+    fixture.assert_deferred().await;
+    sqlx::query("UPDATE request_records SET completed_at = $1 WHERE id = $2")
+        .bind(unix_millis() - super::super::super::archive_spool::CAPTURE_TTL - 1)
+        .bind(fixture.request_id.to_string())
+        .execute(&fixture.state.db.pool)
+        .await
+        .unwrap();
+    fixture.assert_deferred().await;
+}
+
+#[tokio::test]
+async fn postgres_session_body_waits_for_capture_and_both_uploads() {
+    let Ok(database_url) = std::env::var("MTC_TEST_POSTGRES_URL") else {
+        return;
+    };
+    // Projection advisory locks are database scoped, so a private schema
+    // still shares contention with other PostgreSQL regression tests.
+    let isolated = PostgresTestDatabase::create(&database_url).await;
+    readiness_contract(isolated.url().to_owned()).await;
+    isolated.cleanup().await;
+}
+
+async fn source_contract(database_url: String) {
+    for protocol in ["openai", "anthropic", "openai-responses"] {
+        let mut fixture =
+            Fixture::new_with_protocol(database_url.clone(), true, Some(protocol)).await;
+        let source = fixture.source.take().unwrap();
+        assert!(source.upload_outcome().await);
+        let locator = source.object_locator().unwrap().to_owned();
+        let original = fixture.state.archive.get(&locator).await.unwrap();
+        source.release_retained();
+        drop(source);
+        fixture.state.responses_request_spool.drain_uploads().await;
+        fixture.state.db.drain_gateway_persistence_for_test().await;
+        assert!(String::from_utf8_lossy(&original).contains("provider_secret_field"));
+        // Upload EOF precedes the independent metadata handoff. Drain the real
+        // writer before simulating deletion/restart, so it cannot recreate the
+        // metadata after the fixture removes it.
+        fixture.state.responses_request_spool.drain_uploads().await;
+        fixture
+            .state
+            .db
+            .record_request_source(
+                fixture.identity,
+                &locator,
+                original.len(),
+                *blake3::hash(&original).as_bytes(),
+                true,
+            )
+            .await
+            .unwrap();
+        sqlx::query("DELETE FROM request_archive_spools WHERE request_id = $1")
+            .bind(fixture.request_id.to_string())
+            .execute(&fixture.state.db.pool)
+            .await
+            .unwrap();
+        sqlx::query("DELETE FROM archive_staging_attempts WHERE attempt_id = $1")
+            .bind(fixture.request_id.to_string())
+            .execute(&fixture.state.db.pool)
+            .await
+            .unwrap();
+        let remaining: i64 = sqlx::query_scalar(
+            "SELECT (SELECT COUNT(*) FROM request_archive_spools WHERE request_id = $1)
+                  + (SELECT COUNT(*) FROM archive_staging_attempts WHERE attempt_id = $1)",
+        )
+        .bind(fixture.request_id.to_string())
+        .fetch_one(&fixture.state.db.pool)
+        .await
+        .unwrap();
+        assert_eq!(remaining, 0, "recovery must start without either binding");
+        sqlx::query("UPDATE request_records SET completed_at = $1 WHERE id = $2")
+            .bind(unix_millis() - 24 * 60 * 60 * 1000)
+            .bind(fixture.request_id.to_string())
+            .execute(&fixture.state.db.pool)
+            .await
+            .unwrap();
+        fixture.state.db = Database::connect_with_max(&database_url, 4)
+            .await
+            .unwrap()
+            .with_archive(fixture.state.archive.clone());
+        fixture.assert_completed(true).await;
+        let root = fixture
+            .state
+            .archive
+            .raw_capture_reference(fixture.identity.tenant_id, fixture.request_id, "request")
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(root.size_bytes, original.len() as u64);
+        assert_eq!(
+            root.blake3_digest,
+            blake3::hash(&original).to_hex().to_string()
+        );
+        assert_eq!(
+            fixture
+                .state
+                .archive
+                .get_tenant_content(fixture.identity.tenant_id, &root, original.len())
+                .await
+                .unwrap(),
+            original
+        );
+        let recreated: i64 =
+            sqlx::query_scalar("SELECT COUNT(*) FROM request_archive_spools WHERE request_id = $1")
+                .bind(fixture.request_id.to_string())
+                .fetch_one(&fixture.state.db.pool)
+                .await
+                .unwrap();
+        assert_eq!(
+            recreated, 0,
+            "immutable roots restore content without recreating retired spools"
+        );
+        let chunks: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM request_archive_spool_chunks WHERE request_id = $1",
+        )
+        .bind(fixture.request_id.to_string())
+        .fetch_one(&fixture.state.db.pool)
+        .await
+        .unwrap();
+        assert_eq!(chunks, 0);
+        let leaf: String = sqlx::query_scalar(
+            "SELECT leaf_node_hash FROM conversation_observations WHERE request_id = $1",
+        )
+        .bind(fixture.request_id.to_string())
+        .fetch_one(&fixture.state.db.pool)
+        .await
+        .unwrap();
+        let turns = fixture
+            .state
+            .db
+            .export_training_dialogue(fixture.identity.tenant_id, &leaf)
+            .await
+            .unwrap();
+        assert!(
+            turns
+                .iter()
+                .flat_map(|turn| &turn.parts)
+                .all(|part| !part.to_string().contains("provider_secret_field"))
+        );
+    }
+}
+
+async fn failed_source_metadata_contract(database_url: String) {
+    use crate::gateway_body::request_spool::{MemoryObjectStore, RequestSpoolAdmission};
+    use std::time::Duration;
+
+    let store = MemoryObjectStore::new();
+    store.fail_writes_for_test();
+    let release = store.pause_next_write();
+    let admission =
+        RequestSpoolAdmission::new(std::path::PathBuf::new()).with_memory_store(store.clone());
+    // Inject the metadata outage explicitly. Production now gives a healthy
+    // cold/queued connection ten seconds rather than failing within 250ms.
+    let mut fixture = Database::with_source_pool_timeout_for_test(
+        Duration::from_millis(250),
+        Fixture::new_with_source(database_url, true, Some("openai"), Some(admission)),
+    )
+    .await;
+    let source = fixture.source.take().unwrap();
+    let locator = source.object_locator().unwrap().to_owned();
+    tokio::time::timeout(Duration::from_secs(5), async {
+        loop {
+            let capturing: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM request_archive_spools WHERE request_id = $1 AND state = 'capturing'")
+                .bind(fixture.request_id.to_string()).fetch_one(&fixture.state.db.pool).await.unwrap();
+            if capturing == 1 {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+    }).await.expect("the real admitted request must have a live source writer");
+    fixture.assert_deferred().await;
+    let held = fixture
+        .state
+        .db
+        .hold_gateway_archive_connection_for_test()
+        .await;
+    release.send(()).unwrap();
+    assert!(
+        tokio::time::timeout(Duration::from_millis(300), source.upload_outcome())
+            .await
+            .is_err()
+    );
+    assert!(fixture.state.proxy_memory_budget.snapshot().0 > 0);
+    store.resume_writes_for_test(fixture.state.archive.clone());
+    assert!(source.upload_outcome().await);
+    source.release_retained();
+    drop(source);
+    tokio::time::timeout(Duration::from_secs(5), async {
+        while fixture.state.proxy_memory_budget.snapshot().0 != 0 {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("completed Put releases raw bytes while its metadata retries");
+    let pending: String =
+        sqlx::query_scalar("SELECT state FROM request_archive_spools WHERE request_id = $1")
+            .bind(fixture.request_id.to_string())
+            .fetch_one(&fixture.state.db.pool)
+            .await
+            .unwrap();
+    assert_eq!(pending, "capturing");
+    drop(held);
+    tokio::time::timeout(Duration::from_secs(5), async {
+        loop {
+            let state: String = sqlx::query_scalar(
+                "SELECT state FROM request_archive_spools WHERE request_id = $1",
+            )
+            .bind(fixture.request_id.to_string())
+            .fetch_one(&fixture.state.db.pool)
+            .await
+            .unwrap();
+            if state == "bound" {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("the retained outcome must retry without a replacement object");
+    let original = fixture.state.archive.get(&locator).await.unwrap();
+    assert!(
+        std::str::from_utf8(&original)
+            .unwrap()
+            .contains("provider_secret_field")
+    );
+    fixture.assert_completed(true).await;
+}
+
+async fn expired_live_source_writer_contract(database_url: String) {
+    use crate::gateway_body::request_spool::{MemoryObjectStore, RequestSpoolAdmission};
+    use std::time::Duration;
+
+    let store = MemoryObjectStore::new();
+    let release = store.pause_next_write();
+    let admission =
+        RequestSpoolAdmission::new(std::path::PathBuf::new()).with_memory_store(store.clone());
+    let mut fixture = Database::with_source_pool_timeout_for_test(
+        Duration::from_millis(250),
+        Fixture::new_with_source(database_url, true, Some("openai"), Some(admission)),
+    )
+    .await;
+    let source = fixture.source.take().unwrap();
+    let locator = source.object_locator().unwrap().to_owned();
+    let length = source.len();
+    let digest = source.digest();
+    tokio::time::timeout(Duration::from_secs(5), async {
+        loop {
+            let capturing: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM request_archive_spools WHERE request_id = $1 AND state = 'capturing'")
+                .bind(fixture.request_id.to_string()).fetch_one(&fixture.state.db.pool).await.unwrap();
+            if capturing == 1 {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    }).await.expect("the admitted source must register before its metadata outage");
+    let held = fixture
+        .state
+        .db
+        .hold_gateway_archive_connection_for_test()
+        .await;
+    sqlx::query("UPDATE archive_staging_attempts SET lease_expires_at = 0 WHERE attempt_id = $1 AND state = 'writing'")
+        .bind(fixture.request_id.to_string()).execute(&fixture.state.db.pool).await.unwrap();
+    drop(source);
+    let charged = fixture.state.proxy_memory_budget.snapshot().0;
+    assert!(
+        charged > 0,
+        "the pending Put still owns the raw bytes after request drop"
+    );
+    {
+        // Explicitly poll this writer's real heartbeat while its pool is held.
+        // The background writer may be between its normal 20-second ticks;
+        // a five-second assertion must not depend on that timer firing.
+        let (_outcome, receiver) = tokio::sync::watch::channel(None);
+        let heartbeat = fixture.state.db.wait_request_source_upload(
+            fixture.identity,
+            &locator,
+            length,
+            digest,
+            receiver,
+        );
+        tokio::pin!(heartbeat);
+        tokio::select! {
+            result = &mut heartbeat => panic!("pending source heartbeat unexpectedly ended: {result:?}"),
+            _ = tokio::time::sleep(Duration::from_millis(300)) => {}
+        }
+        assert!(
+            !release.is_closed(),
+            "metadata failure must retain the paused Put"
+        );
+        assert_eq!(fixture.state.proxy_memory_budget.snapshot().0, charged);
+        drop(held);
+        tokio::time::timeout(Duration::from_secs(5), async {
+            tokio::select! {
+                result = &mut heartbeat => panic!("pending source heartbeat unexpectedly ended: {result:?}"),
+                _ = async {
+                    loop {
+                        let expiry: i64 = sqlx::query_scalar("SELECT lease_expires_at FROM archive_staging_attempts WHERE attempt_id = $1 AND state = 'writing'")
+                            .bind(fixture.request_id.to_string()).fetch_one(&fixture.state.db.pool).await.unwrap();
+                        if expiry > unix_millis() {
+                            break;
+                        }
+                        tokio::time::sleep(Duration::from_millis(10)).await;
+                    }
+                } => {}
+            }
+        }).await.expect("the original writer must renew its expired lease before takeover");
+    }
+    assert!(
+        !release.is_closed(),
+        "renewal must keep the original Put alive"
+    );
+    assert_eq!(
+        fixture.state.proxy_memory_budget.snapshot().0,
+        charged,
+        "renewal must not release the raw budget before Put"
+    );
+    assert!(
+        !fixture
+            .state
+            .db
+            .recover_request_source(fixture.identity, &locator)
+            .await
+            .unwrap(),
+        "recovery must defer to the renewed live writer"
+    );
+    store.resume_writes_for_test(fixture.state.archive.clone());
+    release.send(()).unwrap();
+    tokio::time::timeout(Duration::from_secs(5), async {
+        loop {
+            let state: String = sqlx::query_scalar(
+                "SELECT state FROM request_archive_spools WHERE request_id = $1",
+            )
+            .bind(fixture.request_id.to_string())
+            .fetch_one(&fixture.state.db.pool)
+            .await
+            .unwrap();
+            if state == "bound" && fixture.state.proxy_memory_budget.snapshot().0 == 0 {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("the original Put must bind and release its raw budget");
+    let original = fixture.state.archive.get(&locator).await.unwrap();
+    assert_eq!(original.len(), length);
+    assert_eq!(*blake3::hash(&original).as_bytes(), digest);
+    assert!(
+        std::str::from_utf8(&original)
+            .unwrap()
+            .contains("provider_secret_field")
+    );
+    fixture.assert_completed(true).await;
+}
+
+async fn fenced_source_upload_contract(database_url: String) {
+    use crate::gateway_body::request_spool::{MemoryObjectStore, RequestSpoolAdmission};
+    use std::time::Duration;
+
+    let store = MemoryObjectStore::new();
+    let release = store.pause_next_write();
+    let admission =
+        RequestSpoolAdmission::new(std::path::PathBuf::new()).with_memory_store(store.clone());
+    let mut fixture =
+        Fixture::new_with_source(database_url, true, Some("openai"), Some(admission)).await;
+    let source = fixture.source.take().unwrap();
+    let locator = source.object_locator().unwrap().to_owned();
+    let length = source.len();
+    let digest = source.digest();
+    let (outcome, receiver) = tokio::sync::watch::channel(None);
+    // Register the actual owner while the only object-store Put is paused.
+    assert!(
+        tokio::time::timeout(
+            Duration::from_millis(500),
+            fixture.state.db.wait_request_source_upload(
+                fixture.identity,
+                &locator,
+                length,
+                digest,
+                receiver.clone(),
+            ),
+        )
+        .await
+        .is_err()
+    );
+    // Fencing schedules cleanup before a cleaner claims its own lease.
+    sqlx::query("UPDATE archive_staging_attempts SET state = 'cleanup_pending', lease_owner = NULL, lease_token = NULL, lease_expires_at = NULL, next_cleanup_at = updated_at WHERE attempt_id = $1")
+        .bind(fixture.request_id.to_string()).execute(&fixture.state.db.pool).await.unwrap();
+    assert!(
+        tokio::time::timeout(
+            Duration::from_millis(500),
+            fixture.state.db.wait_request_source_upload(
+                fixture.identity,
+                &locator,
+                length,
+                digest,
+                receiver.clone(),
+            ),
+        )
+        .await
+        .is_err(),
+        "a staging fence must keep waiting for the original Put"
+    );
+    let stage: String =
+        sqlx::query_scalar("SELECT state FROM archive_staging_attempts WHERE attempt_id = $1")
+            .bind(fixture.request_id.to_string())
+            .fetch_one(&fixture.state.db.pool)
+            .await
+            .unwrap();
+    assert_eq!(
+        stage, "cleanup_pending",
+        "heartbeat cannot reclaim the fence"
+    );
+    let wrong_owner = ArchiveSpoolIdentity {
+        reservation_id: Uuid::now_v7(),
+        ..fixture.identity
+    };
+    assert_eq!(
+        fixture
+            .state
+            .db
+            .wait_request_source_upload(wrong_owner, &locator, length, digest, receiver)
+            .await,
+        None,
+        "a different request reservation must still cancel its upload"
+    );
+    drop(outcome);
+    assert!(!release.is_closed());
+    assert!(fixture.state.proxy_memory_budget.snapshot().0 > 0);
+    store.resume_writes_for_test(fixture.state.archive.clone());
+    release.send(()).unwrap();
+    assert!(source.upload_outcome().await);
+    drop(source);
+    let original = fixture.state.archive.get(&locator).await.unwrap();
+    assert_eq!(original.len(), length);
+    assert_eq!(*blake3::hash(&original).as_bytes(), digest);
+    tokio::time::timeout(Duration::from_secs(5), async {
+        loop {
+            let state: String = sqlx::query_scalar(
+                "SELECT state FROM request_archive_spools WHERE request_id = $1",
+            )
+            .bind(fixture.request_id.to_string())
+            .fetch_one(&fixture.state.db.pool)
+            .await
+            .unwrap();
+            if state == "bound" {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("durable completion repairs the fenced metadata");
+    fixture.assert_completed(true).await;
+}
+
+async fn lost_source_writer_contract(database_url: String) {
+    use crate::gateway_body::request_spool::{MemoryObjectStore, RequestSpoolAdmission};
+    use std::time::Duration;
+
+    let store = MemoryObjectStore::new();
+    let release = store.pause_next_write();
+    let admission = RequestSpoolAdmission::new(std::path::PathBuf::new()).with_memory_store(store);
+    let mut fixture =
+        Fixture::new_with_source(database_url.clone(), true, Some("openai"), Some(admission)).await;
+    let source = fixture.source.take().unwrap();
+    let locator = source.object_locator().unwrap().to_owned();
+    tokio::time::timeout(Duration::from_secs(5), async {
+        loop {
+            let live: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM archive_staging_attempts WHERE attempt_id = $1 AND state = 'writing'")
+                .bind(fixture.request_id.to_string()).fetch_one(&fixture.state.db.pool).await.unwrap();
+            if live == 1 {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+    }).await.unwrap();
+    sqlx::query("UPDATE request_records SET completed_at = $1 WHERE id = $2")
+        .bind(unix_millis() - 24 * 60 * 60 * 1000)
+        .bind(fixture.request_id.to_string())
+        .execute(&fixture.state.db.pool)
+        .await
+        .unwrap();
+    fixture.assert_deferred().await;
+    assert!(
+        !fixture
+            .state
+            .db
+            .recover_request_source(fixture.identity, &locator)
+            .await
+            .unwrap()
+    );
+    source.abort_writer_for_test().await;
+    drop(source);
+    assert!(release.send(()).is_err());
+    sqlx::query("DELETE FROM request_archive_spools WHERE request_id = $1")
+        .bind(fixture.request_id.to_string())
+        .execute(&fixture.state.db.pool)
+        .await
+        .unwrap();
+    sqlx::query("DELETE FROM archive_staging_attempts WHERE attempt_id = $1")
+        .bind(fixture.request_id.to_string())
+        .execute(&fixture.state.db.pool)
+        .await
+        .unwrap();
+    assert!(
+        !fixture
+            .state
+            .db
+            .recover_request_source(fixture.identity, &locator)
+            .await
+            .unwrap(),
+        "missing registration must establish a fence, not declare an immediate gap"
+    );
+    sqlx::query("UPDATE archive_staging_attempts SET lease_expires_at = 0 WHERE attempt_id = $1 AND state = 'writing'")
+        .bind(fixture.request_id.to_string()).execute(&fixture.state.db.pool).await.unwrap();
+    fixture.state.db = Database::connect_with_max(&database_url, 4)
+        .await
+        .unwrap()
+        .with_archive(fixture.state.archive.clone());
+    assert!(fixture.state.archive.get(&locator).await.is_err());
+    let owner = fixture.claim().await;
+    assert!(
+        !crate::worker::archive_session_body(&fixture.state, owner, fixture.request_id)
+            .await
+            .unwrap()
+    );
+    let skipped: String = sqlx::query_scalar("SELECT semantic_snapshot_json FROM conversation_projection_outbox WHERE request_id = $1 AND projected_at IS NOT NULL")
+        .bind(fixture.request_id.to_string()).fetch_one(&fixture.state.db.pool).await.unwrap();
+    assert_eq!(
+        serde_json::from_str::<serde_json::Value>(&skipped).unwrap()["session_body_skip"],
+        "session_body_skipped_missing_source"
+    );
+    let observations: i64 =
+        sqlx::query_scalar("SELECT COUNT(*) FROM conversation_observations WHERE request_id = $1")
+            .bind(fixture.request_id.to_string())
+            .fetch_one(&fixture.state.db.pool)
+            .await
+            .unwrap();
+    assert_eq!(
+        observations, 0,
+        "an aborted original cannot become a fabricated training turn"
+    );
+    assert!(
+        fixture
+            .state
+            .archive
+            .raw_capture_failed(fixture.identity.tenant_id, fixture.request_id, "request")
+            .await
+            .unwrap()
+    );
+    assert!(
+        !fixture
+            .state
+            .db
+            .record_request_source_state(
+                fixture.identity,
+                &locator,
+                2,
+                *blake3::hash(b"{}").as_bytes(),
+                Some(true),
+                false,
+            )
+            .await
+            .unwrap()
+    );
+    let state: String =
+        sqlx::query_scalar("SELECT state FROM request_archive_spools WHERE request_id = $1")
+            .bind(fixture.request_id.to_string())
+            .fetch_one(&fixture.state.db.pool)
+            .await
+            .unwrap();
+    assert_eq!(state, "gap", "a fenced writer cannot resurrect the source");
+}
+
+#[tokio::test]
+async fn sqlite_source_failed_state_write_retries_and_lost_writer_converges() {
+    let directory = tempfile::tempdir().unwrap();
+    let database_url = format!(
+        "sqlite://{}?mode=rwc",
+        directory.path().join("source-failures.db").display()
+    );
+    failed_source_metadata_contract(database_url.clone()).await;
+    expired_live_source_writer_contract(database_url.clone()).await;
+    fenced_source_upload_contract(database_url.clone()).await;
+    lost_source_writer_contract(database_url).await;
+}
+
+#[tokio::test]
+async fn postgres_source_failed_state_write_retries_and_lost_writer_converges() {
+    let database_url = std::env::var("MTC_TEST_POSTGRES_URL")
+        .expect("source R2 PostgreSQL regression must not silently skip");
+    // Projection advisory locks are database scoped, so a private schema
+    // still shares contention with other PostgreSQL regression tests.
+    let isolated = PostgresTestDatabase::create(&database_url).await;
+    failed_source_metadata_contract(isolated.url().to_owned()).await;
+    expired_live_source_writer_contract(isolated.url().to_owned()).await;
+    fenced_source_upload_contract(isolated.url().to_owned()).await;
+    lost_source_writer_contract(isolated.url().to_owned()).await;
+    isolated.cleanup().await;
+}
+
+#[tokio::test]
+async fn sqlite_source_identity_recovers_after_request_drop_and_missing_binding() {
+    let directory = tempfile::tempdir().unwrap();
+    source_contract(format!(
+        "sqlite://{}?mode=rwc",
+        directory.path().join("source-recovery.db").display()
+    ))
+    .await;
+}
+
+#[tokio::test]
+async fn postgres_source_identity_recovers_after_request_drop_and_missing_binding() {
+    let Ok(database_url) = std::env::var("MTC_TEST_POSTGRES_URL") else {
+        return;
+    };
+    // Projection advisory locks are database scoped, so a private schema
+    // still shares contention with other PostgreSQL regression tests.
+    let isolated = PostgresTestDatabase::create(&database_url).await;
+    source_contract(isolated.url().to_owned()).await;
+    isolated.cleanup().await;
+}
+
+fn archive_bodies() -> [(BufferedArchivePurpose, Bytes); 2] {
+    [
+        (BufferedArchivePurpose::Request, Bytes::from_static(br#"{"messages":[{"role":"user","content":"archive question"}]}"#)),
+        (BufferedArchivePurpose::Response, Bytes::from_static(br#"{"choices":[{"message":{"role":"assistant","content":"archive assistant answer"},"finish_reason":"stop"}]}"#)),
+    ]
+}
+
+async fn terminal_archive_order_contract(database_url: String) {
+    for archive_before_terminal in [
+        ArchiveBeforeTerminal::Bound,
+        ArchiveBeforeTerminal::Pending,
+        ArchiveBeforeTerminal::UnownedResponse,
+    ] {
+        let fixture = Fixture::new_with_source_order(
+            database_url.clone(),
+            false,
+            None,
+            None,
+            archive_before_terminal,
+        )
+        .await;
+        if archive_before_terminal != ArchiveBeforeTerminal::Bound {
+            let locator: String =
+                sqlx::query_scalar("SELECT response_object FROM request_records WHERE id = $1")
+                    .bind(fixture.request_id.to_string())
+                    .fetch_one(&fixture.state.db.pool)
+                    .await
+                    .unwrap();
+            assert_eq!(locator, format!("gap://{}/response", fixture.request_id));
+            fixture.capture().await;
+            assert!(response_archive_spool::process_one_for_test(&fixture.state).await);
+            assert!(response_archive_spool::process_one_for_test(&fixture.state).await);
+        }
+        let row = sqlx::query(
+            "SELECT request_object, response_object FROM request_records WHERE id = $1",
+        )
+        .bind(fixture.request_id.to_string())
+        .fetch_one(&fixture.state.db.pool)
+        .await
+        .unwrap();
+        for ((purpose, expected), field) in archive_bodies()
+            .into_iter()
+            .zip(["request_object", "response_object"])
+        {
+            let locator = row.get::<String, _>(field);
+            assert!(!locator.starts_with("gap://"), "{field}: {locator}");
+            let actual = fixture.state.archive.get(&locator).await.unwrap();
+            assert_eq!(actual.as_ref(), expected.as_ref(), "{purpose:?}");
+            assert_eq!(blake3::hash(&actual), blake3::hash(&expected));
+        }
+        fixture.assert_completed(true).await;
+        let effects = sqlx::query("SELECT (SELECT COUNT(*) FROM ledger_entries WHERE source = $1 AND kind = 'usage') AS settlements, (SELECT COUNT(*) FROM request_events WHERE request_id = $2 AND event_kind = 'finished') AS finishes")
+            .bind(fixture.identity.reservation_id.to_string()).bind(fixture.request_id.to_string())
+            .fetch_one(&fixture.state.db.pool).await.unwrap();
+        assert_eq!(effects.get::<i64, _>("settlements"), 1);
+        assert_eq!(effects.get::<i64, _>("finishes"), 1);
+
+        // A delayed source completion must not allocate an event cursor after
+        // the financial terminal has closed its request owner.
+        let cursors_before: i64 =
+            sqlx::query_scalar("SELECT COUNT(*) FROM request_event_locators WHERE request_id = $1")
+                .bind(fixture.request_id.to_string())
+                .fetch_one(&fixture.state.db.pool)
+                .await
+                .unwrap();
+        fixture
+            .state
+            .db
+            .publish_proxy_started_event(fixture.identity)
+            .await
+            .unwrap();
+        let cursors_after: i64 =
+            sqlx::query_scalar("SELECT COUNT(*) FROM request_event_locators WHERE request_id = $1")
+                .bind(fixture.request_id.to_string())
+                .fetch_one(&fixture.state.db.pool)
+                .await
+                .unwrap();
+        assert_eq!(cursors_after, cursors_before);
+        let orphaned: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM request_event_locators locator LEFT JOIN request_events event ON event.event_id = locator.id AND event.event_at = locator.created_at WHERE locator.request_id = $1 AND event.event_id IS NULL")
+            .bind(fixture.request_id.to_string()).fetch_one(&fixture.state.db.pool).await.unwrap();
+        assert_eq!(orphaned, 0);
+    }
+}
+
+#[tokio::test]
+async fn sqlite_archive_binding_and_financial_terminal_preserve_bodies_in_both_orders() {
+    let directory = tempfile::tempdir().unwrap();
+    terminal_archive_order_contract(format!(
+        "sqlite://{}?mode=rwc",
+        directory.path().join("terminal-order.db").display()
+    ))
+    .await;
+}
+
+#[tokio::test]
+async fn postgres_archive_binding_and_financial_terminal_preserve_bodies_in_both_orders() {
+    let database_url = std::env::var("MTC_TEST_POSTGRES_URL")
+        .expect("archive terminal ordering PostgreSQL regression requires its CI database");
+    let isolated = PostgresTestDatabase::create(&database_url).await;
+    terminal_archive_order_contract(isolated.url().to_owned()).await;
+    isolated.cleanup().await;
+}
+
+async fn semantic_coverage_committed_recovery_contract(database_url: String) {
+    for fault in ["projection_commit_ack", "coverage_put"] {
+        let fixture = Fixture::new(database_url.clone(), true).await;
+        fixture.capture().await;
+        // Commit both original raw publications through their real owners
+        // before exercising the separate semantic projection boundary.
+        assert!(response_archive_spool::process_one_for_test(&fixture.state).await);
+        assert!(response_archive_spool::process_one_for_test(&fixture.state).await);
+        let owner = fixture.claim().await;
+        let result = Database::with_semantic_coverage_fault(
+            fault,
+            crate::worker::archive_session_body(&fixture.state, owner, fixture.request_id),
+        )
+        .await;
+        assert!(
+            result.is_err(),
+            "fault must occur after the actual SQL commit: {fault}"
+        );
+        let db = &fixture.state.db;
+        let before: (i64, String, String) = sqlx::query_as(
+            "SELECT p.projected_at, p.lease_owner, o.leaf_node_hash FROM conversation_projection_outbox p JOIN conversation_observations o ON o.request_id=p.request_id WHERE p.request_id=$1"
+        ).bind(fixture.request_id.to_string()).fetch_one(&db.pool).await.unwrap();
+        assert_eq!(before.1, "semantic-coverage-v2");
+        let snapshot: String = sqlx::query_scalar(
+            "SELECT semantic_snapshot_json FROM conversation_projection_outbox WHERE request_id=$1",
+        )
+        .bind(fixture.request_id.to_string())
+        .fetch_one(&db.pool)
+        .await
+        .unwrap();
+        let snapshot: serde_json::Value = serde_json::from_str(&snapshot).unwrap();
+        let publication: crate::archive::SemanticPublication =
+            serde_json::from_value(snapshot["semantic_coverage_pending"].clone()).unwrap();
+        let receipt = format!(
+            "tenants/{}/semantic/v2/requests/{}/{}-coverage.json",
+            fixture.key.tenant_id, fixture.request_id, publication.revision
+        );
+        assert!(fixture.state.archive.get(&receipt).await.is_err());
+        // Recovery itself can fail without losing the durable obligation.
+        assert!(
+            Database::with_semantic_coverage_fault("coverage_put", db.recover_semantic_coverage())
+                .await
+                .is_err()
+        );
+        let retained: String = sqlx::query_scalar(
+            "SELECT lease_owner FROM conversation_projection_outbox WHERE request_id=$1",
+        )
+        .bind(fixture.request_id.to_string())
+        .fetch_one(&db.pool)
+        .await
+        .unwrap();
+        assert_eq!(retained, "semantic-coverage-v2");
+        db.recover_semantic_coverage().await.unwrap();
+        assert!(
+            !fixture
+                .state
+                .archive
+                .get(&receipt)
+                .await
+                .unwrap()
+                .is_empty()
+        );
+        let after: (i64, Option<String>, String) = sqlx::query_as(
+            "SELECT p.projected_at, p.lease_owner, o.leaf_node_hash FROM conversation_projection_outbox p JOIN conversation_observations o ON o.request_id=p.request_id WHERE p.request_id=$1"
+        ).bind(fixture.request_id.to_string()).fetch_one(&db.pool).await.unwrap();
+        assert_eq!(
+            (after.0, &after.2),
+            (before.0, &before.2),
+            "recovery must not reproject the leaf or SQL acknowledgement"
+        );
+        assert_eq!(after.1.as_deref(), Some("semantic-raw-retire-v1"));
+        // An unrelated global carrier receipt is deliberately unreadable as
+        // ownership metadata. Logical retirement must not enumerate that
+        // namespace, and must leave its bytes/cleanup responsibility untouched.
+        let unrelated_owner = "carrier-owners/v1/unrelated-incomplete-owner.json";
+        fixture
+            .state
+            .archive
+            .put(
+                unrelated_owner,
+                Bytes::from_static(b"unrelated active owner"),
+            )
+            .await
+            .unwrap();
+        // The root replacement really commits, then its ACK is lost. The
+        // original outbox remains a retryable owner of the exact retirement.
+        assert!(
+            Database::with_semantic_coverage_fault(
+                "raw_retirement_marker_ack",
+                db.recover_semantic_raw_retirement()
+            )
+            .await
+            .is_err()
+        );
+        let retained: Option<String> = sqlx::query_scalar(
+            "SELECT lease_owner FROM conversation_projection_outbox WHERE request_id=$1",
+        )
+        .bind(fixture.request_id.to_string())
+        .fetch_one(&db.pool)
+        .await
+        .unwrap();
+        assert_eq!(retained.as_deref(), Some("semantic-raw-retire-v1"));
+        db.recover_semantic_raw_retirement().await.unwrap();
+        let retired: Option<String> = sqlx::query_scalar(
+            "SELECT lease_owner FROM conversation_projection_outbox WHERE request_id=$1",
+        )
+        .bind(fixture.request_id.to_string())
+        .fetch_one(&db.pool)
+        .await
+        .unwrap();
+        assert!(retired.is_none());
+        assert_eq!(
+            fixture.state.archive.get(unrelated_owner).await.unwrap(),
+            Bytes::from_static(b"unrelated active owner")
+        );
+        let manifest = fixture
+            .state
+            .archive
+            .get_semantic_manifest_streamed(fixture.key.tenant_id, &publication.manifest)
+            .await
+            .unwrap();
+        let sources = manifest.raw_sources.unwrap();
+        for (side, source) in [
+            ("request", sources.request),
+            ("response", sources.response.unwrap()),
+        ] {
+            assert!(
+                fixture
+                    .state
+                    .archive
+                    .raw_capture_reference(fixture.key.tenant_id, fixture.request_id, side)
+                    .await
+                    .unwrap()
+                    .is_none()
+            );
+            assert!(matches!(
+                fixture
+                    .state
+                    .archive
+                    .settle_raw_capture(fixture.key.tenant_id, fixture.request_id, side, &source)
+                    .await
+                    .unwrap(),
+                crate::archive::RawPublicationSettlement::Retired { .. }
+            ));
+            // This is reference retirement only. Shared physical CAS remains
+            // protected until its independent history/read/publication GC proof.
+            fixture
+                .state
+                .archive
+                .verify_tenant_content(fixture.key.tenant_id, &source)
+                .await
+                .unwrap();
+        }
+        db.recover_semantic_coverage().await.unwrap();
+        assert!(
+            !crate::worker::archive_session_body(&fixture.state, owner, fixture.request_id)
+                .await
+                .unwrap()
+        );
+    }
+}
+
+#[tokio::test]
+async fn sqlite_semantic_coverage_recovers_committed_projection_and_failed_put() {
+    let directory = tempfile::tempdir().unwrap();
+    semantic_coverage_committed_recovery_contract(format!(
+        "sqlite://{}?mode=rwc",
+        directory.path().join("coverage.db").display()
+    ))
+    .await;
+}
+
+#[tokio::test]
+async fn postgres_semantic_coverage_recovers_committed_projection_and_failed_put() {
+    let url = std::env::var("MTC_TEST_POSTGRES_URL")
+        .expect("semantic coverage recovery requires real PostgreSQL");
+    let isolated = PostgresTestDatabase::create(&url).await;
+    semantic_coverage_committed_recovery_contract(isolated.url().to_owned()).await;
+    isolated.cleanup().await;
+}
+
+struct CoverageWorkerGuard {
+    request: Uuid,
+    gate: std::sync::Arc<(tokio::sync::Notify, tokio::sync::Notify)>,
+    worker: tokio::task::AbortHandle,
+}
+impl Drop for CoverageWorkerGuard {
+    fn drop(&mut self) {
+        Database::clear_coverage_read_gate_for_test(self.request);
+        self.gate.1.notify_one();
+        self.worker.abort();
+    }
+}
+
+async fn coverage_read_does_not_block_body_worker_contract(database_url: String) {
+    let historical = Fixture::new(database_url.clone(), true).await;
+    historical.capture().await;
+    assert!(response_archive_spool::process_one_for_test(&historical.state).await);
+    assert!(response_archive_spool::process_one_for_test(&historical.state).await);
+    let owner = historical.claim().await;
+    assert!(
+        Database::with_semantic_coverage_fault(
+            "projection_commit_ack",
+            crate::worker::archive_session_body(&historical.state, owner, historical.request_id),
+        )
+        .await
+        .is_err()
+    );
+    let mut fresh = Fixture::new(database_url, true).await;
+    // Both tasks use exactly the same backing objects, without delaying any
+    // reads belonging to the fresh request.
+    fresh.state.archive = historical.state.archive.clone();
+    fresh.state.db = fresh
+        .state
+        .db
+        .clone()
+        .with_archive(fresh.state.archive.clone());
+    fresh.capture().await;
+    assert!(response_archive_spool::process_one_for_test(&fresh.state).await);
+    assert!(response_archive_spool::process_one_for_test(&fresh.state).await);
+    sqlx::query(
+        "UPDATE conversation_projection_outbox SET terminal_lease_expires_at=0 WHERE request_id=$1",
+    )
+    .bind(fresh.request_id.to_string())
+    .execute(&fresh.state.db.pool)
+    .await
+    .unwrap();
+    let gate = Database::gate_coverage_read_for_test(historical.request_id);
+    let (stop, shutdown) = tokio::sync::watch::channel(false);
+    let worker = tokio::spawn(crate::worker::run_until_shutdown(
+        fresh.state.clone(),
+        shutdown,
+    ));
+    let _cleanup = CoverageWorkerGuard {
+        request: historical.request_id,
+        gate: gate.clone(),
+        worker: worker.abort_handle(),
+    };
+    tokio::time::timeout(std::time::Duration::from_secs(10), gate.0.notified())
+        .await
+        .expect("the real worker must enter historical manifest recovery");
+    tokio::time::timeout(std::time::Duration::from_secs(10), async {
+        loop {
+            let projected: Option<i64> = sqlx::query_scalar(
+                "SELECT projected_at FROM conversation_projection_outbox WHERE request_id=$1",
+            )
+            .bind(fresh.request_id.to_string())
+            .fetch_one(&fresh.state.db.pool)
+            .await
+            .unwrap();
+            if projected.is_some() {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+    })
+    .await
+    .expect("eligible body must complete while historical GET is blocked");
+    let attempts: i64 = sqlx::query_scalar(
+        "SELECT attempts FROM conversation_projection_outbox WHERE request_id=$1",
+    )
+    .bind(fresh.request_id.to_string())
+    .fetch_one(&fresh.state.db.pool)
+    .await
+    .unwrap();
+    assert_eq!(
+        attempts, 1,
+        "one projection owner must claim the fresh body"
+    );
+    gate.1.notify_one();
+    tokio::time::timeout(std::time::Duration::from_secs(10), async {
+        loop {
+            let owner: Option<String> = sqlx::query_scalar(
+                "SELECT lease_owner FROM conversation_projection_outbox WHERE request_id=$1",
+            )
+            .bind(historical.request_id.to_string())
+            .fetch_one(&fresh.state.db.pool)
+            .await
+            .unwrap();
+            if owner.as_deref() != Some("semantic-coverage-v2") {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+    })
+    .await
+    .expect("historical recovery must resume after release");
+    stop.send(true).unwrap();
+    tokio::time::timeout(std::time::Duration::from_secs(30), worker)
+        .await
+        .unwrap()
+        .unwrap();
+}
+
+#[tokio::test]
+async fn postgres_coverage_read_does_not_block_body_worker() {
+    let url = std::env::var("MTC_TEST_POSTGRES_URL").expect("requires CI PostgreSQL");
+    let isolated = PostgresTestDatabase::create(&url).await;
+    coverage_read_does_not_block_body_worker_contract(isolated.url().to_owned()).await;
+    isolated.cleanup().await;
+}
+
+#[tokio::test]
+async fn sqlite_admission_event_precedes_queued_archive_and_preserves_raw_body() {
+    let directory = tempfile::tempdir().unwrap();
+    queued_archive_event_contract(format!(
+        "sqlite://{}?mode=rwc",
+        directory.path().join("event-archive.db").display()
+    ))
+    .await;
+}
+
+#[tokio::test]
+async fn postgres_admission_event_precedes_queued_archive_and_preserves_raw_body() {
+    let url = std::env::var("MTC_TEST_POSTGRES_URL")
+        .expect("PostgreSQL archive event contract requires its service");
+    let isolated = PostgresTestDatabase::create(&url).await;
+    queued_archive_event_contract(isolated.url().to_owned()).await;
+    isolated.cleanup().await;
+}
+
+async fn queued_archive_event_contract(url: String) {
+    let fixture = Fixture::new(url, true).await;
+    let state = &fixture.state;
+    let price = state
+        .db
+        .upsert_model_price("queued-event-model", "USD", Decimal::ONE, Decimal::ONE)
+        .await
+        .unwrap();
+    let request_id = Uuid::now_v7();
+    let raw = Bytes::from_static(br#"{ "model": "queued-event-model", "messages": [{"role":"user","content":"full raw body retained"}], "custom": {"preserve":true} }"#);
+    let gate = state.db.saturate_gateway_persistence_for_test().await;
+    let request_locator = format!("gap://{request_id}/request");
+    let started = tokio::time::timeout(
+        std::time::Duration::from_secs(5),
+        state.db.start_proxy_request_with_deferred_archive(
+            StartProxyRequest {
+                request_id,
+                key: &fixture.key,
+                price: &price,
+                input_token_ceiling: 10,
+                output_token_ceiling: 10,
+                protocol: "openai",
+                model: "queued-event-model",
+                request_object: &request_locator,
+                upstream_account_id: None,
+                model_route_id: None,
+            },
+            &raw,
+            state.config.key_pepper.as_bytes(),
+            false,
+            None,
+            Some(10),
+        ),
+    )
+    .await
+    .expect("admission and started event are independent of queued archive permits")
+    .unwrap();
+    assert_eq!(started.archive_admission, RequestArchiveAdmission::Queued);
+    let tenant_external_id: String =
+        sqlx::query_scalar("SELECT external_id FROM tenants WHERE id = $1")
+            .bind(fixture.key.tenant_id.to_string())
+            .fetch_one(&state.db.pool)
+            .await
+            .unwrap();
+    let events = state
+        .db
+        .request_events_after(&tenant_external_id, 0, None, 500)
+        .await
+        .unwrap();
+    let event = events
+        .iter()
+        .find(|event| event.request_id == request_id)
+        .expect("the real deferred archive admission publishes started before its capture runs");
+    assert_eq!(event.event_kind, "started");
+    assert!(event.status_code.is_none());
+    let locator: String =
+        sqlx::query_scalar("SELECT request_object FROM request_records WHERE id = $1")
+            .bind(request_id.to_string())
+            .fetch_one(&state.db.pool)
+            .await
+            .unwrap();
+    assert_eq!(locator, request_locator);
+    drop(gate);
+    state.db.drain_gateway_persistence_for_test().await;
+    let locator = tokio::time::timeout(std::time::Duration::from_secs(10), async {
+        loop {
+            let locator: String =
+                sqlx::query_scalar("SELECT request_object FROM request_records WHERE id = $1")
+                    .bind(request_id.to_string())
+                    .fetch_one(&state.db.pool)
+                    .await
+                    .unwrap();
+            if !locator.starts_with("gap://") {
+                break locator;
+            }
+            response_archive_spool::process_one_for_test(state).await;
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("releasing archive capacity preserves the complete queued request");
+    assert_eq!(
+        state.archive.get(&locator).await.unwrap().as_ref(),
+        raw.as_ref()
+    );
+}

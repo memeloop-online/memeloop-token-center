@@ -47,8 +47,7 @@ async fn postgres_archive_lock_isolation(lock_request_chunks: bool) {
                     "reservation_token_bounds": {upstream_model.clone(): 64},
                     "transport_policy": {
                         "version": 1,
-                        "candidate_attempts": 1,
-                        "failover_deadline_millis": 1000
+                        "candidate_attempts": 1
                     }
                 }),
                 credential: UpstreamCredential::OAuth {
@@ -205,6 +204,7 @@ async fn postgres_archive_lock_isolation(lock_request_chunks: bool) {
     .await
     .expect("bounded PostgreSQL archive drain");
 
+    state.drain_proxy_tasks().await;
     state.db.close().await;
     holder_pool.close().await;
     sqlx::query(sqlx::AssertSqlSafe(format!("DROP SCHEMA {schema} CASCADE")))

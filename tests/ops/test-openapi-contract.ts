@@ -15,6 +15,77 @@ const repository = resolve(dirname(fileURLToPath(import.meta.url)), "../..");
 const originalDocument = parse(readFileSync(`${repository}/openapi/openapi.yaml`, "utf8")) as Obj;
 const cloneDocument = (): Obj => structuredClone(originalDocument) as Obj;
 
+// Evaluate the JSON Schema keywords used by the health payload contract.
+// This validates values (including negative cases), not only document parity.
+function healthPayloadMatches(document: Obj, schema: Obj, value: any): boolean {
+  if (schema.$ref) return healthPayloadMatches(document, document.components.schemas[schema.$ref.split("/").at(-1)], value);
+  if (schema.allOf && !schema.allOf.every((part: Obj) => healthPayloadMatches(document, part, value))) return false;
+  if (schema.anyOf && !schema.anyOf.some((part: Obj) => healthPayloadMatches(document, part, value))) return false;
+  if (schema.not && healthPayloadMatches(document, schema.not, value)) return false;
+  if (schema.enum && !schema.enum.includes(value)) return false;
+  if (schema.type) {
+    const types = Array.isArray(schema.type) ? schema.type : [schema.type];
+    const type = value === null ? "null" : Array.isArray(value) ? "array" : typeof value;
+    if (!types.includes(type) && !(type === "number" && Number.isInteger(value) && types.includes("integer"))) return false;
+  }
+  if (typeof value === "number" && ((schema.minimum !== undefined && value < schema.minimum) || (schema.maximum !== undefined && value > schema.maximum))) return false;
+  if (typeof value === "string" && schema.format === "uuid" && !/^[0-9a-f]{8}(?:-[0-9a-f]{4}){3}-[0-9a-f]{12}$/iu.test(value)) return false;
+  if (value !== null && typeof value === "object" && !Array.isArray(value)) {
+    if (schema.required?.some((key: string) => !(key in value))) return false;
+    if (schema.additionalProperties === false && Object.keys(value).some(key => !(key in (schema.properties ?? {})))) return false;
+    for (const [key, child] of Object.entries(schema.properties ?? {})) {
+      if (key in value && !healthPayloadMatches(document, child as Obj, value[key])) return false;
+    }
+  }
+  return true;
+}
+
+test("health GET and POST payloads validate against both published contracts", () => {
+  const jsonDocument = JSON.parse(readFileSync(`${repository}/openapi/openapi.json`, "utf8"));
+  const path = "/internal/v1/upstreams/{account_id}/health";
+  for (const name of ["UpstreamHealthResult", "UpstreamProbeAttempt", "UpstreamProbeResult"]) {
+    assert.deepEqual(jsonDocument.components.schemas[name], originalDocument.components.schemas[name]);
+  }
+  assert.deepEqual(jsonDocument.paths[path], originalDocument.paths[path]);
+  const healthy = {
+    account_id: "00000000-0000-0000-0000-000000000001", status: "healthy",
+    source: "model_probe", checked_at: 1002, started_at: 1000, trigger: "manual",
+    credential_generation: 7, transport_revision: 999, selected_model: "exact",
+    actual_model: "exact", request_id: "00000000-0000-0000-0000-000000000002",
+    error_code: null, upstream_status: 200, latency_ms: 2, status_origin: "provider",
+  };
+  const failed = { ...healthy, status: "unhealthy", error_code: "quota_exhausted", upstream_status: 429, reset_at: null, reset_source: "unknown" };
+  const skipped = { ...healthy, status: "skipped", error_code: "probe_admission_skipped", actual_model: null, upstream_status: null, status_origin: "mtc" };
+  const disabled = { account_id: healthy.account_id, status: "skipped", source: "model_probe", error_code: "probe_account_unavailable", checked_at: 1003 };
+  const legacy = { account_id: healthy.account_id, status: "unknown", source: "legacy_unverified", checked_at: 1, historical_result: { status: "healthy", error_code: null, latency_ms: 17, checked_at: 1 }, last_attempt: null };
+  for (const document of [originalDocument, jsonDocument]) {
+    const get = document.paths[path].get.responses["200"].content["application/json"].schema;
+    const post = document.paths[path].post.responses["200"].content["application/json"].schema;
+    for (const payload of [healthy, failed, skipped, disabled]) assert.ok(healthPayloadMatches(document, post, payload));
+    for (const payload of [null, legacy, { ...healthy, last_attempt: healthy }, { ...skipped, last_result: healthy }, { ...skipped, last_result: null }]) {
+      assert.ok(healthPayloadMatches(document, get, payload), JSON.stringify(payload));
+    }
+    for (const payload of [
+      { ...healthy, upstream_status: 99 },
+      { ...failed, error_code: "raw provider message" },
+      { ...healthy, credential: "must not be exposed" },
+      { ...skipped, last_result: skipped },
+      { ...healthy, last_attempt: { ...healthy, last_attempt: healthy } },
+    ]) assert.equal(healthPayloadMatches(document, get, payload), false);
+  }
+});
+
+test("accepted reset readback uses the existing fresh-read interface without a second consume", () => {
+  const source = readFileSync(`${repository}/src/upstream_quota/reset.rs`, "utf8");
+  const confirm = source.slice(source.indexOf("pub(crate) async fn confirm("), source.indexOf("pub(crate) async fn reconcile("));
+  assert.equal(confirm.match(/dispatch_once\(/gu)?.length, 1);
+  const accepted = confirm.slice(confirm.indexOf("if accepted {"));
+  assert.match(accepted, /\.read_fresh\(\s*state,\s*account,\s*credential,\s*tenant,\s*QuotaReadTrigger::ResetWorkflow/su);
+  assert.doesNotMatch(accepted, /fresh_snapshot\(|dispatch_once\(/u);
+  assert.match(confirm, /let dispatch_credential = &selection.credential/u);
+  assert.doesNotMatch(confirm, /let credential = &selection.credential/u);
+});
+
 test("statistics cache metadata matches the serialized Rust coverage contract", () => {
   const schemas = cloneDocument().components.schemas;
   assert.ok(schemas.StatisticsSummary.required.includes("cache_usage"));
@@ -225,7 +296,18 @@ test("overview usage trends is an exact minimal projection of the full query con
   const trends = document.paths["/internal/v1/usage-analysis/trends"].get;
   assert.deepEqual(trends.security, full.security);
   assert.equal(trends["x-required-scope"], full["x-required-scope"]);
-  assert.deepEqual(trends.parameters, full.parameters);
+  const sharedParameters = (operation: Obj) => operation.parameters.filter((parameter: Obj) => parameter.name !== "projection");
+  assert.deepEqual(sharedParameters(trends), sharedParameters(full));
+  for (const [operation, values] of [
+    [full, ["full", "overview", "trends", "dimensions", "sessions", "heatmap", "output_rate"]],
+    [trends, ["full", "trends"]],
+  ] as const) {
+    const projections = operation.parameters.filter((parameter: Obj) => parameter.name === "projection");
+    assert.equal(projections.length, 1, "each endpoint declares exactly one projection selector");
+    assert.equal(projections[0].in, "query");
+    assert.equal(projections[0].required, false);
+    assert.deepEqual(projections[0].schema, { type: "string", enum: values, default: "full" });
+  }
   assert.equal(trends.responses["200"].content["application/json"].schema.$ref, "#/components/schemas/UsageAnalysisTrends");
   const schema = document.components.schemas.UsageAnalysisTrends;
   const expected = ["from_created_at", "to_created_at", "granularity", "time_zone", "p95_is_approximate", "p95_method", "summary", "time_series"];
@@ -451,7 +533,98 @@ test("image quarantine reconciliation never implies successful delivery or a res
 });
 
 // Discovery embeds the generated JSON; keep it semantically equal to YAML.
+test("session context contracts expose bounded signed reads and separate title execution authority", () => {
+  const document = cloneDocument();
+  for (const prefix of ["/internal/v1", "/self/v1"]) {
+    const base = `${prefix}/sessions/{session_id}/requests/{request_id}/context`;
+    for (const suffix of ["", "/content"]) {
+      const operation = document.paths[base + suffix].get;
+      assert.deepEqual(operation.security, prefix === "/internal/v1" ? [{ serviceBearer: [] }] : [{ clientBearer: [] }]);
+      assert.equal(operation["x-required-scope"], prefix === "/internal/v1" ? "requests:read" : undefined);
+      assert.equal(operation.responses["200"].content["application/json"].schema.$ref,
+        `#/components/schemas/${suffix ? "SessionContextContent" : "SessionContextPage"}`);
+      assert.ok(operation.responses["404"]);
+      assert.ok(operation.responses["409"]);
+    }
+  }
+  const title = document.paths["/internal/v1/sessions/{session_id}/title"];
+  assert.equal(title.get["x-required-scope"], "requests:read");
+  assert.equal(title.post["x-required-scope"], "filter_assistant:execute");
+  assert.deepEqual(title.post["x-additional-required-scopes"], ["requests:read"]);
+  const schemas = document.components.schemas;
+  assert.equal(schemas.SessionContextPage.properties.items.maxItems, 32);
+  assert.equal(schemas.SessionContextContent.properties.content.maxLength, 16384);
+  assert.deepEqual(schemas.SessionContextContent.properties.representation.enum, ["semantic_context", "message_text"]);
+  assert.equal(schemas.SessionGeneratedTitle.properties.title.maxLength, 80);
+  assert.ok(schemas.SessionContextItem.required.includes("text_cursor"));
+});
+
 test("runtime discovery JSON matches the canonical OpenAPI contract", () => {
   const embedded = JSON.parse(readFileSync(new URL("../../openapi/openapi.json", import.meta.url), "utf8"));
   assert.deepEqual(embedded, cloneDocument());
+});
+
+test("request execution completion remains distinct from unknown financial settlement", () => {
+  const schemas = cloneDocument().components.schemas;
+  const summary = schemas.RequestSummary;
+  assert.deepEqual(summary.properties.operational_terminal.oneOf, [
+    { $ref: "#/components/schemas/RequestOperationalTerminal" },
+    { type: "null" },
+  ]);
+  // RequestEvent shares RequestSummary but does not publish this observation.
+  // Do not accidentally require an unimplemented operational SSE projection.
+  assert.ok(!summary.required.includes("operational_terminal"));
+  assert.deepEqual(schemas.RequestEvent.allOf[0], { $ref: "#/components/schemas/RequestSummary" });
+  assert.deepEqual(schemas.RequestDetail.allOf[0], { $ref: "#/components/schemas/RequestSummary" });
+  assert.deepEqual(schemas.RequestEvent.allOf[1].properties.event_kind.enum,
+    ["started", "finished", "projected", "archive_bound", "archive_gap"]);
+  const terminal = schemas.RequestOperationalTerminal;
+  assert.equal(terminal.additionalProperties, false);
+  assert.deepEqual(terminal.required, ["completed_at", "stage", "financial_state"]);
+  assert.deepEqual(Object.keys(terminal.properties).sort(), [...terminal.required].sort());
+  assert.equal(terminal.properties.completed_at.type, "integer");
+  assert.equal(terminal.properties.completed_at.format, "int64");
+  assert.deepEqual(terminal.properties.stage.type, ["string", "null"]);
+  assert.deepEqual(terminal.properties.stage.enum,
+    ["upstream_response_headers", "upstream_response_body", "response_delivery", "buffered_response_ready", null]);
+  assert.equal(terminal.properties.financial_state.$ref, "#/components/schemas/RequestFinancialState");
+  assert.deepEqual(schemas.RequestFinancialState.enum, ["pending", "unknown", "applied"]);
+  assert.deepEqual(summary.properties.completed_at.type, ["integer", "null"]);
+  assert.match(summary.properties.completed_at.description, /May remain null after execution/u);
+  assert.match(schemas.RequestFinancialState.description, /does not imply zero usage or zero cost/u);
+  assert.deepEqual(summary.properties.cost.oneOf, [{ $ref: "#/components/schemas/Money" }, { type: "null" }]);
+  assert.deepEqual(schemas.RequestBilling.properties.cost.oneOf,
+    [{ $ref: "#/components/schemas/Money" }, { type: "null" }]);
+  assert.deepEqual(schemas.RequestUsage.properties.tokens.oneOf,
+    [{ $ref: "#/components/schemas/RequestTokenUsage" }, { type: "null" }]);
+  // Execution metadata must not expose the private claim, receipt, or locator.
+  for (const field of ["receipt_id", "fence", "owner_token", "contract_digest", "response_object", "usage", "cost"]) {
+    assert.ok(!(field in terminal.properties));
+  }
+  assert.deepEqual(summary.properties.failure_diagnostic.oneOf,
+    [{ $ref: "#/components/schemas/RequestFailureDiagnostic" }, { type: "null" }]);
+  const diagnostic = schemas.RequestFailureDiagnostic;
+  assert.deepEqual(diagnostic.required, ["stage", "source", "reason"]);
+  assert.equal(diagnostic.additionalProperties, false);
+  assert.ok(diagnostic.properties.reason.enum.includes("client_disconnected"));
+  assert.deepEqual(diagnostic.properties.reason.enum,
+    summary.properties.terminal_cause_code.enum.filter((value: unknown) => value !== null));
+  assert.deepEqual(diagnostic.properties.stage.enum,
+    ["pre_admission", ...terminal.properties.stage.enum]);
+});
+
+
+test("operator Responses declares SSE without relaxing other inference transports", () => {
+  const document = cloneDocument();
+  const responses = document.paths["/internal/v1/inference/responses"].post;
+  assert.deepEqual(responses.requestBody.content["application/json"].schema.properties.request.properties.stream, { type: "boolean" });
+  assert.ok(responses.responses["200"].content["application/json"]);
+  assert.deepEqual(responses.responses["200"].content["text/event-stream"].schema, { type: "string" });
+  assert.deepEqual(responses.security, [{ serviceBearer: [] }]);
+  assert.equal(responses["x-required-scope"], "keys:write");
+  for (const path of ["/internal/v1/inference/chat/completions", "/internal/v1/inference/messages"]) {
+    const operation = document.paths[path].post;
+    assert.deepEqual(operation.requestBody.content["application/json"].schema.properties.request.properties.stream, { type: "boolean", const: false });
+    assert.equal(operation.responses["200"].content["text/event-stream"], undefined);
+  }
 });

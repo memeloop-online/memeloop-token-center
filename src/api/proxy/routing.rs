@@ -5,11 +5,18 @@ mod admission;
 mod anthropic;
 mod candidates;
 mod clock;
-mod codex;
+pub(super) mod codex;
+mod compact_file;
 pub(super) mod diagnostics;
 mod http;
+#[cfg(test)]
+pub(super) use http::with_failed_probe_preparation;
+#[cfg(test)]
+mod component_workspace_tests;
 pub(super) mod kimi;
-mod outcome;
+#[cfg(test)]
+mod kimi_workspace_tests;
+pub(super) mod outcome;
 mod policy;
 mod probe;
 mod readiness;
@@ -18,8 +25,7 @@ mod route_types;
 
 pub(super) use crate::provider::PROXY_ROUTING_POLICY;
 pub(super) use admission::{
-    AdmittedProxyRouteInput, DeferredSharedProbe, NextSendableProxyRouteInput,
-    prepare_admitted_proxy_route,
+    AdmittedProxyRouteInput, NextSendableProxyRouteInput, prepare_admitted_proxy_route,
 };
 pub(super) use candidates::{
     CandidatePreparationSummary, candidate_reservation_bounds, exhausted_candidate_error,
@@ -29,11 +35,13 @@ pub(super) use clock::credential_application_now;
 #[cfg(test)]
 pub(super) use clock::with_test_credential_application_now_once;
 pub(super) use codex::quota::classify_rate_limit;
+pub(super) use codex::quota::{classify_stream_quota, classify_supplier_quota, quota_evidence};
 #[cfg(test)]
 pub(super) use codex::with_test_pre_delivery_connect_failures;
 #[cfg(test)]
 pub(super) use codex::with_test_send_failures;
 pub(super) use codex::{CodexRetryTerminal, CodexRetryTerminalGuard, runtime_transport_policy};
+pub(in crate::api) use compact_file::ValidatedCompact;
 pub(super) use outcome::{attempt_failure_stage, classify_attempt_failure, failover_disposition};
 pub(crate) use policy::RequestAttemptBudget;
 pub(super) use probe::{SharedProbePermit, join_shared_probe};
@@ -44,11 +52,40 @@ pub(super) use readiness::{
     CandidateCompatibility, PreparedRouteReadiness, candidate_compatibility,
     credential_application_error, refresh_route_snapshot,
 };
-pub(crate) use recovery_wait::wait as wait_media_recovery;
 pub(super) use route_types::{
     PlannedProxyRoute, PreparedProxyRoute, ProxyRequestContext, ProxyRoutePlanInput,
     ProxyRouteResponse, ProxySendError, TransportFailureKind,
 };
+
+pub(super) fn native_chat_candidate_shape(
+    protocol: Protocol,
+    request: &mut Value,
+    candidates: &[AuthorizedUpstreamCandidate],
+) -> Result<Option<(usize, usize)>, AppError> {
+    kimi::candidate_shape(protocol, request, candidates)
+}
+
+fn route_temporary_memory(
+    state: &AppState,
+    bytes: usize,
+) -> Result<std::sync::Arc<crate::gateway_body::memory::ProxyMemoryReservation>, AppError> {
+    let mut reservation = None;
+    state.responses_request_spool.reclaim_for(|| {
+        reservation = state.proxy_memory_budget.temporary(bytes).ok();
+        reservation.is_some()
+    });
+    reservation.ok_or_else(|| {
+        state.metrics.observe_proxy_memory_error(
+            crate::metrics::ProxyMemoryRejectionStage::Route,
+            AppError::capacity(
+                "proxy_memory_temporary",
+                crate::error::ErrorFacts::new()
+                    .stage("proxy_memory_route")
+                    .bytes(bytes as u64),
+            ),
+        )
+    })
+}
 
 pub(super) fn plan_proxy_route(
     input: ProxyRoutePlanInput<'_>,
@@ -62,28 +99,16 @@ pub(super) fn plan_proxy_route(
                 protocol,
                 request_id,
                 request_json,
+                request_memory,
                 codex_multi_agent_v2_request,
             },
         route,
         preparation_now,
     } = input;
     if !state.providers.is_public(&route.driver) {
-        return Err(AppError::Upstream(format!(
-            "provider driver {} is not loaded",
-            route.driver
-        )));
+        return Err(AppError::upstream("provider_driver_is_not_loaded"));
     }
     route.credential.validate(preparation_now)?;
-    let _planning_memory = state
-        .proxy_memory_budget
-        .temporary(
-            crate::gateway_body::memory::json_encoded_length(request_json)?.saturating_mul(3),
-        )
-        .map_err(|error| {
-            state
-                .metrics
-                .observe_proxy_memory_error(crate::metrics::ProxyMemoryRejectionStage::Route, error)
-        })?;
     let is_codex = codex_transport::is_driver(&route.driver);
     if is_codex {
         codex::validate_route(&route, protocol)?;
@@ -107,6 +132,33 @@ pub(super) fn plan_proxy_route(
         && state
             .providers
             .supports_responses_via_anthropic_messages_v1(&route.driver);
+    // Direct HTTP and clone-only native Kimi Chat use the third tree already
+    // prepaid by admission. Histories requiring copied tool/reasoning repair,
+    // dialect/component/compact transforms retain their separate workspace.
+    let native_kimi_chat = route.driver == crate::oauth::managed::kimi::PROVIDER_DRIVER
+        && kimi::reuses_chat_workspace(protocol, request_json);
+    let direct_http = (http_json || new_api || native_kimi_chat)
+        && !is_codex
+        && (responses_via_chat_dialect.is_none() || native_kimi_chat)
+        && !responses_via_anthropic
+        && !matches!(protocol, Protocol::OpenAiResponsesCompact)
+        && !crate::api::new_api_transport::has_compaction_trigger(request_json)
+        && state
+            .providers
+            .get(&route.driver)
+            .is_some_and(|provider| provider.component_adapter.is_none());
+    let request_bytes = crate::gateway_body::memory::json_encoded_length(request_json)?;
+    let request_workspace = direct_http
+        .then(|| request_memory.and_then(|memory| memory.borrow_route_workspace(request_bytes)))
+        .flatten();
+    let _planning_memory = if request_workspace.is_some() {
+        None
+    } else {
+        Some(route_temporary_memory(
+            state,
+            request_bytes.saturating_mul(3),
+        )?)
+    };
     let (mut forwarded_json, responses_chat, responses_anthropic) = if responses_via_anthropic {
         let (forwarded, context) =
             anthropic::prepare_forwarded_request(&route, request_json, bridge_multi_agent)?;
@@ -223,7 +275,8 @@ pub(super) fn plan_proxy_route(
             key_id: key.key_id.to_string(),
             protocol: protocol.name().to_owned(),
             model: model.to_owned(),
-            config_json: serde_json::to_string(&route.config).map_err(|_| AppError::Internal)?,
+            config_json: serde_json::to_string(&route.config)
+                .map_err(|_| AppError::internal("routing_site_1"))?,
         };
         Some(context)
     } else {
@@ -258,6 +311,7 @@ pub(super) fn plan_proxy_route(
             || (matches!(protocol, Protocol::OpenAiResponses)
                 && crate::api::new_api_transport::has_compaction_trigger(request_json)));
     Ok(PlannedProxyRoute {
+        request_workspace,
         wait_for_compaction,
         route,
         forwarded_json,
@@ -305,7 +359,7 @@ fn configured_output_reservation_bound(
 ) -> Result<i64, AppError> {
     if let Some(bounds) = config.get("reservation_token_bounds") {
         let bounds = bounds.as_object().ok_or_else(|| {
-            AppError::Upstream("compatible upstream reservation metadata must be an object".into())
+            AppError::upstream("compatible_upstream_reservation_metadata_must_be_an_object")
         })?;
         // Generic accounts can opt in one model at a time. An absent entry
         // preserves that model's legacy admission; native Codex remains strict.
@@ -314,8 +368,10 @@ fn configured_output_reservation_bound(
         }
         return codex_transport::trusted_reservation_token_bound(config, upstream_model).map_err(
             |_| {
-                AppError::Upstream(
-                    "compatible upstream requires valid reservation metadata for its model".into(),
+                AppError::upstream_with(
+                    "upstream_unavailable",
+                    crate::error::ErrorFacts::new()
+                        .stage("routing_configured_output_reservation_bound"),
                 )
             },
         );
@@ -377,67 +433,94 @@ pub(super) async fn materialize_proxy_route(
     let encoded_length = crate::gateway_body::memory::json_encoded_length(&planned.forwarded_json)?;
     // Allocate temporary serialization/adapter work before cloning any payload.
     let temporary_bytes = if planned.component_context.is_some() {
-        64 * 1024 * 1024 + encoded_length.saturating_mul(6)
-    } else {
+        encoded_length.saturating_mul(6)
+    } else if planned.wire_shim_context.is_some() {
         encoded_length.saturating_mul(2)
+    } else {
+        // Serialization creates one Vec; Bytes::from takes ownership without
+        // copying. A plain HTTP route does not allocate a second encoded body.
+        encoded_length
     };
-    let _temporary_memory = state
-        .proxy_memory_budget
-        .temporary(temporary_bytes)
-        .map_err(|error| {
-            state
-                .metrics
-                .observe_proxy_memory_error(crate::metrics::ProxyMemoryRejectionStage::Route, error)
-        })?;
-    let component_request = if let Some(context) = planned.component_context {
+    // The original request tree has been dropped before materialization.
+    // Serializing the forwarded tree occupies its prepaid third copy instead.
+    let borrowed_serialization = planned.component_context.is_none()
+        && planned.wire_shim_context.is_none()
+        && planned
+            .request_workspace
+            .as_ref()
+            .is_some_and(|workspace| workspace.covers(encoded_length));
+    let _temporary_memory = if borrowed_serialization {
+        None
+    } else {
+        Some(route_temporary_memory(state, temporary_bytes)?)
+    };
+    let component_input_bytes = if planned.component_context.is_some() {
+        encoded_length
+    } else {
+        0
+    };
+    let (component_request, forwarded_body) = if let Some(context) = planned.component_context {
         let prepared = prepare_component_provider(
             state,
             &planned.route.driver,
             context.clone(),
             planned.route.config.clone(),
-            planned.forwarded_json.clone(),
-            _temporary_memory.clone(),
+            planned.forwarded_json,
+            _temporary_memory
+                .as_ref()
+                .expect("component workspace reserved independently")
+                .clone(),
         )
         .await?;
-        Some((prepared, context))
+        // The component owns the forwarded tree until its blocking call ends.
+        // Only its prepared body is dispatched by execute_component_primary;
+        // serializing the input again would retain an unused full body copy.
+        (Some((prepared, context)), Vec::new())
     } else {
-        None
-    };
-    let mut forwarded_body = Vec::with_capacity(encoded_length);
-    serde_json::to_writer(&mut forwarded_body, &planned.forwarded_json)
-        .map_err(|_| AppError::Internal)?;
-    if let Some(context) = planned.wire_shim_context {
-        let plugins = wire_shim_runtime(state);
-        let configurations = plugins
-            .resolved_traffic_configurations(
-                context.tenant_id.parse().map_err(|_| AppError::Internal)?,
-            )
-            .await?;
-        let body = String::from_utf8(forwarded_body).map_err(|_| AppError::Internal)?;
-        let driver = planned.route.driver.clone();
-        let protocol = context.protocol.clone();
-        let outcome = crate::api::plugin_execution::run(
-            state.metrics.clone(),
-            crate::api::plugin_execution::Phase::WireShimFinalize,
-            move || {
-                plugins.finalize_wire_shim(
-                    &driver,
-                    &protocol,
-                    context,
-                    &body,
-                    "{}",
-                    &configurations,
+        let mut forwarded_body = Vec::with_capacity(encoded_length);
+        serde_json::to_writer(&mut forwarded_body, &planned.forwarded_json)
+            .map_err(|_| AppError::internal("routing_materialize_proxy_route_1"))?;
+        if let Some(context) = planned.wire_shim_context {
+            let plugins = wire_shim_runtime(state);
+            let configurations = plugins
+                .resolved_traffic_configurations(
+                    context
+                        .tenant_id
+                        .parse()
+                        .map_err(|_| AppError::internal("routing_materialize_proxy_route_2"))?,
                 )
-            },
-        )
-        .await?
-        .ok_or(AppError::Internal)?;
-        forwarded_body = outcome.request_json.into_bytes();
-    }
+                .await?;
+            let body = String::from_utf8(forwarded_body)
+                .map_err(|_| AppError::internal("routing_materialize_proxy_route_3"))?;
+            let driver = planned.route.driver.clone();
+            let protocol = context.protocol.clone();
+            let outcome = crate::api::plugin_execution::run(
+                state.metrics.clone(),
+                crate::api::plugin_execution::Phase::WireShimFinalize,
+                move || {
+                    plugins.finalize_wire_shim(
+                        &driver,
+                        &protocol,
+                        context,
+                        &body,
+                        "{}",
+                        &configurations,
+                    )
+                },
+            )
+            .await?
+            .ok_or(AppError::internal("routing_materialize_proxy_route_1"))?;
+            forwarded_body = outcome.request_json.into_bytes();
+        }
+        (None, forwarded_body)
+    };
     Ok(PreparedProxyRoute {
+        request_workspace: planned.request_workspace,
+        inspect_stream_rejection: false,
         wait_for_compaction: planned.wait_for_compaction,
         route: planned.route,
         forwarded_body: Bytes::from(forwarded_body),
+        component_input_bytes,
         upstream_stream: planned.upstream_stream,
         codex_downstream_stream: planned.codex_downstream_stream,
         codex_store_disabled: planned.codex_store_disabled,
@@ -481,7 +564,15 @@ pub(super) async fn send_proxy_route(
         )
         .await;
     }
-    http::send_reqwest_proxy_route(state, headers, protocol, request_id, route).await
+    http::send_reqwest_proxy_route(
+        state,
+        headers,
+        protocol,
+        request_id,
+        route,
+        outbound_attempt,
+    )
+    .await
 }
 
 pub(super) fn retryable_upstream_status(status: StatusCode) -> bool {
@@ -494,6 +585,40 @@ pub(super) fn retryable_upstream_status(status: StatusCode) -> bool {
 #[cfg(test)]
 mod compact_bridge_tests {
     use super::*;
+
+    #[tokio::test]
+    async fn route_workspace_reclaims_only_durably_uploaded_source_cache() {
+        use crate::gateway_body::{
+            memory::ProxyMemoryBudget,
+            request_spool::{MemoryObjectStore, RequestSpoolAdmission},
+        };
+        let (mut state, directory) = crate::api::tests::test_state().await;
+        state.proxy_memory_budget = std::sync::Arc::new(ProxyMemoryBudget::new(256 * 1024));
+        state.responses_request_spool = RequestSpoolAdmission::new(directory.path().to_owned())
+            .with_memory_store(MemoryObjectStore::new());
+        let memory = state.proxy_memory_budget.reservation();
+        let original = Bytes::from(vec![b'x'; 128 * 1024]);
+        let source = state
+            .responses_request_spool
+            .capture_with_memory(
+                Body::from(original.clone()),
+                original.len(),
+                Some(original.len()),
+                Some(&memory),
+                0,
+                Some("route-workspace-reclaim"),
+            )
+            .await
+            .unwrap();
+        assert!(source.upload_outcome().await);
+        assert!(state.proxy_memory_budget.temporary(192 * 1024).is_err());
+        let workspace = route_temporary_memory(&state, 192 * 1024).unwrap();
+        assert_eq!(source.read_all().await.unwrap(), original);
+        drop(workspace);
+        drop(source);
+        drop(memory);
+        assert_eq!(state.proxy_memory_budget.snapshot().0, 0);
+    }
     use serde_json::json;
 
     fn route(driver: &str, config: Value) -> ResolvedUpstream {

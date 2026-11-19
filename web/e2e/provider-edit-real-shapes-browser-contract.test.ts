@@ -34,17 +34,31 @@ test('real Codex config shapes localize transport controls and preserve advanced
       }
       const advanced = workspace.getByRole('button', { name: '高级网络与用量设置', exact: true });
       assert.equal(await advanced.getAttribute('aria-expanded'), 'false');
-      const proxy = workspace.getByRole('button', { name: '配置网络代理', exact: true });
-      await workspace.locator('.provider-proxy-value input').waitFor();
-      assert.ok(await proxy.evaluate(element => element.getBoundingClientRect().bottom < innerHeight), 'proxy action is available in the initial desktop viewport');
+      const proxy = workspace.getByLabel(/^固定出口\s*\*?$/);
+      await proxy.waitFor();
+      assert.equal(await proxy.inputValue(), 'exit-15');
+      const proxyViewport = await proxy.evaluate(element => {
+        const { top, bottom, left, right } = element.getBoundingClientRect();
+        return { top, bottom, left, right, width: innerWidth, height: innerHeight };
+      });
+      assert.ok(proxyViewport.top >= 0 && proxyViewport.bottom < proxyViewport.height
+        && proxyViewport.left >= 0 && proxyViewport.right <= proxyViewport.width,
+      `proxy action is available in the initial desktop viewport (${shape}: ${JSON.stringify(proxyViewport)})`);
       assert.doesNotMatch(await workspace.innerText(), /reservation_token_bounds|Conservative token|network_scope|代理标识|synthetic-diagnostic-fingerprint/);
-      assert.equal(await workspace.locator('.provider-readable-proxy').getByRole('button', { name: '配置网络代理', exact: true }).count(), 1, 'editing and copying sit beside the single authorized proxy value');
+      assert.equal(await workspace.locator('.network-proxy-policy-workspace').count(), 1, 'one policy editor owns the selected network exit');
+      assert.equal(await workspace.locator('.provider-proxy-value input').count(), 0, 'the account editor uses managed proxy identities rather than a second raw-address editor');
       const retry = workspace.getByRole('button', { name: '配置超时与重试', exact: true });
       assert.equal(await retry.getAttribute('aria-expanded'), 'false');
       await retry.focus(); await page.keyboard.press('Enter');
       await workspace.getByLabel('连接尝试次数').waitFor();
       assert.doesNotMatch(await workspace.innerText(), /Pre-delivery|Maximum inactivity|One absolute budget/);
-      await workspace.getByText('建立连接的等待时限，必须小于请求总超时。', { exact: true }).waitFor();
+      for (const help of [
+        '可选的连接建立超时。默认不设置，不施加应用层连接时限。显式取值只覆盖建立连接（含 TLS 和配置的代理），不限制响应时长。',
+        '可选。默认不设置时，上游再安静也不会被中断。设置后，该值是每收到一个字节就重新计时的读取静默窗口；Codex 转发不把它当作绝对时限。',
+        'HTTP/2 保活 PING 应答超时，也是模型目录和额度读取的总预算。不对推理或压缩施加绝对时限；连接保持健康时，安静的上游响应会继续。',
+      ]) {
+        await workspace.getByText(help, { exact: true }).waitFor();
+      }
       await workspace.getByText('运行时传输策略', { exact: true }).waitFor();
       await workspace.getByText('单位见各字段；这些设置影响该账号的所有请求。', { exact: true }).waitFor();
       for (const title of ['最大 SSE 事件（字节）', '单个网络分片最大帧数据量（字节）', '终止事件最大暂存量（字节）',

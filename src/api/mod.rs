@@ -51,6 +51,7 @@ mod generation;
 mod generation_quarantine;
 mod groups;
 mod health;
+mod http_settings;
 mod image_generation_quarantine;
 mod kimi_transport;
 mod limits;
@@ -59,15 +60,23 @@ mod model_routes;
 mod monitoring_snapshot;
 mod new_api_transport;
 mod operator_inference;
+mod plugin_background_actions;
 pub(crate) mod plugin_execution;
+#[cfg(feature = "experimental-plugin-revisions")]
+mod plugin_installer_network;
+mod plugin_private_data;
 mod plugins;
 pub(crate) mod proxy;
-pub(crate) use proxy::{MediaAttemptBudget, wait_media_recovery};
-pub(crate) use proxy::{
-    MediaAttemptGuard, MediaAttemptTerminal, classify_media_rate_limit,
-    current_gateway_failure_domain,
-};
+pub(crate) use proxy::MediaAttemptBudget;
+pub(crate) use proxy::{MediaAttemptGuard, MediaAttemptTerminal, classify_media_rate_limit};
 mod proxy_diagnostics;
+
+pub(crate) fn current_proxy_request_id() -> Option<Uuid> {
+    proxy_diagnostics::CONTEXT
+        .try_with(|context| context.request_id)
+        .ok()
+}
+
 mod request_detail;
 mod request_normalization;
 mod responses_via_anthropic;
@@ -76,6 +85,12 @@ mod router;
 mod routes;
 mod routing;
 mod self_service;
+mod semantic_session_view;
+mod session_reading;
+mod session_tasks;
+mod session_titles;
+pub(crate) use session_titles::process_one as process_session_title;
+mod network_proxies;
 mod sessions;
 mod sse;
 pub mod startup;
@@ -84,6 +99,7 @@ mod traffic;
 mod transport_proxy_groups;
 mod upstreams;
 use transport_proxy_groups::*;
+pub(crate) use upstreams::run_upstream_service_probes;
 mod usage_analysis;
 mod web;
 
@@ -124,7 +140,8 @@ use limits::*;
 use model_picker::list_model_picker_options;
 use model_routes::{
     archive_model_route, create_model_route, delete_model_route, get_archived_model_route,
-    list_model_routes, retire_model_route_upstreams, set_model_route_enabled, update_model_route,
+    list_filter_model_names, list_model_routes, retire_model_route_upstreams,
+    set_model_route_enabled, update_model_route,
 };
 use plugins::{get_plugin_configuration, get_plugin_service_data, put_plugin_configuration};
 use request_detail::*;
@@ -132,6 +149,9 @@ pub use router::{router, router_for_role};
 use routes::{control_router, gateway_router};
 use routing::*;
 use self_service::*;
+use semantic_session_view::*;
+use session_reading::*;
+use session_titles::{generate_session_title, get_session_title};
 use sessions::*;
 use tenants::{
     archive_tenant, create_tenant, delete_tenant, list_tenant_management, rename_tenant,
@@ -140,10 +160,9 @@ use tenants::{
 use traffic::{
     AppliedTraffic, Protocol, TrafficPolicyProtocols,
     apply_traffic_plugin_for_existing_idempotency, apply_traffic_policy,
-    authorize_applied_traffic_policy, component_provider_timeout, component_provider_url,
-    inject_controlled_output_ceiling, negotiate_openai_responses_websocket,
-    normalize_component_provider, prepare_component_provider, proxy_anthropic,
-    proxy_anthropic_count_tokens, proxy_openai_alpha_search, proxy_openai_chat,
+    authorize_applied_traffic_policy, component_provider_url, inject_controlled_output_ceiling,
+    negotiate_openai_responses_websocket, normalize_component_provider, prepare_component_provider,
+    proxy_anthropic, proxy_anthropic_count_tokens, proxy_openai_alpha_search, proxy_openai_chat,
     proxy_openai_embeddings, proxy_openai_responses, proxy_openai_responses_compact,
 };
 pub(crate) use upstreams::sync_upstream_models_after_refresh;
@@ -185,11 +204,7 @@ use crate::{
     },
     plugin::{PreparedProviderRequest, memeloop::token_center::types::RequestContext},
     provider::{ResolvedUpstream, UpstreamCredential, validate_config},
-    proxy_lifecycle::{
-        MAX_DOWNSTREAM_SEND_WAIT, MAX_PROXY_FINALIZATION_LIFETIME, abandon_proxy_archive_attempt,
-        confirm_proxy_delivery_with_retry, finish_proxy_request_with_retry,
-        prepare_proxy_delivery_with_retry, response_archive_requires_cleanup,
-    },
+    proxy_lifecycle::{MAX_DOWNSTREAM_SEND_WAIT, MAX_PROXY_FINALIZATION_LIFETIME},
 };
 
 #[cfg(test)]

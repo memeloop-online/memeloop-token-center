@@ -4,6 +4,7 @@ import { tmpdir } from 'node:os';
 import { dirname, join, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { spawn } from 'node:child_process';
+import { DatabaseSync } from 'node:sqlite';
 
 const webRoot = resolve(dirname(fileURLToPath(import.meta.url)), '..');
 const repositoryRoot = resolve(webRoot, '..');
@@ -12,6 +13,8 @@ const listenHost = baseURL.hostname;
 const listenPort = baseURL.port || '80';
 const mockPort = Number(process.env.MTC_E2E_MOCK_PORT ?? 41740);
 const testDirectory = mkdtempSync(join(tmpdir(), 'memeloop-token-center-e2e-'));
+const requestSpoolPath = join(testDirectory, 'request-spool');
+mkdirSync(requestSpoolPath, { mode: 0o700 });
 const pluginRoot = join(testDirectory, 'plugins');
 const configurablePlugin = join(pluginRoot, 'browser-configuration');
 mkdirSync(configurablePlugin, { recursive: true });
@@ -146,10 +149,31 @@ const upstream = createServer((request, response) => {
     }
     if (request.method === 'GET' && requestUrl.pathname === '/__e2e/never-persist-state') {
       const needle = Buffer.from('never-persist');
+      const database = new DatabaseSync(join(testDirectory, 'browser.db'), { readOnly: true });
+      let references;
+      try {
+        references = database.prepare(
+          'SELECT job.id, job.key_id, job.tenant_id, job.result_json, credential.tenant_id AS owner_tenant_id FROM generation_jobs job JOIN key_records credential ON credential.id = job.key_id WHERE job.result_json LIKE ? ORDER BY job.id',
+        ).all('%never-persist%').map((row) => {
+          const result = JSON.parse(row.result_json);
+          const reference = result.provider_reference;
+          delete result.provider_reference;
+          return {
+            job_id: row.id,
+            key_id: row.key_id,
+            owner_matches: row.tenant_id === row.owner_tenant_id,
+            plaintext: typeof reference === 'string' && reference.startsWith('provider-reference-json:') && reference.includes('never-persist'),
+            public_clean: !JSON.stringify(result).includes('never-persist'),
+          };
+        });
+      } finally {
+        database.close();
+      }
       response.writeHead(200, { 'content-type': 'application/json', 'cache-control': 'no-store' });
       response.end(JSON.stringify({
         database: databaseContains(needle),
         archive: directoryContains(join(testDirectory, 'archive'), needle),
+        references,
       }));
       return;
     }
@@ -356,6 +380,7 @@ upstream.listen(mockPort, '127.0.0.1', () => {
         MTC_SERVICE_TOKEN: process.env.MTC_E2E_SERVICE_TOKEN ?? 'browser-e2e-bootstrap-not-a-real-token',
         MTC_ARCHIVE_BACKEND: 'filesystem',
         MTC_ARCHIVE_PATH: join(testDirectory, 'archive'),
+        MTC_RESPONSES_REQUEST_SPOOL_PATH: requestSpoolPath,
         MTC_PLUGIN_DIR: pluginRoot,
         MTC_WEB_ROOT: join(webRoot, 'dist'),
         MTC_ALLOW_OAUTH_LOOPBACK: 'true',

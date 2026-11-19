@@ -13,8 +13,14 @@ use crate::{
     error::AppError, generation, metrics::BackgroundProjectionKind,
 };
 
+#[cfg(test)]
+mod background_actions_tests;
+
 const MAINTENANCE_INTERVAL: Duration = Duration::from_secs(6 * 60 * 60);
 const ORPHANED_RESERVATION_REAPER_INTERVAL: Duration = Duration::from_secs(5 * 60);
+// 已投影的会话 outbox 行回收节奏。表里存的是可达数 MB 的请求/语义快照，
+// 必须在后台持续回收，否则会把存储 IO 拖垮。
+const PROJECTION_OUTBOX_CLEANUP_INTERVAL: Duration = Duration::from_secs(5 * 60);
 const GENERATION_INTERVAL: Duration = Duration::from_millis(500);
 const PROJECTION_INTERVAL: Duration = Duration::from_secs(1);
 const OAUTH_REFRESH_INTERVAL: Duration = Duration::from_secs(60);
@@ -24,16 +30,58 @@ const OAUTH_REFRESH_AHEAD_MILLIS: i64 = 5 * 60 * 1_000;
 const CODEX_MODEL_CATALOG_RETRY_MILLIS: i64 = 60 * 60 * 1_000;
 const PROJECTION_BATCH_LIMIT: i64 = 32;
 
+async fn compact_conversation_receipts(state: AppState, mut shutdown: watch::Receiver<bool>) {
+    let mut ticker = tokio::time::interval(Duration::from_secs(5));
+    ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+    let mut cursor = None;
+    let mut next_pass = tokio::time::Instant::now();
+    loop {
+        tokio::select! {
+            changed = shutdown.changed() => {
+                if changed.is_err() || *shutdown.borrow() { break; }
+            }
+            _ = ticker.tick() => {
+                if *shutdown.borrow() { break; }
+                if tokio::time::Instant::now() < next_pass { continue; }
+                match state.db.compact_completed_conversation_receipts(cursor.as_deref()).await {
+                    Ok((next, compacted)) => {
+                        cursor = next;
+                        if compacted > 0 {
+                            tracing::info!(compacted, "worker compacted completed conversation receipts");
+                        }
+                        if cursor.is_none() {
+                            next_pass = tokio::time::Instant::now() + Duration::from_secs(24 * 60 * 60);
+                        }
+                    }
+                    Err(error) => {
+                        tracing::warn!(%error, "worker failed to compact completed conversation receipts");
+                        next_pass = tokio::time::Instant::now() + Duration::from_secs(60);
+                    }
+                }
+            }
+        }
+    }
+}
+
 async fn refresh_expiring_oauth(
     state: &AppState,
     account_id: Uuid,
     generation: i64,
     blocking: &BlockingTasks,
 ) -> Result<(), AppError> {
-    let recovery_key = format!("oauth-worker-{account_id}-generation-{generation}");
-    let result =
-        api::refresh_managed_upstream_oauth_for_worker(state, account_id, &recovery_key, blocking)
-            .await;
+    let recovery_key = state
+        .db
+        .upstream_oauth_refresh_recovery_key(account_id, generation)
+        .await?
+        .unwrap_or_else(|| format!("oauth-worker-{account_id}-generation-{generation}"));
+    let result = api::refresh_managed_upstream_oauth_for_worker(
+        state,
+        account_id,
+        &recovery_key,
+        generation,
+        blocking,
+    )
+    .await;
     match result {
         Err(AppError::Conflict(message))
             if message == "OAuth refresh is already in progress for this Idempotency-Key" =>
@@ -47,6 +95,7 @@ async fn refresh_expiring_oauth(
                 state,
                 account_id,
                 &takeover_key,
+                generation,
                 blocking,
             )
             .await?;
@@ -145,9 +194,16 @@ pub async fn run_until_shutdown_with_oauth_stop(
     let (oauth_stop, oauth_role_shutdown) = watch::channel(false);
     let mut roles = JoinSet::new();
     let mut oauth_refresh_roles = JoinSet::new();
+    let history_state = state.clone();
+    let history_shutdown = role_shutdown.clone();
+    roles.spawn(async move {
+        crate::request_history::migration::run_worker(history_state, history_shutdown).await;
+        "request_history"
+    });
     let blocking_tasks = BlockingTasks::new();
     let oauth_blocking = blocking_tasks.clone();
     let service_data_blocking = blocking_tasks.clone();
+    let background_action_blocking = blocking_tasks.clone();
     let worker_id = format!("worker-{}", Uuid::now_v7());
     let projection_owner = Uuid::now_v7();
     let reaper_owner = ArchiveStagingLeaseOwner::new(format!("archive-reaper-{}", Uuid::now_v7()))
@@ -164,6 +220,12 @@ pub async fn run_until_shutdown_with_oauth_stop(
         crate::response_archive_spool::run(spool_state, spool_shutdown).await;
         "response_spool"
     });
+    let receipt_state = state.clone();
+    let receipt_shutdown = role_shutdown.clone();
+    roles.spawn(async move {
+        compact_conversation_receipts(receipt_state, receipt_shutdown).await;
+        "conversation_receipts"
+    });
 
     // No spawn-per-tick: generation remains single-flight and OAuth remains serial.
     let quota_state = state.clone();
@@ -171,6 +233,12 @@ pub async fn run_until_shutdown_with_oauth_stop(
     roles.spawn(async move {
         crate::upstream_quota::observations::run(quota_state, quota_shutdown).await;
         "quota_observations"
+    });
+    let probe_state = state.clone();
+    let probe_shutdown = role_shutdown.clone();
+    roles.spawn(async move {
+        crate::api::run_upstream_service_probes(probe_state, probe_shutdown).await;
+        "upstream_service_probes"
     });
 
     macro_rules! periodic {
@@ -230,6 +298,7 @@ pub async fn run_until_shutdown_with_oauth_stop(
                     tracing::error!(%error, "worker failed to delete expired budget rollup detail");
                 }
             }
+            crate::upstream_quota::reset_receipt::recover(state).await;
             let cleanup_deadline = tokio::time::Instant::now() + Duration::from_secs(5);
             let mut deleted_total = 0_u64;
             loop {
@@ -273,17 +342,67 @@ pub async fn run_until_shutdown_with_oauth_stop(
             }
         }
     );
+    let orphan_reservation_scan = Mutex::new(crate::db::OrphanReservationScan::default());
+    periodic!(
+        "projection_outbox_cleanup",
+        PROJECTION_OUTBOX_CLEANUP_INTERVAL,
+        async |state: &AppState, _shutdown: &watch::Receiver<bool>| {
+            let cleanup_deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+            let mut deleted_total = 0_u64;
+            loop {
+                match state.db.delete_projected_conversation_outbox(2_000).await {
+                    Ok(deleted) => {
+                        deleted_total = deleted_total.saturating_add(deleted);
+                        if deleted < 2_000 || tokio::time::Instant::now() >= cleanup_deadline {
+                            break;
+                        }
+                    }
+                    Err(error) => {
+                        tracing::error!(
+                            %error,
+                            "worker failed to delete projected conversation outbox rows"
+                        );
+                        break;
+                    }
+                }
+            }
+            if deleted_total > 0 {
+                tracing::info!(
+                    deleted = deleted_total,
+                    "worker deleted projected conversation outbox rows"
+                );
+            }
+        }
+    );
     periodic!(
         "orphaned_reservations",
         ORPHANED_RESERVATION_REAPER_INTERVAL,
         async |state: &AppState, _shutdown: &watch::Receiver<bool>| {
-            match state.db.release_orphaned_reservations(100).await {
+            let mut scan = orphan_reservation_scan.lock().unwrap().clone();
+            let result = state
+                .db
+                .release_orphaned_reservations_page(100, &mut scan)
+                .await;
+            *orphan_reservation_scan.lock().unwrap() = scan;
+            match result {
                 Ok(released) if released > 0 => {
                     tracing::warn!(released, "worker released orphaned usage reservations");
                 }
                 Ok(_) => {}
                 Err(error) => {
                     tracing::error!(%error, "worker failed to release orphaned usage reservations");
+                }
+            }
+            match state.db.close_expired_proxy_owners(100).await {
+                Ok(closed) if closed > 0 => {
+                    tracing::warn!(
+                        closed,
+                        "worker closed proxy requests whose owner lease expired"
+                    );
+                }
+                Ok(_) => {}
+                Err(error) => {
+                    tracing::error!(%error, "worker failed to close expired proxy owners");
                 }
             }
         }
@@ -318,6 +437,24 @@ pub async fn run_until_shutdown_with_oauth_stop(
             process_terminal_projection_batch(state, Uuid::now_v7()).await;
         }
     );
+    let terminal_recovery_cursor = Mutex::new(None::<String>);
+    periodic!(
+        "terminal_projection_recovery",
+        PROJECTION_INTERVAL,
+        async |state: &AppState, _shutdown: &watch::Receiver<bool>| {
+            let after = terminal_recovery_cursor.lock().unwrap().clone();
+            match state
+                .db
+                .recover_unknown_terminal_projections(after.as_deref())
+                .await
+            {
+                Ok(next) => *terminal_recovery_cursor.lock().unwrap() = next,
+                Err(error) => {
+                    tracing::error!(%error, "worker failed to recover unknown terminal projections");
+                }
+            }
+        }
+    );
     periodic!(
         "metered_projection",
         PROJECTION_INTERVAL,
@@ -325,11 +462,87 @@ pub async fn run_until_shutdown_with_oauth_stop(
             process_metered_usage_projection_batch(state, projection_owner).await;
         }
     );
+    let identity_projection_cursor = Mutex::new((None::<String>, None::<String>));
+    periodic!(
+        "conversation_identity",
+        PROJECTION_INTERVAL,
+        async |state: &AppState, _shutdown: &watch::Receiver<bool>| {
+            let (live_after, history_before) = identity_projection_cursor.lock().unwrap().clone();
+            tracing::debug!(target: "mtc_identity_projection", stage = "tick_start",
+                ?live_after, ?history_before, "conversation identity progress");
+            match state
+                .db
+                .project_declared_conversation_identity_pages(
+                    live_after.as_deref(),
+                    history_before.as_deref(),
+                    PROJECTION_BATCH_LIMIT,
+                )
+                .await
+            {
+                Ok(next) => {
+                    *identity_projection_cursor.lock().unwrap() = next;
+                    tracing::debug!(target: "mtc_identity_projection", stage = "cursor_committed",
+                        "conversation identity progress");
+                }
+                Err(error) => {
+                    tracing::debug!(target: "mtc_identity_projection", stage = "tick_failed",
+                        "conversation identity progress");
+                    tracing::error!(%error, "worker failed to publish declared conversation identities")
+                }
+            }
+        }
+    );
+    // Recovery obligations have independent serial lanes: historical object IO
+    // must not prevent already eligible body tasks from being claimed.
+    periodic!(
+        "session_body_rebuild_recovery",
+        PROJECTION_INTERVAL,
+        async |state: &AppState, _shutdown: &watch::Receiver<bool>| {
+            process_session_body_rebuild_recovery(state).await;
+        }
+    );
+    periodic!(
+        "semantic_coverage_recovery",
+        PROJECTION_INTERVAL,
+        async |state: &AppState, _shutdown: &watch::Receiver<bool>| {
+            let started = std::time::Instant::now();
+            tracing::debug!(stage = "coverage_start", "conversation recovery stage");
+            if let Err(error) = state.db.recover_semantic_coverage().await {
+                tracing::warn!(
+                    error_category = error.diagnostic_category(),
+                    "semantic coverage confirmation remains pending"
+                );
+            }
+            tracing::debug!(
+                stage = "coverage_done",
+                elapsed_ms = started.elapsed().as_millis() as u64,
+                "conversation recovery stage"
+            );
+        }
+    );
     periodic!(
         "conversation_projection",
         PROJECTION_INTERVAL,
         async |state: &AppState, _shutdown: &watch::Receiver<bool>| {
             process_conversation_projection_batch(state, Uuid::now_v7()).await;
+        }
+    );
+    periodic!(
+        "session_titles",
+        Duration::from_secs(5),
+        async |state: &AppState, _shutdown: &watch::Receiver<bool>| {
+            if let Err(error) = api::process_session_title(state).await {
+                tracing::error!(%error, "worker failed to claim or update a session title");
+            }
+        }
+    );
+    periodic!(
+        "session_response_reading",
+        Duration::from_secs(1),
+        async |state: &AppState, _shutdown: &watch::Receiver<bool>| {
+            if let Err(error) = crate::session_response_worker::process_one(state).await {
+                tracing::error!(%error, "worker failed to update session response reading projection");
+            }
         }
     );
     periodic!(
@@ -413,6 +626,13 @@ pub async fn run_until_shutdown_with_oauth_stop(
         }
     );
     periodic!(
+        "plugin_background_actions",
+        PLUGIN_SERVICE_DATA_INTERVAL,
+        async |state: &AppState, shutdown: &watch::Receiver<bool>| {
+            run_plugin_background_actions(state, shutdown, &background_action_blocking).await;
+        }
+    );
+    periodic!(
         "plugin_service_data",
         PLUGIN_SERVICE_DATA_INTERVAL,
         async |state: &AppState, shutdown: &watch::Receiver<bool>| {
@@ -433,6 +653,106 @@ pub async fn run_until_shutdown_with_oauth_stop(
         blocking_tasks,
     )
     .await;
+}
+
+async fn run_plugin_background_actions(
+    state: &AppState,
+    shutdown: &watch::Receiver<bool>,
+    blocking: &BlockingTasks,
+) {
+    let pinned = match state.clone().pin_application_plugins().await {
+        Ok(state) => state,
+        Err(error) => {
+            tracing::warn!(%error,"worker background action runtime pin failed");
+            return;
+        }
+    };
+    for (plugin, interval) in pinned.plugins.background_action_targets() {
+        let now = crate::db::unix_millis();
+        let grants = match pinned.db.due_background_action_grants(&plugin, now).await {
+            Ok(grants) => grants,
+            Err(error) => {
+                tracing::warn!(%error,"worker background action grant enumeration failed");
+                continue;
+            }
+        };
+        for grant in grants {
+            if *shutdown.borrow() {
+                return;
+            }
+            let owner = format!("plugin-action-{}", Uuid::now_v7());
+            match pinned
+                .db
+                .claim_background_action_tick(
+                    &grant,
+                    &owner,
+                    crate::db::unix_millis(),
+                    (interval as i64) * 1000,
+                )
+                .await
+            {
+                Ok(true) => {}
+                Ok(false) => continue,
+                Err(error) => {
+                    tracing::warn!(%error,"worker background action tick claim failed");
+                    continue;
+                }
+            }
+            let result = tokio::time::timeout(
+                Duration::from_secs(90),
+                crate::plugin::background_actions::execute_tick(
+                    pinned.clone(),
+                    grant.clone(),
+                    owner.clone(),
+                    blocking,
+                ),
+            )
+            .await
+            .unwrap_or_else(|_| {
+                Err(crate::error::AppError::capacity_error(
+                    "background_action_timeout",
+                ))
+            });
+            let code = result
+                .as_ref()
+                .err()
+                .map(|error| error.diagnostic_category());
+            let operation = result
+                .as_ref()
+                .ok()
+                .and_then(|operation| operation.as_ref());
+            let outcome = Some(if let Some(operation) = operation {
+                operation.state.as_str()
+            } else if result.is_ok() {
+                "no_action"
+            } else if matches!(
+                result,
+                Err(crate::error::AppError::Capacity { .. }
+                    | crate::error::AppError::Overloaded
+                    | crate::error::AppError::DatabaseUnavailable(_))
+            ) {
+                "retryable_error"
+            } else {
+                "blocked"
+            });
+            if let Err(error) = pinned
+                .db
+                .finish_background_action_tick(
+                    &grant,
+                    &owner,
+                    code,
+                    outcome,
+                    operation.map(|op| op.id.as_str()),
+                )
+                .await
+            {
+                tracing::warn!(%error,"worker background action tick completion failed");
+            }
+            if let Err(error) = result {
+                tracing::warn!(plugin_id=%plugin,upstream_account_id=%grant.upstream_account_id,error_category=error.diagnostic_category(),"plugin background action tick failed");
+            }
+        }
+    }
 }
 
 async fn refresh_plugin_service_data(
@@ -509,7 +829,9 @@ async fn refresh_plugin_service_data(
                 .unwrap_or(Err(
                     crate::plugin::service_data::PluginServiceDataCollectionFailure {
                         code: crate::db::PluginServiceDataRefreshErrorCode::ComponentExecution,
-                        error: crate::error::AppError::Internal,
+                        error: Box::new(crate::error::AppError::internal(
+                            "worker_refresh_plugin_service_data_1",
+                        )),
                     },
                 ))
         } else {
@@ -556,7 +878,7 @@ async fn refresh_plugin_service_data(
                 }
             }
             Err(failure) => {
-                let shift = u32::try_from(previous_failures.clamp(0, 6)).unwrap_or(6);
+                let shift = u32::try_from(previous_failures).unwrap_or(6);
                 let backoff_seconds = 5_i64
                     .saturating_mul(1_i64.checked_shl(shift).unwrap_or(64))
                     .min(300);
@@ -775,6 +1097,8 @@ async fn supervise_roles_with_early_oauth_shutdown(
 }
 
 async fn process_terminal_projection_batch(state: &AppState, lease_owner: Uuid) {
+    let started = std::time::Instant::now();
+    tracing::debug!(%lease_owner, stage = "claim_start", "terminal projection stage");
     let tasks = match state
         .db
         .claim_terminal_projection_tasks(lease_owner, PROJECTION_BATCH_LIMIT)
@@ -782,17 +1106,30 @@ async fn process_terminal_projection_batch(state: &AppState, lease_owner: Uuid) 
     {
         Ok(tasks) => tasks,
         Err(error) => {
-            tracing::error!(%error, "worker failed to claim terminal projections");
+            tracing::error!(%lease_owner, stage = "claim_failed",
+                elapsed_ms = started.elapsed().as_millis() as u64,
+                error_category = error.diagnostic_category(),
+                "worker failed to claim terminal projections");
             return;
         }
     };
+    tracing::debug!(%lease_owner, stage = "claim_done", count = tasks.len(),
+        elapsed_ms = started.elapsed().as_millis() as u64, "terminal projection stage");
     for request_id in tasks {
-        if let Err(error) = state
+        let started = std::time::Instant::now();
+        tracing::debug!(%lease_owner, %request_id, stage = "apply_start", "terminal projection stage");
+        match state
             .db
             .project_claimed_terminal_projection_task(lease_owner, request_id)
             .await
         {
-            tracing::error!(%error, %request_id, "worker failed to apply terminal projection");
+            Ok(projected) => tracing::debug!(%lease_owner, %request_id, stage = "apply_done",
+                projected, elapsed_ms = started.elapsed().as_millis() as u64,
+                "terminal projection stage"),
+            Err(error) => tracing::error!(%lease_owner, %request_id, stage = "apply_failed",
+                elapsed_ms = started.elapsed().as_millis() as u64,
+                error_category = error.diagnostic_category(),
+                "worker failed to apply terminal projection"),
         }
     }
 }
@@ -836,7 +1173,28 @@ async fn process_metered_usage_projection_batch(state: &AppState, lease_owner: U
     }
 }
 
+async fn process_session_body_rebuild_recovery(state: &AppState) {
+    let started = std::time::Instant::now();
+    tracing::debug!(stage = "reopen_start", "conversation recovery stage");
+    if let Err(error) = state
+        .db
+        .reopen_session_body_rebuilds(PROJECTION_BATCH_LIMIT / 4)
+        .await
+    {
+        state
+            .metrics
+            .observe_background_projection(BackgroundProjectionKind::Conversation, false);
+        tracing::error!(%error, "worker 未能把已有原始请求 JSON 和原始返回 JSON 的会话正文重新排队");
+    }
+    tracing::debug!(
+        stage = "reopen_done",
+        elapsed_ms = started.elapsed().as_millis() as u64,
+        "conversation recovery stage"
+    );
+}
+
 async fn process_conversation_projection_batch(state: &AppState, lease_owner: Uuid) {
+    tracing::debug!(%lease_owner, stage = "claim_start", "conversation projection stage");
     let tasks = match state
         .db
         .claim_conversation_projection_tasks(lease_owner, PROJECTION_BATCH_LIMIT)
@@ -847,16 +1205,14 @@ async fn process_conversation_projection_batch(state: &AppState, lease_owner: Uu
             state
                 .metrics
                 .observe_background_projection(BackgroundProjectionKind::Conversation, false);
-            tracing::error!(%error, "worker failed to claim conversation projection tasks");
+            tracing::error!(%error, "worker 未能领取会话正文归档任务");
             return;
         }
     };
+    tracing::debug!(%lease_owner, count = tasks.len(), stage = "claim_done", "conversation projection stage");
     for task in tasks {
-        match state
-            .db
-            .project_claimed_conversation_projection_task(lease_owner, task.request_id)
-            .await
-        {
+        tracing::debug!(request_id = %task.request_id, %lease_owner, stage = "archive_start", "conversation projection stage");
+        match archive_session_body(state, lease_owner, task.request_id).await {
             Ok(true) => state
                 .metrics
                 .observe_background_projection(BackgroundProjectionKind::Conversation, true),
@@ -868,11 +1224,276 @@ async fn process_conversation_projection_batch(state: &AppState, lease_owner: Uu
                 tracing::error!(
                     %error,
                     request_id = %task.request_id,
-                    "worker failed to project conversation task"
+                    "会话正文归档没有写完，客户端请求已经结束"
                 );
             }
         }
     }
+}
+
+/// 读取原始请求/返回，正文写对象存储，CNPG 仅记录引用和投影元数据。
+/// locator 缺失或文档读不出来时记下原因并结束这条队列，不让客户端失败。
+pub(crate) async fn archive_session_body(
+    state: &AppState,
+    lease_owner: Uuid,
+    request_id: Uuid,
+) -> Result<bool, AppError> {
+    tracing::debug!(%request_id, %lease_owner, stage = "context_start", "conversation projection stage");
+    let (tenant_id, hints, response_complete) =
+        state.db.conversation_object_context(request_id).await?;
+    let Some(mut locators) = state.db.session_body_locators(request_id).await? else {
+        return skip_session_body(
+            state,
+            lease_owner,
+            request_id,
+            "session_body_skipped_missing_request_locator",
+        )
+        .await;
+    };
+    tracing::debug!(%request_id, %lease_owner, stage = "raw_response_reference_start", "conversation projection stage");
+    if let Some(response) = state
+        .archive
+        .raw_capture_reference(tenant_id, request_id, "response")
+        .await?
+    {
+        state
+            .db
+            .bind_raw_capture(tenant_id, request_id, "response", &response)
+            .await?;
+        locators.response = Some(response.object_locator);
+        locators.pending = false;
+    } else if state
+        .archive
+        .raw_capture_failed(tenant_id, request_id, "response")
+        .await?
+    {
+        locators.response = None;
+        locators.pending = false;
+    }
+    tracing::debug!(%request_id, %lease_owner, stage = "raw_request_reference_start", "conversation projection stage");
+    if let Some(request) = state
+        .archive
+        .raw_capture_reference(tenant_id, request_id, "request")
+        .await?
+    {
+        state
+            .db
+            .bind_raw_capture(tenant_id, request_id, "request", &request)
+            .await?;
+        locators.request = request.object_locator;
+        locators.source_identity = None;
+    }
+    let request_capture_pending = locators.request == format!("gap://{request_id}/request")
+        && !state
+            .archive
+            .raw_capture_failed(tenant_id, request_id, "request")
+            .await?;
+    if locators.pending || request_capture_pending {
+        tracing::debug!(%request_id, %lease_owner, raw_pending = locators.pending, request_capture_pending, stage = "raw_pending_defer", "conversation projection stage");
+        state
+            .db
+            .project_claimed_conversation_identity(lease_owner, request_id)
+            .await?;
+        state
+            .db
+            .defer_pending_session_body_archive(lease_owner, request_id)
+            .await?;
+        return Ok(false);
+    }
+    if missing_raw_document(&locators.request) {
+        return skip_session_body(
+            state,
+            lease_owner,
+            request_id,
+            "session_body_skipped_missing_request_locator",
+        )
+        .await;
+    }
+    tracing::debug!(%request_id, %lease_owner, stage = "source_stream_start", "conversation projection stage");
+    let projection = state.archive.prepare_session_body_streamed(
+        tenant_id,
+        request_id,
+        hints,
+        locators.request.clone(),
+        locators
+            .response
+            .clone()
+            .filter(|locator| !missing_raw_document(locator)),
+        response_complete,
+    );
+    tokio::pin!(projection);
+    let mut heartbeat = tokio::time::interval(Duration::from_secs(30));
+    heartbeat.tick().await;
+    let prepared = loop {
+        tokio::select! {
+            result = &mut projection => break result,
+            _ = heartbeat.tick() => {
+                if !state.db.renew_session_body_archive(lease_owner, request_id).await? {
+                    return Ok(false);
+                }
+            }
+        }
+    };
+    tracing::debug!(%request_id, %lease_owner, succeeded = prepared.is_ok(), stage = "source_stream_done", "conversation projection stage");
+    let prepared = match prepared {
+        Ok(Some(prepared)) => prepared,
+        Ok(None) => {
+            return skip_session_body(
+                state,
+                lease_owner,
+                request_id,
+                "session_body_skipped_archive_unreadable",
+            )
+            .await;
+        }
+        Err(error) => {
+            let retry = if let Some(identity) = locators.source_identity {
+                state
+                    .archive
+                    .source_object_exists(&locators.request)
+                    .await?
+                    || (!locators.source_failed
+                        && !state
+                            .db
+                            .recover_request_source(identity, &locators.request)
+                            .await?)
+            } else {
+                !missing_raw_document(&locators.request)
+            };
+            if retry {
+                state
+                    .db
+                    .project_claimed_conversation_identity(lease_owner, request_id)
+                    .await?;
+                state
+                    .db
+                    .defer_session_body_archive(lease_owner, request_id)
+                    .await?;
+                return Ok(false);
+            }
+            if locators.source_identity.is_some() {
+                // The writer's lease has been fenced and its actual source is
+                // absent. Keep explicit loss evidence; SQL snapshots are not
+                // substitutes for the missing original request.
+                state
+                    .archive
+                    .publish_raw_capture_failure(tenant_id, request_id, "request")
+                    .await?;
+                return skip_session_body(
+                    state,
+                    lease_owner,
+                    request_id,
+                    "session_body_skipped_missing_source",
+                )
+                .await;
+            }
+            return Err(error);
+        }
+    };
+    if let Some(identity) = locators.source_identity
+        && !locators.source_recorded
+    {
+        state
+            .db
+            .record_request_source(
+                identity,
+                &locators.request,
+                prepared.request_size,
+                prepared.request_digest,
+                true,
+            )
+            .await?;
+    }
+    for side in ["request", "response"] {
+        if let Some(object) = state
+            .archive
+            .raw_capture_reference(tenant_id, request_id, side)
+            .await?
+        {
+            state
+                .db
+                .bind_raw_capture(tenant_id, request_id, side, &object)
+                .await?;
+        }
+    }
+    let crate::archive::PreparedSessionBody {
+        atoms,
+        nodes,
+        media,
+        publication,
+        coverage_complete,
+        ..
+    } = prepared;
+    if !state
+        .db
+        .prepare_archived_session_body_archive(lease_owner, request_id, atoms, &nodes, &media)
+        .await?
+    {
+        return Ok(false);
+    }
+    if coverage_complete
+        && !state
+            .db
+            .retain_semantic_coverage_obligation(lease_owner, request_id, &publication)
+            .await?
+    {
+        return Ok(false);
+    }
+    tracing::debug!(%request_id, %lease_owner, stage = "semantic_projection_start", "conversation projection stage");
+    let result = state
+        .db
+        .project_claimed_conversation_projection_task(lease_owner, request_id)
+        .await;
+    tracing::debug!(%request_id, %lease_owner, succeeded = result.is_ok(), stage = "semantic_projection_done", "conversation projection stage");
+    let projected = result?;
+    #[cfg(test)]
+    if projected && coverage_complete {
+        // The database has actually committed. Simulate losing the result at
+        // this boundary, without rolling it back or replaying projection.
+        crate::db::Database::semantic_coverage_test_boundary("projection_commit_ack")?;
+    }
+    if projected
+        && coverage_complete
+        && let Some(head) = nodes.last()
+    {
+        let binding = state
+            .db
+            .semantic_archive_binding(tenant_id, request_id, &head.node_hash)
+            .await?
+            .ok_or_else(|| AppError::storage("semantic_sql_binding_not_committed"))?;
+        state
+            .archive
+            .confirm_semantic_coverage(&publication, &binding)
+            .await?;
+    }
+    // Coverage confirmation is a separate durable handoff, not financial ACK
+    // and not yet permission to delete raw still held by another retry owner.
+    Ok(projected)
+}
+
+async fn skip_session_body(
+    state: &AppState,
+    lease_owner: Uuid,
+    request_id: Uuid,
+    reason: &'static str,
+) -> Result<bool, AppError> {
+    state
+        .db
+        .project_claimed_conversation_identity(lease_owner, request_id)
+        .await?;
+    tracing::warn!(%request_id, reason, "会话正文归档跳过这条请求");
+    state
+        .db
+        .skip_session_body_archive(lease_owner, request_id, reason)
+        .await?;
+    Ok(false)
+}
+
+fn missing_raw_document(locator: &str) -> bool {
+    locator.is_empty()
+        || locator.starts_with("gap://")
+        || locator.starts_with("metadata-only-json:")
+        || locator.starts_with("provider-reference-json:")
 }
 
 #[cfg(test)]
@@ -896,6 +1517,103 @@ mod tests {
     };
 
     use super::*;
+
+    #[tokio::test]
+    async fn oauth_worker_keeps_durable_refresh_and_continues_after_stalled_price_followup() {
+        let directory = tempfile::tempdir().unwrap();
+        let server = MockServer::start().await;
+        let mut config = Config::for_test(format!(
+            "sqlite://{}?mode=rwc",
+            directory.path().join("worker-oauth-followup.db").display()
+        ));
+        config.pricing_models_dev_url = format!("{}/prices", server.uri());
+        config.pricing_litellm_url = format!("{}/missing-litellm", server.uri());
+        config.pricing_openrouter_url = format!("{}/missing-openrouter", server.uri());
+        let state = AppState::initialize(config).await.unwrap();
+        Mock::given(method("POST"))
+            .and(path("/refresh"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "accessToken": "fresh-access"
+            })))
+            .expect(2)
+            .mount(&server)
+            .await;
+        Mock::given(path("/v1/models"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "data": [{"id":"test-model"}]
+            })))
+            .expect(2)
+            .mount(&server)
+            .await;
+        let stalled = Mock::given(path("/prices"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_delay(Duration::from_secs(120))
+                    .set_body_json(json!({})),
+            )
+            .expect(1)
+            .mount_as_scoped(&server)
+            .await;
+        let blocking = BlockingTasks::new();
+        for name in ["first", "next"] {
+            let account = state
+                .db
+                .create_upstream_account(
+                    CreateUpstreamAccountInput {
+                        tenant_external_id: "worker-oauth-followup".into(),
+                        name: name.into(),
+                        driver: "http-json".into(),
+                        config: json!({"base_url": server.uri()}),
+                        credential: UpstreamCredential::OAuth {
+                            access_token: "expired-access".into(),
+                            refresh_token: Some("refresh-token".into()),
+                            expires_at: Some(1),
+                            header: "authorization".into(),
+                            prefix: "Bearer ".into(),
+                            adapter_state: None,
+                            proxy_url: None,
+                            proxy_network_scope: None,
+                        },
+                        oauth_session_id: Some(Uuid::now_v7()),
+                        oauth_driver: Some("cursor".into()),
+                        oauth_refresh_url: Some(format!("{}/refresh", server.uri())),
+                    },
+                    state.config.key_pepper.as_bytes(),
+                )
+                .await
+                .unwrap();
+            tokio::time::timeout(
+                Duration::from_secs(45),
+                refresh_expiring_oauth(&state, account.id, 1, &blocking),
+            )
+            .await
+            .expect("price work must yield the renewal lane")
+            .unwrap();
+            let (current, _) = state
+                .db
+                .upstream_account_with_credential(account.id, state.config.key_pepper.as_bytes())
+                .await
+                .unwrap();
+            assert_eq!(current.credential_generation, 2);
+            let catalog = state
+                .db
+                .upstream_model_catalog(account.id, "worker-oauth-followup", None, 100)
+                .await
+                .unwrap();
+            assert_eq!(catalog.status, "ready");
+            assert_eq!(catalog.models.len(), 1);
+            if name == "first" {
+                // Keep the first response stalled while the next account renews.
+                Mock::given(path("/prices"))
+                    .respond_with(ResponseTemplate::new(503))
+                    .with_priority(1)
+                    .mount(&server)
+                    .await;
+            }
+        }
+        drop(stalled);
+        server.verify().await;
+    }
 
     #[tokio::test]
     async fn oauth_worker_reclaims_stale_undispatched_claim_but_not_unknown_outcome() {
@@ -1010,6 +1728,105 @@ mod tests {
             refresh_expiring_oauth(&state, uncertain.id, 1, &blocking).await,
             Err(AppError::Conflict(message)) if message.contains("outcome is unknown")
         ));
+        // Both a manual endpoint and a stale worker takeover may have saved a
+        // result under a key different from the deterministic generation key.
+        for pending_key in ["manual-refresh-result", "oauth-worker-takeover-result"] {
+            let pending = state
+                .db
+                .create_upstream_account(
+                    make_account(pending_key),
+                    state.config.key_pepper.as_bytes(),
+                )
+                .await
+                .unwrap();
+            state
+                .db
+                .claim_upstream_oauth_refresh(
+                    pending.id,
+                    pending_key,
+                    state.config.key_pepper.as_bytes(),
+                )
+                .await
+                .unwrap();
+            state
+                .db
+                .mark_upstream_oauth_refresh_request_started(pending.id, pending_key)
+                .await
+                .unwrap();
+            let saved = UpstreamCredential::OAuth {
+                access_token: "already-refreshed-access".into(),
+                refresh_token: Some("already-rotated-refresh".into()),
+                expires_at: Some(crate::db::unix_millis() + 900_000),
+                header: "authorization".into(),
+                prefix: "Bearer ".into(),
+                adapter_state: None,
+                proxy_url: None,
+                proxy_network_scope: None,
+            };
+            let encrypted =
+                crate::provider::seal_credential(&saved, state.config.key_pepper.as_bytes())
+                    .unwrap();
+            sqlx::query("UPDATE upstream_oauth_refresh_leases SET pending_credential_ciphertext = $1, pending_expires_at = $2, lease_expires_at = 0 WHERE account_id = $3")
+                .bind(encrypted).bind(saved.expires_at()).bind(pending.id.to_string())
+                .execute(&test_pool).await.unwrap();
+            refresh_expiring_oauth(&state, pending.id, 1, &blocking)
+                .await
+                .unwrap();
+            let installed = state
+                .db
+                .upstream_account_with_credential(pending.id, state.config.key_pepper.as_bytes())
+                .await
+                .unwrap();
+            assert_eq!(installed.0.credential_generation, 2);
+            assert_eq!(
+                serde_json::to_value(&installed.1).unwrap()["refresh_token"],
+                "already-rotated-refresh"
+            );
+        }
+
+        // A new authorization installed after the scheduler's snapshot must
+        // not be refreshed with the old selected generation.
+        let replaced = state
+            .db
+            .create_upstream_account(
+                make_account("manual-replacement"),
+                state.config.key_pepper.as_bytes(),
+            )
+            .await
+            .unwrap();
+        let (_, replacement) = state
+            .db
+            .upstream_account_with_credential(replaced.id, state.config.key_pepper.as_bytes())
+            .await
+            .unwrap();
+        state
+            .db
+            .rotate_upstream_credential(
+                replaced.id,
+                replacement,
+                "operator-replacement",
+                state.config.key_pepper.as_bytes(),
+            )
+            .await
+            .unwrap();
+        assert!(matches!(
+            refresh_expiring_oauth(&state, replaced.id, 1, &blocking).await,
+            Err(AppError::Conflict(message)) if message.contains("changed after automatic refresh")
+        ));
+        let installed = state
+            .db
+            .upstream_account_with_credential(replaced.id, state.config.key_pepper.as_bytes())
+            .await
+            .unwrap();
+        assert_eq!(installed.0.credential_generation, 2);
+        let claims: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM upstream_oauth_refresh_leases WHERE account_id = $1",
+        )
+        .bind(replaced.id.to_string())
+        .fetch_one(&test_pool)
+        .await
+        .unwrap();
+        assert_eq!(claims, 0, "stale scheduling must roll back its claim");
         server.verify().await;
     }
 

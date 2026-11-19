@@ -53,6 +53,78 @@ mod tests {
             .unwrap();
         let document: Value = serde_json::from_slice(&body).unwrap();
         assert_eq!(document["openapi"], "3.1.0");
-        assert!(document["paths"]["/internal/v1/inference/chat/completions"]["post"].is_object());
+        let schemas = &document["components"]["schemas"];
+        for path in [
+            "/internal/v1/inference/chat/completions",
+            "/internal/v1/inference/messages",
+            "/internal/v1/inference/responses",
+        ] {
+            let operation = &document["paths"][path]["post"];
+            assert_eq!(operation["x-required-scope"], "keys:write");
+            let request = &operation["requestBody"]["content"]["application/json"]["schema"];
+            assert_eq!(request["additionalProperties"], false);
+            assert_eq!(
+                request["properties"]["conversation"]["$ref"],
+                "#/components/schemas/OperatorInferenceConversation"
+            );
+        }
+        assert_eq!(
+            schemas["OperatorInferenceConversation"]["additionalProperties"],
+            false
+        );
+        assert_eq!(
+            schemas["OperatorInferenceConversation"]["required"],
+            json!(["id"])
+        );
+        assert_eq!(
+            schemas["OperatorInferenceConversationIdentifier"]["minLength"],
+            1
+        );
+        assert_eq!(
+            schemas["OperatorInferenceConversationIdentifier"]["maxLength"],
+            128
+        );
+        assert_eq!(
+            schemas["OperatorInferenceConversationIdentifier"]["pattern"],
+            "^[A-Za-z0-9._:-]+$"
+        );
+        assert_eq!(
+            schemas["RequestSummary"]["properties"]["operational_terminal"]["oneOf"],
+            serde_json::json!([
+                {"$ref": "#/components/schemas/RequestOperationalTerminal"},
+                {"type": "null"}
+            ])
+        );
+        use crate::model::{RequestFinancialState, RequestOperationalTerminalView};
+        assert_eq!(
+            schemas["RequestFinancialState"]["enum"],
+            serde_json::to_value([
+                RequestFinancialState::Pending,
+                RequestFinancialState::Unknown,
+                RequestFinancialState::Applied,
+            ])
+            .unwrap()
+        );
+        let terminal = serde_json::to_value(RequestOperationalTerminalView {
+            completed_at: 1_792_195_200_000,
+            stage: None,
+            financial_state: RequestFinancialState::Unknown,
+        })
+        .unwrap();
+        let declared: std::collections::BTreeSet<&str> =
+            schemas["RequestOperationalTerminal"]["required"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|value| value.as_str().unwrap())
+                .collect();
+        let serialized: std::collections::BTreeSet<&str> = terminal
+            .as_object()
+            .unwrap()
+            .keys()
+            .map(String::as_str)
+            .collect();
+        assert_eq!(serialized, declared);
+        assert!(terminal["stage"].is_null());
     }
 }

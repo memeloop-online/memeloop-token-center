@@ -18,15 +18,58 @@ pub enum OAuthRefreshFailureKind {
 }
 
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum OAuthRefreshPhase {
+    BeforeHeaders,
+    ResponseBody,
+}
+
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum OAuthRefreshTimeoutSource {
+    HttpClient,
+    OperationDeadline,
+}
+
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct OAuthRefreshObservation {
+    pub phase: OAuthRefreshPhase,
+    pub elapsed_ms: u64,
+    pub budget_ms: u64,
+    pub connector_failure: bool,
+    pub timeout_source: Option<OAuthRefreshTimeoutSource>,
+}
+
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct OAuthRefreshFailure {
     pub kind: OAuthRefreshFailureKind,
     pub http_status: Option<u16>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub observation: Option<OAuthRefreshObservation>,
 }
 
 impl OAuthRefreshFailure {
     pub(crate) fn new(kind: OAuthRefreshFailureKind, http_status: Option<u16>) -> Self {
-        Self { kind, http_status }
+        Self {
+            kind,
+            http_status,
+            observation: None,
+        }
+    }
+
+    /// Kimi's official OAuth client retries these failures using the same token.
+    /// This policy does not apply to quota resets or other OAuth providers.
+    pub(crate) fn kimi_retryable(self) -> bool {
+        if matches!(self.http_status, Some(401 | 403)) {
+            return false;
+        }
+        matches!(
+            self.kind,
+            OAuthRefreshFailureKind::Network | OAuthRefreshFailureKind::Timeout
+        ) || (self.kind == OAuthRefreshFailureKind::HttpRejected
+            && matches!(self.http_status, Some(429 | 500 | 502 | 503 | 504)))
     }
 
     pub(crate) fn requires_reauthorization(self) -> bool {
@@ -60,6 +103,13 @@ pub(crate) struct OAuthRefreshDiagnostic {
 }
 
 impl OAuthRefreshDiagnostic {
+    pub(crate) fn allows_kimi_retry(&self, lease_created_at: i64, request_started_at: i64) -> bool {
+        self.attempt_created_at == lease_created_at
+            && self.attempt_finished_at >= request_started_at
+            && self.outcome == OAuthRefreshOutcome::OutcomeUnknown
+            && self.failure.kimi_retryable()
+    }
+
     pub(crate) fn from_json(value: &str, generation: i64) -> Option<Self> {
         if value.len() > 2048 {
             return None;
@@ -114,9 +164,14 @@ pub(crate) struct OAuthRefreshStatus {
     pub http_status: Option<u16>,
     pub reauthorization_required: bool,
     pub automatic_refresh_paused: bool,
+    pub lease_expires_at: Option<i64>,
+    pub allowed_actions: Vec<&'static str>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub failure_observation: Option<OAuthRefreshObservation>,
 }
 
 pub(crate) struct OAuthRefreshMetadata {
+    pub kimi: bool,
     pub generation: i64,
     pub expires_at: Option<i64>,
     pub revoked_at: Option<i64>,
@@ -156,8 +211,32 @@ impl OAuthRefreshMetadata {
         } else {
             OAuthRefreshState::NotObserved
         };
+        let completed_kimi_retry = self.kimi
+            && self.lease_created_at.is_some_and(|created| {
+                diagnostic.as_ref().is_some_and(|value| {
+                    self.request_started_at
+                        .is_some_and(|started| value.allows_kimi_retry(created, started))
+                })
+            })
+            && self.lease_expires_at.is_some_and(|expiry| expiry <= now);
+        let mut allowed_actions = vec!["reauthorize"];
+        if self.has_pending {
+            allowed_actions.insert(0, "resume_local");
+        } else if self.revoked_at.is_none()
+            && ((self.request_started_at.is_none()
+                && self.lease_expires_at.is_none_or(|expiry| expiry <= now)
+                && matches!(
+                    refresh_state,
+                    OAuthRefreshState::NotObserved | OAuthRefreshState::Failed
+                ))
+                || completed_kimi_retry)
+        {
+            allowed_actions.insert(0, "refresh");
+        }
         OAuthRefreshStatus {
             credential_generation: self.generation,
+            lease_expires_at: self.lease_expires_at,
+            allowed_actions,
             access_state: if self.revoked_at.is_some() {
                 OAuthAccessState::Revoked
             } else {
@@ -184,6 +263,9 @@ impl OAuthRefreshMetadata {
                     refresh_state,
                     OAuthRefreshState::OutcomeUnknown | OAuthRefreshState::ReauthorizationRequired
                 ),
+            failure_observation: diagnostic
+                .as_ref()
+                .and_then(|value| value.failure.observation),
         }
     }
 }
@@ -194,6 +276,7 @@ mod tests {
 
     fn metadata() -> OAuthRefreshMetadata {
         OAuthRefreshMetadata {
+            kimi: false,
             generation: 7,
             expires_at: Some(10),
             revoked_at: None,
@@ -225,6 +308,7 @@ mod tests {
         assert!(status.automatic_refresh_paused);
         assert!(status.attempt_finished_at.is_none());
         assert!(status.failure_class.is_none());
+        assert_eq!(status.allowed_actions, ["reauthorize"]);
     }
 
     #[test]
@@ -241,6 +325,27 @@ mod tests {
         let status = pending.status(30);
         assert_eq!(status.refresh_state, OAuthRefreshState::PendingLocal);
         assert!(!status.reauthorization_required);
+    }
+
+    #[test]
+    fn actions_separate_local_recovery_and_safe_dispatch_from_access_validity() {
+        let mut source = metadata();
+        source.expires_at = Some(100);
+        source.has_pending = true;
+        let status = source.status(30);
+        assert_eq!(status.allowed_actions, ["resume_local", "reauthorize"]);
+        assert_eq!(status.access_state, OAuthAccessState::Valid);
+        assert!(!status.reauthorization_required);
+        let mut source = metadata();
+        source.expires_at = Some(100);
+        source.request_started_at = None;
+        assert_eq!(
+            source.status(30).allowed_actions,
+            ["refresh", "reauthorize"]
+        );
+        let mut active = metadata();
+        active.request_started_at = None;
+        assert_eq!(active.status(10).allowed_actions, ["reauthorize"]);
     }
 
     #[test]
@@ -289,6 +394,33 @@ mod tests {
     }
 
     #[test]
+    fn legacy_diagnostics_do_not_invent_phase_and_new_observations_are_fenced() {
+        let legacy = r#"{"version":1,"credential_generation":7,"attempt_created_at":5,"attempt_finished_at":9,"outcome":"outcome_unknown","failure":{"kind":"timeout","http_status":null}}"#;
+        let mut source = metadata();
+        source.diagnostic_json = Some(legacy.into());
+        assert!(source.status(30).failure_observation.is_none());
+        let mut current = OAuthRefreshDiagnostic::from_json(legacy, 7).unwrap();
+        current.failure.observation = Some(OAuthRefreshObservation {
+            phase: OAuthRefreshPhase::BeforeHeaders,
+            elapsed_ms: 30_737,
+            budget_ms: 120_000,
+            connector_failure: false,
+            timeout_source: Some(OAuthRefreshTimeoutSource::HttpClient),
+        });
+        let encoded = serde_json::to_string(&current).unwrap();
+        assert!(encoded.len() < 2048);
+        for (generation, expected) in [(7, current.failure.observation), (8, None)] {
+            let mut source = metadata();
+            source.generation = generation;
+            source.diagnostic_json = Some(encoded.clone());
+            let status = source.status(30);
+            assert_eq!(status.failure_observation, expected);
+            assert!(!status.reauthorization_required);
+            assert!(status.automatic_refresh_paused);
+        }
+    }
+
+    #[test]
     fn automatic_refresh_pause_is_not_expiry_or_an_active_or_saved_attempt() {
         let active = metadata().status(7);
         assert_eq!(active.refresh_state, OAuthRefreshState::InProgress);
@@ -308,5 +440,56 @@ mod tests {
         let rejected = rejected.status(30);
         assert!(rejected.reauthorization_required);
         assert!(rejected.automatic_refresh_paused);
+    }
+    #[test]
+    fn kimi_completed_transient_failure_allows_explicit_retry_without_relabeling_access() {
+        let mut source = metadata();
+        source.kimi = true;
+        source.expires_at = Some(100);
+        let mut failure = diagnostic();
+        failure.outcome = OAuthRefreshOutcome::OutcomeUnknown;
+        failure.failure = OAuthRefreshFailure::new(OAuthRefreshFailureKind::Timeout, None);
+        source.diagnostic_json = Some(serde_json::to_string(&failure).unwrap());
+        let active = source.status(19);
+        assert_eq!(active.allowed_actions, ["reauthorize"]);
+        let mut source = metadata();
+        source.kimi = true;
+        source.expires_at = Some(100);
+        source.diagnostic_json = Some(serde_json::to_string(&failure).unwrap());
+        let completed = source.status(30);
+        assert_eq!(completed.allowed_actions, ["refresh", "reauthorize"]);
+        assert_eq!(completed.access_state, OAuthAccessState::Valid);
+        assert_eq!(completed.refresh_state, OAuthRefreshState::OutcomeUnknown);
+        assert!(completed.automatic_refresh_paused);
+        assert!(!completed.reauthorization_required);
+        failure.failure = OAuthRefreshFailure {
+            kind: OAuthRefreshFailureKind::Network,
+            http_status: Some(200),
+            observation: Some(OAuthRefreshObservation {
+                phase: OAuthRefreshPhase::ResponseBody,
+                elapsed_ms: 100,
+                budget_ms: 0,
+                connector_failure: false,
+                timeout_source: None,
+            }),
+        };
+        let mut body_source = metadata();
+        body_source.kimi = true;
+        body_source.diagnostic_json = Some(serde_json::to_string(&failure).unwrap());
+        let body_status = body_source.status(30);
+        assert_eq!(body_status.allowed_actions, ["refresh", "reauthorize"]);
+        assert_eq!(body_status.http_status, Some(200));
+        assert_eq!(
+            body_status.failure_observation.unwrap().phase,
+            OAuthRefreshPhase::ResponseBody
+        );
+        failure.failure.http_status = Some(401);
+        assert!(!failure.allows_kimi_retry(5, 6));
+        failure.failure.http_status = Some(200);
+        assert!(!failure.allows_kimi_retry(4, 6));
+        assert!(!failure.allows_kimi_retry(5, 10));
+        failure.failure =
+            OAuthRefreshFailure::new(OAuthRefreshFailureKind::InvalidGrant, Some(400));
+        assert!(!failure.allows_kimi_retry(5, 6));
     }
 }

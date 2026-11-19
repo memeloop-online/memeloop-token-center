@@ -16,7 +16,8 @@ fn validate_directory(directory: &Path) -> Result<(), AppError> {
     {
         return Err(AppError::Forbidden);
     }
-    let metadata = std::fs::symlink_metadata(directory).map_err(|_| AppError::Internal)?;
+    let metadata = std::fs::symlink_metadata(directory)
+        .map_err(|_| AppError::internal("prepare_validate_directory_1"))?;
     if !metadata.is_dir() || metadata.file_type().is_symlink() {
         return Err(AppError::Forbidden);
     }
@@ -31,7 +32,11 @@ pub fn check_inventory_directory(directory: &Path) -> Result<(), AppError> {
 pub fn prepare_inventory_directory(directory: &Path) -> Result<(), AppError> {
     validate_directory(directory)?;
     let inventory = directory.join("inventory.json");
-    if inventory.try_exists().map_err(|_| AppError::Internal)? {
+    let _lock = super::inventory_lock::try_write_lock(&inventory)?;
+    if inventory
+        .try_exists()
+        .map_err(|_| AppError::internal("prepare_prepare_inventory_directory_1"))?
+    {
         return validate_existing(&inventory);
     }
     // Publish only a complete fsynced file; create-new on the final filename
@@ -45,17 +50,21 @@ pub fn prepare_inventory_directory(directory: &Path) -> Result<(), AppError> {
         options.mode(0o640);
     }
     let result = (|| {
-        let mut file = options.open(&temporary).map_err(|_| AppError::Internal)?;
-        file.write_all(b"{}").map_err(|_| AppError::Internal)?;
-        file.sync_all().map_err(|_| AppError::Internal)?;
+        let mut file = options
+            .open(&temporary)
+            .map_err(|_| AppError::internal("prepare_prepare_inventory_directory_2"))?;
+        file.write_all(b"{}")
+            .map_err(|_| AppError::internal("prepare_prepare_inventory_directory_3"))?;
+        file.sync_all()
+            .map_err(|_| AppError::internal("prepare_prepare_inventory_directory_4"))?;
         match std::fs::hard_link(&temporary, &inventory) {
             Ok(()) => {}
             Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {}
-            Err(_) => return Err(AppError::Internal),
+            Err(_) => return Err(AppError::internal("prepare_prepare_inventory_directory_1")),
         }
         std::fs::File::open(directory)
             .and_then(|file| file.sync_all())
-            .map_err(|_| AppError::Internal)?;
+            .map_err(|_| AppError::internal("prepare_prepare_inventory_directory_5"))?;
         validate_existing(&inventory)
     })();
     let _ = std::fs::remove_file(&temporary);
@@ -63,16 +72,17 @@ pub fn prepare_inventory_directory(directory: &Path) -> Result<(), AppError> {
 }
 
 fn validate_existing(path: &Path) -> Result<(), AppError> {
-    let metadata = std::fs::symlink_metadata(path).map_err(|_| AppError::Internal)?;
+    let metadata = std::fs::symlink_metadata(path)
+        .map_err(|_| AppError::internal("prepare_validate_existing_1"))?;
     if !metadata.is_file() || metadata.file_type().is_symlink() {
         return Err(AppError::Forbidden);
     }
     let mut bytes = Vec::new();
     std::fs::File::open(path)
-        .map_err(|_| AppError::Internal)?
+        .map_err(|_| AppError::internal("prepare_validate_existing_2"))?
         .take(4 * 1024 * 1024 + 1)
         .read_to_end(&mut bytes)
-        .map_err(|_| AppError::Internal)?;
+        .map_err(|_| AppError::internal("prepare_validate_existing_3"))?;
     if bytes.len() > 4 * 1024 * 1024 {
         return Err(AppError::Forbidden);
     }
@@ -118,14 +128,34 @@ mod tests {
     fn concurrent_initializers_converge_and_crashed_temporary_file_is_ignored() {
         let root = tempfile::tempdir().unwrap();
         std::fs::write(root.path().join(".mtc-inventory-init-crashed"), b"").unwrap();
-        std::thread::scope(|scope| {
-            for _ in 0..4 {
-                scope.spawn(|| prepare_inventory_directory(root.path()).unwrap());
+        let successful = std::thread::scope(|scope| {
+            let attempts: Vec<_> = (0..4)
+                .map(|_| scope.spawn(|| prepare_inventory_directory(root.path())))
+                .collect();
+            let mut successful = 0;
+            for attempt in attempts {
+                match attempt.join().unwrap() {
+                    Ok(()) => successful += 1,
+                    Err(AppError::Capacity {
+                        code: "plugin_installation_lock",
+                        ..
+                    }) => {}
+                    Err(error) => panic!("unexpected initialization failure: {error:?}"),
+                }
             }
+            successful
         });
+        // One initializer owns publication; contenders report the explicit busy
+        // outcome consumed by --allow-unavailable, rather than wait in Pod init.
+        assert!(successful >= 1);
         assert_eq!(
             std::fs::read(root.path().join("inventory.json")).unwrap(),
             b"{}"
+        );
+        prepare_inventory_directory(root.path()).unwrap();
+        assert_eq!(
+            std::fs::read(root.path().join(".mtc-inventory-init-crashed")).unwrap(),
+            b""
         );
     }
 

@@ -57,7 +57,7 @@ test('connection, localization and edit composition translate transport copy wit
     request_timeout_millis: '请求总超时（毫秒）', memory_admission_wait_millis: '内存排队超时（毫秒）',
     dispatch_max_in_flight: '调度最大并发数', dispatch_max_queued: '调度队列容量', dispatch_queue_timeout_millis: '调度排队超时（毫秒）',
     max_sse_event_bytes: '最大 SSE 事件（字节）', max_sse_framed_bytes: '单个网络分片最大帧数据量（字节）', max_sse_terminal_hold_bytes: '终止事件最大暂存量（字节）',
-    candidate_attempts: '候选尝试次数', failover_deadline_millis: '故障切换时限（毫秒）', connect_attempts: '连接尝试次数',
+    candidate_attempts: '候选尝试次数', connect_attempts: '连接尝试次数',
     connect_retry_delay_millis: '连接重试间隔（毫秒）', shared_probe_attempts: '共享探测次数',
     chat_controls: 'Chat 控制策略', responses_output_limits: 'Responses 输出限制',
   };
@@ -67,9 +67,9 @@ test('connection, localization and edit composition translate transport copy wit
     responses_output_limits: '默认策略（provider_default）会校验并移除客户端的输出限制提示；上游使用自身默认值，不强制执行请求指定的词元上限。由于 Codex OAuth 无法保证该限制，显式选择严格策略（strict）时会拒绝任何输出限制提示。额度始终按可信的模型上限预留，并按观测到的实际用量结算。',
   };
   const existingEditHelp: Record<string, string> = {
-    connect_timeout_millis: '建立连接的等待时限，必须小于请求总超时。',
-    read_timeout_millis: '收到响应头后等待首段内容，以及后续相邻内容之间允许的最长无数据时间。',
-    request_timeout_millis: '从首次发送到完整接收响应的总时限，包含系统允许的重放。',
+    connect_timeout_millis: '可选的连接建立超时。默认不设置，不施加应用层连接时限。显式取值只覆盖建立连接（含 TLS 和配置的代理），不限制响应时长。',
+    read_timeout_millis: '可选。默认不设置时，上游再安静也不会被中断。设置后，该值是每收到一个字节就重新计时的读取静默窗口；Codex 转发不把它当作绝对时限。',
+    request_timeout_millis: 'HTTP/2 保活 PING 应答超时，也是模型目录和额度读取的总预算。不对推理或压缩施加绝对时限；连接保持健康时，安静的上游响应会继续。',
     dispatch_max_in_flight: '此账号每个代理出口的可选请求并发上限。默认值 0 表示不添加派发限制，也不使用派发队列。正数会限制正在执行的请求（包括流式响应）；调低已设置的上限时，现有请求继续完成。',
     dispatch_max_queued: '仅在派发并发上限大于 0 时生效。设置可排队等待的请求数；0 表示并发满时立即拒绝新请求。',
     dispatch_queue_timeout_millis: '仅在派发并发上限大于 0 时生效。请求排队超过此时限会返回 503；该请求尚未派发或计费。',

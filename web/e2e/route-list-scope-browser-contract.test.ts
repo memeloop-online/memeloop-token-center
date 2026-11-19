@@ -14,7 +14,8 @@ test('route list exposes group-only candidate scope and readable models without 
   const artifacts = fileURLToPath(new URL('../e2e-artifacts/route-list-scope/', import.meta.url));
   await mkdir(artifacts, { recursive: true });
   try {
-    const page = await browser.newPage({ hasTouch: true }); const errors: string[] = [];
+    const page = await browser.newPage({ hasTouch: true });
+    await page.context().grantPermissions(['clipboard-read', 'clipboard-write']); const errors: string[] = [];
     page.on('pageerror', error => errors.push(error.message));
     const describedTooltip = async (trigger: Locator, expectedText: string | RegExp) => {
       const element = await trigger.elementHandle();
@@ -47,6 +48,20 @@ test('route list exposes group-only candidate scope and readable models without 
       assert.equal(await rows.filter({ hasText: 'Kimi empty' }).getByText(locale === 'en' ? '0 candidate accounts' : '0 个候选账号', { exact: true }).count(), 1);
       assert.equal(await rows.filter({ hasText: 'Kimi unknown' }).getByText(locale === 'en' ? 'Account range unknown' : '账号范围未知', { exact: true }).count(), 1);
       assert.match(await rows.filter({ hasText: 'Kimi direct' }).locator('.route-list-source-name').innerText(), /Kimi personal account/);
+      const kimiDuplicate = rows.filter({ hasText: 'terra-model-7770' });
+      const otherDuplicate = rows.filter({ hasText: 'terra-model-other' });
+      assert.match(await kimiDuplicate.locator('.route-list-source-name').innerText(), /Shared subscription · Kimi Coding · kimi.example.invalid/);
+      assert.match(await otherDuplicate.locator('.route-list-source-name').innerText(), /Shared subscription · Other provider · provider.example.invalid/);
+      assert.equal(await kimiDuplicate.locator('.route-model-name').first().innerText(), 'terra-model-7770', 'the exact client model name remains usable');
+      const missingSource = rows.filter({ hasText: 'Missing source' });
+      assert.equal(await missingSource.locator('.route-list-source-name').innerText(), locale === 'en' ? 'Unknown account' : '未知账号');
+      assert.doesNotMatch(await missingSource.locator('.route-list-source-name').innerText(), /333333/);
+      const diagnostics = kimiDuplicate.locator('.route-source-diagnostics');
+      await diagnostics.locator('summary').click();
+      const accountId = '11111111-1111-4111-8111-111111111111';
+      await diagnostics.getByRole('button', { name: new RegExp(locale === 'en' ? 'Copy ID: Shared subscription' : '复制 ID: Shared subscription') }).click();
+      assert.equal(await page.evaluate(() => navigator.clipboard.readText()), accountId);
+      await diagnostics.locator('summary').click();
       const mixedRange = rows.filter({ hasText: 'Kimi mixed' }).getByRole('button', { name: locale === 'en' ? '1 candidate accounts' : '1 个候选账号', exact: true });
       await mixedRange.click();
       const mixedTip = await describedTooltip(mixedRange, /团队排除组/);
@@ -66,6 +81,7 @@ test('route list exposes group-only candidate scope and readable models without 
         assert.equal(await range.evaluate(el => el === document.activeElement), true);
         const tip = await describedTooltip(range, /Kimi personal account/);
         assert.match(await tip.innerText(), /Kimi personal account/); assert.match(await tip.innerText(), /Kimi team account/);
+        assert.doesNotMatch(await tip.innerText(), /\(personal\)|\(team\)|\(kimi-group\)/, 'ordinary source tooltips show names; IDs belong to the diagnostics');
         await page.keyboard.press('Escape'); await tip.waitFor({ state: 'hidden' });
         await range.tap(); await describedTooltip(range, /Kimi personal account/);
         const bounds = await tip.boundingBox(); assert.ok(bounds && bounds.x >= -1 && bounds.x + bounds.width <= width + 1);

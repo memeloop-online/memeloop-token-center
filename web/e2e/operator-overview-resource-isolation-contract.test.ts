@@ -4,7 +4,7 @@ import test from 'node:test';
 
 const pageSource = await readFile(new URL('../src/operator/pages/OperatorPages.tsx', import.meta.url), 'utf8');
 const overviewSource = pageSource.slice(pageSource.indexOf('export function OverviewPage'), pageSource.indexOf('export function UsagePage'));
-const usageSource = pageSource.slice(pageSource.indexOf('export function UsagePage'), pageSource.indexOf('export function GenerationsPage'));
+const usageSource = pageSource.slice(pageSource.indexOf('export function UsagePage'), pageSource.length);
 
 test('Overview loads monitoring and recent requests as independent tenant-scoped resources', () => {
   assert.doesNotMatch(overviewSource, /Promise\.all/);

@@ -68,7 +68,11 @@ pub(super) async fn attach_output_rates(
     tenant_scoped: bool,
     filter: &UsageAnalysisFilter,
     range: ValidatedUsageAnalysisRange,
+    standalone: bool,
 ) -> Result<(), AppError> {
+    // The standalone projection has no main rollup buckets to attach to.
+    // Preserve legacy full/trends bucket membership while emitting the exact
+    // eligible sample buckets when this is the only requested statement.
     let sql = output_rate_sql(range.granularity, tenant_scoped);
     let rows = snapshot
         .fetch_all(
@@ -114,7 +118,11 @@ pub(super) async fn attach_output_rates(
         total.output_tokens = total.output_tokens.saturating_add(rate.output_tokens);
         total.duration_ms = total.duration_ms.saturating_add(rate.duration_ms);
         let bucket: i64 = row.try_get("bucket_start")?;
-        if let Some(accumulator) = projections.get_mut(&("time".to_owned(), bucket.to_string())) {
+        let key = ("time".to_owned(), bucket.to_string());
+        if standalone {
+            projections.entry(key.clone()).or_default();
+        }
+        if let Some(accumulator) = projections.get_mut(&key) {
             accumulator.output_rate = Some(rate);
         }
     }

@@ -76,6 +76,8 @@ export function observeSessionReadyRequests({
   const deadline = AbortSignal.timeout(30_000);
   const signal = AbortSignal.any([controller.signal, deadline]);
   const requestIds = new Set<string>();
+  const readyEventIds = new Set<string>();
+  const readyKinds = new Map<string, Set<string>>();
   let ready: SessionReadyRequests | undefined;
   let eventAt: number | undefined;
   let eventId: string | undefined;
@@ -130,9 +132,19 @@ export function observeSessionReadyRequests({
             }
             const eventSessionId = event.session_context?.session_id;
             assert.ok(eventSessionId, 'confirmed session-ready events must name their logical session');
-            assert.ok(!requestIds.has(event.request_id), `request-event stream repeated ready request ${event.request_id}`);
+            assert.ok(!readyEventIds.has(id), `request-event stream repeated ready event ${id}`);
+            const kinds = readyKinds.get(event.request_id) ?? new Set<string>();
+            assert.ok(!kinds.has(event.event_kind), `request-event stream repeated ${event.event_kind} for ready request ${event.request_id}`);
+            readyEventIds.add(id);
+            kinds.add(event.event_kind);
+            readyKinds.set(event.request_id, kinds);
             eventAt = event.event_at;
             eventId = id;
+            // Deferred statistics and conversation projection each publish a
+            // distinct committed event. Both can carry the same confirmed
+            // session when the bounded event batch is enriched after replay.
+            // Count requests once while still rejecting duplicate publications.
+            if (requestIds.has(event.request_id)) return;
             requestIds.add(event.request_id);
             if (requestIds.size !== expected || settled) return;
             // A child can commit to an isolated cluster before its declared parent, then be merged
@@ -185,10 +197,9 @@ export function observeSessionReadyRequests({
 }
 
 function matchesReadySessionEvent(event: RequestEvent, sessionName: string): boolean {
-  // Prepaid requests materialize conversation semantics in the terminal
-  // transaction, so their committed `finished` event is the barrier. Metered
-  // requests enqueue that work and emit `projected` only after the projector
-  // commits. Both paths must expose confirmed semantics before the UI reads.
+  // Legacy inline finalization and durable terminal/conversation projectors
+  // can expose confirmed semantics on finished or projected events. Distinct
+  // event kinds for one request do not represent another completed request.
   return (event.event_kind === 'finished' || event.event_kind === 'projected')
     && event.session_context?.association === 'confirmed'
     && event.session_context.session_name === sessionName;
@@ -203,6 +214,7 @@ export interface SeedState {
   otherClientKeyId: string;
   globalServiceCredential: string;
   serviceCredential: string;
+  sessionObserverCredential: string;
   upstreamId: string;
   upstreamName: string;
   otherUpstreamId: string;
@@ -524,18 +536,20 @@ async function seedThroughHttp(): Promise<SeedState> {
       ],
     },
   });
-
-  await requestJson('/v1/chat/completions', {
-    method: 'POST', credential: client.key,
+  // The browser operator reuses its four-stream service quota across scenarios.
+  // Give the independent durable-event observer its own tenant-scoped identity.
+  const sessionObserver = await requestJson<{ token: string }>('/internal/v1/service-tokens', {
+    method: 'POST', credential: bootstrapToken,
     body: {
-      model,
-      messages: [{ role: 'user', content: 'Create one observable browser test request.' }],
-      max_tokens: 32,
+      name: 'Browser session-ready observer',
+      tenant_external_id: tenant,
+      scopes: ['requests:read'],
     },
   });
-  // This is browser workflow coverage, not SQLite write-concurrency coverage.
-  // Sequential traffic prevents a temporary SQLite finalizer from outliving a slow shared runner.
-  for (let requestNumber = 2; requestNumber <= 50; requestNumber += 1) {
+
+  // Response delivery precedes background financial acknowledgement. Wait for
+  // each seed's concurrency reservation before issuing the next non-idempotent POST.
+  for (let requestNumber = 1; requestNumber <= 50; requestNumber += 1) {
     await requestJson('/v1/chat/completions', {
       method: 'POST', credential: client.key,
       body: {
@@ -544,6 +558,12 @@ async function seedThroughHttp(): Promise<SeedState> {
         max_tokens: 32,
       },
     });
+    await eventually(async () => {
+      const limits = await requestJson<{ concurrency: { active: number } }>(
+        '/self/v1/key/limits', { credential: client.key },
+      );
+      assert.equal(limits.concurrency.active, 0, 'seed concurrency reservation is still pending');
+    }, 30_000, 'seed request did not release its concurrency reservation');
   }
   const failed = await fetch(new URL('/v1/chat/completions', baseURL), {
     method: 'POST',
@@ -591,6 +611,7 @@ async function seedThroughHttp(): Promise<SeedState> {
     globalServiceCredential: globalService.token,
     otherClientKeyId: otherClient.key_id,
     serviceCredential: service.token,
+    sessionObserverCredential: sessionObserver.token,
     upstreamId: upstream.id,
     upstreamName: 'Browser mock upstream',
     otherUpstreamId: otherUpstream.id,

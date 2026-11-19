@@ -80,6 +80,9 @@ pub(super) fn normalize_codex_multi_agent_v2(
         let mut last_readable_user_or_agent = None;
         for (index, mut item) in input.clone().into_iter().enumerate() {
             if item.get("type").and_then(Value::as_str) == Some("agent_message") {
+                if is_empty_agent_notification(&item) {
+                    continue;
+                }
                 if rewrite_agent_message(&mut item)? {
                     last_readable_user_or_agent = Some(index);
                     normalized.push(item);
@@ -93,9 +96,11 @@ pub(super) fn normalize_codex_multi_agent_v2(
                 normalized.push(item);
             }
         }
-        if last_opaque_agent.is_some_and(|opaque| {
-            last_readable_user_or_agent.is_none_or(|readable| readable < opaque)
-        }) {
+        if (normalized.is_empty() && !input.is_empty())
+            || last_opaque_agent.is_some_and(|opaque| {
+                last_readable_user_or_agent.is_none_or(|readable| readable < opaque)
+            })
+        {
             return Err(malformed_agent_message());
         }
         *input = normalized;
@@ -221,6 +226,24 @@ fn agent_envelope_has_empty_payload(text: &str) -> bool {
             .is_some_and(|(_, payload)| payload.trim().is_empty())
 }
 
+fn is_empty_agent_notification(item: &Value) -> bool {
+    // Only provably empty text is disposable. Encrypted, image, unknown, and
+    // malformed content still goes through the loss-preventing validation.
+    item.get("content")
+        .and_then(Value::as_array)
+        .is_some_and(|parts| {
+            parts.iter().all(|part| {
+                matches!(
+                    part.get("type").and_then(Value::as_str),
+                    Some("input_text" | "output_text" | "text")
+                ) && part
+                    .get("text")
+                    .and_then(Value::as_str)
+                    .is_some_and(|text| text.trim().is_empty())
+            })
+        })
+}
+
 fn rewrite_agent_message(item: &mut Value) -> Result<bool, AppError> {
     let content = item
         .get("content")
@@ -245,8 +268,10 @@ fn rewrite_agent_message(item: &mut Value) -> Result<bool, AppError> {
                 let text = part
                     .get("text")
                     .and_then(Value::as_str)
-                    .filter(|text| !text.trim().is_empty())
                     .ok_or_else(malformed_agent_message)?;
+                if text.trim().is_empty() {
+                    continue;
+                }
                 if carries_encrypted_content && agent_envelope_has_empty_payload(text) {
                     continue;
                 }
@@ -561,6 +586,20 @@ mod tests {
             let mut request = json!({"input":[item]});
             assert!(normalize_codex_multi_agent_v2(&mut request, true).is_err());
         }
+        let mut request = json!({"input":[
+            {"type":"message","role":"user","content":"review the change"},
+            {"type":"agent_message","content":[]},
+            {"type":"function_call","call_id":"call_1","name":"inspect","arguments":"{}"},
+            {"type":"agent_message","content":[{"type":"input_text","text":" \n"}]},
+            {"type":"function_call_output","call_id":"call_1","output":"actual result"}
+        ]});
+        let expected = json!({"input":[
+            request["input"][0].clone(),
+            request["input"][2].clone(),
+            request["input"][4].clone()
+        ]});
+        normalize_codex_multi_agent_v2(&mut request, true).unwrap();
+        assert_eq!(request, expected);
     }
 
     #[test]

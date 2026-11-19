@@ -1,10 +1,18 @@
-import { useCallback, useEffect, useRef, useState, type RefObject } from 'react';
+import { createSemanticViewLoader } from '../semanticViewReader.js';
+import { useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState, type RefObject } from 'react';
+import { createSessionContextLoader } from '../sessionContextReader.js';
 import { api, apiRead } from '../api.js';
 import { readArchiveRange, type ArchiveRangeLoader } from '../archiveRange.js';
 import { useI18n } from '../i18n.js';
 import { Button, Checkbox } from '../design-system';
 import { SessionDetailSurface, SessionList } from '../SessionViews.js';
 import { SessionCredentialFilter } from './SessionCredentialFilter.js';
+import { SessionRelationships } from './SessionRelationships.js';
+import { SessionTitleAction } from './SessionTitleAction.js';
+import { enqueueSessionTitles, useSessionParentLabel } from './sessionTasks.js';
+import { isUnlinkedSession, type SessionRequestOrigin } from './sessionNavigation.js';
+import { credentialDisplayName } from '../identityPresentation.js';
+import { unnamedSessionName } from '../sessionTitles.js';
 import { RequestRefreshControl } from './traffic/RequestRefreshControl.js';
 import { defaultRequestRefreshInterval } from './traffic/requestRefresh.js';
 import {
@@ -15,7 +23,7 @@ import {
 import { LatestRequestGate } from './latestRequestGate.js';
 import type {
   LogicalSessionCursor, LogicalSessionDetail, LogicalSessionListResponse, LogicalSessionSummary,
-  LogicalSessionSummaryBatchResponse, RequestDetail, RequestView,
+  LogicalSessionSummaryBatchResponse, RequestDetail, RequestView, SessionIdentity,
 } from '../types.js';
 
 interface SessionFilters {
@@ -29,6 +37,7 @@ export interface SessionFocus {
   sessionId: string;
   keyId?: string;
   revision: number;
+  origin?: SessionRequestOrigin;
 }
 
 export type SessionStreamState = 'idle' | 'connecting' | 'live' | 'reconnecting';
@@ -37,6 +46,8 @@ export { LatestRequestGate, type LatestRequest } from './latestRequestGate.js';
 
 const emptySessionFilters: SessionFilters = { q: '', keyId: '', model: '', state: '' };
 const sessionPageLimit = 50;
+const sessionIdentityUuid = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
+const titleEnqueueChunk = 100;
 
 function sessionsPath(tenant: string, filters: SessionFilters, before?: LogicalSessionCursor) {
   const params = new URLSearchParams({ limit: String(sessionPageLimit) });
@@ -82,10 +93,12 @@ function requestArchivePath(tenant: string, requestId: string, side?: 'request' 
 }
 
 function messageOf(reason: unknown, fallback: string) {
+  // Browser-generated timeout strings are not product copy.
+  if (reason instanceof Error && (reason.name === 'TimeoutError' || reason.name === 'AbortError')) return fallback;
   return reason instanceof Error ? reason.message : fallback;
 }
 
-export function SessionMonitor({ token, tenant, revision, eventKeyIds, eventOverflowed, focus, streamState, onSelectRequest, refreshCadence }: {
+export function SessionMonitor({ token, tenant, revision, eventKeyIds, eventOverflowed, focus, streamState, onSelectRequest, onOpenUnlinkedRequests, onReturnOrigin, refreshCadence }: {
   token: string;
   tenant: string;
   revision: number;
@@ -94,6 +107,8 @@ export function SessionMonitor({ token, tenant, revision, eventKeyIds, eventOver
   focus?: SessionFocus;
   streamState: SessionStreamState;
   onSelectRequest: (request: RequestView) => Promise<void>;
+  onOpenUnlinkedRequests?: (sessionId: string, keyId?: string) => void;
+  onReturnOrigin?: (origin: SessionRequestOrigin) => void;
   refreshCadence?: { intervalMs: number; paused: boolean; onIntervalChange: (value: number) => void };
 }) {
   const { locale, t } = useI18n();
@@ -103,16 +118,33 @@ export function SessionMonitor({ token, tenant, revision, eventKeyIds, eventOver
   const [detail, setDetail] = useState<LogicalSessionDetail>();
   const [detailScope, setDetailScope] = useState('');
   const [selected, setSelected] = useState<LogicalSessionSummary>();
+  const [returnOrigin, setReturnOrigin] = useState<SessionRequestOrigin>();
+  const listReturn = useRef<{ element: HTMLElement; scrollY: number } | undefined>(undefined);
+  const pendingListReturn = useRef<{ element: HTMLElement; scrollY: number } | undefined>(undefined);
+  const [returnTailHeight, setReturnTailHeight] = useState(0);
+  useLayoutEffect(() => {
+    const origin = pendingListReturn.current;
+    if (!origin || selected) return;
+    // Removing a tall detail can make the original list position unreachable.
+    // Reserve only the missing viewport tail before restoring focus and scroll.
+    const missing = origin.scrollY + window.innerHeight - document.documentElement.scrollHeight;
+    if (missing > 0) { setReturnTailHeight(height => height + missing); return; }
+    window.scrollTo(0, origin.scrollY);
+    origin.element.focus({ preventScroll: true });
+    pendingListReturn.current = undefined;
+  }, [selected, returnTailHeight]);
   const [loading, setLoading] = useState(false);
   const [detailLoading, setDetailLoading] = useState(false);
   const [nextCursor, setNextCursor] = useState<LogicalSessionCursor | null>(null);
   const [generatedAt, setGeneratedAt] = useState(0);
   const [error, setError] = useState('');
+  const [errorTarget, setErrorTarget] = useState<'list' | 'detail'>('list');
   const [errorScope, setErrorScope] = useState('');
   const [draft, setDraft] = useState<SessionFilters>(emptySessionFilters);
   const [filters, setFilters] = useState<SessionFilters>(emptySessionFilters);
   const [refreshing, setRefreshing] = useState(false);
   const [localRefreshInterval, setLocalRefreshInterval] = useState(defaultRequestRefreshInterval);
+  const [namingBatch, setNamingBatch] = useState<{ scope: string; submitted: number; failed: boolean; done: boolean }>();
   const [manualPaused, setManualPaused] = useState(false);
   const refreshInterval = refreshCadence?.intervalMs ?? localRefreshInterval;
   const backgroundPaused = refreshCadence?.paused ?? false;
@@ -151,6 +183,16 @@ export function SessionMonitor({ token, tenant, revision, eventKeyIds, eventOver
   const scopeGeneration = useRef(0);
   const filtersRef = useRef(filters);
   const selectedRef = useRef<LogicalSessionSummary | undefined>(selected);
+  const contextLoader = useMemo(() => selected ? createSessionContextLoader(selected.session_id, token, (requestId, content) => {
+    const params = new URLSearchParams({ key_id: selected.key_id });
+    if (tenant) params.set('tenant_external_id', tenant);
+    return `/internal/v1/sessions/${encodeURIComponent(selected.session_id)}/requests/${encodeURIComponent(requestId)}/context${content ? '/content' : ''}?${params}`;
+  }) : undefined, [selected?.session_id, selected?.key_id, token, tenant]);
+  const semanticLoader = useMemo(() => selected ? createSemanticViewLoader(token, requestId => {
+    const params = new URLSearchParams({ key_id: selected.key_id });
+    if (tenant) params.set('tenant_external_id', tenant);
+    return `/internal/v1/sessions/${encodeURIComponent(selected.session_id)}/requests/${encodeURIComponent(requestId)}/semantic-view?${params}`;
+  }) : undefined, [selected?.session_id, selected?.key_id, token, tenant]);
   const detailRef = useRef<LogicalSessionDetail | undefined>(detail);
   filtersRef.current = filters;
   selectedRef.current = selected;
@@ -179,11 +221,23 @@ export function SessionMonitor({ token, tenant, revision, eventKeyIds, eventOver
       // A list read is idempotent. Retry early transient failures inside the
       // existing 15-second user-visible budget; scope/filter cancellation still
       // immediately aborts every attempt and its backoff.
-      const response = await apiRead<LogicalSessionListResponse>(
-        sessionsPath(tenant, selectedFilters, older ? nextCursor ?? undefined : undefined),
-        credential,
-        { attempts: 3, attemptTimeoutMilliseconds: 15_000, totalTimeoutMilliseconds: 15_000, signal: request.signal },
-      );
+      const exactFocus = !older && focus?.keyId && focus.sessionId === selectedFilters.q
+        && focus.keyId === selectedFilters.keyId && !isUnlinkedSession(focus.sessionId)
+        ? { key_id: focus.keyId, session_id: focus.sessionId } : undefined;
+      const response: LogicalSessionListResponse = exactFocus
+        ? {
+            ...await api<LogicalSessionSummaryBatchResponse>('/internal/v1/sessions/summaries', credential, {
+              method: 'POST',
+              body: sessionSummaryBatchBody(tenant, { ...selectedFilters, q: '' }, [exactFocus]),
+              signal: AbortSignal.any([request.signal, AbortSignal.timeout(15_000)]),
+            }),
+            next_cursor: null,
+          }
+        : await apiRead<LogicalSessionListResponse>(
+            sessionsPath(tenant, selectedFilters, older ? nextCursor ?? undefined : undefined),
+            credential,
+            { attempts: 3, attemptTimeoutMilliseconds: 15_000, totalTimeoutMilliseconds: 15_000, signal: request.signal },
+          );
       if (!request.isCurrent() || sequence !== listSequence.current) return false;
       const page = response.sessions;
       const resetActiveTail = background && loadedOlderList.current && selectedFilters.state === 'active';
@@ -214,7 +268,9 @@ export function SessionMonitor({ token, tenant, revision, eventKeyIds, eventOver
           ? page.find((session) => session.session_id === pendingFocus.sessionId && (!pendingFocus.keyId || session.key_id === pendingFocus.keyId))
           : undefined;
         const currentlyVisible = selectedRef.current && page.some((session) => session.session_id === selectedRef.current?.session_id && session.key_id === selectedRef.current?.key_id);
-        const target = focused ?? (!pendingFocus && !currentlyVisible ? page[0] : undefined);
+        const target = focused ?? (!pendingFocus && !currentlyVisible
+          ? page.find((session) => !isUnlinkedSession(session.session_id, session.unlinked))
+          : undefined);
         if (focused && pendingFocus) handledFocus.current = pendingFocus.revision;
         if (target) void selectSession(target);
       }
@@ -222,6 +278,7 @@ export function SessionMonitor({ token, tenant, revision, eventKeyIds, eventOver
     } catch (reason) {
       if (!request.isCurrent() || sequence !== listSequence.current) return false;
       setError(messageOf(reason, t('sessions.loadFailed')));
+      setErrorTarget('list');
       setErrorScope(requestScope);
       // A failed live refresh is not an empty result set. Keep the current
       // scoped page (including older pages) and report the refresh failure.
@@ -257,6 +314,7 @@ export function SessionMonitor({ token, tenant, revision, eventKeyIds, eventOver
     } catch (reason) {
       if (!request.isCurrent() || sequence !== listSequence.current) return undefined;
       setError(messageOf(reason, t('sessions.loadFailed')));
+      setErrorTarget('list');
       setErrorScope(requestScope);
       return undefined;
     } finally {
@@ -268,6 +326,11 @@ export function SessionMonitor({ token, tenant, revision, eventKeyIds, eventOver
   }
 
   async function selectSession(session: LogicalSessionSummary) {
+    pendingListReturn.current = undefined; setReturnTailHeight(0);
+    if (isUnlinkedSession(session.session_id, session.unlinked)) {
+      onOpenUnlinkedRequests?.(session.session_id, session.key_id);
+      return;
+    }
     const request = detailRequests.current.begin();
     detailInFlight.current = true;
     selectedRef.current = session;
@@ -285,6 +348,7 @@ export function SessionMonitor({ token, tenant, revision, eventKeyIds, eventOver
     } catch (reason) {
       if (request.isCurrent()) {
         setError(messageOf(reason, t('sessions.detailFailed')));
+        setErrorTarget('detail');
         setErrorScope(requestScope);
       }
     } finally {
@@ -325,6 +389,7 @@ export function SessionMonitor({ token, tenant, revision, eventKeyIds, eventOver
     } catch (reason) {
       if (request.isCurrent()) {
         setError(messageOf(reason, t('sessions.detailFailed')));
+        setErrorTarget('detail');
         setErrorScope(requestScope);
       }
       return false;
@@ -362,6 +427,7 @@ export function SessionMonitor({ token, tenant, revision, eventKeyIds, eventOver
     } catch (reason) {
       if (request.isCurrent()) {
         setError(messageOf(reason, t('sessions.detailFailed')));
+        setErrorTarget('detail');
         setErrorScope(requestScope);
       }
     } finally {
@@ -474,12 +540,19 @@ export function SessionMonitor({ token, tenant, revision, eventKeyIds, eventOver
 
   useEffect(() => {
     if (!focus) return;
+    listReturn.current = undefined;
+    setReturnOrigin(focus.origin);
+    if (isUnlinkedSession(focus.sessionId)) {
+      onOpenUnlinkedRequests?.(focus.sessionId, focus.keyId);
+      return;
+    }
     const focusedFilters: SessionFilters = { q: focus.sessionId, keyId: focus.keyId ?? '', model: '', state: '' };
     setDraft(focusedFilters);
     setFilters(focusedFilters);
   }, [focus?.revision]);
 
   useEffect(() => {
+    pendingListReturn.current = undefined; setReturnTailHeight(0);
     scopeGeneration.current += 1;
     // A filter/scope transition starts an authoritative first-page read. Drop
     // events queued for the previous projection before issuing that snapshot;
@@ -510,6 +583,7 @@ export function SessionMonitor({ token, tenant, revision, eventKeyIds, eventOver
     handledFocus.current = 0;
     setSessions([]); setListScope(''); setDetail(undefined); setDetailScope(''); setSelected(undefined); setNextCursor(null); setGeneratedAt(0);
     setLoading(false); setDetailLoading(false); setRefreshing(false); setError(''); setErrorScope('');
+    setNamingBatch(undefined);
     if (!token.trim()) {
       setDraft(emptySessionFilters);
       setFilters(emptySessionFilters);
@@ -649,13 +723,82 @@ export function SessionMonitor({ token, tenant, revision, eventKeyIds, eventOver
     }
   }
 
+  const namingBatchRequest = useRef<AbortController | undefined>(undefined);
+  useEffect(() => () => {
+    namingBatchRequest.current?.abort();
+    namingBatchRequest.current = undefined;
+  }, [scopeKey]);
+  async function nameUnnamedSessions() {
+    if (namingBatchRequest.current) return;
+    const controller = new AbortController();
+    namingBatchRequest.current = controller;
+    const batchScope = scopeKey;
+    const generation = scopeGeneration.current;
+    const batchFilters = emptySessionFilters;
+    setNamingBatch({ scope: batchScope, submitted: 0, failed: false, done: false });
+    let submitted = 0;
+    let failed = false;
+    let cursor: LogicalSessionCursor | undefined;
+    try {
+      do {
+        const page = await api<LogicalSessionListResponse>(sessionsPath(tenant, batchFilters, cursor), token.trim(), { signal: AbortSignal.any([controller.signal, AbortSignal.timeout(30_000)]) });
+        if (controller.signal.aborted || generation !== scopeGeneration.current) return;
+        const candidates = page.sessions
+          .filter((session) => !session.unlinked && !session.session_name?.trim() && sessionIdentityUuid.test(session.session_id))
+          .map((session): SessionIdentity => ({ key_id: session.key_id, session_id: session.session_id }));
+        for (let start = 0; start < candidates.length; start += titleEnqueueChunk) {
+          if (controller.signal.aborted || generation !== scopeGeneration.current) return;
+          const receipt = await enqueueSessionTitles(tenant, token, candidates.slice(start, start + titleEnqueueChunk), controller.signal);
+          if (controller.signal.aborted || generation !== scopeGeneration.current) return;
+          submitted += receipt.results.filter((result) => result.status !== 'named').length;
+          setNamingBatch({ scope: batchScope, submitted, failed: false, done: false });
+        }
+        cursor = page.next_cursor ?? undefined;
+        if (generation !== scopeGeneration.current) return;
+      } while (cursor);
+    } catch {
+      failed = true;
+    } finally {
+      if (namingBatchRequest.current === controller) namingBatchRequest.current = undefined;
+    }
+    if (controller.signal.aborted || generation !== scopeGeneration.current) return;
+    setNamingBatch({ scope: batchScope, submitted, failed, done: !failed });
+  }
+
   const hasScope = Boolean(token.trim());
   const status = !hasScope ? 'idle' : refreshing ? 'refreshing' : streamState;
   const visibleSessions = listScope === scopeKey ? sessions : [];
   const visibleDetail = detailScope === scopeKey ? detail : undefined;
   const visibleError = errorScope === scopeKey ? error : '';
+  const visibleNamingBatch = namingBatch?.scope === scopeKey ? namingBatch : undefined;
+  const openSessionIdentity = (target: SessionIdentity) => {
+    const next: SessionFilters = { q: target.session_id, keyId: target.key_id, model: '', state: '' };
+    setDraft(next);
+    setFilters(next);
+  };
+  const clearDetail = () => {
+    detailRequests.current.invalidate();
+    detailInFlight.current = false;
+    setDetailLoading(false);
+    setDetail(undefined);
+    setDetailScope('');
+    setSelected(undefined);
+    selectedRef.current = undefined;
+  };
+  const returnFromDetail = () => {
+    if (returnOrigin && onReturnOrigin) {
+      onReturnOrigin(returnOrigin);
+      return;
+    }
+    pendingListReturn.current = listReturn.current;
+    clearDetail();
+  };
+  const selectedParent = useSessionParentLabel(tenant, token,
+    selected && visibleDetail && !visibleDetail.unlinked ? selected.key_id : undefined,
+    selected && visibleDetail && !visibleDetail.unlinked && sessionIdentityUuid.test(visibleDetail.session_id) ? visibleDetail.session_id : null,
+    (session) => session.session_name?.trim() || unnamedSessionName(t, locale, session.last_activity_at, credentialDisplayName(session.key_alias, t), true));
   return <>
-    {visibleError && <div className="notice error" role="alert">{visibleError} <button type="button" className="secondary" disabled={loading} onClick={() => void loadSessions(false, filters, visibleSessions.length > 0)}>{t('sessions.retryLoad')}</button></div>}
+    {visibleError && <div className="notice error" role="alert">{visibleError} <Button appearance="secondary" disabled={loading || detailLoading} onClick={() => errorTarget === 'detail' && selected ? void selectSession(selected) : void loadSessions(false, filters, visibleSessions.length > 0)}>{t('sessions.retryLoad')}</Button></div>}
     <RequestRefreshControl
       intervalMs={refreshInterval}
       onIntervalChange={refreshCadence?.onIntervalChange ?? setLocalRefreshInterval}
@@ -667,7 +810,16 @@ export function SessionMonitor({ token, tenant, revision, eventKeyIds, eventOver
       <span className={`session-live-state ${status}`} role="status">{autoRefresh ? t(`sessions.live.${status}`) : t('sessions.paused')}</span>
       <Button appearance="secondary" disabled={loading || refreshing || detailLoading} onClick={() => { void refreshNow(); }}>{t('sessions.refreshNow')}</Button>
       {(loading || refreshing) && <Button appearance="secondary" onClick={cancelListLoad}>{t('common.cancel')}</Button>}
+      <Button appearance="secondary" disabled={!hasScope || (visibleNamingBatch !== undefined && !visibleNamingBatch.done && !visibleNamingBatch.failed)}
+        onClick={() => { void nameUnnamedSessions(); }}>{t('sessions.name.batch')}</Button>
     </div>
+    {visibleNamingBatch && <p className="muted" role="status">{visibleNamingBatch.failed
+      ? t('sessions.name.batchFailed')
+      : visibleNamingBatch.done && visibleNamingBatch.submitted === 0
+        ? t('sessions.name.batchEmpty')
+        : visibleNamingBatch.done
+          ? t('sessions.name.batchDone', { count: visibleNamingBatch.submitted })
+          : t('sessions.name.batchProgress', { done: visibleNamingBatch.submitted })}</p>}
     <form className="session-controls" onSubmit={(event) => { event.preventDefault(); setFilters({ ...draft }); }}>
       <label>{t('sessions.search')}<input value={draft.q} onChange={(event) => setDraft({ ...draft, q: event.target.value })} placeholder={t('sessions.searchPlaceholder')} /></label>
       <SessionCredentialFilter value={draft.keyId} sessions={visibleSessions} token={token} tenant={tenant} onChange={(keyId) => setDraft({ ...draft, keyId })} />
@@ -678,14 +830,35 @@ export function SessionMonitor({ token, tenant, revision, eventKeyIds, eventOver
     <p className="muted session-result-count">{loading && !visibleSessions.length ? t('common.loading') : t('sessions.serverFiltered', { count: visibleSessions.length })}{listScope === scopeKey && generatedAt > 0 && <> · {t('sessions.generatedAt', { time: new Date(generatedAt).toLocaleString(locale) })}</>}</p>
     <div className="session-workspace">
       <section className="session-browser" aria-label={t('sessions.recent')}>
-        <SessionList values={visibleSessions} loading={loading} showCredential selected={selected} layout="sidebar" onSelect={(session) => void selectSession(session)} />
+        <SessionList values={visibleSessions} loading={loading} showCredential selected={selected} layout="sidebar" onSelect={(session) => {
+          if (document.activeElement instanceof HTMLElement) listReturn.current = { element: document.activeElement, scrollY: window.scrollY };
+          setReturnOrigin(undefined);
+          void selectSession(session);
+        }} />
         {listScope === scopeKey && nextCursor && <div className="load-more"><Button appearance="secondary" disabled={loading} onClick={() => void loadSessions(true, filters)}>{loading ? t('common.loading') : t('sessions.loadOlder')}</Button></div>}
       </section>
       <div className="session-detail-region">
         {!visibleDetail && detailLoading && <div className="session-detail-skeleton" role="status" aria-label={t('common.loading')}><i /><i /><i /><i /></div>}
         {!visibleDetail && !detailLoading && <div className="empty">{selected && visibleError ? <button type="button" className="secondary" onClick={() => void selectSession(selected)}>{t('sessions.retryLoad')}</button> : t('sessions.selectHint')}</div>}
-        {visibleDetail && <SessionDetailSurface detail={visibleDetail} summary={selected} showDiagnosticIds loading={detailLoading} onLoadOlder={() => void loadEarlier()} loadReplayArchive={loadReplayArchive} loadArchiveRange={loadArchiveRange} onSelect={(request) => { void onSelectRequest(request); }} onClose={() => { detailRequests.current.invalidate(); detailInFlight.current = false; setDetailLoading(false); setDetail(undefined); setDetailScope(''); setSelected(undefined); selectedRef.current = undefined; }} />}
+        {visibleDetail && <SessionDetailSurface detail={visibleDetail} summary={selected} showDiagnosticIds loading={detailLoading} onLoadOlder={() => void loadEarlier()} loadReplayArchive={loadReplayArchive} loadArchiveRange={loadArchiveRange} contextLoader={contextLoader} semanticLoader={semanticLoader}
+          backNav={<p className="session-origin-nav"><Button appearance="transparent" className="table-link" onClick={returnFromDetail}><span aria-hidden="true">←</span> {t(returnOrigin ? 'sessions.backToRequest' : 'sessions.backToList')}</Button></p>}
+          parentNav={selectedParent ? <p className="session-parent-nav"><Button appearance="transparent" className="table-link"
+            onClick={() => openSessionIdentity(selectedParent.identity)}>{t('sessions.rel.backToParent', { name: selectedParent.label })}</Button></p> : undefined}
+          taskRelations={selected && !visibleDetail.unlinked && sessionIdentityUuid.test(visibleDetail.session_id)
+            ? <SessionRelationships key={`relationships:${scopeKey}\0${selected.key_id}\0${visibleDetail.session_id}`} token={token} tenant={tenant}
+                identity={{ key_id: selected.key_id, session_id: visibleDetail.session_id }}
+                onOpenSession={openSessionIdentity} />
+            : undefined}
+          titleAction={selected && !visibleDetail.unlinked ? <SessionTitleAction key={`title:${scopeKey}\0${selected.key_id}\0${visibleDetail.session_id}`}
+            token={token} tenant={tenant} keyId={selected.key_id} sessionId={visibleDetail.session_id}
+            onTitle={(title) => {
+              const target = selected;
+              setSelected((current) => current?.key_id === target.key_id && current.session_id === target.session_id ? { ...current, session_name: title } : current);
+              setSessions((current) => current.map((session) => session.key_id === target.key_id && session.session_id === target.session_id ? { ...session, session_name: title } : session));
+            }} /> : undefined}
+          onSelect={(request) => { void onSelectRequest(request); }} onClose={returnFromDetail} />}
       </div>
     </div>
+    {returnTailHeight > 0 && <div aria-hidden="true" style={{ height: returnTailHeight }} />}
   </>;
 }

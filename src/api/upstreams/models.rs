@@ -75,11 +75,10 @@ fn codex_catalog_budget(config: &Value) -> Result<CatalogBudget, &'static str> {
     } else {
         CODEX_MODEL_CATALOG_TIMEOUT
     };
-    let read = if value.is_some_and(|p| p.get("read_timeout_millis").is_some()) {
-        Duration::from_millis(policy.read_timeout_millis).min(total)
-    } else {
-        total
-    };
+    let read = policy
+        .read_timeout_millis
+        .filter(|_| value.is_some_and(|p| p.get("read_timeout_millis").is_some()))
+        .map_or(total, |millis| Duration::from_millis(millis).min(total));
     Ok(CatalogBudget { total, read })
 }
 
@@ -109,11 +108,16 @@ impl CatalogFailure {
         }
     }
 
-    fn send(error: wreq::Error) -> Self {
+    fn send(error: reqwest::Error) -> Self {
         let mut source: Option<&(dyn std::error::Error + 'static)> = Some(&error);
         while let Some(current) = source {
-            if let Some(http2) = current.downcast_ref::<http2::Error>()
-                && (http2.is_reset() || http2.is_go_away())
+            if let Some(frame) = current.downcast_ref::<http2::Error>()
+                && (frame.is_reset() || frame.is_go_away())
+            {
+                return Self::transport("send", error.is_timeout(), false);
+            }
+            if let Some(frame) = current.downcast_ref::<h2::Error>()
+                && (frame.is_reset() || frame.is_go_away())
             {
                 return Self::transport("send", error.is_timeout(), false);
             }
@@ -128,7 +132,7 @@ impl CatalogFailure {
         Self::transport(
             "send",
             error.is_timeout(),
-            error.is_connect() || error.is_proxy_connect() || error.is_dns() || error.is_tls(),
+            crate::simple_http::classify_transport(&error).pre_delivery(),
         )
     }
 
@@ -205,13 +209,18 @@ pub(in crate::api) async fn discover_upstream_model(
     )
     .await
     .unwrap_or(Err("connection_failed"))
-    .map_err(|code| AppError::Upstream(code.into()))?;
+    .map_err(|_code| {
+        AppError::upstream_with(
+            "upstream_unavailable",
+            crate::error::ErrorFacts::new().stage("models_discover_upstream_model"),
+        )
+    })?;
     let matches = values
         .iter()
         .filter(|value| value.get("slug").and_then(Value::as_str) == Some(query.model.as_str()))
         .collect::<Vec<_>>();
     if matches.len() > 1 {
-        return Err(AppError::Upstream("invalid_response".into()));
+        return Err(AppError::upstream("invalid_response"));
     }
     let metadata = matches.first().copied();
     let configured = state
@@ -668,7 +677,11 @@ async fn sync_account_models_selected(
                         "selected model is absent from authenticated upstream metadata".into(),
                     )
                 } else {
-                    AppError::Upstream(code.into())
+                    AppError::upstream_with(
+                        "upstream_unavailable",
+                        crate::error::ErrorFacts::new()
+                            .stage("models_sync_account_models_selected"),
+                    )
                 });
             }
         }
@@ -1131,19 +1144,14 @@ async fn fetch_codex_models(
                 .request_header(unix_millis())
                 .map_err(|_| "credential_invalid")?
                 .ok_or("credential_invalid")?;
-            let mut request = client
+            let request = client
                 .get(&url)
-                .default_headers(false)
                 .header(credential_header, credential_value)
                 .header(header::ACCEPT, "application/json")
                 .header(header::ACCEPT_ENCODING, "identity")
                 .header(header::USER_AGENT, crate::oauth::managed::codex::USER_AGENT)
                 .header("originator", crate::oauth::managed::codex::ORIGINATOR)
                 .header("chatgpt-account-id", account_id);
-            if let Some((proxy_url, _)) = credential.proxy() {
-                request =
-                    request.proxy(wreq::Proxy::all(proxy_url).map_err(|_| "destination_invalid")?);
-            }
             Ok(request)
         },
     )
@@ -1169,7 +1177,7 @@ async fn codex_catalog_response(
     mut build_request: impl FnMut(
         &UpstreamCredential,
         i64,
-    ) -> Result<wreq::RequestBuilder, &'static str>,
+    ) -> Result<reqwest::RequestBuilder, &'static str>,
 ) -> Result<Value, &'static str> {
     let policy =
         crate::provider::CodexTransportPolicy::parse(account.config.get("transport_policy"))?;
@@ -1334,7 +1342,7 @@ fn codex_account_header(credential: &UpstreamCredential) -> Result<String, &'sta
 }
 
 async fn bounded_json_response(
-    request: wreq::RequestBuilder,
+    request: reqwest::RequestBuilder,
     budget: CatalogBudget,
     deadline: tokio::time::Instant,
     require_complete: bool,
@@ -2059,6 +2067,18 @@ mod tests {
     const CATALOG_PRIMARY_PROXY: &str = "socks5h://10.20.30.40:1080";
     const CATALOG_BACKUP_PROXY: &str = "socks5h://10.20.30.41:1080";
 
+    fn direct_catalog_client(
+        account: &crate::provider::UpstreamAccountView,
+    ) -> Result<reqwest::Client, &'static str> {
+        // 成员地址在这些测试里只用来区分选择结果，并不是真的 SOCKS 监听。
+        // 请求打到夹具 URL。生产客户端仍然会走账号代理。
+        let policy =
+            crate::provider::CodexTransportPolicy::parse(account.config.get("transport_policy"))
+                .map_err(|_| "transport_client_unavailable")?;
+        crate::build_codex_http_client_with_policy(policy)
+            .map_err(|_| "transport_client_unavailable")
+    }
+
     async fn catalog_proxy_fixture(
         policy: Value,
     ) -> (
@@ -2162,9 +2182,10 @@ mod tests {
                 |selected, generation| {
                     let proxy = selected.proxy().unwrap().0;
                     attempts.push((proxy.to_owned(), generation));
-                    let client = state
+                    let _proxied = state
                         .codex_clients
                         .account_transport_snapshot(&account, selected, generation)?;
+                    let client = direct_catalog_client(&account)?;
                     Ok(client.get(if proxy == CATALOG_PRIMARY_PROXY {
                         primary.clone()
                     } else {
@@ -2197,10 +2218,19 @@ mod tests {
     async fn codex_catalog_connect_fallback_is_bounded_by_members_attempts_and_budget() {
         for (policy, expected_attempts) in [
             (
-                json!({"connect_attempts": 4, "connect_retry_delay_millis": 0}),
+                // These are unreachable SOCKS fixture members. Bound each
+                // connect so both fit inside the management catalog budget;
+                // an absent connect timeout intentionally has no deadline.
+                json!({
+                    "connect_attempts": 4, "connect_retry_delay_millis": 0,
+                    "connect_timeout_millis": 100,
+                }),
                 2,
             ),
-            (json!({"connect_attempts": 1}), 1),
+            (
+                json!({"connect_attempts": 1, "connect_timeout_millis": 100}),
+                1,
+            ),
             (
                 json!({
                     "connect_attempts": 4, "connect_retry_delay_millis": 1000,
@@ -2274,9 +2304,10 @@ mod tests {
                 true,
                 |selected, generation| {
                     attempts += 1;
-                    let client = state
+                    let _proxied = state
                         .codex_clients
                         .account_transport_snapshot(&account, selected, generation)?;
+                    let client = direct_catalog_client(&account)?;
                     Ok(client.get(format!("{}/models", server.uri())))
                 },
             )
@@ -2334,11 +2365,13 @@ mod tests {
                     &account,
                     &credential,
                     true,
-                    |selected, generation| {
+                    |_selected, _generation| {
                         attempts += 1;
-                        let client = state
-                            .codex_clients
-                            .account_transport_snapshot(&account, selected, generation)?;
+                        let client = crate::build_codex_http2_test_client(
+                            crate::provider::CodexTransportPolicy::default(),
+                            crate::CODEX_HTTP2_KEEP_ALIVE_INTERVAL,
+                        )
+                        .map_err(|_| "transport_client_unavailable")?;
                         Ok(client.get(&endpoint).version(http::Version::HTTP_2))
                     },
                 ),
@@ -2388,9 +2421,10 @@ mod tests {
                     }
                     let proxy = selected.proxy().unwrap().0;
                     attempts.push(proxy.to_owned());
-                    let client = state
+                    let _proxied = state
                         .codex_clients
                         .account_transport_snapshot(&account, selected, generation)?;
+                    let client = direct_catalog_client(&account)?;
                     Ok(client.get(if proxy == CATALOG_PRIMARY_PROXY {
                         &primary
                     } else {

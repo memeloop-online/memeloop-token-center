@@ -24,7 +24,9 @@ fn response(result: Result<(StatusCode, Value), AppError>) -> axum::response::Re
     let mut response = match result {
         Ok((StatusCode::NO_CONTENT, _)) => StatusCode::NO_CONTENT.into_response(),
         Ok((status, body)) => (status, Json(body)).into_response(),
-        Err(AppError::Storage(_)) => AppError::Overloaded.into_response(),
+        Err(AppError::Storage { .. }) => {
+            AppError::capacity_error("transport_proxy_storage_unavailable").into_response()
+        }
         Err(error) => error.into_response(),
     };
     response.headers_mut().insert(
@@ -54,6 +56,10 @@ pub(super) async fn transport_group_response(
 pub(super) async fn transport_group_headers(request: Request, next: Next) -> Response {
     let path = request.uri().path();
     let managed = path == "/internal/v1/transport-proxy-groups"
+        || path == "/internal/v1/transport-proxies"
+        || path == "/internal/v1/transport-proxy-strategies"
+        || path.starts_with("/internal/v1/transport-proxies/")
+        || path.ends_with("/transport-proxy-selection")
         || path.starts_with("/internal/v1/transport-proxy-groups/")
         || (path.starts_with("/internal/v1/upstreams/")
             && path.ends_with("/transport-proxy-group"));
@@ -126,6 +132,41 @@ pub(super) async fn get_transport_group(
                         state.config.key_pepper.as_bytes(),
                     )
                     .await?,
+            ))
+        }
+        .await,
+    )
+}
+
+pub(super) async fn probe_transport_group(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path(id): Path<Uuid>,
+    Query(query): Query<TenantQuery>,
+) -> axum::response::Response {
+    response(
+        async {
+            authority(&headers, &state, &query.tenant_external_id).await?;
+            state
+                .db
+                .get_transport_group(
+                    id,
+                    &query.tenant_external_id,
+                    state.config.key_pepper.as_bytes(),
+                )
+                .await?;
+            let accounts = state.db.transport_group_bound_accounts(id).await?;
+            let requested = accounts
+                .iter()
+                .filter(|account| {
+                    state
+                        .transport_proxy_groups
+                        .request_account_probe(**account)
+                })
+                .count();
+            Ok((
+                StatusCode::ACCEPTED,
+                serde_json::json!({ "requested_accounts": requested }),
             ))
         }
         .await,
@@ -251,7 +292,10 @@ pub(super) async fn unbind_transport_group(
     )
 }
 
-async fn validate_binding_provider(state: &AppState, account_id: Uuid) -> Result<(), AppError> {
+pub(super) async fn validate_binding_provider(
+    state: &AppState,
+    account_id: Uuid,
+) -> Result<(), AppError> {
     let (account, credential, _, flow) = state
         .db
         .upstream_account_with_current_credential(account_id, state.config.key_pepper.as_bytes())

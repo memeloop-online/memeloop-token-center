@@ -26,9 +26,9 @@ test('live metrics retain only actionable aggregate cards across themes and widt
     assert.equal(await cards.count(), 4);
     assert.deepEqual(await cards.first().locator('.metric-label').evaluate(node => { const style = getComputedStyle(node); return { transform: style.textTransform, size: style.fontSize }; }), { transform: 'none', size: '13px' });
     assert.deepEqual(await cards.locator('.metric-label').allTextContents(), ['Total tokens', 'Local settlement ⓘ', 'Cache rate', 'Average latency']);
-    assert.deepEqual(await cards.locator('.metric-value').allTextContents(), ['300', '€0.00$1.50', '40%', '25 s']);
+    assert.deepEqual(await cards.locator('.metric-value').allTextContents(), ['300', '€0.25$1.50', '40%', '25 s']);
     const settlement = cards.filter({ hasText: 'Local settlement' });
-    assert.deepEqual(await settlement.locator('.usage-cost-lines > span').allTextContents(), ['€0.00', '$1.50'], 'local settlement keeps each recorded currency on its own line and displays the not-observed failure at the zero policy amount');
+    assert.deepEqual(await settlement.locator('.usage-cost-lines > span').allTextContents(), ['€0.25', '$1.50'], 'local settlement keeps each recorded currency and amount independently of usage provenance or failure');
     assert.equal(await settlement.locator('.analytics-metric-trend, .analytics-metric-ratio').count(), 0, 'mixed currencies must not fabricate a settlement trend or ratio');
     const cacheRate = cards.filter({ hasText: 'Cache rate' });
     assert.equal(await cacheRate.locator('.analytics-metric-ratio').getAttribute('data-ratio'), '0.4');

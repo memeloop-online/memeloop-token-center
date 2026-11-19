@@ -4,6 +4,26 @@ use crate::plugin::application::installation::{
 };
 
 impl Database {
+    pub(crate) async fn application_plugin_review_manifests(
+        &self,
+        inventory_id: &str,
+    ) -> Result<Option<serde_json::Value>, AppError> {
+        let review: Option<Option<String>> = sqlx::query_scalar(
+            "SELECT review_json FROM application_plugin_installations WHERE inventory_id = $1 AND status = 'registered' ORDER BY updated_at DESC LIMIT 1",
+        )
+        .bind(inventory_id)
+        .fetch_optional(&self.pool)
+        .await?;
+        review
+            .flatten()
+            .map(|review| {
+                serde_json::from_str::<serde_json::Value>(&review)
+                    .map(|review| review["plugins"].clone())
+                    .map_err(|_| AppError::internal("application_plugin_review_manifests"))
+            })
+            .transpose()
+    }
+
     pub(crate) async fn replay_plugin_installation(
         &self,
         key: &str,
@@ -25,7 +45,10 @@ impl Database {
                 "installation idempotency key was used for another operation".into(),
             ));
         }
-        let record = installation_record(row)?;
+        let mut record = installation_record(row)?;
+        record.base_revision = self
+            .plugin_release_base_revision(&record.inventory_id)
+            .await?;
         if matches!(
             record.status.as_str(),
             "review" | "registered" | "installing"
@@ -44,12 +67,22 @@ impl Database {
             .fetch_optional(&self.pool)
             .await?
             .ok_or(AppError::NotFound)?;
-        installation_record(row)
+        let mut record = installation_record(row)?;
+        record.base_revision = self
+            .plugin_release_base_revision(&record.inventory_id)
+            .await?;
+        Ok(record)
     }
 
     pub(crate) async fn plugin_installations(&self) -> Result<Vec<InstallationRecord>, AppError> {
-        sqlx::query("SELECT id,idempotency_hash,request_hash,inventory_id,packages_json,actor,attempt_id,status,review_digest,NULL AS review_json,checkpoints_json,failure_category,lease_until,created_at,updated_at FROM application_plugin_installations ORDER BY created_at DESC, id DESC LIMIT 100")
-            .fetch_all(&self.pool).await?.into_iter().map(installation_record).collect()
+        let mut records = sqlx::query("SELECT id,idempotency_hash,request_hash,inventory_id,packages_json,actor,attempt_id,status,review_digest,NULL AS review_json,checkpoints_json,failure_category,lease_until,created_at,updated_at FROM application_plugin_installations ORDER BY created_at DESC, id DESC LIMIT 100")
+            .fetch_all(&self.pool).await?.into_iter().map(installation_record).collect::<Result<Vec<_>,_>>()?;
+        for record in &mut records {
+            record.base_revision = self
+                .plugin_release_base_revision(&record.inventory_id)
+                .await?;
+        }
+        Ok(records)
     }
 
     pub(crate) async fn begin_plugin_installation(
@@ -97,7 +130,7 @@ impl Database {
         let locked = sqlx::query("UPDATE application_plugin_install_lock SET operation_id=$1, lease_until=$2 WHERE scope='global' AND (lease_until <= $3 OR operation_id=$1)")
             .bind(&id).bind(lease_until).bind(now).execute(&mut *tx).await?.rows_affected();
         if locked != 1 {
-            return Err(AppError::Overloaded);
+            return Err(AppError::capacity_error("plugin_installation_lock"));
         }
         if sqlx::query(
             "SELECT inventory_id FROM application_plugin_candidates WHERE inventory_id=$1",
@@ -159,7 +192,9 @@ impl Database {
         attempt: &str,
         checkpoints: &std::collections::BTreeMap<String, PackageCheckpoint>,
     ) -> Result<(), AppError> {
-        let encoded = serde_json::to_string(checkpoints).map_err(|_| AppError::Internal)?;
+        let encoded = serde_json::to_string(checkpoints).map_err(|_| {
+            AppError::internal("plugin_installations_checkpoint_plugin_installation_1")
+        })?;
         if checkpoints.len() > 16 || encoded.len() > 65536 {
             return Err(AppError::Forbidden);
         }
@@ -222,7 +257,7 @@ impl Database {
         actor: &str,
     ) -> Result<(), AppError> {
         let mut tx = self.pool.begin().await?;
-        let changed = sqlx::query("UPDATE application_plugin_installations SET status='registered', updated_at=$1 WHERE id=$2 AND review_digest=$3 AND status IN ('review','registered')")
+        let changed = sqlx::query("UPDATE application_plugin_installations SET status='registered', updated_at=$1 WHERE id=$2 AND review_digest=$3 AND status IN ('review','registered') AND NOT EXISTS (SELECT 1 FROM application_plugin_release_resolutions r WHERE r.install_key_hash=application_plugin_installations.idempotency_hash AND r.base_revision <> COALESCE((SELECT revision FROM application_plugin_head WHERE scope='global'),0))")
             .bind(unix_millis()).bind(id).bind(digest).execute(&mut *tx).await?.rows_affected();
         if changed != 1 {
             return Err(AppError::Conflict("installation review changed".into()));
@@ -307,24 +342,25 @@ fn installation_record(row: AnyRow) -> Result<InstallationRecord, AppError> {
     }
     let checkpoints: std::collections::BTreeMap<String, PackageCheckpoint> =
         serde_json::from_str(&row.try_get::<String, _>("checkpoints_json")?)
-            .map_err(|_| AppError::Internal)?;
+            .map_err(|_| AppError::internal("plugin_installations_installation_record_1"))?;
     Ok(InstallationRecord {
         completed_packages: checkpoints.len(),
         checkpoints,
         id: row.try_get("id")?,
         inventory_id: row.try_get("inventory_id")?,
+        base_revision: None,
         actor: row.try_get("actor")?,
         attempt_id: row.try_get("attempt_id")?,
         idempotency_hash: row.try_get("idempotency_hash")?,
         status,
         packages: serde_json::from_str(&row.try_get::<String, _>("packages_json")?)
-            .map_err(|_| AppError::Internal)?,
+            .map_err(|_| AppError::internal("plugin_installations_installation_record_2"))?,
         review_digest: row.try_get("review_digest")?,
         review: row
             .try_get::<Option<String>, _>("review_json")?
             .map(|value| serde_json::from_str(&value))
             .transpose()
-            .map_err(|_| AppError::Internal)?,
+            .map_err(|_| AppError::internal("plugin_installations_installation_record_3"))?,
         failure_category: row.try_get("failure_category")?,
         lease_until,
         created_at: row.try_get("created_at")?,

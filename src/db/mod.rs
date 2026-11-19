@@ -1,5 +1,7 @@
 use std::time::Duration;
 
+mod allocation_history;
+mod history_immutable_outbox;
 mod quota_observations;
 
 use chrono::{Days, Utc};
@@ -8,7 +10,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use sha2::{Digest, Sha256};
 use sqlx::{
-    Any, AnyConnection, AnyPool, Row, Transaction,
+    Any, AnyConnection, Row, Transaction,
     any::{AnyPoolOptions, AnyQueryResult, AnyRow},
 };
 use uuid::Uuid;
@@ -44,15 +46,19 @@ use crate::{
     },
     provider::{
         ModelRouteView, ResolvedUpstream, UpstreamAccountView, UpstreamCredential, open_credential,
-        open_private_json, seal_credential, seal_private_json, validate_config,
+        seal_credential, validate_config,
     },
 };
 
 mod archive_spool;
 mod archive_staging;
 mod gateway_persistence;
+mod request_connection;
+mod request_pool;
 pub(crate) use archive_spool::ArchiveSpoolChunk;
 pub(crate) use archive_spool::{ArchiveSpoolIdentity, ArchiveSpoolTask};
+use request_pool::RequestPool as AnyPool;
+pub(crate) mod allocation;
 mod billing;
 mod constants;
 mod credentials;
@@ -62,33 +68,64 @@ mod filter_assistant;
 mod generation;
 mod group_routing;
 mod groups;
+mod history_delivery;
+mod history_source_snapshot;
+mod http_settings;
 mod migrations;
 mod monitoring_snapshot;
 mod oauth_sessions;
+pub(crate) mod plugin_background_actions;
 mod plugin_configurations;
 #[cfg(feature = "experimental-plugin-revisions")]
 mod plugin_installations;
+#[cfg(feature = "experimental-plugin-revisions")]
+pub(crate) mod plugin_installer_network;
 mod plugin_kv;
+#[cfg(feature = "experimental-plugin-revisions")]
+pub(crate) mod plugin_release_resolutions;
 #[cfg(feature = "experimental-plugin-revisions")]
 mod plugin_revisions;
 mod plugin_service_data;
 mod projection_lock;
 mod providers;
+mod request_history;
 mod requests;
 pub(crate) use requests::EarlyRequestTerminal;
+#[allow(unused_imports)] // Consumed by the separately owned API receipt integration.
+pub(crate) use requests::pending_settlement::{
+    PendingProxySettlementAck, PendingProxySettlementClaim, PendingProxySettlementEvidence,
+};
+#[allow(unused_imports)] // Separately owned API journal integration.
+pub(crate) use requests::{PendingProxyOperationalTerminal, PendingProxyOperationalTerminalAck};
 mod rotation;
 mod routing;
 pub use routing::egress;
+mod object_bodies;
 mod rows;
 mod session_analytics;
+mod session_reading;
+mod session_reading_lifecycle;
+pub(crate) use session_reading_lifecycle::merge_session_reading_in_transaction;
+mod session_responses;
+pub(crate) use session_reading::{SessionContextNode, SessionContextScope};
+pub(crate) use session_responses::SessionResponseTask;
 mod session_projection;
+pub(crate) mod session_tasks;
+mod session_titles;
+pub(crate) use session_titles::{
+    SessionTitleTask, SessionTitleView, enqueue_initial_session_title,
+};
+pub(crate) mod network_proxies;
 mod tenants;
-mod transport_proxy_groups;
+pub(crate) mod transport_proxy_groups;
 pub(crate) mod transport_proxy_management;
 pub(crate) use transport_proxy_groups::{ProxySelection, TransportProxyGroups};
 mod time;
 mod upstream_account_availability;
+pub(crate) mod upstream_concurrency;
 mod upstream_quota_reset;
+pub(crate) mod upstream_service_probes;
+pub(crate) use upstream_service_probes::SupplierQuotaEvidence;
 mod usage_analysis;
 mod validation;
 
@@ -114,14 +151,41 @@ pub use time::unix_millis;
 pub(crate) use upstream_quota_reset::{PrepareQuotaReset, QuotaResetClaim, QuotaResetOperation};
 use validation::*;
 
-const POSTGRES_SERVE_STATEMENT_TIMEOUT: &str = "SET statement_timeout = 30000";
-const POSTGRES_SERVE_LOCK_TIMEOUT: &str = "SET lock_timeout = 10000";
-const POSTGRES_SERVE_IDLE_TRANSACTION_TIMEOUT: &str =
-    "SET idle_in_transaction_session_timeout = 30000";
-const POSTGRES_MIGRATION_STATEMENT_TIMEOUT: &str = "SET statement_timeout = 900000";
-const POSTGRES_MIGRATION_LOCK_TIMEOUT: &str = "SET lock_timeout = 60000";
-const POSTGRES_MIGRATION_IDLE_TRANSACTION_TIMEOUT: &str =
-    "SET idle_in_transaction_session_timeout = 300000";
+// One startup round trip per new socket. Session settings are not re-applied
+// on request checkout; transaction-local overrides retain their original scope.
+async fn initialize_postgres_connection(
+    connection: &mut sqlx::AnyConnection,
+    application_name: &str,
+    profile: ConnectionProfile,
+) -> Result<(), sqlx::Error> {
+    let (statement, lock, idle) = match profile {
+        ConnectionProfile::Serve => ("0", "0", "30000"),
+        ConnectionProfile::Migration => ("900000", "60000", "300000"),
+    };
+    sqlx::query("SELECT set_config('application_name', CASE WHEN current_setting('application_name') = '' THEN $1 ELSE current_setting('application_name') END, false), set_config('statement_timeout', $2, false), set_config('lock_timeout', $3, false), set_config('idle_in_transaction_session_timeout', $4, false), set_config('client_connection_check_interval', '1000', false)")
+        .bind(application_name).bind(statement).bind(lock).bind(idle)
+        .execute(connection).await?;
+    Ok(())
+}
+
+async fn wait_for_initial_postgres_connection(pool: &AnyPool) -> Result<(), sqlx::Error> {
+    let mut timeouts = 0_u64;
+    loop {
+        match pool.acquire().await {
+            Ok(connection) => {
+                connection.finish();
+                return Ok(());
+            }
+            Err(sqlx::Error::PoolTimedOut) => {
+                timeouts += 1;
+                if timeouts == 1 || timeouts.is_multiple_of(6) {
+                    tracing::warn!(timeouts, "waiting for initial PostgreSQL connection");
+                }
+            }
+            Err(error) => return Err(error),
+        }
+    }
+}
 
 #[derive(Clone, Copy)]
 enum ConnectionProfile {
@@ -181,7 +245,6 @@ pub use providers::{
     NativeOAuthImportCohortResult, ReauthorizeUpstreamAccountInput, ReplaceModelCatalogResult,
     UpdateModelRouteInput, UpdateUpstreamAccountInput, UpstreamModelCatalogView, UpstreamModelView,
 };
-pub(crate) use requests::RequestArchiveAdmission;
 pub use requests::{
     AttachProxyArchiveResult, ConversationDetailFilter, ConversationListFilter,
     ConversationProjectionTask, FinishMeteredSynchronousRequest, FinishProxyRequest,
@@ -189,27 +252,27 @@ pub use requests::{
     ProxyConversationInput, RequestListFilter, StartMeteredSynchronousRequest, StartProxyRequest,
     StatsFilter, normalize_proxy_usage,
 };
+#[cfg_attr(not(test), allow(unused_imports))]
 pub(crate) use requests::{
-    ConversationObservationInput, MAX_STATS_RANGE_MILLIS, ProxyRequestUpstreamAttribution,
-    SessionRoutingTerminalInput, SwitchProxyCandidateInput, allocate_request_event_cursor,
-    attach_conversation_upstream_response_in_transaction, is_session_avoid_terminal,
-    normalize_proxy_usage_with_output_limit, price_token_usage,
-    record_request_finished_in_transaction, record_request_started_in_transaction,
-    reserve_usage_in_transaction, search_prefix, settle_token_usage_in_transaction,
-    validate_numeric_range,
+    ConversationObservationInput, attach_conversation_upstream_response_in_transaction,
 };
 #[cfg(test)]
 pub(crate) use requests::{
     FILTERED_ACTIVITY_SOURCE_FACTS, FILTERED_ACTIVITY_SOURCE_PENDING,
     FILTERED_ACTIVITY_SOURCE_ROLLUPS,
 };
+pub(crate) use requests::{
+    MAX_STATS_RANGE_MILLIS, ProxyRequestUpstreamAttribution, SessionRoutingTerminalInput,
+    SwitchProxyCandidateInput, allocate_request_event_cursor, is_session_avoid_terminal,
+    normalize_proxy_usage_with_output_limit, price_token_usage,
+    record_request_finished_in_transaction, record_request_started_in_transaction,
+    reserve_usage_in_transaction, search_prefix, settle_token_usage_in_transaction,
+    validate_numeric_range,
+};
+pub(crate) use requests::{OrphanReservationScan, RequestArchiveAdmission};
 #[cfg(test)]
 pub(crate) use requests::{
     RequestEventCursor, claim_request_event_locator, claim_request_record_locator,
-};
-pub(crate) use routing::{
-    AdmittedConnectionFailure, GrantedModelCapabilitySource, UpstreamAttemptAdmission,
-    UpstreamFailureKind, UpstreamTransportDiagnostic, upstream_probe_heartbeat_interval,
 };
 pub use routing::{
     CreateRoutedModelRouteInput, CreateRoutedModelRouteResult, CredentialRoutingView,
@@ -217,16 +280,39 @@ pub use routing::{
     RouteCreateDisposition, RouteCreateIdempotencyKey, RouteRoutingView, RouteSelectionOptions,
     UpdateRoutedModelRouteInput,
 };
+pub(crate) use routing::{
+    GrantedModelCapabilitySource, UpstreamAttemptAdmission, UpstreamFailureKind,
+    UpstreamTransportDiagnostic, upstream_probe_heartbeat_interval,
+};
 pub use upstream_account_availability::{
     UpstreamAccountAvailability, UpstreamAccountAvailabilityFilter,
     UpstreamAccountAvailabilityWindow,
 };
-pub use usage_analysis::{UsageAnalysisFilter, UsageAnalysisUpstreamFilter};
+pub use usage_analysis::{
+    UsageAnalysisFilter, UsageAnalysisProjection, UsageAnalysisUpstreamFilter,
+};
+
+fn postgres_application_name(role: &str) -> String {
+    let hostname = std::env::var("HOSTNAME").unwrap_or_default();
+    let suffix: String = hostname
+        .chars()
+        .rev()
+        .take(32)
+        .collect::<String>()
+        .chars()
+        .rev()
+        .collect();
+    format!("{role}/{suffix}")
+}
 
 #[derive(Clone)]
 pub struct Database {
+    pub(crate) http_clients: std::sync::Arc<crate::http_settings::HttpClientFactory>,
     pool: AnyPool,
+    archive: Option<crate::archive::ArchiveStore>,
     pool_role: &'static str,
+    auxiliary_pool_max_connections: u32,
+    connection_profile: ConnectionProfile,
     backend: DatabaseBackend,
     terminal_projection_enabled: bool,
     gateway_persistence: std::sync::Arc<gateway_persistence::GatewayPersistence>,
@@ -414,7 +500,9 @@ impl Database {
             .await
             .map_err(|error| match error {
                 DatabaseReadinessError::Dependency(error) => error,
-                DatabaseReadinessError::SchemaOutdated(_) => AppError::Internal,
+                DatabaseReadinessError::SchemaOutdated(_) => {
+                    AppError::internal("db_mod_readiness_check_1")
+                }
             })
     }
 
@@ -427,7 +515,7 @@ impl Database {
         &self,
         progress: &DatabaseReadinessProgress,
         stage: DatabaseReadinessStage,
-    ) -> Result<sqlx::pool::PoolConnection<Any>, sqlx::Error> {
+    ) -> Result<request_connection::RequestConnection, sqlx::Error> {
         progress.enter(stage, DatabaseReadinessPhase::Acquire).await;
         let started = tokio::time::Instant::now();
         let connection = self.pool.acquire().await.inspect_err(|error| {
@@ -445,21 +533,26 @@ impl Database {
             .acquire_readiness_connection(progress, DatabaseReadinessStage::Ping)
             .await
             .map_err(AppError::from)?;
-        sqlx::query("SELECT 1")
-            .execute(&mut *connection)
-            .await
-            .map_err(AppError::from)?;
-        let schema = self
-            .schema_status(&mut connection, progress)
-            .await
-            .map_err(AppError::from)?;
-        if !schema.is_ready() {
-            return Err(DatabaseReadinessError::SchemaOutdated(schema));
+        let result = async {
+            sqlx::query("SELECT 1")
+                .execute(&mut *connection)
+                .await
+                .map_err(AppError::from)?;
+            let schema = self
+                .schema_status(&mut connection, progress)
+                .await
+                .map_err(AppError::from)?;
+            if !schema.is_ready() {
+                return Err(DatabaseReadinessError::SchemaOutdated(schema));
+            }
+            self.archive_staging_readiness_check(&mut connection, progress)
+                .await
+                .map_err(AppError::from)?;
+            Ok(())
         }
-        self.archive_staging_readiness_check(&mut connection, progress)
-            .await
-            .map_err(AppError::from)?;
-        Ok(())
+        .await;
+        connection.finish();
+        result
     }
 
     pub async fn list_tenants(&self) -> Result<Vec<TenantView>, AppError> {
@@ -475,7 +568,7 @@ impl Database {
             "SELECT external_id FROM tenants WHERE status = 'active' AND external_id > $1 ORDER BY external_id ASC LIMIT $2",
         )
         .bind(after_external_id.unwrap_or_default())
-        .bind(limit.clamp(1, 100))
+        .bind(limit)
         .fetch_all(&self.pool)
         .await?;
         rows.into_iter()
@@ -489,6 +582,40 @@ impl Database {
 
     pub async fn connect(database_url: &str) -> Result<Self, sqlx::Error> {
         Self::connect_with_max(database_url, 8).await
+    }
+
+    #[cfg(test)]
+    pub(crate) fn sqlite_database_url(database_url: &str) -> String {
+        Self::normalized_sqlite_url(database_url).into_owned()
+    }
+
+    fn normalized_sqlite_url(database_url: &str) -> std::borrow::Cow<'_, str> {
+        // `sqlite://C:/...` is a URL with host `C` and loses the drive. Keep the
+        // drive in the path (`sqlite:///C:/...`) and accept Windows separators.
+        let Some(rest) = database_url.strip_prefix("sqlite://") else {
+            return std::borrow::Cow::Borrowed(database_url);
+        };
+        if !rest.contains('\\') && !Self::is_windows_drive_path(rest) {
+            return std::borrow::Cow::Borrowed(database_url);
+        }
+        let rest = rest.replace('\\', "/");
+        let (path, query) = rest.split_once('?').unwrap_or((rest.as_str(), ""));
+        let path = if Self::is_windows_drive_path(path) {
+            format!("/{path}")
+        } else {
+            path.to_owned()
+        };
+        let mut url = format!("sqlite://{path}");
+        if !query.is_empty() {
+            url.push('?');
+            url.push_str(query);
+        }
+        std::borrow::Cow::Owned(url)
+    }
+
+    fn is_windows_drive_path(path: &str) -> bool {
+        let bytes = path.as_bytes();
+        bytes.len() >= 3 && bytes[0].is_ascii_alphabetic() && bytes[1] == b':' && bytes[2] == b'/'
     }
 
     pub async fn connect_with_max(
@@ -512,7 +639,9 @@ impl Database {
     }
 
     pub(crate) async fn close(&self) {
-        self.gateway_persistence.pool.close().await;
+        if self.pool_role != "independent_persistence" {
+            self.gateway_persistence.pool.close().await;
+        }
         self.pool.close().await;
     }
 
@@ -530,12 +659,23 @@ impl Database {
         } else {
             DatabaseBackend::PostgreSql
         };
+        let diagnostics = request_pool::PoolDiagnostics::new(match profile {
+            ConnectionProfile::Serve => "serve",
+            ConnectionProfile::Migration => "migration",
+        });
+        let initialization_diagnostics = diagnostics.clone();
+        let release_diagnostics = diagnostics.clone();
         let mut pool_options = AnyPoolOptions::new()
             .min_connections(0)
-            .max_connections(maximum_connections.clamp(1, 32))
+            .max_connections(maximum_connections)
             .acquire_timeout(Duration::from_secs(10))
             .idle_timeout(Some(Duration::from_secs(5 * 60)))
-            .max_lifetime(Some(Duration::from_secs(30 * 60)));
+            .max_lifetime(Some(Duration::from_secs(30 * 60)))
+            .after_release(move |connection, _metadata| {
+                let reusable = request_connection::can_reuse(connection, backend);
+                release_diagnostics.released(reusable);
+                Box::pin(async move { Ok(reusable) })
+            });
         if matches!(backend, DatabaseBackend::Sqlite) {
             // SQLite is a supported lightweight/test backend and can have a
             // background worker and an HTTP handler contend for its single
@@ -553,33 +693,33 @@ impl Database {
                 })
             });
         } else {
+            pool_options = pool_options.test_before_acquire(false);
+            let application_name = postgres_application_name("mtc-serve");
             pool_options = pool_options.after_connect(move |connection, _metadata| {
+                let application_name = application_name.clone();
+                let mut initialization = initialization_diagnostics.initializing();
                 Box::pin(async move {
-                    let (statement_timeout, lock_timeout, idle_transaction_timeout) = match profile
-                    {
-                        ConnectionProfile::Serve => (
-                            POSTGRES_SERVE_STATEMENT_TIMEOUT,
-                            POSTGRES_SERVE_LOCK_TIMEOUT,
-                            POSTGRES_SERVE_IDLE_TRANSACTION_TIMEOUT,
-                        ),
-                        ConnectionProfile::Migration => (
-                            POSTGRES_MIGRATION_STATEMENT_TIMEOUT,
-                            POSTGRES_MIGRATION_LOCK_TIMEOUT,
-                            POSTGRES_MIGRATION_IDLE_TRANSACTION_TIMEOUT,
-                        ),
-                    };
-                    sqlx::query(statement_timeout)
-                        .execute(&mut *connection)
-                        .await?;
-                    sqlx::query(lock_timeout).execute(&mut *connection).await?;
-                    sqlx::query(idle_transaction_timeout)
-                        .execute(&mut *connection)
-                        .await?;
-                    Ok(())
+                    let result =
+                        initialize_postgres_connection(connection, &application_name, profile)
+                            .await;
+                    initialization.finish(result.is_ok());
+                    result
                 })
             });
         }
-        let pool = pool_options.connect(database_url).await?;
+        // Windows test paths use `\`. SQLite's URL parser treats that as an
+        // invalid URL, so the same `sqlite://...` fixtures never open a file.
+        let database_url = Self::normalized_sqlite_url(database_url);
+        let pool = if matches!(backend, DatabaseBackend::PostgreSql) {
+            let pool: AnyPool =
+                request_pool::RequestPool::from(pool_options.connect_lazy(database_url.as_ref())?)
+                    .with_diagnostics(diagnostics.clone());
+            wait_for_initial_postgres_connection(&pool).await?;
+            pool
+        } else {
+            AnyPool::from(pool_options.connect(database_url.as_ref()).await?)
+                .with_diagnostics(diagnostics)
+        };
         if matches!(backend, DatabaseBackend::Sqlite) {
             // The control, gateway, and worker roles may be separate processes
             // over the same lightweight/test database. WAL keeps readers on a
@@ -592,8 +732,13 @@ impl Database {
                 .await?;
         }
         Ok(Self {
+            #[cfg(test)]
+            archive: Some(crate::archive::ArchiveStore::memory_for_test()),
+            #[cfg(not(test))]
+            archive: None,
+            http_clients: std::sync::Arc::default(),
             gateway_persistence: std::sync::Arc::new(gateway_persistence::GatewayPersistence::new(
-                database_url,
+                database_url.as_ref(),
                 backend,
             )?),
             pool,
@@ -603,15 +748,51 @@ impl Database {
             },
             backend,
             terminal_projection_enabled: false,
+            auxiliary_pool_max_connections: 2,
+            connection_profile: profile,
             #[cfg(test)]
             oauth_refresh_write_phase_seam: std::sync::Arc::new(tokio::sync::Mutex::new(None)),
         })
+    }
+
+    // Waiting for a pool slot is safe to resume: no application SQL has been
+    // sent yet. Once a connection is returned, callers must not replay work.
+    async fn acquire_request_connection(
+        &self,
+        operation: &'static str,
+    ) -> Result<request_connection::RequestConnection, sqlx::Error> {
+        let started = tokio::time::Instant::now();
+        let mut timeouts = 0_u64;
+        loop {
+            match self.pool.acquire().await {
+                Ok(connection) => return Ok(connection),
+                Err(sqlx::Error::PoolTimedOut)
+                    if matches!(self.backend, DatabaseBackend::PostgreSql) =>
+                {
+                    timeouts += 1;
+                    if timeouts == 1 || timeouts.is_multiple_of(6) {
+                        self.observe_pool_timeout(operation, started, &sqlx::Error::PoolTimedOut);
+                    }
+                }
+                Err(error) => {
+                    self.observe_pool_timeout(operation, started, &error);
+                    return Err(error);
+                }
+            }
+        }
     }
 
     pub(crate) async fn begin_write_transaction(
         &self,
     ) -> Result<Transaction<'static, Any>, sqlx::Error> {
         let started = tokio::time::Instant::now();
+        if let Some(deadline) = self.gateway_archive_retry_deadline() {
+            return Box::pin(self.begin_gateway_archive_transaction(deadline))
+                .await
+                .inspect_err(|error| {
+                    self.observe_pool_timeout("write_transaction", started, error);
+                });
+        }
         // SQLite's default deferred transaction can fail immediately with
         // SQLITE_BUSY when a read-before-write transaction races another
         // writer: the shared lock cannot be upgraded after that writer has
@@ -621,14 +802,19 @@ impl Database {
         // Keep SQLx's acquisition state out of every enclosing write future.
         // Gateway completion awaits several layers of these futures on the
         // request task; retaining acquisition inline compounds stack pressure.
-        Box::pin(self.pool.begin_with(match self.backend {
+        let connection = Box::pin(self.acquire_request_connection("write_transaction")).await?;
+        let statement = match self.backend {
             DatabaseBackend::PostgreSql => "BEGIN",
             DatabaseBackend::Sqlite => "BEGIN IMMEDIATE",
-        }))
-        .await
-        .inspect_err(|error| {
-            self.observe_pool_timeout("write_transaction", started, error);
-        })
+        };
+        let mut phase = self.pool.diagnostics().begin();
+        let result = Box::pin(Transaction::begin(
+            connection.into_pool(),
+            Some(sqlx::SqlStr::from_static(statement)),
+        ))
+        .await;
+        phase.finish(result.is_ok());
+        result
     }
 
     fn observe_pool_timeout(
@@ -640,9 +826,20 @@ impl Database {
         if matches!(error, sqlx::Error::PoolTimedOut) {
             let pool_size = self.pool.size();
             let pool_idle = self.pool.num_idle();
+            let diagnostics = self.pool.diagnostics();
+            diagnostics.observe_phases();
+            let (waiters, initializing, cancelled, failed, returned, discarded) =
+                diagnostics.snapshot();
             tracing::warn!(
                 operation,
                 pool_role = self.pool_role,
+                pool_label = diagnostics.label,
+                pool_acquire_waiters = waiters,
+                pool_session_initializing = initializing,
+                pool_session_initialization_cancelled = cancelled,
+                pool_session_initialization_failed = failed,
+                pool_return_callbacks = returned,
+                pool_protocol_discards = discarded,
                 phase = "acquire",
                 error_kind = "pool_timeout",
                 elapsed_ms = started.elapsed().as_millis() as u64,
@@ -656,21 +853,82 @@ impl Database {
         }
     }
 
+    pub(crate) fn with_auxiliary_pool_max_connections(mut self, maximum: u32) -> Self {
+        // 调用方显式传入的规模就是最终规模，不再二次夹取上限。
+        self.auxiliary_pool_max_connections = maximum;
+        self
+    }
+
     pub(crate) fn independent_persistence_pool(&self) -> Self {
+        self.independent_persistence_pool_for("independent-persistence")
+    }
+
+    pub(crate) fn independent_persistence_pool_for(&self, label: &'static str) -> Self {
         Self {
+            archive: self.archive.clone(),
+            http_clients: self.http_clients.clone(),
             gateway_persistence: self.gateway_persistence.clone(),
             pool_role: "independent_persistence",
-            pool: self
-                .pool
-                .options()
-                .clone()
-                .min_connections(0)
-                .max_connections(2)
-                .connect_lazy_with(self.pool.connect_options().as_ref().clone()),
+            pool: {
+                let backend = self.backend;
+                let profile = self.connection_profile;
+                let application_name = postgres_application_name(&format!("mtc-{label}"));
+                let diagnostics = request_pool::PoolDiagnostics::new(label);
+                let initialization_diagnostics = diagnostics.clone();
+                let release_diagnostics = diagnostics.clone();
+                let pool: sqlx::AnyPool = self
+                    .pool
+                    .options()
+                    .clone()
+                    .min_connections(0)
+                    .max_connections(self.auxiliary_pool_max_connections)
+                    .after_connect(move |connection, _| {
+                        let application_name = application_name.clone();
+                        let mut initialization = initialization_diagnostics.initializing();
+                        Box::pin(async move {
+                            let result = async {
+                                match backend {
+                                    DatabaseBackend::Sqlite => {
+                                        sqlx::query("PRAGMA busy_timeout = 10000")
+                                            .execute(&mut *connection)
+                                            .await?;
+                                    }
+                                    DatabaseBackend::PostgreSql => {
+                                        initialize_postgres_connection(
+                                            connection,
+                                            &application_name,
+                                            profile,
+                                        )
+                                        .await?;
+                                    }
+                                }
+                                Ok(())
+                            }
+                            .await;
+                            initialization.finish(result.is_ok());
+                            result
+                        })
+                    })
+                    .after_release(move |connection, _| {
+                        let reusable = request_connection::can_reuse(connection, backend);
+                        release_diagnostics.released(reusable);
+                        Box::pin(async move { Ok(reusable) })
+                    })
+                    .connect_lazy_with(self.pool.connect_options().as_ref().clone());
+                request_pool::RequestPool::from(pool).with_diagnostics(diagnostics)
+            },
             backend: self.backend,
             terminal_projection_enabled: self.terminal_projection_enabled,
+            auxiliary_pool_max_connections: self.auxiliary_pool_max_connections,
+            connection_profile: self.connection_profile,
             #[cfg(test)]
             oauth_refresh_write_phase_seam: std::sync::Arc::new(tokio::sync::Mutex::new(None)),
+        }
+    }
+
+    pub(crate) fn refresh_closed_persistence_pool(&mut self) {
+        if self.pool_role == "independent_persistence" && self.pool.is_closed() {
+            *self = self.independent_persistence_pool_for(self.pool.diagnostics().label);
         }
     }
 
@@ -695,3 +953,5 @@ impl Database {
 pub(crate) mod test_support;
 #[cfg(test)]
 mod tests;
+
+mod semantic_archive_binding;

@@ -34,6 +34,41 @@ async fn fixture_with_members(label: &str, members: &[&str]) -> CodexRouteFixtur
         )
         .await
         .unwrap();
+    // This suite exercises pre-policy environment groups. The URL editor now
+    // migrates managed accounts, so explicitly restore the legacy fixture.
+    let pool = sqlx::AnyPool::connect(&fixture.database_url).await.unwrap();
+    let mut config: Value = serde_json::from_str(
+        &sqlx::query_scalar::<_, String>("SELECT config_json FROM upstream_accounts WHERE id = $1")
+            .bind(account.id.to_string())
+            .fetch_one(&pool)
+            .await
+            .unwrap(),
+    )
+    .unwrap();
+    config
+        .as_object_mut()
+        .unwrap()
+        .remove(crate::db::transport_proxy_management::CONFIG_KEY);
+    sqlx::query("UPDATE upstream_accounts SET config_json = $1 WHERE id = $2")
+        .bind(config.to_string())
+        .bind(account.id.to_string())
+        .execute(&pool)
+        .await
+        .unwrap();
+    for table in [
+        "network_proxy_selection_policies",
+        "transport_proxy_bindings",
+        "upstream_transport_proxy_selections",
+    ] {
+        sqlx::query(sqlx::AssertSqlSafe(format!(
+            "DELETE FROM {table} WHERE account_id = $1"
+        )))
+        .bind(account.id.to_string())
+        .execute(&pool)
+        .await
+        .unwrap();
+    }
+    pool.close().await;
     let groups = if members.is_empty() {
         json!([])
     } else {
@@ -114,14 +149,14 @@ async fn assert_connection_sends(fixture: &CodexRouteFixture, expected: usize) {
 }
 
 #[tokio::test]
-async fn group_fallback_visits_all_members_with_one_default_or_larger_connect_budget() {
+async fn group_connection_failure_keeps_the_sticky_exit() {
     assert_eq!(
         crate::provider::CodexTransportPolicy::default().connect_attempts,
         2
     );
     for attempts in [Some(1), None, Some(4)] {
         let fixture = fixture_with_members(
-            &format!("group-fallback-budget-{attempts:?}"),
+            &format!("group-sticky-exit-{attempts:?}"),
             &[PRIMARY, BACKUP, TERTIARY],
         )
         .await;
@@ -129,10 +164,8 @@ async fn group_fallback_visits_all_members_with_one_default_or_larger_connect_bu
             set_transport_policy(&fixture, json!({"connect_attempts": attempts})).await;
         }
         let before = selection(&fixture).await;
-        assert_connection_sends(&fixture, 3).await;
-        let after = selection(&fixture).await;
-        assert_eq!(after.0, TERTIARY);
-        assert_eq!(after.1, before.1 + 2);
+        assert_connection_sends(&fixture, 1).await;
+        assert_eq!(selection(&fixture).await, before);
     }
 }
 
@@ -149,7 +182,7 @@ async fn singleton_and_ungrouped_keep_the_original_connect_budget() {
                 set_transport_policy(&fixture, json!({"connect_attempts": attempts})).await;
             }
             let before = selection(&fixture).await;
-            assert_connection_sends(&fixture, attempts.unwrap_or(2)).await;
+            assert_connection_sends(&fixture, 1).await;
             assert_eq!(selection(&fixture).await, before);
         }
     }
@@ -238,6 +271,8 @@ async fn managed_binding_stamp_reaches_send_stage_without_bad_request() {
                     label: "primary".into(),
                     proxy_url: Some(PRIMARY.into()),
                 }],
+                probe_url: None,
+                probe_attempts: None,
             },
             None,
             key,
@@ -282,7 +317,10 @@ async fn managed_binding_stamp_reaches_send_stage_without_bad_request() {
     assert_eq!(stamp["binding_version"], binding["binding_version"]);
     assert!(stamp["selection_version"].as_i64().unwrap() > 0);
 
-    let pool = sqlx::AnyPool::connect(&fixture.database_url).await.unwrap();
+    let pool = sqlx::AnyPool::connect(&fixture.database_url)
+        .await
+        .unwrap()
+        .into();
     fixture
         .state
         .transport_proxy_groups
@@ -324,7 +362,7 @@ async fn managed_binding_stamp_reaches_send_stage_without_bad_request() {
 }
 
 #[tokio::test]
-async fn connection_failures_visit_each_group_member_once() {
+async fn connection_failure_keeps_sticky_member_without_replaying() {
     let fixture = fixture("sticky-group-connect").await;
     let first = selection(&fixture).await;
     let (response, remaining) = routing::with_test_send_failures(
@@ -344,10 +382,9 @@ async fn connection_failures_visit_each_group_member_once() {
     let _ = to_bytes(response.into_body(), MAX_PROXY_RESPONSE_BODY)
         .await
         .unwrap();
-    assert_eq!(remaining, 0);
+    assert_eq!(remaining, 1, "a customer POST must not rotate and replay");
     let selected = selection(&fixture).await;
-    assert_eq!(selected.0, BACKUP);
-    assert_eq!(selected.1, first.1 + 1);
+    assert_eq!(selected, first);
 }
 
 #[tokio::test]
@@ -450,80 +487,22 @@ async fn ambiguous_delivery_never_replays_or_changes_group_selection() {
 }
 
 #[tokio::test]
-async fn concurrent_selection_round_trip_does_not_exhaust_untried_member() {
-    for (label, second_failure, expected_status, expected_sends) in [
-        (
-            "connect",
-            ProxySendError::RetryableConnection("connect"),
-            StatusCode::SERVICE_UNAVAILABLE,
-            3,
-        ),
-        (
-            "h2",
-            ProxySendError::NonRetryableTransport(routing::TransportFailureKind::Http2Reset),
-            StatusCode::BAD_GATEWAY,
-            2,
-        ),
-    ] {
-        let fixture = fixture_with_members(
-            &format!("proxy-group-cas-round-trip-{label}"),
-            &[PRIMARY, BACKUP, TERTIARY],
-        )
-        .await;
-        set_transport_policy(&fixture, json!({"connect_attempts": 1})).await;
-        let before = selection(&fixture).await;
-        let (account, credential) = fixture
+async fn independent_probe_moves_the_exit_for_the_next_request_only() {
+    let fixture = fixture_with_members(
+        "independent-probe-advances-sticky-exit",
+        &[PRIMARY, BACKUP, TERTIARY],
+    )
+    .await;
+    let before = selection(&fixture).await;
+    assert_connection_sends(&fixture, 1).await;
+    assert_eq!(selection(&fixture).await, before);
+    assert!(
+        fixture
             .state
-            .db
-            .upstream_account_with_credential(
-                fixture.upstream_account_id,
-                fixture.state.config.key_pepper.as_bytes(),
-            )
-            .await
-            .unwrap();
-        let groups = fixture.state.transport_proxy_groups.clone();
-        let (response, remaining) =
-            crate::db::TransportProxyGroups::with_test_connect_failure_interleaving(
-                move || {
-                    let primary = groups
-                        .select(account.id, account.credential_generation, &credential)
-                        .unwrap();
-                    assert_eq!(primary.member(), Some(0));
-                    assert!(primary.advance_after_connect_failure(&[0]).unwrap());
-                    let backup = groups
-                        .select(account.id, account.credential_generation, &credential)
-                        .unwrap();
-                    assert_eq!(backup.member(), Some(1));
-                    assert!(backup.advance_after_connect_failure(&[1, 2]).unwrap());
-                },
-                routing::with_test_send_failures(
-                    vec![
-                        ProxySendError::RetryableConnection("connect"),
-                        second_failure,
-                        ProxySendError::RetryableConnection("connect"),
-                        ProxySendError::RetryableConnection("must_not_send_again"),
-                    ],
-                    send_codex_route_to_endpoint(
-                        &fixture,
-                        codex_transport::BASE_URL.to_owned(),
-                        "/v1/responses",
-                        json!({"model": fixture.model, "input": "hello", "stream": false}),
-                    ),
-                ),
-            )
-            .await;
-        let status = response.status();
-        let _ = to_bytes(response.into_body(), MAX_PROXY_RESPONSE_BODY)
-            .await
-            .unwrap();
-        assert_eq!(status, expected_status);
-        assert_eq!(
-            4 - remaining,
-            expected_sends,
-            "each distinct member must be sent exactly once"
-        );
-        let after = selection(&fixture).await;
-        assert_eq!(after.0, PRIMARY);
-        assert_eq!(after.1, before.1 + 2);
-    }
+            .transport_proxy_groups
+            .advance_sticky_after_probe(fixture.upstream_account_id)
+    );
+    let after = selection(&fixture).await;
+    assert_eq!(after.0, BACKUP);
+    assert!(after.1 > before.1);
 }

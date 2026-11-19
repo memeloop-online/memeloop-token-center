@@ -11,3 +11,4 @@ pub(super) use responses::{
     is_sse_field_line, parse_sse_event, safe_failure_event, trim_ascii,
 };
 pub(in crate::api) use unique_json::parse_unique_json;
+pub(in crate::api) use unique_json::parse_unique_json_reader;

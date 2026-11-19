@@ -28,7 +28,7 @@ fn same_refresh_identity(
     }
 }
 
-pub(super) async fn carry_forward_refresh_catalog(
+pub(in crate::db) async fn carry_forward_refresh_catalog(
     transaction: &mut sqlx::Transaction<'_, sqlx::Any>,
     account_id: Uuid,
     account: &sqlx::any::AnyRow,

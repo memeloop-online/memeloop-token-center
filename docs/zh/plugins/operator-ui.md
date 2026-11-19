@@ -1,5 +1,7 @@
 # 管理界面扩展
 
+`operator.upstream-account.reset-settings` 将组件嵌入当前上游账号的重置设置。`context.upstreamAccount` 提供 `id`、`name`、`provider`、`tenantExternalId`，可选的 `context.quotaSnapshot` 复用宿主当前额度快照。此插槽不声明导航字段，也不额外读取额度。组件请求账号数据前应校验上下文。
+
 安装经过签名的插件后，可以新增页面、卡片、页面扩展和模型路由操作，无需重新构建 Token Center。插件提供独立的 ESM 模块，导出 `activateOperatorUi(host)`，使用宿主提供的 React 和 Fluent，并返回 `operator-ui-package-v1` 组件注册表。清单中的贡献声明组件、模块路径与 SHA-256 摘要，由安装快照提供校验后的资源。
 
 `operator.sidebar.tab` 支持自定义分组（`id` 与 `label`）和插件路由。`operator.model-route.action` 在每条模型路由的操作区渲染 `component_v1` 组件，通过 `props.context.modelRoute` 提供当前路由。操作组件可以调用 `props.api.navigate(destination, { modelRoute })`，将所选资源传给独立的插件页面。跳转沿用宿主的未保存修改保护；上下文只保存在内存中，离开页面、切换租户或更换凭据后失效。

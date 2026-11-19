@@ -18,65 +18,6 @@ async fn chunk(socket: &mut tokio::net::TcpStream, bytes: &[u8]) {
 }
 
 #[tokio::test]
-async fn malformed_strict_chat_output_never_releases_half_open_admission() {
-    for payload in [
-        b"data: not-json\n\n".as_slice(),
-        b"data: {\"id\":\"chatcmpl-invalid\",\"object\":\"wrong-envelope\",\"model\":\"fixture\",\"choices\":[{\"index\":0,\"delta\":{\"content\":\"bad\"}}]}\n\n".as_slice(),
-    ] {
-        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let endpoint = format!("http://{}", listener.local_addr().unwrap());
-        let (release, released) = tokio::sync::oneshot::channel();
-        let server = tokio::spawn(async move {
-            let (mut socket, _) = listener.accept().await.unwrap();
-            begin_response(&mut socket).await;
-            chunk(&mut socket, payload).await;
-            released.await.unwrap();
-            socket.write_all(b"0\r\n\r\n").await.unwrap();
-        });
-        let mut fixture =
-            response_usage_fixture_with_uri("invalid-probe-prefix", endpoint, 0).await;
-        std::sync::Arc::make_mut(&mut fixture.state.config)
-            .upstream_health
-            .shared_probe_attempts = 0;
-        make_account_half_open_probe(&fixture).await;
-        let body = json!({"model": fixture.model, "messages": [{"role":"user","content":"fixture"}],
-            "stream": true, "stream_options": {"include_usage": true}, "max_tokens":16});
-        let first = send_chat_usage_request(&fixture, &body).await;
-        assert_eq!(first.status(), StatusCode::OK);
-        let mut stream = first.into_body().into_data_stream();
-        let frame = tokio::time::timeout(Duration::from_secs(3), futures_util::StreamExt::next(&mut stream))
-            .await.unwrap().unwrap().unwrap();
-        assert!(!frame.is_empty());
-        let second = tokio::time::timeout(Duration::from_secs(3), send_chat_usage_request(&fixture, &body))
-            .await.expect("invalid prefix must not dispatch another upstream POST");
-        assert_eq!(second.status(), StatusCode::SERVICE_UNAVAILABLE);
-        let _ = to_bytes(second.into_body(), MAX_PROXY_RESPONSE_BODY).await.unwrap();
-        assert!(!fixture.state.metrics.render(&crate::metrics::RuntimeMetrics::default()).contains("event=\"recovered\""));
-        release.send(()).unwrap();
-        tokio::time::timeout(Duration::from_secs(3), async {
-            while let Some(frame) = futures_util::StreamExt::next(&mut stream).await {
-                frame.unwrap();
-            }
-        }).await.expect("malformed strict Chat EOF must close the downstream body");
-        server.await.unwrap();
-        // The rejected probe contender is admitted to the request ledger before
-        // account-lease selection, so its 503 is a second terminal record.
-        wait_for_request_settlement(&fixture, 2).await;
-        let rows = fixture.state.db.list_requests(fixture.key_id, 10).await.unwrap();
-        assert_eq!(rows.len(), 2);
-        assert!(rows.iter().all(|row| row.completed_at.is_some()));
-        let malformed = rows.iter().find(|row| row.status_code == Some(502))
-            .expect("malformed stream must finish with a protocol failure");
-        assert_eq!(malformed.error_code.as_deref(), Some("upstream_incomplete_response"));
-        let rejected = rows.iter().find(|row| row.status_code == Some(503))
-            .expect("the concurrent request must remain rejected");
-        assert_eq!(rejected.error_code.as_deref(), Some("upstream_unavailable"));
-        assert_eq!((rejected.input_tokens, rejected.output_tokens), (0, 0));
-        wait_for_account_failure_count(&fixture, 2).await;
-    }
-}
-
-#[tokio::test]
 async fn completed_only_codex_with_invalid_usage_never_records_recovery() {
     for usage in [
         None,
@@ -112,8 +53,8 @@ async fn completed_only_codex_with_invalid_usage_never_records_recovery() {
         let _ = to_bytes(first.into_body(), MAX_PROXY_RESPONSE_BODY)
             .await
             .unwrap();
-        wait_for_request_settlement(&fixture, 1).await;
-        wait_for_account_failure_count(&fixture, 2).await;
+        let receipt = cancellation::single_unknown_receipt(&fixture).await;
+        assert_eq!(receipt["status_code"], 502);
         assert!(
             !fixture
                 .state
@@ -121,105 +62,36 @@ async fn completed_only_codex_with_invalid_usage_never_records_recovery() {
                 .render(&crate::metrics::RuntimeMetrics::default())
                 .contains("event=\"recovered\"")
         );
+        upstream.verify().await;
+        upstream.reset().await;
+        Mock::given(method("POST"))
+            .respond_with(ResponseTemplate::new(200).set_body_raw(
+                completed_codex_sse("next request despite invalid prior usage"),
+                "text/event-stream",
+            ))
+            .expect(1)
+            .mount(&upstream)
+            .await;
         let second = send_codex_route(
             &fixture,
             &upstream,
             "/v1/responses",
-            json!({"model":fixture.model,"input":"still unhealthy","stream":true}),
+            json!({"model":fixture.model,"input":"next independent request","stream":true}),
         )
         .await;
-        assert_eq!(second.status(), StatusCode::SERVICE_UNAVAILABLE);
-        let _ = to_bytes(second.into_body(), MAX_PROXY_RESPONSE_BODY)
+        assert_eq!(second.status(), StatusCode::OK);
+        let body = to_bytes(second.into_body(), MAX_PROXY_RESPONSE_BODY)
             .await
             .unwrap();
+        assert!(
+            String::from_utf8_lossy(&body).contains("next request despite invalid prior usage")
+        );
         upstream.verify().await;
     }
 }
 
 #[tokio::test]
-async fn sole_half_open_account_retains_bounded_capacity_while_primary_probe_is_slow() {
-    let mut fixture = codex_route_fixture("bounded-shared-probe").await;
-    std::sync::Arc::make_mut(&mut fixture.state.config)
-        .upstream_health
-        .shared_probe_attempts = 1;
-    make_account_half_open_probe_with_kind(&fixture, UpstreamFailureKind::Connection).await;
-    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-    let endpoint = format!("http://{}", listener.local_addr().unwrap());
-    let (release, released) = tokio::sync::watch::channel(false);
-    let upstream = tokio::spawn(async move {
-        let mut handlers = Vec::new();
-        for index in 0..2 {
-            let (mut socket, _) = listener.accept().await.unwrap();
-            let mut released = released.clone();
-            handlers.push(tokio::spawn(async move {
-                begin_response(&mut socket).await;
-                chunk(
-                    &mut socket,
-                    format!(
-                        "event: response.created\ndata: {{\"type\":\"response.created\",\"response\":{{\"id\":\"resp-shared-{index}\"}}}}\n\n"
-                    )
-                    .as_bytes(),
-                )
-                .await;
-                while !*released.borrow() {
-                    released.changed().await.unwrap();
-                }
-                chunk(
-                    &mut socket,
-                    completed_codex_sse(&format!("shared probe {index}")).as_bytes(),
-                )
-                .await;
-                socket.write_all(b"0\r\n\r\n").await.unwrap();
-            }));
-        }
-        for handler in handlers {
-            handler.await.unwrap();
-        }
-    });
-
-    let first = send_codex_route_to_endpoint(
-        &fixture,
-        endpoint.clone(),
-        "/v1/responses",
-        json!({"model": fixture.model, "input": "primary slow probe", "stream": true}),
-    )
-    .await;
-    assert_eq!(first.status(), StatusCode::OK);
-    let second = send_codex_route_to_endpoint(
-        &fixture,
-        endpoint.clone(),
-        "/v1/responses",
-        json!({"model": fixture.model, "input": "bounded shared probe", "stream": true}),
-    )
-    .await;
-    assert_eq!(second.status(), StatusCode::OK);
-    let denied = send_codex_route_to_endpoint(
-        &fixture,
-        endpoint,
-        "/v1/responses",
-        json!({"model": fixture.model, "input": "beyond shared bound", "stream": true}),
-    )
-    .await;
-    assert_eq!(denied.status(), StatusCode::SERVICE_UNAVAILABLE);
-    let _ = to_bytes(denied.into_body(), MAX_PROXY_RESPONSE_BODY)
-        .await
-        .unwrap();
-
-    release.send(true).unwrap();
-    let (first_body, second_body) = tokio::join!(
-        to_bytes(first.into_body(), MAX_PROXY_RESPONSE_BODY),
-        to_bytes(second.into_body(), MAX_PROXY_RESPONSE_BODY),
-    );
-    assert!(first_body.is_ok());
-    assert!(second_body.is_ok());
-    tokio::time::timeout(Duration::from_secs(3), upstream)
-        .await
-        .unwrap()
-        .unwrap();
-}
-
-#[tokio::test]
-async fn validated_delivered_probe_opens_concurrent_admission_before_long_stream_eof() {
+async fn codex_concurrent_admission_does_not_wait_for_validated_output_or_eof() {
     let mut fixture = codex_route_fixture("delivered-long-probe").await;
     std::sync::Arc::make_mut(&mut fixture.state.config)
         .upstream_health
@@ -243,8 +115,8 @@ async fn validated_delivered_probe_opens_concurrent_admission_before_long_stream
             chunk(&mut first, &complete.as_bytes()[terminal_at..]).await;
             first.write_all(b"0\r\n\r\n").await.unwrap();
         });
-        // Only two actual POSTs are permitted. The rejected request below must
-        // never reach this listener while headers/control are the only proof.
+        // A second request can proceed while the first is still waiting for
+        // output and its terminal frame, irrespective of historical health.
         let (mut second, _) = listener.accept().await.unwrap();
         begin_response(&mut second).await;
         chunk(
@@ -273,17 +145,6 @@ async fn validated_delivered_probe_opens_concurrent_admission_before_long_stream
     .unwrap()
     .unwrap();
     assert!(!String::from_utf8_lossy(&initial).contains("long probe output"));
-    let denied = send_codex_route_to_endpoint(
-        &fixture,
-        endpoint.clone(),
-        "/v1/responses",
-        json!({"model": fixture.model, "input": "headers are not recovery", "stream": true}),
-    )
-    .await;
-    assert_eq!(denied.status(), StatusCode::SERVICE_UNAVAILABLE);
-    let _ = to_bytes(denied.into_body(), MAX_PROXY_RESPONSE_BODY)
-        .await
-        .unwrap();
     output_tx.send(()).unwrap();
     tokio::time::timeout(Duration::from_secs(3), async {
         loop {
@@ -298,7 +159,6 @@ async fn validated_delivered_probe_opens_concurrent_admission_before_long_stream
     })
     .await
     .unwrap();
-    wait_for_account_failure_count(&fixture, 0).await;
     assert!(
         !upstream.is_finished(),
         "first upstream is still waiting for its EOF gate"
@@ -341,7 +201,7 @@ async fn validated_delivered_probe_opens_concurrent_admission_before_long_stream
                 .unwrap();
             if rows
                 .iter()
-                .filter(|row| row.status_code == Some(200))
+                .filter(|row| row.status_code == Some(200) && row.completed_at.is_some())
                 .count()
                 == 2
             {

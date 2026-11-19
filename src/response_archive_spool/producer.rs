@@ -4,6 +4,7 @@ use std::sync::{
     Arc,
     atomic::{AtomicBool, Ordering},
 };
+#[cfg(test)]
 use tracing::Instrument;
 
 use crate::{AppState, db::ArchiveSpoolIdentity, error::AppError};
@@ -47,14 +48,14 @@ impl<'a> BufferedArchive<'a> {
         pepper: &'a [u8],
         compression_enabled: bool,
     ) -> Result<Self, AppError> {
-        if body.len() > 64 * 1024 * 1024 {
-            return Err(AppError::Overloaded);
-        }
+        // Raw request JSON and raw response JSON are split into CHUNK_BYTES
+        // pieces and archived in full. The former 64MiB plain ceiling is not
+        // a capture cutoff.
         let chunk_count = body.len().div_ceil(super::CHUNK_BYTES);
         let mut nonces = Vec::with_capacity(chunk_count);
         for _ in 0..chunk_count {
             let mut nonce = [0_u8; 12];
-            fill(&mut nonce).map_err(|_| AppError::Internal)?;
+            fill(&mut nonce).map_err(|_| AppError::internal("producer_new_1"))?;
             nonces.push(nonce);
         }
         Ok(Self {
@@ -84,15 +85,22 @@ impl<'a> BufferedArchive<'a> {
     }
 
     pub(crate) fn seal(&self, seq: usize) -> Result<String, AppError> {
-        let nonce = self.nonces.get(seq).copied().ok_or(AppError::Internal)?;
+        let nonce = self
+            .nonces
+            .get(seq)
+            .copied()
+            .ok_or(AppError::internal("producer_seal_1"))?;
         let start = seq
             .checked_mul(super::CHUNK_BYTES)
-            .ok_or(AppError::Internal)?;
+            .ok_or(AppError::internal("producer_seal_2"))?;
         let end = (start + super::CHUNK_BYTES).min(self.body.len());
-        let bytes = self.body.get(start..end).ok_or(AppError::Internal)?;
+        let bytes = self
+            .body
+            .get(start..end)
+            .ok_or(AppError::internal("producer_seal_3"))?;
         let sealed = super::cipher::seal_for_purpose_with_nonce_and_compression(
             self.identity,
-            i64::try_from(seq).map_err(|_| AppError::Internal)?,
+            i64::try_from(seq).map_err(|_| AppError::internal("producer_seal_1"))?,
             bytes,
             self.pepper,
             self.purpose,
@@ -115,12 +123,14 @@ impl<'a> BufferedArchive<'a> {
             .map(|seq| {
                 let start = seq
                     .checked_mul(super::CHUNK_BYTES)
-                    .ok_or(AppError::Internal)?;
+                    .ok_or(AppError::internal("producer_prepare_first_batch_1"))?;
                 let end = (start + super::CHUNK_BYTES).min(self.body.len());
                 Ok(crate::db::ArchiveSpoolChunk {
-                    seq: i64::try_from(seq).map_err(|_| AppError::Internal)?,
+                    seq: i64::try_from(seq)
+                        .map_err(|_| AppError::internal("producer_prepare_first_batch_1"))?,
                     ciphertext: self.seal(seq)?,
-                    byte_count: i64::try_from(end - start).map_err(|_| AppError::Internal)?,
+                    byte_count: i64::try_from(end - start)
+                        .map_err(|_| AppError::internal("producer_prepare_first_batch_2"))?,
                 })
             })
             .collect::<Result<Vec<_>, AppError>>()?;
@@ -236,9 +246,8 @@ pub(crate) fn encrypt_buffered(
     body: &Bytes,
     pepper: &[u8],
 ) -> Result<Vec<crate::db::ArchiveSpoolChunk>, AppError> {
-    if body.len() > 64 * 1024 * 1024 {
-        return Err(AppError::Overloaded);
-    }
+    // Same full-body chunking as BufferedArchive::new. The former 64MiB plain
+    // ceiling is not a capture cutoff.
     body.chunks(super::CHUNK_BYTES)
         .enumerate()
         .map(|(seq, bytes)| {
@@ -405,15 +414,13 @@ pub(crate) struct ResponseArchiveProducer {
     identity: ArchiveSpoolIdentity,
     #[cfg(test)]
     state: AppState,
-    sender: Option<tokio::sync::mpsc::Sender<QueuedArchiveChunk>>,
-    chunk_memory: Arc<tokio::sync::Semaphore>,
-    terminal: Option<tokio::sync::oneshot::Sender<Bytes>>,
-    pending: Vec<u8>,
+    capture: CarrierCaptureInput,
     writer: super::OwnedTask<()>,
     active: Arc<AtomicBool>,
     _queue_memory: Arc<CaptureQueueMemory>,
 }
 
+#[cfg(test)]
 struct QueuedArchiveChunk {
     bytes: Bytes,
     _memory: Option<tokio::sync::OwnedSemaphorePermit>,
@@ -436,11 +443,18 @@ impl ResponseArchiveSettlement {
     }
 
     #[cfg(test)]
+    pub(super) async fn wait_result_for_test(mut self) -> Option<Result<(), AppError>> {
+        self._writer.wait().await
+    }
+
+    #[cfg(test)]
     pub(crate) fn pending_for_test(released: tokio::sync::oneshot::Receiver<()>) -> Self {
         Self {
             _writer: super::OwnedTask::spawn(
                 async move {
-                    released.await.map_err(|_| AppError::Internal)?;
+                    released
+                        .await
+                        .map_err(|_| AppError::internal("producer_pending_for_test_1"))?;
                     Ok(())
                 },
                 "response_spool_writer_test",
@@ -450,6 +464,7 @@ impl ResponseArchiveSettlement {
     }
 }
 
+#[cfg(test)]
 pub(super) struct ResponseArchiveWriter {
     state: AppState,
     identity: ArchiveSpoolIdentity,
@@ -461,6 +476,7 @@ pub(super) struct ResponseArchiveWriter {
     max_append_wait: std::time::Duration,
 }
 
+#[cfg(test)]
 impl Drop for ResponseArchiveWriter {
     fn drop(&mut self) {
         tracing::info!(request_id = %self.identity.request_id, phase = "response_spool_writer_summary",
@@ -471,33 +487,128 @@ impl Drop for ResponseArchiveWriter {
     }
 }
 
+struct CapturedResponse {
+    source: Arc<crate::gateway_body::carrier::BodyCarrier>,
+    staging: crate::archive_staging::ArchiveStagingKey,
+}
+
+struct CaptureChunk {
+    bytes: Bytes,
+    acknowledged: tokio::sync::oneshot::Sender<()>,
+    #[cfg(test)]
+    pause: Option<(
+        tokio::sync::oneshot::Sender<()>,
+        tokio::sync::oneshot::Receiver<()>,
+    )>,
+}
+
+struct CaptureReceipt {
+    acknowledged: tokio::sync::oneshot::Sender<()>,
+    #[cfg(test)]
+    pause: Option<(
+        tokio::sync::oneshot::Sender<()>,
+        tokio::sync::oneshot::Receiver<()>,
+    )>,
+}
+
+struct CarrierCaptureInput {
+    source: Option<tokio::sync::mpsc::Sender<CaptureChunk>>,
+    progress: tokio::sync::watch::Sender<(u64, bool)>,
+    length: u64,
+    #[cfg(test)]
+    write_pause: Option<(
+        tokio::sync::oneshot::Sender<()>,
+        tokio::sync::oneshot::Receiver<()>,
+    )>,
+    #[cfg(test)]
+    owner: std::sync::Weak<()>,
+}
+
+impl CarrierCaptureInput {
+    async fn append(&mut self, bytes: Bytes) -> std::io::Result<()> {
+        for offset in (0..bytes.len()).step_by(super::CHUNK_BYTES) {
+            let end = (offset + super::CHUNK_BYTES).min(bytes.len());
+            let (acknowledged, completion) = tokio::sync::oneshot::channel();
+            self.source
+                .as_ref()
+                .ok_or_else(|| std::io::Error::other("capture closed"))?
+                .send(CaptureChunk {
+                    bytes: bytes.slice(offset..end),
+                    acknowledged,
+                    #[cfg(test)]
+                    pause: self.write_pause.take(),
+                })
+                .await
+                .map_err(|_| std::io::Error::other("capture closed"))?;
+            // The receiver acknowledges only when capture has taken ownership
+            // of the previous chunk, rather than merely queueing its bytes.
+            completion
+                .await
+                .map_err(|_| std::io::Error::other("capture closed"))?;
+            self.length += (end - offset) as u64;
+            self.progress.send_replace((self.length, false));
+        }
+        Ok(())
+    }
+}
+
+fn carrier_capture_stream(
+    receiver: tokio::sync::mpsc::Receiver<CaptureChunk>,
+) -> impl futures_util::Stream<Item = Result<Bytes, AppError>> + Send {
+    futures_util::stream::unfold(
+        (receiver, None::<CaptureReceipt>),
+        |(mut receiver, previous)| async move {
+            if let Some(previous) = previous {
+                #[cfg(test)]
+                if let Some((entered, release)) = previous.pause {
+                    let _ = entered.send(());
+                    let _ = release.await;
+                }
+                let _ = previous.acknowledged.send(());
+            }
+            let chunk = receiver.recv().await?;
+            Some((
+                Ok(chunk.bytes),
+                (
+                    receiver,
+                    Some(CaptureReceipt {
+                        acknowledged: chunk.acknowledged,
+                        #[cfg(test)]
+                        pause: chunk.pause,
+                    }),
+                ),
+            ))
+        },
+    )
+}
+
 struct CaptureQueueMemory {
-    reservation: Arc<crate::gateway_body::memory::ProxyMemoryReservation>,
+    // Legacy test admission and the background multipart envelope retain their
+    // own permits. Production source allocations belong to BodyCarrier.
+    _local_metrics: Option<crate::metrics::MemoryUsageGuard>,
+    _archive_permit: Option<tokio::sync::OwnedSemaphorePermit>,
+    reservation: Option<Arc<crate::gateway_body::memory::ProxyMemoryReservation>>,
 }
 
 impl Drop for CaptureQueueMemory {
     fn drop(&mut self) {
-        self.reservation.release(
-            super::CAPTURE_MEMORY_BYTES,
-            crate::gateway_body::memory::CAPTURE_MEMORY_WEIGHT,
-        );
+        if let Some(reservation) = &self.reservation {
+            reservation.release(
+                super::CAPTURE_MEMORY_BYTES,
+                crate::gateway_body::memory::CAPTURE_MEMORY_WEIGHT,
+            );
+        }
     }
 }
 
 async fn fence_failed_capture(
     state: &AppState,
     identity: ArchiveSpoolIdentity,
+    target: CaptureTarget,
 ) -> Result<(), AppError> {
     #[cfg(test)]
     super::fence_probe::observe(state).await;
-    let result = observe_writer_database(identity, "response_spool_failed_fence", 0, async {
-        state
-            .db
-            .fail_response_archive_spool(identity, "capture_failed")
-            .await
-            .map(|()| true)
-    })
-    .await;
+    let result = target.publish_failure(&state.archive, identity).await;
     if let Err(error) = &result {
         tracing::warn!(
             request_id = %identity.request_id,
@@ -506,10 +617,124 @@ async fn fence_failed_capture(
             "failed response archive acknowledgement could not be fenced"
         );
     }
-    result.map(|_| ())
+    result
+}
+
+struct OriginalAdmission {
+    state: Option<AppState>,
+    identity: ArchiveSpoolIdentity,
+    target: CaptureTarget,
+}
+
+#[derive(Clone, Copy)]
+pub(crate) enum CaptureTarget {
+    Response,
+    DiscardedAttempt(crate::archive::RawResponseAttempt),
+}
+
+impl CaptureTarget {
+    pub(crate) async fn publish_failure(
+        self,
+        archive: &crate::archive::ArchiveStore,
+        identity: ArchiveSpoolIdentity,
+    ) -> Result<(), AppError> {
+        match self {
+            Self::Response => {
+                archive
+                    .publish_raw_capture_failure(
+                        identity.tenant_id,
+                        identity.request_id,
+                        "response",
+                    )
+                    .await
+            }
+            Self::DiscardedAttempt(attempt) => {
+                archive
+                    .publish_response_attempt_failure(
+                        identity.tenant_id,
+                        identity.request_id,
+                        attempt,
+                    )
+                    .await
+            }
+        }
+    }
+    async fn publish(
+        self,
+        archive: &crate::archive::ArchiveStore,
+        identity: ArchiveSpoolIdentity,
+        object: &crate::archive::CasArchiveObject,
+    ) -> Result<crate::archive::RawPublicationSettlement, AppError> {
+        match self {
+            Self::Response => {
+                archive
+                    .settle_raw_capture(identity.tenant_id, identity.request_id, "response", object)
+                    .await
+            }
+            Self::DiscardedAttempt(attempt) => archive
+                .publish_response_attempt(identity.tenant_id, identity.request_id, attempt, object)
+                .await
+                .map(|()| crate::archive::RawPublicationSettlement::Published),
+        }
+    }
+}
+
+impl OriginalAdmission {
+    fn disarm(mut self) {
+        self.state.take();
+    }
+}
+
+impl Drop for OriginalAdmission {
+    fn drop(&mut self) {
+        if let Some(state) = self.state.take() {
+            crate::api::proxy::persistence::record_capture_failure_target(
+                &state,
+                self.identity,
+                self.target,
+            );
+        }
+    }
 }
 
 impl ResponseArchiveProducer {
+    #[cfg(test)]
+    pub(crate) async fn begin_original(
+        state: &AppState,
+        identity: ArchiveSpoolIdentity,
+    ) -> Option<Self> {
+        Self::admit_original(state, identity).await
+    }
+
+    #[cfg(test)]
+    pub(crate) fn admit_original(
+        state: &AppState,
+        identity: ArchiveSpoolIdentity,
+    ) -> impl std::future::Future<Output = Option<Self>> + Send + 'static {
+        Self::admit_target(state, identity, CaptureTarget::Response)
+    }
+
+    pub(crate) fn admit_target(
+        state: &AppState,
+        identity: ArchiveSpoolIdentity,
+        target: CaptureTarget,
+    ) -> impl std::future::Future<Output = Option<Self>> + Send + 'static {
+        let state = state.clone();
+        let admission = OriginalAdmission {
+            state: Some(state.clone()),
+            identity,
+            target,
+        };
+        async move {
+            // Capture takes real RAM/object ownership independently of upload
+            // admission. The writer retains it until the CAS/root acknowledgement.
+            let producer = Self::begin_admitted(&state, identity, None, None, target);
+            admission.disarm();
+            Some(producer)
+        }
+    }
+
+    #[cfg(test)]
     pub(crate) fn begin(
         state: &AppState,
         identity: ArchiveSpoolIdentity,
@@ -533,34 +758,80 @@ impl ResponseArchiveProducer {
             tracing::warn!(request_id = %identity.request_id, stage = "response_spool_memory_admission", "proxy archive gap");
             return None;
         }
+        Some(Self::begin_admitted(
+            state,
+            identity,
+            Some(memory),
+            Some(archive_permit),
+            CaptureTarget::Response,
+        ))
+    }
+
+    fn begin_admitted(
+        state: &AppState,
+        identity: ArchiveSpoolIdentity,
+        memory: Option<Arc<crate::gateway_body::memory::ProxyMemoryReservation>>,
+        archive_permit: Option<tokio::sync::OwnedSemaphorePermit>,
+        target: CaptureTarget,
+    ) -> Self {
         let queue_memory = Arc::new(CaptureQueueMemory {
+            _local_metrics: None,
             reservation: memory,
+            _archive_permit: archive_permit,
         });
-        let chunk_memory = Arc::new(tokio::sync::Semaphore::new(
-            super::CAPTURE_DATABASE_BATCH_CHUNKS,
-        ));
-        let (sender, receiver) = tokio::sync::mpsc::channel(super::CAPTURE_QUEUE_CHUNKS);
-        let (terminal, terminal_receiver) = tokio::sync::oneshot::channel();
+        let (source, source_receiver) = tokio::sync::mpsc::channel(1);
+        let (progress, progress_receiver) = tokio::sync::watch::channel((0_u64, false));
         let active = Arc::new(AtomicBool::new(true));
         let writer_active = active.clone();
         let failure_active = active.clone();
+        let capture_owner = Arc::new(());
+        let source_owner = capture_owner.clone();
+        let capture_state = state.clone();
+        let capture_progress = progress_receiver.clone();
+        let capture_active = active.clone();
+        let captured = super::OwnedTask::spawn(
+            async move {
+                let _source_owner = source_owner;
+                let key = capture_state.archive.select_staging_key(
+                    crate::archive_staging::ArchiveStagingKey::new(
+                        crate::archive_staging::ArchiveStagingOwner::ProxyRequest(
+                            identity.request_id,
+                        ),
+                        crate::archive_staging::ArchiveStagingPurpose::Response,
+                        uuid::Uuid::now_v7(),
+                    )?,
+                )?;
+                let capture = crate::gateway_body::carrier::CarrierCapture::new(
+                    capture_state.proxy_memory_budget.clone(),
+                    Some(capture_state.archive.clone()),
+                    key,
+                );
+                tokio::select! {
+                    result = crate::gateway_body::carrier::BodyCarrier::capture(carrier_capture_stream(source_receiver), capture) => result.map(|source| CapturedResponse { source, staging: key }),
+                    () = capture_abandoned(capture_progress, capture_active) => Err(AppError::internal("response_capture_cancelled")),
+                }
+            },
+            "response_carrier_capture",
+            None,
+        );
+        #[cfg(test)]
+        let producer_owner = capture_owner.clone();
         let mut writer_state = state.clone();
         writer_state.db = state.persistence_db.clone();
+        writer_state.db.refresh_closed_persistence_pool();
         let writer_memory = queue_memory.clone();
         let writer = super::OwnedTask::spawn(
             async move {
-                let _archive_permit = archive_permit;
-                let _queue_memory = writer_memory;
-                let _capture_metrics = writer_state.metrics.memory_usage(
-                    crate::metrics::MemoryComponent::StreamCapture,
-                    super::CAPTURE_MEMORY_BYTES,
-                );
+                let _queue_memory = writer_memory.clone();
+                let _source_owner = capture_owner;
                 match run_response_archive_writer(
                     writer_state.clone(),
                     identity,
-                    receiver,
-                    terminal_receiver,
+                    captured,
+                    progress_receiver,
+                    writer_memory,
                     writer_active,
+                    target,
                 )
                 .await
                 {
@@ -569,11 +840,11 @@ impl ResponseArchiveProducer {
                     // after its producer disappears. A successful gap fence
                     // is not a failed database operation.
                     Ok(WriterOutcome::Abandoned) => {
-                        fence_failed_capture(&writer_state, identity).await
+                        fence_failed_capture(&writer_state, identity, target).await
                     }
                     Err(error) => {
                         failure_active.store(false, Ordering::Release);
-                        let _ = fence_failed_capture(&writer_state, identity).await;
+                        let _ = fence_failed_capture(&writer_state, identity, target).await;
                         Err(error)
                     }
                 }
@@ -581,18 +852,23 @@ impl ResponseArchiveProducer {
             "response_spool_writer",
             Some(active.clone()),
         );
-        Some(Self {
+        Self {
             identity,
             #[cfg(test)]
             state: state.clone(),
-            sender: Some(sender),
-            chunk_memory,
-            terminal: Some(terminal),
-            pending: Vec::with_capacity(super::CHUNK_BYTES),
+            capture: CarrierCaptureInput {
+                source: Some(source),
+                progress,
+                length: 0,
+                #[cfg(test)]
+                write_pause: None,
+                #[cfg(test)]
+                owner: Arc::downgrade(&producer_owner),
+            },
             writer,
             active,
             _queue_memory: queue_memory,
-        })
+        }
     }
 
     #[cfg(test)]
@@ -603,66 +879,50 @@ impl ResponseArchiveProducer {
         ResponseArchiveWriter::begin_inner(state.clone(), identity).await
     }
 
-    pub(crate) fn append(&mut self, chunks: Vec<Bytes>) -> bool {
-        if !self.active.load(Ordering::Acquire) {
-            self.abandon("writer_inactive");
-            return false;
-        }
+    /// Hand each chunk to the shared carrier without an archive-admission gate.
+    /// Storage is needed only when real RAM credit cannot retain the source.
+    pub(crate) async fn append_with_backpressure(&mut self, chunk: Bytes) -> bool {
         #[cfg(test)]
         if take_append_failure_for_test(&self.state) {
             self.abandon("injected_append_failure");
             return false;
         }
-        for chunk in chunks {
-            let mut remaining = chunk.as_ref();
-            while !remaining.is_empty() {
-                let take = remaining.len().min(super::CHUNK_BYTES - self.pending.len());
-                self.pending.extend_from_slice(&remaining[..take]);
-                remaining = &remaining[take..];
-                if self.pending.len() == super::CHUNK_BYTES {
-                    let Some(sender) = self.sender.clone() else {
-                        return false;
-                    };
-                    let permit = match sender.try_reserve() {
-                        Ok(permit) => permit,
-                        Err(error) => {
-                            self.abandon(match error {
-                                tokio::sync::mpsc::error::TrySendError::Full(_) => "queue_capacity",
-                                tokio::sync::mpsc::error::TrySendError::Closed(_) => "queue_closed",
-                            });
-                            return false;
-                        }
-                    };
-                    let memory = match self.chunk_memory.clone().try_acquire_owned() {
-                        Ok(memory) => memory,
-                        Err(_) => {
-                            self.abandon("queue_capacity");
-                            return false;
-                        }
-                    };
-                    let full = Bytes::from(std::mem::take(&mut self.pending));
-                    permit.send(QueuedArchiveChunk {
-                        bytes: full,
-                        _memory: Some(memory),
-                    });
-                    self.pending = Vec::with_capacity(super::CHUNK_BYTES);
-                }
-            }
+        if !self.active.load(Ordering::Acquire) {
+            return false;
         }
-        true
+        if self.capture.append(chunk).await.is_ok() {
+            true
+        } else {
+            self.abandon("carrier_capture_unavailable");
+            false
+        }
     }
 
     fn abandon(&mut self, reason: &'static str) {
         tracing::warn!(request_id = %self.identity.request_id, phase = "response_spool_producer", outcome = reason, "response capture abandoned");
         self.active.store(false, Ordering::Release);
-        self.sender.take();
-        self.terminal.take();
-        self.pending.clear();
+        self.capture.source.take();
+        self.capture
+            .progress
+            .send_replace((self.capture.length, true));
     }
 
     #[cfg(test)]
-    pub(super) fn queue_memory_owners_for_test(&self) -> usize {
-        Arc::strong_count(&self._queue_memory)
+    pub(crate) fn local_source_owner_for_test(&self) -> std::sync::Weak<()> {
+        self.capture.owner.clone()
+    }
+
+    #[cfg(test)]
+    pub(super) fn pause_local_write_for_test(
+        &mut self,
+    ) -> (
+        tokio::sync::oneshot::Receiver<()>,
+        tokio::sync::oneshot::Sender<()>,
+    ) {
+        let (entered, entering) = tokio::sync::oneshot::channel();
+        let (release, released) = tokio::sync::oneshot::channel();
+        self.capture.write_pause = Some((entered, released));
+        (entering, release)
     }
 
     #[cfg(test)]
@@ -671,30 +931,25 @@ impl ResponseArchiveProducer {
         self.writer.wait().await
     }
 
-    /// Hand the terminal tail to the owned writer. Database completion is
-    /// intentionally not on the downstream delivery path; the supervisor
-    /// observes the writer until it seals or fences the capture as a gap.
-    pub(crate) fn seal(self) -> Option<ResponseArchiveSettlement> {
-        let Self {
-            mut sender,
-            mut terminal,
-            pending,
-            mut writer,
-            active,
-            ..
-        } = self;
-        let tail = Bytes::from(pending);
-        let terminal = terminal.take()?;
-        if terminal.send(tail).is_err() {
-            active.store(false, Ordering::Release);
+    /// Capture EOF is not an ACK. The owned writer must still publish its CAS root.
+    pub(crate) fn seal(mut self) -> Option<ResponseArchiveSettlement> {
+        if !self.active.load(Ordering::Acquire) {
             return None;
         }
-        sender.take();
-        writer.continue_on_drop();
-        Some(ResponseArchiveSettlement { _writer: writer })
+        // Publish EOF before closing an empty source: the receiver can wake
+        // concurrently as soon as its sender is dropped.
+        self.capture
+            .progress
+            .send_replace((self.capture.length, true));
+        self.capture.source.take();
+        self.writer.continue_on_drop();
+        Some(ResponseArchiveSettlement {
+            _writer: self.writer,
+        })
     }
 }
 
+#[cfg(test)]
 impl ResponseArchiveWriter {
     async fn begin_inner(
         state: AppState,
@@ -709,7 +964,7 @@ impl ResponseArchiveWriter {
         )
         .await?
         {
-            return Err(AppError::Internal);
+            return Err(AppError::internal("producer_begin_inner_1"));
         }
         Ok(Self {
             state,
@@ -725,13 +980,16 @@ impl ResponseArchiveWriter {
 
     async fn append_chunks(&mut self, chunks: Vec<QueuedArchiveChunk>) -> Result<(), AppError> {
         if chunks.is_empty() || chunks.len() > super::CAPTURE_DATABASE_BATCH_CHUNKS {
-            return Err(AppError::Internal);
+            return Err(AppError::internal("producer_append_chunks_1"));
         }
         let chunk_count = chunks.len();
         let batch_bytes = chunks.iter().try_fold(0_i64, |total, chunk| {
             total
-                .checked_add(i64::try_from(chunk.bytes.len()).map_err(|_| AppError::Internal)?)
-                .ok_or(AppError::Internal)
+                .checked_add(
+                    i64::try_from(chunk.bytes.len())
+                        .map_err(|_| AppError::internal("producer_append_chunks_1"))?,
+                )
+                .ok_or(AppError::internal("producer_append_chunks_2"))
         })?;
         let mut chunks = chunks.into_iter();
         let identity = self.identity;
@@ -758,9 +1016,9 @@ impl ResponseArchiveWriter {
                             bytes,
                             _memory: memory,
                         } =
-                            chunks.next().ok_or(AppError::Internal)?;
+                            chunks.next().ok_or(AppError::internal("producer_append_chunks_3"))?;
                         let byte_count =
-                            i64::try_from(bytes.len()).map_err(|_| AppError::Internal)?;
+                            i64::try_from(bytes.len()).map_err(|_| AppError::internal("producer_append_chunks_2"))?;
                         let ciphertext = super::cipher::seal_for_purpose_with_compression(
                             identity,
                             seq,
@@ -790,25 +1048,20 @@ impl ResponseArchiveWriter {
         };
         self.append_attempts += 1;
         if !appended? {
-            return Err(AppError::Internal);
+            return Err(AppError::internal("producer_append_chunks_4"));
         }
         self.seq = self
             .seq
-            .checked_add(i64::try_from(chunk_count).map_err(|_| AppError::Internal)?)
-            .ok_or(AppError::Internal)?;
+            .checked_add(
+                i64::try_from(chunk_count)
+                    .map_err(|_| AppError::internal("producer_append_chunks_3"))?,
+            )
+            .ok_or(AppError::internal("producer_append_chunks_5"))?;
         self.bytes = self
             .bytes
             .checked_add(batch_bytes)
-            .ok_or(AppError::Internal)?;
+            .ok_or(AppError::internal("producer_append_chunks_6"))?;
         Ok(())
-    }
-
-    async fn append_chunk(&mut self, bytes: Bytes) -> Result<(), AppError> {
-        self.append_chunks(vec![QueuedArchiveChunk {
-            bytes,
-            _memory: None,
-        }])
-        .await
     }
 
     #[cfg(test)]
@@ -861,7 +1114,7 @@ impl ResponseArchiveWriter {
         )
         .await?
         {
-            return Err(AppError::Internal);
+            return Err(AppError::internal("producer_seal_inner_1"));
         }
         Ok(())
     }
@@ -878,46 +1131,238 @@ enum WriterOutcome {
     Abandoned,
 }
 
-async fn run_response_archive_writer(
-    state: AppState,
+async fn captured_source(
+    source: &mut super::OwnedTask<CapturedResponse>,
     identity: ArchiveSpoolIdentity,
-    mut receiver: tokio::sync::mpsc::Receiver<QueuedArchiveChunk>,
-    terminal: tokio::sync::oneshot::Receiver<Bytes>,
+    progress: tokio::sync::watch::Receiver<(u64, bool)>,
     active: Arc<AtomicBool>,
+) -> Result<Option<CapturedResponse>, AppError> {
+    tokio::select! {
+        result = source.wait() => match result {
+            Some(Ok(source)) if active.load(Ordering::Acquire) => Ok(Some(source)),
+            Some(Err(error)) if active.load(Ordering::Acquire) => Err(error),
+            _ => { writer_interrupted(identity, "carrier_source_dropped"); Ok(None) }
+        },
+        () = capture_abandoned(progress, active.clone()) => Ok(None),
+    }
+}
+
+// Closing an unsealed producer or explicitly abandoning it wakes resource
+// waits. A sealed source remains owned even after every observer disappears.
+async fn capture_abandoned(
+    mut progress: tokio::sync::watch::Receiver<(u64, bool)>,
+    active: Arc<AtomicBool>,
+) {
+    loop {
+        if !active.load(Ordering::Acquire) {
+            return;
+        }
+        if progress.changed().await.is_err() {
+            if !progress.borrow().1 || !active.load(Ordering::Acquire) {
+                return;
+            }
+            std::future::pending::<()>().await;
+        }
+    }
+}
+
+/// The common carrier remains the complete retry source. A separate, already
+/// reserved upload envelope owns multipart copies instead of source-pool leases.
+async fn stage_captured_response(
+    state: &AppState,
+    source: &Arc<crate::gateway_body::carrier::BodyCarrier>,
+    staging: crate::archive_staging::ArchiveStagingKey,
+) -> Result<
+    (
+        crate::archive::StagedArchiveObject,
+        Option<crate::archive::CarrierObjectOwner>,
+    ),
+    AppError,
+> {
+    if let Some(staged) = source.sealed_staged_reference() {
+        return Ok((staged.clone(), None));
+    }
+    let locator = format!(
+        "{}/carrier-{}",
+        staging.canonical_prefix(),
+        uuid::Uuid::now_v7()
+    );
+    let owner = crate::archive::CarrierObjectOwner::from_identity(
+        staging,
+        locator.clone(),
+        source.len(),
+        source.digest().to_owned(),
+    )?;
+    // An unknown receipt acknowledgement must never authorize a body upload.
+    state.archive.begin_carrier_object(&owner).await?;
+    let mut writer = state.archive.start_writer(&locator).await?;
+    use futures_util::StreamExt;
+    let mut stream = source.open_stream();
+    while let Some(chunk) = stream.next().await {
+        let chunk = chunk?;
+        let upload = Bytes::copy_from_slice(&chunk);
+        drop(chunk);
+        if let Err(error) = writer.write(upload).await {
+            let _ = writer.abort().await;
+            return Err(error);
+        }
+    }
+    drop(stream);
+    let staged = writer.finish_staged().await?;
+    if staged.size_bytes != source.len() || staged.blake3_digest != source.digest() {
+        return Err(AppError::storage(
+            "response_carrier_stage_identity_mismatch",
+        ));
+    }
+    Ok((staged, Some(owner)))
+}
+
+async fn run_response_archive_writer(
+    mut state: AppState,
+    identity: ArchiveSpoolIdentity,
+    mut source_task: super::OwnedTask<CapturedResponse>,
+    progress: tokio::sync::watch::Receiver<(u64, bool)>,
+    memory: Arc<CaptureQueueMemory>,
+    active: Arc<AtomicBool>,
+    target: CaptureTarget,
 ) -> Result<WriterOutcome, AppError> {
+    // Upload concurrency and multipart memory belong to this background task,
+    // never to admission of the supplier/client stream. Shared carrier capture
+    // runs independently; the handoff channel holds one acknowledged chunk.
+    let _upload_memory = if memory._archive_permit.is_none() {
+        let permits = state.proxy_archive_stream_permits.clone();
+        let permit = tokio::select! {
+            permit = permits.acquire_owned() => permit
+                .map_err(|_| AppError::internal("capture_upload_admission_closed"))?,
+            () = capture_abandoned(progress.clone(), active.clone()) =>
+                return Ok(writer_interrupted(identity, "abandoned_before_upload")),
+        };
+        let reservation = tokio::select! {
+            reservation = state.persistence.stream_memory.temporary_wait(
+                super::CAPTURE_MEMORY_BYTES,
+                crate::gateway_body::memory::CAPTURE_MEMORY_WEIGHT,
+            ) => reservation.ok_or_else(|| AppError::internal("capture_upload_memory_closed"))?,
+            () = capture_abandoned(progress.clone(), active.clone()) =>
+                return Ok(writer_interrupted(identity, "abandoned_before_upload_memory")),
+        };
+        Some(CaptureQueueMemory {
+            _local_metrics: None,
+            _archive_permit: Some(permit),
+            reservation: Some(reservation),
+        })
+    } else {
+        None
+    };
+    let _upload_metrics = state.metrics.memory_usage(
+        crate::metrics::MemoryComponent::StreamCapture,
+        super::CAPTURE_MEMORY_BYTES,
+    );
     #[cfg(test)]
     pause_begin_for_test(&state).await;
-    let mut writer = ResponseArchiveWriter::begin_inner(state.clone(), identity).await?;
     #[cfg(test)]
     pause_begin_ack_for_test(&state).await;
-    while let Some(first) = receiver.recv().await {
-        if !active.load(Ordering::Acquire) {
-            return Ok(writer_interrupted(identity, "abandoned_before_append"));
-        }
-        let mut batch = Vec::with_capacity(super::CAPTURE_DATABASE_BATCH_CHUNKS);
-        batch.push(first);
-        while batch.len() < super::CAPTURE_DATABASE_BATCH_CHUNKS {
-            match receiver.try_recv() {
-                Ok(chunk) => batch.push(chunk),
-                Err(tokio::sync::mpsc::error::TryRecvError::Empty) => break,
-                Err(tokio::sync::mpsc::error::TryRecvError::Disconnected) => break,
-            }
-        }
-        writer.append_chunks(batch).await?;
-    }
-    let Ok(tail) = terminal.await else {
-        return Ok(writer_interrupted(identity, "terminal_sender_dropped"));
+    let Some(captured) =
+        captured_source(&mut source_task, identity, progress, active.clone()).await?
+    else {
+        return Ok(WriterOutcome::Abandoned);
     };
-    if !active.load(Ordering::Acquire) {
-        return Ok(writer_interrupted(identity, "abandoned_before_tail"));
+    let source = captured.source;
+    let publication_started = std::time::Instant::now();
+    let mut publication_attempt = 0_u64;
+    let (staged, staging_owner) = loop {
+        match stage_captured_response(&state, &source, captured.staging).await {
+            Ok(staged) => break staged,
+            Err(error @ AppError::Storage { .. }) => {
+                publication_attempt = publication_attempt.saturating_add(1);
+                let kind = match &error {
+                    AppError::Storage { facts, .. } => facts.kind.unwrap_or("operation_error"),
+                    _ => "operation_error",
+                };
+                tracing::warn!(request_id = %identity.request_id, error_category = error.diagnostic_category(),
+                    stage = "carrier_stage", error_kind = kind, attempt = publication_attempt,
+                    elapsed_ms = publication_started.elapsed().as_millis() as u64,
+                    "complete carrier source awaits object storage publication");
+                tokio::time::sleep(std::time::Duration::from_millis(250)).await;
+            }
+            Err(error) => return Err(error),
+        }
+    };
+    let object = loop {
+        match state
+            .archive
+            .promote_staged_text_to_cas(identity.tenant_id, &staged)
+            .await
+        {
+            Ok(object) => break object,
+            Err(error @ AppError::Storage { .. }) => {
+                publication_attempt = publication_attempt.saturating_add(1);
+                let kind = match &error {
+                    AppError::Storage { facts, .. } => facts.kind.unwrap_or("operation_error"),
+                    _ => "operation_error",
+                };
+                tracing::warn!(request_id = %identity.request_id, error_category = error.diagnostic_category(),
+                    stage = "cas_promote", error_kind = kind, attempt = publication_attempt,
+                    elapsed_ms = publication_started.elapsed().as_millis() as u64,
+                    "sealed original awaits immutable CAS promotion");
+                tokio::time::sleep(std::time::Duration::from_millis(250)).await;
+            }
+            Err(error) => return Err(error),
+        }
+    };
+    let publication = loop {
+        match target.publish(&state.archive, identity, &object).await {
+            Ok(publication) => break publication,
+            Err(error @ AppError::Storage { .. }) => {
+                publication_attempt = publication_attempt.saturating_add(1);
+                let kind = match &error {
+                    AppError::Storage { facts, .. } => facts.kind.unwrap_or("operation_error"),
+                    _ => "operation_error",
+                };
+                tracing::warn!(request_id = %identity.request_id, error_category = error.diagnostic_category(),
+                    stage = "root_publish", error_kind = kind, attempt = publication_attempt,
+                    elapsed_ms = publication_started.elapsed().as_millis() as u64,
+                    "immutable original awaits durable root publication");
+                tokio::time::sleep(std::time::Duration::from_millis(250)).await;
+            }
+            Err(error) => return Err(error),
+        }
+    };
+    // The immutable CAS object is confirmed. Publication either owns a raw
+    // root or has transferred responsibility to verified semantic retirement.
+    // Old readers retain their original allocation leases in either case.
+    source.handoff_verified_publication(state.archive.clone(), object.clone())?;
+    if let Some(owner) = staging_owner
+        && let Err(error) = state.archive.release_carrier_object(&owner).await
+    {
+        tracing::warn!(request_id = %identity.request_id, error_category = error.diagnostic_category(),
+            "complete original retains its exact staging cleanup receipt");
     }
-    if !tail.is_empty() {
-        writer.append_chunk(tail).await?;
+    if let crate::archive::RawPublicationSettlement::Retired {
+        semantic_revision,
+        semantic_leaf,
+    } = publication
+    {
+        tracing::debug!(request_id = %identity.request_id, semantic_revision, %semantic_leaf,
+            "late response publisher transferred responsibility to verified semantic retirement");
+        // Retirement is not a new raw-root acknowledgement. In particular, a
+        // late publisher must not restore the retired SQL locator binding.
+        return Ok(WriterOutcome::Sealed);
     }
-    if !active.load(Ordering::Acquire) {
-        return Ok(writer_interrupted(identity, "abandoned_before_seal"));
+    if matches!(target, CaptureTarget::DiscardedAttempt(_)) {
+        return Ok(WriterOutcome::Sealed);
     }
-    writer.seal_inner().await?;
+    state.db.refresh_closed_persistence_pool();
+    if let Err(error) = state
+        .db
+        .bind_raw_capture(identity.tenant_id, identity.request_id, "response", &object)
+        .await
+    {
+        // The immutable root is already the durable authority. The body
+        // worker retries relational binding from that root; a metadata outage
+        // must not relabel this complete original as a failed capture.
+        tracing::warn!(request_id = %identity.request_id, error_category = error.diagnostic_category(),
+            "raw response root awaits relational projection");
+    }
     Ok(WriterOutcome::Sealed)
 }
 
@@ -944,6 +1389,7 @@ fn writer_interrupted(identity: ArchiveSpoolIdentity, reason: &'static str) -> W
     WriterOutcome::Abandoned
 }
 
+#[cfg(test)]
 async fn observe_writer_database(
     identity: ArchiveSpoolIdentity,
     phase: &'static str,
@@ -958,7 +1404,7 @@ async fn observe_writer_database(
     }
     // The existing SQLx conversion emits only a safe fixed error_kind (for
     // example pool_timeout/query_cancelled). Keep that event correlated before
-    // conversion erases its type into AppError::Internal.
+    // conversion erases its type into AppError::internal("producer_observe_writer_database_1").
     let result = operation.instrument(tracing::info_span!("response_archive_database", request_id = %identity.request_id, phase)).await;
     let outcome = match &result {
         Ok(true) => "acknowledged",
@@ -1117,13 +1563,19 @@ mod tests {
             })
             .now_or_never()
             .unwrap();
-            assert!(matches!(result, Err(AppError::Overloaded)));
+            assert!(matches!(
+                result,
+                Err(AppError::Capacity {
+                    code: "database_pool_exhausted",
+                    ..
+                })
+            ));
             let result = observe_writer_database(identity(), "response_spool_seal", 8, async {
-                Err(AppError::Storage("SECRET_CANARY".to_owned()))
+                Err(AppError::storage("object_storage_failed"))
             })
             .now_or_never()
             .unwrap();
-            assert!(matches!(result, Err(AppError::Storage(_))));
+            assert!(matches!(result, Err(AppError::Storage { .. })));
         });
         let bytes = writer.0.lock().unwrap();
         let logs = std::str::from_utf8(&bytes).unwrap();
@@ -1194,6 +1646,91 @@ mod tests {
         assert!(replay.starts_with("zstd1."));
         assert_eq!(replay, first.seal(0).unwrap());
         assert_ne!(first.seal(0).unwrap(), second.seal(0).unwrap());
+    }
+
+    #[test]
+    fn raw_json_above_former_plain_ceiling_is_chunked_in_full() {
+        const FORMER_PLAIN_CEILING: usize = 64 * 1024 * 1024;
+        let chunk_bytes = super::super::CHUNK_BYTES;
+        assert_eq!(FORMER_PLAIN_CEILING % chunk_bytes, 0);
+        let mut raw = vec![b'x'; FORMER_PLAIN_CEILING + 1];
+        raw[0] = b'a';
+        raw[FORMER_PLAIN_CEILING] = b'z';
+        let body = Bytes::from(raw);
+        let pepper = b"archive-spool-test-pepper";
+        let chunk_count = body.len().div_ceil(chunk_bytes);
+        let tail_seq = chunk_count - 1;
+        let tail_len = body.len() - tail_seq * chunk_bytes;
+        assert_eq!(chunk_count, FORMER_PLAIN_CEILING / chunk_bytes + 1);
+        assert_eq!(tail_len, 1);
+
+        let request = super::super::BufferedArchivePurpose::Request;
+        let archive = match BufferedArchive::new(identity(), request, &body, pepper, false) {
+            Ok(archive) => archive,
+            Err(error) => panic!("raw request JSON capture failed: {error}"),
+        };
+        let opened_tail = super::super::cipher::open_for_purpose(
+            identity(),
+            tail_seq as i64,
+            &archive.seal(tail_seq).unwrap(),
+            tail_len as i64,
+            pepper,
+            request,
+        )
+        .unwrap();
+        assert_eq!(opened_tail.as_ref(), &body[FORMER_PLAIN_CEILING..]);
+        assert!(archive.seal(chunk_count).is_err());
+        let opened_first = super::super::cipher::open_for_purpose(
+            identity(),
+            0,
+            &archive.seal(0).unwrap(),
+            chunk_bytes as i64,
+            pepper,
+            request,
+        )
+        .unwrap();
+        assert_eq!(opened_first.len(), chunk_bytes);
+        assert_eq!(opened_first[0], body[0]);
+        assert_eq!(&opened_first[1..], &body[1..chunk_bytes]);
+
+        let response = super::super::BufferedArchivePurpose::Response;
+        let chunks = match encrypt_buffered(identity(), response, &body, pepper) {
+            Ok(chunks) => chunks,
+            Err(error) => panic!("raw response JSON capture failed: {error}"),
+        };
+        assert_eq!(chunks.len(), chunk_count);
+        assert!(chunks.iter().enumerate().all(|(seq, chunk)| {
+            let start = seq * chunk_bytes;
+            chunk.seq == seq as i64
+                && chunk.byte_count as usize == body.len().saturating_sub(start).min(chunk_bytes)
+        }));
+        assert_eq!(
+            chunks
+                .iter()
+                .map(|chunk| chunk.byte_count as usize)
+                .sum::<usize>(),
+            body.len()
+        );
+        let opened_response_tail = super::super::cipher::open_for_purpose(
+            identity(),
+            tail_seq as i64,
+            &chunks[tail_seq].ciphertext,
+            tail_len as i64,
+            pepper,
+            response,
+        )
+        .unwrap();
+        assert_eq!(opened_response_tail.as_ref(), &body[FORMER_PLAIN_CEILING..]);
+        let opened_response_first = super::super::cipher::open_for_purpose(
+            identity(),
+            0,
+            &chunks[0].ciphertext,
+            chunk_bytes as i64,
+            pepper,
+            response,
+        )
+        .unwrap();
+        assert_eq!(opened_response_first.as_ref(), &body[..chunk_bytes]);
     }
 
     #[tokio::test(start_paused = true)]

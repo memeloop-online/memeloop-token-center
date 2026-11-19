@@ -9,7 +9,7 @@ use crate::{
 use super::{OAuthRefreshRequestGuard, managed};
 
 pub async fn refresh_managed_oauth_credential(
-    http: &reqwest::Client,
+    http: &dyn crate::http_settings::HttpClientSource,
     adapter: &ResolvedManagedOAuthAdapter,
     credential: &UpstreamCredential,
     allow_test_loopback: bool,

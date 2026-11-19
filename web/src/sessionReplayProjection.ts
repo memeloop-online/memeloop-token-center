@@ -22,6 +22,8 @@ export interface ReplayMessage {
   requestId: string;
   body: ReplayBody;
   role: 'user' | 'assistant' | 'agent';
+  /** Retained protocol marker, not inferred from the message's wording. */
+  phase?: string;
   /** Null means the archive named the role but did not retain readable text. */
   text: string | null;
   unknown: Extract<ReplayUnknownReason, 'redacted' | 'missing_text'> | null;
@@ -146,11 +148,11 @@ function unknown(items: SessionReplayItem[], requestId: string, body: ReplayBody
   push(items, { kind: 'unknown', requestId, body, reason }, limit);
 }
 
-function message(items: SessionReplayItem[], requestId: string, body: ReplayBody, role: ReplayMessage['role'], content: unknown, limit: ProjectionLimit) {
+function message(items: SessionReplayItem[], requestId: string, body: ReplayBody, role: ReplayMessage['role'], content: unknown, limit: ProjectionLimit, phase?: string) {
   const extracted = textFromContent(content);
   if (extracted.truncated) limit.truncated = true;
   push(items, {
-    kind: 'message', requestId, body, role,
+    kind: 'message', requestId, body, role, ...(phase ? { phase } : {}),
     text: extracted.text, unknown: extracted.unknown, truncated: extracted.truncated,
   }, limit);
 }
@@ -210,7 +212,7 @@ function chatMessage(items: SessionReplayItem[], requestId: string, body: Replay
   const role = string(record.role);
   // Instructions are valid protocol input, not conversation turns.
   if (role === 'system' || role === 'developer') return;
-  if (role === 'user' || role === 'assistant') message(items, requestId, body, role, record.content, limit);
+  if (role === 'user' || role === 'assistant') message(items, requestId, body, role, record.content, limit, string(record.phase) ?? string(record.channel));
   const calls = array(record.tool_calls);
   if (calls) {
     for (const call of calls) toolCall(items, requestId, body, call, limit);
@@ -230,22 +232,33 @@ function responsesItem(items: SessionReplayItem[], requestId: string, body: Repl
   }
   const type = string(record.type);
   if (type === 'additional_tools' || record.role === 'system' || record.role === 'developer') return;
-  if (type === 'agent_message') { message(items, requestId, body, 'agent', record.content, limit); return; }
+  if (type === 'agent_message') { message(items, requestId, body, 'agent', record.content, limit, string(record.phase) ?? string(record.channel)); return; }
   if (type === 'custom_tool_call') { toolCall(items, requestId, body, { ...record, arguments: record.input }, limit); return; }
   if (type === 'custom_tool_call_output') { toolResult(items, requestId, body, record, limit); return; }
   if (type === 'function_call') { toolCall(items, requestId, body, record, limit); return; }
   if (type === 'function_call_output') { toolResult(items, requestId, body, record, limit); return; }
   if (type === 'message') {
     const role = string(record.role);
-    if (role === 'user' || role === 'assistant') message(items, requestId, body, role, record.content, limit);
+    if (role === 'user' || role === 'assistant') message(items, requestId, body, role, record.content, limit, string(record.phase) ?? string(record.channel));
     else unknown(items, requestId, body, 'unsupported_body', limit);
     return;
   }
   if (string(record.role) === 'user' || string(record.role) === 'assistant') {
-    message(items, requestId, body, string(record.role) as 'user' | 'assistant', record.content, limit);
+    message(items, requestId, body, string(record.role) as 'user' | 'assistant', record.content, limit, string(record.phase) ?? string(record.channel));
     return;
   }
   unknown(items, requestId, body, 'unsupported_body', limit);
+}
+
+/** Prefer protocol final markers; never promote an explicit progress message. */
+export function finalReplayResponse(items: readonly SessionReplayItem[]): ReplayMessage | undefined {
+  const messages = items.filter((item): item is ReplayMessage =>
+    item.kind === 'message' && item.body === 'response' && item.role !== 'user' && Boolean(item.text));
+  const marked = messages.filter(item => item.phase === 'final' || item.phase === 'final_answer');
+  if (marked.length) return marked.at(-1);
+  const last = messages.filter(item => !item.phase).at(-1);
+  if (!last?.text) return undefined;
+  return { ...last, text: last.text.trimEnd().split(/\n[ \t]*\n/).at(-1) ?? last.text };
 }
 
 function responsesRequest(items: SessionReplayItem[], requestId: string, body: ReplayBody, input: unknown, limit: ProjectionLimit) {
@@ -389,4 +402,86 @@ export function projectSessionReplay(sessionId: string, details: readonly Reques
   }
   pairToolCalls(items, limit);
   return { sessionId, items, truncated: limit.truncated, totalItems: limit.seen, nextItemOffset: limit.seen > limit.itemOffset + items.length ? limit.itemOffset + items.length : null };
+}
+
+/** One cleaned turn stored in CNPG. `origin` names the raw document it was taken from. */
+export interface SessionDialoguePart {
+  part_index: number;
+  kind: string;
+  text: string | null;
+  media_type: string | null;
+  byte_length: number | null;
+  call_id: string | null;
+  tool_call_id: string | null;
+}
+
+export interface SessionDialogueTurn {
+  role: string;
+  origin: 'request' | 'return';
+  parts: SessionDialoguePart[];
+}
+
+/**
+ * Renders the cleaned dialogue already stored in CNPG. It does not read raw
+ * request or return documents, and it does not open object storage.
+ */
+export function projectSessionDialogue(
+  requestId: string,
+  turns: readonly SessionDialogueTurn[],
+  mediaLabel: (type: string) => string = (type) => type,
+): SessionReplayItem[] {
+  const items: SessionReplayItem[] = [];
+  for (const turn of turns) {
+    const body: ReplayBody = turn.origin === 'return' ? 'response' : 'request';
+    const texts: string[] = [];
+    for (const part of turn.parts) {
+      if (part.kind === 'tool_call') {
+        const lines = (part.text ?? '').split('\n');
+        const name = lines[0] ?? '';
+        const args = lines.slice(1).join('\n');
+        items.push({
+          kind: 'tool_call',
+          requestId,
+          body,
+          callId: part.call_id,
+          name: name.length > 0 ? name : null,
+          arguments: args.length > 0 ? args : null,
+          unknownFields: name.length > 0 ? args.length > 0 ? [] : ['arguments'] : args.length > 0 ? ['name'] : ['name', 'arguments'],
+          pairedResultRequestId: null,
+          pairing: part.call_id ? 'unpaired' : 'unknown',
+          truncated: false,
+        });
+        continue;
+      }
+      if (part.kind === 'tool_result' || turn.role === 'tool') {
+        items.push({
+          kind: 'tool_result',
+          requestId,
+          body,
+          callId: part.call_id ?? part.tool_call_id,
+          name: null,
+          output: part.text,
+          unknownFields: part.text ? [] : ['output'],
+          pairedCallRequestId: null,
+          pairing: part.call_id || part.tool_call_id ? 'unpaired' : 'unknown',
+          truncated: false,
+        });
+        continue;
+      }
+      if (part.text) texts.push(part.text);
+      else if (part.media_type) texts.push(mediaLabel(part.media_type));
+    }
+    if (texts.length > 0 && turn.role !== 'tool') {
+      items.push({
+        kind: 'message',
+        requestId,
+        body,
+        role: turn.role === 'assistant' ? 'assistant' : turn.role === 'agent' ? 'agent' : 'user',
+        text: texts.join('\n'),
+        unknown: null,
+        truncated: false,
+      });
+    }
+  }
+  return items;
 }

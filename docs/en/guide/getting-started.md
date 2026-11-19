@@ -35,6 +35,10 @@ curl https://mtc.example.com/v1/models \
   -H "Authorization: Bearer mtc_example_client_key"
 ```
 
+## Interactive request example
+
+<RequestExample locale="en" />
+
 ## View your requests and usage
 
 Client credentials can query their own data through `/self/v1/*`:

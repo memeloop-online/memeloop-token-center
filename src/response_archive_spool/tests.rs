@@ -8,14 +8,282 @@ use crate::{AppState, config::Config, db::ArchiveSpoolIdentity};
 const PEPPER: &[u8] = b"existing-test-pepper-over-thirty-two-bytes";
 
 #[tokio::test]
-async fn failed_terminal_captures_keep_legacy_bodies_and_drain_budget_after_binding() {
+async fn late_response_capture_settles_against_retired_semantics_without_restoring_raw_binding() {
+    let (_directory, state, pool, identity) = fixture().await;
+    let baseline = state.proxy_memory_budget.snapshot().0;
+    let input = state
+        .archive
+        .put_tenant_content(
+            identity.tenant_id,
+            Bytes::from_static(br#"{"messages":[{"role":"user","content":"retired original"}]}"#),
+        )
+        .await
+        .unwrap();
+    let bytes = Bytes::from_static(br#"{"choices":[{"message":{"role":"assistant","content":"complete answer"},"finish_reason":"stop"}]}"#);
+    let response = state
+        .archive
+        .put_tenant_content(identity.tenant_id, bytes.clone())
+        .await
+        .unwrap();
+    let prepared = state
+        .archive
+        .prepare_session_body_streamed(
+            identity.tenant_id,
+            identity.request_id,
+            crate::conversation::ConversationHints::default(),
+            input.object_locator,
+            Some(response.object_locator.clone()),
+            true,
+        )
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(prepared.coverage_complete);
+    let proof = crate::archive::SemanticBindingProof {
+        tenant_id: identity.tenant_id,
+        request_id: identity.request_id,
+        node_hash: prepared.nodes.last().unwrap().node_hash.clone(),
+        projected_at: 1,
+    };
+    state
+        .archive
+        .retire_covered_raw_roots(&prepared.publication, &proof)
+        .await
+        .unwrap();
+    for _ in 0..2 {
+        let mut producer = ResponseArchiveProducer::begin_original(&state, identity)
+            .await
+            .unwrap();
+        assert!(producer.append_with_backpressure(bytes.clone()).await);
+        tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            producer.seal().unwrap().wait_result_for_test(),
+        )
+        .await
+        .unwrap()
+        .unwrap()
+        .unwrap();
+        assert!(
+            state
+                .archive
+                .raw_capture_reference(identity.tenant_id, identity.request_id, "response")
+                .await
+                .unwrap()
+                .is_none()
+        );
+        let binding: Option<String> =
+            sqlx::query_scalar("SELECT response_object FROM request_records WHERE id = $1")
+                .bind(identity.request_id.to_string())
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        assert!(
+            binding.is_none(),
+            "semantic retirement cannot be a new raw binding ACK"
+        );
+        assert_eq!(
+            state
+                .archive
+                .get_tenant_content(identity.tenant_id, &response, bytes.len())
+                .await
+                .unwrap(),
+            bytes
+        );
+        assert_eq!(state.proxy_memory_budget.snapshot().0, baseline);
+        assert_eq!(
+            state.proxy_archive_stream_permits.available_permits(),
+            crate::PROXY_ARCHIVE_STREAM_CONCURRENCY
+        );
+    }
+}
+
+#[tokio::test]
+async fn shared_capture_reaches_eof_while_all_upload_slots_are_held() {
+    let (_directory, state, _pool, identity) = fixture().await;
+    let baseline = state.proxy_memory_budget.snapshot().0;
+    let slots = state.proxy_archive_stream_permits.clone();
+    let held = slots
+        .clone()
+        .acquire_many_owned(crate::PROXY_ARCHIVE_STREAM_CONCURRENCY as u32)
+        .await
+        .unwrap();
+    let expected = Bytes::from(vec![b's'; super::CHUNK_BYTES * 2 + 7]);
+    let mut producer = ResponseArchiveProducer::begin_original(&state, identity)
+        .await
+        .unwrap();
+    assert!(
+        tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            producer.append_with_backpressure(expected.clone())
+        )
+        .await
+        .unwrap()
+    );
+    let sealed = producer.seal().unwrap();
+    assert!(state.proxy_memory_budget.snapshot().0 > baseline);
+    assert!(
+        state
+            .archive
+            .raw_capture_reference(identity.tenant_id, identity.request_id, "response")
+            .await
+            .unwrap()
+            .is_none()
+    );
+    drop(held);
+    tokio::time::timeout(std::time::Duration::from_secs(5), sealed.wait())
+        .await
+        .unwrap();
+    let object = state
+        .archive
+        .raw_capture_reference(identity.tenant_id, identity.request_id, "response")
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(object.size_bytes, expected.len() as u64);
+    assert_eq!(
+        object.blake3_digest,
+        blake3::hash(&expected).to_hex().to_string()
+    );
+    assert_eq!(
+        state
+            .archive
+            .get_tenant_content(identity.tenant_id, &object, expected.len())
+            .await
+            .unwrap(),
+        expected
+    );
+    assert_eq!(state.proxy_memory_budget.snapshot().0, baseline);
+    assert_eq!(
+        slots.available_permits(),
+        crate::PROXY_ARCHIVE_STREAM_CONCURRENCY
+    );
+}
+
+#[tokio::test]
+async fn original_stream_capture_uses_selected_backend_without_legacy_body_copy() {
+    for training in [false, true] {
+        let (_directory, mut state, pool, identity) = fixture().await;
+        if training {
+            state.archive = crate::archive::ArchiveStore::training_staging_memory_for_test();
+            state.db = state.db.clone().with_archive(state.archive.clone());
+            state.persistence_db = state
+                .persistence_db
+                .clone()
+                .with_archive(state.archive.clone());
+        }
+        let body = Bytes::from(vec![b'x'; super::CHUNK_BYTES + 17]);
+        let mut producer = ResponseArchiveProducer::begin_original(&state, identity)
+            .await
+            .unwrap();
+        assert!(producer.append_with_backpressure(body.clone()).await);
+        producer.seal().unwrap().wait().await;
+        let object = state
+            .archive
+            .raw_capture_reference(identity.tenant_id, identity.request_id, "response")
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            object.object_locator.starts_with("stores/training/"),
+            training
+        );
+        assert_eq!(object.size_bytes, body.len() as u64);
+        assert_eq!(
+            object.blake3_digest,
+            blake3::hash(&body).to_hex().to_string()
+        );
+        assert_eq!(
+            state
+                .archive
+                .get_tenant_content(identity.tenant_id, &object, body.len())
+                .await
+                .unwrap(),
+            body
+        );
+        if training {
+            let bare = object.object_locator.splitn(4, '/').nth(3).unwrap();
+            assert!(state.archive.head_size(bare).await.is_err());
+        }
+        let chunks: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM response_archive_spool_chunks")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        assert_eq!(
+            chunks, 0,
+            "raw stream must not duplicate the body into SQL chunks"
+        );
+    }
+}
+
+#[tokio::test]
+async fn object_capture_recovers_a_completed_request_without_a_response_locator() {
+    let capture_directory = tempfile::tempdir().unwrap();
+    let configured = capture_directory
+        .path()
+        .join("configured")
+        .join("request-spool");
+    let (_directory, state, pool, identity) =
+        fixture_with_capture_directory(false, Some(configured.clone())).await;
+    sqlx::query(
+        "UPDATE request_records SET completed_at = 2, response_object = NULL WHERE id = $1",
+    )
+    .bind(identity.request_id.to_string())
+    .execute(&pool)
+    .await
+    .unwrap();
+    let body = Bytes::from_static(b"{\"output\":\"original delivered response\"}");
+    let mut archive = ResponseArchiveProducer::begin(
+        &state,
+        identity,
+        state.persistence.stream_memory.reservation(),
+    )
+    .unwrap();
+    assert!(archive.append_with_backpressure(body.clone()).await);
+    assert!(
+        configured.is_dir(),
+        "capture uses the production Config spool path"
+    );
+    archive.seal().unwrap().wait().await;
+    let reference = state
+        .archive
+        .raw_capture_reference(identity.tenant_id, identity.request_id, "response")
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        state
+            .archive
+            .get_tenant_content(identity.tenant_id, &reference, 1024)
+            .await
+            .unwrap(),
+        body
+    );
+    let chunks: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM response_archive_spool_chunks")
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+    assert_eq!(chunks, 0);
+    let completed_at: i64 =
+        sqlx::query_scalar("SELECT completed_at FROM request_records WHERE id = $1")
+            .bind(identity.request_id.to_string())
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+    assert_eq!(completed_at, 2);
+}
+
+#[tokio::test]
+async fn failed_terminal_captures_retain_legacy_bodies_and_budget_until_verified_migration() {
     for compressed in [false, true] {
-        for (status_code, error_code) in [
+        for (status_code, error_code, early_upload) in [
             (503_i64, None),
             (502, Some("stream_incomplete")),
             (200, Some("stream_incomplete")),
             (429, None),
-        ] {
+        ]
+        .into_iter()
+        .flat_map(|(status, error)| [(status, error, true), (status, error, false)])
+        {
             let (_dir, mut state, pool, identity) = fixture().await;
             sqlx::query("INSERT INTO request_record_locators (id, created_at, tenant_id, key_id) SELECT id, created_at, tenant_id, key_id FROM request_records WHERE id = $1")
                 .bind(identity.request_id.to_string()).execute(&pool).await.unwrap();
@@ -30,11 +298,22 @@ async fn failed_terminal_captures_keep_legacy_bodies_and_drain_budget_after_bind
             ] {
                 assert!(capture_buffered(&state, identity, purpose, body).await);
             }
-            assert!(!process_one_for_test(&state).await);
-            finish(&pool, identity).await;
-            sqlx::query("UPDATE request_records SET status_code = $1, error_code = $2, request_object = $3, input_tokens = 45, output_tokens = 67, cost_micros = 123 WHERE id = $4")
-                .bind(status_code).bind(error_code).bind(format!("gap://{}/request", identity.request_id))
-                .bind(identity.request_id.to_string()).execute(&pool).await.unwrap();
+            sqlx::query("UPDATE request_records SET request_object = $1 WHERE id = $2")
+                .bind(format!("gap://{}/request", identity.request_id))
+                .bind(identity.request_id.to_string())
+                .execute(&pool)
+                .await
+                .unwrap();
+            sqlx::query("UPDATE request_records SET status_code = $1, error_code = $2, input_tokens = 45, output_tokens = 67, cost_micros = 123 WHERE id = $3")
+                .bind(status_code).bind(error_code).bind(identity.request_id.to_string())
+                .execute(&pool).await.unwrap();
+            if !early_upload {
+                sqlx::query("UPDATE request_records SET completed_at = 2 WHERE id = $1")
+                    .bind(identity.request_id.to_string())
+                    .execute(&pool)
+                    .await
+                    .unwrap();
+            }
             let retained: i64 = sqlx::query_scalar(
                 "SELECT cipher_bytes FROM response_archive_spool_budget WHERE singleton = 1",
             )
@@ -42,17 +321,51 @@ async fn failed_terminal_captures_keep_legacy_bodies_and_drain_budget_after_bind
             .await
             .unwrap();
             assert!(retained > 0);
+            // Sealed bodies can bind on either side of settlement.
             assert!(process_one_for_test(&state).await);
             assert!(process_one_for_test(&state).await);
+            let early = sqlx::query("SELECT completed_at, request_object, response_object FROM request_records WHERE id = $1")
+                .bind(identity.request_id.to_string()).fetch_one(&pool).await.unwrap();
+            assert_eq!(
+                early.get::<Option<i64>, _>("completed_at").is_none(),
+                early_upload
+            );
+            let before_cleanup: i64 = sqlx::query_scalar(
+                "SELECT cipher_bytes FROM response_archive_spool_budget WHERE singleton = 1",
+            )
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+            let remaining = sqlx::query("SELECT COUNT(*) AS spool_count, SUM(cipher_bytes) AS cipher_bytes FROM (SELECT cipher_bytes FROM request_archive_spools WHERE cipher_bytes > 0 UNION ALL SELECT cipher_bytes FROM response_archive_spools WHERE cipher_bytes > 0) remaining")
+                .fetch_one(&pool).await.unwrap();
+            assert!(before_cleanup > 0 && before_cleanup <= retained);
+            assert_eq!(before_cleanup, remaining.get::<i64, _>("cipher_bytes"));
+            assert_eq!(
+                state.db.cleanup_response_archive_spools(32).await.unwrap(),
+                0
+            );
+            // Settlement preserves the already-bound locators.
+            if early_upload {
+                sqlx::query("UPDATE request_records SET completed_at = 2 WHERE id = $1")
+                    .bind(identity.request_id.to_string())
+                    .execute(&pool)
+                    .await
+                    .unwrap();
+            }
             for _ in 0..2 {
                 assert!(!process_one_for_test(&state).await);
             }
+            assert_eq!(
+                state.db.cleanup_response_archive_spools(32).await.unwrap(),
+                0
+            );
             let budget = sqlx::query("SELECT cipher_bytes, request_cipher_bytes FROM response_archive_spool_budget WHERE singleton = 1")
                 .fetch_one(&pool).await.unwrap();
-            assert_eq!(budget.get::<i64, _>("cipher_bytes"), 0);
-            assert_eq!(budget.get::<i64, _>("request_cipher_bytes"), 0);
-            let row = sqlx::query("SELECT request_object, response_object, status_code, error_code, input_tokens, output_tokens, cost_micros FROM request_records WHERE id = $1")
+            assert_eq!(budget.get::<i64, _>("cipher_bytes"), before_cleanup);
+            assert!(budget.get::<i64, _>("request_cipher_bytes") > 0);
+            let row = sqlx::query("SELECT completed_at, request_object, response_object, status_code, error_code, input_tokens, output_tokens, cost_micros FROM request_records WHERE id = $1")
                 .bind(identity.request_id.to_string()).fetch_one(&pool).await.unwrap();
+            assert_eq!(row.get::<i64, _>("completed_at"), 2);
             assert_eq!(row.get::<i64, _>("status_code"), status_code);
             assert_eq!(
                 row.get::<Option<String>, _>("error_code").as_deref(),
@@ -66,16 +379,17 @@ async fn failed_terminal_captures_keep_legacy_bodies_and_drain_budget_after_bind
                 ("response_object", response, "response"),
             ] {
                 let locator: String = row.get(column);
+                assert_eq!(locator, early.get::<String, _>(column));
                 assert!(!locator.starts_with("gap://"));
                 assert!(!locator.contains("/cas/"));
                 assert_eq!(locator.ends_with(".mtcz1"), compressed);
                 assert_eq!(state.archive.get(&locator).await.unwrap(), body);
-                let bound: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM archive_staging_attempts WHERE owner_kind = 'proxy_request' AND owner_id = $1 AND purpose = $2 AND state = 'bound' AND bound_locator = $3")
+                let bound: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM archive_staging_attempts WHERE owner_kind = 'proxy_request' AND owner_id = $1 AND purpose = $2 AND state = 'bound' AND bound_locator = $3 AND lease_owner IS NULL AND lease_token IS NULL AND lease_expires_at IS NULL")
                     .bind(identity.request_id.to_string()).bind(purpose).bind(&locator)
                     .fetch_one(&pool).await.unwrap();
                 assert_eq!(bound, 1);
             }
-            let spools: i64 = sqlx::query_scalar("SELECT (SELECT COUNT(*) FROM request_archive_spools WHERE request_id = $1 AND state = 'bound' AND attempts = 1 AND cipher_bytes = 0) + (SELECT COUNT(*) FROM response_archive_spools WHERE request_id = $1 AND state = 'bound' AND attempts = 1 AND cipher_bytes = 0)")
+            let spools: i64 = sqlx::query_scalar("SELECT (SELECT COUNT(*) FROM request_archive_spools WHERE request_id = $1 AND state = 'bound' AND attempts = 1 AND cipher_bytes > 0 AND cleaned_at IS NULL AND lease_owner IS NULL AND lease_token IS NULL AND lease_expires_at IS NULL) + (SELECT COUNT(*) FROM response_archive_spools WHERE request_id = $1 AND state = 'bound' AND attempts = 1 AND cipher_bytes > 0 AND cleaned_at IS NULL AND lease_owner IS NULL AND lease_token IS NULL AND lease_expires_at IS NULL)")
                 .bind(identity.request_id.to_string()).fetch_one(&pool).await.unwrap();
             assert_eq!(spools, 2);
             let events: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM request_events WHERE request_id = $1 AND event_kind = 'archive_bound'")
@@ -89,7 +403,7 @@ async fn failed_terminal_captures_keep_legacy_bodies_and_drain_budget_after_bind
 }
 
 #[tokio::test]
-async fn inline_failure_summary_keeps_captured_request_and_drains_its_budget() {
+async fn inline_failure_summary_keeps_captured_request_and_legacy_budget() {
     let (_dir, state, pool, identity) = fixture().await;
     let request = Bytes::from_static(b"{\"input\":\"diagnostic request\"}");
     assert!(
@@ -124,7 +438,7 @@ async fn inline_failure_summary_keeps_captured_request_and_drains_its_budget() {
     .fetch_one(&pool)
     .await
     .unwrap();
-    assert_eq!(budget, 0);
+    assert!(budget > 0, "unverified legacy chunks remain charged");
 }
 
 #[tokio::test]
@@ -172,16 +486,20 @@ async fn corrupt_or_missing_spool_chunks_never_publish_a_locator() {
 }
 
 #[tokio::test]
-async fn both_buffered_purposes_recover_exact_bytes_only_after_terminal() {
-    buffered_purposes_recover(false).await;
+async fn both_buffered_purposes_recover_exact_bytes_before_and_after_terminal() {
+    for early_upload in [true, false] {
+        buffered_purposes_recover(false, early_upload).await;
+    }
 }
 
 #[tokio::test]
 async fn compressed_objects_bind_both_purposes_and_recover_original_bytes() {
-    buffered_purposes_recover(true).await;
+    for early_upload in [true, false] {
+        buffered_purposes_recover(true, early_upload).await;
+    }
 }
 
-async fn buffered_purposes_recover(compressed: bool) {
+async fn buffered_purposes_recover(compressed: bool, early_upload: bool) {
     let (_dir, mut state, pool, identity) = fixture().await;
     std::sync::Arc::make_mut(&mut state.config).archive_object_compression_enabled = compressed;
     let request = Bytes::from_static(b"{\"messages\":[{\"content\":\"private request\"}]}");
@@ -204,14 +522,15 @@ async fn buffered_purposes_recover(compressed: bool) {
         )
         .await
     );
-    assert!(!process_one_for_test(&state).await);
     sqlx::query("UPDATE request_records SET request_object = $1 WHERE id = $2")
         .bind(format!("gap://{}/request", identity.request_id))
         .bind(identity.request_id.to_string())
         .execute(&pool)
         .await
         .unwrap();
-    finish(&pool, identity).await;
+    if !early_upload {
+        finish(&pool, identity).await;
+    }
     let permits = state.proxy_archive_stream_permits.clone();
     let held = permits
         .clone()
@@ -221,7 +540,7 @@ async fn buffered_purposes_recover(compressed: bool) {
     assert!(!process_one_for_test(&state).await);
     for table in ["request_archive_spools", "response_archive_spools"] {
         let row = sqlx::query(sqlx::AssertSqlSafe(format!(
-            "SELECT state, attempts FROM {table} WHERE request_id = $1"
+            "SELECT state, attempts, lease_owner, lease_token, lease_expires_at FROM {table} WHERE request_id = $1"
         )))
         .bind(identity.request_id.to_string())
         .fetch_one(&pool)
@@ -229,38 +548,120 @@ async fn buffered_purposes_recover(compressed: bool) {
         .unwrap();
         assert_eq!(row.get::<String, _>("state"), "pending");
         assert_eq!(row.get::<i64, _>("attempts"), 0);
+        assert!(row.get::<Option<String>, _>("lease_owner").is_none());
+        assert!(row.get::<Option<String>, _>("lease_token").is_none());
+        assert!(row.get::<Option<i64>, _>("lease_expires_at").is_none());
     }
     drop(held);
     assert!(process_one_for_test(&state).await);
     assert!(process_one_for_test(&state).await);
-    let row =
-        sqlx::query("SELECT request_object, response_object FROM request_records WHERE id = $1")
-            .bind(identity.request_id.to_string())
-            .fetch_one(&pool)
-            .await
-            .unwrap();
+    let row = sqlx::query(
+        "SELECT completed_at, request_object, response_object FROM request_records WHERE id = $1",
+    )
+    .bind(identity.request_id.to_string())
+    .fetch_one(&pool)
+    .await
+    .unwrap();
     let request_locator: String = row.get("request_object");
     let response_locator: String = row.get("response_object");
+    assert_eq!(
+        row.get::<Option<i64>, _>("completed_at").is_none(),
+        early_upload
+    );
     assert_eq!(request_locator.ends_with(".mtcz1"), compressed);
     assert_eq!(response_locator.ends_with(".mtcz1"), compressed);
-    assert!(request_locator.contains(&format!("tenants/{}/cas/v1/", identity.tenant_id)));
-    assert!(response_locator.contains(&format!("tenants/{}/cas/v1/", identity.tenant_id)));
+    for locator in [&request_locator, &response_locator] {
+        assert!(!locator.starts_with("gap://"));
+        assert_eq!(
+            locator.contains(&format!("tenants/{}/cas/v1/", identity.tenant_id)),
+            !early_upload
+        );
+    }
     assert_ne!(request_locator, response_locator);
     assert_eq!(state.archive.get(&request_locator).await.unwrap(), request);
     assert_eq!(
         state.archive.get(&response_locator).await.unwrap(),
         response
     );
-    let staging_states: Vec<String> = sqlx::query_scalar(
-        "SELECT state FROM archive_staging_attempts WHERE owner_id = $1 ORDER BY purpose",
+    let staging = sqlx::query(
+        "SELECT purpose, state, bound_locator, lease_owner, lease_token, lease_expires_at FROM archive_staging_attempts WHERE owner_id = $1 ORDER BY purpose",
     )
     .bind(identity.request_id.to_string())
     .fetch_all(&pool)
     .await
     .unwrap();
+    assert_eq!(staging.len(), 2);
+    for (attempt, (purpose, locator)) in staging.iter().zip([
+        ("request", &request_locator),
+        ("response", &response_locator),
+    ]) {
+        assert_eq!(attempt.get::<String, _>("purpose"), purpose);
+        assert_eq!(
+            attempt.get::<String, _>("state"),
+            if early_upload {
+                "bound"
+            } else {
+                "cleanup_pending"
+            }
+        );
+        assert_eq!(
+            attempt.get::<Option<String>, _>("bound_locator").as_deref(),
+            early_upload.then_some(locator.as_str())
+        );
+        assert!(attempt.get::<Option<String>, _>("lease_owner").is_none());
+        assert!(attempt.get::<Option<String>, _>("lease_token").is_none());
+        assert!(attempt.get::<Option<i64>, _>("lease_expires_at").is_none());
+    }
+    let remaining: i64 = sqlx::query_scalar("SELECT (SELECT COUNT(*) FROM request_archive_spools WHERE cipher_bytes > 0) + (SELECT COUNT(*) FROM response_archive_spools WHERE cipher_bytes > 0)")
+        .fetch_one(&pool).await.unwrap();
+    assert_eq!(remaining, 2);
+    let retained_budget: i64 = sqlx::query_scalar(
+        "SELECT cipher_bytes FROM response_archive_spool_budget WHERE singleton = 1",
+    )
+    .fetch_one(&pool)
+    .await
+    .unwrap();
     assert_eq!(
-        staging_states,
-        vec!["cleanup_pending".to_owned(), "cleanup_pending".to_owned()]
+        state.db.cleanup_response_archive_spools(32).await.unwrap(),
+        0
+    );
+    let budget = sqlx::query("SELECT cipher_bytes, request_cipher_bytes FROM response_archive_spool_budget WHERE singleton = 1")
+        .fetch_one(&pool).await.unwrap();
+    assert_eq!(budget.get::<i64, _>("cipher_bytes"), retained_budget);
+    assert!(budget.get::<i64, _>("request_cipher_bytes") > 0);
+    for table in ["request_archive_spools", "response_archive_spools"] {
+        let bound: i64 = sqlx::query_scalar(sqlx::AssertSqlSafe(format!(
+            "SELECT COUNT(*) FROM {table} WHERE request_id = $1 AND state = 'bound' AND attempts = 1 AND cipher_bytes > 0 AND cleaned_at IS NULL AND lease_owner IS NULL AND lease_token IS NULL AND lease_expires_at IS NULL"
+        )))
+        .bind(identity.request_id.to_string()).fetch_one(&pool).await.unwrap();
+        assert_eq!(bound, 1);
+    }
+    if early_upload {
+        // Successful settlement must not replace the legacy early-upload binding.
+        sqlx::query("UPDATE request_records SET completed_at = 2, status_code = 200 WHERE id = $1")
+            .bind(identity.request_id.to_string())
+            .execute(&pool)
+            .await
+            .unwrap();
+    }
+    assert!(!process_one_for_test(&state).await);
+    assert_eq!(
+        state.db.cleanup_response_archive_spools(32).await.unwrap(),
+        0
+    );
+    let settled = sqlx::query("SELECT completed_at, status_code, request_object, response_object FROM request_records WHERE id = $1")
+        .bind(identity.request_id.to_string()).fetch_one(&pool).await.unwrap();
+    assert_eq!(settled.get::<i64, _>("completed_at"), 2);
+    assert_eq!(settled.get::<i64, _>("status_code"), 200);
+    assert_eq!(settled.get::<String, _>("request_object"), request_locator);
+    assert_eq!(
+        settled.get::<String, _>("response_object"),
+        response_locator
+    );
+    assert_eq!(state.archive.get(&request_locator).await.unwrap(), request);
+    assert_eq!(
+        state.archive.get(&response_locator).await.unwrap(),
+        response
     );
 }
 
@@ -300,7 +701,7 @@ fn request_cipher_domain_is_distinct_and_schema71_response_aad_is_unchanged() {
         "memeloop-token-center/response-archive-spool/v1/{}/{}/{}/0",
         identity.tenant_id, identity.request_id, identity.reservation_id
     );
-    let legacy = crate::provider::seal_private_json(
+    let legacy = crate::provider::seal_envelope(
         &serde_json::json!({"bytes":"cHJpdmF0ZSBhcmNoaXZl"}),
         PEPPER,
         legacy_aad.as_bytes(),
@@ -393,6 +794,18 @@ async fn fixture_with_compression(
     sqlx::AnyPool,
     ArchiveSpoolIdentity,
 ) {
+    fixture_with_capture_directory(compression_enabled, None).await
+}
+
+async fn fixture_with_capture_directory(
+    compression_enabled: bool,
+    directory: Option<std::path::PathBuf>,
+) -> (
+    tempfile::TempDir,
+    AppState,
+    sqlx::AnyPool,
+    ArchiveSpoolIdentity,
+) {
     let dir = tempfile::tempdir().unwrap();
     let url = format!(
         "sqlite://{}?mode=rwc",
@@ -400,6 +813,9 @@ async fn fixture_with_compression(
     );
     let mut config = Config::for_test(url.clone());
     config.archive_spool_compression_enabled = compression_enabled;
+    if let Some(directory) = directory {
+        config.responses_request_spool_path = directory.to_string_lossy().into_owned();
+    }
     let state = AppState::initialize(config).await.unwrap();
     let pool = sqlx::AnyPool::connect(&url).await.unwrap();
     let identity = ArchiveSpoolIdentity {
@@ -656,34 +1072,46 @@ async fn cancelled_producer_fences_a_begin_that_committed_late() {
     assert_eq!(fence_probe.calls(), 1);
     release_fence.send(()).unwrap();
     tokio::time::timeout(std::time::Duration::from_secs(1), async {
-        loop {
-            let row = sqlx::query(
-                "SELECT state, expires_at, updated_at FROM response_archive_spools WHERE request_id = $1",
-            )
-            .bind(identity.request_id.to_string())
-            .fetch_one(&pool)
+        while !state
+            .archive
+            .raw_capture_failed(identity.tenant_id, identity.request_id, "response")
             .await
-            .unwrap();
-            if row.get::<String, _>("state") == "gap" {
-                assert!(row.get::<i64, _>("expires_at") <= row.get::<i64, _>("updated_at"));
-                break;
-            }
+            .unwrap()
+        {
             tokio::task::yield_now().await;
         }
     })
     .await
-    .expect("a late committed begin must be fenced after producer cancellation");
+    .expect("cancelled capture must publish durable missing evidence");
+    assert!(
+        state
+            .archive
+            .raw_capture_reference(identity.tenant_id, identity.request_id, "response")
+            .await
+            .unwrap()
+            .is_none()
+    );
+    let spools: i64 =
+        sqlx::query_scalar("SELECT COUNT(*) FROM response_archive_spools WHERE request_id = $1")
+            .bind(identity.request_id.to_string())
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+    assert_eq!(spools, 0);
     assert_eq!(fence_probe.calls(), 1);
 }
 
 #[tokio::test]
 async fn cancelled_writer_returns_success_only_when_its_single_fence_succeeds() {
     for fail_fence in [false, true] {
-        let (_dir, state, pool, identity) = fixture().await;
-        if fail_fence {
-            sqlx::query("CREATE TRIGGER reject_cancel_fence BEFORE UPDATE OF state ON response_archive_spools WHEN NEW.state = 'gap' BEGIN SELECT RAISE(ABORT, 'synthetic fence failure'); END")
-                .execute(&pool).await.unwrap();
-        }
+        let (directory, mut state, pool, identity) = fixture().await;
+        let archive_path = directory.path().join("fence-objects");
+        let mut config = (*state.config).clone();
+        config.archive_backend = crate::config::ArchiveBackend::Filesystem;
+        config.archive_path = Some(archive_path.display().to_string());
+        state.archive = crate::archive::ArchiveStore::from_config(&config)
+            .await
+            .unwrap();
         let (probe, entered, release) = fence_probe::install(&state);
         let memory = state.proxy_memory_budget.reservation();
         let producer = ResponseArchiveProducer::begin(&state, identity, memory).unwrap();
@@ -693,6 +1121,10 @@ async fn cancelled_writer_returns_success_only_when_its_single_fence_succeeds() 
             .unwrap()
             .unwrap();
         assert_eq!(probe.calls(), 1);
+        if fail_fence {
+            std::fs::remove_dir_all(&archive_path).unwrap();
+            std::fs::write(&archive_path, b"object storage unavailable").unwrap();
+        }
         release.send(()).unwrap();
         let result = tokio::time::timeout(std::time::Duration::from_secs(5), cancelled)
             .await
@@ -705,13 +1137,34 @@ async fn cancelled_writer_returns_success_only_when_its_single_fence_succeeds() 
             "cancellation is not a database error, but a failed fence is"
         );
         assert_eq!(probe.calls(), 1);
-        let spool_state: String =
-            sqlx::query_scalar("SELECT state FROM response_archive_spools WHERE request_id = $1")
-                .bind(identity.request_id.to_string())
-                .fetch_one(&pool)
+        if fail_fence {
+            std::fs::remove_file(&archive_path).unwrap();
+            std::fs::create_dir_all(&archive_path).unwrap();
+        }
+        assert_eq!(
+            state
+                .archive
+                .raw_capture_failed(identity.tenant_id, identity.request_id, "response")
                 .await
-                .unwrap();
-        assert_eq!(spool_state, if fail_fence { "capturing" } else { "gap" });
+                .unwrap(),
+            !fail_fence
+        );
+        assert!(
+            state
+                .archive
+                .raw_capture_reference(identity.tenant_id, identity.request_id, "response")
+                .await
+                .unwrap()
+                .is_none()
+        );
+        let spools: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM response_archive_spools WHERE request_id = $1",
+        )
+        .bind(identity.request_id.to_string())
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(spools, 0);
     }
 }
 
@@ -726,80 +1179,188 @@ async fn terminal_tail_survives_observer_cancellation_without_waiting_for_databa
         .expect("owned writer must commit begin before the test pause")
         .unwrap();
     assert!(
-        producer.append(vec![Bytes::from_static(b"one"), Bytes::from_static(b"two")]),
-        "small frames merge in the preallocated partial chunk without waiting for the writer"
+        producer
+            .append_with_backpressure(Bytes::from_static(b"onetwo"))
+            .await,
+        "local capture must not wait for the paused object writer"
     );
-    let state_before_terminal: String =
-        sqlx::query_scalar("SELECT state FROM response_archive_spools WHERE request_id = $1")
-            .bind(identity.request_id.to_string())
-            .fetch_one(&pool)
+    assert!(
+        state
+            .archive
+            .raw_capture_reference(identity.tenant_id, identity.request_id, "response")
             .await
-            .unwrap();
-    assert_eq!(state_before_terminal, "capturing");
-
+            .unwrap()
+            .is_none()
+    );
     let settlement = producer
         .seal()
         .expect("terminal handoff must not wait for SQL");
     drop(settlement);
     release.send(()).unwrap();
-    tokio::time::timeout(std::time::Duration::from_secs(1), async {
+    let object = tokio::time::timeout(std::time::Duration::from_secs(1), async {
         loop {
-            let row = sqlx::query(
-                "SELECT state, chunk_count, byte_count FROM response_archive_spools WHERE request_id = $1",
-            )
-            .bind(identity.request_id.to_string())
-            .fetch_one(&pool)
-            .await
-            .unwrap();
-            if row.get::<String, _>("state") == "pending" {
-                assert_eq!(row.get::<i64, _>("chunk_count"), 1);
-                assert_eq!(row.get::<i64, _>("byte_count"), 6);
-                break;
+            if let Some(object) = state
+                .archive
+                .raw_capture_reference(identity.tenant_id, identity.request_id, "response")
+                .await
+                .unwrap()
+            {
+                break object;
             }
             tokio::task::yield_now().await;
         }
     })
     .await
-    .expect("the runtime supervisor must persist and seal the accepted terminal tail");
+    .expect("runtime supervisor must retain the accepted terminal tail");
+    assert_eq!(object.size_bytes, 6);
+    assert_eq!(
+        object.blake3_digest,
+        blake3::hash(b"onetwo").to_hex().to_string()
+    );
+    assert_eq!(
+        state
+            .archive
+            .get_tenant_content(identity.tenant_id, &object, 6)
+            .await
+            .unwrap()
+            .as_ref(),
+        b"onetwo"
+    );
+    let spools: i64 =
+        sqlx::query_scalar("SELECT COUNT(*) FROM response_archive_spools WHERE request_id = $1")
+            .bind(identity.request_id.to_string())
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+    assert_eq!(spools, 0);
 }
 
 #[tokio::test]
-async fn owned_writer_queue_is_byte_bounded_and_releases_proxy_memory_after_gap() {
-    let (_dir, state, pool, identity) = fixture().await;
-    let (entering, release) = pause_next_begin_ack_for_test(&state);
+async fn empty_shared_carrier_publishes_the_exact_empty_original() {
+    let (_dir, state, _pool, identity) = fixture().await;
     let baseline = state.proxy_memory_budget.snapshot().0;
-    let memory = state.proxy_memory_budget.reservation();
-    let mut producer = ResponseArchiveProducer::begin(&state, identity, memory).unwrap();
-    tokio::time::timeout(std::time::Duration::from_secs(1), entering)
-        .await
-        .expect("writer begin must reach the deterministic pause")
-        .unwrap();
-    assert_eq!(
-        state.proxy_memory_budget.snapshot().0 - baseline,
-        super::CAPTURE_MEMORY_BYTES * crate::gateway_body::memory::CAPTURE_MEMORY_WEIGHT
-    );
-
-    let kib = Bytes::from(vec![b'x'; 1024]);
-    assert!(
-        producer.append(vec![kib.clone(); super::CAPTURE_QUEUE_CHUNKS * 64]),
-        "many small frames must merge by bytes rather than consume message slots"
-    );
-    assert!(
-        !producer.append(vec![kib; 64]),
-        "a fourth complete queued chunk must fail closed while the writer is paused"
-    );
-    release.send(()).unwrap();
-
-    tokio::time::timeout(std::time::Duration::from_secs(1), async {
-        loop {
-            let state_name: Option<String> = sqlx::query_scalar(
-                "SELECT state FROM response_archive_spools WHERE request_id = $1",
-            )
-            .bind(identity.request_id.to_string())
-            .fetch_optional(&pool)
-            .await
+    let producer =
+        ResponseArchiveProducer::begin(&state, identity, state.proxy_memory_budget.reservation())
             .unwrap();
-            if state_name.as_deref() == Some("gap") && producer.queue_memory_owners_for_test() == 1
+    tokio::time::timeout(
+        std::time::Duration::from_secs(5),
+        producer.seal().unwrap().wait(),
+    )
+    .await
+    .unwrap();
+    let reference = state
+        .archive
+        .raw_capture_reference(identity.tenant_id, identity.request_id, "response")
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(reference.size_bytes, 0);
+    assert_eq!(
+        reference.blake3_digest,
+        blake3::hash(b"").to_hex().to_string()
+    );
+    assert_eq!(
+        state
+            .archive
+            .get_tenant_content(identity.tenant_id, &reference, 1)
+            .await
+            .unwrap(),
+        Bytes::new()
+    );
+    assert!(
+        !state
+            .archive
+            .raw_capture_failed(identity.tenant_id, identity.request_id, "response")
+            .await
+            .unwrap()
+    );
+    assert_eq!(state.proxy_memory_budget.snapshot().0, baseline);
+}
+
+#[tokio::test]
+async fn unavailable_local_directory_does_not_gate_complete_original() {
+    let directory = tempfile::tempdir().unwrap();
+    let path = directory.path().join("not-a-directory");
+    std::fs::write(&path, b"blocked").unwrap();
+    let (_fixture, state, _pool, identity) =
+        fixture_with_capture_directory(false, Some(path.clone())).await;
+    let baseline = state.proxy_memory_budget.snapshot().0;
+    let expected = Bytes::from_static(b"complete supplier bytes");
+    let mut producer =
+        ResponseArchiveProducer::begin(&state, identity, state.proxy_memory_budget.reservation())
+            .unwrap();
+    assert!(producer.append_with_backpressure(expected.clone()).await);
+    tokio::time::timeout(
+        std::time::Duration::from_secs(5),
+        producer.seal().unwrap().wait(),
+    )
+    .await
+    .unwrap();
+    let reference = state
+        .archive
+        .raw_capture_reference(identity.tenant_id, identity.request_id, "response")
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(reference.size_bytes, expected.len() as u64);
+    assert_eq!(
+        reference.blake3_digest,
+        blake3::hash(&expected).to_hex().to_string()
+    );
+    assert_eq!(
+        state
+            .archive
+            .get_tenant_content(identity.tenant_id, &reference, expected.len())
+            .await
+            .unwrap(),
+        expected
+    );
+    assert!(
+        !state
+            .archive
+            .raw_capture_failed(identity.tenant_id, identity.request_id, "response")
+            .await
+            .unwrap()
+    );
+    assert_eq!(std::fs::read(path).unwrap(), b"blocked");
+    assert_eq!(state.proxy_memory_budget.snapshot().0, baseline);
+    assert_eq!(
+        state.proxy_archive_stream_permits.available_permits(),
+        crate::PROXY_ARCHIVE_STREAM_CONCURRENCY
+    );
+}
+
+#[tokio::test]
+async fn cancelled_unsealed_carrier_releases_owned_capture_without_acknowledging_original() {
+    let (_dir, state, _pool, identity) = fixture().await;
+    let (writer_entering, release_writer) = pause_next_begin_ack_for_test(&state);
+    let baseline = state.proxy_memory_budget.snapshot().0;
+    let mut producer =
+        ResponseArchiveProducer::begin(&state, identity, state.proxy_memory_budget.reservation())
+            .unwrap();
+    writer_entering.await.unwrap();
+    let (entering, release_receipt) = producer.pause_local_write_for_test();
+    let mut append =
+        Box::pin(producer.append_with_backpressure(Bytes::from(vec![b'x'; super::CHUNK_BYTES])));
+    tokio::select! {
+        result = entering => result.unwrap(),
+        _ = &mut append => panic!("capture receipt must remain paused after owning the chunk"),
+    }
+    assert!(state.proxy_memory_budget.snapshot().0 > baseline);
+    drop(append);
+    drop(producer);
+    release_writer.send(()).unwrap();
+    // Do not release the receipt gate: cancellation must wake the capture owner.
+    tokio::time::timeout(std::time::Duration::from_secs(5), async {
+        loop {
+            if state
+                .archive
+                .raw_capture_failed(identity.tenant_id, identity.request_id, "response")
+                .await
+                .unwrap()
+                && state.proxy_memory_budget.snapshot().0 == baseline
+                && state.proxy_archive_stream_permits.available_permits()
+                    == crate::PROXY_ARCHIVE_STREAM_CONCURRENCY
             {
                 break;
             }
@@ -807,21 +1368,15 @@ async fn owned_writer_queue_is_byte_bounded_and_releases_proxy_memory_after_gap(
         }
     })
     .await
-    .expect("queue failure must settle the writer and fence the spool");
-    assert_eq!(
-        state.proxy_memory_budget.snapshot().0 - baseline,
-        super::CAPTURE_MEMORY_BYTES * crate::gateway_body::memory::CAPTURE_MEMORY_WEIGHT,
-        "the live producer must keep the shared queue allocation charged after the writer exits"
-    );
+    .unwrap();
+    assert!(release_receipt.send(()).is_err());
     assert!(
-        !producer.append(vec![Bytes::from_static(b"late")]),
-        "a producer must observe an already failed writer before buffering more bytes"
-    );
-    drop(producer);
-    assert_eq!(
-        state.proxy_memory_budget.snapshot().0,
-        baseline,
-        "the shared queue charge must release after both producer and writer settle"
+        state
+            .archive
+            .raw_capture_reference(identity.tenant_id, identity.request_id, "response")
+            .await
+            .unwrap()
+            .is_none()
     );
 }
 
@@ -833,13 +1388,15 @@ async fn streaming_writer_batches_four_chunks_without_growing_its_memory_reserva
     );
     assert_eq!(
         super::CAPTURE_MEMORY_BYTES,
-        (super::CAPTURE_DATABASE_BATCH_CHUNKS + 1) * super::CHUNK_BYTES,
+        (super::CAPTURE_DATABASE_BATCH_CHUNKS + 1) * super::CHUNK_BYTES
+            + crate::archive::ARCHIVE_MULTIPART_PART_BYTES,
         "the batch uses four complete-chunk permits plus the producer's partial chunk"
     );
     let maximum_ciphertext = super::cipher::sealed_len(super::CHUNK_BYTES).unwrap();
     let legacy_peak_bound = super::CAPTURE_MEMORY_BYTES + 2 * maximum_ciphertext;
-    let batched_peak_bound =
-        (super::CAPTURE_DATABASE_BATCH_CHUNKS + 1) * super::CHUNK_BYTES + 2 * maximum_ciphertext;
+    let batched_peak_bound = (super::CAPTURE_DATABASE_BATCH_CHUNKS + 1) * super::CHUNK_BYTES
+        + 2 * maximum_ciphertext
+        + crate::archive::ARCHIVE_MULTIPART_PART_BYTES;
     assert_eq!(
         batched_peak_bound, legacy_peak_bound,
         "one-at-a-time sealing keeps the plaintext, base64 envelope, and ciphertext bound unchanged"

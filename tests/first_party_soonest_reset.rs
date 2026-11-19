@@ -15,7 +15,20 @@ async fn soonest_reset_real_component_orders_only_fresh_eligible_slots() {
     let root = directory.path().join("plugins");
     let package = root.join("mtc-soonest-reset");
     std::fs::create_dir_all(&package).unwrap();
-    for name in ["plugin.json", "plugin.wasm"] {
+    let source_manifest: Value =
+        serde_json::from_slice(&std::fs::read(source.join("plugin.json")).unwrap()).unwrap();
+    let mut files = vec!["plugin.json", "plugin.wasm"];
+    for ui in source_manifest["contributions"]["operator_ui"]
+        .as_array()
+        .into_iter()
+        .flatten()
+    {
+        if let Some(entry) = ui["module_entry"].as_str() {
+            files.push(entry);
+        }
+    }
+    for name in files {
+        std::fs::create_dir_all(package.join(name).parent().unwrap()).unwrap();
         std::fs::copy(source.join(name), package.join(name)).unwrap();
     }
     let database = Database::connect(&format!(
@@ -26,10 +39,12 @@ async fn soonest_reset_real_component_orders_only_fresh_eligible_slots() {
     .unwrap();
     let runtime = PluginRuntime::load(root.to_str(), database).unwrap();
     let manifest = serde_json::to_value(&runtime.manifests()[0]).unwrap();
-    assert_eq!(
-        manifest["capabilities"],
+    let expected_capabilities = if manifest["contributions"]["background_actions"].is_object() {
+        json!([{"kind":"group_routing_quota"},{"kind":"quota_reset_credit"}])
+    } else {
         json!([{"kind":"group_routing_quota"}])
-    );
+    };
+    assert_eq!(manifest["capabilities"], expected_capabilities);
     assert_eq!(
         manifest["contributions"]["group_routing"]["health_policy"],
         "native"

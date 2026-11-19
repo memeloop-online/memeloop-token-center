@@ -28,7 +28,7 @@ impl Database {
                      ORDER BY j.created_at DESC, j.id DESC LIMIT $2"#,
                 )
                 .bind(tenant)
-                .bind(limit.clamp(1, 200))
+                .bind(limit)
                 .fetch_all(&self.pool)
                 .await?
             }
@@ -50,7 +50,7 @@ impl Database {
                           AND facts.key_id = j.key_id
                      ORDER BY j.created_at DESC, j.id DESC LIMIT $1"#,
                 )
-                .bind(limit.clamp(1, 200))
+                .bind(limit)
                 .fetch_all(&self.pool)
                 .await?
             }

@@ -60,6 +60,13 @@ impl ArchiveReaper {
     /// persisted and do not prevent another candidate in the batch from being
     /// claimed.
     pub async fn reap_once(&self) -> Result<ArchiveReaperPass, AppError> {
+        // Retry a persisted release even if SQL is temporarily unavailable.
+        if self.archive.reap_released_carrier_objects().await.is_err() {
+            tracing::warn!(
+                stage = "carrier_cleanup",
+                "released carrier cleanup deferred"
+            );
+        }
         let promoted = self
             .database
             .promote_stale_archive_staging_attempts()
@@ -81,6 +88,15 @@ impl ArchiveReaper {
             if self.cleanup_claim(lease).await == CleanupClaimResult::Cleaned {
                 pass.cleaned = pass.cleaned.saturating_add(1);
             }
+        }
+        // Retirement may enumerate durable object owners. Keep that work in
+        // this independent, shutdown-cancellable cleanup loop rather than
+        // delaying the next conversation projection claim.
+        if let Err(error) = self.database.recover_semantic_raw_retirement().await {
+            tracing::warn!(
+                error_category = error.diagnostic_category(),
+                "semantic raw retirement remains pending"
+            );
         }
         Ok(pass)
     }
@@ -129,7 +145,7 @@ impl ArchiveReaper {
             .prove_archive_staging_unreferenced(lease)
             .await
         {
-            Ok(ArchiveStagingReferenceProof::Unreferenced(proof)) => proof,
+            Ok(ArchiveStagingReferenceProof::Unreferenced(proof)) => *proof,
             Ok(ArchiveStagingReferenceProof::Protected { .. }) => {
                 // The proof method already released the lease and persisted the
                 // fixed `reference_present` code plus backoff.

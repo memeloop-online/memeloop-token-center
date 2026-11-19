@@ -1,7 +1,9 @@
 import { ApiError } from '../api.js';
 import type { ProviderType, UpstreamAccount } from '../types.js';
 
-export function canReauthorizeAccount(account: Pick<UpstreamAccount, 'driver' | 'can_reauthorize'>, provider?: Pick<ProviderType, 'id' | 'oauth_adapter'>): boolean {
+export function canReauthorizeAccount(account: Pick<UpstreamAccount, 'driver' | 'can_reauthorize'> & Partial<Pick<UpstreamAccount, 'credential_generation' | 'oauth_refresh'>>, provider?: Pick<ProviderType, 'id' | 'oauth_adapter'>): boolean {
+  const diagnostic = account.oauth_refresh?.credential_generation === account.credential_generation ? account.oauth_refresh : undefined;
+  if (diagnostic?.allowed_actions && !diagnostic.allowed_actions.includes('reauthorize')) return false;
   if (!account.can_reauthorize || !provider || provider.id !== account.driver) return false;
   return Boolean(provider.oauth_adapter);
 }
@@ -10,16 +12,20 @@ export function isAuthorizationIdentityMismatch(reason: unknown): boolean {
   return reason instanceof ApiError && reason.status === 409 && reason.code === 'oauth_identity_mismatch';
 }
 
+function rejectionText(reason: ApiError): string {
+  return reason.messageEn ?? reason.message;
+}
+
 /** The one documented fragment-manual rejection; any other server text stays on the safe uncertain path. */
 export function isFragmentManualCodeRejection(reason: unknown): boolean {
   return reason instanceof ApiError && reason.status === 400 && reason.code === 'invalid_request'
-    && reason.message === 'invalid request: OAuth completion must be code#state';
+    && rejectionText(reason) === 'invalid request: OAuth completion must be code#state';
 }
 
 export function authorizationCompleteError(reason: unknown) {
   if (!(reason instanceof ApiError)) return 'completeUncertain';
   if (reason.status === 400 && reason.code === 'invalid_request') {
-    switch (reason.message) {
+    switch (rejectionText(reason)) {
       case 'invalid request: invalid OAuth session token': return 'completeInvalidSession';
       case 'invalid request: OAuth login session expired': return 'completeExpired';
       case 'invalid request: OAuth login session is no longer active': return 'completeInactive';
@@ -28,7 +34,7 @@ export function authorizationCompleteError(reason: unknown) {
     }
   }
   if (reason.status === 409 && reason.code === 'conflict'
-    && reason.message === 'conflict: reauthorization must use the same Anthropic account') return 'completeIdentityMismatch';
+    && rejectionText(reason) === 'conflict: reauthorization must use the same Anthropic account') return 'completeIdentityMismatch';
   if (reason.status === 401 && reason.code === 'unauthorized') return 'completeUnauthorized';
   if (reason.status === 403 && reason.code === 'forbidden') return 'completeForbidden';
   if (reason.status === 502 && reason.code === 'upstream_error') return 'completeUnavailable';

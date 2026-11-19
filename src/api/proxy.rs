@@ -6,22 +6,27 @@ pub(super) fn parse_cache_usage_contract(value: &Value) -> TokenUsage {
         .unwrap()
         .unwrap()
 }
-pub(crate) use routing::{RequestAttemptBudget as MediaAttemptBudget, wait_media_recovery};
+pub(crate) use routing::RequestAttemptBudget as MediaAttemptBudget;
 pub(crate) use routing::{
     UpstreamAttemptGuard as MediaAttemptGuard, UpstreamAttemptTerminal as MediaAttemptTerminal,
-    current_gateway_failure_domain,
 };
 
 pub(crate) async fn classify_media_rate_limit(
     response: reqwest::Response,
 ) -> crate::db::UpstreamFailureKind {
-    let (response, kind) = routing::classify_rate_limit(response.into()).await;
+    classify_archived_media_rate_limit(response.into()).await
+}
+
+pub(in crate::api) async fn classify_archived_media_rate_limit(
+    response: upstream_response::UpstreamResponse,
+) -> crate::db::UpstreamFailureKind {
+    let (response, kind) = routing::classify_rate_limit(response).await;
     drop(response);
     kind
 }
 
 pub(in crate::api) async fn classify_codex_media_rate_limit(
-    response: wreq::Response,
+    response: reqwest::Response,
 ) -> crate::db::UpstreamFailureKind {
     let (response, kind) = routing::classify_rate_limit(UpstreamResponse::Codex(response)).await;
     drop(response);
@@ -31,24 +36,27 @@ pub(in crate::api) async fn classify_codex_media_rate_limit(
 #[path = "codex_transport.rs"]
 pub(in crate::api) mod codex_transport;
 
-pub(crate) mod archive_retention;
 mod buffered_upstream;
+mod independent_probe;
+pub(in crate::api) use independent_probe::IndependentProbeTarget;
+mod supplier_quota;
+use supplier_quota::{observe_quota_body, publish_supplier_quota};
 mod chat_sse_usage;
 mod conversation_hints;
 mod lifecycle;
 pub(crate) mod persistence;
+mod request_source;
 mod response_metadata;
 mod routing;
 pub(crate) mod session_preferences;
 mod sse_capture;
 mod streaming;
 mod transport_protocol;
-mod upstream_error;
-mod upstream_response;
+pub(super) mod upstream_error;
+pub(in crate::api) mod upstream_response;
 
 #[cfg(test)]
 use crate::db::UpstreamFailureKind;
-use crate::response_archive_spool::BufferedArchive;
 use crate::{
     db::{ProxyRequestUpstreamAttribution, SwitchProxyCandidateInput, UpstreamAttemptAdmission},
     metrics::{UpstreamHealthEvent, UpstreamHealthReason},
@@ -58,14 +66,12 @@ use buffered_upstream::{read_bounded_upstream, upstream_error_health_terminal};
 use chat_sse_usage::ChatSseUsageContract;
 pub(in crate::api) use conversation_hints::safe_conversation_hint as safe_response_id;
 use conversation_hints::{client_name, conversation_hints};
-use lifecycle::{
-    finish_proxy_request_with_archive_fallback, finish_unavailable, run_bounded_proxy_lifecycle,
-};
+use lifecycle::{finish_unavailable, run_bounded_proxy_lifecycle};
 use routing::{
     AdmittedProxyRouteInput, CandidatePreparationSummary, CodexRetryTerminal,
-    CodexRetryTerminalGuard, DeferredSharedProbe, NextSendableProxyRouteInput, PlannedProxyRoute,
-    PreparedProxyRoute, PreparedRouteReadiness, ProxyRequestContext, ProxyRoutePlanInput,
-    ProxySendError, UpstreamAttemptGuard, UpstreamAttemptTerminal, candidate_reservation_bounds,
+    CodexRetryTerminalGuard, NextSendableProxyRouteInput, PlannedProxyRoute, PreparedProxyRoute,
+    PreparedRouteReadiness, ProxyRequestContext, ProxyRoutePlanInput, ProxySendError,
+    UpstreamAttemptGuard, UpstreamAttemptTerminal, candidate_reservation_bounds,
     exhausted_candidate_error, materialize_proxy_route, next_planned_proxy_candidate,
     plan_proxy_route, prepare_admitted_proxy_route, prepared_input_reservation_bound,
     refresh_route_snapshot, retain_pinned_text_candidates, send_proxy_route,
@@ -102,7 +108,9 @@ async fn read_safe_proxy_rejection(
     if !upstream.status().is_success()
         && !protocol.is_anthropic()
         && !responses_anthropic_route
-        && (crate::provider::is_openai_compatible_http_driver(driver) || native_kimi)
+        && (crate::provider::is_openai_compatible_http_driver(driver)
+            || native_kimi
+            || codex_transport::is_driver(driver))
     {
         (None, Some(upstream_error::read_rejection(upstream).await))
     } else {
@@ -212,8 +220,9 @@ async fn prepare_authorized_proxy_routes(
     )
     .await?
     else {
-        // Normalized grants are the sole downstream authorization source. A
-        // missing route must never fall back to unscoped process secrets.
+        // The candidate query already widened to any active account on this
+        // route. Reaching here means nothing active remains to send. Do not
+        // invent a credential that is not an upstream account.
         return Err(exhausted_candidate_error(protocol, request_json, &summary)?);
     };
     candidate_preparation.finish("completed", None, None);
@@ -256,7 +265,7 @@ async fn next_sendable_proxy_route(
     let strict_choice_count_is_incompatible = matches!(request.protocol, Protocol::OpenAiChat)
         && openai_chat_choice_count(request.request_json)? != 1;
     let mut summary = CandidatePreparationSummary::default();
-    let mut transient_candidate = None;
+    let transient_candidate = None;
     while let Some(mut planned) = match planned_candidate.take() {
         Some(planned) => Some(planned),
         None => {
@@ -283,7 +292,9 @@ async fn next_sendable_proxy_route(
             );
             continue;
         }
-        if refresh_route_snapshot(state, &mut planned.route).await? != PreparedRouteReadiness::Ready
+        if !codex_transport::is_driver(&planned.route.driver)
+            && refresh_route_snapshot(state, &mut planned.route).await?
+                != PreparedRouteReadiness::Ready
         {
             tracing::warn!(
                 %request_id,
@@ -326,90 +337,9 @@ async fn next_sendable_proxy_route(
         }
         let (next_input_token_ceiling, next_output_token_ceiling, next_output_token_limit) =
             candidate_reservation_bounds(&planned, original_body_length, output_choice_count)?;
-        let admission = if let Some(snapshot) = state.group_routing.as_ref()
-            && let Some((allow_probe, cooldown_ms)) = snapshot
-                .policy(
-                    planned.route.route_id,
-                    planned.route.account_id,
-                    planned.route.credential_generation,
-                )
-                .and_then(|policy| policy.transient_probe_controls())
-        {
-            state
-                .db
-                .claim_upstream_account_attempt_at_revision_with_strategy(
-                    snapshot.tenant_id,
-                    planned.route.account_id,
-                    planned.route.credential_generation,
-                    planned.route.transport_revision,
-                    state.config.upstream_health,
-                    allow_probe,
-                    Some(cooldown_ms),
-                    false,
-                    Some(routing::current_gateway_failure_domain()),
-                )
-                .await?
-        } else {
-            state
-                .db
-                .claim_upstream_account_attempt_at_revision_with_health_config(
-                    planned.route.account_id,
-                    planned.route.credential_generation,
-                    planned.route.transport_revision,
-                    state.config.upstream_health,
-                    Some(routing::current_gateway_failure_domain()),
-                )
-                .await?
-        };
-        if let UpstreamAttemptAdmission::Unavailable {
-            cooldown_until,
-            probe_lease_until,
-            shared_probe_eligible,
-            transient_wait_eligible,
-        } = admission
-        {
-            let now = unix_millis();
-            let admission_reason = if cooldown_until > now {
-                "cooldown"
-            } else if probe_lease_until > now {
-                "probe_lease"
-            } else {
-                "claim_contention"
-            };
-            tracing::warn!(
-                %request_id,
-                upstream_account_id = %planned.route.account_id,
-                candidate_rank = rank,
-                outbound_attempt,
-                admission_reason,
-                cooldown_until,
-                probe_lease_until,
-                failure_domain = routing::current_gateway_failure_domain(),
-                stage = "upstream_admission_skip",
-                "proxy skipped an authorized upstream before sending"
-            );
-            if shared_probe_eligible {
-                deferred_shared_probes.push_back(DeferredSharedProbe {
-                    route: planned.route.clone(),
-                    candidate_rank: rank,
-                    probe_lease_until,
-                });
-            }
-            // Retain at most one small route snapshot, never another request body.
-            if outbound_attempts == 0
-                && transient_wait_eligible
-                && !shared_probe_eligible
-                && transient_candidate.is_none()
-            {
-                transient_candidate = Some((planned.route.clone(), rank));
-            }
-            state.metrics.observe_upstream_health(
-                UpstreamHealthEvent::Skipped,
-                UpstreamHealthReason::Cooldown,
-            );
-            failover_reason = Some(UpstreamHealthReason::Cooldown);
-            continue;
-        }
+        // Scoped quota and legacy account quota were consumed by the existing
+        // candidate snapshot. Customer forwarding never starts a probe.
+        let admission = UpstreamAttemptAdmission::Observed;
         return prepare_admitted_proxy_route(AdmittedProxyRouteInput {
             request,
             price,
@@ -471,7 +401,7 @@ async fn next_sendable_proxy_route(
             preparation_now,
         })?;
         if planned.is_component() {
-            return Err(AppError::Internal);
+            return Err(AppError::internal("proxy_site_1"));
         }
         let (next_input_token_ceiling, next_output_token_ceiling, next_output_token_limit) =
             candidate_reservation_bounds(&planned, original_body_length, output_choice_count)?;
@@ -656,11 +586,15 @@ async fn finish_non_sse_proxy_response(
             let (response_status, response_body, terminal_error) = if valid_output {
                 (status, response_body, "upstream_incomplete_response")
             } else {
+                drop(response_body);
                 (
                     StatusCode::BAD_GATEWAY,
-                    Bytes::from_static(
-                        b"{\"error\":{\"message\":\"upstream returned an invalid response\",\"type\":\"upstream_error\"}}",
-                    ),
+                    Bytes::from(crate::error::explained_failure_body(
+                        "上游请求失败",
+                        "upstream request failed",
+                        "upstream_invalid_response",
+                        crate::error::ErrorFacts::new(),
+                    )),
                     "upstream_invalid_response",
                 )
             };
@@ -682,6 +616,7 @@ async fn finish_non_sse_proxy_response(
                 .await;
             return result;
         }
+        drop(response_body);
         let result = finish_proxy_failure(buffered_request, error_code).await;
         upstream_attempt
             .complete(UpstreamAttemptTerminal::invalid_response())
@@ -709,6 +644,7 @@ async fn finish_non_sse_proxy_response(
                     selected_driver,
                     protocol,
                 );
+                drop(response_body);
                 let result = finish_proxy_failure(buffered_request, "upstream_invalid_usage").await;
                 upstream_attempt
                     .complete(UpstreamAttemptTerminal::invalid_response())
@@ -774,8 +710,31 @@ fn requested_service_tier(
     Ok(requested)
 }
 
+async fn note_in_flight_stage(request: &BufferedRequest<'_>, stage: &'static str) {
+    if let Err(error) = request
+        .state
+        .db
+        .record_proxy_in_flight_stage(
+            request.request_id,
+            request.tenant_id,
+            request.reservation.key_id,
+            request.reservation.id,
+            stage,
+        )
+        .await
+    {
+        tracing::warn!(
+            request_id = %request.request_id,
+            stage,
+            error_category = error.diagnostic_category(),
+            "in-flight request stage was not stored"
+        );
+    }
+}
+
 async fn execute_component_primary(
     mut request: BufferedRequest<'_>,
+    cancellation: &mut lifecycle::CancellationGuard,
     key: &AuthenticatedKey,
     price: &crate::model::ModelPrice,
     mut primary: PlannedProxyRoute,
@@ -797,78 +756,18 @@ async fn execute_component_primary(
     if readiness != PreparedRouteReadiness::Ready {
         return finish_unavailable(&request, readiness.error_code(), None).await;
     }
-    // Every component request passes core health admission, including failed
-    // strategy execution/native fallback. A missing policy never disables the
-    // generation fence or revives hard quota. This path never replays a send.
-    let admission = if let Some(snapshot) = request.state.group_routing.as_ref()
-        && let Some((allow_probe, cooldown_ms)) = snapshot
-            .policy(
-                primary.route.route_id,
-                primary.route.account_id,
-                primary.route.credential_generation,
-            )
-            .and_then(|policy| policy.transient_probe_controls())
-    {
-        request
-            .state
-            .db
-            .claim_upstream_account_attempt_at_revision_with_strategy(
-                snapshot.tenant_id,
-                primary.route.account_id,
-                primary.route.credential_generation,
-                primary.route.transport_revision,
-                request.state.config.upstream_health,
-                allow_probe,
-                Some(cooldown_ms),
-                false,
-                Some(routing::current_gateway_failure_domain()),
-            )
-            .await?
-    } else {
-        request
-            .state
-            .db
-            .claim_upstream_account_attempt_at_revision_with_health_config(
-                primary.route.account_id,
-                primary.route.credential_generation,
-                primary.route.transport_revision,
-                request.state.config.upstream_health,
-                Some(routing::current_gateway_failure_domain()),
-            )
-            .await?
-    };
-    let upstream_attempt = match admission {
-        UpstreamAttemptAdmission::Unavailable {
-            transient_wait_eligible: true,
-            ..
-        } => {
-            let Some((route, _, guard)) = routing::recovery_wait::wait(
-                request.state,
-                request.request_id,
-                primary.route.clone(),
-                recovery_wait_deadline,
-            )
-            .await?
-            else {
-                return finish_unavailable(&request, "upstream_unavailable", None).await;
-            };
-            primary.route = route;
-            Some(guard)
-        }
-        UpstreamAttemptAdmission::Unavailable { .. } => {
-            return finish_unavailable(&request, "upstream_unavailable", None).await;
-        }
-        admission => Some(UpstreamAttemptGuard::new(
-            request.state,
-            request.request_id,
-            primary.route.route_id,
-            primary.route.account_id,
-            primary.route.credential_generation,
-            primary.route.transport_revision,
-            admission,
-            None,
-        )),
-    };
+    // A customer request does not wait on, or become, an account health probe.
+    let _ = recovery_wait_deadline;
+    let upstream_attempt = Some(UpstreamAttemptGuard::new(
+        request.state,
+        request.request_id,
+        primary.route.route_id,
+        primary.route.account_id,
+        primary.route.credential_generation,
+        primary.route.transport_revision,
+        UpstreamAttemptAdmission::Observed,
+        None,
+    ));
     let mut active_route = match materialize_proxy_route(request.state, primary).await {
         Ok(prepared) => prepared,
         Err(_) => return finish_proxy_failure(&request, "provider_candidate_invalid").await,
@@ -908,12 +807,10 @@ async fn execute_component_primary(
         return finish_proxy_failure(&request, "provider_candidate_invalid").await;
     };
     active_route.release_request_buffers();
+    cancellation.prepare_dispatch(&request).await?;
     execute_component_provider(
         request,
-        &active_route.route.driver,
-        &active_route.route.base_url,
-        &active_route.route.config,
-        &active_route.route.credential,
+        &active_route.route,
         prepared,
         component_context,
         upstream_attempt,
@@ -930,7 +827,7 @@ pub(super) async fn proxy(
 ) -> Result<Response, AppError> {
     let key = authenticate_downstream(&headers, &state).await?;
     proxy_with_identity_and_conversation_spool(
-        state, headers, body, protocol, key, None, memory, None,
+        state, headers, body, protocol, key, None, None, memory, None,
     )
     .await
 }
@@ -951,6 +848,7 @@ pub(super) async fn proxy_spooled_responses(
         protocol,
         key,
         None,
+        None,
         memory,
         Some(spool),
     )
@@ -958,7 +856,8 @@ pub(super) async fn proxy_spooled_responses(
 }
 
 /// Internal callers must establish an explicit billing identity. A pinned route
-/// narrows normal grants; it never grants access or falls back to another route.
+/// or account narrows normal grants; it never grants access or falls back.
+#[allow(clippy::too_many_arguments)]
 pub(in crate::api) async fn proxy_with_identity(
     state: AppState,
     headers: HeaderMap,
@@ -967,6 +866,7 @@ pub(in crate::api) async fn proxy_with_identity(
     key: AuthenticatedKey,
     pinned_route: Option<Uuid>,
     memory: std::sync::Arc<crate::gateway_body::memory::ProxyMemoryReservation>,
+    pinned_account: Option<Uuid>,
 ) -> Result<Response, AppError> {
     proxy_with_identity_and_conversation_spool(
         state,
@@ -975,10 +875,42 @@ pub(in crate::api) async fn proxy_with_identity(
         protocol,
         key,
         pinned_route,
+        pinned_account,
         memory,
         None,
     )
     .await
+}
+
+/// The billing key and route grant still decide access. The account pin only
+/// keeps candidates for that account after those checks.
+#[allow(clippy::too_many_arguments)]
+pub(in crate::api) async fn proxy_with_pinned_account(
+    state: AppState,
+    headers: HeaderMap,
+    body: Bytes,
+    protocol: Protocol,
+    key: AuthenticatedKey,
+    pinned_route: Uuid,
+    pinned_account: Uuid,
+    memory: std::sync::Arc<crate::gateway_body::memory::ProxyMemoryReservation>,
+    target: IndependentProbeTarget,
+) -> Result<Response, AppError> {
+    independent_probe::TARGET
+        .scope(
+            target,
+            proxy_with_identity(
+                state,
+                headers,
+                body,
+                protocol,
+                key,
+                Some(pinned_route),
+                memory,
+                Some(pinned_account),
+            ),
+        )
+        .await
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -989,31 +921,25 @@ async fn proxy_with_identity_and_conversation_spool(
     protocol: Protocol,
     key: AuthenticatedKey,
     pinned_route: Option<Uuid>,
+    pinned_account: Option<Uuid>,
     memory: std::sync::Arc<crate::gateway_body::memory::ProxyMemoryReservation>,
     conversation_spool: Option<std::sync::Arc<crate::gateway_body::request_spool::RequestSpool>>,
 ) -> Result<Response, AppError> {
     let mut cancellation = lifecycle::CancellationGuard::default();
-    let owner_loss = cancellation.owner_loss();
-    let result = tokio::select! {
-        biased;
-        _ = crate::proxy_lifecycle::wait_for_owner_loss(Some(owner_loss.clone())) => {
-            return Err(AppError::Internal);
-        }
-        result = Box::pin(proxy_with_cancellation_guard(
+    let result = Box::pin(proxy_with_cancellation_guard(
         state,
         headers,
         body,
         protocol,
         key,
         pinned_route,
+        pinned_account,
         memory,
         conversation_spool,
         &mut cancellation,
-        )) => result,
-    };
-    if !*owner_loss.borrow() {
-        cancellation.disarm();
-    }
+    ))
+    .await;
+    cancellation.disarm();
     result
 }
 
@@ -1021,10 +947,11 @@ async fn proxy_with_identity_and_conversation_spool(
 async fn proxy_with_cancellation_guard(
     state: AppState,
     headers: HeaderMap,
-    body: Bytes,
+    mut body: Bytes,
     protocol: Protocol,
     key: AuthenticatedKey,
     pinned_route: Option<Uuid>,
+    pinned_account: Option<Uuid>,
     memory: std::sync::Arc<crate::gateway_body::memory::ProxyMemoryReservation>,
     conversation_spool: Option<std::sync::Arc<crate::gateway_body::request_spool::RequestSpool>>,
     cancellation: &mut lifecycle::CancellationGuard,
@@ -1033,6 +960,12 @@ async fn proxy_with_cancellation_guard(
         crate::api::request_normalization::is_official_codex_user_agent(&headers);
     let diagnostic_context = proxy_diagnostics::Context::current();
     let request_id = diagnostic_context.request_id;
+    let mut conversation_spool =
+        conversation_spool.or_else(|| state.responses_request_spool.source(request_id));
+    let request_body_length = conversation_spool
+        .as_ref()
+        .map_or(body.len(), |source| source.len());
+    let streamed_source = conversation_spool.is_some() && body.is_empty();
     let preparation = proxy_diagnostics::Phase::new(diagnostic_context, "request_preparation");
     let _request_buffer = state
         .metrics
@@ -1042,19 +975,50 @@ async fn proxy_with_cancellation_guard(
     let mut state = state.pin_application_plugins().await?;
     plugin_snapshot.finish("completed", None, None);
     let proxy_lifecycle_permit = state.proxy_lifecycles.start();
-    if !memory.try_reserve_json(&body) {
+    if !streamed_source
+        && !state
+            .responses_request_spool
+            .reclaim_for(|| memory.try_reserve_json(&body))
+    {
+        let (used_bytes, capacity_bytes, _, _) = state.proxy_memory_budget.snapshot();
+        tracing::warn!(%request_id, stage = "request_json_admission",
+            actual_body_bytes = body.len(), used_bytes, capacity_bytes,
+            has_durable_source = conversation_spool.is_some(),
+            "request JSON working allocation unavailable after durable cache reclamation");
         state
             .metrics
             .record_proxy_memory_rejection(crate::metrics::ProxyMemoryRejectionStage::Json);
-        return Err(AppError::Overloaded);
+        return Err(AppError::capacity_error("proxy_memory_json"));
     }
     let json_parse = proxy_diagnostics::Phase::new(diagnostic_context, "request_json_parse");
-    let original_request_json: Value = crate::api::sse::parse_unique_json(&body)
-        .map_err(|_| AppError::BadRequest("request body must be valid JSON".into()))?;
+    let mut original_request_json: Value = if streamed_source {
+        match request_source::parse(conversation_spool.as_ref().unwrap().clone(), memory.clone())
+            .await
+        {
+            Ok(value) => value,
+            Err(error) => {
+                if matches!(
+                    error,
+                    AppError::Capacity {
+                        code: "proxy_memory_json",
+                        ..
+                    }
+                ) {
+                    state.metrics.record_proxy_memory_rejection(
+                        crate::metrics::ProxyMemoryRejectionStage::Json,
+                    );
+                }
+                return Err(error);
+            }
+        }
+    } else {
+        crate::api::sse::parse_unique_json(&body)
+            .map_err(|_| AppError::BadRequest("request body must be valid JSON".into()))?
+    };
     super::early_request::observe_model(original_request_json.get("model"));
-    json_parse.finish("completed", None, Some(body.len()));
+    json_parse.finish("completed", None, Some(request_body_length));
     let conversation_hints = conversation_hints(&headers, &original_request_json);
-    tracing::info!(%request_id, phase = "request_shape", bytes = body.len(), compaction_hint = conversation_hints.compaction, "proxy request metadata");
+    tracing::info!(%request_id, phase = "request_shape", bytes = request_body_length, compaction_hint = conversation_hints.compaction, "proxy request metadata");
     let traffic_policy =
         proxy_diagnostics::Phase::new(diagnostic_context, "request_traffic_policy");
     let applied = super::traffic::apply_traffic_policy_with_memory(
@@ -1079,13 +1043,13 @@ async fn proxy_with_cancellation_guard(
         );
         return Err(AppError::Forbidden);
     }
-    let request_json = applied.request_json;
+    let mut request_json = applied.request_json;
     let model = applied.model;
     super::early_request::observe_model(Some(&Value::String(model.clone())));
     let codex_multi_agent_v2_request = matches!(protocol, Protocol::OpenAiResponses)
         && official_codex_client
         && crate::api::request_normalization::has_codex_multi_agent_v2_shape(&request_json);
-    preparation.finish("completed", None, Some(body.len()));
+    preparation.finish("completed", None, Some(request_body_length));
     let route_preparation = proxy_diagnostics::Phase::new(diagnostic_context, "route_preparation");
     let selection_seed = routing_selection_seed(&key, request_id, &conversation_hints);
     let avoid_route_account = session_route_account_to_avoid(
@@ -1101,7 +1065,7 @@ async fn proxy_with_cancellation_guard(
         proxy_diagnostics::Phase::new(diagnostic_context, "authorized_candidate_query");
     let mut candidates = state
         .db
-        .list_authorized_upstream_candidates_with_hint(
+        .list_upstream_candidates_for_dispatch(
             key.key_id,
             key.tenant_id,
             &model,
@@ -1109,8 +1073,12 @@ async fn proxy_with_cancellation_guard(
             RouteSelectionOptions {
                 upstream_account_hint: applied.upstream_account_hint,
                 avoid_route_account,
-                selection_seed,
+                // Native weighted rendezvous balances requests, including within
+                // a session. Session affinity is opt-in through a group policy;
+                // its stable seed is still passed to group_routing::prepare.
+                selection_seed: request_id,
             },
+            pinned_account.is_some(),
         )
         .await?;
     candidate_query.finish("completed", None, None);
@@ -1124,6 +1092,54 @@ async fn proxy_with_cancellation_guard(
         "authorized candidate query completed"
     );
     retain_pinned_text_candidates(&state, pinned_route, &mut candidates)?;
+    if let Some(account_id) = pinned_account {
+        candidates.retain(|candidate| candidate.account_id == account_id);
+        if candidates.is_empty() {
+            return Err(AppError::Forbidden);
+        }
+    }
+    if let Some((required_bytes, required_nodes)) =
+        routing::native_chat_candidate_shape(protocol, &mut request_json, &candidates)?
+        && !memory.covers_json_shape(required_bytes, required_nodes)
+    {
+        // Preserve the original request for archiving independently of the
+        // normalized replay. No provider-specific rewrite becomes its source.
+        if conversation_spool.is_none() {
+            conversation_spool = Some(std::sync::Arc::new(
+                state
+                    .responses_request_spool
+                    .capture_with_memory(
+                        Body::from(body.clone()),
+                        body.len(),
+                        Some(body.len()),
+                        Some(&memory),
+                        0,
+                        Some(&request_id.to_string()),
+                    )
+                    .await
+                    .map_err(|_| AppError::capacity_error("request_spool_read_failed"))?,
+            ));
+        }
+        conversation_spool
+            .as_ref()
+            .unwrap()
+            .release_local_retained();
+        memory.release(
+            body.len(),
+            crate::gateway_body::memory::CAPTURE_MEMORY_WEIGHT,
+        );
+        body = Bytes::new();
+        drop(std::mem::take(&mut original_request_json));
+        request_json = request_source::parse_normalized(
+            std::mem::take(&mut request_json),
+            &state,
+            request_id,
+            memory.clone(),
+            required_bytes,
+            required_nodes,
+        )
+        .await?;
+    }
     let strategy_candidates =
         crate::group_routing::candidate_snapshot_if_enabled(&state, &candidates);
     let request_context = ProxyRequestContext {
@@ -1133,11 +1149,12 @@ async fn proxy_with_cancellation_guard(
         protocol,
         request_id,
         request_json: &request_json,
+        request_memory: Some(&memory),
         codex_multi_agent_v2_request,
     };
     let mut route_plan = prepare_authorized_proxy_routes(AuthorizedProxyRoutesInput {
         request: request_context,
-        original_body_length: body.len(),
+        original_body_length: request_body_length,
         candidates,
     })
     .await?;
@@ -1157,10 +1174,20 @@ async fn proxy_with_cancellation_guard(
             request_id,
             route_preparation_recovery_wait_deadline,
             &mut candidates,
+            conversation_hints.session_id.as_deref().map(|session| {
+                crate::db::allocation::AllocationSession {
+                    key: &key,
+                    session,
+                    model: &model,
+                    protocol: protocol.name(),
+                }
+            }),
         )
         .await?;
         strategy.finish("completed", None, None);
         if state.group_routing.is_some() {
+            // Release the previous plan before building its replacement.
+            drop(route_plan);
             route_plan = prepare_authorized_proxy_routes(AuthorizedProxyRoutesInput {
                 request: ProxyRequestContext {
                     state: &state,
@@ -1169,9 +1196,10 @@ async fn proxy_with_cancellation_guard(
                     protocol,
                     request_id,
                     request_json: &request_json,
+                    request_memory: Some(&memory),
                     codex_multi_agent_v2_request,
                 },
-                original_body_length: body.len(),
+                original_body_length: request_body_length,
                 candidates,
             })
             .await?;
@@ -1184,6 +1212,7 @@ async fn proxy_with_cancellation_guard(
         protocol,
         request_id,
         request_json: &request_json,
+        request_memory: Some(&memory),
         codex_multi_agent_v2_request,
     };
     let primary = route_plan.primary_route();
@@ -1213,7 +1242,6 @@ async fn proxy_with_cancellation_guard(
     } else {
         crate::provider::CodexTransportPolicy::default().memory_admission_wait_millis
     };
-    memory.configure_admission(Duration::from_millis(memory_wait), state.metrics.clone());
     let requested_native_stream = request_json.get("stream").and_then(Value::as_bool) == Some(true)
         && !route_plan.primary.is_component()
         && matches!(
@@ -1241,15 +1269,41 @@ async fn proxy_with_cancellation_guard(
         upstream_account_id,
         Some(primary.credential_generation),
     );
-    let admitted_request_object = format!("gap://{request_id}/request");
-    drop(original_request_json);
-    let request_capture_memory = state.metrics.memory_usage(
-        crate::metrics::MemoryComponent::StreamCapture,
-        body.len().saturating_mul(3),
-    );
+    let source_backed = conversation_spool.is_some();
+    let source = match conversation_spool {
+        Some(source) => source,
+        None => std::sync::Arc::new(
+            state
+                .responses_request_spool
+                .capture_with_memory(
+                    Body::from(body.clone()),
+                    body.len(),
+                    Some(body.len()),
+                    Some(&memory),
+                    0,
+                    Some(&request_id.to_string()),
+                )
+                .await
+                .map_err(|_| AppError::capacity_error("request_spool_read_failed"))?,
+        ),
+    };
+    let admitted_request_object = source
+        .object_locator()
+        .ok_or_else(|| AppError::internal("proxy_request_source_locator"))?
+        .to_owned();
+    let conversation_body = if source_backed {
+        ConversationBody::source_backed(
+            source.clone(),
+            original_request_json,
+            memory.request_json_reserved_bytes(),
+        )
+    } else {
+        drop(original_request_json);
+        ConversationBody::InMemory(body.clone())
+    };
     let started_request = match state
         .db
-        .start_proxy_request_with_deferred_archive(
+        .start_proxy_request_with_source(
             StartProxyRequest {
                 request_id,
                 key: &key,
@@ -1262,9 +1316,7 @@ async fn proxy_with_cancellation_guard(
                 upstream_account_id,
                 model_route_id,
             },
-            &body,
-            state.config.key_pepper.as_bytes(),
-            state.config.archive_spool_compression_enabled,
+            &source,
             Some(&primary.upstream_model),
             output_token_limit,
         )
@@ -1272,7 +1324,7 @@ async fn proxy_with_cancellation_guard(
     {
         Ok(started) => started,
         Err(error) => {
-            admission.finish(error.diagnostic_category(), None, Some(body.len()));
+            admission.finish(error.diagnostic_category(), None, Some(request_body_length));
             tracing::error!(%request_id, stage = "request_transaction_admission", failure_domain = "local_admission", error_category = error.diagnostic_category(), "proxy request admission failed");
             return Err(error);
         }
@@ -1280,6 +1332,7 @@ async fn proxy_with_cancellation_guard(
     super::early_request::mark_admitted();
     cancellation.arm(
         state.db.clone(),
+        state.pending_terminals.clone(),
         diagnostic_context,
         key.tenant_id,
         started_request.reservation.clone(),
@@ -1289,16 +1342,9 @@ async fn proxy_with_cancellation_guard(
     match started_request.archive_admission {
         crate::db::RequestArchiveAdmission::Captured
         | crate::db::RequestArchiveAdmission::Queued => {}
-        crate::db::RequestArchiveAdmission::GapCapacity => state
-            .metrics
-            .record_request_archive_gap(crate::metrics::RequestArchiveGapReason::Capacity),
-        crate::db::RequestArchiveAdmission::GapRetentionLimit => state
-            .metrics
-            .record_request_archive_gap(crate::metrics::RequestArchiveGapReason::RetentionLimit),
     }
     let reservation = started_request.reservation;
-    admission.finish("completed", None, Some(body.len()));
-    attempt_budget.arm();
+    admission.finish("completed", None, Some(request_body_length));
     let recovery_wait_deadline =
         attempt_budget.recovery_wait_deadline(state.config.upstream_health);
     let client_name = client_name(&headers);
@@ -1311,19 +1357,15 @@ async fn proxy_with_cancellation_guard(
     )
     .then(|| ProxyConversation {
         key: key.clone(),
-        request_body: conversation_spool
-            .map(ConversationBody::Spool)
-            .unwrap_or_else(|| ConversationBody::InMemory(body.clone())),
+        request_body: conversation_body,
         hints: conversation_hints,
         client_name,
         projection_admission: std::sync::Mutex::new(ConversationProjectionAdmission::Deferred),
     });
-    drop(request_capture_memory);
     memory.release(
         body.len(),
         crate::gateway_body::memory::CAPTURE_MEMORY_WEIGHT,
     );
-    let request_body_length = body.len();
     drop(body);
     let mut buffered_request = BufferedRequest {
         session_preference: conversation.as_ref().and_then(|conversation| {
@@ -1345,7 +1387,8 @@ async fn proxy_with_cancellation_guard(
         conversation,
         protocol,
         tenant_id: key.tenant_id,
-        memory,
+        original_response_capture: false,
+        memory: memory.clone(),
     };
     // Native streams and source-backed Responses retain their charged request
     // under the process-wide budget without occupying buffered-response
@@ -1363,7 +1406,6 @@ async fn proxy_with_cancellation_guard(
         && !buffered_request
             .memory
             .finalize_request(recovery_wait_deadline)
-            .await
     {
         retained_admission.finish("rejected", Some(503), None);
         state
@@ -1373,7 +1415,7 @@ async fn proxy_with_cancellation_guard(
             &buffered_request,
             StatusCode::SERVICE_UNAVAILABLE,
             Bytes::from_static(
-                b"{\"error\":{\"message\":\"gateway memory capacity unavailable\"}}",
+                b"{\"error\":{\"code\":\"proxy_memory_capacity\",\"message\":\"the retained request partition was full\"}}",
             ),
             "application/json",
             (
@@ -1411,6 +1453,7 @@ async fn proxy_with_cancellation_guard(
         drop(request_json);
         return execute_component_primary(
             buffered_request,
+            cancellation,
             &key,
             &price,
             primary,
@@ -1422,10 +1465,11 @@ async fn proxy_with_cancellation_guard(
     let mut planned_candidate = Some(primary);
     let mut route_candidates = remaining_candidates;
     let mut assigned_route = (
-        upstream_account_id.ok_or(AppError::Internal)?,
-        model_route_id.ok_or(AppError::Internal)?,
+        upstream_account_id.ok_or(AppError::internal("proxy_site_2"))?,
+        model_route_id.ok_or(AppError::internal("proxy_site_3"))?,
     );
     let mut outbound_attempts = 0_usize;
+    let mut rejected_models = std::collections::HashSet::new();
     let mut h2_recovery_available = true;
     let mut last_dispatch = None;
     let mut candidate_rank = 0_usize;
@@ -1475,6 +1519,30 @@ async fn proxy_with_cancellation_guard(
                     stage = "upstream_candidate_selection",
                     "proxy candidate selection failed"
                 );
+                if matches!(error, AppError::Capacity { .. } | AppError::Overloaded) {
+                    let code = error.diagnostic_category().to_owned();
+                    let response = error.into_response();
+                    let (parts, body) = response.into_parts();
+                    let body = axum::body::to_bytes(body, 64 * 1024)
+                        .await
+                        .map_err(|_| AppError::internal("local_admission_error_body"))?;
+                    let mut response = finish_buffered_request(
+                        &buffered_request,
+                        parts.status,
+                        body,
+                        "application/json",
+                        (
+                            TokenUsage::default(),
+                            crate::model::RequestUsageBasis::NotObserved,
+                        ),
+                        Some(code),
+                    )
+                    .await?;
+                    response
+                        .headers_mut()
+                        .insert(header::RETRY_AFTER, HeaderValue::from_static("1"));
+                    return Ok(response);
+                }
                 return finish_proxy_failure(&buffered_request, "upstream_candidate_invalid").await;
             }
         };
@@ -1487,12 +1555,28 @@ async fn proxy_with_cancellation_guard(
             None,
             None,
         );
-        let Some((active_route, mut upstream_attempt, selected_candidate_rank, outbound_attempt)) =
-            selected
+        let Some((
+            mut active_route,
+            mut upstream_attempt,
+            selected_candidate_rank,
+            outbound_attempt,
+        )) = selected
         else {
             return finish_unavailable(&buffered_request, "upstream_unavailable", last_dispatch)
                 .await;
         };
+        let candidate_model = (
+            active_route.route.account_id,
+            active_route.route.upstream_model.clone(),
+            active_route.route.credential_generation,
+            active_route.route.transport_revision,
+        );
+        if rejected_models.contains(&candidate_model) {
+            upstream_attempt
+                .complete(UpstreamAttemptTerminal::Inconclusive)
+                .await;
+            continue;
+        }
         if !active_route.is_codex()
             || !dispatch_permit
                 .as_ref()
@@ -1521,8 +1605,6 @@ async fn proxy_with_cancellation_guard(
                 }
             }
         }
-        // Selection may have waited for database admission; do not dispatch
-        // when the original deadline expired during that wait.
         if let Some(reason) = attempt_budget.terminal_reason(outbound_attempts) {
             tracing::warn!(%request_id, outbound_attempts, stage = reason,
                 failure_domain = "local_admission", delivery_evidence = "candidate_not_dispatched",
@@ -1538,31 +1620,110 @@ async fn proxy_with_cancellation_guard(
             Some(active_route.route.account_id),
             Some(active_route.route.credential_generation),
         );
-        let (result, rate_limit) = match attempt_budget
+        if let Err(error) = cancellation.prepare_dispatch(&buffered_request).await {
+            attempt.finish(error.diagnostic_category(), None, None);
+            let response = error.into_response();
+            cancellation.record_dispatch_failure(&response);
+            return Ok(response);
+        }
+        IndependentProbeTarget::validate_target(&active_route.route)?;
+        active_route.inspect_stream_rejection = !route_candidates.as_slice().is_empty()
+            || !deferred_shared_probes.is_empty()
+            || independent_probe::TARGET.try_with(|_| ()).is_ok();
+        let result = attempt_budget
             .send(
-                send_proxy_route(
-                    &state,
-                    &headers,
-                    protocol,
-                    request_id,
-                    &active_route,
-                    selected_candidate_rank,
-                    outbound_attempt,
-                    &mut h2_recovery_available,
+                routing::codex::RESPONSE_ARCHIVE_IDENTITY.scope(
+                    crate::db::ArchiveSpoolIdentity {
+                        request_id,
+                        tenant_id: buffered_request.tenant_id,
+                        reservation_id: buffered_request.reservation.id,
+                    },
+                    send_proxy_route(
+                        &state,
+                        &headers,
+                        protocol,
+                        request_id,
+                        &active_route,
+                        selected_candidate_rank,
+                        outbound_attempt,
+                        &mut h2_recovery_available,
+                    ),
                 ),
                 active_route.wait_for_compaction,
             )
-            .await
-        {
+            .await;
+        if result.is_ok() {
+            cancellation.response_headers_received();
+            note_in_flight_stage(&buffered_request, "upstream_response_body").await;
+        }
+        let (result, rate_limit) = match result {
             Ok(mut result)
-                if active_route.is_codex()
-                    && result.response.status() == StatusCode::TOO_MANY_REQUESTS =>
+                if result.response.status() == StatusCode::FORBIDDEN
+                    || (active_route.is_codex()
+                        && result.response.status() == StatusCode::TOO_MANY_REQUESTS) =>
             {
-                let (response, kind) = routing::classify_rate_limit(result.response).await;
+                let observed_at = unix_millis();
+                let (response, kind, evidence) =
+                    routing::classify_supplier_quota(result.response).await;
+                if response.status() == StatusCode::TOO_MANY_REQUESTS || evidence.exhausted {
+                    publish_supplier_quota(
+                        &state,
+                        &active_route.route,
+                        request_id,
+                        observed_at,
+                        evidence,
+                    );
+                }
                 result.response = response;
                 (Ok(result), Some(kind))
             }
+            Ok(mut result) if result.response.status() == StatusCode::TOO_MANY_REQUESTS => {
+                let observed_at = unix_millis();
+                let evidence =
+                    routing::quota_evidence(result.response.headers(), None, observed_at);
+                publish_supplier_quota(
+                    &state,
+                    &active_route.route,
+                    request_id,
+                    observed_at,
+                    evidence,
+                );
+                result.response = observe_quota_body(
+                    result.response,
+                    &state,
+                    &active_route.route,
+                    request_id,
+                    observed_at,
+                );
+                (Ok(result), None)
+            }
+            Ok(mut result) if result.response.status().is_success() => {
+                let observed_at = unix_millis();
+                let kind = result.preoutput_quota.take().map(|(kind, evidence)| {
+                    publish_supplier_quota(
+                        &state,
+                        &active_route.route,
+                        request_id,
+                        observed_at,
+                        evidence,
+                    );
+                    kind
+                });
+                (Ok(result), kind)
+            }
             result => (result, None),
+        };
+        let (result, model_rejected) = match result {
+            Ok(mut result)
+                if !route_candidates.as_slice().is_empty()
+                    || !deferred_shared_probes.is_empty() =>
+            {
+                let (response, rejected) =
+                    upstream_error::inspect_model_rejection(result.response).await;
+                result.response = response;
+                (Ok(result), rejected)
+            }
+            result => (result, false),
         };
         if active_route.is_codex()
             && let Ok(response) = &result
@@ -1592,6 +1753,15 @@ async fn proxy_with_cancellation_guard(
             &result,
             Err(ProxySendError::CandidateUnavailable | ProxySendError::CredentialUnavailable)
         );
+        // Only the transport's pre-delivery classification proves that an
+        // attempted send did not execute. Preserve uncertainty from any prior
+        // candidate even if the final connection fails before delivery.
+        cancellation.record_transport_non_delivery(matches!(
+            &result,
+            Err(ProxySendError::RetryableConnection(_)
+                | ProxySendError::CandidateUnavailable
+                | ProxySendError::CredentialUnavailable)
+        ));
         if consumed_outbound_attempt {
             outbound_attempts += 1;
             last_dispatch = Some((active_route.route.account_id, active_route.route.route_id));
@@ -1602,6 +1772,8 @@ async fn proxy_with_cancellation_guard(
             selected_candidate_rank,
             outbound_attempt,
             &result,
+            rate_limit,
+            model_rejected,
         );
         let candidate_unavailable = matches!(
             &result,
@@ -1649,16 +1821,26 @@ async fn proxy_with_cancellation_guard(
                 })
                 .await;
         }
-        let disposition = routing::failover_disposition(
-            result.as_ref().ok().map(|result| result.response.status()),
-            result.as_ref().err(),
-        );
+        let disposition = if model_rejected {
+            routing::outcome::FailoverDisposition::ModelRejected
+        } else {
+            routing::failover_disposition(
+                result.as_ref().ok().map(|result| result.response.status()),
+                result.as_ref().err(),
+                rate_limit,
+            )
+        };
+        if disposition.is_definite_rejection() {
+            attempt_budget.note_definite_rejection();
+            rejected_models.insert(candidate_model);
+        }
         let has_standby =
             !route_candidates.as_slice().is_empty() || !deferred_shared_probes.is_empty();
         let failover_reason = disposition.reason().filter(|_| has_standby);
-        if !result
-            .as_ref()
-            .is_ok_and(|result| result.response.status().is_success())
+        if disposition.is_definite_rejection()
+            || !result
+                .as_ref()
+                .is_ok_and(|result| result.response.status().is_success())
         {
             tracing::warn!(%request_id, route_id = %active_route.route.route_id,
                 upstream_account_id = %active_route.route.account_id,
@@ -1676,6 +1858,36 @@ async fn proxy_with_cancellation_guard(
             // A candidate transition is different: release before selection
             // can wait on health/database admission, then rejoin the new lane.
             drop(dispatch_permit.take());
+            if let Ok(discarded) = result {
+                let attempt = crate::archive::RawResponseAttempt {
+                    outbound_attempt,
+                    upstream_account_id: active_route.route.account_id,
+                    model_route_id: active_route.route.route_id,
+                    status_code: discarded.response.status().as_u16(),
+                };
+                // A definite supplier rejection remains original evidence even
+                // if the next candidate fails local admission. The immutable
+                // attempt root is independent of the final response root.
+                let response = discarded.response.with_discarded_attempt_capture(
+                    &state,
+                    crate::db::ArchiveSpoolIdentity {
+                        request_id,
+                        tenant_id: key.tenant_id,
+                        reservation_id: buffered_request.reservation.id,
+                    },
+                    attempt,
+                );
+                if response.status() == StatusCode::TOO_MANY_REQUESTS && !active_route.is_codex() {
+                    state
+                        .routing_persistence
+                        .submit(upstream_error::MAX_ERROR_BYTES, async move {
+                            let _ = upstream_error::read_rejection(response).await;
+                            Ok(())
+                        });
+                } else {
+                    drop(response);
+                }
+            }
             next_failover_reason = Some(reason);
             continue;
         }
@@ -1707,7 +1919,15 @@ async fn proxy_with_cancellation_guard(
                 )
                 .await;
             }
-            Err(ProxySendError::RetryableConnection(_) | ProxySendError::CandidateUnavailable) => {
+            Err(ProxySendError::RetryableConnection(stage)) => {
+                return finish_unavailable(
+                    &buffered_request,
+                    connection_stage_code(stage),
+                    last_dispatch,
+                )
+                .await;
+            }
+            Err(ProxySendError::CandidateUnavailable) => {
                 return finish_unavailable(&buffered_request, "upstream_connection", last_dispatch)
                     .await;
             }
@@ -1715,22 +1935,35 @@ async fn proxy_with_cancellation_guard(
                 return finish_unavailable(&buffered_request, "upstream_rejected", last_dispatch)
                     .await;
             }
-            Err(ProxySendError::CodexBadRequest) => {
+            Err(error @ (ProxySendError::CodexBadRequest | ProxySendError::CodexRejection(_))) => {
+                buffered_request.original_response_capture = true;
+                let body = match error {
+                    ProxySendError::CodexRejection(body) => body,
+                    _ => upstream_error::fallback_body(),
+                };
+                let reason = serde_json::from_slice(&body)
+                    .ok()
+                    .as_ref()
+                    .and_then(crate::supplier_error::reason_from_value);
                 upstream_attempt
                     .complete(UpstreamAttemptTerminal::Inconclusive)
                     .await;
-                return finish_local_buffered_error(
+                return finish_buffered_request_with_upstream_attribution_and_response_object(
                     &buffered_request,
                     StatusCode::BAD_REQUEST,
-                    Bytes::from_static(
-                        b"{\"error\":{\"message\":\"upstream rejected the request\",\"type\":\"upstream_error\"}}",
-                    ),
+                    body,
                     "application/json",
                     (
                         TokenUsage::default(),
                         crate::model::RequestUsageBasis::NotObserved,
                     ),
-                    Some("http_400".to_owned()),
+                    Some(reason.map_or("http_400", |reason| reason.code()).to_owned()),
+                    BufferedFinishPolicy {
+                        upstream_attribution: ProxyRequestUpstreamAttribution::KeepSelected,
+                        terminal_cause: Some(
+                            crate::model::RequestTerminalCause::UpstreamHttpStatus,
+                        ),
+                    },
                 )
                 .await;
             }
@@ -1753,17 +1986,6 @@ async fn proxy_with_cancellation_guard(
                     &buffered_request,
                     kind.error_code(),
                     Some(kind.terminal_cause()),
-                )
-                .await;
-            }
-            Err(ProxySendError::OuterDeadline) => {
-                upstream_attempt
-                    .complete(UpstreamAttemptTerminal::Inconclusive)
-                    .await;
-                return finish_proxy_failure_with_cause(
-                    &buffered_request,
-                    "upstream_transport_outer_deadline",
-                    Some(crate::model::RequestTerminalCause::TransportOuterDeadline),
                 )
                 .await;
             }
@@ -1799,6 +2021,9 @@ async fn proxy_with_cancellation_guard(
             "Upstream rejection header structure"
         );
     }
+    // Capture before any delivery/validation branch can discard a supplier
+    // response, including successful envelopes rejected by local boundaries.
+    let upstream = buffered_request.capture_original_response(upstream).await;
     let (upstream, rejection) = read_safe_proxy_rejection(
         upstream,
         protocol,
@@ -1810,6 +2035,8 @@ async fn proxy_with_cancellation_guard(
     active_route.release_request_buffers();
     if let Some(conversation) = buffered_request.conversation.as_ref() {
         conversation.release_working_copies(&buffered_request.memory);
+    } else {
+        buffered_request.memory.release_unretained_json();
     }
     let is_codex_route = active_route.is_codex();
     let codex_downstream_stream = active_route.codex_downstream_stream;
@@ -1817,7 +2044,10 @@ async fn proxy_with_cancellation_guard(
     let route_driver = Some(active_route.route.driver.as_str());
     let response_headers = if protocol.is_anthropic() || responses_anthropic_route {
         crate::api::anthropic::downstream_response_headers(
-            upstream.as_ref().ok_or(AppError::Internal)?.headers(),
+            upstream
+                .as_ref()
+                .ok_or(AppError::internal("proxy_site_4"))?
+                .headers(),
         )
     } else {
         HeaderMap::new()
@@ -1831,7 +2061,7 @@ async fn proxy_with_cancellation_guard(
             status,
         );
         if protocol.is_anthropic() || responses_anthropic_route {
-            let upstream = upstream.ok_or(AppError::Internal)?;
+            let upstream = upstream.ok_or(AppError::internal("proxy_site_5"))?;
             let content_type = upstream
                 .headers()
                 .get(header::CONTENT_TYPE)
@@ -1850,7 +2080,7 @@ async fn proxy_with_cancellation_guard(
             .map(Bytes::from);
             let mut result = match body {
                 Ok(body) => {
-                    finish_unarchived_proxy_response(
+                    finish_passthrough_error_response(
                         &buffered_request,
                         status,
                         body,
@@ -1891,7 +2121,7 @@ async fn proxy_with_cancellation_guard(
         let (body, terminal_cause) = if let Some(rejection) = rejection {
             (rejection.body, rejection.terminal_cause)
         } else {
-            let upstream = upstream.ok_or(AppError::Internal)?;
+            let upstream = upstream.ok_or(AppError::internal("proxy_site_6"))?;
             let terminal_cause = if status == StatusCode::BAD_GATEWAY {
                 upstream_response::rejected_response_terminal_cause(upstream)
                     .await
@@ -1902,10 +2132,6 @@ async fn proxy_with_cancellation_guard(
             };
             (upstream_error::fallback_body(), terminal_cause)
         };
-        let stored_response = format!(
-            "inline-json:{}",
-            std::str::from_utf8(&body).map_err(|_| AppError::Internal)?
-        );
         let result = finish_buffered_request_with_upstream_attribution_and_response_object(
             &buffered_request,
             status,
@@ -1918,7 +2144,6 @@ async fn proxy_with_cancellation_guard(
             Some(format!("http_{}", status.as_u16())),
             BufferedFinishPolicy {
                 upstream_attribution: ProxyRequestUpstreamAttribution::KeepSelected,
-                response_storage: BufferedResponseStorage::InlineLocalJson(stored_response),
                 terminal_cause,
             },
         )
@@ -1936,15 +2161,16 @@ async fn proxy_with_cancellation_guard(
         codex_retry.complete(CodexRetryTerminal::Failed);
         return result;
     }
-    let upstream = upstream.ok_or(AppError::Internal)?;
+    let upstream = upstream.ok_or(AppError::internal("proxy_site_7"))?;
+    let validated_compact = upstream.validated_compact().is_some();
     let content_type = upstream.headers().get(header::CONTENT_TYPE).cloned();
     let is_sse = content_type
         .as_ref()
         .and_then(|value| value.to_str().ok())
         .and_then(|value| value.split(';').next())
         .is_some_and(|value| value.trim().eq_ignore_ascii_case("text/event-stream"));
-    let will_buffer_response =
-        (is_codex_route && !codex_downstream_stream) || (!is_sse && !strict_openai_chat_usage);
+    let will_buffer_response = !validated_compact
+        && ((is_codex_route && !codex_downstream_stream) || (!is_sse && !strict_openai_chat_usage));
     if requested_native_stream
         && will_buffer_response
         && let Some(conversation) = buffered_request.conversation.as_ref()
@@ -1968,19 +2194,21 @@ async fn proxy_with_cancellation_guard(
         codex_retry.complete(CodexRetryTerminal::Failed);
         return result;
     }
-    if is_codex_route && !codex_downstream_stream {
+    if is_codex_route && !codex_downstream_stream && !validated_compact {
         let buffer_phase = proxy_diagnostics::Phase::account(
             diagnostic_context,
             "codex_buffered_response",
             Some(active_route.route.account_id),
             Some(active_route.route.credential_generation),
         );
-        let buffered = match codex_transport::buffer_response(
+        let mut error_details = None;
+        let buffered = match codex_transport::buffer_response_with_details(
             upstream,
             &buffered_request.memory,
             buffered_request.memory_admission_wait,
             buffered_request.conversation.as_ref(),
             sse_framing_limits,
+            &mut error_details,
         )
         .await
         {
@@ -1988,6 +2216,30 @@ async fn proxy_with_cancellation_guard(
             Err(error_code) => {
                 buffer_phase.finish(error_code, None, None);
                 tracing::warn!(%request_id, stage = error_code, "Codex upstream response failed");
+                if let Some(body) = error_details {
+                    let result =
+                        finish_buffered_request_with_upstream_attribution_and_response_object(
+                            &buffered_request,
+                            StatusCode::BAD_GATEWAY,
+                            body,
+                            "application/json",
+                            (
+                                TokenUsage::default(),
+                                crate::model::RequestUsageBasis::NotObserved,
+                            ),
+                            Some(error_code.to_owned()),
+                            BufferedFinishPolicy {
+                                upstream_attribution: ProxyRequestUpstreamAttribution::KeepSelected,
+                                terminal_cause: None,
+                            },
+                        )
+                        .await;
+                    upstream_attempt
+                        .complete(UpstreamAttemptTerminal::Inconclusive)
+                        .await;
+                    codex_retry.complete(CodexRetryTerminal::Failed);
+                    return result;
+                }
                 let result = finish_proxy_failure_with_cause(
                     &buffered_request,
                     error_code,
@@ -2014,9 +2266,12 @@ async fn proxy_with_cancellation_guard(
             } else if !valid_output {
                 (
                     StatusCode::BAD_GATEWAY,
-                    Bytes::from_static(
-                        b"{\"error\":{\"message\":\"upstream returned an invalid response\",\"type\":\"upstream_error\"}}",
-                    ),
+                    Bytes::from(crate::error::explained_failure_body(
+                        "上游请求失败",
+                        "upstream request failed",
+                        "upstream_invalid_response",
+                        crate::error::ErrorFacts::new(),
+                    )),
                 )
             } else {
                 (
@@ -2111,8 +2366,9 @@ async fn proxy_with_cancellation_guard(
             .await;
         return result;
     }
-    let capture_json_usage = should_capture_buffered_usage(is_sse, content_type.as_ref());
-    if !is_sse {
+    let capture_json_usage =
+        !validated_compact && should_capture_buffered_usage(is_sse, content_type.as_ref());
+    if !is_sse && !validated_compact {
         return finish_non_sse_proxy_response(NonSseProxyResponseInput {
             buffered_request: &buffered_request,
             selected_driver: active_route.route.driver.as_str(),
@@ -2174,8 +2430,9 @@ fn trusted_input_token_overhead_ceiling(
         .as_i64()
         .filter(|ceiling| (0..=MAX_INPUT_TOKEN_OVERHEAD_CEILING).contains(ceiling))
         .ok_or_else(|| {
-            AppError::Upstream(
-                "OpenAI-compatible upstream input token overhead ceiling is invalid".into(),
+            AppError::upstream_with(
+                "upstream_unavailable",
+                crate::error::ErrorFacts::new().stage("proxy_trusted_input_token_overhead_ceiling"),
             )
         })
 }
@@ -2314,16 +2571,36 @@ struct ProxyConversation {
     projection_admission: std::sync::Mutex<ConversationProjectionAdmission>,
 }
 
+#[derive(Clone)]
 enum ConversationBody {
     InMemory(Bytes),
+    #[cfg(test)]
     Spool(std::sync::Arc<crate::gateway_body::request_spool::RequestSpool>),
+    ProjectedSpool {
+        spool: std::sync::Arc<crate::gateway_body::request_spool::RequestSpool>,
+        json_memory_bytes: usize,
+    },
 }
 
 impl ConversationBody {
+    fn source_backed(
+        spool: std::sync::Arc<crate::gateway_body::request_spool::RequestSpool>,
+        request_json: Value,
+        json_memory_bytes: usize,
+    ) -> Self {
+        drop(request_json);
+        Self::ProjectedSpool {
+            spool,
+            json_memory_bytes,
+        }
+    }
+
     fn len(&self) -> usize {
         match self {
             Self::InMemory(body) => body.len(),
+            #[cfg(test)]
             Self::Spool(spool) => spool.len(),
+            Self::ProjectedSpool { spool, .. } => spool.len(),
         }
     }
 
@@ -2332,21 +2609,41 @@ impl ConversationBody {
             Self::InMemory(_) => {
                 crate::gateway_body::memory::REQUEST_MEMORY_WEIGHT.saturating_sub(1)
             }
+            #[cfg(test)]
             Self::Spool(_) => crate::gateway_body::memory::REQUEST_MEMORY_WEIGHT,
+            Self::ProjectedSpool { .. } => crate::gateway_body::memory::REQUEST_MEMORY_WEIGHT,
         }
     }
 
-    async fn read(&self) -> Result<Bytes, AppError> {
+    async fn read(
+        &self,
+        projection_memory: &crate::gateway_body::memory::ConversationProjectionPermit,
+    ) -> Result<Bytes, AppError> {
         match self {
             Self::InMemory(body) => Ok(body.clone()),
-            Self::Spool(spool) => spool.read_all().await.map_err(|_| AppError::Overloaded),
+            #[cfg(test)]
+            Self::Spool(spool) => spool
+                .read_all()
+                .await
+                .map_err(|_| AppError::capacity_error("request_spool_read_failed")),
+            Self::ProjectedSpool { spool, .. } => spool
+                .read_prepaid_projection(projection_memory)
+                .await
+                .map_err(|_| AppError::capacity_error("request_spool_read_failed")),
         }
     }
 
     fn release_working_copies(&self, memory: &crate::gateway_body::memory::ProxyMemoryReservation) {
         match self {
             Self::InMemory(body) => memory.release_conversation_working_copies(body.len()),
+            #[cfg(test)]
             Self::Spool(spool) => {
+                // The test double still has to reread the retained bytes. Dropping
+                // them here made projection fail after the budget charge was released.
+                memory.release_source_backed_conversation_working_copies(spool.len())
+            }
+            Self::ProjectedSpool { spool, .. } => {
+                spool.release_durable_retained();
                 memory.release_source_backed_conversation_working_copies(spool.len())
             }
         }
@@ -2361,17 +2658,60 @@ enum ConversationProjectionAdmission {
 
 struct ProxyConversationProjection<'a> {
     conversation: &'a ProxyConversation,
-    request_json: Value,
-    _memory: crate::gateway_body::memory::ConversationProjectionPermit,
+    request_json: std::sync::Arc<Value>,
+    _memory: Option<crate::gateway_body::memory::ConversationProjectionPermit>,
 }
 
 impl ProxyConversation {
+    fn terminal_receipt_seed(
+        &self,
+        upstream_response_id: Option<&str>,
+    ) -> crate::proxy_lifecycle::pending_terminal::OwnedConversation {
+        crate::proxy_lifecycle::pending_terminal::OwnedConversation::capture(
+            ProxyConversationInput {
+                key: &self.key,
+                request_json: &serde_json::json!({}),
+                hints: &self.hints,
+                client_name: self.client_name.as_deref(),
+                upstream_response_id,
+            },
+        )
+    }
+
+    fn take_for_terminal(&self) -> Option<Self> {
+        let admission = std::mem::replace(
+            &mut *self.projection_admission.lock().ok()?,
+            ConversationProjectionAdmission::Rejected,
+        );
+        Some(Self {
+            key: self.key.clone(),
+            request_body: self.request_body.clone(),
+            hints: self.hints.clone(),
+            client_name: self.client_name.clone(),
+            projection_admission: std::sync::Mutex::new(admission),
+        })
+    }
+
     fn is_source_backed(&self) -> bool {
-        matches!(&self.request_body, ConversationBody::Spool(_))
+        match &self.request_body {
+            ConversationBody::InMemory(_) => false,
+            #[cfg(test)]
+            ConversationBody::Spool(_) => true,
+            ConversationBody::ProjectedSpool { .. } => true,
+        }
     }
 
     fn release_working_copies(&self, memory: &crate::gateway_body::memory::ProxyMemoryReservation) {
         self.request_body.release_working_copies(memory);
+    }
+
+    fn release_retained_upload(&self) {
+        match &self.request_body {
+            ConversationBody::InMemory(_) => {}
+            #[cfg(test)]
+            ConversationBody::Spool(spool) => spool.release_retained(),
+            ConversationBody::ProjectedSpool { spool, .. } => spool.release_durable_retained(),
+        }
     }
 
     fn reject_projection(&self) {
@@ -2380,20 +2720,25 @@ impl ProxyConversation {
         }
     }
 
-    async fn reserve_for_buffered_response(
+    fn reserve_for_buffered_response(
         &self,
         memory: &crate::gateway_body::memory::ProxyMemoryReservation,
         response_maximum: usize,
         deadline: tokio::time::Instant,
     ) -> bool {
+        let (projection_bytes, projection_weight) = match &self.request_body {
+            ConversationBody::ProjectedSpool {
+                json_memory_bytes, ..
+            } => (*json_memory_bytes, 1),
+            body => (body.len(), body.projection_weight()),
+        };
         let admission = memory
             .reserve_buffered_response_with_projection(
                 response_maximum,
-                self.request_body.len(),
-                self.request_body.projection_weight(),
+                projection_bytes,
+                projection_weight,
                 deadline,
             )
-            .await
             .map_or(
                 ConversationProjectionAdmission::Rejected,
                 ConversationProjectionAdmission::Reserved,
@@ -2414,27 +2759,31 @@ impl ProxyConversation {
             let mut current = self
                 .projection_admission
                 .lock()
-                .map_err(|_| AppError::Internal)?;
+                .map_err(|_| AppError::internal("proxy_project_1"))?;
             std::mem::replace(&mut *current, ConversationProjectionAdmission::Rejected)
+        };
+        let (projection_bytes, projection_weight) = match &self.request_body {
+            ConversationBody::ProjectedSpool {
+                json_memory_bytes, ..
+            } => (*json_memory_bytes, 1),
+            body => (body.len(), body.projection_weight()),
         };
         let projection_memory = match admission {
             ConversationProjectionAdmission::Deferred => memory
-                .reserve_conversation_projection(
-                    self.request_body.len(),
-                    self.request_body.projection_weight(),
-                    deadline,
-                )
-                .await
-                .ok_or(AppError::Overloaded)?,
+                .reserve_conversation_projection(projection_bytes, projection_weight, deadline)
+                .ok_or(AppError::capacity_error("proxy_memory_projection"))?,
             ConversationProjectionAdmission::Reserved(permit) => permit,
-            ConversationProjectionAdmission::Rejected => return Err(AppError::Overloaded),
+            ConversationProjectionAdmission::Rejected => {
+                return Err(AppError::capacity_error("proxy_memory_projection"));
+            }
         };
-        let request_body = self.request_body.read().await?;
-        let request_json = serde_json::from_slice(&request_body).map_err(|_| AppError::Internal)?;
+        let request_body = self.request_body.read(&projection_memory).await?;
+        let request_json = serde_json::from_slice(&request_body)
+            .map_err(|_| AppError::internal("proxy_project_2"))?;
         Ok(ProxyConversationProjection {
             conversation: self,
-            request_json,
-            _memory: projection_memory,
+            request_json: std::sync::Arc::new(request_json),
+            _memory: Some(projection_memory),
         })
     }
 
@@ -2460,6 +2809,33 @@ impl<'a> ProxyConversationProjection<'a> {
     }
 }
 
+async fn prepare_terminal_conversation(
+    conversation: Option<ProxyConversation>,
+    memory: std::sync::Arc<crate::gateway_body::memory::ProxyMemoryReservation>,
+    response_id: Option<String>,
+    request_id: Uuid,
+    deadline: tokio::time::Instant,
+) -> Option<crate::proxy_lifecycle::pending_terminal::PreparedConversation> {
+    let conversation = conversation?;
+    match conversation.project(&memory, deadline).await {
+        Ok(projection) => {
+            let conversation = crate::proxy_lifecycle::pending_terminal::OwnedConversation::capture(
+                projection.input(response_id.as_deref()),
+            );
+            Some(
+                crate::proxy_lifecycle::pending_terminal::PreparedConversation {
+                    conversation,
+                    retained: Box::new((projection._memory, memory)),
+                },
+            )
+        }
+        Err(error) => {
+            ProxyConversation::log_projection_error(request_id, &error);
+            None
+        }
+    }
+}
+
 struct BufferedRequest<'a> {
     session_preference: Option<[u8; 32]>,
     state: &'a AppState,
@@ -2473,31 +2849,53 @@ struct BufferedRequest<'a> {
     conversation: Option<ProxyConversation>,
     protocol: Protocol,
     tenant_id: Uuid,
+    original_response_capture: bool,
     memory: std::sync::Arc<crate::gateway_body::memory::ProxyMemoryReservation>,
+}
+
+impl BufferedRequest<'_> {
+    async fn capture_original_response(&mut self, upstream: UpstreamResponse) -> UpstreamResponse {
+        self.original_response_capture = true;
+        let identity = crate::db::ArchiveSpoolIdentity {
+            request_id: self.request_id,
+            tenant_id: self.tenant_id,
+            reservation_id: self.reservation.id,
+        };
+        upstream.with_original_archive_capture(self.state, identity)
+    }
 }
 
 #[allow(clippy::too_many_arguments)]
 async fn execute_component_provider(
-    request: BufferedRequest<'_>,
-    driver: &str,
-    base_url: &str,
-    config: &Value,
-    credential: &UpstreamCredential,
+    mut request: BufferedRequest<'_>,
+    route: &ResolvedUpstream,
     prepared: PreparedProviderRequest,
     context: RequestContext,
     mut upstream_attempt: Option<UpstreamAttemptGuard>,
 ) -> Result<Response, AppError> {
+    let ResolvedUpstream {
+        driver,
+        base_url,
+        config,
+        credential,
+        ..
+    } = route;
     let target = match component_provider_url(base_url, &prepared.path) {
         Ok(target) => target,
         Err(_) => {
             tracing::warn!(request_id = %request.request_id, stage = "component_target", "component provider request failed");
-            return finish_component_provider_failure(&request, "provider_unsafe_target").await;
+            return finish_component_provider_failure(
+                &request,
+                Some("component_target"),
+                "provider_unsafe_target",
+            )
+            .await;
         }
     };
     // The component chooses the HTTP method. Treat every prepared operation
     // as non-replayable unless a future adapter contract proves otherwise.
     let outbound_http = match network::client_for_config_url_no_retry(
-        &request.state.http,
+        &crate::http_settings::inference(&request.state.http),
         &target,
         config,
         credential.proxy(),
@@ -2508,26 +2906,38 @@ async fn execute_component_provider(
         Ok(client) => client,
         Err(_) => {
             tracing::warn!(request_id = %request.request_id, stage = "component_network_client", "component provider request failed");
-            return finish_component_provider_failure(&request, "provider_unsafe_target").await;
+            return finish_component_provider_failure(
+                &request,
+                Some("component_network_client"),
+                "provider_unsafe_target",
+            )
+            .await;
         }
     };
     let mut upstream_request = outbound_http
         .request(prepared.method, target)
-        .timeout(component_provider_timeout(config))
         .body(prepared.body);
     for (name, value) in prepared.headers {
         let name = match reqwest::header::HeaderName::from_bytes(name.as_bytes()) {
             Ok(name) => name,
             Err(_) => {
-                return finish_component_provider_failure(&request, "provider_invalid_request")
-                    .await;
+                return finish_component_provider_failure(
+                    &request,
+                    Some("component_request_header"),
+                    "provider_invalid_request",
+                )
+                .await;
             }
         };
         let value = match reqwest::header::HeaderValue::from_str(&value) {
             Ok(value) => value,
             Err(_) => {
-                return finish_component_provider_failure(&request, "provider_invalid_request")
-                    .await;
+                return finish_component_provider_failure(
+                    &request,
+                    Some("component_request_header"),
+                    "provider_invalid_request",
+                )
+                .await;
             }
         };
         upstream_request = upstream_request.header(name, value);
@@ -2536,7 +2946,12 @@ async fn execute_component_provider(
         Ok(request) => request,
         Err(_) => {
             tracing::warn!(request_id = %request.request_id, stage = "component_credential", "component provider request failed");
-            return finish_component_provider_failure(&request, "provider_credential").await;
+            return finish_component_provider_failure(
+                &request,
+                Some("component_credential"),
+                "provider_credential",
+            )
+            .await;
         }
     };
     let _upstream_activity = request
@@ -2544,9 +2959,40 @@ async fn execute_component_provider(
         .metrics
         .active_upstream(driver, "component_provider");
     let upstream_started = Instant::now();
-    let upstream_result = upstream_request.send().await;
+    IndependentProbeTarget::validate_target(route)?;
+    let body_consumption = routing::codex::send_diagnostics::BodyConsumption::default();
+    let selected_egress =
+        crate::db::egress::SelectedEgress::capture(credential.proxy().map(|value| value.0))
+            .ok()
+            .map(|mut selected| {
+                if credential.proxy().is_none() {
+                    selected.kind = "direct".into();
+                }
+                selected
+            });
+    let mut egress_recorder = None;
+    let upstream_result = async {
+        let (client, prepared) = upstream_request.build_split();
+        let mut prepared = prepared?;
+        body_consumption.attach(&mut prepared);
+        egress_recorder = routing::codex::egress::AttemptRecorder::begin_http(
+            request.state,
+            route,
+            request.request_id,
+            1,
+            selected_egress,
+            body_consumption,
+        );
+        IndependentProbeTarget::dispatched(route);
+        let response = client.execute(prepared).await?;
+        IndependentProbeTarget::response(response.status());
+        Ok::<_, reqwest::Error>(response)
+    }
+    .await;
     if let Some(conversation) = request.conversation.as_ref() {
         conversation.release_working_copies(&request.memory);
+    } else {
+        request.memory.release_unretained_json();
     }
     request.state.metrics.observe_upstream(
         driver,
@@ -2555,12 +3001,20 @@ async fn execute_component_provider(
         upstream_started.elapsed(),
     );
     let upstream = match upstream_result {
-        Ok(response) => response,
+        Ok(response) => {
+            let (response, selected) =
+                routing::codex::egress::observe_response(response.into(), egress_recorder);
+            if let Some(selected) = selected {
+                selected.select();
+            }
+            response
+        }
         Err(error) => {
             tracing::warn!(
                 request_id = %request.request_id,
                 is_timeout = error.is_timeout(),
                 is_connect = error.is_connect(),
+                failure_code = reqwest_connection_code(&error),
                 "component provider upstream request failed"
             );
             if let Some(attempt) = upstream_attempt.as_mut() {
@@ -2578,18 +3032,64 @@ async fn execute_component_provider(
                     })
                     .await;
             }
-            return finish_component_provider_failure(&request, "upstream_connection").await;
+            return finish_component_provider_failure(
+                &request,
+                None,
+                reqwest_connection_code(&error),
+            )
+            .await;
         }
     };
     let upstream_status = upstream.status();
+    let stage_db = request.state.routing_persistence_db.clone();
+    let (stage_request, stage_tenant, stage_key, stage_reservation) = (
+        request.request_id,
+        request.tenant_id,
+        request.reservation.key_id,
+        request.reservation.id,
+    );
+    request
+        .state
+        .routing_persistence
+        .submit_observation(1024, async move {
+            stage_db
+                .record_proxy_in_flight_stage(
+                    stage_request,
+                    stage_tenant,
+                    stage_key,
+                    stage_reservation,
+                    "upstream_response_body",
+                )
+                .await
+        });
+    let upstream = request.capture_original_response(upstream).await;
+
+    IndependentProbeTarget::response(upstream_status);
     if !upstream_status.is_success() && !upstream_status.is_redirection() {
         if let Some(attempt) = upstream_attempt.as_mut() {
-            let terminal = if upstream_status == StatusCode::TOO_MANY_REQUESTS {
-                let (response, kind) = routing::classify_rate_limit(upstream.into()).await;
+            let terminal = if matches!(
+                upstream_status,
+                StatusCode::TOO_MANY_REQUESTS | StatusCode::FORBIDDEN
+            ) {
+                let observed_at = unix_millis();
+                let (response, kind, evidence) = routing::classify_supplier_quota(upstream).await;
+                if upstream_status == StatusCode::TOO_MANY_REQUESTS || evidence.exhausted {
+                    publish_supplier_quota(
+                        request.state,
+                        route,
+                        request.request_id,
+                        observed_at,
+                        evidence,
+                    );
+                }
                 drop(response);
                 UpstreamAttemptTerminal::Failed {
                     kind,
-                    reason: UpstreamHealthReason::RateLimited,
+                    reason: if kind == crate::db::UpstreamFailureKind::Authentication {
+                        UpstreamHealthReason::Unavailable
+                    } else {
+                        UpstreamHealthReason::RateLimited
+                    },
                     failure_stage: "upstream_response",
                 }
             } else {
@@ -2631,7 +3131,6 @@ async fn execute_component_provider(
             Some(format!("http_{}", upstream_status.as_u16())),
             BufferedFinishPolicy {
                 upstream_attribution: ProxyRequestUpstreamAttribution::KeepSelected,
-                response_storage: BufferedResponseStorage::DurableArchive,
                 terminal_cause: Some(crate::model::RequestTerminalCause::UpstreamHttpStatus),
             },
         )
@@ -2647,8 +3146,12 @@ async fn execute_component_provider(
                         .complete(UpstreamAttemptTerminal::invalid_response())
                         .await;
                 }
-                return finish_component_provider_failure(&request, "upstream_invalid_headers")
-                    .await;
+                return finish_component_provider_failure(
+                    &request,
+                    Some("component_response"),
+                    "upstream_invalid_headers",
+                )
+                .await;
             }
         };
         upstream_headers.insert(name.to_string(), value.to_owned());
@@ -2660,10 +3163,11 @@ async fn execute_component_provider(
         .and_then(|provider| provider.component_adapter.as_ref())
         .map(|adapter| adapter.max_response_bytes)
     else {
-        return finish_component_provider_failure(&request, "provider_configuration").await;
+        return finish_component_provider_failure(&request, None, "provider_configuration").await;
     };
+    let has_content_length = upstream.content_length().is_some();
     let upstream_body = match read_bounded_upstream(
-        upstream.into(),
+        upstream,
         maximum.min(MAX_PROXY_RESPONSE_BODY),
         &request.memory,
         request.memory_admission_wait,
@@ -2680,7 +3184,12 @@ async fn execute_component_provider(
                     .complete(upstream_error_health_terminal(error.code()))
                     .await;
             }
-            return finish_component_provider_failure(&request, error.code()).await;
+            return finish_component_provider_failure(
+                &request,
+                Some("component_response"),
+                error.code(),
+            )
+            .await;
         }
     };
     let mut normalized = match normalize_component_provider(
@@ -2690,6 +3199,7 @@ async fn execute_component_provider(
         upstream_status.as_u16(),
         upstream_headers,
         upstream_body,
+        request.memory.clone(),
     )
     .await
     {
@@ -2700,36 +3210,69 @@ async fn execute_component_provider(
             // envelopes through the same typed Upstream error. Both are a
             // failed response-processing attempt, never a client cancellation.
             // Local memory/storage/runtime setup errors remain inconclusive.
-            if matches!(error, AppError::Upstream(_))
+            if matches!(error, AppError::Upstream { .. })
                 && let Some(attempt) = upstream_attempt.as_mut()
             {
                 attempt
                     .complete(UpstreamAttemptTerminal::invalid_response())
                     .await;
             }
-            return finish_component_provider_failure(&request, "provider_normalize").await;
+            return finish_component_provider_failure(
+                &request,
+                Some("component_normalize"),
+                "provider_normalize",
+            )
+            .await;
         }
     };
-    if !request.memory.response_capture_fits(normalized.body.len())
-        || !request.memory.response_json_fits(&normalized.body)
-    {
+    if normalized.body.len() > maximum.min(MAX_PROXY_RESPONSE_BODY) {
         drop(normalized);
-        return finish_component_provider_failure(&request, "upstream_response_memory_capacity")
-            .await;
+        request.memory.release_buffered_response();
+        return finish_component_provider_failure(
+            &request,
+            Some("component_response"),
+            "upstream_response_too_large",
+        )
+        .await;
+    }
+    if !normalized
+        .input_memory
+        .take()
+        .is_some_and(|permit| request.memory.restore_response_envelope(permit))
+        || !request.memory.reserve_response_json(&normalized.body)
+    {
+        tracing::warn!(request_id = %request.request_id,
+            stage = "component_response_json", reserved_bytes = request.memory.buffered_response_reserved_bytes(),
+            actual_bytes = normalized.body.len(), has_content_length, "normalized response JSON memory unavailable");
+        drop(normalized);
+        request.memory.release_buffered_response();
+        return finish_component_provider_failure(
+            &request,
+            Some("component_response"),
+            "upstream_response_memory_capacity",
+        )
+        .await;
     }
     normalized.body.shrink_to_fit();
+    request.memory.shrink_buffered_response(&normalized.body);
+    tracing::debug!(request_id = %request.request_id,
+        stage = "component_response_ready", reserved_bytes = request.memory.buffered_response_reserved_bytes(),
+        actual_bytes = normalized.body.len(), has_content_length, "normalized response memory accounted");
     let status = match StatusCode::from_u16(normalized.status) {
         Ok(status) => status,
         Err(_) => {
+            drop(normalized);
             if let Some(attempt) = upstream_attempt.as_mut() {
                 attempt
                     .complete(UpstreamAttemptTerminal::invalid_response())
                     .await;
             }
-            return finish_component_provider_failure(&request, "provider_invalid_response").await;
+            return finish_component_provider_failure(&request, None, "provider_invalid_response")
+                .await;
         }
     };
     if !status.is_success() {
+        drop(normalized);
         if let Some(attempt) = upstream_attempt.as_mut() {
             attempt
                 .complete(UpstreamAttemptTerminal::invalid_response())
@@ -2761,12 +3304,13 @@ async fn execute_component_provider(
                 .is_none_or(|limit| tokens <= limit)
     });
     if !usage_is_valid {
+        drop(normalized);
         if let Some(attempt) = upstream_attempt.as_mut() {
             attempt
                 .complete(UpstreamAttemptTerminal::invalid_response())
                 .await;
         }
-        return finish_component_provider_failure(&request, "upstream_invalid_usage").await;
+        return finish_component_provider_failure(&request, None, "upstream_invalid_usage").await;
     }
     if normalized.estimated {
         tracing::debug!(request_id = %request.request_id, stage = "component_usage", "component provider reported estimated usage");
@@ -2817,8 +3361,48 @@ async fn execute_component_provider(
     result
 }
 
+fn connection_stage_code(stage: &str) -> &'static str {
+    match stage {
+        "proxy_connect" => "proxy_connect_failed",
+        "dns" => "dns_resolution_failed",
+        "tls" => "tls_handshake_failed",
+        "connect" => "upstream_connect_failed",
+        _ => "upstream_connection",
+    }
+}
+
+fn reqwest_connection_code(error: &reqwest::Error) -> &'static str {
+    let mut stage = if error.is_connect() {
+        "upstream_connect_failed"
+    } else if error.is_timeout() {
+        "upstream_transport_timeout"
+    } else {
+        "upstream_connection"
+    };
+    let mut source = std::error::Error::source(error);
+    for _ in 0..16 {
+        let Some(current) = source else {
+            break;
+        };
+        let name = std::any::type_name_of_val(current);
+        if name.contains("TunnelError") {
+            return "proxy_connect_failed";
+        }
+        if name.contains("rustls") {
+            stage = "tls_handshake_failed";
+        } else if stage == "upstream_connect_failed"
+            && (name.contains("ResolveError") || name.contains("dns::"))
+        {
+            stage = "dns_resolution_failed";
+        }
+        source = current.source();
+    }
+    stage
+}
+
 async fn finish_component_provider_failure(
     request: &BufferedRequest<'_>,
+    stage: Option<&'static str>,
     error_code: &str,
 ) -> Result<Response, AppError> {
     let memory_capacity = error_code == "upstream_response_memory_capacity";
@@ -2831,7 +3415,15 @@ async fn finish_component_provider_failure(
     finish_local_buffered_error(
         request,
         StatusCode::BAD_GATEWAY,
-        Bytes::from_static(b"{\"error\":{\"message\":\"component provider request failed\"}}"),
+        Bytes::from(crate::error::explained_failure_body(
+            "组件提供商请求失败",
+            "component provider request failed",
+            error_code,
+            match stage {
+                Some(stage) => crate::error::ErrorFacts::new().stage(stage),
+                None => crate::error::ErrorFacts::new(),
+            },
+        )),
         "application/json",
         (
             TokenUsage::default(),
@@ -2861,13 +3453,19 @@ async fn finish_proxy_failure_with_cause(
             .metrics
             .record_proxy_memory_rejection(crate::metrics::ProxyMemoryRejectionStage::Response);
     }
-    let body = Bytes::from_static(
-        b"{\"error\":{\"message\":\"upstream request failed\",\"type\":\"upstream_error\"}}",
-    );
-    let stored_response = format!(
-        "inline-json:{}",
-        std::str::from_utf8(&body).map_err(|_| AppError::Internal)?
-    );
+    let mut facts = crate::error::ErrorFacts::new();
+    if let Some(cause) = terminal_cause {
+        let stage = cause.as_str();
+        if stage != error_code {
+            facts = facts.stage(stage);
+        }
+    }
+    let body = Bytes::from(crate::error::explained_failure_body(
+        "上游请求失败",
+        "upstream request failed",
+        error_code,
+        facts,
+    ));
     finish_buffered_request_with_upstream_attribution_and_response_object(
         request,
         StatusCode::BAD_GATEWAY,
@@ -2880,7 +3478,6 @@ async fn finish_proxy_failure_with_cause(
         Some(error_code.to_owned()),
         BufferedFinishPolicy {
             upstream_attribution: ProxyRequestUpstreamAttribution::KeepSelected,
-            response_storage: BufferedResponseStorage::InlineLocalJson(stored_response),
             terminal_cause,
         },
     )
@@ -2916,13 +3513,6 @@ async fn finish_local_buffered_error_with_upstream_attribution(
     error_code: Option<String>,
     upstream_attribution: ProxyRequestUpstreamAttribution,
 ) -> Result<Response, AppError> {
-    const MAX_INLINE_LOCAL_ERROR_BYTES: usize = 4 * 1024;
-    if body.len() > MAX_INLINE_LOCAL_ERROR_BYTES || serde_json::from_slice::<Value>(&body).is_err()
-    {
-        return Err(AppError::Internal);
-    }
-    let body_text = std::str::from_utf8(&body).map_err(|_| AppError::Internal)?;
-    let stored_response = format!("inline-json:{body_text}");
     finish_buffered_request_with_upstream_attribution_and_response_object(
         request,
         status,
@@ -2932,25 +3522,14 @@ async fn finish_local_buffered_error_with_upstream_attribution(
         error_code,
         BufferedFinishPolicy {
             upstream_attribution,
-            response_storage: BufferedResponseStorage::InlineLocalJson(stored_response),
             terminal_cause: None,
         },
     )
     .await
 }
 
-enum BufferedResponseStorage {
-    DurableArchive,
-    InlineLocalJson(String),
-    /// A passthrough error is returned to the client so its protocol-level
-    /// recovery can inspect it, while archival retains only the request and
-    /// terminal facts. Upstream error text is not a durable audit payload.
-    Omit,
-}
-
 struct BufferedFinishPolicy {
     upstream_attribution: ProxyRequestUpstreamAttribution,
-    response_storage: BufferedResponseStorage,
     terminal_cause: Option<crate::model::RequestTerminalCause>,
 }
 
@@ -2992,14 +3571,13 @@ async fn finish_buffered_request_with_upstream_attribution(
         error_code,
         BufferedFinishPolicy {
             upstream_attribution,
-            response_storage: BufferedResponseStorage::DurableArchive,
             terminal_cause: None,
         },
     )
     .await
 }
 
-async fn finish_unarchived_proxy_response(
+async fn finish_passthrough_error_response(
     request: &BufferedRequest<'_>,
     status: StatusCode,
     body: Bytes,
@@ -3016,7 +3594,6 @@ async fn finish_unarchived_proxy_response(
         error_code,
         BufferedFinishPolicy {
             upstream_attribution: ProxyRequestUpstreamAttribution::KeepSelected,
-            response_storage: BufferedResponseStorage::Omit,
             terminal_cause: Some(crate::model::RequestTerminalCause::UpstreamHttpStatus),
         },
     )
@@ -3033,7 +3610,7 @@ async fn finish_buffered_request_with_upstream_attribution_and_response_object(
     policy: BufferedFinishPolicy,
 ) -> Result<Response, AppError> {
     let deadline = tokio::time::Instant::now() + MAX_PROXY_FINALIZATION_LIFETIME;
-    let finalization = Box::pin(finish_buffered_request_before_deadline(
+    finish_buffered_request_before_deadline(
         request,
         status,
         body,
@@ -3042,24 +3619,8 @@ async fn finish_buffered_request_with_upstream_attribution_and_response_object(
         error_code,
         policy,
         deadline,
-    ));
-    match run_bounded_proxy_lifecycle(deadline, finalization).await {
-        Ok(result) => result,
-        Err(_) => {
-            let _ = tokio::time::timeout(
-                MAX_PROXY_FINALIZATION_LIFETIME,
-                request.state.db.expire_proxy_lifecycle_deadline(
-                    request.request_id,
-                    request.tenant_id,
-                    &request.reservation,
-                    proxy_diagnostics::Context::for_request(request.request_id)
-                        .elapsed_millis_at(Instant::now()),
-                ),
-            )
-            .await;
-            Err(AppError::Internal)
-        }
-    }
+    )
+    .await
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -3075,14 +3636,11 @@ async fn finish_buffered_request_before_deadline(
 ) -> Result<Response, AppError> {
     let BufferedFinishPolicy {
         upstream_attribution,
-        response_storage,
         terminal_cause,
     } = policy;
-    let (inline_response_object, archive_response) = match response_storage {
-        BufferedResponseStorage::DurableArchive => (None, true),
-        BufferedResponseStorage::InlineLocalJson(stored_response) => (Some(stored_response), false),
-        BufferedResponseStorage::Omit => (None, false),
-    };
+    if let Some(conversation) = request.conversation.as_ref() {
+        conversation.release_retained_upload();
+    }
     let request_id = request.request_id;
     let (usage, mut usage_basis) = usage;
     let usage = match crate::db::normalize_proxy_usage_with_output_limit(
@@ -3092,7 +3650,7 @@ async fn finish_buffered_request_before_deadline(
         request.requested_service_tier.as_deref(),
     ) {
         Ok(usage) => usage,
-        Err(AppError::Upstream(_)) => {
+        Err(AppError::Upstream { .. }) => {
             status = StatusCode::BAD_GATEWAY;
             body = Bytes::from_static(
                 b"{\"error\":{\"message\":\"upstream returned invalid usage\",\"type\":\"upstream_error\"}}",
@@ -3112,26 +3670,21 @@ async fn finish_buffered_request_before_deadline(
         && matches!(request.protocol, Protocol::OpenAiResponses))
     .then(|| extract_response_id(&body))
     .flatten();
-    let stored_response =
-        inline_response_object.unwrap_or_else(|| format!("gap://{request_id}/response"));
+    if request.memory.has_buffered_response() {
+        body = request
+            .memory
+            .own_response_bytes(body)
+            .ok_or_else(|| AppError::capacity_error("upstream_response_memory_capacity"))?;
+    }
+    let stored_response = format!("gap://{request_id}/response");
     let routing_session_id = request
         .conversation
         .as_ref()
         .and_then(|conversation| conversation.hints.session_id.clone());
-    let conversation = if let Some(conversation) = request.conversation.as_ref() {
-        match conversation
-            .project(&request.memory, projection_deadline)
-            .await
-        {
-            Ok(projection) => Some(projection),
-            Err(error) => {
-                ProxyConversation::log_projection_error(request_id, &error);
-                None
-            }
-        }
-    } else {
-        None
-    };
+    let conversation = request
+        .conversation
+        .as_ref()
+        .and_then(ProxyConversation::take_for_terminal);
     let terminal = FinishProxyRequest {
         terminal_cause,
         first_output_ms: None,
@@ -3151,59 +3704,67 @@ async fn finish_buffered_request_before_deadline(
         response_object: &stored_response,
         routing_session_id: routing_session_id.as_deref(),
         routing_terminal_observed_at: None,
-        conversation: conversation
-            .as_ref()
-            .map(|projection| projection.input(response_id.as_deref())),
+        conversation: None,
     };
-    let terminal_phase = proxy_diagnostics::Phase::new(
-        proxy_diagnostics::Context::for_request(request_id),
-        "buffered_billing_settlement",
+    let snapshot = crate::proxy_lifecycle::pending_terminal::Snapshot::capture(
+        terminal,
+        upstream_attribution,
+        response_id.clone(),
+        false,
+        "buffered_response_ready",
+    )
+    .with_supplier_summary(&body);
+    request.state.pending_terminals.submit_with_preparation(
+        snapshot,
+        (body.clone(), request.memory.clone(), _response_buffer),
+        conversation
+            .as_ref()
+            .map(|conversation| conversation.terminal_receipt_seed(response_id.as_deref())),
+        prepare_terminal_conversation(
+            conversation,
+            request.memory.clone(),
+            response_id,
+            request_id,
+            projection_deadline,
+        ),
     );
-    let result =
-        finish_proxy_request_with_retry(&request.state.db, terminal, None, upstream_attribution)
-            .await;
-    if archive_response && result.is_ok() {
-        persistence::capture(
+    if let Err(error) = request
+        .state
+        .pending_terminals
+        .record_operational_observation(&request.state.db, request_id)
+        .await
+    {
+        tracing::error!(
+            %request_id,
+            error_category = error.diagnostic_category(),
+            "runtime terminal was not durable before the client response returned"
+        );
+    }
+    if !request.original_response_capture {
+        // Local transport/validation errors are delivery artifacts, not
+        // supplier responses. Preserve their safe summary separately and
+        // retain explicit evidence that no original response was received.
+        persistence::record_capture_failure(
             request.state,
             crate::db::ArchiveSpoolIdentity {
                 request_id,
                 tenant_id: request.tenant_id,
                 reservation_id: request.reservation.id,
             },
-            crate::response_archive_spool::BufferedArchivePurpose::Response,
-            body.clone(),
         );
     }
-    terminal_phase.finish(
-        if result.is_ok() {
-            "completed"
-        } else {
-            "failed"
-        },
-        Some(status.as_u16()),
-        Some(body.len()),
-    );
-    if result.is_err() {
-        tracing::error!(%request_id, stage = "buffered_terminal_transaction", "proxy request finalization failed");
-    }
-    let result = result?;
-    if matches!(result, FinishProxyRequestResult::Finished { .. })
-        && let Some(identity) = request.session_preference
-    {
+    if let Some(identity) = request.session_preference {
         request
             .state
             .session_preferences
             .invalidate(request.state, identity);
-    }
-    if matches!(result, FinishProxyRequestResult::AlreadyFinished { .. }) {
-        tracing::debug!(%request_id, stage = "terminal_replay", "proxy request already finalized");
     }
     Response::builder()
         .status(status)
         .header(REQUEST_ID_HEADER, request_id.to_string())
         .header(header::CONTENT_TYPE, content_type)
         .body(Body::from(body))
-        .map_err(|_| AppError::Internal)
+        .map_err(|_| AppError::internal("proxy_site_2"))
 }
 
 fn routing_selection_seed(

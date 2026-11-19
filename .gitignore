@@ -1,6 +1,7 @@
 /target/
 /.cargo/*
 !/.cargo/config.toml
+!/.cargo/audit.toml
 /.env
 /web/node_modules/
 /web/dist/
@@ -19,3 +20,7 @@ node_modules/
 dist/
 
 /.plugin-examples/
+
+# build-context vendors (fetched from the pinned upstream when network allows)
+/cosign-linux-amd64
+/cosign-LICENSE

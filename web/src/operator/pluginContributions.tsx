@@ -1,8 +1,10 @@
+import type { UpstreamQuotaSnapshot } from './upstreamQuota.js';
 import { useEffect, useState } from 'react';
 import { ApiError, api } from '../api.js';
 import { PluginUiSlot } from '../plugins/PluginUiSlot.js';
 import { operatorRouteKeys, pluginRouteKey, type OperatorRouteKey, type PluginRouteKey } from '../app/routes.js';
 import { OperatorPluginComponentHost } from '../plugins/OperatorPluginComponentHost.js';
+import { PluginConcurrencyAdvice } from './PluginConcurrencyAdvice.js';
 import type {
   PluginManifest,
   PluginOperatorUiContribution,
@@ -42,6 +44,7 @@ export interface OperatorPluginRegistry {
   pages: Map<PluginRouteKey, RegisteredPluginContribution>;
   overviewCards: RegisteredPluginContribution[];
   modelRouteActions: RegisteredPluginContribution[];
+  upstreamAccountResetSettings: RegisteredPluginContribution[];
   pageExtensions: Map<OperatorRouteKey, { before: RegisteredPluginContribution[]; after: RegisteredPluginContribution[] }>;
 }
 
@@ -90,6 +93,7 @@ export function registerOperatorPluginContributions(manifests: PluginManifest[])
   const pages = new Map<PluginRouteKey, RegisteredPluginContribution>();
   const overviewCards: RegisteredPluginContribution[] = [];
   const modelRouteActions: RegisteredPluginContribution[] = [];
+  const upstreamAccountResetSettings: RegisteredPluginContribution[] = [];
   const pageExtensions = new Map<OperatorRouteKey, { before: RegisteredPluginContribution[]; after: RegisteredPluginContribution[] }>();
   const sidebar: Array<RegisteredPluginContribution & { route: PluginRouteKey; category: NonNullable<PluginOperatorUiContribution['category']> }> = [];
   for (const manifest of manifests) {
@@ -117,6 +121,11 @@ export function registerOperatorPluginContributions(manifests: PluginManifest[])
       if (contribution.slot === 'operator.overview.card') {
         if (contribution.route || contribution.category || contribution.target_route) continue;
         overviewCards.push({ ...registration, route: null });
+        continue;
+      }
+      if (contribution.slot === 'operator.upstream-account.reset-settings') {
+        if (contribution.renderer !== 'component_v1' || contribution.route || contribution.category || contribution.target_route) continue;
+        upstreamAccountResetSettings.push({ ...registration, route: null });
         continue;
       }
       if (contribution.slot === 'operator.page.before' || contribution.slot === 'operator.page.after') {
@@ -163,7 +172,7 @@ export function registerOperatorPluginContributions(manifests: PluginManifest[])
       });
     }
   }
-  return { navigation: [...navigation.values()], pages, overviewCards, modelRouteActions, pageExtensions };
+  return { navigation: [...navigation.values()], pages, overviewCards, modelRouteActions, upstreamAccountResetSettings, pageExtensions };
 }
 
 function serviceDataPath(pluginId: string, endpointId: string, tenant: string) {
@@ -413,11 +422,13 @@ export function PluginContributionPage({ registered, token, tenant, locale, onNa
   if (registered.contribution.renderer === 'component_v1') {
     return <article className="plugin-contribution-page plugin-component-page" aria-label={registered.contribution.label}>
       <PluginContributionData registered={registered} token={token} tenant={tenant} locale={locale} onNavigate={onNavigate} context={context} />
+      {registered.pluginId === 'mtc-health-intelligence' && <PluginConcurrencyAdvice token={token} tenant={tenant} locale={locale} />}
     </article>;
   }
   return <article className="panel plugin-contribution-page">
     <div className="panel-title"><div><h2>{registered.contribution.label}</h2><p className="muted">Data from the installed extension.</p></div></div>
     <PluginContributionData registered={registered} token={token} tenant={tenant} locale={locale} onNavigate={onNavigate} />
+    {registered.pluginId === 'mtc-health-intelligence' && <PluginConcurrencyAdvice token={token} tenant={tenant} locale={locale} />}
   </article>;
 }
 
@@ -470,5 +481,26 @@ export function PluginModelRouteActions({ actions, modelRoute, token, tenant, lo
     key={`${registered.pluginId}:${registered.contribution.id}`}
     registered={registered} token={token} tenant={tenant} locale={locale}
     onNavigate={onNavigate} context={{ modelRoute }} compact
+  />)}</>;
+}
+
+/** Account-scoped extension rendered by the core reset-settings section itself. */
+export function PluginUpstreamAccountResetSettings({ contributions, token, accountId, accountName, provider, tenant, locale, onNavigate, quotaSnapshot }: {
+  contributions: RegisteredPluginContribution[];
+  token: string;
+  quotaSnapshot?: UpstreamQuotaSnapshot;
+  accountId: string;
+  accountName: string;
+  provider: string;
+  tenant: string;
+  locale: string;
+  onNavigate: (route: string, context?: Record<string, unknown>) => void;
+}) {
+  if (contributions.length === 0) return null;
+  const upstreamAccount = Object.freeze({ id: accountId, name: accountName, provider, tenantExternalId: tenant });
+  return <>{contributions.map(registered => <PluginContributionData
+    key={`${registered.pluginId}:${registered.contribution.id}:${tenant}:${accountId}`}
+    registered={registered} token={token} tenant={tenant} locale={locale}
+    onNavigate={onNavigate} context={{ upstreamAccount, quotaSnapshot }} compact
   />)}</>;
 }

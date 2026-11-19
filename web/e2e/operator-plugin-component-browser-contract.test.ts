@@ -5,6 +5,68 @@ import test from 'node:test';
 import { chromium } from 'playwright';
 import { createServer } from 'vite';
 
+test('plugin charts load on demand, resize on narrow screens and unmount cleanly', { timeout: 60_000 }, async () => {
+  if (!existsSync(chromium.executablePath())) {
+    if (process.env.MTC_REQUIRE_BROWSER === '1') throw new Error('Chromium is required');
+    return test.skip('Chromium is required');
+  }
+  const server = await createServer({ root: fileURLToPath(new URL('..', import.meta.url)), configFile: false, logLevel: 'silent', server: { host: '127.0.0.1', port: 0 } });
+  await server.listen();
+  const address = server.httpServer?.address();
+  assert.ok(address && typeof address !== 'string');
+  const browser = await chromium.launch({ headless: true });
+  try {
+    const page = await browser.newPage({ viewport: { width: 1024, height: 768 } });
+    const errors: string[] = [];
+    let chartModuleLoads = 0;
+    page.on('pageerror', error => errors.push(error.message));
+    page.on('request', request => {
+      if (new URL(request.url()).pathname === '/src/charts/EChart.tsx') chartModuleLoads += 1;
+    });
+    await page.route('**/ui-assets/plugins/**', route => route.fulfill({
+      contentType: 'text/javascript; charset=utf-8',
+      body: `export function activateOperatorUi({ React, EChart, defineOperatorUiPackage }) {
+        function Workspace() {
+          const [visible, setVisible] = React.useState(false);
+          return React.createElement('div', { style: { minWidth: 0 } },
+            React.createElement('button', { onClick: () => setVisible(current => !current) }, visible ? 'Hide chart' : 'Show chart'),
+            visible && React.createElement(EChart, {
+              ariaLabel: 'Model latency', locale: 'en', timeZone: 'UTC',
+              style: { height: 300, width: '100%', minWidth: 0 },
+              option: { animation: false, xAxis: { type: 'category', data: ['A', 'B'] },
+                yAxis: { type: 'value' }, series: [{ type: 'bar', data: [12, 24] }] },
+            }));
+        }
+        return defineOperatorUiPackage({ apiVersion: 'operator-ui-package-v1', pluginId: 'runtime-bindings',
+          compatiblePluginVersions: ['1.0.0'], components: { workspace: Workspace } });
+      }`,
+    }));
+    await page.goto(`http://127.0.0.1:${address.port}/e2e/fixtures/operator-plugin-runtime-bindings.html`);
+    await page.getByRole('button', { name: 'Show chart', exact: true }).waitFor();
+    assert.equal(chartModuleLoads, 0, 'text-only plugins do not load the chart renderer');
+    await page.getByRole('button', { name: 'Show chart', exact: true }).click();
+    const chart = page.getByRole('img', { name: 'Model latency (UTC)', exact: true });
+    await chart.locator('canvas').waitFor();
+    assert.equal(chartModuleLoads, 1);
+    for (const width of [390, 320, 1024]) {
+      await page.setViewportSize({ width, height: 768 });
+      await page.waitForFunction(() => {
+        const host = document.querySelector<HTMLElement>('[aria-label="Model latency (UTC)"]');
+        const canvas = host?.querySelector('canvas');
+        return host && canvas && host.clientWidth > 100
+          && Math.abs(canvas.width / window.devicePixelRatio - host.clientWidth) < 2;
+      });
+      assert.equal(await page.evaluate(() => document.documentElement.scrollWidth <= window.innerWidth), true);
+    }
+    await page.getByRole('button', { name: 'Hide chart', exact: true }).click();
+    assert.equal(await chart.count(), 0);
+    await page.getByRole('button', { name: 'Show chart', exact: true }).click();
+    await chart.locator('canvas').waitFor();
+    assert.equal(chartModuleLoads, 1, 'remount reuses the shared chart module');
+    assert.deepEqual(errors, []);
+  } finally { await browser.close(); await server.close(); }
+});
+
 test('an installed runtime module renders without rebuilding MTC and failures stay local', { timeout: 60_000 }, async () => {
   if (!existsSync(chromium.executablePath())) {
     if (process.env.MTC_REQUIRE_BROWSER === '1') throw new Error('Chromium is required');
@@ -71,5 +133,98 @@ test('an installed runtime module renders without rebuilding MTC and failures st
     await page.getByTestId('healthy-page-extension').waitFor();
     await page.getByRole('alert').getByText('This plugin view could not be loaded.').waitFor();
     assert.equal(moduleLoads, 1);
+  } finally { await browser.close(); await server.close(); }
+});
+
+test('plugin activation shares the complete React DOM and JSX runtimes with host hooks and portals', { timeout: 60_000 }, async () => {
+  if (!existsSync(chromium.executablePath())) {
+    if (process.env.MTC_REQUIRE_BROWSER === '1') throw new Error('Chromium is required');
+    return test.skip('Chromium is required');
+  }
+  const server = await createServer({ root: fileURLToPath(new URL('..', import.meta.url)), configFile: false, logLevel: 'silent', server: { host: '127.0.0.1', port: 0 } });
+  await server.listen();
+  const address = server.httpServer?.address();
+  assert.ok(address && typeof address !== 'string');
+  const browser = await chromium.launch({ headless: true });
+  try {
+    const page = await browser.newPage();
+    const pageErrors: string[] = [];
+    const consoleErrors: string[] = [];
+    page.on('pageerror', error => pageErrors.push(error.message));
+    page.on('console', message => {
+      if (message.type() === 'error') consoleErrors.push(message.text());
+    });
+    await page.route('**/ui-assets/plugins/**', route => route.fulfill({
+      contentType: 'text/javascript; charset=utf-8',
+      body: `
+        function componentLibrary(loadExternal) {
+          const React = loadExternal('react');
+          const ReactDOM = loadExternal('react-dom');
+          const JSX = loadExternal('react/jsx-runtime');
+          const Context = React.createContext('missing');
+          const PortalCounter = React.memo(function PortalCounter() {
+            const value = React.useContext(Context);
+            const [count, setCount] = React.useState(0);
+            return JSX.jsx('button', {
+              type: 'button',
+              onClick: () => ReactDOM.flushSync(() => setCount(current => current + 1)),
+              children: 'Portal ' + value + ' ' + count,
+            });
+          });
+          return React.memo(function Workspace() {
+            return JSX.jsx(Context.Provider, { value: 'shared', children:
+              JSX.jsxs(JSX.Fragment, { children: [
+                JSX.jsx('div', { 'data-testid': 'runtime-single-instance', children: 'Shared runtime' }),
+                ReactDOM.createPortal(JSX.jsx(PortalCounter, {}), document.getElementById('portal-target')),
+              ] }),
+            });
+          });
+        }
+        export function activateOperatorUi(host) {
+          const expected = window.__operatorRuntimeBindingsFixture;
+          if (!Object.isFrozen(host)) throw new Error('Plugin activation host must be frozen');
+          // Vite may wrap a CommonJS namespace separately at each import site.
+          // Every export, including the default module instance, must stay shared.
+          for (const name of ['React', 'ReactDOM', 'ReactJSXRuntime']) {
+            for (const key of Object.keys(expected[name])) {
+              if (host[name]?.[key] !== expected[name][key]) {
+                throw new Error('Plugin runtime must share host export ' + name + '.' + key);
+              }
+            }
+          }
+          const externals = {
+            react: host.React, 'react-dom': host.ReactDOM, 'react/jsx-runtime': host.ReactJSXRuntime,
+          };
+          // Evaluate the bundled library only after activation supplies externals.
+          const Workspace = componentLibrary(name => {
+            if (!Object.hasOwn(externals, name)) throw new Error('Unknown runtime external');
+            return externals[name];
+          });
+          return host.defineOperatorUiPackage({
+            apiVersion: 'operator-ui-package-v1', pluginId: 'runtime-bindings',
+            compatiblePluginVersions: ['1.0.0'], components: { workspace: Workspace },
+          });
+        }
+      `,
+    }));
+    await page.goto(`http://127.0.0.1:${address.port}/e2e/fixtures/operator-plugin-runtime-bindings.html`);
+    const ready = page.getByTestId('runtime-single-instance');
+    try {
+      await ready.or(page.getByRole('alert')).first().waitFor();
+      assert.equal(await ready.count(), 1, 'the plugin must render instead of its error boundary');
+    } catch (cause) {
+      throw new Error(JSON.stringify({
+        message: 'Runtime binding fixture failed to render',
+        pageErrors,
+        consoleErrors,
+        body: await page.locator('body').innerText(),
+      }), { cause });
+    }
+    assert.equal(await page.getByTestId('runtime-single-instance').innerText(), 'Shared runtime');
+    const portal = page.locator('#portal-target').getByRole('button', { name: 'Portal shared 0', exact: true });
+    await portal.click();
+    await page.locator('#portal-target').getByRole('button', { name: 'Portal shared 1', exact: true }).waitFor();
+    assert.equal(await page.locator('#root #portal-target').count(), 0, 'the portal renders outside the plugin root');
+    assert.deepEqual(pageErrors, []);
   } finally { await browser.close(); await server.close(); }
 });

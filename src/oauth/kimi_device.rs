@@ -9,14 +9,12 @@ use crate::{
     db::{BeginOAuthLoginSession, Database, OAuthLoginClaim, OAuthLoginSessionReference},
     error::AppError,
     network::{self, OutboundScope},
-    provider::{UpstreamCredential, open_private_json, seal_private_json},
+    plain_json::{decode_handle, encode_handle},
+    provider::UpstreamCredential,
 };
 
 pub const DEVICE_ENDPOINT: &str = "https://auth.kimi.com/api/oauth/device_authorization";
 pub const OAUTH_DRIVER: &str = "kimi-oauth";
-const SESSION_AAD: &[u8] = b"mtc/kimi-device/session/v1";
-const STATE_AAD: &[u8] = b"mtc/kimi-device/state/v1";
-const READY_AAD: &[u8] = b"mtc/kimi-device/ready/v1";
 
 pub struct StartKimiDeviceLogin {
     pub tenant_external_id: String,
@@ -103,7 +101,7 @@ struct DeviceResponse {
 }
 
 fn failed() -> AppError {
-    AppError::Upstream("Kimi OAuth request failed".into())
+    AppError::upstream("kimi_oauth_request_failed")
 }
 
 fn encode_form(form: &[(&str, &str)]) -> String {
@@ -113,7 +111,7 @@ fn encode_form(form: &[(&str, &str)]) -> String {
 }
 
 async fn post(
-    http: &reqwest::Client,
+    http: &dyn crate::http_settings::HttpClientSource,
     endpoint: &str,
     proxy: Option<&str>,
     device: &str,
@@ -121,7 +119,7 @@ async fn post(
     allow_test_loopback: bool,
 ) -> Result<Value, AppError> {
     let client = network::client_for_config_url_no_retry(
-        http,
+        &crate::http_settings::scoped(http, crate::http_settings::HttpPurpose::Oauth),
         endpoint,
         &json!({"network_scope":"public"}),
         proxy.map(|url| (url, OutboundScope::Private)),
@@ -133,7 +131,6 @@ async fn post(
         .header("Accept", "application/json")
         .header("Content-Type", "application/x-www-form-urlencoded")
         .body(encode_form(form))
-        .timeout(std::time::Duration::from_secs(10))
         .send()
         .await
         .map_err(|_| failed())?;
@@ -149,7 +146,7 @@ async fn post(
 
 pub async fn start_kimi_device_login(
     db: &Database,
-    http: &reqwest::Client,
+    http: &dyn crate::http_settings::HttpClientSource,
     input: StartKimiDeviceLogin,
     key: &[u8],
     now: i64,
@@ -169,9 +166,9 @@ pub async fn start_kimi_device_login(
 
 async fn start_at(
     db: &Database,
-    http: &reqwest::Client,
+    http: &dyn crate::http_settings::HttpClientSource,
     input: StartKimiDeviceLogin,
-    key: &[u8],
+    _key: &[u8],
     now: i64,
     allow_test_loopback: bool,
     endpoint: &str,
@@ -235,7 +232,7 @@ async fn start_at(
         operator_service_id: input.operator_service_id,
         expires_at,
     };
-    let token = seal_private_json(&session, key, SESSION_AAD)?;
+    let token = encode_handle(&session)?;
     let state = LoginState {
         session,
         account_name: input.account_name.trim().to_owned(),
@@ -252,7 +249,7 @@ async fn start_at(
         flow_kind: OAUTH_DRIVER.to_owned(),
         tenant_external_id: state.session.tenant_external_id.clone(),
         operator_service_id: state.session.operator_service_id,
-        state_ciphertext: super::seal_oauth_login_state(&state, key, STATE_AAD)?,
+        state_ciphertext: super::seal_oauth_login_state(&state)?,
         next_poll_at: now + (interval * 1000) as i64,
         expires_at,
     })
@@ -270,7 +267,7 @@ async fn start_at(
 
 pub async fn poll_kimi_device_login(
     db: &Database,
-    http: &reqwest::Client,
+    http: &dyn crate::http_settings::HttpClientSource,
     token: &str,
     key: &[u8],
     now: i64,
@@ -294,7 +291,7 @@ pub async fn poll_kimi_device_login(
 #[allow(clippy::too_many_arguments)]
 async fn poll_at(
     db: &Database,
-    http: &reqwest::Client,
+    http: &dyn crate::http_settings::HttpClientSource,
     token: &str,
     key: &[u8],
     now: i64,
@@ -321,7 +318,7 @@ async fn poll_at(
 #[allow(clippy::too_many_arguments)]
 async fn poll_at_with_clock(
     db: &Database,
-    http: &reqwest::Client,
+    http: &dyn crate::http_settings::HttpClientSource,
     token: &str,
     key: &[u8],
     now: i64,
@@ -330,7 +327,7 @@ async fn poll_at_with_clock(
     endpoint: &str,
     clock: &(dyn Fn() -> i64 + Sync),
 ) -> Result<KimiDevicePollResult, AppError> {
-    let session: Session = open_private_json(token, key, SESSION_AAD)
+    let session: Session = decode_handle(token)
         .map_err(|_| AppError::BadRequest("invalid OAuth session token".into()))?;
     if scope
         .required_tenant
@@ -356,7 +353,7 @@ async fn poll_at_with_clock(
         } => (lease_owner, state_ciphertext),
         other => return claim_result(other, &session, key),
     };
-    let mut state: LoginState = open_private_json(&encrypted, key, STATE_AAD)?;
+    let mut state: LoginState = decode_handle(&encrypted)?;
     if state.session.session_id != session.session_id
         || state.session.tenant_external_id != session.tenant_external_id
         || state.session.operator_service_id != session.operator_service_id
@@ -411,7 +408,7 @@ async fn poll_at_with_clock(
             db.reschedule_oauth_login_poll(
                 session.session_id,
                 owner,
-                super::seal_oauth_login_state(&state, key, STATE_AAD)?,
+                super::seal_oauth_login_state(&state)?,
                 next,
                 now,
             )
@@ -443,13 +440,8 @@ async fn poll_at_with_clock(
         credential,
         reauthorize: state.reauthorize,
     };
-    db.stage_oauth_login_ready(
-        session.session_id,
-        owner,
-        seal_private_json(&ready, key, READY_AAD)?,
-        now,
-    )
-    .await?;
+    db.stage_oauth_login_ready(session.session_id, owner, encode_handle(&ready)?, now)
+        .await?;
     claim_result(
         db.claim_oauth_login_poll(&reference, now, 5).await?,
         &session,
@@ -460,7 +452,7 @@ async fn poll_at_with_clock(
 fn claim_result(
     claim: OAuthLoginClaim,
     session: &Session,
-    key: &[u8],
+    _key: &[u8],
 ) -> Result<KimiDevicePollResult, AppError> {
     Ok(match claim {
         OAuthLoginClaim::Pending {
@@ -477,9 +469,11 @@ fn claim_result(
             ready_ciphertext,
         } => KimiDevicePollResult::Ready {
             lease_owner,
-            login: Box::new(open_private_json(&ready_ciphertext, key, READY_AAD)?),
+            login: Box::new(decode_handle(&ready_ciphertext)?),
         },
-        OAuthLoginClaim::Claimed { .. } => return Err(AppError::Internal),
+        OAuthLoginClaim::Claimed { .. } => {
+            return Err(AppError::internal("kimi_device_claim_result_1"));
+        }
     })
 }
 
@@ -585,7 +579,7 @@ mod tests {
         )
         .await
         .unwrap_err();
-        assert!(matches!(error, AppError::Upstream(_)));
+        assert!(matches!(error, AppError::Upstream { .. }));
         shutdown.send(()).unwrap();
         server.await.unwrap();
         assert_eq!(
@@ -705,7 +699,7 @@ mod tests {
             started.expires_at - 1, scope(), true, &token_url, &|| started.expires_at).await,
             Err(AppError::BadRequest(message)) if message == "Kimi authorization expired")
         );
-        let session: Session = open_private_json(&started.session_token, key, SESSION_AAD).unwrap();
+        let session: Session = decode_handle(&started.session_token).unwrap();
         let audit_pool = sqlx::AnyPool::connect(&database_url).await.unwrap();
         let (status, ready): (String, Option<String>) = sqlx::query_as(
             "SELECT status, ready_ciphertext FROM oauth_login_sessions WHERE id = $1",

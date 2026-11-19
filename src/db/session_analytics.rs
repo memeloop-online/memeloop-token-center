@@ -85,7 +85,7 @@ pub(super) const RECENT_SESSIONS_FIRST_PAGE_SQL: &str = r#"WITH completed_candid
             WHERE request.tenant_id = $1
               AND ($2 = '' OR request.key_id = $2)
               AND request.status_code IS NULL
-              AND request.completed_at IS NULL
+              AND request.completed_at IS NULL AND NOT EXISTS (SELECT 1 FROM proxy_operational_terminals operational WHERE operational.request_id = request.id AND operational.request_created_at = request.created_at AND operational.tenant_id = request.tenant_id AND operational.key_id = request.key_id AND operational.reservation_id = request.reservation_id)
             GROUP BY request.tenant_id, request.key_id,
                      COALESCE(request.conversation_cluster_id,
                          'unlinked:' || request.key_id)
@@ -155,7 +155,7 @@ pub(super) const RECENT_SESSIONS_FIRST_PAGE_SQL: &str = r#"WITH completed_candid
               AND COALESCE(request.conversation_cluster_id,
                       'unlinked:' || request.key_id) = recent.session_id
               AND request.status_code IS NULL
-              AND request.completed_at IS NULL
+              AND request.completed_at IS NULL AND NOT EXISTS (SELECT 1 FROM proxy_operational_terminals operational WHERE operational.request_id = request.id AND operational.request_created_at = request.created_at AND operational.tenant_id = request.tenant_id AND operational.key_id = request.key_id AND operational.reservation_id = request.reservation_id)
             GROUP BY request.tenant_id, request.key_id,
                      COALESCE(request.conversation_cluster_id,
                          'unlinked:' || request.key_id)
@@ -182,10 +182,9 @@ pub(super) const RECENT_SESSIONS_FIRST_PAGE_SQL: &str = r#"WITH completed_candid
            SELECT recent.key_id, recent.session_id,
                   (SELECT latest.id FROM request_records latest
                     WHERE latest.conversation_cluster_id IS NOT NULL
-                      AND (latest.key_id, latest.conversation_cluster_id) >=
-                          (recent.key_id, recent.session_id)
-                      AND (latest.key_id, latest.conversation_cluster_id) <=
-                          (recent.key_id, recent.session_id)
+                      AND latest.key_id = recent.key_id
+                      AND latest.conversation_cluster_id >= recent.session_id
+                      AND latest.conversation_cluster_id <= recent.session_id
                     ORDER BY latest.key_id ASC,
                              latest.conversation_cluster_id ASC,
                              latest.created_at DESC, latest.id DESC LIMIT 1) AS request_id,
@@ -392,6 +391,61 @@ impl Database {
         session_id: &str,
         filter: ConversationDetailFilter,
     ) -> Result<LogicalSessionDetail, AppError> {
+        if let Some(client) = self.history_reader().await? {
+            if session_id == format!("unlinked:{key_id}") {
+                let mut requests = client
+                    .conversation_requests(
+                        crate::request_history::HistoryScope::Key { tenant_id, key_id },
+                        session_id,
+                        &filter,
+                    )
+                    .await?;
+                let limit = filter.limit as usize;
+                let has_more = requests.len() > limit;
+                requests.truncate(limit);
+                let next_cursor = if has_more {
+                    requests.last().map(|row| crate::model::ConversationCursor {
+                        before_created_at: row.request.created_at,
+                        before_request_id: row.request.request_id,
+                    })
+                } else {
+                    None
+                };
+                requests.reverse();
+                return Ok(LogicalSessionDetail {
+                    session_id: session_id.into(),
+                    cluster_id: None,
+                    unlinked: true,
+                    requests,
+                    edges: vec![],
+                    has_more,
+                    next_cursor,
+                    edges_truncated: false,
+                });
+            }
+            if session_id.starts_with("unlinked:") {
+                return Err(AppError::NotFound);
+            }
+            let cluster = Uuid::parse_str(session_id).map_err(|_| AppError::NotFound)?;
+            let owned = sqlx::query("SELECT 1 FROM conversation_key_clusters p JOIN conversation_clusters c ON c.id = p.cluster_id WHERE p.key_id = $1 AND p.cluster_id = $2 AND c.tenant_id = $3")
+                .bind(key_id.to_string()).bind(cluster.to_string()).bind(tenant_id.to_string()).fetch_optional(&self.pool).await?.is_some();
+            if !owned {
+                return Err(AppError::NotFound);
+            }
+            let detail = self
+                .conversation_cluster_detail(key_id, cluster, filter)
+                .await?;
+            return Ok(LogicalSessionDetail {
+                session_id: session_id.into(),
+                cluster_id: Some(cluster),
+                unlinked: false,
+                requests: detail.requests,
+                edges: detail.edges,
+                has_more: detail.has_more,
+                next_cursor: detail.next_cursor,
+                edges_truncated: detail.edges_truncated,
+            });
+        }
         // Durable session facts outlive a physically retired credential. Authorize
         // details from those tenant-scoped facts instead of the mutable key row.
         let owned = sqlx::query(
@@ -454,6 +508,22 @@ impl Database {
         tenant_id: &str,
         filter: LogicalSessionListFilter,
     ) -> Result<Vec<LogicalSessionSummary>, AppError> {
+        if let Some(client) = self.history_reader().await? {
+            let tenant = parse_uuid(tenant_id.to_owned())?;
+            let scope = if tenant.is_nil() {
+                crate::request_history::HistoryScope::EmptyTenant
+            } else {
+                crate::request_history::HistoryScope::Tenant(tenant)
+            };
+            return Ok(client
+                .session_summaries(
+                    scope,
+                    &filter,
+                    None,
+                    self.history_session_directory(tenant).await?,
+                )
+                .await?);
+        }
         self.recent_sessions_with_candidate_first(tenant_id, filter, true)
             .await
     }
@@ -474,7 +544,7 @@ impl Database {
         filter: LogicalSessionListFilter,
         allow_candidate_first: bool,
     ) -> Result<Vec<LogicalSessionSummary>, AppError> {
-        let limit = filter.limit.clamp(1, 100) + 1;
+        let limit = filter.limit + 1;
         let key_id = filter.key_id.map(|id| id.to_string()).unwrap_or_default();
         let has_cursor = filter.cursor.is_some();
         let (before_last_activity_at, before_session_id, mut before_key_id) =
@@ -523,7 +593,7 @@ impl Database {
                     WHERE request.tenant_id = $1
                       AND ($2 = '' OR request.key_id = $2)
                       AND request.status_code IS NULL
-                      AND request.completed_at IS NULL
+                      AND request.completed_at IS NULL AND NOT EXISTS (SELECT 1 FROM proxy_operational_terminals operational WHERE operational.request_id = request.id AND operational.request_created_at = request.created_at AND operational.tenant_id = request.tenant_id AND operational.key_id = request.key_id AND operational.reservation_id = request.reservation_id)
                     GROUP BY request.tenant_id, request.key_id,
                              COALESCE(request.conversation_cluster_id,
                                  'unlinked:' || request.key_id)
@@ -589,7 +659,13 @@ impl Database {
                               SELECT 1 FROM conversation_observations named_observation
                                WHERE named_observation.key_id = ranked.key_id
                                  AND named_observation.cluster_id = ranked.session_id
-                                 AND LOWER(named_observation.session_name) LIKE $8 ESCAPE '\'))
+                                 AND LOWER(named_observation.session_name) LIKE $8 ESCAPE '\')
+                           OR EXISTS (
+                              SELECT 1 FROM session_generated_titles generated_title
+                               WHERE generated_title.tenant_id = ranked.tenant_id
+                                 AND generated_title.key_id = ranked.key_id
+                                 AND generated_title.session_id = ranked.session_id
+                                 AND LOWER(generated_title.title) LIKE $8 ESCAPE '\'))
                       AND ($7 = '' OR EXISTS (
                               SELECT 1 FROM session_usage_hourly model_usage
                                WHERE model_usage.tenant_id = ranked.tenant_id
@@ -623,10 +699,9 @@ impl Database {
                    SELECT recent.key_id, recent.session_id,
                           (SELECT latest.id FROM request_records latest
                             WHERE latest.conversation_cluster_id IS NOT NULL
-                              AND (latest.key_id, latest.conversation_cluster_id) >=
-                                  (recent.key_id, recent.session_id)
-                              AND (latest.key_id, latest.conversation_cluster_id) <=
-                                  (recent.key_id, recent.session_id)
+                              AND latest.key_id = recent.key_id
+                              AND latest.conversation_cluster_id >= recent.session_id
+                              AND latest.conversation_cluster_id <= recent.session_id
                             ORDER BY latest.key_id ASC,
                                      latest.conversation_cluster_id ASC,
                                      latest.created_at DESC, latest.id DESC LIMIT 1) AS request_id,
@@ -787,10 +862,13 @@ impl Database {
                 .bind(&query)
                 .bind(&before_key_id);
         }
-        session_summaries_from_rows(
+        let mut sessions = session_summaries_from_rows(
             session_query.fetch_all(&self.pool).await?,
             Some(limit as usize),
-        )
+        )?;
+        self.apply_generated_session_titles(tenant_id, &mut sessions)
+            .await?;
+        Ok(sessions)
     }
 
     async fn session_summaries(
@@ -809,13 +887,29 @@ impl Database {
                 "at most {MAX_SESSION_SUMMARY_IDENTITIES} session identities can be loaded at once"
             )));
         }
+        if let Some(client) = self.history_reader().await? {
+            let tenant = parse_uuid(tenant_id.to_owned())?;
+            let scope = if tenant.is_nil() {
+                crate::request_history::HistoryScope::EmptyTenant
+            } else {
+                crate::request_history::HistoryScope::Tenant(tenant)
+            };
+            return Ok(client
+                .session_summaries(
+                    scope,
+                    &filter,
+                    Some(identities),
+                    self.history_session_directory(tenant).await?,
+                )
+                .await?);
+        }
         let mut statement = "WITH requested(key_id, session_id) AS (VALUES ".to_owned();
         for index in 0..identities.len() {
             if index > 0 {
                 statement.push_str(", ");
             }
             write!(statement, "(${}, ${})", index * 2 + 2, index * 2 + 3)
-                .map_err(|_| AppError::Internal)?;
+                .map_err(|_| AppError::internal("session_analytics_session_summaries_1"))?;
         }
         statement.push_str(
             r#"), completed AS (
@@ -846,12 +940,12 @@ impl Database {
                       AND COALESCE(request.conversation_cluster_id,
                               'unlinked:' || request.key_id) = requested.session_id
                       AND request.status_code IS NULL
-                      AND request.completed_at IS NULL
+                      AND request.completed_at IS NULL AND NOT EXISTS (SELECT 1 FROM proxy_operational_terminals operational WHERE operational.request_id = request.id AND operational.request_created_at = request.created_at AND operational.tenant_id = request.tenant_id AND operational.key_id = request.key_id AND operational.reservation_id = request.reservation_id)
                     GROUP BY request.tenant_id, request.key_id,
                              COALESCE(request.conversation_cluster_id,
                                  'unlinked:' || request.key_id)
                ), projected AS (
-                   SELECT key_record.tenant_id, projection.key_id,
+                   SELECT COALESCE(key_record.tenant_id, cluster.tenant_id) AS tenant_id, projection.key_id,
                           projection.cluster_id AS session_id,
                           projection.updated_at AS last_activity_at,
                           projection.request_count
@@ -859,9 +953,12 @@ impl Database {
                      JOIN conversation_key_clusters projection
                        ON projection.key_id = requested.key_id
                       AND projection.cluster_id = requested.session_id
-                     JOIN key_records key_record
+                     JOIN conversation_clusters cluster
+                       ON cluster.id = projection.cluster_id
+                     LEFT JOIN key_records key_record
                        ON key_record.id = projection.key_id
-                      AND key_record.tenant_id = $1
+                    WHERE COALESCE(key_record.tenant_id, cluster.tenant_id) = $1
+                      AND (key_record.id IS NULL OR key_record.tenant_id = cluster.tenant_id)
                ), archived AS (
                    SELECT archive.tenant_id, archive.key_id, archive.session_id,
                           archive.last_activity_at, archive.requests, archive.errors,
@@ -888,7 +985,7 @@ impl Database {
                ), filterable AS (
                    SELECT ranked.*
                      FROM ranked
-                     JOIN key_records filter_key
+                     LEFT JOIN key_records filter_key
                        ON filter_key.id = ranked.key_id
                       AND filter_key.tenant_id = ranked.tenant_id
                      LEFT JOIN completed
@@ -910,12 +1007,12 @@ impl Database {
         let query_parameter = state_parameter + 2;
         write!(
             statement,
-            "({0} = 'all' OR ({0} = 'active' AND active.active_requests > 0) OR ({0} = 'has_errors' AND COALESCE(completed.errors, 0) + COALESCE(archived.errors, 0) > 0)) AND ({2} = '' OR LOWER(ranked.session_id) LIKE {2} ESCAPE '\\' OR LOWER(filter_key.alias) LIKE {2} ESCAPE '\\' OR EXISTS (SELECT 1 FROM conversation_observations named_observation WHERE named_observation.key_id = ranked.key_id AND named_observation.cluster_id = ranked.session_id AND LOWER(named_observation.session_name) LIKE {2} ESCAPE '\\')) AND ({1} = '' OR EXISTS (SELECT 1 FROM session_usage_hourly model_usage WHERE model_usage.tenant_id = ranked.tenant_id AND model_usage.key_id = ranked.key_id AND model_usage.session_id = ranked.session_id AND model_usage.model = {1}) OR EXISTS (SELECT 1 FROM request_records model_active WHERE model_active.tenant_id = ranked.tenant_id AND model_active.key_id = ranked.key_id AND COALESCE(model_active.conversation_cluster_id, 'unlinked:' || model_active.key_id) = ranked.session_id AND model_active.status_code IS NULL AND model_active.completed_at IS NULL AND model_active.model = {1}) OR EXISTS (SELECT 1 FROM session_archive_unlinked_requests model_archive WHERE model_archive.tenant_id = ranked.tenant_id AND model_archive.key_id = ranked.key_id AND COALESCE(model_archive.conversation_cluster_id, 'unlinked:' || model_archive.key_id) = ranked.session_id AND model_archive.model = {1}))",
+            "({0} = 'all' OR ({0} = 'active' AND active.active_requests > 0) OR ({0} = 'has_errors' AND COALESCE(completed.errors, 0) + COALESCE(archived.errors, 0) > 0)) AND ({2} = '' OR LOWER(ranked.session_id) LIKE {2} ESCAPE '\\' OR LOWER(filter_key.alias) LIKE {2} ESCAPE '\\' OR EXISTS (SELECT 1 FROM conversation_observations named_observation WHERE named_observation.key_id = ranked.key_id AND named_observation.cluster_id = ranked.session_id AND LOWER(named_observation.session_name) LIKE {2} ESCAPE '\\') OR EXISTS (SELECT 1 FROM session_generated_titles generated_title WHERE generated_title.tenant_id = ranked.tenant_id AND generated_title.key_id = ranked.key_id AND generated_title.session_id = ranked.session_id AND LOWER(generated_title.title) LIKE {2} ESCAPE '\\')) AND ({1} = '' OR EXISTS (SELECT 1 FROM session_usage_hourly model_usage WHERE model_usage.tenant_id = ranked.tenant_id AND model_usage.key_id = ranked.key_id AND model_usage.session_id = ranked.session_id AND model_usage.model = {1}) OR EXISTS (SELECT 1 FROM request_records model_active WHERE model_active.tenant_id = ranked.tenant_id AND model_active.key_id = ranked.key_id AND COALESCE(model_active.conversation_cluster_id, 'unlinked:' || model_active.key_id) = ranked.session_id AND model_active.status_code IS NULL AND model_active.completed_at IS NULL AND model_active.model = {1}) OR EXISTS (SELECT 1 FROM session_archive_unlinked_requests model_archive WHERE model_archive.tenant_id = ranked.tenant_id AND model_archive.key_id = ranked.key_id AND COALESCE(model_archive.conversation_cluster_id, 'unlinked:' || model_archive.key_id) = ranked.session_id AND model_archive.model = {1}))",
             format_args!("${state_parameter}"),
             format_args!("${model_parameter}"),
             format_args!("${query_parameter}"),
         )
-        .map_err(|_| AppError::Internal)?;
+        .map_err(|_| AppError::internal("session_analytics_site_1"))?;
         statement.push_str(
             r#"
                ), recent AS (
@@ -924,10 +1021,9 @@ impl Database {
                    SELECT recent.key_id, recent.session_id,
                           (SELECT latest.id FROM request_records latest
                             WHERE latest.conversation_cluster_id IS NOT NULL
-                              AND (latest.key_id, latest.conversation_cluster_id) >=
-                                  (recent.key_id, recent.session_id)
-                              AND (latest.key_id, latest.conversation_cluster_id) <=
-                                  (recent.key_id, recent.session_id)
+                              AND latest.key_id = recent.key_id
+                              AND latest.conversation_cluster_id >= recent.session_id
+                              AND latest.conversation_cluster_id <= recent.session_id
                             ORDER BY latest.key_id ASC,
                                      latest.conversation_cluster_id ASC,
                                      latest.created_at DESC, latest.id DESC LIMIT 1) AS request_id,
@@ -1014,7 +1110,7 @@ impl Database {
                           ) AS activity_rank
                      FROM recent_activity
                )
-               SELECT recent.*, key_record.alias AS key_alias,
+               SELECT recent.*, COALESCE(key_record.alias, '__retired_credential__') AS key_alias,
                       COALESCE(totals.currency, '') AS currency,
                       COALESCE(totals.cost_micros, 0) AS cost_micros,
                       COALESCE(completed.requests, 0) AS requests,
@@ -1040,7 +1136,7 @@ impl Database {
                            WHEN latest_activity.status_code BETWEEN 200 AND 399 THEN 'success'
                            ELSE 'error' END AS last_status
                  FROM recent
-                 JOIN key_records key_record
+                 LEFT JOIN key_records key_record
                    ON key_record.id = recent.key_id
                   AND key_record.tenant_id = recent.tenant_id
                  LEFT JOIN completed
@@ -1077,7 +1173,11 @@ impl Database {
         let model = filter.model.unwrap_or_default();
         let query = search_prefix(filter.query.as_deref());
         session_query = session_query.bind(&filter.state).bind(&model).bind(&query);
-        session_summaries_from_rows(session_query.fetch_all(&self.pool).await?, None)
+        let mut sessions =
+            session_summaries_from_rows(session_query.fetch_all(&self.pool).await?, None)?;
+        self.apply_generated_session_titles(tenant_id, &mut sessions)
+            .await?;
+        Ok(sessions)
     }
 
     async fn unlinked_session_detail(
@@ -1087,23 +1187,26 @@ impl Database {
         filter: ConversationDetailFilter,
     ) -> Result<LogicalSessionDetail, AppError> {
         let key_id = key_id.to_string();
-        let limit = filter.limit.clamp(1, 200);
+        let limit = filter.limit;
         let rows = if let (Some(before_created_at), Some(before_request_id)) =
             (filter.before_created_at, filter.before_request_id)
         {
             sqlx::query(
                 r#"SELECT id, created_at, completed_at, source_completed_at, protocol, model, upstream_model, upstream_account_id, route_id, status_code, duration_ms, first_output_ms, generation_duration_ms,
                           usage_basis, input_tokens, cached_input_tokens, cache_write_tokens, output_tokens, billed_units, billing_unit,
-                          cost_micros, currency, error_code, terminal_cause_code, archive_state,
+                          cost_micros, currency, error_code, terminal_cause_code, in_flight_stage, archive_state,
                           source_kind, provenance_kind, archive_source, external_request_id
                      FROM (
                          SELECT r.id, r.created_at, r.completed_at, CAST(NULL AS BIGINT) AS source_completed_at, r.protocol, r.model, r.upstream_model, r.upstream_account_id, r.model_route_id AS route_id, r.status_code, r.duration_ms, r.first_output_ms, r.generation_duration_ms,
                                 r.usage_basis, r.input_tokens, r.cached_input_tokens, r.cache_write_tokens, r.output_tokens, r.billed_units, r.billing_unit,
-                                r.cost_micros, r.currency, r.error_code, r.terminal_cause_code,
+                                r.cost_micros, r.currency, r.error_code, r.terminal_cause_code, r.in_flight_stage,
                                 CASE WHEN request_spool.state = 'uploading' OR spool.state = 'uploading' THEN 'uploading' WHEN request_spool.state = 'pending' OR spool.state = 'pending' THEN 'pending' WHEN request_spool.state = 'capturing' OR spool.state = 'capturing' OR r.completed_at IS NULL THEN 'capturing' WHEN request_spool.state = 'gap' OR spool.state = 'gap' OR r.request_object LIKE 'gap://%' OR r.response_object IS NULL OR r.response_object LIKE 'gap://%' THEN 'gap' ELSE 'bound' END AS archive_state,
                                 'live' AS source_kind, 'native' AS provenance_kind,
                                 NULL AS archive_source, NULL AS external_request_id
-                           FROM request_records r
+                           FROM (SELECT * FROM request_records
+                                  WHERE key_id = $1 AND conversation_cluster_id IS NULL
+                                    AND (created_at < $2 OR (created_at = $2 AND id < $3))
+                                  ORDER BY created_at DESC, id DESC LIMIT $4) r
                            LEFT JOIN request_archive_spools request_spool
                              ON request_spool.request_id = r.id AND request_spool.tenant_id = r.tenant_id
                             AND request_spool.reservation_id = r.reservation_id
@@ -1117,14 +1220,16 @@ impl Database {
                                 CAST(0 AS BIGINT) AS cached_input_tokens,
                                 CAST(0 AS BIGINT) AS cache_write_tokens, output_tokens,
                                 CAST(0 AS BIGINT) AS billed_units, CAST(NULL AS TEXT) AS billing_unit,
-                                CAST(0 AS BIGINT), NULL AS currency, error_code, CAST(NULL AS TEXT) AS terminal_cause_code,
+                                CAST(0 AS BIGINT), NULL AS currency, error_code, CAST(NULL AS TEXT) AS terminal_cause_code, CAST(NULL AS TEXT) AS in_flight_stage,
                                 CASE WHEN request_object IS NULL OR request_object LIKE 'gap://%'
                                            OR response_object IS NULL OR response_object LIKE 'gap://%'
                                      THEN 'gap' ELSE 'bound' END AS archive_state,
                                 'session_archive',
                                 'archive_unlinked', source, external_request_id
-                           FROM session_archive_unlinked_requests
-                          WHERE key_id = $1 AND conversation_cluster_id IS NULL
+                           FROM (SELECT * FROM session_archive_unlinked_requests
+                                  WHERE key_id = $1 AND conversation_cluster_id IS NULL
+                                    AND (source_started_at < $2 OR (source_started_at = $2 AND archive_request_id < $3))
+                                  ORDER BY source_started_at DESC, archive_request_id DESC LIMIT $4) archive_page
                      ) activity
                     WHERE created_at < $2 OR (created_at = $2 AND id < $3)
                     ORDER BY created_at DESC, id DESC LIMIT $4"#,
@@ -1139,16 +1244,18 @@ impl Database {
             sqlx::query(
                 r#"SELECT id, created_at, completed_at, source_completed_at, protocol, model, upstream_model, upstream_account_id, route_id, status_code, duration_ms, first_output_ms, generation_duration_ms,
                           usage_basis, input_tokens, cached_input_tokens, cache_write_tokens, output_tokens, billed_units, billing_unit,
-                          cost_micros, currency, error_code, terminal_cause_code, archive_state,
+                          cost_micros, currency, error_code, terminal_cause_code, in_flight_stage, archive_state,
                           source_kind, provenance_kind, archive_source, external_request_id
                      FROM (
                          SELECT r.id, r.created_at, r.completed_at, CAST(NULL AS BIGINT) AS source_completed_at, r.protocol, r.model, r.upstream_model, r.upstream_account_id, r.model_route_id AS route_id, r.status_code, r.duration_ms, r.first_output_ms, r.generation_duration_ms,
                                 r.usage_basis, r.input_tokens, r.cached_input_tokens, r.cache_write_tokens, r.output_tokens, r.billed_units, r.billing_unit,
-                                r.cost_micros, r.currency, r.error_code, r.terminal_cause_code,
+                                r.cost_micros, r.currency, r.error_code, r.terminal_cause_code, r.in_flight_stage,
                                 CASE WHEN request_spool.state = 'uploading' OR spool.state = 'uploading' THEN 'uploading' WHEN request_spool.state = 'pending' OR spool.state = 'pending' THEN 'pending' WHEN request_spool.state = 'capturing' OR spool.state = 'capturing' OR r.completed_at IS NULL THEN 'capturing' WHEN request_spool.state = 'gap' OR spool.state = 'gap' OR r.request_object LIKE 'gap://%' OR r.response_object IS NULL OR r.response_object LIKE 'gap://%' THEN 'gap' ELSE 'bound' END AS archive_state,
                                 'live' AS source_kind, 'native' AS provenance_kind,
                                 NULL AS archive_source, NULL AS external_request_id
-                           FROM request_records r
+                           FROM (SELECT * FROM request_records
+                                  WHERE key_id = $1 AND conversation_cluster_id IS NULL
+                                  ORDER BY created_at DESC, id DESC LIMIT $2) r
                            LEFT JOIN request_archive_spools request_spool
                              ON request_spool.request_id = r.id AND request_spool.tenant_id = r.tenant_id
                             AND request_spool.reservation_id = r.reservation_id
@@ -1162,14 +1269,15 @@ impl Database {
                                 CAST(0 AS BIGINT) AS cached_input_tokens,
                                 CAST(0 AS BIGINT) AS cache_write_tokens, output_tokens,
                                 CAST(0 AS BIGINT) AS billed_units, CAST(NULL AS TEXT) AS billing_unit,
-                                CAST(0 AS BIGINT), NULL AS currency, error_code, CAST(NULL AS TEXT) AS terminal_cause_code,
+                                CAST(0 AS BIGINT), NULL AS currency, error_code, CAST(NULL AS TEXT) AS terminal_cause_code, CAST(NULL AS TEXT) AS in_flight_stage,
                                 CASE WHEN request_object IS NULL OR request_object LIKE 'gap://%'
                                            OR response_object IS NULL OR response_object LIKE 'gap://%'
                                      THEN 'gap' ELSE 'bound' END AS archive_state,
                                 'session_archive',
                                 'archive_unlinked', source, external_request_id
-                           FROM session_archive_unlinked_requests
-                          WHERE key_id = $1 AND conversation_cluster_id IS NULL
+                           FROM (SELECT * FROM session_archive_unlinked_requests
+                                  WHERE key_id = $1 AND conversation_cluster_id IS NULL
+                                  ORDER BY source_started_at DESC, archive_request_id DESC LIMIT $2) archive_page
                      ) activity
                     ORDER BY created_at DESC, id DESC LIMIT $2"#,
             )
@@ -1229,6 +1337,7 @@ impl Database {
                 }
                 Ok(ConversationRequestView {
                     request: RequestView {
+                        operational_terminal: None,
                         egress: None,
                         usage_basis: super::requests::request_usage_basis_from_row(&row)?,
                         compaction: None,
@@ -1285,11 +1394,14 @@ impl Database {
                         billing,
                         error_code,
                         terminal_cause_code: row.try_get("terminal_cause_code")?,
+                        in_flight_stage: crate::model::recorded_in_flight_stage(
+                            row.try_get("in_flight_stage")?,
+                        ),
                         supplier_error: None,
                         archive_state: crate::model::RequestArchiveState::from_storage(
                             row.try_get::<String, _>("archive_state")?.as_str(),
                         )
-                        .ok_or(AppError::Internal)?,
+                        .ok_or(AppError::internal("session_analytics_site_1"))?,
                         credential_identity: None,
                         session_context: Some(RequestSessionContext::unlinked(None)),
                     },

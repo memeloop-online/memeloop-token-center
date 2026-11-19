@@ -50,18 +50,14 @@ app.kubernetes.io/managed-by: {{ .Release.Service }}
       key: {{ .Values.config.databaseUrlSecret.key }}
 - name: MTC_DATABASE_MAX_CONNECTIONS
   value: {{ .Values.config.databaseMaxConnections | quote }}
-- name: MTC_PROXY_LIFECYCLE_CONCURRENCY
-  value: {{ .Values.config.proxyLifecycleConcurrency | quote }}
+- name: MTC_DATABASE_AUX_POOL_MAX_CONNECTIONS
+  value: {{ .Values.config.databaseAuxPoolMaxConnections | quote }}
 - name: MTC_PROXY_MEMORY_BUDGET_BYTES
   value: {{ printf "%d" (int64 .Values.config.proxyMemoryBudgetBytes) | quote }}
 - name: MTC_GATEWAY_BODY_READ_CONCURRENCY
   value: {{ .Values.config.gatewayBodyReadConcurrency | quote }}
 - name: MTC_RESPONSES_BODY_MAX_BYTES
   value: {{ printf "%d" (int64 .Values.config.responsesBodyMaxBytes) | quote }}
-- name: MTC_RESPONSES_REQUEST_SPOOL_BYTES
-  value: {{ printf "%d" (int64 .Values.config.responsesRequestSpoolBytes) | quote }}
-- name: MTC_RESPONSES_REQUEST_SPOOL_PATH
-  value: {{ .Values.requestSpool.mountPath | quote }}
 - name: MTC_RESPONSES_BODY_READ_CONCURRENCY
   value: {{ .Values.config.responsesBodyReadConcurrency | quote }}
 - name: MTC_AUDIO_BODY_MAX_BYTES
@@ -100,11 +96,19 @@ app.kubernetes.io/managed-by: {{ .Release.Service }}
 - name: MTC_S3_READINESS_DEADLINE_MILLIS
   value: {{ .Values.config.s3.readinessDeadlineMillis | quote }}
 - name: MTC_S3_ENDPOINT
+  {{- if .Values.rustfs.connectArchive }}
+  value: {{ printf "http://%s:9000" (include "memeloop-token-center.rustfsName" .) | quote }}
+  {{- else }}
   value: {{ .Values.config.s3.endpoint | quote }}
+  {{- end }}
 - name: MTC_S3_REGION
   value: {{ .Values.config.s3.region | quote }}
 - name: MTC_S3_ALLOW_HTTP
+  {{- if .Values.rustfs.connectArchive }}
+  value: "true"
+  {{- else }}
   value: {{ .Values.config.s3.allowHttp | quote }}
+  {{- end }}
 - name: MTC_S3_ACCESS_KEY
   valueFrom:
     secretKeyRef:

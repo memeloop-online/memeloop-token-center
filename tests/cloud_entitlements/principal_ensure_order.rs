@@ -68,7 +68,7 @@ async fn subscription_then_ensure_preserves_credit_policy_and_routing() {
         .await
         .unwrap();
     assert_eq!(managed[0].available_balance, "10");
-    assert_eq!(managed[0].policy.requests_per_minute, 73);
+    assert_eq!(managed[0].policy.requests_per_minute, Some(73));
     assert_eq!(
         fixture
             .state

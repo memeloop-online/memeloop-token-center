@@ -1,25 +1,17 @@
-import type { ModelRouteView } from '../types.js';
+export const filterModelNameSuggestionLimit = 50;
 
-export const filterModelPageSize = 100;
-
-/** The route endpoint is a cursor page, not the complete public model directory. */
-export async function loadFilterModelRoutes(
-  fetchPage: (cursor?: Pick<ModelRouteView, 'created_at' | 'id'>) => Promise<ModelRouteView[]>,
-  onPage: (routes: ModelRouteView[]) => void,
-  signal: AbortSignal,
-): Promise<void> {
-  const routes = new Map<string, ModelRouteView>();
-  const cursors = new Set<string>();
-  let cursor: ModelRouteView | undefined;
-  while (!signal.aborted) {
-    const page = await fetchPage(cursor);
-    if (signal.aborted) return;
-    for (const route of page) routes.set(route.id, route);
-    onPage([...routes.values()]);
-    if (page.length < filterModelPageSize) return;
-    cursor = page[page.length - 1];
-    const key = `${cursor.created_at}:${cursor.id}`;
-    if (cursors.has(key)) throw new Error('Model catalog cursor did not advance');
-    cursors.add(key);
-  }
+/**
+ * Suggestions for the request filter's model-name field. The endpoint returns
+ * distinct public model names recorded for the scope — including names whose
+ * routes are disabled or archived — with no route, account, or availability
+ * enrichment. The backend applies a bounded, case-insensitive literal
+ * substring search, so manual historical names and "contains" fragments
+ * always remain valid even when no suggestion matches.
+ */
+export function filterModelNamesUrl(tenant: string, search: string, limit = filterModelNameSuggestionLimit): string {
+  const params = new URLSearchParams({ limit: String(limit) });
+  if (tenant) params.set('tenant_external_id', tenant);
+  const query = search.trim();
+  if (query) params.set('search', query);
+  return `/internal/v1/filter-model-names?${params.toString()}`;
 }

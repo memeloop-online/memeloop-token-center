@@ -26,6 +26,7 @@ export function RequestStatistics({ stats, onModelSelect }: {
       {countMetric(t('traffic.total'), stats.summary.total_requests, days.map(day => day.requests))}
       <NumberMetric label={t('traffic.success')} value={stats.summary.successful_requests} tone="positive" />
       <NumberMetric label={t('traffic.failure')} value={stats.summary.failed_requests} tone="negative" />
+      <NumberMetric label={t('common.running')} value={stats.summary.pending_requests ?? 0} />
       {countMetric(t('request.tokens'), stats.summary.input_tokens + stats.summary.output_tokens, days.map(day => day.input_tokens + day.output_tokens))}
       <AnalyticsMetric label={copy.tokens} value={cache.tokens === null ? copy.unknown : formatNumber(cache.tokens, locale)} note={tokenNote} />
       <AnalyticsMetric label={copy.rate} value={cache.rate === null ? copy.unknown : new Intl.NumberFormat(locale, { style: 'percent', maximumFractionDigits: 2 }).format(cache.rate)} ratio={cache.rate} note={copy[cache.note]} />

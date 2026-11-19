@@ -62,10 +62,8 @@ pub(crate) struct CodexTransportPolicy {
     pub connect_retry_delay_millis: u64,
     pub shared_probe_attempts: Option<u32>,
     pub candidate_attempts: usize,
-    /// Absolute selection/send budget, not the successful stream lifetime.
-    pub failover_deadline_millis: u64,
-    pub connect_timeout_millis: u64,
-    pub read_timeout_millis: u64,
+    pub connect_timeout_millis: Option<u64>,
+    pub read_timeout_millis: Option<u64>,
     pub request_timeout_millis: u64,
     /// Maximum local memory queue time; does not extend the request deadline.
     pub memory_admission_wait_millis: u64,
@@ -88,9 +86,8 @@ impl Default for CodexTransportPolicy {
             connect_retry_delay_millis: 150,
             shared_probe_attempts: None,
             candidate_attempts: super::types::PROXY_ROUTING_POLICY.max_attempts(),
-            failover_deadline_millis: 300_000,
-            connect_timeout_millis: 5_000,
-            read_timeout_millis: 600_000,
+            connect_timeout_millis: None,
+            read_timeout_millis: None,
             request_timeout_millis: 1_260_000,
             memory_admission_wait_millis: 30_000,
             dispatch_max_in_flight: 0,
@@ -137,9 +134,12 @@ impl CodexTransportPolicy {
                 attempts > crate::config::MAX_UPSTREAM_SHARED_PROBE_ATTEMPTS
             })
             || !(1..=8).contains(&policy.candidate_attempts)
-            || !(1_000..=300_000).contains(&policy.failover_deadline_millis)
-            || !(100..=60_000).contains(&policy.connect_timeout_millis)
-            || !(1_000..=1_260_000).contains(&policy.read_timeout_millis)
+            || policy
+                .connect_timeout_millis
+                .is_some_and(|value| !(100..=600_000).contains(&value))
+            || policy
+                .read_timeout_millis
+                .is_some_and(|value| !(1_000..=1_260_000).contains(&value))
             || !(1_000..=1_260_000).contains(&policy.request_timeout_millis)
             || !(100..=300_000).contains(&policy.memory_admission_wait_millis)
             || policy.dispatch_max_in_flight > 64
@@ -152,8 +152,6 @@ impl CodexTransportPolicy {
             || !(policy.max_sse_event_bytes..=SseFramingLimits::MAX_BUFFER_BYTES)
                 .contains(&policy.max_sse_terminal_hold_bytes)
             || policy.max_sse_terminal_hold_bytes > policy.max_sse_framed_bytes
-            || policy.connect_timeout_millis >= policy.request_timeout_millis
-            || policy.read_timeout_millis > policy.request_timeout_millis
             || value.is_some_and(|value| value.get("shared_probe_attempts") == Some(&Value::Null))
         {
             return Err("invalid_transport_policy");
@@ -174,6 +172,30 @@ impl CodexTransportPolicy {
 mod tests {
     use super::*;
     use serde_json::json;
+
+    #[test]
+    fn network_windows_are_opt_in_and_independent_of_keepalive_ack_budget() {
+        for config in [
+            None,
+            Some(json!({})),
+            Some(json!({
+                "connect_timeout_millis": null, "read_timeout_millis": null
+            })),
+        ] {
+            let policy = CodexTransportPolicy::parse(config.as_ref()).unwrap();
+            assert_eq!(policy.connect_timeout_millis, None);
+            assert_eq!(policy.read_timeout_millis, None);
+        }
+        let policy = CodexTransportPolicy::parse(Some(&json!({
+            "connect_timeout_millis": 2000,
+            "read_timeout_millis": 3000,
+            "request_timeout_millis": 1000
+        })))
+        .unwrap();
+        assert_eq!(policy.connect_timeout_millis, Some(2000));
+        assert_eq!(policy.read_timeout_millis, Some(3000));
+        assert_eq!(policy.request_timeout_millis, 1000);
+    }
 
     #[test]
     fn account_protocol_is_opt_in_and_does_not_gate_existing_fields() {
@@ -217,15 +239,14 @@ mod tests {
             3
         );
         let policy = CodexTransportPolicy::parse(Some(&json!({
-            "version": 1, "candidate_attempts": 8, "failover_deadline_millis": 1000,
+            "version": 1, "candidate_attempts": 8,
             "connect_attempts": 1, "shared_probe_attempts": 0
         })))
         .unwrap();
         assert_eq!(policy.candidate_attempts, 8);
-        assert_eq!(policy.failover_deadline_millis, 1000);
         assert_eq!(policy.shared_probe_attempts, Some(0));
-        assert_eq!(policy.connect_timeout_millis, 5_000);
-        assert_eq!(policy.read_timeout_millis, 600_000);
+        assert_eq!(policy.connect_timeout_millis, None);
+        assert_eq!(policy.read_timeout_millis, None);
         assert_eq!(policy.request_timeout_millis, 1_260_000);
         assert_eq!(policy.memory_admission_wait_millis, 30_000);
         assert_eq!(policy.sse_framing_limits(), SseFramingLimits::default());
@@ -255,8 +276,8 @@ mod tests {
             "request_timeout_millis": 6_000
         })))
         .unwrap();
-        assert_eq!(independent_phases.connect_timeout_millis, 5_000);
-        assert_eq!(independent_phases.read_timeout_millis, 1_000);
+        assert_eq!(independent_phases.connect_timeout_millis, Some(5_000));
+        assert_eq!(independent_phases.read_timeout_millis, Some(1_000));
         let framing = CodexTransportPolicy::parse(Some(&json!({
             "max_sse_event_bytes": 1_048_576,
             "max_sse_framed_bytes": 1_114_112,
@@ -380,8 +401,6 @@ mod tests {
             json!({"version": 2}),
             json!({"candidate_attempts": 0}),
             json!({"candidate_attempts": 9}),
-            json!({"failover_deadline_millis": 999}),
-            json!({"failover_deadline_millis": 300001}),
             json!({"connect_attempts": -1}),
             json!({"connect_attempts": 5}),
             json!({"connect_retry_delay_millis": 2001}),
@@ -394,7 +413,7 @@ mod tests {
             json!({"chat_controls": true}),
             json!({"responses_output_limits": 1}),
             json!({"connect_timeout_millis": 99}),
-            json!({"connect_timeout_millis": 60001}),
+            json!({"connect_timeout_millis": 600001}),
             json!({"read_timeout_millis": 999}),
             json!({"request_timeout_millis": 1260001}),
             json!({"memory_admission_wait_millis": 99}),
@@ -411,9 +430,6 @@ mod tests {
             json!({"max_sse_event_bytes": 1048576, "max_sse_framed_bytes": 1114112, "max_sse_terminal_hold_bytes": 1179648}),
             json!({"max_sse_framed_bytes": 16842753}),
             json!({"max_sse_terminal_hold_bytes": 16842753}),
-            json!({"read_timeout_millis": 2000, "request_timeout_millis": 1000}),
-            json!({"connect_timeout_millis": 2000, "read_timeout_millis": 1000, "request_timeout_millis": 1000}),
-            json!({"connect_timeout_millis": 1000, "read_timeout_millis": 1000, "request_timeout_millis": 1000}),
         ] {
             assert!(
                 CodexTransportPolicy::parse(Some(&invalid)).is_err(),

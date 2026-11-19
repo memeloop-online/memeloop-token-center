@@ -23,6 +23,9 @@ window.conflictNextFormNotesWrite = false;
 window.deferNextFormNotesWrite = false;
 window.deferNextFormQuotaRead = false;
 window.deferNextFormProxyRead = false;
+window.deferNextFormProxyPolicyWrite = false;
+let releaseProxyPolicy: (() => void) | undefined;
+window.releaseFormProxyPolicyWrite = () => { if (!releaseProxyPolicy) throw new Error('No pending proxy policy write'); releaseProxyPolicy(); releaseProxyPolicy = undefined; };
 let releaseProviderCreate: ((status: number) => void) | undefined;
 window.releaseFormProviderCreate = status => { if (!releaseProviderCreate) throw new Error('No pending provider create'); releaseProviderCreate(status); releaseProviderCreate = undefined; };
 let createdProvider: typeof account | undefined;
@@ -41,6 +44,15 @@ const account = { id: 'account-native', tenant_id: 'tenant-fixture', tenant_exte
 const editShape = providerEditShape(new URLSearchParams(location.search).get('provider-shape'));
 if (editShape) { Object.assign(account.config, editShape.config); Object.assign(account, { name: 'synthetic.automation.account@example.invalid', proxy_fingerprint: 'synthetic-diagnostic-fingerprint' }); }
 let proxyUrl = 'socks5h://fixture-user:fixture-password@10.0.0.15:1080';
+let selectionVersion = 0;
+let selectedProxy = 'exit-15';
+const networkProxies = [15, 10, 20, 30, 40].map(last => ({ id: `exit-${last}`, tenant_external_id: 'fixture', name: `Fixture exit ${last}`, version: 1,
+  address: { scheme: 'socks5h', host: `10.0.0.${last}`, port: 1080, remote_dns: true, has_auth: last === 15 },
+  probe: { enabled: false, target_url: 'https://example.invalid/', interval_ms: 60000, attempts: 1 },
+  active_health: { status: 'unknown', checked_at: null, latency_ms: null, scope: 'proxy' }, created_at: 1, updated_at: 1 }));
+const proxySelection = () => ({ configuration_revision: selectionVersion, account_id: account.id, tenant_external_id: account.tenant_external_id,
+  selection_version: selectionVersion, binding_version: selectionVersion, credential_generation: account.credential_generation, account_updated_at: account.updated_at,
+  desired: { mode: 'manual', proxy_id: selectedProxy, group_id: null, plugin_id: null, plugin_version: null, config: {} }, applied: { pending: false } });
 function formQuotaSnapshot(value: { id: string; tenant_external_id: string; driver: string; credential_generation: number }): UpstreamQuotaSnapshot {
   const generation = value.credential_generation;
   const now = Date.now();
@@ -58,6 +70,35 @@ window.fetch = async (input, init) => {
   const url = new URL(typeof input === 'string' ? input : input instanceof URL ? input.href : input.url, location.origin);
   const path = url.pathname;
   const method = init?.method ?? (input instanceof Request ? input.method : 'GET');
+  if (path === '/internal/v1/transport-proxy-groups/access' && method === 'GET' && !url.search) return Response.json({ can_manage: false });
+  if (path.startsWith('/internal/v1/transport-prox') || path.endsWith('/transport-proxy-selection')) {
+    if (method !== 'GET') window.formJourneyWrites++;
+    if (account.can_update_transport_proxy !== true) return new Response(JSON.stringify({ error: { code: 'forbidden' } }), { status: 403 });
+    if (method === 'GET') {
+      if (url.searchParams.get('tenant_external_id') !== account.tenant_external_id) throw new Error('Proxy policy tenant mismatch');
+      if (init?.cache !== 'no-store' || init.credentials !== 'omit' || init.referrerPolicy !== 'no-referrer') throw new Error('Proxy policy reads must stay private and uncached');
+      window.formJourneyReads.push(path);
+      if (path === '/internal/v1/transport-proxies') return Response.json({ items: networkProxies });
+      if (path === '/internal/v1/transport-proxy-groups') return Response.json({ items: [] });
+      if (path === '/internal/v1/transport-proxy-strategies') return Response.json({ items: [{ id: 'manual', version: '1', schema: { type: 'object', properties: {} }, default: {} }] });
+      if (path === '/internal/v1/upstreams/account-native/transport-proxy-selection') return Response.json(proxySelection());
+      throw new Error('Unexpected proxy policy read');
+    }
+    if (method !== 'PUT' || path !== '/internal/v1/upstreams/account-native/transport-proxy-selection' || !workflows || !new URLSearchParams(location.search).has('proxy-workflow')) throw new Error('Mutation outside proxy policy workflow');
+    const data = JSON.parse(String(init?.body ?? '{}'));
+    if (Object.keys(data).sort().join(',') !== ['tenant_external_id', 'expected_selection_version', 'expected_binding_version', 'expected_credential_generation', 'expected_updated_at', 'mode', 'proxy_id', 'config'].sort().join(',') || data.tenant_external_id !== account.tenant_external_id || data.mode !== 'manual' || JSON.stringify(data.config) !== '{}') throw new Error('Proxy policy request shape');
+    if (data.expected_selection_version !== selectionVersion || data.expected_binding_version !== selectionVersion || data.expected_credential_generation !== account.credential_generation || data.expected_updated_at !== account.updated_at) return Response.json({ error: { code: 'network_proxy_selection_version_conflict' } }, { status: 409 });
+    const chosen = networkProxies.find(proxy => proxy.id === data.proxy_id); if (!chosen) throw new Error('Unknown proxy identity');
+    window.formJourneyLastProxyPolicyWrite = structuredClone(data);
+    selectedProxy = chosen.id; selectionVersion++; account.credential_generation++; account.updated_at++;
+    proxyUrl = `socks5h://${chosen.address.host}:${chosen.address.port}`;
+    const savedSelection = proxySelection();
+    if (window.deferNextFormProxyPolicyWrite) {
+      window.deferNextFormProxyPolicyWrite = false;
+      return new Promise<Response>(resolve => { releaseProxyPolicy = () => resolve(Response.json(savedSelection, { status: 202 })); });
+    }
+    return Response.json(savedSelection, { status: 202 });
+  }
   if (method !== 'GET') {
     window.formJourneyWrites++;
     if (workflows && new URLSearchParams(location.search).has('provider-workflow') && method === 'POST' && path === '/internal/v1/upstreams') {
@@ -126,7 +167,7 @@ window.fetch = async (input, init) => {
   window.formJourneyReads.push(path);
   if (path === '/internal/v1/upstreams/account-native/transport-proxy') {
     if (init?.cache !== 'no-store') throw new Error('Proxy reads must not be cached');
-    const snapshot = JSON.stringify({ account_id: account.id, proxy_url: proxyUrl, supported: true, proxy_network_scope: 'private', updated_at: account.updated_at, credential_generation: account.credential_generation });
+    const snapshot = JSON.stringify({ account_id: account.id, proxy_url: proxyUrl, supported: true, proxy_network_scope: 'private', source: 'manual', configuration_state: 'applied', selected_member_id: selectedProxy, updated_at: account.updated_at, credential_generation: account.credential_generation });
     if (window.deferNextFormProxyRead) {
       window.deferNextFormProxyRead = false;
       // Ignore AbortSignal to prove a late response cannot re-publish a prior

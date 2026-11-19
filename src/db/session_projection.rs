@@ -28,6 +28,7 @@ struct RequestSessionDelta {
 pub(crate) async fn add_request_fact_to_session_projection_in_transaction(
     tx: &mut Transaction<'_, Any>,
     request_id: &str,
+    direction: i64,
 ) -> Result<(), AppError> {
     lock_request_stats_projection_writer_in_transaction(tx).await?;
     sqlx::query(
@@ -36,29 +37,30 @@ pub(crate) async fn add_request_fact_to_session_projection_in_transaction(
                requests, errors, input_tokens, output_tokens, cached_input_tokens,
                cache_write_tokens, generation_units, duration_count,
                duration_sum_ms, cost_micros)
-           SELECT tenant_id, key_id, session_id, currency, created_at, 1,
-                  CASE WHEN status_class = 'failure' THEN 1 ELSE 0 END,
-                  CASE WHEN input_tokens >= cached_input_tokens + cache_write_tokens
-                       THEN input_tokens - cached_input_tokens - cache_write_tokens ELSE 0 END,
-                  output_tokens, cached_input_tokens, cache_write_tokens, generation_units,
-                  1, duration_ms, cost_micros
+           SELECT tenant_id, key_id, session_id, currency, created_at, CAST($2 AS BIGINT) * (1),
+                  CAST($2 AS BIGINT) * (CASE WHEN status_class = 'failure' THEN 1 ELSE 0 END),
+                  CAST($2 AS BIGINT) * (CASE WHEN input_tokens >= cached_input_tokens + cache_write_tokens
+                       THEN input_tokens - cached_input_tokens - cache_write_tokens ELSE 0 END),
+                  CAST($2 AS BIGINT) * (output_tokens), CAST($2 AS BIGINT) * (cached_input_tokens), CAST($2 AS BIGINT) * (cache_write_tokens), CAST($2 AS BIGINT) * (generation_units),
+                  CAST($2 AS BIGINT) * (1), CAST($2 AS BIGINT) * (duration_ms), CAST($2 AS BIGINT) * (cost_micros)
              FROM request_stats_facts WHERE request_id = $1
            ON CONFLICT (tenant_id, key_id, session_id, currency) DO UPDATE SET
                last_activity_at = CASE
                    WHEN session_usage_totals.last_activity_at < excluded.last_activity_at
                    THEN excluded.last_activity_at ELSE session_usage_totals.last_activity_at END,
-               requests = session_usage_totals.requests + 1,
+               requests = session_usage_totals.requests + excluded.requests,
                errors = session_usage_totals.errors + excluded.errors,
                input_tokens = session_usage_totals.input_tokens + excluded.input_tokens,
                output_tokens = session_usage_totals.output_tokens + excluded.output_tokens,
                cached_input_tokens = session_usage_totals.cached_input_tokens + excluded.cached_input_tokens,
                cache_write_tokens = session_usage_totals.cache_write_tokens + excluded.cache_write_tokens,
                generation_units = session_usage_totals.generation_units + excluded.generation_units,
-               duration_count = session_usage_totals.duration_count + 1,
+               duration_count = session_usage_totals.duration_count + excluded.duration_count,
                duration_sum_ms = session_usage_totals.duration_sum_ms + excluded.duration_sum_ms,
                cost_micros = session_usage_totals.cost_micros + excluded.cost_micros"#,
     )
     .bind(request_id)
+    .bind(direction)
     .execute(&mut **tx)
     .await?;
 
@@ -79,28 +81,29 @@ pub(crate) async fn add_request_fact_to_session_projection_in_transaction(
                            WHEN protocol = 'audio-transcription' THEN 'audio-transcription'
                            ELSE 'openai' END,
                       status_class, error_code, upstream_account_id, model_route_id,
-                      currency, 1,
-                      CASE WHEN input_tokens >= cached_input_tokens + cache_write_tokens
-                           THEN input_tokens - cached_input_tokens - cache_write_tokens ELSE 0 END,
-                      output_tokens, cached_input_tokens, cache_write_tokens, generation_units,
-                      1, duration_ms, cost_micros
+                      currency, CAST($2 AS BIGINT) * (1),
+                      CAST($2 AS BIGINT) * (CASE WHEN input_tokens >= cached_input_tokens + cache_write_tokens
+                           THEN input_tokens - cached_input_tokens - cache_write_tokens ELSE 0 END),
+                      CAST($2 AS BIGINT) * (output_tokens), CAST($2 AS BIGINT) * (cached_input_tokens), CAST($2 AS BIGINT) * (cache_write_tokens), CAST($2 AS BIGINT) * (generation_units),
+                      CAST($2 AS BIGINT) * (1), CAST($2 AS BIGINT) * (duration_ms), CAST($2 AS BIGINT) * (cost_micros)
                  FROM request_stats_facts WHERE request_id = $1
                ON CONFLICT (
                    tenant_id, key_id, session_id, {bucket_column}, model, protocol,
                    status_class, error_code, upstream_account_id, model_route_id, currency)
                DO UPDATE SET
-                   requests = {table}.requests + 1,
+                   requests = {table}.requests + excluded.requests,
                    input_tokens = {table}.input_tokens + excluded.input_tokens,
                    output_tokens = {table}.output_tokens + excluded.output_tokens,
                    cached_input_tokens = {table}.cached_input_tokens + excluded.cached_input_tokens,
                    cache_write_tokens = {table}.cache_write_tokens + excluded.cache_write_tokens,
                    generation_units = {table}.generation_units + excluded.generation_units,
-                   duration_count = {table}.duration_count + 1,
+                   duration_count = {table}.duration_count + excluded.duration_count,
                    duration_sum_ms = {table}.duration_sum_ms + excluded.duration_sum_ms,
                    cost_micros = {table}.cost_micros + excluded.cost_micros"#,
         );
         sqlx::query(sqlx::AssertSqlSafe(statement))
             .bind(request_id)
+            .bind(direction)
             .execute(&mut **tx)
             .await?;
     }
@@ -185,7 +188,7 @@ pub(crate) async fn reclassify_request_session_in_transaction(
     if !delta.previous_session_id.is_empty() {
         remove_request_fact_from_session_projection_in_transaction(tx, &delta).await?;
     }
-    add_request_fact_to_session_projection_in_transaction(tx, &request_id).await?;
+    add_request_fact_to_session_projection_in_transaction(tx, &request_id, 1).await?;
     Ok(true)
 }
 

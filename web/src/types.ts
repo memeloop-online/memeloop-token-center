@@ -2,6 +2,17 @@
 export interface SupplierError {
   code: string;
   message: string;
+  /** Optional coarse kind (request/policy/authentication/quota/rate_limit/availability); absent on older records. */
+  category?: string;
+  /** Optional server hint that retrying the same request may succeed. */
+  retryable?: boolean;
+  /** Optional stable suggested next step (shorten_context/revise_request/contact_provider/retry_later/check_credentials/check_model). */
+  action?: string;
+  /** Optional provider identifiers kept as labeled technical details, never primary copy. */
+  provider_code?: string;
+  provider_message?: string;
+  /** Optional provider-supplied payload kept verbatim as a labeled technical detail. */
+  provider_details?: unknown;
 }
 
 /** Typed server-recorded failure evidence; a null stage means the observation phase was not recorded. */
@@ -12,6 +23,11 @@ export interface RequestFailureDiagnostic {
 }
 
 export interface RequestView {
+  operational_terminal?: {
+    completed_at: number;
+    stage: 'upstream_response_headers' | 'upstream_response_body' | 'response_delivery' | 'buffered_response_ready' | null;
+    financial_state: 'pending' | 'unknown' | 'applied';
+  } | null;
   /** Recorded token provenance; null/absence is historical unknown, not provider actual. */
   usage_basis?: 'provider_reported' | 'provider_estimated' | 'contract_ceiling' | 'not_observed' | null;
   /** Explicit client context-compaction evidence only; absent/null is unknown. */
@@ -21,7 +37,7 @@ export interface RequestView {
   request_id: string;
   /** Server receipt time in Unix milliseconds; it is not an upstream start time. */
   created_at: number;
-  /** Server-recorded terminal completion time, when this history source retained it. */
+  /** Financial completion time; execution can finish before settlement. */
   completed_at?: number | null;
   protocol: string;
   model: string;
@@ -29,10 +45,10 @@ export interface RequestView {
   duration_ms: number | null;
   input_tokens: number;
   // Missing cache telemetry is unknown, never an inferred zero.
-  cached_input_tokens?: number;
-  cache_write_tokens?: number;
+  cached_input_tokens?: number | null;
+  cache_write_tokens?: number | null;
   output_tokens: number;
-  cost: string;
+  cost: string | null;
   /** Stable final upstream assignment, not a routing-attempt history. */
   upstream_account_id?: string | null;
   /** Stable final model-route assignment, not a routing-attempt history. */
@@ -41,6 +57,11 @@ export interface RequestView {
   credential_identity?: RequestCredentialIdentity | null;
   error_code: string | null;
   terminal_cause_code?: string | null;
+  /**
+   * Stage stored on the open request row. Absence means no stage was recorded.
+   * It is not a terminal cause and is not inferred.
+   */
+  in_flight_stage?: 'upstream_response_headers' | 'upstream_response_body' | 'response_delivery' | null;
   failure_diagnostic?: RequestFailureDiagnostic | null;
   supplier_error?: SupplierError | null;
   /**
@@ -75,7 +96,7 @@ export interface RequestListResponse {
 }
 
 export type TypedFilterField = 'created_at' | 'key_id' | 'model' | 'protocol' | 'status' | 'error_code'
-  | 'upstream_account_id' | 'route_id' | 'duration_ms' | 'cost_micros' | 'key_alias' | 'principal';
+  | 'upstream_account_id' | 'route_id' | 'duration_ms' | 'cost_micros' | 'key_alias' | 'principal' | 'session_association' | 'session_id' | 'client_session_id';
 export type TypedFilterOperator = 'equals' | 'not_equals' | 'contains' | 'greater_than'
   | 'greater_than_or_equal' | 'less_than' | 'less_than_or_equal' | 'between';
 export type TypedFilterValue =
@@ -116,7 +137,7 @@ export interface RequestDetail extends RequestView {
   request_body: unknown;
   response_body: unknown;
   archive_complete: boolean;
-  archive?: Record<'request' | 'response', { state: RequestArchiveState; complete: boolean; reason: string | null }>;
+  archive?: Record<'request' | 'response', { state: RequestArchiveState; complete: boolean; reason: string | null; preview?: { kind: 'stream'; bytes: number } }>;
   provenance?: {
     source: string;
     disposition: 'exact' | 'unlinked';
@@ -208,6 +229,8 @@ export type RequestEventKind = 'started' | 'finished' | 'projected' | 'archive_b
 export type RequestArchiveState = 'capturing' | 'pending' | 'uploading' | 'metadata_only' | 'bound' | 'gap';
 
 export interface RequestEvent {
+  egress?: RequestView['egress'];
+  operational_terminal?: RequestView['operational_terminal'];
   usage_basis?: RequestView['usage_basis'];
   compaction?: true | null;
   first_output_ms?: number | null;
@@ -231,9 +254,10 @@ export interface RequestEvent {
   duration_ms: number | null;
   input_tokens: number;
   output_tokens: number;
-  cost: string;
+  cost: string | null;
   error_code: string | null;
   terminal_cause_code?: string | null;
+  in_flight_stage?: RequestView['in_flight_stage'];
   failure_diagnostic?: RequestFailureDiagnostic | null;
   supplier_error?: SupplierError | null;
   archive_state: RequestArchiveState;
@@ -315,6 +339,7 @@ export interface SelfStats {
     total_requests: number;
     successful_requests: number;
     failed_requests: number;
+    pending_requests?: number;
     input_tokens: number;
     output_tokens: number;
     cache_usage?: CacheStats;
@@ -827,6 +852,80 @@ export interface LogicalSessionSummaryBatchResponse {
   sessions: LogicalSessionSummary[];
 }
 
+/** Stable session identity is always the credential/session pair, never a title. */
+export interface SessionIdentity {
+  key_id: string;
+  session_id: string;
+}
+
+export interface SessionTitleState {
+  title: string | null;
+  state: 'unavailable' | 'pending' | 'running' | 'ready' | 'failed' | 'waiting_config';
+  error_code: string | null;
+  updated_at?: number | null;
+  /** Absent on deployments before title provenance: treat as generated. */
+  source?: string;
+  /** Absent on deployments before title provenance: treat as 0. */
+  revision?: number;
+}
+
+export interface SessionNameUpdate {
+  title: string;
+  source: 'manual' | 'codex';
+  explicit_session_id?: string;
+  expected_revision: number;
+  expected_unnamed?: boolean;
+  idempotency_key?: string;
+}
+
+export type SessionTaskScope = 'session' | 'subtree' | 'related';
+
+export interface SessionTaskUsage {
+  requests: number;
+  input_tokens: number;
+  output_tokens: number;
+  cached_input_tokens: number;
+  cache_write_tokens: number;
+  request_duration_sum_ms: number;
+  unknown_cost_requests: number;
+  /** Currency → cost in millionths of the currency unit. */
+  costs: Record<string, number>;
+}
+
+export interface SessionTaskDailyBucket {
+  day_bucket: number;
+  day_start_at: number;
+  usage: SessionTaskUsage;
+}
+
+export interface SessionTaskAnalysis {
+  scope: SessionTaskScope;
+  include_subtrees: boolean;
+  identities: SessionIdentity[];
+  /** Day-bucket boundary zone reported by the backend, e.g. UTC. */
+  timezone: string;
+  timezone_offset_minutes: number | null;
+  first_request_at: number | null;
+  last_request_at: number | null;
+  calendar_span_days: number;
+  active_days: number;
+  totals: SessionTaskUsage;
+  daily: SessionTaskDailyBucket[];
+  coverage: string;
+}
+
+export interface SessionRelationship {
+  key_id: string;
+  session_id: string;
+  target: SessionIdentity;
+  kind: 'parent' | 'related';
+  evidence: string | null;
+}
+
+export interface SessionRelationshipsResponse {
+  relationships: SessionRelationship[];
+}
+
 export interface LogicalSessionDetail {
   session_id: string;
   cluster_id: string | null;
@@ -923,7 +1022,7 @@ export interface PluginManifest {
   version: string;
   wit_version: string;
   capabilities: Array<
-    | { kind: 'log' | 'kv' | 'group_routing_quota' }
+    | { kind: 'log' | 'kv' | 'group_routing_quota' | 'quota_reset_credit' }
     | { kind: 'http'; allowed_origins: string[] }
   >;
   contributions: {
@@ -944,7 +1043,8 @@ export type PluginOperatorUiSlot =
   | 'operator.overview.card'
   | 'operator.page.before'
   | 'operator.page.after'
-  | 'operator.model-route.action';
+  | 'operator.model-route.action'
+  | 'operator.upstream-account.reset-settings';
 export type PluginOperatorUiIcon = 'activity' | 'chart' | 'database' | 'heart' | 'plug' | 'shield';
 export type PluginOperatorUiPresentation = 'health_intelligence_v1' | 'projection_v1';
 export type PluginOperatorUiRenderer = 'typed_data_v1' | 'component_v1';
@@ -1018,6 +1118,7 @@ export interface PluginConfiguration {
 }
 
 export interface UpstreamAccount {
+  oauth_refresh?: import('./operator/providerAccountState.js').OAuthRefreshStatus | null;
   can_update_transport_proxy?: boolean;
   has_proxy?: boolean;
   proxy_scheme?: 'socks5' | 'socks5h' | null;
@@ -1063,13 +1164,13 @@ export interface UpstreamDeletionReadiness {
 
 export interface UpstreamHealth {
   account_id: string;
-  status: 'healthy' | 'unhealthy';
+  status: 'healthy' | 'unhealthy' | 'skipped';
   error_code?: string | null;
   upstream_status?: number;
   latency_ms?: number;
   checked_at: number;
   retry_at?: number;
-  source?: 'routing_state' | 'connection_probe' | 'local_state';
+  source?: 'routing_state' | 'connection_probe' | 'model_probe' | 'local_state';
 }
 
 export interface ConfigurationSchemas {

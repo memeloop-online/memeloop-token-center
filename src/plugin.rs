@@ -1,4 +1,5 @@
 use std::{
+    borrow::Cow,
     collections::{BTreeMap, BTreeSet},
     fs,
     path::{Component as PathComponent, Path, PathBuf},
@@ -24,11 +25,13 @@ use crate::{
 
 #[cfg(feature = "experimental-plugin-revisions")]
 pub mod application;
+pub(crate) mod background_actions;
 mod configuration;
 /// Experimental lifecycle primitives; application integration is separately
 /// host-opted-in through `application` and never enabled by the production binary.
 #[cfg(feature = "experimental-plugin-revisions")]
 pub mod lifecycle;
+pub mod network_proxy_strategy;
 pub mod routing;
 pub(crate) mod service_data;
 mod ui_projection;
@@ -36,10 +39,8 @@ pub use configuration::{
     ConfigurationSource, ResolvedConfigurationRevision, ResolvedTrafficSnapshot,
 };
 
-const PLUGIN_FUEL: u64 = 5_000_000;
-const PLUGIN_MEMORY_BYTES: usize = 32 * 1024 * 1024;
+const PLUGIN_FUEL: u64 = u64::MAX;
 const PLUGIN_TABLE_ELEMENTS: usize = 100_000;
-const PLUGIN_HTTP_BODY_BYTES: usize = 16 * 1024 * 1024;
 const PLUGIN_HTTP_HEADER_COUNT: usize = 64;
 const PLUGIN_HTTP_HEADER_NAME_BYTES: usize = 256;
 const PLUGIN_HTTP_HEADER_VALUE_BYTES: usize = 8 * 1024;
@@ -53,23 +54,24 @@ const MAX_PLUGIN_ID_BYTES: usize = 64;
 const MAX_TRAFFIC_REASON_BYTES: usize = 256;
 const MAX_TRAFFIC_MODEL_BYTES: usize = 200;
 const MAX_TRAFFIC_ACCOUNT_ID_BYTES: usize = 64;
-const MAX_TRAFFIC_REQUEST_JSON_BYTES: usize = 16 * 1024 * 1024;
 const PLUGIN_EXECUTION_TIMEOUT: Duration = Duration::from_secs(30);
 const PLUGIN_EPOCH_TICK: Duration = Duration::from_millis(10);
 const PLUGIN_CONFIGURATION_CACHE_TTL: Duration = Duration::from_secs(5);
 const PLUGIN_CONFIGURATION_CACHE_ENTRIES: usize = 64;
 const PLUGIN_CONFIGURATION_CACHE_BYTES: usize = 16 * 1024 * 1024;
-const MAX_PLUGIN_SERVICE_DATA_TIMEOUT_MILLIS: u64 = 10_000;
+const MAX_PLUGIN_SERVICE_DATA_TIMEOUT_MILLIS: u64 = 30_000;
 const MAX_PLUGIN_SERVICE_DATA_BODY_BYTES: usize = 1024 * 1024;
 const MAX_PLUGIN_SERVICE_DATA_ENDPOINTS: usize = 32;
 const PLUGIN_SERVICE_DATA_COMPONENT_API: &str = "component-v1";
 const SUPPORTED_WIT_REQUIREMENT: &str = ">=0.2.0, <0.4.0";
-const WIRE_SHIM_FUEL_BASE: u64 = 8_000_000;
-const WIRE_SHIM_FUEL_PER_BODY_BYTE: u64 = 2;
-const WIRE_SHIM_MEMORY_BYTES: usize = 96 * 1024 * 1024;
 // These plugin_kv namespaces contain core-owned policy or its immutable
 // receipt. Guest components must never acquire them through their manifest ID.
-const CORE_PLUGIN_KV_NAMESPACES: &[&str] = &["typed-filter", "filter-assistant-audit"];
+const CORE_PLUGIN_KV_NAMESPACES: &[&str] = &[
+    "typed-filter",
+    "filter-assistant-audit",
+    "system-settings",
+    "http-settings-audit",
+];
 const CORE_OPERATOR_ROUTES: &[&str] = &[
     "overview",
     "requests",
@@ -141,6 +143,8 @@ pub struct PluginManifest {
 #[serde(deny_unknown_fields)]
 pub struct PluginContributions {
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub network_proxy_strategy: Option<network_proxy_strategy::NetworkProxyStrategyContribution>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub group_routing: Option<routing::GroupRoutingContribution>,
     #[serde(default)]
     pub traffic_policy: bool,
@@ -165,6 +169,8 @@ pub struct PluginContributions {
     #[serde(default)]
     pub service_data: Vec<PluginServiceDataEndpoint>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub background_actions: Option<background_actions::BackgroundActionContribution>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub wire_shim: Option<WireShimContribution>,
 }
 
@@ -179,13 +185,11 @@ pub(crate) struct WireShimOutcome {
     pub(crate) request_json: String,
 }
 
-fn validate_wire_shim_output(
-    request_json: &str,
-    set_headers: &[(String, String)],
-) -> Result<(), AppError> {
-    if request_json.len() > MAX_TRAFFIC_REQUEST_JSON_BYTES || !set_headers.is_empty() {
-        return Err(AppError::Upstream(
-            "wire shim returned an unsupported body or headers".into(),
+fn validate_wire_shim_output(set_headers: &[(String, String)]) -> Result<(), AppError> {
+    if !set_headers.is_empty() {
+        return Err(AppError::upstream_with(
+            "upstream_unavailable",
+            crate::error::ErrorFacts::new().stage("plugin_validate_wire_shim_output"),
         ));
     }
     Ok(())
@@ -204,6 +208,10 @@ pub enum PluginOperatorUiSlot {
     PageAfter,
     #[serde(rename = "operator.model-route.action")]
     ModelRouteAction,
+    /// A component embedded in the existing settings for one upstream account.
+    /// The host supplies only that account's bounded identity as context.
+    #[serde(rename = "operator.upstream-account.reset-settings")]
+    UpstreamAccountResetSettings,
 }
 
 /// Closed, core-owned visual presentation choices for declarative operator
@@ -389,6 +397,8 @@ pub enum PluginCapability {
     },
     /// Read-only candidate quota context for native-health group ordering.
     GroupRoutingQuota,
+    /// Account-scoped reset-credit intents, authorized separately by an operator.
+    QuotaResetCredit,
 }
 
 #[derive(Clone)]
@@ -396,6 +406,9 @@ struct LoadedPlugin {
     manifest: PluginManifest,
     component: Option<Component>,
     service_data_component: Option<service_data_component::ServiceDataPluginPre<HostState>>,
+    routing_component: Option<routing::PreparedGroupRouting>,
+    background_action_component:
+        Option<background_actions::bindings::BackgroundActionsPluginPre<HostState>>,
     wire_shim_component: Option<wire_shim_component::WireShimPluginPre<HostState>>,
     ui_modules: BTreeMap<String, Arc<[u8]>>,
     configuration_validator: Option<crate::schema::CompiledSchema>,
@@ -415,7 +428,8 @@ pub struct PluginInstallProvenance {
     pub signature_policy: String,
 }
 
-/// Host-owned exact GitHub Actions signing identity, never request input.
+/// Exact GitHub Actions signing identity. Installation callers must obtain
+/// host policy or explicit operator confirmation before treating it as trust.
 #[derive(Clone, Debug, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct CosignKeylessIdentity {
@@ -428,7 +442,7 @@ impl CosignKeylessIdentity {
         self.issuer == "https://token.actions.githubusercontent.com"
             && self.identity.starts_with("https://github.com/")
             && self.identity.contains("/.github/workflows/")
-            && self.identity.contains("@refs/heads/")
+            && (self.identity.contains("@refs/heads/") || self.identity.contains("@refs/tags/"))
             && self.identity.len() <= 512
             && !self
                 .identity
@@ -478,6 +492,41 @@ pub struct TrafficDecision {
 }
 
 impl TrafficDecision {
+    /// Project the model the proxy would dispatch at this chain position. An
+    /// explicit model decision remains authoritative across later body rewrites.
+    /// Keep the JSON presented to the next guest consistent with its context,
+    /// without changing the original authentication identity or returned metadata.
+    fn project_context<'request>(
+        &self,
+        original: &types::RequestContext,
+        request: &'request Value,
+    ) -> (types::RequestContext, Cow<'request, Value>) {
+        let model = self
+            .model
+            .as_deref()
+            .or_else(|| {
+                request
+                    .get("model")
+                    .and_then(Value::as_str)
+                    .filter(|model| {
+                        !model.trim().is_empty() && model.len() <= MAX_TRAFFIC_MODEL_BYTES
+                    })
+            })
+            .unwrap_or(&original.model)
+            .to_owned();
+        // Preserve non-object rewrites so the proxy still rejects them instead
+        // of accidentally turning malformed guest output into a valid request.
+        let mut request = Cow::Borrowed(request);
+        if request.is_object()
+            && request.get("model").and_then(Value::as_str) != Some(model.as_str())
+        {
+            request.to_mut()["model"] = Value::String(model.clone());
+        }
+        let mut context = original.clone();
+        context.model = model;
+        (context, request)
+    }
+
     pub(crate) fn log_denial(&self) {
         debug_assert!(!self.allow);
         tracing::warn!(
@@ -513,7 +562,7 @@ pub struct PreparedProviderRequest {
     pub body: Vec<u8>,
 }
 
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Debug)]
 pub struct NormalizedProviderResponse {
     pub status: u16,
     pub headers: BTreeMap<String, String>,
@@ -521,6 +570,9 @@ pub struct NormalizedProviderResponse {
     pub input_tokens: u64,
     pub output_tokens: u64,
     pub estimated: bool,
+    // Gateway-owned envelope, retained across blocking-task completion and
+    // transferred back without releasing/reacquiring global capacity.
+    pub(crate) input_memory: Option<crate::gateway_body::memory::BufferedResponsePermit>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -538,16 +590,25 @@ struct PreparedProviderEnvelope {
 struct UpstreamResponseEnvelope<'a> {
     status: u16,
     headers: &'a BTreeMap<String, String>,
-    body_base64: String,
+    #[serde(serialize_with = "serialize_provider_body")]
+    body_base64: &'a [u8],
+}
+
+fn serialize_provider_body<S>(body: &[u8], serializer: S) -> Result<S::Ok, S::Error>
+where
+    S: serde::Serializer,
+{
+    serializer.collect_str(&base64::display::Base64Display::new(body, &STANDARD))
 }
 
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
-struct NormalizedProviderEnvelope {
+struct NormalizedProviderEnvelope<'a> {
     status: u16,
     #[serde(default)]
     headers: BTreeMap<String, String>,
-    body_base64: String,
+    #[serde(borrow)]
+    body_base64: Cow<'a, str>,
     usage: ComponentProviderUsage,
 }
 
@@ -562,7 +623,7 @@ struct ComponentProviderUsage {
 #[derive(Clone, Default)]
 pub struct PluginRuntime {
     engine: Option<Engine>,
-    http: Option<reqwest::Client>,
+    http: Option<crate::http_settings::HttpClient>,
     runtime: Option<tokio::runtime::Handle>,
     kv: Option<PluginKv>,
     plugins: Arc<Vec<LoadedPlugin>>,
@@ -592,12 +653,12 @@ struct PluginKv {
 struct HostState {
     plugin_id: String,
     capabilities: Vec<PluginCapability>,
-    http: reqwest::Client,
+    http: crate::http_settings::HttpClient,
     runtime: tokio::runtime::Handle,
     kv: Option<PluginKv>,
     limits: StoreLimits,
     deadline: Instant,
-    http_body_limit: usize,
+    http_body_limit: Option<usize>,
     http_diagnostic: PluginHttpDiagnostic,
 }
 
@@ -626,6 +687,13 @@ fn read_identity_bytes(path: &Path, maximum: u64) -> Result<Vec<u8>, AppError> {
 }
 
 impl PluginRuntime {
+    /// Host `http-request` is the outbound hook a plugin calls. No loaded
+    /// package registers a replacement for the core Codex send, so that path
+    /// keeps using the built-in client.
+    pub(crate) fn codex_outbound_registered(&self) -> bool {
+        false
+    }
+
     pub(crate) fn wire_shim_matches(&self, driver: &str, protocol: &str) -> bool {
         self.plugins.iter().any(|plugin| {
             plugin
@@ -665,10 +733,12 @@ impl PluginRuntime {
         let pre = plugin
             .wire_shim_component
             .as_ref()
-            .ok_or(AppError::Internal)?;
-        let engine = self.engine.as_ref().ok_or(AppError::Internal)?;
+            .ok_or(AppError::internal("plugin_finalize_wire_shim_1"))?;
+        let engine = self
+            .engine
+            .as_ref()
+            .ok_or(AppError::internal("plugin_finalize_wire_shim_2"))?;
         let limits = StoreLimitsBuilder::new()
-            .memory_size(WIRE_SHIM_MEMORY_BYTES)
             .table_elements(PLUGIN_TABLE_ELEMENTS)
             .instances(8)
             .tables(2)
@@ -679,36 +749,30 @@ impl PluginRuntime {
             HostState {
                 plugin_id: plugin.manifest.id.clone(),
                 capabilities: plugin.manifest.capabilities.clone(),
-                http: self.http.as_ref().ok_or(AppError::Internal)?.clone(),
-                runtime: self.runtime.as_ref().ok_or(AppError::Internal)?.clone(),
+                http: self
+                    .http
+                    .as_ref()
+                    .ok_or(AppError::internal("plugin_finalize_wire_shim_3"))?
+                    .clone(),
+                runtime: self
+                    .runtime
+                    .as_ref()
+                    .ok_or(AppError::internal("plugin_finalize_wire_shim_4"))?
+                    .clone(),
                 kv: self.kv.clone(),
                 limits,
                 deadline: Instant::now() + self.execution_timeout,
-                http_body_limit: PLUGIN_HTTP_BODY_BYTES,
+                http_body_limit: None,
                 http_diagnostic: PluginHttpDiagnostic::default(),
             },
         );
         store.limiter(|state| &mut state.limits);
         store.set_epoch_deadline(epoch_deadline_ticks(self.execution_timeout));
         store
-            .set_fuel(WIRE_SHIM_FUEL_BASE.saturating_add(
-                (request_json.len() as u64).saturating_mul(WIRE_SHIM_FUEL_PER_BODY_BYTE),
-            ))
+            .set_fuel(self.fuel)
             .map_err(|_| plugin_runtime_failure("fuel_configuration"))?;
-        let configuration = configurations
-            .get(&plugin.manifest.id)
-            .cloned()
-            .or_else(|| {
-                plugin
-                    .manifest
-                    .contributions
-                    .configuration
-                    .as_ref()
-                    .map(|value| value.default.clone())
-            })
-            .unwrap_or_else(empty_json_object);
-        context.config_json =
-            serde_json::to_string(&configuration).map_err(|_| AppError::Internal)?;
+        context.config_json = serde_json::to_string(traffic_configuration(plugin, configurations))
+            .map_err(|_| AppError::internal("plugin_finalize_wire_shim_1"))?;
         let context = wire_shim_component::memeloop::token_center0_3_0::types::RequestContext {
             tenant_id: context.tenant_id,
             principal_id: context.principal_id,
@@ -727,7 +791,7 @@ impl PluginRuntime {
             .map_err(|error| {
                 plugin_reported_error(&plugin.manifest.id, "wire-shim-finalize", &error)
             })?;
-        validate_wire_shim_output(&result.request_json, &result.set_headers)?;
+        validate_wire_shim_output(&result.set_headers)?;
         Ok(Some(WireShimOutcome {
             request_json: result.request_json,
         }))
@@ -745,7 +809,7 @@ impl PluginRuntime {
         match fs::symlink_metadata(Path::new(root).join("plugin.json")) {
             Ok(_) => return Err(AppError::Forbidden),
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
-            Err(_) => return Err(AppError::Internal),
+            Err(_) => return Err(AppError::internal("plugin_load_for_inventory_1")),
         }
         Self::load_with_database(Some(root), None)
     }
@@ -782,16 +846,11 @@ impl PluginRuntime {
         let epoch_task = Arc::new(EpochTask(epoch_task));
         #[cfg(not(feature = "experimental-plugin-revisions"))]
         drop(epoch_task); // Preserve the default loader's detached epoch timer.
-        let http = reqwest::Client::builder()
-            .connect_timeout(std::time::Duration::from_secs(5))
-            .timeout(std::time::Duration::from_secs(30))
-            .redirect(reqwest::redirect::Policy::none())
-            // The service-data and guest HTTP paths use DNS-pinned clients for
-            // hostnames. Keep the shared literal-IP fallback equally isolated
-            // from inherited proxy configuration.
-            .no_proxy()
-            .build()
-            .map_err(|_| plugin_runtime_failure("http_initialization"))?;
+        let http = database
+            .as_ref()
+            .map(|database| database.http_clients.clone())
+            .unwrap_or_default()
+            .handle(crate::http_settings::HttpPurpose::Plugin);
         let canonical_root =
             fs::canonicalize(root).map_err(|_| plugin_runtime_failure("directory_resolution"))?;
         let directories = plugin_directories(&canonical_root)?;
@@ -889,8 +948,14 @@ impl PluginRuntime {
             } else {
                 None
             };
+            let routing_component =
+                routing::prepare_component(&engine, &manifest, component.as_ref())?;
+            let background_action_component =
+                background_actions::prepare_component(&engine, &manifest, component.as_ref())?;
             let wire_shim_component = if manifest.contributions.wire_shim.is_some() {
-                let component = component.as_ref().ok_or(AppError::Internal)?;
+                let component = component
+                    .as_ref()
+                    .ok_or(AppError::internal("plugin_site_1"))?;
                 let mut linker = Linker::<HostState>::new(&engine);
                 register_wire_shim_host_imports(&mut linker)
                     .map_err(|_| plugin_runtime_failure("wire_shim_linker_configuration"))?;
@@ -945,6 +1010,8 @@ impl PluginRuntime {
                 manifest,
                 component,
                 service_data_component,
+                background_action_component,
+                routing_component,
                 wire_shim_component,
                 ui_modules,
                 configuration_validator,
@@ -1084,7 +1151,13 @@ impl PluginRuntime {
         if self.plugins.is_empty() {
             return Ok(());
         }
-        let database = &self.kv.as_ref().ok_or(AppError::Internal)?.database;
+        let database = &self
+            .kv
+            .as_ref()
+            .ok_or(AppError::internal(
+                "plugin_validate_stored_configurations_1",
+            ))?
+            .database;
         database
             .visit_plugin_configurations(|stored| {
                 let Some(plugin) = self
@@ -1110,7 +1183,9 @@ impl PluginRuntime {
                 plugin
                     .configuration_validator
                     .as_ref()
-                    .ok_or(AppError::Internal)?
+                    .ok_or(AppError::internal(
+                        "plugin_validate_stored_configurations_2",
+                    ))?
                     .validate(&stored.value)
             })
             .await
@@ -1124,15 +1199,6 @@ impl PluginRuntime {
         self.apply_traffic_with_config(context, request_json, &BTreeMap::new())
     }
 
-    pub fn apply_traffic_with_config(
-        &self,
-        context: types::RequestContext,
-        request_json: &Value,
-        configurations: &BTreeMap<String, Value>,
-    ) -> Result<TrafficDecision, AppError> {
-        self.apply_traffic_with_config_and_memory(context, request_json, configurations, None)
-    }
-
     pub(crate) fn has_traffic_hooks(&self) -> bool {
         self.engine.is_some()
             && self.plugins.iter().any(|plugin| {
@@ -1141,12 +1207,11 @@ impl PluginRuntime {
             })
     }
 
-    pub(crate) fn apply_traffic_with_config_and_memory(
+    pub fn apply_traffic_with_config(
         &self,
         context: types::RequestContext,
         request_json: &Value,
         configurations: &BTreeMap<String, Value>,
-        memory: Option<&crate::gateway_body::memory::ProxyMemoryReservation>,
     ) -> Result<TrafficDecision, AppError> {
         let Some(engine) = &self.engine else {
             return Ok(TrafficDecision {
@@ -1154,9 +1219,12 @@ impl PluginRuntime {
                 ..TrafficDecision::default()
             });
         };
-        let http = self.http.as_ref().ok_or(AppError::Internal)?;
-        let runtime = self.runtime.as_ref().ok_or(AppError::Internal)?;
-        let mut current = request_json.clone();
+        let http = self.http.as_ref().ok_or(AppError::internal(
+            "plugin_apply_traffic_with_config_and_memory_1",
+        ))?;
+        let runtime = self.runtime.as_ref().ok_or(AppError::internal(
+            "plugin_apply_traffic_with_config_and_memory_2",
+        ))?;
         let mut decision = TrafficDecision {
             allow: true,
             ..TrafficDecision::default()
@@ -1165,14 +1233,21 @@ impl PluginRuntime {
             plugin.manifest.contributions.traffic_policy
                 || plugin.manifest.contributions.request_rewrite
         }) {
+            let (mut plugin_context, current) = decision.project_context(
+                &context,
+                decision.request_json.as_ref().unwrap_or(request_json),
+            );
+            let request = serde_json::to_string(current.as_ref())
+                .map_err(|_| AppError::internal("plugin_apply_traffic_with_config_and_memory_1"))?;
+            drop(current);
+            plugin_context.config_json =
+                serde_json::to_string(traffic_configuration(plugin, configurations)).map_err(
+                    |_| AppError::internal("plugin_apply_traffic_with_config_and_memory_2"),
+                )?;
             let component = plugin.component.as_ref().ok_or_else(|| {
-                AppError::Storage(format!(
-                    "plugin {} contributes a traffic policy without a component",
-                    plugin.manifest.id
-                ))
+                AppError::storage("plugin_contributes_a_traffic_policy_without_a_component")
             })?;
             let limits = StoreLimitsBuilder::new()
-                .memory_size(PLUGIN_MEMORY_BYTES)
                 .table_elements(PLUGIN_TABLE_ELEMENTS)
                 // Component-model instantiation uses more than one internal
                 // instance. Keep it functional but tightly bounded.
@@ -1190,11 +1265,12 @@ impl PluginRuntime {
                     kv: self.kv.clone(),
                     limits,
                     deadline: Instant::now() + self.execution_timeout,
-                    http_body_limit: PLUGIN_HTTP_BODY_BYTES,
+                    http_body_limit: None,
                     http_diagnostic: PluginHttpDiagnostic::default(),
                 },
             );
             store.limiter(|state| &mut state.limits);
+            store.set_hostcall_fuel(usize::MAX);
             store.set_epoch_deadline(epoch_deadline_ticks(self.execution_timeout));
             store
                 .set_fuel(self.fuel)
@@ -1204,22 +1280,6 @@ impl PluginRuntime {
                 .map_err(|_| plugin_runtime_failure("linker_configuration"))?;
             let bindings = Plugin::instantiate(&mut store, component, &linker)
                 .map_err(|error| plugin_failure(&plugin.manifest.id, error))?;
-            let request = serde_json::to_string(&current).map_err(|_| AppError::Internal)?;
-            let mut plugin_context = context.clone();
-            let configuration = configurations
-                .get(&plugin.manifest.id)
-                .cloned()
-                .or_else(|| {
-                    plugin
-                        .manifest
-                        .contributions
-                        .configuration
-                        .as_ref()
-                        .map(|contribution| contribution.default.clone())
-                })
-                .unwrap_or_else(empty_json_object);
-            plugin_context.config_json =
-                serde_json::to_string(&configuration).map_err(|_| AppError::Internal)?;
             let result = bindings
                 .memeloop_token_center_traffic_policy()
                 .call_post_auth(&mut store, &plugin_context, &request)
@@ -1227,6 +1287,8 @@ impl PluginRuntime {
                 .map_err(|error| {
                     plugin_reported_error(&plugin.manifest.id, "traffic-policy", &error)
                 })?;
+            drop(request);
+            drop(store);
             let reason_is_valid = result.reason.as_deref().is_none_or(|reason| {
                 validate_plugin_text(reason, MAX_TRAFFIC_REASON_BYTES, false).is_ok()
             });
@@ -1241,12 +1303,6 @@ impl PluginRuntime {
                         validate_plugin_text(account_id, MAX_TRAFFIC_ACCOUNT_ID_BYTES, false)
                             .is_ok()
                     });
-            if let (Some(memory), Some(rewrite)) = (memory, result.request_json.as_deref())
-                && (rewrite.len() > MAX_TRAFFIC_REQUEST_JSON_BYTES
-                    || !memory.try_reserve_rewrite(rewrite.as_bytes()))
-            {
-                return Err(AppError::Overloaded);
-            }
             let validated_request = result
                 .request_json
                 .as_deref()
@@ -1291,8 +1347,7 @@ impl PluginRuntime {
             if let Some(request) = validated_request.map_err(|_| {
                 invalid_plugin_result(&plugin.manifest.id, "traffic policy request JSON")
             })? {
-                current = request;
-                decision.request_json = Some(current.clone());
+                decision.request_json = Some(request);
             }
             if let Some(model) = result.model {
                 decision.model = Some(model);
@@ -1329,11 +1384,19 @@ impl PluginRuntime {
         let Some(component) = plugin.component.as_ref() else {
             return Ok(None);
         };
-        let engine = self.engine.as_ref().ok_or(AppError::Internal)?;
-        let http = self.http.as_ref().ok_or(AppError::Internal)?;
-        let runtime = self.runtime.as_ref().ok_or(AppError::Internal)?;
+        let engine = self
+            .engine
+            .as_ref()
+            .ok_or(AppError::internal("plugin_list_provider_models_1"))?;
+        let http = self
+            .http
+            .as_ref()
+            .ok_or(AppError::internal("plugin_list_provider_models_2"))?;
+        let runtime = self
+            .runtime
+            .as_ref()
+            .ok_or(AppError::internal("plugin_list_provider_models_3"))?;
         let limits = StoreLimitsBuilder::new()
-            .memory_size(PLUGIN_MEMORY_BYTES)
             .table_elements(PLUGIN_TABLE_ELEMENTS)
             .instances(8)
             .tables(2)
@@ -1349,7 +1412,7 @@ impl PluginRuntime {
                 kv: self.kv.clone(),
                 limits,
                 deadline: Instant::now() + self.execution_timeout,
-                http_body_limit: PLUGIN_HTTP_BODY_BYTES,
+                http_body_limit: None,
                 http_diagnostic: PluginHttpDiagnostic::default(),
             },
         );
@@ -1363,23 +1426,19 @@ impl PluginRuntime {
             .map_err(|_| plugin_runtime_failure("linker_configuration"))?;
         let bindings = Plugin::instantiate(&mut store, component, &linker)
             .map_err(|error| plugin_failure(&plugin.manifest.id, error))?;
-        let config_json = serde_json::to_string(config).map_err(|_| AppError::Internal)?;
+        let config_json = serde_json::to_string(config)
+            .map_err(|_| AppError::internal("plugin_list_provider_models_1"))?;
         let models_json = bindings
             .memeloop_token_center_upstream_provider()
             .call_list_models(&mut store, &config_json)
             .map_err(|error| plugin_failure(&plugin.manifest.id, error))?
             .map_err(|error| plugin_reported_error(&plugin.manifest.id, "list-models", &error))?;
-        let models: Value = serde_json::from_str(&models_json).map_err(|_| {
-            AppError::Upstream(format!(
-                "plugin {} returned invalid models JSON",
-                plugin.manifest.id
-            ))
-        })?;
+        let models: Value = serde_json::from_str(&models_json)
+            .map_err(|_| AppError::upstream("plugin_returned_invalid_models_json"))?;
         if !models.is_array() {
-            return Err(AppError::Upstream(format!(
-                "plugin {} models response must be a JSON array",
-                plugin.manifest.id
-            )));
+            return Err(AppError::upstream(
+                "plugin_models_response_must_be_a_json_array",
+            ));
         }
         Ok(Some(models))
     }
@@ -1397,19 +1456,26 @@ impl PluginRuntime {
         let Some((plugin, provider)) = self.component_provider(provider_id)? else {
             return Ok(None);
         };
-        let component = plugin.component.as_ref().ok_or_else(|| {
-            AppError::Storage(format!(
-                "plugin {} component provider is unavailable",
-                plugin.manifest.id
-            ))
-        })?;
-        let engine = self.engine.as_ref().ok_or(AppError::Internal)?;
+        let component = plugin
+            .component
+            .as_ref()
+            .ok_or_else(|| AppError::storage("plugin_component_provider_is_unavailable"))?;
+        let engine = self
+            .engine
+            .as_ref()
+            .ok_or(AppError::internal("plugin_prepare_provider_request_1"))?;
         let (mut store, bindings) = self.instantiate(plugin, component, engine)?;
-        let config_json = serde_json::to_string(config).map_err(|_| AppError::Internal)?;
-        let request_json = serde_json::to_string(request).map_err(|_| AppError::Internal)?;
+        let config_json = serde_json::to_string(config)
+            .map_err(|_| AppError::internal("plugin_prepare_provider_request_1"))?;
+        let request_json = serde_json::to_string(request)
+            .map_err(|_| AppError::internal("plugin_prepare_provider_request_2"))?;
         if config_json.len().saturating_add(request_json.len()) > MAX_COMPONENT_PROVIDER_BODY {
-            return Err(AppError::Upstream(
-                "component provider request exceeds the 4 MiB ABI limit".into(),
+            return Err(AppError::upstream_with(
+                "plugin_prepared_request_exceeds_the_4_mib_abi_limit",
+                crate::error::ErrorFacts::new()
+                    .stage("plugin_prepare_provider_request")
+                    .bytes(config_json.len().saturating_add(request_json.len()) as u64)
+                    .limit(MAX_COMPONENT_PROVIDER_BODY as u64),
             ));
         }
         let result = bindings
@@ -1417,38 +1483,37 @@ impl PluginRuntime {
             .call_prepare(&mut store, &context, &config_json, &request_json)
             .map_err(|error| plugin_failure(&plugin.manifest.id, error))?
             .map_err(|error| plugin_reported_error(&plugin.manifest.id, "prepare", &error))?;
+        drop(config_json);
+        drop(request_json);
+        drop(store);
         if result.len() > encoded_body_limit(MAX_COMPONENT_PROVIDER_BODY) {
-            return Err(AppError::Upstream(format!(
-                "plugin {} prepared request exceeds the 4 MiB ABI limit",
-                plugin.manifest.id
-            )));
+            return Err(AppError::upstream_with(
+                "plugin_prepared_request_exceeds_the_4_mib_abi_limit",
+                crate::error::ErrorFacts::new()
+                    .bytes(result.len() as u64)
+                    .limit(encoded_body_limit(MAX_COMPONENT_PROVIDER_BODY) as u64),
+            ));
         }
-        let envelope: PreparedProviderEnvelope = serde_json::from_str(&result).map_err(|_| {
-            AppError::Upstream(format!(
-                "plugin {} returned an invalid prepared request",
-                plugin.manifest.id
-            ))
-        })?;
+        let envelope: PreparedProviderEnvelope = serde_json::from_str(&result)
+            .map_err(|_| AppError::upstream("plugin_returned_an_invalid_prepared_request"))?;
         if envelope.streaming {
-            return Err(AppError::Upstream(format!(
-                "plugin {} requested unsupported streaming transport",
-                plugin.manifest.id
-            )));
+            return Err(AppError::upstream(
+                "plugin_requested_unsupported_streaming_transport",
+            ));
         }
         let method = validate_provider_method(&envelope.method)?;
         validate_provider_path(&envelope.path)?;
         validate_provider_headers(&envelope.headers, true)?;
-        let body = STANDARD.decode(envelope.body_base64).map_err(|_| {
-            AppError::Upstream(format!(
-                "plugin {} returned invalid request body encoding",
-                plugin.manifest.id
-            ))
-        })?;
+        let body = STANDARD
+            .decode(envelope.body_base64)
+            .map_err(|_| AppError::upstream("plugin_returned_invalid_request_body_encoding"))?;
         if body.len() > MAX_COMPONENT_PROVIDER_BODY {
-            return Err(AppError::Upstream(format!(
-                "plugin {} prepared request body exceeds 4 MiB",
-                plugin.manifest.id
-            )));
+            return Err(AppError::upstream_with(
+                "plugin_prepared_request_body_exceeds_4_mib",
+                crate::error::ErrorFacts::new()
+                    .bytes(body.len() as u64)
+                    .limit(MAX_COMPONENT_PROVIDER_BODY as u64),
+            ));
         }
         debug_assert_eq!(
             provider.component_adapter.as_ref().unwrap().api_version,
@@ -1476,71 +1541,75 @@ impl PluginRuntime {
         let adapter = provider
             .component_adapter
             .as_ref()
-            .ok_or(AppError::Internal)?;
+            .ok_or(AppError::internal("plugin_normalize_provider_response_1"))?;
         if upstream_body.len() > adapter.max_response_bytes
             || upstream_body.len() > MAX_COMPONENT_PROVIDER_BODY
         {
-            return Err(AppError::Upstream(format!(
-                "plugin {} upstream response exceeds its declared limit",
-                plugin.manifest.id
-            )));
+            return Err(AppError::upstream_with(
+                "plugin_upstream_response_exceeds_its_declared_limit",
+                crate::error::ErrorFacts::new()
+                    .bytes(upstream_body.len() as u64)
+                    .limit(adapter.max_response_bytes.min(MAX_COMPONENT_PROVIDER_BODY) as u64),
+            ));
         }
         validate_provider_headers(upstream_headers, false)?;
         let response_json = serde_json::to_string(&UpstreamResponseEnvelope {
             status: upstream_status,
             headers: upstream_headers,
-            body_base64: STANDARD.encode(upstream_body),
+            body_base64: upstream_body,
         })
-        .map_err(|_| AppError::Internal)?;
+        .map_err(|_| AppError::internal("plugin_normalize_provider_response_1"))?;
         if response_json.len() > encoded_body_limit(adapter.max_response_bytes) {
-            return Err(AppError::Upstream(format!(
-                "plugin {} upstream response exceeds its declared ABI limit",
-                plugin.manifest.id
-            )));
+            return Err(AppError::upstream_with(
+                "plugin_upstream_response_exceeds_its_declared_abi_limit",
+                crate::error::ErrorFacts::new()
+                    .bytes(response_json.len() as u64)
+                    .limit(encoded_body_limit(adapter.max_response_bytes) as u64),
+            ));
         }
-        let component = plugin.component.as_ref().ok_or_else(|| {
-            AppError::Storage(format!(
-                "plugin {} component provider is unavailable",
-                plugin.manifest.id
-            ))
-        })?;
-        let engine = self.engine.as_ref().ok_or(AppError::Internal)?;
+        let component = plugin
+            .component
+            .as_ref()
+            .ok_or_else(|| AppError::storage("plugin_component_provider_is_unavailable"))?;
+        let engine = self
+            .engine
+            .as_ref()
+            .ok_or(AppError::internal("plugin_normalize_provider_response_2"))?;
         let (mut store, bindings) = self.instantiate(plugin, component, engine)?;
         let result = bindings
             .memeloop_token_center_upstream_provider()
             .call_normalize(&mut store, &context, &response_json)
             .map_err(|error| plugin_failure(&plugin.manifest.id, error))?
             .map_err(|error| plugin_reported_error(&plugin.manifest.id, "normalize", &error))?;
+        drop(response_json);
+        drop(store);
         if result.len() > encoded_body_limit(adapter.max_response_bytes) {
-            return Err(AppError::Upstream(format!(
-                "plugin {} normalized response exceeds its declared limit",
-                plugin.manifest.id
-            )));
+            return Err(AppError::upstream_with(
+                "plugin_normalized_response_exceeds_its_declared_limit",
+                crate::error::ErrorFacts::new()
+                    .bytes(result.len() as u64)
+                    .limit(encoded_body_limit(adapter.max_response_bytes) as u64),
+            ));
         }
-        let envelope: NormalizedProviderEnvelope = serde_json::from_str(&result).map_err(|_| {
-            AppError::Upstream(format!(
-                "plugin {} returned an invalid normalized response",
-                plugin.manifest.id
-            ))
-        })?;
+        let envelope: NormalizedProviderEnvelope = serde_json::from_str(&result)
+            .map_err(|_| AppError::upstream("plugin_returned_an_invalid_normalized_response"))?;
         if !(200..=599).contains(&envelope.status) {
-            return Err(AppError::Upstream(format!(
-                "plugin {} returned an invalid downstream status",
-                plugin.manifest.id
-            )));
+            return Err(AppError::upstream_status(
+                "plugin_returned_an_invalid_downstream_status",
+                envelope.status,
+            ));
         }
         validate_provider_headers(&envelope.headers, false)?;
-        let body = STANDARD.decode(envelope.body_base64).map_err(|_| {
-            AppError::Upstream(format!(
-                "plugin {} returned invalid normalized body encoding",
-                plugin.manifest.id
-            ))
-        })?;
+        let body = STANDARD
+            .decode(envelope.body_base64.as_ref())
+            .map_err(|_| AppError::upstream("plugin_returned_invalid_normalized_body_encoding"))?;
         if body.len() > adapter.max_response_bytes || body.len() > MAX_COMPONENT_PROVIDER_BODY {
-            return Err(AppError::Upstream(format!(
-                "plugin {} normalized response body exceeds its declared limit",
-                plugin.manifest.id
-            )));
+            return Err(AppError::upstream_with(
+                "plugin_normalized_response_body_exceeds_its_declared_limit",
+                crate::error::ErrorFacts::new()
+                    .bytes(body.len() as u64)
+                    .limit(adapter.max_response_bytes.min(MAX_COMPONENT_PROVIDER_BODY) as u64),
+            ));
         }
         Ok(Some(NormalizedProviderResponse {
             status: envelope.status,
@@ -1549,6 +1618,7 @@ impl PluginRuntime {
             input_tokens: envelope.usage.input_tokens,
             output_tokens: envelope.usage.output_tokens,
             estimated: envelope.usage.estimated,
+            input_memory: None,
         }))
     }
 
@@ -1572,15 +1642,14 @@ impl PluginRuntime {
             .providers
             .iter()
             .find(|provider| provider.id == provider_id)
-            .ok_or(AppError::Internal)?;
+            .ok_or(AppError::internal("plugin_component_provider_1"))?;
         if provider.component_adapter.is_none() {
             return Ok(None);
         }
         if plugin.component.is_none() {
-            return Err(AppError::Storage(format!(
-                "plugin {} declared a component provider without a component",
-                plugin.manifest.id
-            )));
+            return Err(AppError::storage(
+                "plugin_declared_a_component_provider_without_a_component",
+            ));
         }
         Ok(Some((plugin, provider)))
     }
@@ -1591,10 +1660,15 @@ impl PluginRuntime {
         component: &Component,
         engine: &Engine,
     ) -> Result<(Store<HostState>, Plugin), AppError> {
-        let http = self.http.as_ref().ok_or(AppError::Internal)?;
-        let runtime = self.runtime.as_ref().ok_or(AppError::Internal)?;
+        let http = self
+            .http
+            .as_ref()
+            .ok_or(AppError::internal("plugin_instantiate_1"))?;
+        let runtime = self
+            .runtime
+            .as_ref()
+            .ok_or(AppError::internal("plugin_instantiate_2"))?;
         let limits = StoreLimitsBuilder::new()
-            .memory_size(PLUGIN_MEMORY_BYTES)
             .table_elements(PLUGIN_TABLE_ELEMENTS)
             .instances(8)
             .tables(2)
@@ -1610,7 +1684,7 @@ impl PluginRuntime {
                 kv: self.kv.clone(),
                 limits,
                 deadline: Instant::now() + self.execution_timeout,
-                http_body_limit: PLUGIN_HTTP_BODY_BYTES,
+                http_body_limit: None,
                 http_diagnostic: PluginHttpDiagnostic::default(),
             },
         );
@@ -1650,7 +1724,7 @@ fn encoded_body_limit(body_limit: usize) -> usize {
 
 fn validate_provider_method(value: &str) -> Result<reqwest::Method, AppError> {
     let method = reqwest::Method::from_bytes(value.as_bytes())
-        .map_err(|_| AppError::Upstream("component provider returned an invalid method".into()))?;
+        .map_err(|_| AppError::upstream("component_provider_returned_an_invalid_method"))?;
     if !matches!(
         method,
         reqwest::Method::GET
@@ -1659,8 +1733,9 @@ fn validate_provider_method(value: &str) -> Result<reqwest::Method, AppError> {
             | reqwest::Method::PATCH
             | reqwest::Method::DELETE
     ) {
-        return Err(AppError::Upstream(
-            "component provider method is not allowed".into(),
+        return Err(AppError::upstream_with(
+            "upstream_unavailable",
+            crate::error::ErrorFacts::new().stage("plugin_validate_provider_method"),
         ));
     }
     Ok(method)
@@ -1674,8 +1749,9 @@ fn validate_provider_path(value: &str) -> Result<(), AppError> {
         || value.contains('#')
         || value.chars().any(char::is_control)
     {
-        return Err(AppError::Upstream(
-            "component provider returned an unsafe relative path".into(),
+        return Err(AppError::upstream_with(
+            "upstream_unavailable",
+            crate::error::ErrorFacts::new().stage("plugin_validate_provider_path"),
         ));
     }
     Ok(())
@@ -1686,16 +1762,17 @@ fn validate_provider_headers(
     reject_credentials: bool,
 ) -> Result<(), AppError> {
     if headers.len() > 64 {
-        return Err(AppError::Upstream(
-            "component provider returned too many headers".into(),
+        return Err(AppError::upstream_with(
+            "upstream_unavailable",
+            crate::error::ErrorFacts::new().stage("plugin_validate_provider_headers"),
         ));
     }
     let mut total = 0_usize;
     for (name, value) in headers {
         let parsed_name = reqwest::header::HeaderName::from_bytes(name.as_bytes())
-            .map_err(|_| AppError::Upstream("component provider header name is invalid".into()))?;
+            .map_err(|_| AppError::upstream("component_provider_header_name_is_invalid"))?;
         reqwest::header::HeaderValue::from_str(value)
-            .map_err(|_| AppError::Upstream("component provider header value is invalid".into()))?;
+            .map_err(|_| AppError::upstream("component_provider_header_value_is_invalid"))?;
         total = total.saturating_add(name.len()).saturating_add(value.len());
         let forbidden = matches!(
             parsed_name.as_str(),
@@ -1713,14 +1790,16 @@ fn validate_provider_headers(
                 "authorization" | "cookie" | "x-api-key" | "host" | "content-length"
             ));
         if forbidden {
-            return Err(AppError::Upstream(
-                "component provider returned a forbidden header".into(),
+            return Err(AppError::upstream_with(
+                "upstream_unavailable",
+                crate::error::ErrorFacts::new().stage("plugin_validate_provider_headers"),
             ));
         }
     }
     if total > 16 * 1024 {
-        return Err(AppError::Upstream(
-            "component provider headers exceed 16 KiB".into(),
+        return Err(AppError::upstream_with(
+            "upstream_unavailable",
+            crate::error::ErrorFacts::new().stage("plugin_validate_provider_headers"),
         ));
     }
     Ok(())
@@ -1947,7 +2026,7 @@ impl memeloop::token_center::host::Host for HostState {
             stage: "request_validation",
             ..PluginHttpDiagnostic::default()
         };
-        if body.len() > self.http_body_limit {
+        if self.http_body_limit.is_some_and(|limit| body.len() > limit) {
             return Err("plugin HTTP request exceeds its configured body limit".to_owned());
         }
         let url = url::Url::parse(&url).map_err(|_| "plugin HTTP URL is invalid".to_owned())?;
@@ -2043,7 +2122,9 @@ impl memeloop::token_center::host::Host for HostState {
             let mut stream = response.bytes_stream();
             while let Some(chunk) = stream.next().await {
                 let chunk = chunk.map_err(|_| "plugin HTTP response read failed".to_owned())?;
-                if response_body.len().saturating_add(chunk.len()) > http_body_limit {
+                if http_body_limit
+                    .is_some_and(|limit| response_body.len().saturating_add(chunk.len()) > limit)
+                {
                     return Err("plugin HTTP response exceeds its configured body limit".to_owned());
                 }
                 response_body.extend_from_slice(&chunk);
@@ -2124,7 +2205,7 @@ pub fn validate_plugin_package(directory: &Path) -> Result<PluginManifest, AppEr
         .map_err(|_| AppError::BadRequest("plugin manifest is invalid JSON".into()))?;
     let manifest_schema: Value =
         serde_json::from_str(include_str!("../schemas/plugin-manifest.schema.json"))
-            .map_err(|_| AppError::Internal)?;
+            .map_err(|_| AppError::internal("plugin_validate_plugin_package_1"))?;
     // Validate the source document before Serde applies defaults. The checked-in
     // schema is authoritative for required and unknown fields.
     crate::schema::validate_instance(&manifest_schema, &manifest_value)?;
@@ -2157,7 +2238,9 @@ pub fn validate_plugin_package(directory: &Path) -> Result<PluginManifest, AppEr
 }
 
 fn validate_manifest(manifest: &PluginManifest) -> Result<(), AppError> {
+    network_proxy_strategy::validate_contribution(manifest)?;
     routing::validate_contribution(manifest)?;
+    background_actions::validate_contribution(manifest)?;
     if manifest.id.is_empty()
         || manifest.id.len() > MAX_PLUGIN_ID_BYTES
         || !manifest
@@ -2177,7 +2260,7 @@ fn validate_manifest(manifest: &PluginManifest) -> Result<(), AppError> {
     }
     if semver::Version::parse(&manifest.version).is_err()
         || !semver::VersionReq::parse(SUPPORTED_WIT_REQUIREMENT)
-            .map_err(|_| AppError::Internal)?
+            .map_err(|_| AppError::internal("plugin_validate_manifest_1"))?
             .matches(&semver::Version::parse(&manifest.wit_version).map_err(|_| {
                 AppError::BadRequest(format!("plugin {} has an invalid WIT version", manifest.id))
             })?)
@@ -2417,6 +2500,18 @@ fn validate_operator_ui_contributions(manifest: &PluginManifest) -> Result<(), A
                     )));
                 }
             }
+            PluginOperatorUiSlot::UpstreamAccountResetSettings => {
+                if contribution.renderer != "component_v1"
+                    || contribution.route.is_some()
+                    || contribution.category.is_some()
+                    || contribution.target_route.is_some()
+                {
+                    return Err(AppError::BadRequest(format!(
+                        "plugin {} upstream-account reset settings require a component without route or category",
+                        manifest.id
+                    )));
+                }
+            }
             PluginOperatorUiSlot::PageBefore | PluginOperatorUiSlot::PageAfter => {
                 if contribution.route.is_some()
                     || contribution.category.is_some()
@@ -2466,7 +2561,9 @@ fn validate_service_data_contributions(manifest: &PluginManifest) -> Result<(), 
                     || !safe_plugin_token(&adapter.normalizer, 64)
                     || !adapter.config.is_object()
                     || serde_json::to_vec(&adapter.config)
-                        .map_err(|_| AppError::Internal)?
+                        .map_err(|_| {
+                            AppError::internal("plugin_validate_service_data_contributions_1")
+                        })?
                         .len()
                         > MAX_PLUGIN_SERVICE_DATA_BODY_BYTES
                 {
@@ -2661,7 +2758,8 @@ fn safe_plugin_label(value: &str) -> bool {
 
 pub fn plugin_configuration_schema_digest(schema: &Value) -> Result<String, AppError> {
     let canonical = canonical_json(schema);
-    let bytes = serde_json::to_vec(&canonical).map_err(|_| AppError::Internal)?;
+    let bytes = serde_json::to_vec(&canonical)
+        .map_err(|_| AppError::internal("plugin_plugin_configuration_schema_digest_1"))?;
     Ok(blake3::hash(&bytes).to_hex().to_string())
 }
 
@@ -2679,7 +2777,8 @@ pub fn plugin_configuration_request_hash(
         "schema_digest": schema_digest,
         "value": canonical_json(value)
     });
-    let bytes = serde_json::to_vec(&payload).map_err(|_| AppError::Internal)?;
+    let bytes = serde_json::to_vec(&payload)
+        .map_err(|_| AppError::internal("plugin_plugin_configuration_request_hash_1"))?;
     Ok(blake3::hash(&bytes).to_hex().to_string())
 }
 
@@ -3049,40 +3148,108 @@ fn validate_plugin_text(value: &str, maximum: usize, allow_empty: bool) -> Resul
     Ok(())
 }
 
+fn traffic_configuration<'a>(
+    plugin: &'a LoadedPlugin,
+    configurations: &'a BTreeMap<String, Value>,
+) -> &'a Value {
+    static EMPTY: std::sync::LazyLock<Value> = std::sync::LazyLock::new(empty_json_object);
+    configurations
+        .get(&plugin.manifest.id)
+        .or_else(|| {
+            plugin
+                .manifest
+                .contributions
+                .configuration
+                .as_ref()
+                .map(|configuration| &configuration.default)
+        })
+        .unwrap_or(&EMPTY)
+}
+
 fn validate_traffic_request_json(value: &str) -> Result<Value, ()> {
-    if value.len() > MAX_TRAFFIC_REQUEST_JSON_BYTES {
-        return Err(());
-    }
     serde_json::from_str(value).map_err(|_| ())
 }
 
-fn invalid_plugin_result(plugin_id: &str, field: &str) -> AppError {
-    AppError::Upstream(format!("plugin {plugin_id} returned an invalid {field}"))
+fn invalid_plugin_result(_plugin_id: &str, _field: &str) -> AppError {
+    AppError::upstream("plugin_invalid_result")
 }
 
 fn plugin_runtime_failure(code: &'static str) -> AppError {
     // The fixed low-cardinality code is safe for logs and metrics. Never retain
     // the underlying fs/Wasmtime/HTTP error: those strings may include mount
     // paths, URLs, configuration fragments, or guest-controlled custom text.
-    AppError::Storage(format!("plugin_runtime_{code}"))
+    AppError::storage_with(
+        "plugin_runtime_failed",
+        crate::error::ErrorFacts::new().stage(code),
+    )
 }
 
-fn plugin_reported_error(plugin_id: &str, operation: &str, error: &str) -> AppError {
+fn plugin_reported_error(_plugin_id: &str, _operation: &str, error: &str) -> AppError {
     let code = if validate_plugin_text(error, MAX_TRAFFIC_REASON_BYTES, false).is_ok() {
-        "reported_error"
+        "plugin_reported_error"
     } else {
-        "reported_invalid_error"
+        "plugin_reported_invalid_error"
     };
-    AppError::Upstream(format!("plugin {plugin_id} {operation} failed ({code})"))
+    AppError::upstream(code)
 }
 
-fn plugin_failure(plugin_id: &str, _error: wasmtime::Error) -> AppError {
-    AppError::Upstream(format!("plugin {plugin_id} execution failed"))
+fn plugin_failure(_plugin_id: &str, error: wasmtime::Error) -> AppError {
+    let category = match error.downcast_ref::<wasmtime::Trap>() {
+        Some(wasmtime::Trap::OutOfFuel) => "fuel_exhausted",
+        Some(wasmtime::Trap::Interrupt) => "execution_interrupted",
+        Some(wasmtime::Trap::MemoryOutOfBounds) => "memory_out_of_bounds",
+        Some(_) => "guest_trap",
+        None => "component_error",
+    };
+    tracing::warn!(category, "plugin execution failed");
+    AppError::upstream("plugin_execution_failed")
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn provider_envelope_streams_base64_without_changing_protocol_bytes() {
+        let headers = BTreeMap::from([("x-vendor".into(), "中文\"\\\n".into())]);
+        for body in [
+            Vec::new(),
+            vec![0, 255, 1],
+            (0..=255).cycle().take(1024 * 1024).collect(),
+        ] {
+            let serialized = serde_json::to_string(&UpstreamResponseEnvelope {
+                status: 207,
+                headers: &headers,
+                body_base64: &body,
+            })
+            .unwrap();
+            let envelope: Value = serde_json::from_str(&serialized).unwrap();
+            assert_eq!(
+                envelope,
+                serde_json::json!({
+                    "status":207, "headers":headers, "body_base64":STANDARD.encode(&body)
+                })
+            );
+        }
+    }
+
+    #[test]
+    fn normalized_provider_body_borrows_unescaped_base64_and_accepts_json_escapes() {
+        for encoded in ["eA==", r"\u0065A=="] {
+            let response = format!(
+                r#"{{"status":200,"body_base64":"{encoded}","usage":{{"input_tokens":7,"output_tokens":3,"estimated":false}}}}"#
+            );
+            let envelope: NormalizedProviderEnvelope = serde_json::from_str(&response).unwrap();
+            assert_eq!(
+                STANDARD.decode(envelope.body_base64.as_ref()).unwrap(),
+                b"x"
+            );
+            assert_eq!(
+                matches!(envelope.body_base64, Cow::Borrowed(_)),
+                encoded == "eA=="
+            );
+        }
+    }
 
     #[cfg(all(
         feature = "experimental-plugin-revisions",
@@ -3129,15 +3296,9 @@ mod tests {
     }
 
     #[test]
-    fn privacy_wire_shim_output_rejects_headers_but_not_valid_growth() {
-        assert!(validate_wire_shim_output("{\"text\":\"\\u4fdd\\u7559\"}", &[]).is_ok());
-        assert!(
-            validate_wire_shim_output("{}", &[("authorization".into(), "bad".into())]).is_err()
-        );
-        assert!(
-            validate_wire_shim_output(&"x".repeat(MAX_TRAFFIC_REQUEST_JSON_BYTES + 1), &[])
-                .is_err()
-        );
+    fn privacy_wire_shim_output_rejects_headers_and_ignores_payload_size() {
+        assert!(validate_wire_shim_output(&[]).is_ok());
+        assert!(validate_wire_shim_output(&[("authorization".into(), "bad".into())]).is_err());
     }
 
     #[test]
@@ -3189,6 +3350,8 @@ mod tests {
                 manifest,
                 component: None,
                 service_data_component: None,
+                background_action_component: None,
+                routing_component: None,
                 wire_shim_component: None,
                 ui_modules: BTreeMap::new(),
                 configuration_validator: None,
@@ -3449,6 +3612,45 @@ mod tests {
         ] {
             assert!(!safe_operator_ui_module_entry(entry), "accepted {entry}");
         }
+    }
+
+    #[test]
+    fn upstream_account_reset_settings_are_component_only_and_unrouted() {
+        let manifest = |slot: &str, renderer: &str, route: Option<&str>| {
+            serde_json::from_value::<PluginManifest>(serde_json::json!({
+                "id": "account-settings", "version": "1.0.0", "wit_version": "0.2.0",
+                "capabilities": [], "contributions": {"operator_ui": [{
+                    "id": "reset-settings", "slot": slot, "label": "Reset settings",
+                    "icon": "activity", "renderer": renderer, "module_entry": "ui/settings.mjs",
+                    "component_id": "reset-settings", "route": route
+                }]}
+            }))
+            .unwrap()
+        };
+        assert!(
+            validate_operator_ui_contributions(&manifest(
+                "operator.upstream-account.reset-settings",
+                "component_v1",
+                None,
+            ))
+            .is_ok()
+        );
+        assert!(
+            validate_operator_ui_contributions(&manifest(
+                "operator.upstream-account.reset-settings",
+                "typed_data_v1",
+                None,
+            ))
+            .is_err()
+        );
+        assert!(
+            validate_operator_ui_contributions(&manifest(
+                "operator.upstream-account.reset-settings",
+                "component_v1",
+                Some("settings"),
+            ))
+            .is_err()
+        );
     }
 
     fn configurable_manifest(schema: Value, default: Value) -> PluginManifest {
@@ -3819,15 +4021,12 @@ mod tests {
             capabilities: vec![PluginCapability::Http {
                 allowed_origins: vec!["https://does-not-resolve.invalid".to_owned()],
             }],
-            http: reqwest::Client::builder()
-                .redirect(reqwest::redirect::Policy::none())
-                .build()
-                .unwrap(),
+            http: crate::http_settings::HttpClient::default(),
             runtime: tokio::runtime::Handle::current(),
             kv: None,
             limits: StoreLimitsBuilder::new().build(),
             deadline: Instant::now() + Duration::from_secs(1),
-            http_body_limit: PLUGIN_HTTP_BODY_BYTES,
+            http_body_limit: None,
             http_diagnostic: PluginHttpDiagnostic::default(),
         };
         let error = memeloop::token_center::host::Host::http_request(
@@ -4035,15 +4234,12 @@ mod tests {
         let mut state = HostState {
             plugin_id: "least-privilege-plugin".to_owned(),
             capabilities: Vec::new(),
-            http: reqwest::Client::builder()
-                .redirect(reqwest::redirect::Policy::none())
-                .build()
-                .unwrap(),
+            http: crate::http_settings::HttpClient::default(),
             runtime: tokio::runtime::Handle::current(),
             kv: None,
             limits: StoreLimitsBuilder::new().build(),
             deadline: Instant::now() + Duration::from_secs(1),
-            http_body_limit: PLUGIN_HTTP_BODY_BYTES,
+            http_body_limit: None,
             http_diagnostic: PluginHttpDiagnostic::default(),
         };
         assert!(

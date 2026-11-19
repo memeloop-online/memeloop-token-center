@@ -76,6 +76,7 @@ mod tests {
             route_id: Uuid::from_u128(route),
             account_id: account,
             driver: "kimi-oauth".into(),
+            upstream_model: "fixture-model".into(),
             transport_revision: 9,
             credential_generation: 7,
         };

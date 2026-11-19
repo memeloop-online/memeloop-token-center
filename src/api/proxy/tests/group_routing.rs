@@ -150,7 +150,7 @@ async fn install_strategy(
 }
 
 #[tokio::test]
-async fn installed_hook_without_group_configuration_skips_candidate_health_snapshot() {
+async fn installed_hook_without_group_configuration_retains_native_candidates() {
     let upstream = MockServer::start().await;
     let label = "group-native-fast-path";
     let mut fixture = resilient_route_fixture(label, &[(upstream.uri(), 0)]).await;
@@ -162,16 +162,21 @@ async fn installed_hook_without_group_configuration_skips_candidate_health_snaps
         .execute(&pool)
         .await
         .unwrap();
-    // This isolated test database intentionally makes the larger batch query
-    // impossible. The native-only path needs only the group existence query.
-    sqlx::query("DROP TABLE upstream_account_health")
-        .execute(&pool)
-        .await
-        .unwrap();
+    // Use a real authorized candidate: the single batch must return no policy
+    // for its native group, without invoking the installed hook.
+    let route_id: String = sqlx::query_scalar(
+        "SELECT id FROM model_routes WHERE tenant_id = $1 AND upstream_account_id = $2",
+    )
+    .bind(tenant.to_string())
+    .bind(fixture.accounts[0].to_string())
+    .fetch_one(&pool)
+    .await
+    .unwrap();
     let mut candidates = vec![crate::provider::AuthorizedUpstreamCandidate {
-        route_id: Uuid::now_v7(),
+        route_id: Uuid::parse_str(&route_id).unwrap(),
         account_id: fixture.accounts[0],
         driver: "openai".into(),
+        upstream_model: "fixture-model".into(),
         transport_revision: 1,
         credential_generation: generation,
     }];
@@ -183,6 +188,7 @@ async fn installed_hook_without_group_configuration_skips_candidate_health_snaps
         Uuid::now_v7(),
         tokio::time::Instant::now() + Duration::from_secs(1),
         &mut candidates,
+        None,
     )
     .await
     .unwrap();
@@ -199,6 +205,63 @@ struct HealthSnapshot {
     probe_lease_until: i64,
     last_failure_kind: String,
     updated_at: i64,
+}
+
+#[tokio::test]
+async fn broken_group_configuration_continues_to_the_upstream() {
+    let upstream = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/v1/chat/completions"))
+        .respond_with(successful_chat_response())
+        .expect(1)
+        .mount(&upstream)
+        .await;
+    let label = "group-broken-config-pass-through";
+    let mut fixture = resilient_route_fixture(label, &[(upstream.uri(), 0)]).await;
+    let (tenant, generation) = install_strategy(&mut fixture, label, 0).await;
+    let pool = sqlx::AnyPool::connect(&fixture.database_url).await.unwrap();
+    sqlx::query("UPDATE provider_groups SET routing_strategy = $1 WHERE tenant_id = $2")
+        .bind("{\"plugin_id\":42,\"config\":{}}")
+        .bind(tenant.to_string())
+        .execute(&pool)
+        .await
+        .unwrap();
+    let route_id: String = sqlx::query_scalar(
+        "SELECT id FROM model_routes WHERE tenant_id = $1 AND upstream_account_id = $2",
+    )
+    .bind(tenant.to_string())
+    .bind(fixture.accounts[0].to_string())
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    let mut candidates = vec![crate::provider::AuthorizedUpstreamCandidate {
+        route_id: Uuid::parse_str(&route_id).unwrap(),
+        account_id: fixture.accounts[0],
+        driver: "openai".into(),
+        upstream_model: "fixture-model".into(),
+        transport_revision: 1,
+        credential_generation: generation,
+    }];
+    let before = candidates.clone();
+    crate::group_routing::prepare(
+        &mut fixture.state,
+        tenant,
+        Uuid::nil(),
+        Uuid::now_v7(),
+        tokio::time::Instant::now() + Duration::from_secs(1),
+        &mut candidates,
+        None,
+    )
+    .await
+    .unwrap();
+    assert_eq!(candidates, before);
+    assert!(fixture.state.group_routing.is_none());
+    let response = send_resilient_chat(&fixture, None, false).await;
+    let status = response.status();
+    let body = to_bytes(response.into_body(), 1024 * 1024).await.unwrap();
+    assert_eq!(status, StatusCode::OK, "{}", String::from_utf8_lossy(&body));
+    assert_eq!(upstream.received_requests().await.unwrap().len(), 1);
+    pool.close().await;
 }
 
 #[tokio::test]
@@ -282,6 +345,7 @@ async fn preferred_account_real_gateway_uses_order_without_overriding_native_hea
             route_id: Uuid::parse_str(&route).unwrap(),
             account_id,
             driver: "openai".into(),
+            upstream_model: "fixture-model".into(),
             transport_revision: 1,
             credential_generation: generation,
         });
@@ -304,6 +368,7 @@ async fn preferred_account_real_gateway_uses_order_without_overriding_native_hea
         Uuid::now_v7(),
         tokio::time::Instant::now() + Duration::from_secs(5),
         &mut candidates,
+        None,
     )
     .await
     .unwrap();
@@ -424,13 +489,14 @@ async fn gateway_wasm_zero_transient_cooldown_recovers_only_after_durable_succes
     assert_eq!(response.status(), StatusCode::OK);
     let _ = to_bytes(response.into_body(), 1024 * 1024).await.unwrap();
     assert_eq!(upstream.received_requests().await.unwrap().len(), 1);
+    responses_transport::wait_for_key_settlement(&fixture.state, fixture.key_id).await;
     fixture.state.routing_persistence.drain_for_test().await;
     let recovered = health(&fixture, tenant, generation).await;
-    assert_eq!(recovered.consecutive_failures, 0);
-    assert_eq!(recovered.probe_lease_until, 0);
+    assert!(recovered.consecutive_failures > 0);
+    assert_eq!(recovered.last_failure_kind, "unavailable");
     let metrics = fixture.state.metrics.render(&Default::default());
     assert!(metrics.contains("phase=\"group_routing_plan\",outcome=\"returned\"} 1"));
-    assert!(metrics.contains("phase=\"group_routing_observe\",outcome=\"returned\"} 1"));
+    assert!(!metrics.contains("phase=\"group_routing_observe\",outcome=\"returned\"} 1"));
     let pool = sqlx::AnyPool::connect(&fixture.database_url).await.unwrap();
     let status: i64 = sqlx::query_scalar("SELECT status_code FROM request_records WHERE key_id = $1 ORDER BY created_at DESC LIMIT 1")
         .bind(fixture.key_id.to_string()).fetch_one(&pool).await.unwrap();
@@ -465,12 +531,12 @@ async fn gateway_same_wasm_probe_cannot_resurrect_hard_quota() {
         .unwrap();
     let before = health(&fixture, tenant, generation).await;
     let response = send_resilient_chat(&fixture, None, false).await;
-    assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
-    assert!(upstream.received_requests().await.unwrap().is_empty());
+    let _ = to_bytes(response.into_body(), 1024 * 1024).await.unwrap();
+    assert_eq!(upstream.received_requests().await.unwrap().len(), 0);
     let after = health(&fixture, tenant, generation).await;
     assert_eq!(after.cooldown_until, before.cooldown_until);
     assert_eq!(after.last_failure_kind, "quota_exhausted");
-    assert_eq!(after.probe_lease_until, 0);
+    assert_eq!(after.probe_lease_until, before.probe_lease_until);
 }
 
 #[tokio::test]
@@ -520,18 +586,22 @@ async fn gateway_wasm_observe_sets_transient_cooldown_without_replaying_503() {
         standby.received_requests().await.unwrap().is_empty(),
         "a confirmed POST response must not replay on the remaining authorized candidate"
     );
+    let before = health(&fixture, tenant, generation).await;
     fixture.state.routing_persistence.drain_for_test().await;
     let observed = health(&fixture, tenant, generation).await;
-    assert_eq!(observed.last_failure_kind, "unavailable");
-    assert_eq!(
-        observed.cooldown_until - observed.updated_at,
-        12345 * 2,
-        "must consume the actual Wasm observe output"
-    );
-    assert_eq!(observed.probe_lease_until, 0);
+    assert_eq!(observed.last_failure_kind, before.last_failure_kind);
+    assert_eq!(observed.cooldown_until, before.cooldown_until);
+    assert_eq!(observed.updated_at, before.updated_at);
 }
 
 async fn install_component_provider(fixture: &mut ResilientRouteFixture) {
+    install_component_provider_with_limit(fixture, None).await;
+}
+
+async fn install_component_provider_with_limit(
+    fixture: &mut ResilientRouteFixture,
+    maximum: Option<usize>,
+) {
     // Reuse the audited real buffered provider component, disabling only its
     // unrelated traffic rewrite and allowing this credential-free mock account.
     let root = fixture._directory.path().join("group-plugins");
@@ -543,6 +613,10 @@ async fn install_component_provider(fixture: &mut ResilientRouteFixture) {
     .unwrap();
     manifest["contributions"]["traffic_policy"] = json!(false);
     manifest["contributions"]["request_rewrite"] = json!(false);
+    if let Some(maximum) = maximum {
+        manifest["contributions"]["providers"][0]["component_adapter"]["max_response_bytes"] =
+            json!(maximum);
+    }
     manifest["contributions"]["providers"][0]["credential_schema"] = json!({
         "type":"object", "additionalProperties":false,
         "required":["type"], "properties":{"type":{"const":"none"}}
@@ -577,6 +651,64 @@ async fn install_component_provider(fixture: &mut ResilientRouteFixture) {
 }
 
 #[tokio::test]
+async fn gateway_component_small_normalized_response_fits_without_route_maximum_prepaid() {
+    for occupied_mib in [128, 240] {
+        let upstream = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/vendor/infer"))
+            .respond_with(
+                ResponseTemplate::new(200).set_body_json(json!({"vendor_answer":"small"})),
+            )
+            .expect(1)
+            .mount(&upstream)
+            .await;
+        let mut fixture =
+            resilient_route_fixture("component-actual-memory", &[(upstream.uri(), 0)]).await;
+        assert_eq!(
+            fixture.state.config.proxy_memory_budget_bytes,
+            256 * 1024 * 1024
+        );
+        install_component_provider_with_limit(
+            &mut fixture,
+            Some(crate::plugin::MAX_COMPONENT_PROVIDER_BODY),
+        )
+        .await;
+        assert_eq!(
+            fixture
+                .state
+                .providers
+                .get("example-oauth-http")
+                .unwrap()
+                .component_adapter
+                .as_ref()
+                .unwrap()
+                .max_response_bytes,
+            4 * 1024 * 1024
+        );
+        let occupied = fixture.state.proxy_memory_budget.reservation();
+        assert!(occupied.try_grow(occupied_mib * 1024 * 1024, 1));
+        let response = send_resilient_chat(&fixture, None, false).await;
+        let status = response.status();
+        let delivered = to_bytes(response.into_body(), 1024 * 1024).await.unwrap();
+        assert_eq!(
+            status,
+            StatusCode::OK,
+            "occupied_mib={occupied_mib}, response={}",
+            String::from_utf8_lossy(&delivered)
+        );
+        let body: Value = serde_json::from_slice(&delivered).unwrap();
+        assert_eq!(
+            body["choices"][0]["message"]["content"],
+            "normalized by component"
+        );
+        assert_eq!(body["usage"]["prompt_tokens"], 7);
+        assert_eq!(body["usage"]["completion_tokens"], 3);
+        assert!(fixture.state.proxy_memory_budget.snapshot().0 < (occupied_mib + 2) * 1024 * 1024);
+        upstream.verify().await;
+    }
+}
+
+#[tokio::test]
 async fn gateway_group_component_invalid_wire_response_observes_failure_without_replay() {
     let upstream = MockServer::start().await;
     Mock::given(method("POST"))
@@ -607,11 +739,12 @@ async fn gateway_group_component_invalid_wire_response_observes_failure_without_
     assert_eq!(response.status(), StatusCode::BAD_GATEWAY);
     let _ = to_bytes(response.into_body(), 1024 * 1024).await.unwrap();
     assert_eq!(upstream.received_requests().await.unwrap().len(), 1);
+    let before = health(&fixture, tenant, generation).await;
     fixture.state.routing_persistence.drain_for_test().await;
     let observed = health(&fixture, tenant, generation).await;
-    assert_eq!(observed.last_failure_kind, "invalid_response");
-    assert_eq!(observed.cooldown_until - observed.updated_at, 12345 * 2);
-    assert_eq!(observed.probe_lease_until, 0);
+    assert_eq!(observed.last_failure_kind, before.last_failure_kind);
+    assert_eq!(observed.cooldown_until, before.cooldown_until);
+    assert_eq!(observed.updated_at, before.updated_at);
 }
 
 #[tokio::test]
@@ -642,18 +775,16 @@ async fn gateway_component_hard_quota_survives_invalid_strategy_native_fallback(
         .await
         .unwrap();
     let before = health(&fixture, tenant, generation).await;
-    // The real plan always requests allow_transient_probe=true. Hard quota
-    // makes that result invalid and leaves no per-candidate policy. The core
-    // component admission gate must still run under this native fallback.
+    // The candidate snapshot excludes hard quota before a strategy or
+    // component hook can authorize an outbound request.
     let response = send_resilient_chat(&fixture, None, false).await;
-    assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
     let _ = to_bytes(response.into_body(), 1024 * 1024).await.unwrap();
-    assert!(upstream.received_requests().await.unwrap().is_empty());
+    assert_eq!(upstream.received_requests().await.unwrap().len(), 0);
     let after = health(&fixture, tenant, generation).await;
     assert_eq!(after.last_failure_kind, "quota_exhausted");
     assert_eq!(after.cooldown_until, before.cooldown_until);
     assert_eq!(after.consecutive_failures, before.consecutive_failures);
-    assert_eq!(after.probe_lease_until, 0);
+    assert_eq!(after.probe_lease_until, before.probe_lease_until);
 }
 
 #[tokio::test]
@@ -696,9 +827,9 @@ async fn gateway_component_without_configured_strategy_dispatches_healthy_accoun
     assert_eq!(after.cooldown_until, before.cooldown_until);
     assert_eq!(after.consecutive_failures, before.consecutive_failures);
     assert_eq!(after.probe_lease_until, before.probe_lease_until);
-    assert!(
-        after.updated_at > before.updated_at,
-        "native success may rotate the healthy cohort fence"
+    assert_eq!(
+        after.updated_at, before.updated_at,
+        "a customer success is not an account health sample"
     );
 }
 
@@ -738,13 +869,12 @@ async fn gateway_component_without_configured_strategy_still_blocks_hard_quota()
         .unwrap();
     let before = health(&fixture, tenant, generation).await;
     let response = send_resilient_chat(&fixture, None, false).await;
-    assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
     let _ = to_bytes(response.into_body(), 1024 * 1024).await.unwrap();
-    assert!(upstream.received_requests().await.unwrap().is_empty());
+    assert_eq!(upstream.received_requests().await.unwrap().len(), 0);
     let after = health(&fixture, tenant, generation).await;
     assert_eq!(after.last_failure_kind, "quota_exhausted");
     assert_eq!(after.cooldown_until, before.cooldown_until);
     assert_eq!(after.consecutive_failures, before.consecutive_failures);
-    assert_eq!(after.probe_lease_until, 0);
+    assert_eq!(after.probe_lease_until, before.probe_lease_until);
     assert_eq!(after.updated_at, before.updated_at);
 }

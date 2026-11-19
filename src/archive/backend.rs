@@ -13,32 +13,51 @@ use crate::{
 };
 
 impl ArchiveStore {
+    #[cfg(test)]
+    pub(crate) fn memory_for_test() -> Self {
+        super::tests::memory_store()
+    }
+
+    #[cfg(test)]
+    pub(crate) fn training_memory_for_test() -> Self {
+        let mut archive = super::tests::memory_store();
+        archive.training = Some(super::routing::TrainingStore {
+            store: Arc::new(InMemory::new()),
+            identity: "a".repeat(64),
+        });
+        archive.training_cas_writes = true;
+        archive
+    }
+
+    #[cfg(test)]
+    pub(crate) fn training_staging_memory_for_test() -> Self {
+        let mut archive = Self::training_memory_for_test();
+        archive.training_staging_writes = true;
+        archive
+    }
+
     pub async fn from_config(config: &Config) -> Result<Self, AppError> {
         config
             .s3_timeouts
             .validate()
             .map_err(|_| AppError::BadRequest("invalid S3 timeout configuration".into()))?;
-        let inner: Arc<dyn ObjectStore> =
-            match config.archive_backend {
-                ArchiveBackend::Memory => Arc::new(InMemory::new()),
-                ArchiveBackend::Filesystem => {
-                    let root = config.archive_path.as_ref().ok_or_else(|| {
-                        AppError::BadRequest("MTC_ARCHIVE_PATH is required".into())
-                    })?;
-                    std::fs::create_dir_all(root).map_err(|_| {
-                        AppError::Storage("archive filesystem initialization failed".into())
-                    })?;
-                    Arc::new(
-                        object_store::local::LocalFileSystem::new_with_prefix(PathBuf::from(root))
-                            .map_err(|_| {
-                                AppError::Storage(
-                                    "archive filesystem configuration is invalid".into(),
-                                )
-                            })?,
-                    )
-                }
-                ArchiveBackend::S3 => {
-                    let mut builder = AmazonS3Builder::new()
+        let inner: Arc<dyn ObjectStore> = match config.archive_backend {
+            ArchiveBackend::Memory => Arc::new(InMemory::new()),
+            ArchiveBackend::Filesystem => {
+                let root = config
+                    .archive_path
+                    .as_ref()
+                    .ok_or_else(|| AppError::BadRequest("MTC_ARCHIVE_PATH is required".into()))?;
+                std::fs::create_dir_all(root)
+                    .map_err(|_| AppError::storage("archive_filesystem_initialization_failed"))?;
+                Arc::new(
+                    object_store::local::LocalFileSystem::new_with_prefix(PathBuf::from(root))
+                        .map_err(|_| AppError::storage("local_storage_failed"))?,
+                )
+            }
+            ArchiveBackend::S3 => {
+                let mut builder =
+                    AmazonS3Builder::new()
                         .with_bucket_name(config.s3_bucket.as_ref().ok_or_else(|| {
                             AppError::BadRequest("MTC_S3_BUCKET is required".into())
                         })?)
@@ -60,24 +79,76 @@ impl ArchiveStore {
                             ..RetryConfig::default()
                         })
                         .with_copy_if_not_exists(S3CopyIfNotExists::Multipart);
-                    if let Some(endpoint) = &config.s3_endpoint {
-                        builder = builder.with_endpoint(endpoint);
-                    }
-                    if let Some(access_key) = &config.s3_access_key {
-                        builder = builder.with_access_key_id(access_key);
-                    }
-                    if let Some(secret_key) = &config.s3_secret_key {
-                        builder = builder.with_secret_access_key(secret_key);
-                    }
-                    Arc::new(builder.build().map_err(|_| {
-                        AppError::Storage("archive S3 configuration is invalid".into())
-                    })?)
+                if let Some(endpoint) = &config.s3_endpoint {
+                    builder = builder.with_endpoint(endpoint);
                 }
-            };
+                if let Some(access_key) = &config.s3_access_key {
+                    builder = builder.with_access_key_id(access_key);
+                }
+                if let Some(secret_key) = &config.s3_secret_key {
+                    builder = builder.with_secret_access_key(secret_key);
+                }
+                Arc::new(
+                    builder
+                        .build()
+                        .map_err(|_| AppError::storage("archive_s3_configuration_is_invalid"))?,
+                )
+            }
+        };
+
+        let training = config
+            .training_s3
+            .as_ref()
+            .map(|settings| {
+                let identity_document = serde_json::to_vec(&(
+                    "mtc-training-s3-v1",
+                    &settings.endpoint,
+                    &settings.bucket,
+                    &settings.region,
+                ))
+                .map_err(|_| AppError::storage("archive_training_configuration_invalid"))?;
+                let identity = blake3::hash(&identity_document).to_hex().to_string();
+                let store = AmazonS3Builder::new()
+                    .with_endpoint(&settings.endpoint)
+                    .with_bucket_name(&settings.bucket)
+                    .with_region(&settings.region)
+                    .with_access_key_id(&settings.access_key)
+                    .with_secret_access_key(&settings.secret_key)
+                    .with_allow_http(settings.allow_http)
+                    .with_copy_if_not_exists(S3CopyIfNotExists::Multipart)
+                    .with_client_options(
+                        ClientOptions::new()
+                            .with_allow_http(settings.allow_http)
+                            .with_connect_timeout(Duration::from_millis(
+                                config.s3_timeouts.connect_millis.into(),
+                            ))
+                            .with_timeout(Duration::from_millis(
+                                config.s3_timeouts.request_millis.into(),
+                            )),
+                    )
+                    .with_retry(RetryConfig {
+                        max_retries: 3,
+                        retry_timeout: Duration::from_secs(10),
+                        ..RetryConfig::default()
+                    })
+                    .build()
+                    .map_err(|_| AppError::storage("archive_training_configuration_invalid"))?;
+                Ok::<_, AppError>(super::routing::TrainingStore {
+                    store: Arc::new(store),
+                    identity,
+                })
+            })
+            .transpose()?;
+        if (config.training_cas_writes || config.training_staging_writes) && training.is_none() {
+            return Err(AppError::storage("archive_training_backend_missing"));
+        }
 
         let readiness_path = archive_path(&format!("readiness/{}.bin", uuid::Uuid::now_v7()))?;
         Ok(Self {
             inner,
+            training,
+            training_cas_writes: config.training_cas_writes,
+            training_staging_writes: config.training_staging_writes,
             readiness: Arc::new(tokio::sync::Mutex::new(ReadinessCache::default())),
             readiness_path,
             readiness_deadline: Duration::from_millis(config.s3_timeouts.readiness_millis.into()),

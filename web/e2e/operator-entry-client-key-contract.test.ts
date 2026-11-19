@@ -5,6 +5,7 @@ import { clientCredentialPortalUrl, isOrdinaryClientCredential } from '../src/op
 
 const scope = readFileSync(new URL('../src/operator/hooks/useOperatorScope.ts', import.meta.url), 'utf8');
 const access = readFileSync(new URL('../src/operator/OperatorAccessSettings.tsx', import.meta.url), 'utf8');
+const operator = readFileSync(new URL('../src/operator/Operator.tsx', import.meta.url), 'utf8');
 const i18n = readFileSync(new URL('../src/i18n.tsx', import.meta.url), 'utf8');
 
 const keyId = 'a1b2c3d4e5f60718293a4b5c6d7e8f90';
@@ -35,13 +36,86 @@ test('only a server 401 against the client-key shape shows the portal guidance',
   const catchAt = scope.indexOf('} catch (reason)');
   const guidanceAt = scope.indexOf("t('operator.clientKeyRejected')");
   assert.ok(catchAt > -1 && guidanceAt > catchAt);
-  assert.match(scope, /reason instanceof ApiError && reason\.status === 401 && isOrdinaryClientCredential\(candidate\)/);
+  assert.match(scope, /reason instanceof ApiError && reason\.status === 401/);
+  assert.match(scope, /isOrdinaryClientCredential\(candidate\)\s*\?\s*t\('operator\.clientKeyRejected'\)/);
   assert.match(scope, /messageOf\(reason, t\('common\.connectionFailed'\)\)/);
 });
 
-test('a failed credential is never stored and never shown as signed in', () => {
-  assert.match(scope, /: \{ credential: '', validated: false, credentialInput: state\.credentialInput, tenant: '', tenants: \[\], status: \{ kind: 'failed', message: action\.message \} \}/);
-  assert.match(scope, /clearRememberedCredential\('operator'\)/);
+test('a rejected credential is never stored and never shown as signed in', () => {
+  assert.match(scope, /return \{ credential: '', validated: false, credentialInput: state\.credentialInput, tenant: '', tenants: \[\], status: \{ kind: 'failed', message: action\.message \} \};/);
+  assert.match(scope, /dispatch\(\{ type: 'authentication-failed', message, outcome: 'reject' \}\)/);
+});
+
+test('a 403 is a definitive denial, never an outage and never an active session', () => {
+  assert.match(scope, /reason instanceof ApiError && reason\.status === 403/);
+  // A validated identity is deactivated: validated flips false so pages and
+  // streams lose authorization, while the saved credential is kept.
+  assert.match(scope, /if \(action\.outcome === 'denied'\) return \{ \.\.\.state, validated: false, status: \{ kind: 'failed', message: action\.message \} \};/);
+  assert.match(scope, /reason\.status === 403\) \{\s*dispatch\(\{ type: 'authentication-failed', message: messageOf\(reason, t\('common\.connectionFailed'\)\), outcome: 'denied' \}\);\s*return;\s*\}/);
+  // An unproven candidate is dropped with its saved value, never promoted.
+  assert.match(scope, /if \(before\.validated\) \{\s*dispatch\(\{ type: 'authentication-failed', message, outcome: 'denied' \}\);\s*return;\s*\}\s*clearRememberedCredential\('operator'\);\s*dispatch\(\{ type: 'authentication-failed', message, outcome: 'reject' \}\)/);
+  assert.doesNotMatch(scope, /preserve:/);
+});
+
+test('a failed replacement candidate proves nothing about the validated session', () => {
+  assert.match(scope, /const replacement = before\.validated && Boolean\(before\.credential\) && candidate !== before\.credential;/);
+  assert.match(scope, /if \(replacement\) \{\s*dispatch\(\{ type: 'authentication-failed', message, outcome: 'session-kept' \}\);\s*return;\s*\}/);
+  assert.match(scope, /if \(action\.outcome === 'session-kept'\) return \{ \.\.\.state, status: \{ kind: 'failed', message: action\.message \} \};/);
+});
+
+test('tenant selection never masquerades as recovery; only a successful read recovers', () => {
+  const selectAt = scope.indexOf("case 'select-tenant':");
+  const clearAt = scope.indexOf("case 'clear':");
+  assert.ok(selectAt > -1 && clearAt > selectAt);
+  const selectCase = scope.slice(selectAt, clearAt);
+  assert.match(selectCase, /return \{ \.\.\.state, tenant: action\.tenant \};/);
+  assert.doesNotMatch(selectCase, /kind: 'ready'/);
+  assert.match(scope, /return \{ \.\.\.state, tenants: action\.tenants, tenant: action\.tenant, status: \{ kind: 'ready' \} \};/);
+});
+
+test('only a definitive 401 or 403, or an explicit user clear, removes the remembered credential', () => {
+  const clearSites = [...scope.matchAll(/clearRememberedCredential\('operator'\)/g)].map((match) => match.index ?? 0);
+  assert.equal(clearSites.length, 4, '401 and 403 rejections in authenticate and refresh, plus the explicit clear control');
+  for (const at of clearSites) {
+    const context = scope.slice(Math.max(0, at - 640), at);
+    assert.ok(/reason\.status === 401|reason\.status === 403|function clearCredential/.test(context), 'every clearing site follows a definitive rejection or the explicit clear control');
+  }
+});
+
+test('a network, 502, 503 or database outage preserves the session, page and draft', () => {
+  assert.match(scope, /\{ \.\.\.state, status: \{ kind: 'unavailable', message: action\.message, candidate: action\.candidate \} \}/);
+  assert.match(scope, /dispatch\(\{ type: 'authentication-unavailable', message: outageMessage\(reason\), candidate \}\)/);
+  assert.match(scope, /state\.validated && \(\s*state\.status\.kind === 'ready'\s*\|\| state\.status\.kind === 'failed'\s*\|\| state\.status\.kind === 'unavailable'\s*\|\| \(state\.status\.kind === 'authenticating' && state\.status\.candidate === state\.credential\)\s*\) \? state\.credential : '';/);
+  assert.match(scope, /t\('operator\.serviceUnavailable'\)/);
+  assert.match(scope, /apiDiagnosticMessage\(reason, t\('common\.connectionFailed'\)/);
+});
+
+test('a failed tenant refresh is classified the same way instead of surfacing as a logout', () => {
+  const refreshAt = scope.indexOf('async function refreshTenants()');
+  assert.ok(refreshAt > -1);
+  const refresh = scope.slice(refreshAt);
+  assert.match(refresh, /\} catch \(reason\) \{/);
+  assert.match(refresh, /reason instanceof ApiError && reason\.status === 401/);
+  assert.match(refresh, /reason instanceof ApiError && reason\.status === 403/);
+  assert.match(refresh, /dispatch\(\{ type: 'authentication-unavailable', message: outageMessage\(reason\), candidate: credential \}\)/);
+});
+
+test('retry re-attempts the preserved candidate without new side effects', () => {
+  assert.match(scope, /if \(current\.status\.kind !== 'unavailable'\) return;/);
+  assert.match(scope, /void authenticate\(current\.status\.candidate\)/);
+  assert.match(operator, /scope\.serviceFault && <div className="notice error" role="alert">\{scope\.serviceFault\}<Button appearance="secondary" onClick=\{scope\.retry\} disabled=\{scope\.authenticating\}>/);
+  // Retrying the session's own credential keeps the mounted page and its
+  // drafts; only a scope without an active credential falls back to the
+  // loading page.
+  assert.match(operator, /\{scope\.authenticating && !scope\.activeCredential && activeRoute !== 'system-settings'/);
+});
+
+test('the access card reuses Fluent controls and drops scoped native buttons', () => {
+  assert.match(access, /<SecretInput fluent id="operator-access-credential"/);
+  assert.match(access, /<Button appearance="primary" type="submit"/);
+  assert.match(access, /<Button appearance="secondary" type="button" onClick=\{onClear\}>/);
+  assert.match(access, /<CopyButton fluent value=\{credentialInput\}/);
+  assert.doesNotMatch(access, /<button/);
 });
 
 test('portal guidance is a bare link that never carries the credential', () => {
@@ -61,6 +135,7 @@ test('portal guidance is a bare link that never carries the credential', () => {
 test('rejection and portal-guidance copy exists in both locales', () => {
   assert.equal(i18n.match(/'operator\.clientKeyRejected': '/g)?.length, 2);
   assert.equal(i18n.match(/'operator\.clientCredentialPortalHint': '/g)?.length, 2);
+  assert.equal(i18n.match(/'operator\.serviceUnavailable': '/g)?.length, 2);
   assert.match(i18n, /'operator\.clientKeyRejected': '[^']*mts_[^']*个人中心[^']*'/);
   assert.match(i18n, /'operator\.clientKeyRejected': '[^']*service credential[^']*portal[^']*'/);
   assert.match(i18n, /'operator\.clientCredentialPortalHint': '[^']*mtc_[^']*个人中心[^']*'/);

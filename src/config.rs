@@ -8,20 +8,23 @@ pub const DEFAULT_PRICING_LITELLM_URL: &str =
 pub const DEFAULT_PRICING_OPENROUTER_URL: &str = "https://openrouter.ai/api/v1/models";
 pub const DEFAULT_GATEWAY_BODY_READ_CONCURRENCY: u32 = 1_024;
 pub const MAX_GATEWAY_BODY_READ_CONCURRENCY: u32 = 8_192;
-pub const DEFAULT_RESPONSES_BODY_MAX_BYTES: u32 = 16 * 1024 * 1024;
+pub const DEFAULT_RESPONSES_BODY_MAX_BYTES: u32 = 64 * 1024 * 1024;
 pub const MIN_RESPONSES_BODY_MAX_BYTES: u32 = 4 * 1024 * 1024;
-pub const MAX_RESPONSES_BODY_MAX_BYTES: u32 = 64 * 1024 * 1024;
+pub const MAX_RESPONSES_BODY_MAX_BYTES: u32 = 256 * 1024 * 1024;
 pub const DEFAULT_RESPONSES_BODY_READ_CONCURRENCY: u32 = DEFAULT_GATEWAY_BODY_READ_CONCURRENCY;
-pub const DEFAULT_RESPONSES_REQUEST_SPOOL_BYTES: u32 = 64 * 1024 * 1024;
-pub const MAX_RESPONSES_REQUEST_SPOOL_BYTES: u32 = 2 * 1024 * 1024 * 1024;
 pub const DEFAULT_RESPONSES_REQUEST_SPOOL_PATH: &str =
     "/var/lib/memeloop-token-center/request-spool";
-pub const DEFAULT_PROXY_MEMORY_BUDGET_BYTES: u32 = 256 * 1024 * 1024;
+pub const DEFAULT_PROXY_MEMORY_BUDGET_BYTES: u64 = 256 * 1024 * 1024;
 pub const MAX_RESPONSES_BODY_READ_CONCURRENCY: u32 = MAX_GATEWAY_BODY_READ_CONCURRENCY;
 pub const DEFAULT_AUDIO_BODY_MAX_BYTES: u32 = 25 * 1024 * 1024;
 pub const DEFAULT_UPSTREAM_SHARED_PROBE_ATTEMPTS: u32 = 1;
 pub const MAX_UPSTREAM_SHARED_PROBE_ATTEMPTS: u32 = 4;
 pub const DEFAULT_ARCHIVE_SPOOL_COMPRESSION_ENABLED: bool = false;
+pub const DEFAULT_TERMINAL_PROJECTION_ENABLED: bool = true;
+
+const fn default_terminal_projection_enabled() -> bool {
+    DEFAULT_TERMINAL_PROJECTION_ENABLED
+}
 /// Runtime rollout starts in observation mode until every gateway understands
 /// transport-scoped connection cohorts. Tests keep the historical breaker
 /// semantics through `UpstreamHealthConfig::DEFAULT`; production config must
@@ -148,27 +151,34 @@ impl RuntimeRole {
 }
 
 #[derive(Clone, Serialize, Deserialize)]
+pub struct TrainingS3Config {
+    pub endpoint: String,
+    pub bucket: String,
+    pub region: String,
+    pub access_key: String,
+    pub secret_key: String,
+    pub allow_http: bool,
+}
+
+#[derive(Clone, Serialize, Deserialize)]
 pub struct Config {
     #[serde(default, skip_serializing)]
     pub transport_proxy_groups: String,
     pub listen: String,
     pub database_url: String,
     pub database_max_connections: u32,
-    #[serde(default)]
+    #[serde(default = "default_database_aux_pool_max_connections")]
+    pub database_aux_pool_max_connections: u32,
+    #[serde(default = "default_terminal_projection_enabled")]
     pub terminal_projection_enabled: bool,
-    /// Legacy deployment compatibility value; lifecycle admission uses bytes.
-    pub proxy_lifecycle_concurrency: u32,
     /// Weighted raw body/JSON/ciphertext memory admission, shared by all text routes.
-    pub proxy_memory_budget_bytes: u32,
+    pub proxy_memory_budget_bytes: u64,
     /// Maximum concurrent readers without complete shared byte admission.
     /// Byte-metered default text bodies do not consume these count permits.
     pub gateway_body_read_concurrency: u32,
     /// Maximum `/v1/responses` request body size. It is separately admitted so
     /// its 16 MiB default cannot consume all general body-read capacity.
     pub responses_body_max_bytes: u32,
-    /// Process-local node-disk budget for authenticated Responses request spools.
-    #[serde(default = "default_responses_request_spool_bytes")]
-    pub responses_request_spool_bytes: u32,
     /// Absolute writable directory mounted only into gateway-capable roles.
     #[serde(default = "default_responses_request_spool_path")]
     pub responses_request_spool_path: String,
@@ -180,8 +190,6 @@ pub struct Config {
     pub responses_body_read_concurrency: u32,
     /// Shared per-upstream-account circuit-breaker and half-open probe timings.
     pub upstream_health: UpstreamHealthConfig,
-    #[serde(default)]
-    pub h2_attempt_binding_enabled: bool,
     pub quota_observation_interval_millis: u32,
     pub quota_observation_batch_limit: u32,
     pub quota_observation_timeout_millis: u32,
@@ -209,6 +217,13 @@ pub struct Config {
     pub s3_allow_http: bool,
     #[serde(default)]
     pub s3_timeouts: S3Timeouts,
+    /// Independent immutable training CAS. Legacy S3 settings retain their meaning.
+    #[serde(default)]
+    pub training_s3: Option<TrainingS3Config>,
+    #[serde(default)]
+    pub training_cas_writes: bool,
+    #[serde(default)]
+    pub training_staging_writes: bool,
     pub upstream_openai_url: Option<String>,
     pub upstream_openai_key: Option<String>,
     pub upstream_anthropic_url: Option<String>,
@@ -217,6 +232,13 @@ pub struct Config {
     pub pricing_litellm_url: String,
     pub pricing_openrouter_url: String,
     pub plugin_dir: Option<String>,
+    /// Private, fixed-tenant Health Intelligence companion. Never guest config.
+    #[serde(default, skip_serializing)]
+    pub plugin_advice_origin: Option<String>,
+    #[serde(default, skip_serializing)]
+    pub plugin_advice_tenant: Option<String>,
+    #[serde(default, skip_serializing)]
+    pub plugin_advice_read_token: Option<String>,
     /// Host-provisioned JSON inventory; never accepted from plugin/tenant input.
     #[serde(default)]
     pub plugin_inventory_file: Option<String>,
@@ -240,23 +262,19 @@ impl std::fmt::Debug for Config {
             .field("database_url", &"[redacted]")
             .field("database_max_connections", &self.database_max_connections)
             .field(
+                "database_aux_pool_max_connections",
+                &self.database_aux_pool_max_connections,
+            )
+            .field(
                 "terminal_projection_enabled",
                 &self.terminal_projection_enabled,
             )
             .field("proxy_memory_budget_bytes", &self.proxy_memory_budget_bytes)
             .field(
-                "proxy_lifecycle_concurrency",
-                &self.proxy_lifecycle_concurrency,
-            )
-            .field(
                 "gateway_body_read_concurrency",
                 &self.gateway_body_read_concurrency,
             )
             .field("responses_body_max_bytes", &self.responses_body_max_bytes)
-            .field(
-                "responses_request_spool_bytes",
-                &self.responses_request_spool_bytes,
-            )
             .field(
                 "responses_request_spool_path",
                 &self.responses_request_spool_path,
@@ -267,10 +285,6 @@ impl std::fmt::Debug for Config {
                 &self.responses_body_read_concurrency,
             )
             .field("upstream_health", &self.upstream_health)
-            .field(
-                "h2_attempt_binding_enabled",
-                &self.h2_attempt_binding_enabled,
-            )
             .field("run_migrations_on_start", &self.run_migrations_on_start)
             .field("key_pepper", &"[redacted]")
             .field("service_token", &"[redacted]")
@@ -435,11 +449,15 @@ impl Config {
                 "MTC_DATABASE_URL",
                 "postgres://postgres:postgres@127.0.0.1:5432/memeloop_token_center",
             ),
-            database_max_connections: env_u32("MTC_DATABASE_MAX_CONNECTIONS", 4)?.clamp(1, 32),
-            terminal_projection_enabled: env_bool("MTC_TERMINAL_PROJECTION_ENABLED", false),
-            proxy_lifecycle_concurrency: env_u32("MTC_PROXY_LIFECYCLE_CONCURRENCY", 64)?
-                .clamp(1, 4_096),
-            proxy_memory_budget_bytes: env_u32(
+            // 不再对连接数做上限夹取：容量应由部署规模决定，而不是代码常量。
+            // 只保留下限 1，因为 0 会让 sqlx 连接池无法工作。
+            database_max_connections: env_u32("MTC_DATABASE_MAX_CONNECTIONS", 4)?,
+            database_aux_pool_max_connections: env_u32("MTC_DATABASE_AUX_POOL_MAX_CONNECTIONS", 2)?,
+            terminal_projection_enabled: env_bool(
+                "MTC_TERMINAL_PROJECTION_ENABLED",
+                DEFAULT_TERMINAL_PROJECTION_ENABLED,
+            ),
+            proxy_memory_budget_bytes: env_u64(
                 "MTC_PROXY_MEMORY_BUDGET_BYTES",
                 DEFAULT_PROXY_MEMORY_BUDGET_BYTES,
             )?,
@@ -451,10 +469,6 @@ impl Config {
                 "MTC_RESPONSES_BODY_MAX_BYTES",
                 DEFAULT_RESPONSES_BODY_MAX_BYTES,
             )?),
-            responses_request_spool_bytes: env_u32(
-                "MTC_RESPONSES_REQUEST_SPOOL_BYTES",
-                DEFAULT_RESPONSES_REQUEST_SPOOL_BYTES,
-            )?,
             responses_request_spool_path: env_string(
                 "MTC_RESPONSES_REQUEST_SPOOL_PATH",
                 DEFAULT_RESPONSES_REQUEST_SPOOL_PATH,
@@ -468,19 +482,15 @@ impl Config {
                 DEFAULT_RESPONSES_BODY_READ_CONCURRENCY,
             )?),
             upstream_health,
-            h2_attempt_binding_enabled: env_bool("MTC_H2_ATTEMPT_BINDING_ENABLED", false),
             quota_observation_interval_millis: env_u32(
                 "MTC_QUOTA_OBSERVATION_INTERVAL_MILLIS",
                 10_000,
-            )?
-            .clamp(1_000, 60_000),
-            quota_observation_batch_limit: env_u32("MTC_QUOTA_OBSERVATION_BATCH_LIMIT", 4)?
-                .clamp(1, 16),
+            )?,
+            quota_observation_batch_limit: env_u32("MTC_QUOTA_OBSERVATION_BATCH_LIMIT", 4)?,
             quota_observation_timeout_millis: env_u32(
                 "MTC_QUOTA_OBSERVATION_TIMEOUT_MILLIS",
                 10_000,
-            )?
-            .clamp(1_000, 30_000),
+            )?,
             run_migrations_on_start: env_bool("MTC_RUN_MIGRATIONS_ON_START", true),
             key_pepper,
             service_token,
@@ -502,6 +512,19 @@ impl Config {
             s3_secret_key: env::var("MTC_S3_SECRET_KEY").ok(),
             s3_allow_http: env_bool("MTC_S3_ALLOW_HTTP", false),
             s3_timeouts: S3Timeouts::from_env()?,
+            training_s3: match env::var("MTC_TRAINING_S3_ENDPOINT").ok() {
+                Some(endpoint) => Some(TrainingS3Config {
+                    endpoint,
+                    bucket: required("MTC_TRAINING_S3_BUCKET")?,
+                    region: env_string("MTC_TRAINING_S3_REGION", "us-east-1"),
+                    access_key: required("MTC_TRAINING_S3_ACCESS_KEY")?,
+                    secret_key: required("MTC_TRAINING_S3_SECRET_KEY")?,
+                    allow_http: env_bool("MTC_TRAINING_S3_ALLOW_HTTP", false),
+                }),
+                None => None,
+            },
+            training_cas_writes: env_bool("MTC_TRAINING_CAS_WRITES", false),
+            training_staging_writes: env_bool("MTC_TRAINING_STAGING_WRITES", false),
             upstream_openai_url: env::var("MTC_UPSTREAM_OPENAI_URL").ok(),
             upstream_openai_key: env::var("MTC_UPSTREAM_OPENAI_KEY").ok(),
             upstream_anthropic_url: env::var("MTC_UPSTREAM_ANTHROPIC_URL").ok(),
@@ -510,6 +533,9 @@ impl Config {
             pricing_litellm_url,
             pricing_openrouter_url,
             plugin_dir: env::var("MTC_PLUGIN_DIR").ok(),
+            plugin_advice_origin: env::var("MTC_PLUGIN_ADVICE_ORIGIN").ok(),
+            plugin_advice_tenant: env::var("MTC_PLUGIN_ADVICE_TENANT").ok(),
+            plugin_advice_read_token: env::var("MTC_PLUGIN_ADVICE_READ_TOKEN").ok(),
             plugin_inventory_file: env::var("MTC_PLUGIN_INVENTORY_FILE").ok(),
             plugin_install_policy_file: env::var("MTC_PLUGIN_INSTALL_POLICY_FILE").ok(),
             allow_oauth_loopback,
@@ -522,10 +548,10 @@ impl Config {
 
     pub(crate) fn validate_proxy_memory_budget(&self) -> Result<(), ConfigError> {
         if self.proxy_memory_budget_bytes < DEFAULT_PROXY_MEMORY_BUDGET_BYTES
-            || self.proxy_memory_budget_bytes > 2 * 1024 * 1024 * 1024
-            || u64::from(self.proxy_memory_budget_bytes)
-                < u64::from(self.responses_body_max_bytes) * 12 + 1024 * 1024
-            || u64::from(self.proxy_memory_budget_bytes) < u64::from(self.audio_body_max_bytes) * 3
+            || !crate::gateway_body::memory::ProxyMemoryBudget::supports(
+                self.proxy_memory_budget_bytes,
+            )
+            || self.proxy_memory_budget_bytes < u64::from(self.audio_body_max_bytes) * 3
         {
             return Err(ConfigError::InvalidProxyMemoryBudget);
         }
@@ -535,13 +561,12 @@ impl Config {
             && spool_path.components().all(|component| {
                 matches!(
                     component,
-                    std::path::Component::RootDir | std::path::Component::Normal(_)
+                    std::path::Component::Prefix(_)
+                        | std::path::Component::RootDir
+                        | std::path::Component::Normal(_)
                 )
             });
-        if self.responses_request_spool_bytes < self.responses_body_max_bytes
-            || self.responses_request_spool_bytes > MAX_RESPONSES_REQUEST_SPOOL_BYTES
-            || !valid_spool_path
-        {
+        if !valid_spool_path {
             return Err(ConfigError::InvalidResponsesRequestSpool);
         }
         Ok(())
@@ -553,12 +578,11 @@ impl Config {
             listen: "127.0.0.1:0".to_owned(),
             database_url,
             database_max_connections: 8,
+            database_aux_pool_max_connections: 2,
             terminal_projection_enabled: false,
-            proxy_lifecycle_concurrency: 64,
             proxy_memory_budget_bytes: DEFAULT_PROXY_MEMORY_BUDGET_BYTES,
             gateway_body_read_concurrency: DEFAULT_GATEWAY_BODY_READ_CONCURRENCY,
             responses_body_max_bytes: DEFAULT_RESPONSES_BODY_MAX_BYTES,
-            responses_request_spool_bytes: DEFAULT_RESPONSES_REQUEST_SPOOL_BYTES,
             responses_request_spool_path: std::env::temp_dir()
                 .join("memeloop-token-center-request-spool")
                 .to_string_lossy()
@@ -566,7 +590,6 @@ impl Config {
             audio_body_max_bytes: DEFAULT_AUDIO_BODY_MAX_BYTES,
             responses_body_read_concurrency: DEFAULT_RESPONSES_BODY_READ_CONCURRENCY,
             upstream_health: UpstreamHealthConfig::DEFAULT,
-            h2_attempt_binding_enabled: false,
             quota_observation_interval_millis: 10_000,
             quota_observation_batch_limit: 4,
             quota_observation_timeout_millis: 10_000,
@@ -587,6 +610,9 @@ impl Config {
             s3_secret_key: None,
             s3_allow_http: true,
             s3_timeouts: S3Timeouts::default(),
+            training_s3: None,
+            training_cas_writes: false,
+            training_staging_writes: false,
             upstream_openai_url: None,
             upstream_openai_key: None,
             upstream_anthropic_url: None,
@@ -597,6 +623,9 @@ impl Config {
             pricing_litellm_url: String::new(),
             pricing_openrouter_url: String::new(),
             plugin_dir: None,
+            plugin_advice_origin: None,
+            plugin_advice_tenant: None,
+            plugin_advice_read_token: None,
             plugin_inventory_file: None,
             plugin_install_policy_file: None,
             allow_oauth_loopback: true,
@@ -699,6 +728,15 @@ fn env_u32(name: &'static str, default: u32) -> Result<u32, ConfigError> {
     }
 }
 
+fn env_u64(name: &'static str, default: u64) -> Result<u64, ConfigError> {
+    match env::var(name) {
+        Ok(value) => value
+            .parse()
+            .map_err(|_| ConfigError::InvalidInteger(name, value)),
+        Err(_) => Ok(default),
+    }
+}
+
 fn health_millis(name: &'static str, default: i64) -> Result<i64, ConfigError> {
     const MINIMUM: i64 = 100;
     const MAXIMUM: i64 = 86_400_000;
@@ -717,15 +755,11 @@ fn health_millis(name: &'static str, default: i64) -> Result<i64, ConfigError> {
 }
 
 fn gateway_body_read_concurrency(value: u32) -> u32 {
-    value.clamp(1, MAX_GATEWAY_BODY_READ_CONCURRENCY)
+    value
 }
 
 fn responses_body_max_bytes(value: u32) -> u32 {
-    value.clamp(MIN_RESPONSES_BODY_MAX_BYTES, MAX_RESPONSES_BODY_MAX_BYTES)
-}
-
-const fn default_responses_request_spool_bytes() -> u32 {
-    DEFAULT_RESPONSES_REQUEST_SPOOL_BYTES
+    value
 }
 
 fn default_responses_request_spool_path() -> String {
@@ -737,17 +771,17 @@ const fn default_audio_body_max_bytes() -> u32 {
 }
 
 fn responses_body_read_concurrency(value: u32) -> u32 {
-    value.clamp(1, MAX_RESPONSES_BODY_READ_CONCURRENCY)
+    value
 }
 
 #[derive(Debug, thiserror::Error)]
 pub enum ConfigError {
     #[error(
-        "MTC_PROXY_MEMORY_BUDGET_BYTES must be 256 MiB..2 GiB, at least twelve times MTC_RESPONSES_BODY_MAX_BYTES plus 1 MiB, and at least three times MTC_AUDIO_BODY_MAX_BYTES; pod memory must cover this budget plus 256 MiB"
+        "MTC_PROXY_MEMORY_BUDGET_BYTES must be at least 256 MiB, fit the process memory counter, and be at least three times MTC_AUDIO_BODY_MAX_BYTES; pod memory must cover this budget plus 256 MiB"
     )]
     InvalidProxyMemoryBudget,
     #[error(
-        "MTC_RESPONSES_REQUEST_SPOOL_BYTES must cover MTC_RESPONSES_BODY_MAX_BYTES and remain at most 2 GiB; MTC_RESPONSES_REQUEST_SPOOL_PATH must be an absolute non-root path without traversal components"
+        "MTC_RESPONSES_REQUEST_SPOOL_PATH must be an absolute non-root path without traversal components"
     )]
     InvalidResponsesRequestSpool,
     #[error(
@@ -776,9 +810,39 @@ pub enum ConfigError {
     InvalidPricingSourceUrl(&'static str),
 }
 
+fn default_database_aux_pool_max_connections() -> u32 {
+    2
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn retired_spool_budget_deserializes_and_is_removed_on_configuration_rewrite() {
+        let mut document =
+            serde_json::to_value(Config::for_test("sqlite::memory:".to_owned())).unwrap();
+        document["responses_request_spool_bytes"] = serde_json::json!(1);
+        let loaded: Config = serde_json::from_value(document).unwrap();
+        assert!(loaded.validate_proxy_memory_budget().is_ok());
+        let rewritten = serde_json::to_value(loaded).unwrap();
+        assert!(rewritten.get("responses_request_spool_bytes").is_none());
+    }
+
+    #[test]
+    fn terminal_projection_default_and_explicit_rollback_survive_configuration_loading() {
+        let mut document =
+            serde_json::to_value(Config::for_test("sqlite::memory:".to_owned())).unwrap();
+        document
+            .as_object_mut()
+            .unwrap()
+            .remove("terminal_projection_enabled");
+        let defaulted: Config = serde_json::from_value(document.clone()).unwrap();
+        assert!(defaulted.terminal_projection_enabled);
+        document["terminal_projection_enabled"] = serde_json::json!(false);
+        let rollback: Config = serde_json::from_value(document).unwrap();
+        assert!(!rollback.terminal_projection_enabled);
+    }
 
     #[test]
     fn test_price_sources_require_explicit_mock_urls() {
@@ -796,10 +860,15 @@ mod tests {
         assert!(config.validate_proxy_memory_budget().is_err());
         config.proxy_memory_budget_bytes = DEFAULT_PROXY_MEMORY_BUDGET_BYTES;
         config.responses_body_max_bytes = MAX_RESPONSES_BODY_MAX_BYTES;
-        assert!(config.validate_proxy_memory_budget().is_err());
-        config.proxy_memory_budget_bytes = MAX_RESPONSES_BODY_MAX_BYTES * 12 + 1024 * 1024;
         assert!(config.validate_proxy_memory_budget().is_ok());
-        config.audio_body_max_bytes = config.proxy_memory_budget_bytes / 3 + 1;
+        config.proxy_memory_budget_bytes = 2 * 1024 * 1024 * 1024 + 1;
+        assert!(config.validate_proxy_memory_budget().is_ok());
+        config.proxy_memory_budget_bytes = 4 * 1024 * 1024 * 1024;
+        assert!(config.validate_proxy_memory_budget().is_ok());
+        config.proxy_memory_budget_bytes = u64::MAX;
+        assert!(config.validate_proxy_memory_budget().is_err());
+        config.proxy_memory_budget_bytes = DEFAULT_PROXY_MEMORY_BUDGET_BYTES;
+        config.audio_body_max_bytes = (config.proxy_memory_budget_bytes / 3 + 1) as u32;
         assert!(config.validate_proxy_memory_budget().is_err());
     }
 
@@ -994,7 +1063,7 @@ mod tests {
     fn responses_body_configuration_keeps_large_reads_bounded() {
         assert_eq!(DEFAULT_RESPONSES_BODY_READ_CONCURRENCY, 1_024);
         assert_eq!(responses_body_read_concurrency(1_024), 1_024);
-        assert_eq!(DEFAULT_RESPONSES_BODY_MAX_BYTES, 16 * 1024 * 1024);
+        assert_eq!(DEFAULT_RESPONSES_BODY_MAX_BYTES, 64 * 1024 * 1024);
         assert_eq!(
             responses_body_max_bytes(MIN_RESPONSES_BODY_MAX_BYTES - 1),
             MIN_RESPONSES_BODY_MAX_BYTES
@@ -1017,17 +1086,8 @@ mod tests {
             config.responses_body_read_concurrency,
             DEFAULT_RESPONSES_BODY_READ_CONCURRENCY
         );
-        assert_eq!(
-            config.responses_request_spool_bytes,
-            DEFAULT_RESPONSES_REQUEST_SPOOL_BYTES
-        );
         assert!(std::path::Path::new(&config.responses_request_spool_path).is_absolute());
-        config.responses_request_spool_bytes = config.responses_body_max_bytes - 1;
-        assert!(matches!(
-            config.validate_proxy_memory_budget(),
-            Err(ConfigError::InvalidResponsesRequestSpool)
-        ));
-        config.responses_request_spool_bytes = DEFAULT_RESPONSES_REQUEST_SPOOL_BYTES;
+        assert!(config.validate_proxy_memory_budget().is_ok());
         config.responses_request_spool_path = "relative/request-spool".to_owned();
         assert!(matches!(
             config.validate_proxy_memory_budget(),

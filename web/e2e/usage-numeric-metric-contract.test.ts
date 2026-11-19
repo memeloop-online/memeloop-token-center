@@ -38,6 +38,60 @@ async function localChromiumExecutable() {
   return undefined;
 }
 
+test('UsageAnalysis renders the omitted TPS card as a dash with a note, never a fabricated number', { timeout: 30_000 }, async () => {
+  const executablePath = await localChromiumExecutable();
+  if (!executablePath) {
+    if (process.env.MTC_REQUIRE_BROWSER === '1') throw new Error('Chromium is required for the usage numeric metric CI gate');
+    return test.skip('a local Chromium runtime is required for UsageAnalysis layout assertions');
+  }
+  const server = await createServer({ root: webRoot, configFile: false, logLevel: 'silent', server: { host: '127.0.0.1', port: 0, strictPort: false } });
+  await server.listen();
+  const address = server.httpServer?.address();
+  assert.ok(address && typeof address !== 'string');
+  const browser = await chromium.launch({ executablePath, headless: true });
+  try {
+    const page = await browser.newPage();
+    await page.clock.install({ time: new Date('2026-10-02T12:00:00Z') });
+    await page.addInitScript(() => localStorage.setItem('mtc-locale', 'en'));
+    await page.goto(`http://127.0.0.1:${address.port}/e2e/fixtures/usage-analysis.html`);
+    await page.locator('.usage-metrics').waitFor();
+    await page.getByRole('button', { name: 'Filter', exact: true }).click();
+    const dialog = page.getByRole('dialog');
+    await dialog.getByRole('button', { name: 'Last 7 days' }).click();
+    await dialog.getByRole('button', { name: 'Apply filters' }).click();
+    const tpsCard = page.locator('.usage-metrics .analytics-metric').filter({ hasText: 'Average TPS' });
+    await tpsCard.locator('.analytics-metric-note').waitFor();
+    assert.equal((await tpsCard.locator('.metric-value').innerText()).trim(), '—');
+    assert.equal(await tpsCard.locator('.metric-exact').count(), 0, 'the omitted TPS must not expose an exact numeric value');
+    assert.equal(await tpsCard.locator('svg, [data-ratio]').count(), 0, 'the omitted TPS renders neither a trend nor a ratio background');
+    assert.match(await tpsCard.locator('.analytics-metric-note').innerText(), /not calculated for long ranges/);
+    for (const theme of ['dark', 'light'] as const) {
+      await page.evaluate((value) => { document.documentElement.dataset.theme = value; }, theme);
+      for (const width of [320, 1440] as const) {
+        await page.setViewportSize({ width, height: 900 });
+        await page.evaluate(() => new Promise<void>((resolve) => requestAnimationFrame(() => resolve())));
+        const layout = await page.evaluate(() => {
+          const card = [...document.querySelectorAll<HTMLElement>('.usage-metrics .metric')].find((candidate) => candidate.querySelector('.metric-label')?.textContent === 'Average TPS')!;
+          const note = card.querySelector<HTMLElement>('.analytics-metric-note')!;
+          return {
+            documentClientWidth: document.documentElement.clientWidth,
+            documentScrollWidth: document.documentElement.scrollWidth,
+            metricClientWidth: card.clientWidth,
+            metricScrollWidth: card.scrollWidth,
+            noteVisible: note.getClientRects().length > 0,
+          };
+        });
+        assert.equal(layout.noteVisible, true, `${theme} ${width}px keeps the omission note visible`);
+        assert.ok(layout.metricScrollWidth <= layout.metricClientWidth, `${theme} ${width}px omitted TPS card must not overflow`);
+        assert.ok(layout.documentScrollWidth <= layout.documentClientWidth, `${theme} ${width}px UsageAnalysis page must not overflow`);
+      }
+    }
+  } finally {
+    await browser.close();
+    await server.close();
+  }
+});
+
 test('UsageAnalysis keeps every rendered NumericMetric exact value on one readable line', { timeout: 30_000 }, async () => {
   const executablePath = await localChromiumExecutable();
   if (!executablePath) {

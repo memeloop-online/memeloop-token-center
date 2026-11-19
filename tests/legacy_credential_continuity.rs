@@ -58,9 +58,9 @@ async fn opaque_normal_credential_preserves_identity_history_policy_and_balance(
         .unwrap();
     let expected_policy = KeyPolicy {
         allowed_models: vec!["legacy-model".into()],
-        requests_per_minute: 7,
-        tokens_per_minute: 7000,
-        max_concurrency: 2,
+        requests_per_minute: Some(7),
+        tokens_per_minute: Some(7000),
+        max_concurrency: Some(2),
         enforcement_mode: EnforcementMode::Prepaid,
         daily_budget: Some("5".into()),
         weekly_budget: Some("20".into()),

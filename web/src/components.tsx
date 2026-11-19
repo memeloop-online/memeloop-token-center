@@ -8,8 +8,8 @@ import { useAnchoredPopover } from './useAnchoredPopover.js';
 import { DetailTooltip } from './design-system';
 import { RequestStatus } from './RequestStatus';
 import { unnamedSessionName } from './sessionTitles.js';
-import { averageRequestOutputTps, generationRequestOutputTps, nonCachedRequestInput, requestCostCopy, requestCredentialLabel, requestDisplayedCost, requestFailed, requestIsPending, requestUsageCopy, requestUsageIsActual } from './requestTablePresentation';
-import { requestErrorCopy, requestFailureCause, requestStatusCopy } from './requestStatusPresentation';
+import { averageRequestOutputTps, generationRequestOutputTps, nonCachedRequestInput, requestCostCopy, requestCredentialLabel, requestDisplayedCost, requestDurationTooltip, requestFailed, requestIsPending, requestSettlementPending, requestUsageCopy, requestUsageIsActual } from './requestTablePresentation';
+import { requestCompletedAt, requestErrorCopy, requestFailureCause, requestStatusCopy, requestProviderPayload } from './requestStatusPresentation';
 import { credentialDisplayName, principalDisplayName } from './identityPresentation.js';
 
 export function Shell({ children, operator = false }: { children: ReactNode; operator?: boolean }) {
@@ -102,7 +102,8 @@ export function Buckets({ values, onSelect }: { values: StatsBucket[]; onSelect?
 function requestTokenBreakdown(request: RequestView) {
   const cachedInputTokens = request.cached_input_tokens;
   const cacheWriteTokens = request.cache_write_tokens;
-  if (cachedInputTokens === undefined || cacheWriteTokens === undefined) return undefined;
+  if (typeof request.input_tokens !== 'number' || typeof request.output_tokens !== 'number'
+    || typeof cachedInputTokens !== 'number' || typeof cacheWriteTokens !== 'number') return undefined;
   return {
     input: Math.max(0, request.input_tokens - cachedInputTokens - cacheWriteTokens),
     cached: cachedInputTokens,
@@ -112,13 +113,14 @@ function requestTokenBreakdown(request: RequestView) {
 }
 
 function requestTokenDetails(request: RequestView, locale: Parameters<typeof formatNumber>[1], t: ReturnType<typeof useI18n>['t']) {
+  if (requestSettlementPending(request)) return requestUsageCopy(request, locale).hint;
   const breakdown = requestTokenBreakdown(request);
   if (breakdown) return t('request.tokenBreakdown', { input: formatNumber(breakdown.input, locale), cached: formatNumber(breakdown.cached, locale), cacheWrite: formatNumber(breakdown.cacheWrite, locale), output: formatNumber(breakdown.output, locale) });
   return [
-    `${t('usage.inputTokens')}: ${formatNumber(request.input_tokens, locale)}`,
-    `${t('usage.outputTokens')}: ${formatNumber(request.output_tokens, locale)}`,
-    request.cached_input_tokens !== undefined ? `${t('usage.cachedTokens')}: ${formatNumber(request.cached_input_tokens, locale)}` : '',
-    request.cache_write_tokens !== undefined ? `${t('usage.cacheWriteTokens')}: ${formatNumber(request.cache_write_tokens, locale)}` : '',
+    `${t('usage.inputTokens')}: ${typeof request.input_tokens === 'number' ? formatNumber(request.input_tokens, locale) : '—'}`,
+    `${t('usage.outputTokens')}: ${typeof request.output_tokens === 'number' ? formatNumber(request.output_tokens, locale) : '—'}`,
+    request.cached_input_tokens != null ? `${t('usage.cachedTokens')}: ${formatNumber(request.cached_input_tokens, locale)}` : '',
+    request.cache_write_tokens != null ? `${t('usage.cacheWriteTokens')}: ${formatNumber(request.cache_write_tokens, locale)}` : '',
   ].filter(Boolean).join(' · ');
 }
 
@@ -126,7 +128,7 @@ function RequestTokenSummary({ request }: { request: RequestView }) {
   const { locale, t } = useI18n();
   const pending = requestIsPending(request);
   const obscured = !pending && !requestUsageIsActual(request);
-  const tokenDisplay = formatMetricDisplay(request.input_tokens + request.output_tokens, locale);
+  const tokenDisplay = formatMetricDisplay(obscured ? null : request.input_tokens + request.output_tokens, locale);
   const tokenDetails = pending ? t('request.pendingUsage') : requestTokenDetails(request, locale, t);
   const uncachedInput = nonCachedRequestInput(request);
   const basis = requestUsageCopy(request, locale);
@@ -191,7 +193,7 @@ function RequestOutputRate({ request }: { request: RequestView }) {
   const average = averageRequestOutputTps(request);
   const first = request.first_output_ms;
   const wait = typeof first === 'number' && Number.isFinite(first) && first >= 0
-    ? `${t('request.firstOutputWait')}: ${formatMilliseconds(first, locale)}` : t('request.firstOutputMissing');
+    ? `${t('request.firstOutputWait')}: ${formatMilliseconds(first, locale)}. ${t('request.firstOutputWaitHint')}` : t('request.firstOutputMissing');
   return <span className="request-output-rates">{([
     ['generation', generation, t('request.generationTps'), t('request.generationTpsHint')],
     ['average', average, t('request.averageTps'), t('request.averageTpsHint')],
@@ -227,11 +229,14 @@ export function RequestDiagnostics({
   currency,
   onOpenSession,
   upstreamName,
+  sessionParent,
 }: {
   request: RequestView;
   currency?: string;
-  onOpenSession?: (sessionId: string) => void;
+  onOpenSession?: (sessionId: string, keyId?: string, requestId?: string) => void;
   upstreamName?: string;
+  /** Resolved parent session of a confirmed sub-session, loaded on demand by the owner layer. */
+  sessionParent?: { label: string; sessionId: string; keyId?: string };
 }) {
   const { locale, t } = useI18n();
   const pending = requestIsPending(request);
@@ -244,33 +249,48 @@ export function RequestDiagnostics({
   const credential = requestCredentialLabel(request, undefined);
   const credentialLabel = 'label' in credential ? credential.label : t(credential.key);
   const duration = formatDurationDisplay(request.duration_ms, locale);
-  const timingDetails = `${t('request.receivedAt')}: ${new Date(request.created_at).toLocaleString(locale)} · ${t('request.completedAt')}: ${request.completed_at == null ? (pending ? (zh ? '尚未结束' : 'Still running') : missing) : new Date(request.completed_at).toLocaleString(locale)} · ${t('request.duration')}: ${duration.title ?? missing}`;
+  const completedAt = requestCompletedAt(request);
+  const timingDetails = [
+    `${t('request.receivedAt')}: ${new Date(request.created_at).toLocaleString(locale)}`,
+    `${t('request.completedAt')}: ${completedAt == null ? (pending ? (zh ? '尚未结束' : 'Still running') : missing) : new Date(completedAt).toLocaleString(locale)}`,
+    requestDurationTooltip(request, locale) || `${t('request.duration')}: ${duration.title ?? missing}`,
+  ].join(' · ');
   const cost = currencyForRequest ? formatCurrencyDisplay(requestDisplayedCost(request), currencyForRequest, locale) : { text: missing };
   const costCopy = requestCostCopy(request, locale);
-  const settlement = <DetailTooltip content={t('request.pendingUsage')}><span tabIndex={0}>{zh ? '待结算' : 'Awaiting settlement'}</span></DetailTooltip>;
+  const settlement = <DetailTooltip content={costCopy.hint}><span tabIndex={0}>{costCopy.label}</span></DetailTooltip>;
   const failureCause = pending || requestStatusCopy(request, locale).cause ? null : requestFailureCause(request, locale) ?? (request.error_code ? requestErrorCopy(request.error_code, locale) : null);
-  const supplierDetail = requestStatusCopy(request, locale).supplierDetail;
+  const statusCopy = requestStatusCopy(request, locale);
+  const failureDetails = requestFailed(request) ? statusCopy.details : [];
+  const providerPayload = requestFailed(request) ? requestProviderPayload(request) : null;
 
   return <div className="request-diagnostics request-detail-surface request-detail-summary">
+    {sessionParent && <p className="request-session-parent"><b>{t('request.parentSession')}</b>
+      {onOpenSession
+        ? <button type="button" className="table-link request-diagnostic-session" onClick={() => onOpenSession(sessionParent.sessionId, sessionParent.keyId)}>{sessionParent.label}</button>
+        : <span>{sessionParent.label}</span>}
+    </p>}
     <section className="request-detail-group request-detail-primary" aria-label={zh ? '模型与用量' : 'Model and usage'}>
       <div className="request-detail-wide"><b>{t('request.model')}</b><RequestMetadata label={request.model} fields={[[t('request.routeId'), request.route_id], [t('request.protocol'), request.protocol]]} /><RequestCompaction request={request} /></div>
       <div className="request-detail-wide"><b>{zh ? '凭据' : 'Credential'}</b><RequestMetadata label={credentialLabel} fields={[[zh ? '凭据 ID' : 'Credential ID', request.credential_identity?.key_id], [zh ? '主体' : 'Principal', principalDisplayName(request.credential_identity?.principal_external_id, t)], [zh ? '租户' : 'Tenant', request.credential_identity?.tenant_external_id]]} /></div>
       <div className="request-token-cell"><b>{t('request.tokens')}</b><RequestTokenSummary request={request} /></div>
-      <div><b>{t('request.cost')}</b>{pending ? settlement : <DetailTooltip content={costCopy.unknown ? `${costCopy.hint} ${costCopy.ledgerLabel}: ${cost.title ?? cost.text}` : `${cost.title ?? missing} ${costCopy.hint}`}><span tabIndex={0} aria-label={costCopy.unknown ? costCopy.label : undefined}>{costCopy.unknown ? '—' : cost.text}</span></DetailTooltip>}</div>
+      <div><b>{t('request.cost')}</b>{requestSettlementPending(request) ? settlement : <DetailTooltip content={costCopy.unknown ? costCopy.hint : `${cost.title ?? missing} ${costCopy.hint}`}><span tabIndex={0} aria-label={costCopy.unknown ? costCopy.label : undefined}>{costCopy.unknown ? '—' : cost.text}</span></DetailTooltip>}</div>
     </section>
     <section className="request-detail-group" aria-label={zh ? '交付与性能' : 'Delivery and performance'}>
       <div><b>{zh ? '最终上游' : 'Final upstream'}</b><RequestMetadata label={upstreamName || (request.upstream_account_id ? (zh ? '未命名上游' : 'Unnamed upstream') : missing)} fields={[[t('request.upstreamId'), request.upstream_account_id]]} /></div>
       <div><b>{t('request.status')}</b><RequestStatus request={request} /></div>
       <div><b>{t('request.request')}</b><RequestMetadata label={zh ? '记录标识' : 'Record identifiers'} fields={[[zh ? '请求 ID' : 'Request ID', request.request_id]]} /></div>
       {failureCause && <div className="request-detail-wide"><b>{t('request.error')}</b><span>{failureCause}</span></div>}
-      {supplierDetail && <div className="request-detail-wide request-supplier-detail"><b>{zh ? '供应商错误详情' : 'Provider error details'}</b><span>{supplierDetail}</span></div>}
+      {statusCopy.upstreamNote && <div className="request-detail-wide"><b>{zh ? '上游说明' : 'Upstream message'}</b><span>{statusCopy.upstreamNote.replace(/^(上游说明|Upstream message): /, '')}</span></div>}
+      {statusCopy.nextAction && <div className="request-detail-wide"><b>{statusCopy.labels.nextStep}</b><span>{statusCopy.nextAction}</span></div>}
+      {failureDetails.length > 0 && <div className="request-detail-wide request-supplier-detail"><b>{statusCopy.labels.technicalDetails}</b><span>{failureDetails.map((entry) => `${entry.label}: ${entry.value}`).join(' · ')}</span></div>}
+      {providerPayload !== null && <details className="request-detail-wide request-provider-payload"><summary>{zh ? '完整供应商错误详情' : 'Complete provider error details'}</summary><pre>{providerPayload}</pre></details>}
       <div><b>{t('request.duration')}</b><DetailTooltip content={timingDetails}><span className="request-detail-timing" tabIndex={0}>{duration.text === '—' ? missing : duration.text}</span></DetailTooltip></div>
       <div><RequestOutputRate request={request} /></div>
     </section>
-    {context && <section className="request-detail-group request-detail-session" aria-label={t('request.session')}><div className="request-detail-wide"><b>{t('request.session')}</b>
+      {context && <section className="request-detail-group request-detail-session" aria-label={t('request.session')}><div className="request-detail-wide"><b>{t('request.session')}</b>
       {context.association === 'confirmed'
         ? context.session_id && onOpenSession
-          ? <button type="button" className="table-link request-diagnostic-session" onClick={() => onOpenSession(context.session_id!)}>{sessionLabel}</button>
+          ? <button type="button" className="table-link request-diagnostic-session" onClick={() => onOpenSession(context.session_id!, request.credential_identity?.key_id, request.request_id)}>{sessionLabel}</button>
           : <span>{sessionLabel}</span>
         : <span className="request-session-unlinked">{t('sessions.unlinkedRequests')}</span>}
       <RequestMetadata label={zh ? '会话信息' : 'Session details'} fields={[[zh ? '会话 ID' : 'Session ID', context.session_id], [zh ? '任务类型' : 'Task kind', context.task_kind], [zh ? '代理 ID' : 'Agent ID', context.agent_id]]} />
@@ -288,7 +308,7 @@ export function RequestTable({
 }: {
   requests: RequestView[];
   onSelect?: (request: RequestView) => void;
-  onOpenSession?: (sessionId: string) => void;
+  onOpenSession?: (sessionId: string, keyId?: string, requestId?: string) => void;
   currency?: string;
   credentialAlias?: string;
   upstreamNames?: ReadonlyMap<string, string>;
@@ -321,20 +341,21 @@ export function RequestTable({
                 ? `${locale === 'zh-CN' ? '服务账号' : 'Service account'}: ${upstreamNames?.get(request.upstream_account_id)?.trim() || (locale === 'zh-CN' ? '账号名称不可用' : 'Account name unavailable')}`
                 : '',
             ].filter(Boolean).join(' · ');
-            const durationSummary = request.completed_at != null
-              ? `${t('request.completedAt')}: ${new Date(request.completed_at).toLocaleString(locale)}`
+            const completedAt = requestCompletedAt(request);
+            const durationSummary = completedAt != null
+              ? `${t('request.completedAt')}: ${new Date(completedAt).toLocaleString(locale)}`
               : '';
             const pending = requestIsPending(request);
             const cost = pending ? { text: '—', title: copy.pendingUsage } : currencyForRequest ? formatCurrencyDisplay(requestDisplayedCost(request), currencyForRequest, locale) : { text: '—' };
             const costCopy = requestCostCopy(request, locale);
             const duration = formatDurationDisplay(request.duration_ms, locale);
-            const durationDetails = [duration.title, durationSummary].filter(Boolean).join(' · ');
+            const durationDetails = [requestDurationTooltip(request, locale) || duration.title, durationSummary].filter(Boolean).join(' · ');
             const durationValue = <span className="request-duration-info" aria-label={durationDetails ? [duration.text, durationDetails].join(' · ') : undefined} tabIndex={durationDetails ? 0 : undefined}>{duration.text}</span>;
             const credential = requestCredentialLabel(request, credentialAlias);
             const credentialLabel = 'label' in credential ? credential.label : t(credential.key);
             const credentialDetails = request.credential_identity ? [request.credential_identity.key_id, principalDisplayName(request.credential_identity.principal_external_id, t)].filter(Boolean).join(' · ') : credentialLabel;
             const upstreamName = request.upstream_account_id ? upstreamNames?.get(request.upstream_account_id) : undefined;
-            return <tr key={request.request_id}>
+            return <tr key={request.request_id} data-request-id={request.request_id}>
               <td className="request-time-cell" data-label={t('request.receivedAt')}><time>{new Date(request.created_at).toLocaleString(locale)}</time><RequestIdentifier requestId={request.request_id} compact /></td>
               <td className="request-credential-cell" data-label={t('self.credential')}><DetailTooltip content={credentialDetails}><strong tabIndex={0}>{credentialLabel}</strong></DetailTooltip></td>
               <td className="request-model-cell"><DetailTooltip content={technicalSummary}><span className="request-routing-info" tabIndex={0}><code>{request.model}</code>{upstreamName && <small className="request-upstream-name">{upstreamName}</small>}</span></DetailTooltip><RequestCompaction request={request} /></td>
@@ -345,7 +366,7 @@ export function RequestTable({
                   ? '—'
                   : context.association === 'confirmed'
                     ? context.session_id && onOpenSession
-                      ? <DetailTooltip content={sessionLabel}><button type="button" className={`table-link${contextualSession ? ' request-session-context' : ''}`} onClick={() => onOpenSession(context.session_id!)}>{sessionDisplay}</button></DetailTooltip>
+                      ? <DetailTooltip content={sessionLabel}><button type="button" className={`table-link${contextualSession ? ' request-session-context' : ''}`} onClick={() => onOpenSession(context.session_id!, request.credential_identity?.key_id, request.request_id)}>{sessionDisplay}</button></DetailTooltip>
                       : <DetailTooltip content={sessionLabel}><span className={`request-session-name${contextualSession ? ' request-session-context' : ''}`} tabIndex={0}>{sessionDisplay}</span></DetailTooltip>
                     : <span className="request-session-unlinked">{t('sessions.unlinkedRequests')}</span>}
                 {sessionMeta && <RequestSessionMetadata value={sessionMeta} />}

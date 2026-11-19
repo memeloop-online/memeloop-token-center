@@ -11,8 +11,8 @@ export function RequestDetailDrawer({ detail, currency, onOpenSession, onClose }
       <span><b>{t('self.archive')}</b>{detail.archive_complete ? t('request.archiveComplete') : t('request.archiveIncomplete')}</span>
       {detail.provenance && <span><b>{t('request.provenance')}</b>{detail.provenance.unlinked ? t('request.archiveOnly') : t('request.exactArchive')} · {detail.provenance.source}</span>}
     </div>
-    <h3>{t('request.request')}</h3><pre>{JSON.stringify(detail.request_body, null, 2)}</pre>
-    <h3>{t('request.response')}</h3><pre>{JSON.stringify(detail.response_body, null, 2)}</pre>
+    <h3>{t('request.rawRequestJson')}</h3><pre>{JSON.stringify(detail.request_body, null, 2)}</pre>
+    <h3>{t('request.rawReturnJson')}</h3><pre>{JSON.stringify(detail.response_body, null, 2)}</pre>
   </DrawerFrame>;
 }
 

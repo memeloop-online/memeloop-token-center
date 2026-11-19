@@ -63,6 +63,22 @@ immutable history of every attempt. Kimi errors are typed without logging
 provider response content; unsupported provider error formats remain unknown.
 This change does not recover or reauthorize existing production accounts.
 
+New Kimi network failures optionally include a bounded `failure.observation`
+in the existing durable diagnostic, projected as `failure_observation`:
+`phase` (`before_headers` or `response_body`), monotonic `elapsed_ms`,
+`budget_ms`, `connector_failure`, and `timeout_source` (`http_client`,
+`operation_deadline`, or null). `before_headers` means the HTTP execute future
+has not yielded response headers; it does not prove the POST was delivered or
+identify a DNS/TLS phase. Body-reader failures do not invent a timeout source.
+The observation starts after the durable dispatch marker completes, not when
+the lease is claimed. No URL, error string, token or response body is retained.
+
+Old diagnostics remain readable without invented observations. Older binaries
+with strict diagnostic decoders ignore diagnostics containing the new optional
+field; deploy the reader alongside the writer to retain detailed presentation.
+Replay protection uses lease/pending state, not these optional observations.
+This addition does not change that protection or restore a lost remote result.
+
 ## Kimi timeout and recovery boundary
 
 Kimi refresh has a 120-second request and operation budget, replacing the
@@ -110,13 +126,22 @@ unconsumed credential eligible for the next worker pass. Failure to persist
 this transition leaves the marker in place. An ordinary total timeout, a
 received HTTP rejection or a disconnect after POST does not release it.
 
-A complete Kimi result is sealed once and retained for up to seven local
-staging/finalization attempts, with 100ms, 500ms, 1s, 2s, 4s and 8s backoff.
-Only storage/internal failures are retried. Every attempt reuses the same
-ciphertext and existing generation/claim fences, and never calls the provider.
-Other providers keep their original three-attempt behavior. An exhausted local
-failure emits a secret-free error with account ID, generation, stage and error
-category so it can be alerted separately from remote rejection.
+All managed OAuth providers use the same local result installation path. A
+complete result is sealed once and retained for up to seven local staging and
+finalization attempts, with 100ms, 500ms, 1s, 2s, 4s and 8s backoff. Transient
+database unavailability and pool exhaustion join storage/internal failures in
+this bounded local retry. Confirmed storage-full errors, claim conflicts and
+provider rejections are not retried by this loop. Every attempt reuses the same
+ciphertext and generation/claim fences, and never calls the provider. An
+exhausted failure emits a secret-free error with account ID, generation, stage
+and error category so it can be alerted separately from remote rejection.
+
+The existing worker resumes a saved pending result using its original persisted
+idempotency key, including results from manual refresh or worker takeover. It
+does not manufacture a new key to retry a saved result. Before a new remote
+exchange, its selected generation must still match the locked account row;
+manual authorization installed after selection is preserved. Unknown remote
+outcomes without saved results remain excluded from automatic scheduling.
 
 These are bounded protections, not a guarantee against losing an unstaged
 response during a process crash or a prolonged database outage. Already staged

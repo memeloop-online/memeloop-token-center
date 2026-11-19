@@ -19,19 +19,24 @@ async fn emit(post: &Post, text: &str) {
         .unwrap();
 }
 
-async fn complete(post: Post) {
-    emit(
-        &post,
-        &format!(
-            "data: {{\"type\":\"response.completed\",\"response\":{}}}\n\ndata: [DONE]\n\n",
-            completed_response_with_usage(3, 7)
-        ),
+fn completed_tail() -> String {
+    format!(
+        "data: {{\"type\":\"response.completed\",\"response\":{}}}\n\ndata: [DONE]\n\n",
+        completed_response_with_usage(3, 7)
     )
-    .await;
+}
+
+async fn complete(post: Post) {
+    emit(&post, &completed_tail()).await;
     drop(post);
 }
 
 async fn settled(fixture: &CodexRouteFixture, status: i64) {
+    if status != 200 {
+        let receipt = cancellation::single_unknown_receipt(fixture).await;
+        assert_eq!(receipt["status_code"], status);
+        return;
+    }
     wait_for_request_settlement(fixture, 1).await;
     let rows = fixture
         .state
@@ -41,13 +46,8 @@ async fn settled(fixture: &CodexRouteFixture, status: i64) {
         .unwrap();
     assert_eq!(rows.len(), 1);
     assert_eq!(rows[0].status_code, Some(status));
-    if status == 200 {
-        assert_eq!((rows[0].input_tokens, rows[0].output_tokens), (3, 7));
-        assert_eq!(rows[0].cost, "0.00001");
-    } else {
-        assert_eq!((rows[0].input_tokens, rows[0].output_tokens), (0, 0));
-        assert_eq!(rows[0].cost, "0");
-    }
+    assert_eq!((rows[0].input_tokens, rows[0].output_tokens), (3, 7));
+    assert_eq!(rows[0].cost, "0.00001");
     assert_exactly_once_side_effects(
         fixture,
         rows[0].request_id,
@@ -92,6 +92,11 @@ async fn streaming(version: http::Version, cancel: bool, silence: bool) {
         None => send.await,
     };
     assert_eq!(response.status(), StatusCode::OK);
+    let request_id = response.headers()[REQUEST_ID_HEADER]
+        .to_str()
+        .unwrap()
+        .parse::<Uuid>()
+        .unwrap();
     let mut body = response.into_body().into_data_stream();
     let mut rendered = String::new();
     while !rendered.contains("response.function_call_arguments.delta") {
@@ -109,7 +114,7 @@ async fn streaming(version: http::Version, cancel: bool, silence: bool) {
         let started = std::time::Instant::now();
         let until = tokio::time::sleep(Duration::from_secs(310));
         tokio::pin!(until);
-        let mut progress_count = rendered.matches("event: response.in_progress").count();
+        let mut progress_count = rendered.matches(": keep-alive\n\n").count();
         let initial_progress = progress_count;
         let mut last_progress = std::time::Instant::now();
         loop {
@@ -121,7 +126,7 @@ async fn streaming(version: http::Version, cancel: bool, silence: bool) {
                         .expect("stream must remain open during silence")
                         .unwrap();
                     rendered.push_str(std::str::from_utf8(&chunk).unwrap());
-                    let count = rendered.matches("event: response.in_progress").count();
+                    let count = rendered.matches(": keep-alive\n\n").count();
                     if count > progress_count {
                         return count;
                     }
@@ -145,12 +150,14 @@ async fn streaming(version: http::Version, cancel: bool, silence: bool) {
     }
     if cancel {
         drop(body);
-        tokio::time::timeout(Duration::from_secs(3), peer.cancelled.recv())
-            .await
-            .expect("body drop must cancel silent upstream immediately")
-            .unwrap();
         settled(&fixture, 499).await;
-        assert!(post.output.is_closed());
+        assert_eq!(fixture.state.proxy_lifecycles.active(), 0);
+        assert!(!post.output.is_closed());
+        assert!(peer.cancelled.try_recv().is_err());
+        let original = format!("{CREATED}{TOOL}{}", completed_tail());
+        complete(post).await;
+        cancellation::assert_original_response(&fixture, request_id, original.as_bytes()).await;
+        settled(&fixture, 499).await;
     } else {
         complete(post).await;
         while let Some(chunk) = body.next().await {
@@ -184,8 +191,8 @@ async fn compact(version: http::Version) {
             .unwrap(),
     )
     .unwrap();
-    config["transport_policy"] = json!({"http_protocol":account_protocol(version),"failover_deadline_millis":1000,"connect_timeout_millis":1000,
-        "read_timeout_millis":1000,"request_timeout_millis":2000});
+    config["transport_policy"] = json!({"http_protocol":account_protocol(version),"connect_timeout_millis":1000,
+        "request_timeout_millis":2000});
     sqlx::query("UPDATE upstream_accounts SET config_json = $1 WHERE id = $2")
         .bind(config.to_string())
         .bind(fixture.upstream_account_id.to_string())

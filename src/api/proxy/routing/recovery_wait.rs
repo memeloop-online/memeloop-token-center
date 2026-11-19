@@ -249,10 +249,14 @@ pub(crate) async fn wait(
                     );
                     Ok(Check::Ready((route, admission, guard)))
                 }
-                UpstreamAttemptAdmission::SharedProbe { .. } => Ok(Check::Stop),
+                UpstreamAttemptAdmission::Observed
+                | UpstreamAttemptAdmission::SharedProbe { .. } => Ok(Check::Stop),
             }
         });
-        async move { task.await.map_err(|_| AppError::Internal)? }
+        async move {
+            task.await
+                .map_err(|_| AppError::internal("recovery_wait_wait_1"))?
+        }
     })
     .await
 }
@@ -346,7 +350,10 @@ mod tests {
                         resume.await.unwrap();
                         Ok(Check::Ready(Published(cleanup)))
                     });
-                    async move { task.await.map_err(|_| AppError::Internal)? }
+                    async move {
+                        task.await
+                            .map_err(|_| AppError::internal("recovery_wait_drop_1"))?
+                    }
                 },
             )
             .await

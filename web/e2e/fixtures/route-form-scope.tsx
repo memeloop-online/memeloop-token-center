@@ -6,8 +6,9 @@ import '../../src/styles.css';
 import '../../src/theme.css';
 import '../../src/operator/operator.css';
 
-declare global { interface Window { routeScopePayloads: Array<Record<string, unknown>> } }
+declare global { interface Window { routeScopePayloads: Array<Record<string, unknown>>; routeScopeDeletes: Array<{ path: string; query: string }> } }
 window.routeScopePayloads = [];
+window.routeScopeDeletes = [];
 const parameters = new URLSearchParams(location.search);
 const driver = parameters.get('driver') || 'technical-driver';
 const accounts = ['personal', 'team'].map(id => ({ id, tenant_external_id: 'fixture', name: id === 'personal' ? '个人账号' : '团队账号', driver, status: 'active', connection_method: 'oauth', config: {}, credential_generation: 1, created_at: 1, updated_at: 1 }));
@@ -16,13 +17,18 @@ const credential = { key_id: exactId, tenant_external_id: 'fixture', alias: '精
 const routes: Array<Record<string, unknown>> = parameters.has('existing') ? [{
   id: 'existing-route', tenant_external_id: parameters.has('foreign') ? 'other-tenant' : 'fixture', public_model: 'saved-route', upstream_model: 'kimi-k2', protocol: 'openai', priority: 0,
   upstream_account_ids: ['personal'], included_provider_group_ids: [], excluded_provider_group_ids: [], route_group_ids: ['group-personal'], granted_credential_ids: [exactId],
-  custom_model_confirmed: parameters.get('confirmed') === 'true', enabled: true, grant_revision: 7, created_at: 1, updated_at: 42,
+  custom_model_confirmed: parameters.get('confirmed') === 'true', enabled: !parameters.has('disabled'), grant_revision: 7, created_at: 1, updated_at: 42,
 }] : [];
 function json(value: unknown, status = 200) { return new Response(JSON.stringify(value), { status, headers: { 'Content-Type': 'application/json' } }); }
 window.fetch = async (input, init) => {
   const url = new URL(typeof input === 'string' ? input : input instanceof URL ? input.href : input.url, location.origin);
   const method = init?.method ?? (input instanceof Request ? input.method : 'GET');
   if (method !== 'GET') {
+    if (method === 'DELETE' && url.pathname === '/internal/v1/model-routes/existing-route') {
+      window.routeScopeDeletes.push({ path: url.pathname, query: url.search });
+      routes.splice(0, routes.length);
+      return new Response(null, { status: 204 });
+    }
     if (!(method === 'POST' && url.pathname === '/internal/v1/model-routes') && !(method === 'PUT' && url.pathname === '/internal/v1/model-routes/existing-route')) throw new Error('Unexpected mock mutation');
     const payload = JSON.parse(String(init?.body)); window.routeScopePayloads.push(payload);
     if (parameters.has('reject')) return json({ error: { code: 'bad_request', message: 'the route has no eligible upstream for this model; sync the model catalog or explicitly confirm a custom model' } }, 400);

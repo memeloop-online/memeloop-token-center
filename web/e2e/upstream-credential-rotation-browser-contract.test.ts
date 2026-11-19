@@ -9,8 +9,8 @@ import { isUpstreamModelCatalog } from '../src/operator/managedModelSync.js';
 import { quotaBatchFixtureResponse } from './support/quota-batch.js';
 
 const labels = {
-  'zh-CN': { details: '管理账号', manage: '账号设置与授权操作', rotate: '更换凭据', title: '更换 rotation@example.org 的凭据', back: '取消', close: '关闭', key: '新 API 密钥', submit: '保存', invalid: '请填写所有必填项，并检查标记出的字段。', failed: '未能确认替换结果。请检查网络和账号状态后再重试。', saved: '新凭据已保存。系统后续将使用新凭据连接此账号。', settings: '编辑 rotation@example.org', permission: '没有替换此账号凭据的权限。请联系管理员确认租户范围和提供商管理权限。', old: '这里不会在提供商处撤销旧密钥或令牌', oauth: 'OAuth 授权令牌', token: '访问令牌', expiry: '到期时间' },
-  en: { details: 'Manage account', manage: 'Account settings and authorization', rotate: 'Replace credential', title: 'Replace credential for rotation@example.org', back: 'Cancel', close: 'Close', key: 'New API key', submit: 'Save', invalid: 'Complete all required fields and check the highlighted fields.', failed: 'Could not confirm the replacement. Check the connection and account status before retrying.', saved: 'The new credential is saved. The system will use it for subsequent connections to this account.', settings: 'Edit rotation@example.org', permission: 'You do not have permission to replace this account’s credential. Ask an administrator to check the tenant scope and provider management permission.', old: 'This does not revoke the old key or token at the provider', oauth: 'OAuth token', token: 'Access token', expiry: 'Expiry' },
+  'zh-CN': { details: '管理账号', manage: '账号设置与授权操作', rotate: '更换凭据', title: '更换 rotation@example.org 的凭据', back: '取消', close: '关闭', key: '新 API 密钥', submit: '保存', invalid: '请填写所有必填项，并检查标记出的字段。', failed: '未能确认替换结果。请检查网络和账号状态后再重试。', saved: '新凭据已保存。系统后续将使用新凭据连接此账号。', settings: '编辑 rotation@example.org', permission: '没有替换此账号凭据的权限。请联系管理员确认租户范围和提供商管理权限。', old: '旧密钥或令牌仍在提供商处有效', oauth: 'OAuth 授权令牌', token: '访问令牌', expiry: '到期时间' },
+  en: { details: 'Manage account', manage: 'Account settings and authorization', rotate: 'Replace credential', title: 'Replace credential for rotation@example.org', back: 'Cancel', close: 'Close', key: 'New API key', submit: 'Save', invalid: 'Complete all required fields and check the highlighted fields.', failed: 'Could not confirm the replacement. Check the connection and account status before retrying.', saved: 'The new credential is saved. The system will use it for subsequent connections to this account.', settings: 'Edit rotation@example.org', permission: 'You do not have permission to replace this account’s credential. Ask an administrator to check the tenant scope and provider management permission.', old: 'The old key or token stays valid at the provider', oauth: 'OAuth token', token: 'Access token', expiry: 'Expiry' },
 };
 
 test('rotation explains replacement, uses Fluent controls, restores its parent and validates only mocked credentials', { timeout: 120_000 }, async () => {
@@ -60,7 +60,7 @@ test('rotation explains replacement, uses Fluent controls, restores its parent a
       });
       await page.goto(`${origin}/e2e/fixtures/authorization-code.html?full-page`);
       await page.getByRole('button', { name: copy.details, exact: true }).click();
-      await page.getByRole('button', { name: copy.manage, exact: true }).click();
+      await page.getByRole('region', { name: copy.manage, exact: true }).waitFor();
       const trigger = page.getByRole('button', { name: copy.rotate, exact: true });
       await trigger.focus(); await page.keyboard.press('Enter');
       const form = page.locator('.upstream-credential-rotation');
@@ -77,7 +77,7 @@ test('rotation explains replacement, uses Fluent controls, restores its parent a
         const buttonHeights = await form.locator('.journey-heading .fui-Button, .journey-actions .fui-Button').evaluateAll(buttons => buttons.map(button => button.getBoundingClientRect().height));
         assert.equal(new Set(buttonHeights).size, 1, `heights=${buttonHeights.join(',')} at width=${width}`);
         assert.ok(buttonHeights[0] >= (width <= 600 ? 44 : 40), `rotation close and action buttons share the journey touch target: heights=${buttonHeights.join(',')} at width=${width}`);
-        assert.equal(await form.locator('input[type="password"]').first().inputValue(), '', 'review screenshots contain no entered secret');
+        assert.equal(await form.locator('.secret-input input').first().inputValue(), '', 'review screenshots contain no entered secret');
         const screenshotRoot = fileURLToPath(new URL('../e2e-artifacts/ui-system/account-workspace', import.meta.url));
         await mkdir(screenshotRoot, { recursive: true });
         await page.screenshot({ path: `${screenshotRoot}/credential-rotation-${locale}-${width}.png`, fullPage: true });
@@ -85,13 +85,13 @@ test('rotation explains replacement, uses Fluent controls, restores its parent a
       const selector = form.getByRole('combobox');
       await selector.selectOption({ label: copy.oauth });
       await form.getByLabel(copy.token, { exact: false }).first().waitFor();
-      assert.equal(await form.locator('input[type="password"]').count(), 2);
+      assert.equal(await form.locator('.secret-input input').count(), 2);
       await form.getByLabel(copy.token, { exact: false }).first().fill('synthetic-stale-access-token');
       const expiry = form.getByLabel(copy.expiry, { exact: false });
       assert.equal(await expiry.evaluate(input => input.closest('.fui-Input') !== null && input.getAttribute('type') === 'number'), true, 'expiry uses the shared Fluent number input');
       await expiry.fill('1893456000000');
       await selector.selectOption({ index: 1 });
-      const secret = form.locator('input[type="password"]').first();
+      const secret = form.locator('.secret-input input').first();
       await secret.press('Enter');
       await form.getByRole('alert').filter({ hasText: copy.invalid }).waitFor();
       assert.equal(writes.length, 0);
@@ -129,7 +129,7 @@ test('rotation explains replacement, uses Fluent controls, restores its parent a
       assert.equal(await trigger.isVisible(), true);
       assert.equal(await trigger.evaluate(element => element === document.activeElement), true);
       await trigger.click();
-      assert.equal(await form.locator('input[type="password"]').first().inputValue(), '', 'reopening never retains a submitted secret');
+      assert.equal(await form.locator('.secret-input input').first().inputValue(), '', 'reopening never retains a submitted secret');
       await form.getByRole('button', { name: copy.close }).click();
       assert.equal(await trigger.isVisible(), true);
       await editProviderAccount(page, 'rotation-fixture');

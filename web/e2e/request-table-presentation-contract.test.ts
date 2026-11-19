@@ -1,10 +1,10 @@
 import assert from 'node:assert/strict';
 import test from 'node:test';
-import { averageRequestOutputTps, generationRequestOutputTps, nonCachedRequestInput, requestCostCopy, requestCredentialLabel, requestDisplayedCost, requestIsPending, requestUsageIsActual } from '../src/requestTablePresentation.js';
+import { averageRequestOutputTps, generationRequestOutputTps, nonCachedRequestInput, requestCostCopy, requestCredentialLabel, requestDisplayedCost, requestDurationTooltip, requestIsPending, requestUsageIsActual } from '../src/requestTablePresentation.js';
 import { mergeLiveRequestEvents, requestViewFromEvent } from '../src/operator/traffic/requestTraffic.js';
 import type { RequestEvent } from '../src/types.js';
 import type { RequestView } from '../src/types.js';
-import { requestErrorCopy, requestFailureCause, requestOutcome, requestStatusCopy } from '../src/requestStatusPresentation.js';
+import { requestCompletedAt, requestErrorCopy, requestFailureCause, requestOutcome, requestStatusCopy } from '../src/requestStatusPresentation.js';
 
 const request: RequestView = {
   usage_basis: 'provider_reported',
@@ -12,6 +12,39 @@ const request: RequestView = {
   duration_ms: 2000, input_tokens: 160, cached_input_tokens: 40, cache_write_tokens: 20,
   output_tokens: 32, cost: '0', error_code: null,
 };
+
+test('operational completion and financial confirmation are independent in both languages', () => {
+  for (const financial_state of ['pending', 'unknown', 'applied'] as const) {
+    const terminal: RequestView = { ...request, completed_at: null, cost: null,
+      operational_terminal: { completed_at: 3000, stage: null, financial_state } };
+    assert.equal(requestOutcome(terminal), 'completed');
+    assert.equal(requestCompletedAt(terminal), 3000);
+    assert.equal(requestIsPending(terminal), false);
+    assert.equal(requestDisplayedCost(terminal), '');
+    for (const locale of ['zh-CN', 'en'] as const) {
+      assert.equal(requestStatusCopy(terminal, locale).label, locale === 'en' ? 'Completed' : '已完成');
+      assert.equal(requestCostCopy(terminal, locale).unknown, true);
+      assert.match(requestCostCopy(terminal, locale).hint, locale === 'en' ? /Cost awaits confirmation|No confirmed cost is available yet/ : /费用待确认|尚无已确认的费用/);
+    }
+    for (const cost of ['0', '8.25']) {
+      assert.equal(requestDisplayedCost({ ...terminal, cost }), financial_state === 'applied' ? cost : '');
+      assert.equal(requestCostCopy({ ...terminal, cost }, 'en').unknown, financial_state !== 'applied');
+    }
+    const cancelled = { ...terminal, status_code: 499, error_code: 'http_499', terminal_cause_code: 'client_disconnected' };
+    assert.equal(requestOutcome(cancelled), 'cancelled');
+    assert.equal(requestStatusCopy(cancelled, 'en').hint, 'Recorded cause: The client disconnected before the request was sent upstream. 32 output tokens were recorded');
+    assert.equal(requestStatusCopy(cancelled, 'zh-CN').hint, '已记录原因: 请求还没有发到上游，客户端断开。已记录输出 32 词元');
+    const failed = { ...terminal, status_code: 502, error_code: 'http_502', terminal_cause_code: 'upstream_transport_connection_reset' };
+    assert.equal(requestOutcome(failed), 'failed');
+    assert.equal(requestStatusCopy(failed, 'en').hint, 'Recorded cause: The upstream connection was reset');
+    assert.equal(requestStatusCopy(failed, 'zh-CN').hint, '已记录原因: 上游连接被重置');
+    const nullUsage: RequestView = JSON.parse(JSON.stringify({ ...terminal, input_tokens: null, output_tokens: null }));
+    assert.equal(requestUsageIsActual(nullUsage), false);
+    assert.equal(nonCachedRequestInput(nullUsage), null);
+  }
+  assert.equal(requestDisplayedCost({ ...request, status_code: 502, cost: null }), '');
+  assert.equal(requestDisplayedCost({ ...request, status_code: 502, cost: '0' }), '0');
+});
 
 test('502 tooltip and detail share recorded cause, and missing evidence stays explicitly unknown', () => {
   const reset = { ...request, status_code: 502, error_code: 'upstream_transport_connection_reset' };
@@ -21,7 +54,7 @@ test('502 tooltip and detail share recorded cause, and missing evidence stays ex
   assert.equal(known.hint, known.cause);
   assert.equal(requestErrorCopy(reset.error_code, 'en'), requestFailureCause(reset, 'en'));
   const generic = requestStatusCopy({ ...request, status_code: 502, error_code: 'http_502' }, 'en');
-  assert.equal(generic.cause, 'Recorded cause: No specific cause was captured at the time');
+  assert.equal(generic.cause, 'Recorded cause: Only the HTTP status was stored, not the phase where it failed');
   assert.equal(generic.hint, generic.cause);
   assert.equal(requestFailureCause({ ...request, status_code: 502, error_code: 'Bearer secret-token' }, 'en'), null);
   assert.doesNotMatch(requestStatusCopy({ ...request, status_code: 502, error_code: 'Bearer secret-token' }, 'en').hint, /secret-token/);
@@ -37,17 +70,29 @@ test('502 tooltip and detail share recorded cause, and missing evidence stays ex
   assert.equal(requestStatusCopy({ ...http2, error_code: 'upstream_http2_reset' }, 'zh-CN').hint, '已记录原因: 上游 HTTP/2 流被重置');
   assert.equal(requestStatusCopy({ ...request, status_code: 200, error_code: 'upstream_stream' }, 'en').hint, 'Recorded cause: The upstream response stream was interrupted');
   assert.equal(requestStatusCopy({ ...request, status_code: 502, error_code: 'http_502', terminal_cause_code: 'upstream_transport_http2_reset' }, 'en').hint, 'Recorded cause: The upstream HTTP/2 stream was reset');
-  assert.equal(requestStatusCopy({ ...request, status_code: 502, error_code: 'http_502', terminal_cause_code: 'Bearer secret-token' }, 'en').hint, 'Recorded cause: No specific cause was captured at the time');
+  assert.equal(requestStatusCopy({ ...request, status_code: 502, error_code: 'http_502', terminal_cause_code: 'Bearer secret-token' }, 'en').hint, 'Recorded cause: Only the HTTP status was stored, not the phase where it failed');
 });
 
 test('hostile or unrecorded terminal cause codes never reach operators and never mask a known recorded cause', () => {
   const hostile = { ...request, status_code: 502, error_code: 'http_502', terminal_cause_code: 'Bearer secret-token\r\nSet-Cookie: session=attacker' };
   const hostileCopy = requestStatusCopy(hostile, 'en');
-  assert.equal(hostileCopy.hint, 'Recorded cause: No specific cause was captured at the time');
+  assert.equal(hostileCopy.hint, 'Recorded cause: Only the HTTP status was stored, not the phase where it failed');
   assert.equal(hostileCopy.cause, hostileCopy.hint);
   assert.doesNotMatch(hostileCopy.hint, /secret-token|Set-Cookie|attacker/);
   assert.equal(requestFailureCause(hostile, 'zh-CN'), null);
   assert.equal(requestErrorCopy(hostile.terminal_cause_code!, 'en'), 'The request failed', 'generic copy never interpolates the raw recorded value');
+  assert.equal(requestFailureCause({ ...request, status_code: 503, error_code: 'proxy_memory_ingress' }, 'zh-CN'), '网关内存装不下这次请求体，也没有写入对象存储');
+  assert.equal(requestFailureCause({ ...request, status_code: 503, error_code: 'database_pool_exhausted' }, 'en'), 'The database connection pool timed out');
+  assert.equal(requestErrorCopy('proxy_memory_capacity', 'en'), 'The retained request partition was full');
+  const unmapped = requestErrorCopy('plugin_future_code_v9', 'en');
+  assert.match(unmapped, /plugin_future_code_v9/);
+  assert.match(unmapped, /no finer mapped sentence/);
+  assert.equal(requestErrorCopy('Bearer secret-token', 'zh-CN'), '请求失败');
+  assert.match(requestStatusCopy({ ...request, status_code: 503, error_code: 'plugin_future_code_v9' }, 'zh-CN').hint, /plugin_future_code_v9/);
+  assert.match(requestStatusCopy({ ...request, status_code: 503, error_code: 'plugin_future_code_v9' }, 'zh-CN').hint, /没有更细的对应说明/);
+  const staged = { ...request, status_code: 502, error_code: 'upstream_connection', failure_diagnostic: { stage: null, source: 'upstream' as const, reason: 'upstream_read_timeout' } };
+  assert.equal(requestFailureCause(staged, 'en'), 'The upstream connection failed. Reading the upstream response timed out');
+  assert.equal(requestFailureCause(staged, 'zh-CN'), '上游连接失败。读取上游响应超时');
   const unknownTerminal = { ...request, status_code: 502, error_code: 'upstream_stream_read_error', terminal_cause_code: 'transport_future_code_v9' };
   assert.equal(requestStatusCopy(unknownTerminal, 'en').hint, 'Recorded cause: The upstream response stream was interrupted', 'an unrecognized terminal cause falls back to the recorded error evidence');
   assert.equal(requestStatusCopy(unknownTerminal, 'zh-CN').hint, '已记录原因: 读取上游响应时连接中断');
@@ -70,6 +115,11 @@ test('terminal cause survives SSE reconciliation and legacy events never erase r
   assert.equal(requestViewFromEvent(legacyFinished as RequestEvent, restRow)?.terminal_cause_code, 'upstream_read_timeout', 'a legacy finished event lacking the field must not clear a REST-recorded cause');
   assert.equal(requestViewFromEvent(started, restRow)?.terminal_cause_code, 'upstream_read_timeout', 'a replayed start never regresses the terminal row');
   assert.equal(requestViewFromEvent({ ...finished, terminal_cause_code: null })?.terminal_cause_code, null, 'explicit null without previous evidence stays null');
+  const waitingRow: RequestView = { ...request, status_code: null, completed_at: null, in_flight_stage: 'upstream_response_headers' };
+  assert.equal(requestViewFromEvent(started, waitingRow)?.in_flight_stage, 'upstream_response_headers', 'a later event without a stage keeps the recorded stage');
+  assert.equal(requestViewFromEvent({ ...started, in_flight_stage: 'upstream_response_body' }, waitingRow)?.in_flight_stage, 'upstream_response_body');
+  assert.equal(requestViewFromEvent({ ...started, in_flight_stage: 'response_delivery' }, waitingRow)?.in_flight_stage, 'response_delivery');
+  assert.equal(requestViewFromEvent({ ...started, in_flight_stage: 'delivery_prepared' as never }, waitingRow)?.in_flight_stage, 'upstream_response_headers', 'a delivery contract marker is not an in-flight stage');
   const merged = mergeLiveRequestEvents([restRow], new Map([[restRow.request_id, archive]]), true);
   assert.equal(merged[0]?.terminal_cause_code, 'upstream_read_timeout');
 });
@@ -99,7 +149,7 @@ test('generation TPS requires observed output interval and does not relabel tota
   assert.equal(generationRequestOutputTps({ ...timed, generation_duration_ms: 1 }), 32000, 'no arbitrary high-rate threshold masks an otherwise recorded gateway interval');
 });
 
-test('failed requests use policy zero unless provider-reported usage supports the settlement', () => {
+test('failure and usage provenance do not replace a recorded settlement amount', () => {
   const failures = [
     { status_code: 499, error_code: null },
     { status_code: 502, error_code: null },
@@ -111,14 +161,13 @@ test('failed requests use policy zero unless provider-reported usage supports th
       const failed = { ...request, ...failure, usage_basis, cost: '35' };
       assert.equal(requestUsageIsActual(failed), false);
       assert.equal(requestCostCopy(failed, 'en').unknown, false);
-      assert.equal(requestCostCopy(failed, 'en').label, 'Cost set to 0');
-      assert.equal(requestDisplayedCost(failed), '0');
+      assert.equal(requestDisplayedCost(failed), '35');
       assert.equal(failed.cost, '35', 'presentation policy leaves the stored ledger amount unchanged');
     }
   }
   const successfulUnobserved = { ...request, usage_basis: 'not_observed' as const, cost: '35' };
   assert.equal(requestDisplayedCost(successfulUnobserved), '35');
-  assert.equal(requestDisplayedCost({ ...successfulUnobserved, status_code: null, error_code: 'delivery_started' }), '35');
+  assert.equal(requestDisplayedCost({ ...successfulUnobserved, status_code: null, error_code: 'delivery_started' }), '');
   assert.equal(requestCostCopy({ ...successfulUnobserved, status_code: null }, 'en').label, 'Awaiting settlement');
   const reported = { ...request, status_code: 499, cost: '0.2' };
   assert.equal(requestUsageIsActual(reported), true);
@@ -156,12 +205,11 @@ test('average output TPS uses recorded total seconds, distinguishes valid zero f
   assert.equal(averageRequestOutputTps({ ...request, output_tokens: -1 }), null);
 });
 
-test('failed cost copy states the zero policy while success remains unchanged', () => {
+test('settlement copy does not infer zero from failure or unknown usage', () => {
   const failed = requestCostCopy({ ...request, status_code: 502, usage_basis: 'contract_ceiling', cost: '35' }, 'en');
   assert.equal(failed.unknown, false);
-  assert.equal(failed.label, 'Cost set to 0');
-  assert.match(failed.hint, /cost is 0/);
-  assert.equal(requestCostCopy({ ...request, status_code: 200, usage_basis: 'not_observed', cost: '35' }, 'en').unknown, true);
+  assert.doesNotMatch(failed.hint, /cost is 0/);
+  assert.equal(requestCostCopy({ ...request, status_code: 200, usage_basis: 'not_observed', cost: '35' }, 'en').unknown, false);
 });
 
 test('credential identity remains meaningful without inventing an alias for explicitly unbound history', () => {
@@ -180,9 +228,41 @@ test('terminal imported history need not have completion timestamps; live starte
   assert.equal(requestOutcome({ ...request, completed_at: 3000, error_code: 'upstream_incomplete_response' }), 'interrupted', 'even 200 must not hide a recorded terminal error');
   assert.equal(requestOutcome({ ...request, status_code: 499, error_code: 'client_cancelled' }), 'cancelled');
   assert.equal(requestOutcome({ ...request, status_code: null, error_code: 'delivery_started' }), 'delivering');
-  assert.match(requestStatusCopy({ ...request, completed_at: 3000 }, 'en').hint, /not client acknowledgement/);
+  assert.equal(requestOutcome({ ...request, status_code: null, error_code: null }), 'running');
+  assert.equal(requestStatusCopy({ ...request, status_code: null, error_code: null }, 'zh-CN').label, '运行中');
+  const waiting = { ...request, status_code: null, error_code: null, completed_at: null, in_flight_stage: 'upstream_response_headers' as const };
+  assert.equal(requestOutcome(waiting), 'waiting_upstream');
+  assert.equal(requestStatusCopy(waiting, 'zh-CN').label, '等待上游');
+  assert.equal(requestStatusCopy(waiting, 'en').label, 'Waiting on upstream');
+  assert.match(requestStatusCopy(waiting, 'zh-CN').hint, /请求已经发到上游，还没有收到响应开头。/);
+  assert.match(requestStatusCopy(waiting, 'en').hint, /The request was sent upstream\. The response has not started\./);
+  const reading = { ...waiting, in_flight_stage: 'upstream_response_body' as const };
+  assert.equal(requestOutcome(reading), 'reading_body');
+  assert.equal(requestStatusCopy(reading, 'zh-CN').label, '正在读取响应');
+  assert.equal(requestStatusCopy(reading, 'en').label, 'Reading the response');
+  assert.match(requestStatusCopy(reading, 'zh-CN').hint, /已收到上游响应开头，响应内容还在读取。/);
+  assert.match(requestStatusCopy(reading, 'en').hint, /The upstream response has started and its body is still being read\./);
+  const delivering = { ...waiting, in_flight_stage: 'response_delivery' as const };
+  assert.equal(requestOutcome(delivering), 'delivering');
+  assert.equal(requestStatusCopy(delivering, 'zh-CN').label, '交付中');
+  assert.match(requestStatusCopy(delivering, 'zh-CN').hint, /已开始发送响应，交付完成状态待记录。/);
+  assert.equal(requestOutcome({ ...request, status_code: 200, completed_at: 3000, in_flight_stage: 'upstream_response_headers' }), 'completed');
+  assert.equal(requestOutcome({ ...waiting, in_flight_stage: null }), 'running');
+  assert.equal(requestOutcome({ ...waiting, in_flight_stage: 'delivery_prepared' as never }), 'running');
+  assert.match(requestStatusCopy({ ...request, completed_at: 3000 }, 'en').hint, /The server recorded a normal finish/);
   assert.match(requestStatusCopy(request, 'en').hint, /Completion time is missing; complete delivery is not confirmed\./);
   assert.match(requestStatusCopy(request, 'zh-CN').hint, /此历史记录缺少完成时间，无法确认完整交付。/);
+});
+
+test('duration tooltip splits the upstream wait from later output', () => {
+  const timed = { ...request, first_output_ms: 78_000, generation_duration_ms: 4_000, duration_ms: 101_000 };
+  const zh = requestDurationTooltip(timed, 'zh-CN');
+  assert.match(zh, /总耗时: 101,000 ms/);
+  assert.match(zh, /等待上游开始返回: 78,000 ms/);
+  assert.match(zh, /上游返回内容: 4,000 ms/);
+  assert.match(zh, /网关本地处理: 19,000 ms/);
+  assert.match(requestDurationTooltip(timed, 'en'), /Waiting for the upstream to start: 78,000 ms/);
+  assert.equal(requestDurationTooltip({ ...request, duration_ms: null, first_output_ms: null, generation_duration_ms: null }, 'zh-CN'), '');
 });
 
 test('Anthropic uses persisted normalized total input, not raw provider input', () => {

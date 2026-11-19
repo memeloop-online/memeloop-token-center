@@ -34,18 +34,50 @@ async fn send_official_responses_with_key(state: &AppState, key: &str, body: &Va
         .unwrap()
 }
 
-async fn wait_for_key_settlement(state: &AppState, key_id: Uuid) {
+pub(super) async fn wait_for_key_settlement(state: &AppState, key_id: Uuid) {
     tokio::time::timeout(Duration::from_secs(3), async {
-        loop {
-            let rows = state.db.list_requests(key_id, 10).await.unwrap();
-            if rows.len() == 1 && rows[0].status_code.is_some() {
-                break;
-            }
-            tokio::task::yield_now().await;
-        }
+        wait_for_financial_events(state, key_id, 1).await;
     })
     .await
     .unwrap();
+}
+
+pub(super) async fn wait_for_financial_events(state: &AppState, key_id: Uuid, expected: usize) {
+    let pool = sqlx::AnyPool::connect(&state.config.database_url)
+        .await
+        .unwrap();
+    let owner = Uuid::now_v7();
+    loop {
+        let rows = state.db.list_requests(key_id, 10).await.unwrap();
+        if rows.len() == expected && rows.iter().all(|row| row.completed_at.is_some()) {
+            for request_id in state
+                .db
+                .claim_terminal_projection_tasks(owner, 10)
+                .await
+                .expect("claim terminal projections")
+            {
+                assert!(
+                    state
+                        .db
+                        .project_claimed_terminal_projection_task(owner, request_id)
+                        .await
+                        .unwrap()
+                );
+            }
+            let finished: i64 = sqlx::query_scalar(
+                "SELECT COUNT(*) FROM request_events WHERE key_id = $1 AND event_kind = 'finished'",
+            )
+            .bind(key_id.to_string())
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+            if finished == expected as i64 {
+                break;
+            }
+        }
+        tokio::task::yield_now().await;
+    }
+    pool.close().await;
 }
 
 #[tokio::test]
@@ -357,7 +389,7 @@ async fn same_model_accounts_are_explicitly_pinned_to_native_or_chat_transport()
                 currency: "USD".into(),
                 policy: KeyPolicy {
                     allowed_models: vec![native.model.clone()],
-                    max_concurrency: 4,
+                    max_concurrency: Some(4),
                     ..KeyPolicy::default()
                 },
                 initial_balance: Decimal::ONE,
@@ -486,7 +518,7 @@ fn assert_multi_agent_chat_limit_wire(forwarded: &Value, limit: Option<i64>) {
 }
 
 #[tokio::test]
-async fn http_json_multi_agent_chat_caps_control_buffered_and_streamed_usage() {
+async fn http_json_multi_agent_chat_limits_preserve_actual_buffered_and_streamed_usage() {
     for stream in [false, true] {
         for limit in [Some(4096), Some(5000), None] {
             let upstream = MockServer::start().await;
@@ -531,15 +563,7 @@ async fn http_json_multi_agent_chat_caps_control_buffered_and_streamed_usage() {
                 .await;
             let request = multi_agent_chat_limit_request(&fixture, stream, limit);
             let response = send_official_responses(&fixture, &request).await;
-            let rejected = limit == Some(4096);
-            assert_eq!(
-                response.status(),
-                if rejected && !stream {
-                    StatusCode::BAD_GATEWAY
-                } else {
-                    StatusCode::OK
-                }
-            );
+            assert_eq!(response.status(), StatusCode::OK);
             let delivered = to_bytes(response.into_body(), MAX_PROXY_RESPONSE_BODY)
                 .await
                 .unwrap();
@@ -550,17 +574,13 @@ async fn http_json_multi_agent_chat_caps_control_buffered_and_streamed_usage() {
                 assert!(body.contains(r#""output_tokens":5000"#));
             } else {
                 let body: Value = serde_json::from_slice(&delivered).unwrap();
-                if rejected {
-                    assert_eq!(body["error"]["message"], "upstream returned invalid usage");
-                } else {
-                    assert_eq!(
-                        body["output"][0]["content"][0]["text"],
-                        "translated response"
-                    );
-                    assert_eq!(body["usage"]["output_tokens"], 5000);
-                }
+                assert_eq!(
+                    body["output"][0]["content"][0]["text"],
+                    "translated response"
+                );
+                assert_eq!(body["usage"]["output_tokens"], 5000);
             }
-            wait_for_request_settlement(&fixture, 1).await;
+            wait_for_key_settlement(&fixture.state, fixture.key_id).await;
             let rows = fixture
                 .state
                 .db
@@ -568,18 +588,12 @@ async fn http_json_multi_agent_chat_caps_control_buffered_and_streamed_usage() {
                 .await
                 .unwrap();
             assert_eq!(rows.len(), 1);
-            assert_eq!(rows[0].status_code, Some(if rejected { 502 } else { 200 }));
-            assert_eq!(
-                rows[0].error_code.as_deref(),
-                rejected.then_some("upstream_invalid_usage")
-            );
-            assert_eq!(
-                (rows[0].input_tokens, rows[0].output_tokens),
-                if rejected { (0, 0) } else { (5, 5000) }
-            );
+            assert_eq!(rows[0].status_code, Some(200));
+            assert_eq!(rows[0].error_code, None);
+            assert_eq!((rows[0].input_tokens, rows[0].output_tokens), (5, 5000));
             assert_eq!(
                 rows[0].cost.parse::<Decimal>().unwrap(),
-                Decimal::new(if rejected { 0 } else { 5005 }, 6)
+                Decimal::new(5005, 6)
             );
             let pool = sqlx::AnyPool::connect(&fixture.database_url).await.unwrap();
             let row = sqlx::query("SELECT r.price_snapshot_json, r.reserved_tokens, r.status, (SELECT COUNT(*) FROM ledger_entries l WHERE l.source = r.id) AS ledgers, (SELECT COUNT(*) FROM request_events e WHERE e.request_id = q.id AND e.event_kind = 'finished') AS events FROM usage_reservations r JOIN request_records q ON q.reservation_id = r.id")
@@ -601,7 +615,7 @@ async fn http_json_multi_agent_chat_caps_control_buffered_and_streamed_usage() {
 }
 
 #[tokio::test]
-async fn http_json_multi_agent_chat_cap_survives_independent_connection_finish() {
+async fn http_json_multi_agent_chat_actual_usage_survives_independent_connection_finish() {
     for limit in [Some(4096), Some(5000), None] {
         let upstream = MockServer::start().await;
         let fixture = multi_agent_chat_limit_fixture(&upstream).await;
@@ -679,39 +693,49 @@ async fn http_json_multi_agent_chat_cap_survives_independent_connection_finish()
             routing_terminal_observed_at: None,
             conversation: None,
         };
-        let rejected = limit == Some(4096);
-        let first = recovered
-            .finish_proxy_request(finish.clone())
-            .await
-            .unwrap();
-        assert!(
-            matches!(first, FinishProxyRequestResult::Finished { usage_invalid, .. } if usage_invalid == rejected)
-        );
-        assert!(
-            matches!(recovered.finish_proxy_request(finish).await.unwrap(), FinishProxyRequestResult::AlreadyFinished { status_code, .. } if status_code == if rejected { 502 } else { 200 })
-        );
         drop(request);
-        tokio::time::timeout(Duration::from_secs(3), async {
-            while fixture.state.proxy_lifecycles.active() != 0 {
-                tokio::task::yield_now().await;
+        let receipt =
+            cancellation::assert_single_unknown_receipt(&fixture, 499, Some("client_cancelled"))
+                .await;
+        let claim: crate::db::PendingProxySettlementClaim =
+            serde_json::from_value(receipt["claim"].clone()).unwrap();
+        assert_eq!(claim.request_id, request_id);
+        assert_eq!(claim.reservation_id, reservation.id);
+        assert!(matches!(
+            recovered.finish_proxy_request(finish.clone()).await,
+            Err(AppError::Conflict(_))
+        ));
+        let receipt_id = Uuid::now_v7();
+        let mut first_ack = None;
+        for _ in 0..2 {
+            let result = recovered
+                .finish_pending_proxy_settlement(
+                    &claim,
+                    receipt_id,
+                    crate::db::PendingProxySettlementEvidence::ProviderReported,
+                    finish.clone(),
+                    ProxyRequestUpstreamAttribution::KeepSelected,
+                )
+                .await;
+            let ack = result.unwrap();
+            assert_eq!(ack.request_id, request_id);
+            assert_eq!(ack.reservation_id, reservation.id);
+            assert_eq!(ack.fence, claim.fence);
+            assert_eq!(ack.receipt_id, receipt_id);
+            assert_eq!(ack.cost_micros, 5005);
+            assert!(!ack.receipt_digest.is_empty());
+            if let Some(previous) = first_ack.as_ref() {
+                assert_eq!(&ack, previous);
+            } else {
+                first_ack = Some(ack);
             }
-        })
-        .await
-        .unwrap();
+        }
+        wait_for_key_settlement(&fixture.state, fixture.key_id).await;
         let terminal = sqlx::query("SELECT q.status_code, q.output_tokens, q.cost_micros, (SELECT COUNT(*) FROM ledger_entries l WHERE l.source = q.reservation_id) AS ledgers, (SELECT COUNT(*) FROM request_events e WHERE e.request_id = q.id AND e.event_kind = 'finished') AS events FROM request_records q WHERE q.id = $1")
             .bind(request_id.to_string()).fetch_one(&pool).await.unwrap();
-        assert_eq!(
-            terminal.get::<i64, _>("status_code"),
-            if rejected { 502 } else { 200 }
-        );
-        assert_eq!(
-            terminal.get::<i64, _>("output_tokens"),
-            if rejected { 0 } else { 5000 }
-        );
-        assert_eq!(
-            terminal.get::<i64, _>("cost_micros"),
-            if rejected { 0 } else { 5005 }
-        );
+        assert_eq!(terminal.get::<Option<i64>, _>("status_code"), Some(200));
+        assert_eq!(terminal.get::<i64, _>("output_tokens"), 5000);
+        assert_eq!(terminal.get::<i64, _>("cost_micros"), 5005);
         assert_eq!(terminal.get::<i64, _>("ledgers"), 1);
         assert_eq!(terminal.get::<i64, _>("events"), 1);
         pool.close().await;

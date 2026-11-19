@@ -10,6 +10,7 @@ declare global {
     sessionDetailReads: number;
     sessionListReads: number;
     sessionListAborts: number;
+    unlinkedNavigations: Array<{ sessionId: string; keyId?: string }>;
     resolveSessionList: (status: boolean | number) => void;
     resolveSessionDetail: (status: boolean | number) => void;
   }
@@ -49,8 +50,8 @@ test('session reads retry a transient failure inside one deadline and remain can
     await page.evaluate(() => window.resolveSessionList(true));
     await page.getByText('Retained session', { exact: true }).first().waitFor();
     await page.getByRole('button', { name: 'Agent and request timing', exact: true }).click();
-    assert.equal(await page.locator('.session-event footer > span[tabindex="0"]').innerText(), '5 tokens · 10 ms · —',
-      'unknown session cost renders as a dash instead of the recorded ledger amount');
+    assert.equal(await page.locator('.session-event footer > span[tabindex="0"]').innerText(), '5 tokens · 10 ms · $12.34',
+      'recorded settlement remains visible independently of usage provenance');
     assert.equal(await page.getByRole('checkbox', { name: 'Auto-refresh', exact: true }).isChecked(), true);
     await page.getByRole('button', { name: 'Simulate session event', exact: true }).click();
     await page.waitForFunction(() => window.sessionListReads === 3);
@@ -144,13 +145,18 @@ test('session events refresh only the exact selected credential and session deta
       'the exact selected credential and session event refreshes its detail once');
 
     await page.getByRole('button', { name: 'Open Unlinked requests', exact: true }).click();
-    await page.waitForFunction(() => window.sessionDetailReads === 5);
+    await page.waitForFunction(() => window.unlinkedNavigations.length === 1);
+    assert.deepEqual(await page.evaluate(() => window.unlinkedNavigations[0]), {
+      sessionId: 'unlinked:fixture-key', keyId: 'fixture-key',
+    });
+    assert.equal(await page.evaluate(() => window.sessionDetailReads), 4,
+      'an aggregate opens credential requests without requesting a conversation body');
     await page.getByRole('button', { name: 'Simulate confirmed projection', exact: true }).click();
     await page.waitForFunction(() => window.sessionListReads === 7);
     await page.evaluate(() => window.resolveSessionList(true));
-    await page.waitForFunction(() => window.sessionDetailReads === 6);
-    assert.equal(await page.evaluate(() => window.sessionDetailReads), 6,
-      'a confirmed projection refreshes the old same-credential unlinked detail');
+    await settleRenderedRefresh(page, 7);
+    assert.equal(await page.evaluate(() => window.sessionDetailReads), 4,
+      'a different confirmed session does not create a selected aggregate conversation');
   } finally { await browser.close(); await server.close(); }
 });
 

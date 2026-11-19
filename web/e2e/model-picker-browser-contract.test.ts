@@ -88,26 +88,21 @@ test('filters are non-modal themed popovers and model selection is searchable by
     await row.waitFor({ state: 'visible' });
     assert.equal(await row.getByLabel('Operator', { exact: true }).count(), 1, 'operator label must not include the select option list');
     await row.getByLabel('Field', { exact: true }).selectOption('model');
-    const search = filter.getByRole('combobox', { name: 'Enter or choose a model', exact: true });
+    const search = filter.locator('.typed-filter-model-picker input[role=combobox]');
     const catalog = filter.locator('.shared-model-popover');
-    await search.fill('provider-b');
+    await search.fill('production-model');
     await catalog.getByRole('option').first().waitFor();
-    assert.equal(await catalog.getByRole('group', { name: 'Production pool', exact: true }).count(), 1);
-    assert.equal(await catalog.getByRole('group', { name: 'provider-b', exact: true }).count(), 1);
-    assert.equal(await catalog.getByRole('group', { name: 'Production account', exact: true }).count(), 1);
+    assert.equal(await catalog.getByRole('group').count(), 0, 'request model names are flat across accounts');
     assert.equal(await catalog.getByRole('option').count(), 1);
-    assert.match(await catalog.getByRole('option').first().textContent() ?? '', /Health check not run/);
+    assert.doesNotMatch(await catalog.innerText(), /Health check not run|Production account|provider-b/);
     await search.press('ArrowDown');
     await search.press('Enter');
     assert.equal(await filter.isVisible(), true, 'closing the nested model picker must not close the filter editor');
     await filter.getByRole('button', { name: 'Apply filters', exact: true }).click();
     assert.equal(await page.locator('[data-filter-model]').textContent(), 'production-model');
     context.diagnostic('checking settings provider/account autocomplete');
-    const capabilityAlert = page
-      .locator('.system-settings p[role="alert"]')
-      .filter({ hasText: /friendly-custom-chat.+not currently available/i });
-    assert.match(await capabilityAlert.textContent() ?? '', /friendly-custom-chat.+not currently available/i);
-    assert.doesNotMatch(await page.locator('.system-settings .model-picker-trigger').textContent() ?? '', /route-custom/, 'an unverified stored route must not leak a raw route ID into the picker');
+    assert.match(await page.locator('.system-settings .model-picker-trigger').textContent() ?? '', /friendly-custom-chat/, 'a stored text route stays visible even when its catalog has not been observed');
+    assert.equal(await page.locator('.system-settings p[role="alert"]').count(), 0, 'an unknown catalog state is not presented as a failure');
     await page.locator('.system-settings .model-picker-trigger').click();
     const settingsCatalog = page.locator('.system-settings .shared-model-popover');
     await settingsCatalog.getByRole('combobox').fill('only');
@@ -121,7 +116,7 @@ test('filters are non-modal themed popovers and model selection is searchable by
     await settingsCatalog.getByRole('combobox').fill('image-analysis-assistant');
     assert.equal(await settingsCatalog.getByRole('option').count(), 1, 'a catalog-proven text alias is not rejected because its name contains image');
     await settingsCatalog.getByRole('combobox').fill('friendly-custom-chat');
-    assert.equal(await settingsCatalog.getByRole('option').count(), 0, 'an unobserved custom name is not treated as capability evidence');
+    assert.equal(await settingsCatalog.getByRole('option').count(), 1, 'a supported text route remains selectable without catalog confirmation');
     await settingsCatalog.getByRole('combobox').fill('Research account');
     await settingsCatalog.getByRole('option', { name: /research-model/i }).click();
     assert.match(await page.locator('.system-settings .model-picker-trigger').textContent() ?? '', /research-model/);
@@ -135,7 +130,6 @@ test('filters are non-modal themed popovers and model selection is searchable by
     await settingsCatalog.getByRole('combobox').press('Enter');
     await settingsCatalog.waitFor({ state: 'hidden' });
     assert.match(await page.locator('.system-settings .model-picker-trigger').textContent() ?? '', /production-model/, 'Enter skips an unavailable first result and chooses the first available route');
-    assert.match(await page.locator('.system-settings').getByRole('status').last().textContent() ?? '', /4 models are hidden/i);
     context.diagnostic('checking billing search, failure recovery and late save scope ownership');
     const settings = page.locator('.system-settings');
     const billing = settings.getByRole('combobox', { name: 'Billing credential', exact: true });

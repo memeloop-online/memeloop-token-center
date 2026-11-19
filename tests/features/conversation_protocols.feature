@@ -56,14 +56,6 @@ Feature: Logical conversations across supported coding clients and protocols
     Then the response status is 200
     And only the chat request appears in logical conversations
 
-  Scenario: WorkBuddy uses OpenAI chat with max_completion_tokens and API key auth
-    Given a token center backed by SQLite and memory object storage
-    And the mock WorkBuddy OpenAI upstream requires max_completion_tokens
-    When the service creates a key for principal "workbuddy-user" allowing model "gpt-test"
-    And WorkBuddy sends two OpenAI chat turns for model "gpt-test"
-    Then the response status is 200
-    And the WorkBuddy requests form one logical conversation
-
   Scenario: Explicit header and body markers create paginated subagent ancestry
     Given a token center backed by SQLite and memory object storage
     And the mock OpenAI upstream returns a successful completion

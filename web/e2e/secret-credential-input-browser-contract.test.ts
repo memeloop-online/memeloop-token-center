@@ -6,7 +6,7 @@ import test from 'node:test';
 import { chromium } from 'playwright';
 import { createServer } from 'vite';
 
-test('create and rotate keep provider secrets masked across keyboard, mobile and schema variants', { timeout: 120_000 }, async (context) => {
+test('create and rotate keep authorized values visible and editable across keyboard, mobile and schema variants', { timeout: 120_000 }, async (context) => {
   if (!existsSync(chromium.executablePath())) {
     if (process.env.MTC_REQUIRE_BROWSER === '1') throw new Error('Chromium required');
     context.skip('Chromium required'); return;
@@ -47,9 +47,9 @@ test('create and rotate keep provider secrets masked across keyboard, mobile and
             await inputs.nth(1).fill('');
           }
           for (const input of await inputs.all()) {
-            assert.equal(await input.getAttribute('type'), 'password');
+            assert.equal(await input.getAttribute('type'), 'text');
             assert.equal(await input.inputValue() === '', true, `${variant}/${locale}/${theme}/${name}/${await input.getAttribute('id')}: existing/default secret must not be prefilled`);
-            assert.equal(await input.getAttribute('autocomplete'), 'new-password');
+            assert.equal(await input.getAttribute('autocomplete'), 'off');
             const fieldId = await input.getAttribute('id');
             const synthetic = fieldId?.endsWith('adapter_state') ? '{"synthetic":true}' : fieldId?.endsWith('secret_rows') ? '[{"secret":"synthetic-only"}]' : 'synthetic-only';
             if ((await input.getAttribute('id'))?.endsWith('adapter_state')) {
@@ -62,25 +62,13 @@ test('create and rotate keep provider secrets masked across keyboard, mobile and
               assert.equal((await input.getAttribute('aria-describedby'))?.includes(`${fieldId}-secret-error`), true);
             }
             await input.fill(synthetic);
-            const toggle = input.locator('..').getByRole('button');
-            await toggle.focus(); await page.keyboard.press('Enter');
-            assert.equal(await toggle.getAttribute('aria-pressed'), 'true');
-            assert.equal(await input.getAttribute('type'), 'text');
-            assert.equal(await input.inputValue() === synthetic, true);
-            assert.equal((await input.getAttribute('value') ?? '') === '', true, 'value remains a property, never a DOM attribute');
+            assert.equal(await input.locator('..').getByRole('button').count(), 0, 'no reveal action is required');
+            assert.equal(await input.inputValue(), synthetic);
             await page.keyboard.press('Escape');
-            assert.equal(await input.getAttribute('type'), 'password');
-            assert.equal(await input.inputValue() === synthetic, true, 'hiding must not clear input');
-            await toggle.click();
             await page.evaluate(() => document.dispatchEvent(new Event('visibilitychange')));
-            assert.equal(await input.getAttribute('type'), 'password');
-            assert.equal(await input.inputValue() === synthetic, true);
-            await toggle.click();
             await page.getByRole('button', { name: 'Reopen forms', exact: true }).focus();
-            assert.equal(await input.getAttribute('type'), 'password', 'focus leaving remasks input');
-            assert.equal(await input.inputValue() === synthetic, true);
-            assert.equal(await form.innerText().then((text) => text.includes(synthetic)), false, 'no value echoed in surrounding UI');
-            if (width === 390) assert.ok(await toggle.evaluate((element) => element.getBoundingClientRect().height >= 44));
+            assert.equal(await input.getAttribute('type'), 'text', 'focus changes do not mask configuration');
+            assert.equal(await input.inputValue(), synthetic);
           }
           await form.locator('button[type=submit]').click();
         }
@@ -90,11 +78,8 @@ test('create and rotate keep provider secrets masked across keyboard, mobile and
         await edit.locator('button[type=submit]').click();
         assert.equal(await edit.getByRole('status', { name: 'Edit outcome' }).textContent(), 'unchanged');
         await editSecret.fill('synthetic-replacement');
-        const reveal = editSecret.locator('..').getByRole('button');
-        await reveal.focus(); await page.keyboard.press('Enter');
         assert.equal(await editSecret.getAttribute('type'), 'text');
-        await page.keyboard.press('Escape');
-        assert.equal(await editSecret.getAttribute('type'), 'password');
+        assert.equal(await editSecret.locator('..').getByRole('button').count(), 0);
         await edit.locator('button[type=submit]').click();
         assert.equal(await edit.getByRole('status', { name: 'Edit outcome' }).textContent(), 'replaced');
         assert.equal(await page.evaluate(() => document.documentElement.scrollWidth <= innerWidth), true);

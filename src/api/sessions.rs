@@ -277,7 +277,7 @@ fn session_list_response(
     mut sessions: Vec<crate::model::LogicalSessionSummary>,
     requested_limit: i64,
 ) -> LogicalSessionListResponse {
-    let limit = requested_limit.clamp(1, 100) as usize;
+    let limit = requested_limit as usize;
     let has_more = sessions.len() > limit;
     if has_more {
         sessions.truncate(limit);

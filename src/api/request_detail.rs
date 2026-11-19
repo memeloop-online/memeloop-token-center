@@ -3,6 +3,7 @@ use axum::{
     http::{HeaderMap, StatusCode, header},
     response::Response,
 };
+use futures_util::StreamExt;
 use serde::Deserialize;
 use serde_json::{Value, json};
 
@@ -31,58 +32,80 @@ pub(super) async fn request_detail(
     state: &AppState,
     refs: crate::model::RequestArchiveRefs,
 ) -> crate::model::RequestDetail {
-    let request = if archive_is_pending(refs.request_archive_state) {
+    let retired = || ArchiveValue {
+        value: serde_json::json!({"semantic_archive_available":true}),
+        complete: true,
+        reason: Some("raw_retired_semantic_archive".into()),
+        preview: None,
+    };
+    let request = if refs.request_archive_reason.as_deref() == Some("raw_retired_semantic_archive")
+    {
+        retired()
+    } else if archive_is_pending(refs.request_archive_state) {
         ArchiveValue::pending()
     } else {
         archive_value(state, &refs.request_object).await
     };
-    let response = if archive_is_pending(refs.response_archive_state) {
-        ArchiveValue::pending()
-    } else {
-        match refs.response_object.as_deref() {
-            Some(location) if crate::supplier_error::invalid_native_supplier_envelope(location) => {
-                ArchiveValue::gap("archive_payload_invalid")
-            }
-            Some(location) => archive_value(state, location).await,
-            None => match refs.response_json {
-                Some(value) if json_value_structure_is_bounded(&value) => ArchiveValue {
-                    value,
-                    complete: true,
-                    reason: None,
-                },
-                Some(_) => ArchiveValue::gap("archive_payload_invalid"),
-                None if matches!(
-                    refs.response_archive_state,
-                    crate::model::RequestArchiveState::Bound
-                        | crate::model::RequestArchiveState::MetadataOnly
-                ) =>
-                {
-                    ArchiveValue {
-                        value: Value::Null,
+    let response =
+        if refs.response_archive_reason.as_deref() == Some("raw_retired_semantic_archive") {
+            retired()
+        } else if archive_is_pending(refs.response_archive_state) {
+            ArchiveValue::pending()
+        } else {
+            match refs.response_object.as_deref() {
+                Some(location) => archive_value(state, location).await,
+                None => match refs.response_json {
+                    Some(value) if json_value_structure_is_bounded(&value) => ArchiveValue {
+                        value,
                         complete: true,
                         reason: None,
+                        preview: None,
+                    },
+                    Some(_) => ArchiveValue::gap("archive_payload_invalid"),
+                    None if matches!(
+                        refs.response_archive_state,
+                        crate::model::RequestArchiveState::Bound
+                            | crate::model::RequestArchiveState::MetadataOnly
+                    ) =>
+                    {
+                        ArchiveValue {
+                            value: Value::Null,
+                            complete: true,
+                            reason: None,
+                            preview: None,
+                        }
                     }
-                }
-                None => ArchiveValue {
-                    value: Value::Null,
-                    complete: false,
-                    reason: refs.response_archive_reason.clone(),
+                    None => ArchiveValue {
+                        value: Value::Null,
+                        complete: false,
+                        reason: refs.response_archive_reason.clone(),
+                        preview: None,
+                    },
                 },
-            },
-        }
-    };
+            }
+        };
     crate::model::RequestDetail {
+        semantic_archive: refs.semantic_archive.map(|authority| {
+            crate::model::SemanticArchiveView {
+                manifest_revision: authority.publication.revision.to_string(),
+                projection_version: authority.publication.projection_version,
+                semantic_head: authority.semantic_head,
+                coverage: authority.coverage,
+            }
+        }),
         view: refs.view,
         request_body: request.value,
         response_body: response.value,
         archive_complete: request.complete && response.complete,
         archive: crate::model::RequestArchiveCompletenessView {
             request: crate::model::RequestArchiveSideView {
+                preview: request.preview,
                 state: refs.request_archive_state,
                 complete: request.complete,
                 reason: refs.request_archive_reason.or(request.reason),
             },
             response: crate::model::RequestArchiveSideView {
+                preview: response.preview,
                 state: refs.response_archive_state,
                 complete: response.complete,
                 reason: refs.response_archive_reason.or(response.reason),
@@ -132,6 +155,9 @@ fn archive_content_source(
             refs.response_object.as_deref(),
         ),
     };
+    if reason == Some("raw_retired_semantic_archive") {
+        return Err("raw_retired_semantic_archive");
+    }
     if archive_is_pending(state) {
         return Err("archive_pending");
     }
@@ -139,11 +165,6 @@ fn archive_content_source(
         return Err("media_body_not_archived_by_policy");
     }
     if let Some(location) = location {
-        if side == RequestArchiveSide::Response
-            && crate::supplier_error::invalid_native_supplier_envelope(location)
-        {
-            return Err("archive_payload_invalid");
-        }
         if let Some(value) = location.strip_prefix("inline-json:") {
             return Ok(ArchiveContentSource::Inline(Bytes::copy_from_slice(
                 value.as_bytes(),
@@ -187,7 +208,8 @@ fn inline_archive_content_response(
     headers: &HeaderMap,
     bytes: Bytes,
 ) -> Result<Response, AppError> {
-    let size = u64::try_from(bytes.len()).map_err(|_| AppError::Internal)?;
+    let size = u64::try_from(bytes.len())
+        .map_err(|_| AppError::internal("request_detail_inline_archive_content_response_1"))?;
     let etag = format!("\"{}\"", blake3::hash(&bytes).to_hex());
     if !if_match_satisfied(headers, &etag) {
         return precondition_failed(&etag);
@@ -197,8 +219,10 @@ fn inline_archive_content_response(
         Err(()) => return range_not_satisfiable(size, Some(&etag)),
     };
     let range = requested_range.clone().unwrap_or(0..size);
-    let start = usize::try_from(range.start).map_err(|_| AppError::Internal)?;
-    let end = usize::try_from(range.end).map_err(|_| AppError::Internal)?;
+    let start = usize::try_from(range.start)
+        .map_err(|_| AppError::internal("request_detail_inline_archive_content_response_2"))?;
+    let end = usize::try_from(range.end)
+        .map_err(|_| AppError::internal("request_detail_inline_archive_content_response_3"))?;
     archive_content_success(
         requested_range.is_some(),
         size,
@@ -246,15 +270,11 @@ async fn object_archive_content_response(
         }
     };
     if download.object_size != size {
-        return Err(AppError::Storage(
-            "request archive changed during download".to_owned(),
-        ));
+        return Err(AppError::storage("local_storage_failed"));
     }
     let expected_range = requested_range.clone().unwrap_or(0..size);
     if download.range != expected_range {
-        return Err(AppError::Storage(
-            "request archive returned an unexpected range".to_owned(),
-        ));
+        return Err(AppError::storage("local_storage_failed"));
     }
     archive_content_success(
         requested_range.is_some(),
@@ -338,7 +358,9 @@ fn archive_content_success(
             ),
         );
     }
-    response.body(body).map_err(|_| AppError::Internal)
+    response
+        .body(body)
+        .map_err(|_| AppError::internal("request_detail_archive_content_success_1"))
 }
 
 fn archive_content_unavailable(reason: &str) -> Result<Response, AppError> {
@@ -349,14 +371,14 @@ fn archive_content_unavailable(reason: &str) -> Result<Response, AppError> {
             "reason": reason,
         }
     }))
-    .map_err(|_| AppError::Internal)?;
+    .map_err(|_| AppError::internal("request_detail_archive_content_unavailable_1"))?;
     Response::builder()
         .status(StatusCode::CONFLICT)
         .header(header::CONTENT_TYPE, "application/json")
         .header(header::CONTENT_LENGTH, body.len())
         .header(header::CACHE_CONTROL, "private, no-store")
         .body(Body::from(body))
-        .map_err(|_| AppError::Internal)
+        .map_err(|_| AppError::internal("request_detail_archive_content_unavailable_2"))
 }
 
 fn precondition_failed(etag: &str) -> Result<Response, AppError> {
@@ -367,7 +389,7 @@ fn precondition_failed(etag: &str) -> Result<Response, AppError> {
         .header(header::CACHE_CONTROL, "private, no-store")
         .header(header::ETAG, etag)
         .body(Body::empty())
-        .map_err(|_| AppError::Internal)
+        .map_err(|_| AppError::internal("request_detail_precondition_failed_1"))
 }
 
 fn range_not_satisfiable(size: u64, etag: Option<&str>) -> Result<Response, AppError> {
@@ -380,13 +402,16 @@ fn range_not_satisfiable(size: u64, etag: Option<&str>) -> Result<Response, AppE
     if let Some(etag) = etag {
         response = response.header(header::ETAG, etag);
     }
-    response.body(Body::empty()).map_err(|_| AppError::Internal)
+    response
+        .body(Body::empty())
+        .map_err(|_| AppError::internal("request_detail_range_not_satisfiable_1"))
 }
 
 struct ArchiveValue {
     value: Value,
     complete: bool,
     reason: Option<String>,
+    preview: Option<crate::model::RequestArchivePreviewView>,
 }
 
 fn archive_is_pending(state: crate::model::RequestArchiveState) -> bool {
@@ -399,11 +424,21 @@ fn archive_is_pending(state: crate::model::RequestArchiveState) -> bool {
 }
 
 impl ArchiveValue {
+    fn streamed(bytes: u64) -> Self {
+        Self {
+            value: Value::Null,
+            complete: true,
+            reason: None,
+            preview: Some(crate::model::RequestArchivePreviewView::Stream { bytes }),
+        }
+    }
+
     fn pending() -> Self {
         Self {
             value: Value::Null,
             complete: false,
             reason: None,
+            preview: None,
         }
     }
 
@@ -412,6 +447,7 @@ impl ArchiveValue {
             value: Value::Null,
             complete: false,
             reason: Some(reason.to_owned()),
+            preview: None,
         }
     }
 }
@@ -422,6 +458,7 @@ async fn archive_value(state: &AppState, location: &str) -> ArchiveValue {
             value: serde_json::json!({"media_archived": false}),
             complete: true,
             reason: Some("media_body_not_archived_by_policy".to_owned()),
+            preview: None,
         };
     }
     if let Some(value) = location.strip_prefix("metadata-only-json:") {
@@ -436,15 +473,55 @@ async fn archive_value(state: &AppState, location: &str) -> ArchiveValue {
     if location.starts_with("gap://") {
         return ArchiveValue::gap("archive_object_unavailable");
     }
-    match state
-        .archive
-        .get_bounded(location, MAX_ARCHIVE_DETAIL_BODY)
-        .await
-    {
-        Ok(bytes) => decode_archive_value(&bytes),
+    // Preview omission is independent of durable archive availability. Probe only
+    // a small range so SSE and large objects use the existing authenticated
+    // content reader without materializing their entire body in every detail.
+    let preview: Result<ArchiveValue, AppError> = async {
+        let size = state.archive.head_size(location).await?;
+        let mut prefix = Vec::new();
+        if size > 0 {
+            let download = state
+                .archive
+                .open_stream(location, Some(0..size.min(1024)))
+                .await?;
+            if download.object_size != size || download.range != (0..size.min(1024)) {
+                return Err(AppError::storage("archive_preview_range_mismatch"));
+            }
+            let mut stream = download.stream;
+            while let Some(chunk) = stream.next().await {
+                let chunk = chunk.map_err(|_| AppError::storage("archive_preview_read_failed"))?;
+                if prefix.len().saturating_add(chunk.len()) > 1024 {
+                    return Err(AppError::storage("archive_preview_range_mismatch"));
+                }
+                prefix.extend_from_slice(&chunk);
+            }
+            if prefix.len() as u64 != size.min(1024) {
+                return Err(AppError::storage("archive_preview_range_mismatch"));
+            }
+        }
+        if size > MAX_ARCHIVE_DETAIL_BODY as u64
+            || (is_sse_prefix(&prefix) && size > MAX_ARCHIVE_DETAIL_JSON_STRING_BYTES as u64)
+        {
+            return Ok(ArchiveValue::streamed(size));
+        }
+        let bytes = state
+            .archive
+            .get_bounded(location, MAX_ARCHIVE_DETAIL_BODY)
+            .await?;
+        let value = decode_archive_value(&bytes);
+        // Structural projection budgets do not make an archived JSON invalid.
+        Ok(
+            if value.reason.as_deref() == Some("archive_payload_invalid") {
+                ArchiveValue::streamed(size)
+            } else {
+                value
+            },
+        )
+    }
+    .await;
+    match preview {
+        Ok(value) => value,
         Err(_) => {
-            // Imported locators and object-store errors can contain provider
-            // paths, signed query values, or storage identity metadata.
             tracing::warn!(
                 error_code = "archive_object_unavailable",
                 "archived request object is unavailable"
@@ -454,7 +531,28 @@ async fn archive_value(state: &AppState, location: &str) -> ArchiveValue {
     }
 }
 
+fn is_sse_prefix(bytes: &[u8]) -> bool {
+    let bytes = bytes.strip_prefix(&[0xef, 0xbb, 0xbf]).unwrap_or(bytes);
+    bytes
+        .split(|byte| *byte == b'\n')
+        .map(|line| line.strip_suffix(b"\r").unwrap_or(line))
+        .find(|line| !line.is_empty())
+        .is_some_and(|line| {
+            line.starts_with(b"data:") || line.starts_with(b"event:") || line.starts_with(b":")
+        })
+}
+
 fn decode_archive_value(bytes: &[u8]) -> ArchiveValue {
+    // SSE is framed text, not one JSON document. Preserve existing small text
+    // previews without applying JSON node/depth accounting across all frames.
+    if bytes.len() <= MAX_ARCHIVE_DETAIL_JSON_STRING_BYTES && is_sse_prefix(bytes) {
+        return ArchiveValue {
+            value: Value::String(String::from_utf8_lossy(bytes).into_owned()),
+            complete: true,
+            reason: None,
+            preview: None,
+        };
+    }
     if bytes.len() > MAX_ARCHIVE_DETAIL_BODY || !json_bytes_structure_is_bounded(bytes) {
         return ArchiveValue::gap("archive_payload_invalid");
     }
@@ -463,12 +561,14 @@ fn decode_archive_value(bytes: &[u8]) -> ArchiveValue {
             value,
             complete: true,
             reason: None,
+            preview: None,
         },
         Ok(_) => ArchiveValue::gap("archive_payload_invalid"),
         Err(_) => ArchiveValue {
             value: Value::String(String::from_utf8_lossy(bytes).into_owned()),
             complete: true,
             reason: None,
+            preview: None,
         },
     }
 }

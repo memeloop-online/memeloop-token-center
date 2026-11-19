@@ -4,7 +4,7 @@ use bytes::Bytes;
 use futures_util::{Stream, StreamExt, stream};
 use object_store::{GetOptions, GetRange, ObjectStore};
 
-use super::{ArchiveStore, path::archive_path};
+use super::ArchiveStore;
 use crate::error::AppError;
 
 /// A bounded-memory object-store read. The stream keeps filesystem and S3
@@ -25,10 +25,9 @@ impl ArchiveStore {
         if location.ends_with(super::compressed::SUFFIX) {
             return self.compressed_stream(location, range).await;
         }
-        let path = archive_path(location)?;
+        let (store, path) = self.resolve(location)?;
         let requested_range = range.clone();
-        let result = self
-            .inner
+        let result = store
             .get_opts(
                 &path,
                 GetOptions {
@@ -62,9 +61,7 @@ pub(super) fn validate_download_range(
         || expected.end > object_size
         || *returned != expected
     {
-        return Err(AppError::Storage(
-            "archive download range mismatch".to_owned(),
-        ));
+        return Err(AppError::storage("local_storage_failed"));
     }
     Ok(expected.end - expected.start)
 }

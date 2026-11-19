@@ -15,6 +15,35 @@ impl fmt::Debug for InstallProxyCredentials {
 }
 
 impl InstallProxyCredentials {
+    /// Bounded anonymous pipe input from the host control process.
+    pub fn from_stdin() -> Result<Self, PluginDistributionError> {
+        #[derive(serde::Deserialize)]
+        #[serde(deny_unknown_fields)]
+        struct Input {
+            username: String,
+            password: String,
+        }
+        let invalid = || PluginDistributionError::InvalidEgressProxy;
+        let mut bytes = Vec::new();
+        std::io::stdin()
+            .take(4097)
+            .read_to_end(&mut bytes)
+            .map_err(|_| invalid())?;
+        if bytes.len() > 4096 {
+            return Err(invalid());
+        }
+        let input: Input = serde_json::from_slice(&bytes).map_err(|_| invalid())?;
+        for value in [&input.username, &input.password] {
+            if value.is_empty() || value.len() > 255 || value.chars().any(char::is_control) {
+                return Err(invalid());
+            }
+        }
+        Ok(Self {
+            username: input.username,
+            password: input.password,
+        })
+    }
+
     pub fn from_files(username: &Path, password: &Path) -> Result<Self, PluginDistributionError> {
         Ok(Self {
             username: read_proxy_secret(username)?,

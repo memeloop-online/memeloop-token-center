@@ -30,14 +30,16 @@ export function PluginsPage({ token, tenant, writeTenant, catalog, reloadCatalog
   const manager = access.state.scopeKey !== token ? null : access.state.kind === 'failed'
     ? <p className="notice error" role="alert">{access.state.message}</p>
     : access.state.kind === 'ready' && access.state.value.can_view_runtime
-      ? <PluginRuntimeManager key={token} token={token} canManage={access.state.value.can_manage_runtime} onPublished={reloadCatalog} /> : null;
+      ? <PluginRuntimeManager key={token} token={token} tenant={tenant} canManage={access.state.value.can_manage_runtime} onPublished={reloadCatalog} /> : null;
   const content = !token || (catalog.scopeKey === token && catalog.kind === 'idle' && catalog.disabled)
     ? null
     : catalog.scopeKey !== token || catalog.kind === 'idle' || catalog.kind === 'loading'
       ? <LoadingState label={t('common.loading')} level="page" />
       : catalog.kind === 'failed'
         ? <div className="notice error" role="alert">{catalog.message}<button type="button" onClick={() => void reloadCatalog()}>{t('common.retry')}</button></div>
-        : <Plugins key={`${token}\0${tenant}\0${writeTenant}`} token={token} tenant={tenant} writeTenant={writeTenant} values={catalog.value} onRefresh={reloadCatalog} refreshError={catalog.refreshError} />;
+        : !tenant
+          ? <p className="notice">{t('plugins.createTenantToConfigure')}</p>
+          : <Plugins key={`${token}\0${tenant}\0${writeTenant}`} token={token} tenant={tenant} writeTenant={writeTenant} values={catalog.value} onRefresh={reloadCatalog} refreshError={catalog.refreshError} />;
   const refreshing = catalog.scopeKey === token && catalog.kind === 'ready' && catalog.refreshing === true;
   return <PageLoadingRegion scopeKey={`${token}\0${tenant}\0${writeTenant}\0plugins`} label={t('common.loading')} busy={refreshing}><div className="plugin-management-flow" aria-busy={refreshing}>{manager}{content}</div></PageLoadingRegion>;
 }

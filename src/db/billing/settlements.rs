@@ -51,7 +51,7 @@ impl Database {
         .fetch_all(&self.pool)
         .await?;
         if exact.is_some() && rows.len() > 1 {
-            return Err(AppError::Internal);
+            return Err(AppError::internal("settlements_list_account_settlements_1"));
         }
         let mut items = rows
             .iter()
@@ -205,7 +205,9 @@ fn settlement_correction_preview_from_row(
     let key_id = parse_uuid(row.try_get("key_id")?)?;
     let cost_micros: i64 = row.try_get("cost_micros")?;
     if cost_micros < 0 {
-        return Err(AppError::Internal);
+        return Err(AppError::internal(
+            "settlements_settlement_correction_preview_from_row_1",
+        ));
     }
     let input_tokens: i64 = row.try_get("input_tokens")?;
     let cached_input_tokens: i64 = row.try_get("cached_input_tokens")?;
@@ -287,8 +289,9 @@ fn settlement_correction_preview_from_row(
         SettlementCorrectionReviewState::InvariantMismatch
     };
     let archive_state_value: String = row.try_get("archive_state")?;
-    let archive_state =
-        RequestArchiveState::from_storage(&archive_state_value).ok_or(AppError::Internal)?;
+    let archive_state = RequestArchiveState::from_storage(&archive_state_value).ok_or(
+        AppError::internal("settlements_settlement_correction_preview_from_row_1"),
+    )?;
     Ok(SettlementCorrectionPreviewView {
         request_id,
         reservation_id,
@@ -378,19 +381,19 @@ async fn publish_settlement_row(
     };
     let enforcement_mode =
         EnforcementMode::from_storage(row.try_get::<String, _>("enforcement_mode")?.as_str())
-            .ok_or(AppError::Internal)?;
+            .ok_or(AppError::internal("settlements_publish_settlement_row_1"))?;
     if enforcement_mode == EnforcementMode::MeteredUnlimited {
         return Ok(false);
     }
     let settlement_id: String = row
         .try_get::<Option<String>, _>("settlement_id")?
-        .ok_or(AppError::Internal)?;
+        .ok_or(AppError::internal("settlements_publish_settlement_row_2"))?;
     let amount_micros: i64 = row
         .try_get::<Option<i64>, _>("amount_micros")?
-        .ok_or(AppError::Internal)?;
+        .ok_or(AppError::internal("settlements_publish_settlement_row_3"))?;
     let cost_micros: i64 = row.try_get("cost_micros")?;
     if cost_micros < 0 || amount_micros.checked_neg() != Some(cost_micros) {
-        return Err(AppError::Internal);
+        return Err(AppError::internal("settlements_publish_settlement_row_4"));
     }
     let account_id: String = row.try_get("account_id")?;
     let request_id: String = row.try_get("request_id")?;
@@ -401,7 +404,7 @@ async fn publish_settlement_row(
         .execute(&mut **tx)
         .await?;
     if locked.rows_affected() != 1 {
-        return Err(AppError::Internal);
+        return Err(AppError::internal("settlements_publish_settlement_row_5"));
     }
     let existing = sqlx::query(
         "SELECT settlement_id FROM account_settlement_feed WHERE request_kind = $1 AND request_id = $2",
@@ -414,7 +417,7 @@ async fn publish_settlement_row(
         return if existing.try_get::<String, _>("settlement_id")? == settlement_id {
             Ok(true)
         } else {
-            Err(AppError::Internal)
+            Err(AppError::internal("settlements_publish_settlement_row_6"))
         };
     }
     let sequence: i64 = sqlx::query_scalar(
@@ -436,11 +439,11 @@ async fn publish_settlement_row(
     .bind(cost_micros)
     .bind(
         row.try_get::<Option<String>, _>("currency")?
-            .ok_or(AppError::Internal)?,
+            .ok_or(AppError::internal("settlements_publish_settlement_row_7"))?,
     )
     .bind(
         row.try_get::<Option<i64>, _>("settled_at")?
-            .ok_or(AppError::Internal)?,
+            .ok_or(AppError::internal("settlements_publish_settlement_row_8"))?,
     )
     .bind(row.try_get::<i64, _>("completed_at")?)
     .bind(row.try_get::<Option<i64>, _>("input_tokens")?)
@@ -451,7 +454,7 @@ async fn publish_settlement_row(
     .execute(&mut **tx)
     .await?;
     if inserted.rows_affected() != 1 {
-        return Err(AppError::Internal);
+        return Err(AppError::internal("settlements_publish_settlement_row_9"));
     }
     Ok(true)
 }
@@ -459,12 +462,18 @@ async fn publish_settlement_row(
 fn account_settlement_from_row(row: &AnyRow) -> Result<AccountSettlementView, AppError> {
     let cost_micros: i64 = row.try_get("cost_micros")?;
     if cost_micros < 0 {
-        return Err(AppError::Internal);
+        return Err(AppError::internal(
+            "settlements_account_settlement_from_row_1",
+        ));
     }
     let kind = match row.try_get::<String, _>("request_kind")?.as_str() {
         "text" => AccountSettlementKind::Text,
         "generation" => AccountSettlementKind::Generation,
-        _ => return Err(AppError::Internal),
+        _ => {
+            return Err(AppError::internal(
+                "settlements_account_settlement_from_row_2",
+            ));
+        }
     };
     Ok(AccountSettlementView {
         settlement_id: parse_uuid(row.try_get("settlement_id")?)?,
@@ -484,7 +493,11 @@ fn account_settlement_from_row(row: &AnyRow) -> Result<AccountSettlementView, Ap
         output_tokens: row.try_get("output_tokens")?,
         usage_basis: row
             .try_get::<Option<String>, _>("usage_basis")?
-            .map(|value| RequestUsageBasis::from_storage(&value).ok_or(AppError::Internal))
+            .map(|value| {
+                RequestUsageBasis::from_storage(&value).ok_or(AppError::internal(
+                    "settlements_account_settlement_from_row_3",
+                ))
+            })
             .transpose()?,
     })
 }

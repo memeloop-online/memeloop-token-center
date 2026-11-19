@@ -110,6 +110,8 @@
 }
 .session-detail-heading h2 { margin: 4px 0 0; font-size: clamp(22px, 2.2vw, 32px); }
 .session-detail-heading > button { flex: 0 0 auto; min-width: 38px; padding: 6px 10px; font-size: 20px; }
+.session-origin-nav, .session-parent-nav { margin: 0; }
+.session-origin-nav .table-link, .session-parent-nav .table-link { gap: 6px; }
 
 .session-activity {
   display: grid;

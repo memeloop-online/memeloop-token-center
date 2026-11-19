@@ -10,7 +10,7 @@ import '../../src/styles.css';
 import '../../src/theme.css';
 import '../../src/operator/operator.css';
 
-type Scenario = 'all-tenants' | 'route-failure' | 'scope-race' | 'scope-lock' | 'client-copy' | 'service-copy' | 'service-plaintext' | 'service-scope-aba' | 'client-form' | 'client-filter' | 'client-lifecycle';
+type Scenario = 'all-tenants' | 'route-failure' | 'scope-race' | 'scope-lock' | 'client-copy' | 'service-copy' | 'service-plaintext' | 'service-scope-aba' | 'service-edit' | 'client-form' | 'client-filter' | 'client-lifecycle';
 
 interface RecordedRequest {
   method: string;
@@ -42,8 +42,22 @@ const scenario = (parameters.get('scenario') ?? 'all-tenants') as Scenario;
 const initialTenant = scenario === 'all-tenants' ? '' : scenario === 'client-lifecycle' ? 'default' : 'tenant-a';
 const deletedClientIds = new Set<string>();
 
+let serviceEditState = {
+  service_id: 'service-existing',
+  name: 'Existing service credential',
+  credential_generation: 1,
+  credential_copy_available: false,
+  fingerprint: 'fixture-fingerprint',
+  scopes: ['keys:read'],
+  tenant_external_id: 'tenant-a' as string | null,
+  status: 'active',
+  created_at: 1_700_000_000_000,
+};
+
 const pendingIssues: Array<(response: Response) => void> = [];
 const pendingRouting: Array<(response: Response) => void> = [];
+let clientCredentialValue = 'mtc_client_copied';
+let clientCredentialGeneration = 1;
 const routingResponse = { key_id: 'key-form', route_ids: [], route_group_ids: [], effective_route_ids: [], grant_revision: 1, updated_at: 1 };
 const pendingCredentialScopeA: Array<(response: Response) => void> = [];
 const pendingCredentialCursor: Array<(response: Response) => void> = [];
@@ -170,7 +184,7 @@ globalThis.fetch = async (input: RequestInfo | URL, init?: RequestInit) => {
     credentials: init?.credentials,
     referrerPolicy: init?.referrerPolicy,
     hasSignal: Boolean(init?.signal),
-    ...((scenario === 'client-form' || scenario === 'client-lifecycle') && typeof init?.body === 'string' ? { body: init.body } : {}),
+    ...((scenario === 'client-form' || scenario === 'client-lifecycle' || scenario === 'service-edit') && typeof init?.body === 'string' ? { body: init.body } : {}),
   });
   if (url.pathname === '/internal/v1/schemas') {
     return json({
@@ -191,22 +205,43 @@ globalThis.fetch = async (input: RequestInfo | URL, init?: RequestInit) => {
     // must fence a response from an old tenant/auth epoch.
     return new Promise<Response>((resolve) => pendingIssues.push(resolve));
   }
+  if (url.pathname === '/internal/v1/service-tokens/service-existing' && method === 'PATCH' && scenario === 'service-edit') {
+    if (parameters.has('forbidden')) return json({ error: { code: 'forbidden', message: 'fixture global service_tokens:write required' } }, 403);
+    if (parameters.has('transient') && document.documentElement.dataset.serviceEditAvailable !== 'true') {
+      return json({ error: { code: 'service_unavailable', message: 'fixture credential service temporarily unavailable' } }, 503);
+    }
+    const body = JSON.parse(String(init?.body ?? '{}'));
+    serviceEditState = {
+      ...serviceEditState,
+      name: typeof body.name === 'string' ? body.name : serviceEditState.name,
+      scopes: Array.isArray(body.scopes) ? body.scopes : serviceEditState.scopes,
+      tenant_external_id: body.tenant_external_id === undefined ? serviceEditState.tenant_external_id : body.tenant_external_id,
+    };
+    return json(serviceEditState);
+  }
   if (url.pathname === '/internal/v1/service-tokens') return json([{
     service_id: 'service-existing',
-    name: 'Existing service credential',
+    name: scenario === 'service-edit' ? serviceEditState.name : 'Existing service credential',
     credential_generation: 1,
     credential_copy_available: scenario === 'service-copy' && !parameters.has('missing-original'),
     fingerprint: 'fixture-fingerprint',
-    scopes: ['keys:read'],
-    tenant_external_id: initialTenant || 'tenant-a',
+    scopes: scenario === 'service-edit' ? serviceEditState.scopes : ['keys:read'],
+    tenant_external_id: scenario === 'service-edit' ? serviceEditState.tenant_external_id : (initialTenant || 'tenant-a'),
     status: parameters.has('revoked') ? 'revoked' : parameters.has('suspended') ? 'suspended' : 'active',
     created_at: 1_700_000_000_000,
   }]);
+  if (scenario === 'client-copy' && url.pathname === '/internal/v1/keys/key-copy/routing') return json({ ...routingResponse, key_id: 'key-copy' });
   if (url.pathname === '/internal/v1/keys/key-copy/copy' && method === 'POST') {
-    return json({ key_id: 'key-copy', credential_generation: 1, key: 'mtc_client_copied' });
+    return json({ key_id: 'key-copy', credential_generation: clientCredentialGeneration, key: clientCredentialValue });
   }
   if (url.pathname === '/internal/v1/keys/key-copy/credential' && method === 'PUT') {
     const body = JSON.parse(String(init?.body));
+    if (body.expected_credential_generation !== undefined) {
+      if (body.expected_credential_generation !== clientCredentialGeneration) return json({ error: { message: 'fixture generation conflict' } }, 409);
+      if (body.key !== clientCredentialValue) clientCredentialGeneration += 1;
+      clientCredentialValue = body.key;
+      return json({ key_id: 'key-copy', credential_generation: clientCredentialGeneration, key: clientCredentialValue });
+    }
     return body.key === 'mtc_client_known_original' ? json({}) : json({ error: { message: 'fixture original did not match' } }, 400);
   }
   if (scenario === 'client-lifecycle' && url.pathname === '/internal/v1/keys/delete') {
@@ -221,18 +256,54 @@ globalThis.fetch = async (input: RequestInfo | URL, init?: RequestInit) => {
     if (url.pathname === '/internal/v1/provider-types') return json([{ id: 'kimi', display_name: 'Kimi' }]);
     if (url.pathname === '/internal/v1/upstreams') return json([{ id: 'account-personal', name: 'Personal Kimi', driver: 'kimi', status: 'active' }, { id: 'account-team', name: 'Team Kimi', driver: 'kimi', status: 'active' }]);
     if (url.pathname === '/internal/v1/route-groups') return json([{ id: '00000000-0000-4000-8000-000000000002', name: 'Research group', member_ids: ['00000000-0000-4000-8000-000000000001'], member_count: 1, created_at: 1, updated_at: 1 }]);
-    if (url.pathname === '/internal/v1/model-routes') return json([
-      { id: '00000000-0000-4000-8000-000000000001', public_model: 'Research model', upstream_model: 'kimi-research', protocol: 'openai', enabled: true, tenant_external_id: 'tenant-a', candidate_upstream_account_ids: ['account-personal'] },
-      { id: '00000000-0000-4000-8000-000000000003', public_model: 'Research model', upstream_model: 'kimi-research', protocol: 'openai', enabled: true, tenant_external_id: 'tenant-a', candidate_upstream_account_ids: ['account-team'] },
-      { id: '00000000-0000-4000-8000-000000000004', public_model: 'Spark disabled', enabled: false, tenant_external_id: 'tenant-a', candidate_upstream_account_ids: [] },
-      { id: '00000000-0000-4000-8000-000000000005', public_model: 'Empty route', enabled: true, tenant_external_id: 'tenant-a', candidate_upstream_account_ids: [] },
-      ...Array.from({ length: 7 }, (_, index) => ({ id: `00000000-0000-4000-8000-00000000001${index}`, public_model: 'Research model', upstream_model: 'kimi-research', protocol: 'openai', enabled: false, tenant_external_id: 'tenant-a', candidate_upstream_account_ids: ['account-personal'] })),
-    ]);
+    if (url.pathname === '/internal/v1/model-routes' && parameters.has('paged-route-catalog')) {
+      const pagedCatalog = [
+        ...Array.from({ length: 150 }, (_, index) => ({ id: `00000000-0000-4000-8000-${String(index + 100).padStart(12, '0')}`, public_model: `Paged model ${index + 1}`, upstream_model: 'kimi-paged', protocol: 'openai', enabled: true, tenant_external_id: 'tenant-a', candidate_upstream_account_ids: ['account-personal'], created_at: 10_000 - index })),
+        { id: '00000000-0000-4000-8000-000000000004', public_model: 'Spark disabled', upstream_model: 'kimi-spark', protocol: 'openai', enabled: false, tenant_external_id: 'tenant-a', candidate_upstream_account_ids: [], created_at: 1_000 },
+      ];
+      const beforeCreatedAt = Number(url.searchParams.get('before_created_at') ?? Number.MAX_SAFE_INTEGER);
+      const beforeId = url.searchParams.get('before_id') ?? 'ffffffff-ffff-ffff-ffff-ffffffffffff';
+      const limit = Number(url.searchParams.get('limit') ?? '100');
+      return json(pagedCatalog.filter((route) => route.created_at < beforeCreatedAt || (route.created_at === beforeCreatedAt && route.id < beforeId)).slice(0, limit));
+    }
+    if (url.pathname === '/internal/v1/model-routes' && parameters.has('paged-route-catalog-exact')) {
+      const exactCatalog = [
+        ...Array.from({ length: 199 }, (_, index) => ({ id: `00000000-0000-4000-8000-${String(index + 100).padStart(12, '0')}`, public_model: `Exact model ${index + 1}`, upstream_model: 'kimi-exact', protocol: 'openai', enabled: true, tenant_external_id: 'tenant-a', candidate_upstream_account_ids: ['account-personal'], created_at: 20_000 - index })),
+        { id: '00000000-0000-4000-8000-000000000004', public_model: 'Spark disabled', upstream_model: 'kimi-spark', protocol: 'openai', enabled: false, tenant_external_id: 'tenant-a', candidate_upstream_account_ids: [], created_at: 1_000 },
+      ];
+      const beforeCreatedAt = Number(url.searchParams.get('before_created_at') ?? Number.MAX_SAFE_INTEGER);
+      const beforeId = url.searchParams.get('before_id') ?? 'ffffffff-ffff-ffff-ffff-ffffffffffff';
+      const limit = Number(url.searchParams.get('limit') ?? '100');
+      return json(exactCatalog.filter((route) => route.created_at < beforeCreatedAt || (route.created_at === beforeCreatedAt && route.id < beforeId)).slice(0, limit));
+    }
+    if (url.pathname === '/internal/v1/model-routes' && parameters.has('paged-route-catalog-stuck')) {
+      const stuckPage = Array.from({ length: 100 }, (_, index) => ({ id: `00000000-0000-4000-8000-${String(index + 100).padStart(12, '0')}`, public_model: `Stuck model ${index + 1}`, upstream_model: 'kimi-stuck', protocol: 'openai', enabled: true, tenant_external_id: 'tenant-a', candidate_upstream_account_ids: ['account-personal'], created_at: 30_000 - index }));
+      return json(stuckPage);
+    }
+    if (url.pathname === '/internal/v1/model-routes') {
+      const olderRoutes = [
+        { id: '00000000-0000-4000-8000-000000000001', public_model: 'Research model', upstream_model: 'kimi-research', protocol: 'openai', enabled: true, tenant_external_id: 'tenant-a', candidate_upstream_account_ids: ['account-personal'] },
+        { id: '00000000-0000-4000-8000-000000000003', public_model: 'Research model', upstream_model: 'kimi-research', protocol: 'openai', enabled: true, tenant_external_id: 'tenant-a', candidate_upstream_account_ids: ['account-team'] },
+        { id: '00000000-0000-4000-8000-000000000004', public_model: 'Spark disabled', enabled: false, tenant_external_id: 'tenant-a', candidate_upstream_account_ids: [] },
+        { id: '00000000-0000-4000-8000-000000000005', public_model: 'Empty route', enabled: true, tenant_external_id: 'tenant-a', candidate_upstream_account_ids: [] },
+        ...Array.from({ length: 7 }, (_, index) => ({ id: `00000000-0000-4000-8000-00000000001${index}`, public_model: 'Research model', upstream_model: 'kimi-research', protocol: 'openai', enabled: false, tenant_external_id: 'tenant-a', candidate_upstream_account_ids: ['account-personal'] })),
+      ];
+      if (!parameters.has('route-pages')) return json(olderRoutes);
+      if (!url.searchParams.has('before_id')) return json(Array.from({ length: 100 }, (_, index) => ({
+        ...olderRoutes[0], id: `new-route-${String(100 - index).padStart(3, '0')}`, public_model: `Recent model ${index}`, created_at: 2_000 - index,
+      })));
+      if (parameters.has('route-page-failure') && document.documentElement.dataset.routeCatalogAvailable !== 'true') return json({ error: { message: 'route catalog unavailable' } }, 503);
+      return json([...olderRoutes, { ...olderRoutes[0], id: '00000000-0000-4000-8000-000000000006', public_model: 'gpt-6-astra' }]);
+    }
     if (url.pathname === '/internal/v1/keys' && method === 'POST') {
       if (parameters.has('duplicate-alias')) return json({ error: { message: 'fixture duplicate alias' } }, 409);
       return json({ key_id: 'key-created', key: 'mtc_fixture_created' });
     }
     if (url.pathname === '/internal/v1/keys/key-form/policy' && method === 'PUT') return json({});
+    if (url.pathname === '/internal/v1/keys/key-form/alias' && method === 'PATCH') return json({});
+    if (/^\/internal\/v1\/keys\/[^/]+\/routing$/.test(url.pathname) && url.pathname !== '/internal/v1/keys/key-form/routing') {
+      return json({ ...routingResponse, key_id: url.pathname.split('/')[4] });
+    }
     if (url.pathname === '/internal/v1/keys') return json([
       // Match the API's descending (created_at, key_id) keyset order.
       // These rows share a timestamp, and key-other sorts before key-form.
@@ -269,6 +340,7 @@ globalThis.fetch = async (input: RequestInfo | URL, init?: RequestInit) => {
     const tenant = url.searchParams.get('tenant_external_id');
     if (scenario === 'client-copy') return json([{
       ...credential('Copyable client', 'tenant-a', 'key-copy'),
+      credential_generation: clientCredentialGeneration,
       status: parameters.has('revoked') ? 'revoked' : parameters.has('suspended') ? 'suspended' : 'active',
       policy: { ...credential('unused', 'tenant-a', 'unused').policy, enforcement_mode: 'metered_unlimited' },
       credential_copy_available: !parameters.has('missing-original'),
@@ -301,11 +373,11 @@ function Fixture() {
   const [tenant, setTenant] = useState(initialTenant);
   const { locale, setLocale } = useI18n();
   if (scenario === 'client-form') return <main style={{ maxWidth: 960, margin: '0 auto', padding: 12 }}><button data-change-locale type="button" onClick={() => setLocale(locale === 'en' ? 'zh-CN' : 'en')}>Switch language</button><CredentialsPage token="mts_fixture" tenant={tenant} /></main>;
-  if (scenario === 'service-plaintext' || scenario === 'service-scope-aba' || scenario === 'service-copy') {
+  if (scenario === 'service-plaintext' || scenario === 'service-scope-aba' || scenario === 'service-copy' || scenario === 'service-edit') {
     return <>
       {scenario === 'service-scope-aba' && <button type="button" onClick={() => setTenant((current) => current === 'tenant-a' ? 'tenant-b' : 'tenant-a')}>Switch tenant</button>}
       <span>Tenant {tenant}</span>
-      <ServiceCredentialsPage token="mts_fixture" tenant={tenant} />
+      <ServiceCredentialsPage token="mts_fixture" tenant={tenant} tenants={[{ external_id: 'tenant-a' }, { external_id: 'tenant-b' }]} />
     </>;
   }
   return <>

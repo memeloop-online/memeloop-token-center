@@ -45,6 +45,9 @@ impl MultipartUpload for TestMultipartUpload {
 pub(super) fn memory_store() -> ArchiveStore {
     ArchiveStore {
         inner: Arc::new(InMemory::new()),
+        training: None,
+        training_cas_writes: false,
+        training_staging_writes: false,
         readiness: Arc::new(tokio::sync::Mutex::new(ReadinessCache::default())),
         readiness_path: path::archive_path("readiness/archive-tests.bin").expect("readiness path"),
         readiness_deadline: Duration::from_secs(5),
@@ -57,6 +60,7 @@ fn test_writer(aborts: Arc<AtomicUsize>, fail_parts: bool) -> ArchiveWriter {
     ArchiveWriter {
         store: Arc::new(InMemory::new()),
         staging: Path::from("staging/test/response.bin"),
+        staging_locator: "staging/test/response.bin".into(),
         inner: Some(object_store::WriteMultipart::new_with_chunk_size(
             Box::new(upload),
             1,
@@ -304,7 +308,14 @@ async fn bounded_read_rejects_an_object_over_the_limit() {
         .get_bounded(&location, body.len() - 1)
         .await
         .expect_err("object over limit must be rejected");
-    assert!(error.to_string().contains("read limit"));
+    assert_eq!(
+        error.diagnostic_category(),
+        "archive_object_exceeds_byte_read_limit"
+    );
+    assert_eq!(
+        error.to_string(),
+        "storage error: archive_object_exceeds_byte_read_limit"
+    );
 }
 
 #[tokio::test]

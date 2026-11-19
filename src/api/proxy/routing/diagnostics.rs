@@ -5,7 +5,6 @@ fn classification(status: Option<StatusCode>, error: Option<&ProxySendError>) ->
     match (status, error) {
         (Some(_), None) => "upstream_http_status",
         (None, Some(ProxySendError::RetryableConnection(_))) => "connect_not_delivered",
-        (None, Some(ProxySendError::OuterDeadline)) => "outer_deadline_delivery_unknown",
         (None, Some(ProxySendError::NonRetryableTransport(kind))) => kind.diagnostic_outcome(),
         (None, Some(ProxySendError::AmbiguousResponse(_))) => "response_delivery_unknown",
         (None, Some(ProxySendError::CandidateUnavailable)) => "local_candidate_unavailable",
@@ -14,7 +13,11 @@ fn classification(status: Option<StatusCode>, error: Option<&ProxySendError>) ->
         }
         (
             None,
-            Some(ProxySendError::CodexBadRequest | ProxySendError::RetryableCodexBadRequest),
+            Some(
+                ProxySendError::CodexBadRequest
+                | ProxySendError::RetryableCodexBadRequest
+                | ProxySendError::CodexRejection(_),
+            ),
         ) => "upstream_rejected_request",
         _ => "inconsistent_evidence",
     }
@@ -25,13 +28,23 @@ pub(in crate::api::proxy) fn observe_send(
     candidate_rank: usize,
     outbound_attempt: usize,
     result: &Result<ProxyRouteResponse, ProxySendError>,
+    quota_failure: Option<crate::db::UpstreamFailureKind>,
+    model_rejected: bool,
 ) {
     let status = result
         .as_ref()
         .ok()
         .map(|response| response.response.status());
     let error = result.as_ref().err();
-    emit(request_id, candidate_rank, outbound_attempt, status, error);
+    emit(
+        request_id,
+        candidate_rank,
+        outbound_attempt,
+        status,
+        error,
+        quota_failure,
+        model_rejected,
+    );
 }
 
 fn emit(
@@ -40,13 +53,15 @@ fn emit(
     outbound_attempt: usize,
     status: Option<StatusCode>,
     error: Option<&ProxySendError>,
+    quota_failure: Option<crate::db::UpstreamFailureKind>,
+    model_rejected: bool,
 ) {
     tracing::info!(
         %request_id, candidate_rank, outbound_attempt,
         stage = "upstream_attempt_observed",
         outcome = classification(status, error),
         status = status.map(|value| value.as_u16()),
-        disposition = super::failover_disposition(status, error).as_str(),
+        disposition = if model_rejected { "model_rejected_before_execution" } else { super::failover_disposition(status, error, quota_failure).as_str() },
         "proxy observed attempt delivery evidence"
     );
 }
@@ -84,6 +99,8 @@ mod tests {
                 1,
                 None,
                 Some(&ProxySendError::AmbiguousResponse("SECRET_CANARY")),
+                None,
+                false,
             );
             emit(
                 Uuid::nil(),
@@ -91,6 +108,8 @@ mod tests {
                 1,
                 Some(StatusCode::SERVICE_UNAVAILABLE),
                 None,
+                None,
+                false,
             );
             emit(
                 Uuid::nil(),
@@ -100,6 +119,8 @@ mod tests {
                 Some(&ProxySendError::NonRetryableTransport(
                     TransportFailureKind::Http2Reset,
                 )),
+                None,
+                false,
             );
             emit(
                 Uuid::nil(),
@@ -109,6 +130,8 @@ mod tests {
                 Some(&ProxySendError::NonRetryableTransport(
                     TransportFailureKind::Http2GoAway,
                 )),
+                None,
+                false,
             );
         });
         let bytes = writer.0.lock().unwrap();
@@ -176,10 +199,6 @@ mod tests {
                 "transport_http2_goaway_delivery_unknown",
             ),
             (
-                ProxySendError::OuterDeadline,
-                "outer_deadline_delivery_unknown",
-            ),
-            (
                 ProxySendError::AmbiguousResponse("SECRET_CANARY"),
                 "response_delivery_unknown",
             ),
@@ -193,10 +212,6 @@ mod tests {
                 "upstream_http_status"
             );
         }
-        assert_eq!(
-            super::super::failover_disposition(None, Some(&ProxySendError::OuterDeadline)),
-            super::super::outcome::FailoverDisposition::Stop
-        );
     }
 
     #[test]

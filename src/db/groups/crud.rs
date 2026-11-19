@@ -134,7 +134,7 @@ impl Database {
             .as_ref()
             .map(serde_json::to_string)
             .transpose()
-            .map_err(|_| AppError::Internal)?;
+            .map_err(|_| AppError::internal("crud_update_group_routing_strategy_1"))?;
         if strategy.as_ref().is_some_and(|value| value.len() > 65_536) {
             return Err(AppError::BadRequest(
                 "group routing strategy exceeds 64 KiB".into(),
@@ -291,7 +291,7 @@ fn group_view(row: AnyRow, member_ids: Vec<Uuid>) -> Result<GroupView, AppError>
             .as_deref()
             .map(serde_json::from_str)
             .transpose()
-            .map_err(|_| AppError::Internal)?,
+            .map_err(|_| AppError::internal("crud_group_view_1"))?,
         routing_priority: row.try_get("routing_priority")?,
         strategy_version: row.try_get("strategy_version")?,
     })
