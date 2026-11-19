@@ -114,6 +114,56 @@ async fn assert_originals(world: &TokenCenterWorld, id: Uuid) {
     }
 }
 
+async fn assert_dialogue(world: &TokenCenterWorld, request: Uuid) {
+    let pool = AnyPool::connect(&world.state.as_ref().unwrap().config.database_url)
+        .await
+        .unwrap();
+    let cluster: String = sqlx::query_scalar(
+        "SELECT cluster_id FROM conversation_observations WHERE request_id=$1 AND key_id=$2",
+    )
+    .bind(request.to_string())
+    .bind(world.stable_key_id.unwrap().to_string())
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    pool.close().await;
+    let response = world
+        .client
+        .get(format!(
+            "{}/self/v1/sessions/{cluster}/requests/{request}/dialogue",
+            world.service_url
+        ))
+        .bearer_auth(&world.current_key)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let dialogue: Value = response.json().await.unwrap();
+    assert_eq!(dialogue["representation"], "session_body");
+    assert_eq!(dialogue["request_id"], request.to_string());
+    let turns: Vec<_> = dialogue["turns"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|turn| {
+            let text: String = turn["parts"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .filter_map(|part| part["text"].as_str())
+                .collect();
+            (turn["role"].as_str().unwrap().to_owned(), text)
+        })
+        .collect();
+    assert_eq!(
+        turns,
+        vec![
+            ("user".into(), "hi".into()),
+            ("assistant".into(), "hello".into())
+        ]
+    );
+}
+
 #[then("a fresh request succeeds with readable originals and one bill per request")]
 async fn fresh_request_progresses(world: &mut TokenCenterWorld) {
     let historical = world
@@ -161,6 +211,7 @@ async fn fresh_request_progresses(world: &mut TokenCenterWorld) {
     .await
     .expect("fresh body projection must finish before historical GET is released");
     assert_originals(world, fresh).await;
+    assert_dialogue(world, fresh).await;
     stats_contain_request(world, 2, 20).await;
 }
 
@@ -211,5 +262,6 @@ async fn historical_recovered(world: &mut TokenCenterWorld) {
     .expect("historical coverage obligation must recover");
     pool.close().await;
     assert_originals(world, historical).await;
+    assert_dialogue(world, historical).await;
     stats_contain_request(world, 2, 20).await;
 }
