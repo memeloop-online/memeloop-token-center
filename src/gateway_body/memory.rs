@@ -228,10 +228,21 @@ impl SseAllocationBudget {
             return false;
         };
         // Reallocation can temporarily retain the original backing allocation.
-        if !self.reserve_allocation(bytes) {
+        let Ok(mut memory) = self.memory.lock() else {
+            return false;
+        };
+        let previous = memory.bytes;
+        let Some(total) = previous.checked_add(bytes) else {
+            return false;
+        };
+        if !memory.try_resize(total) {
             return false;
         }
-        buffer.try_reserve_exact(target - buffer.len()).is_ok()
+        if buffer.try_reserve_exact(target - buffer.len()).is_err() {
+            memory.try_resize(previous);
+            return false;
+        }
+        true
     }
 
     pub(crate) fn reconcile_retained(&self, bytes: usize) -> bool {
