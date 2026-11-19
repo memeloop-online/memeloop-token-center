@@ -2484,3 +2484,113 @@ async fn queued_archive_event_contract(url: String) {
         raw.as_ref()
     );
 }
+
+#[tokio::test]
+async fn postgres_exact_legacy_body_rebuild_preserves_incomplete_and_financial_receipt() {
+    let database_url =
+        std::env::var("MTC_TEST_POSTGRES_URL").expect("exact recovery requires PostgreSQL");
+    let isolated = PostgresTestDatabase::create(&database_url).await;
+    let fixture = Fixture::new(isolated.url().to_owned(), false).await;
+    let db = &fixture.state.db;
+    let request =
+        Bytes::from_static(br#"{"model":"fixture","input":"original question","stream":false}"#);
+    let response = Bytes::from_static(br#"{"object":"response","status":"incomplete","incomplete_details":{"reason":"max_output_tokens"},"output":[{"type":"reasoning","summary":[{"type":"summary_text","text":"reason"}]},{"type":"message","role":"assistant","content":[{"type":"output_text","text":"partial answer"}]}]}"#);
+    let request_locator = format!("legacy-exact/{}/request.json", fixture.request_id);
+    let response_locator = format!("legacy-exact/{}/response.json", fixture.request_id);
+    fixture
+        .state
+        .archive
+        .put(&request_locator, request.clone())
+        .await
+        .unwrap();
+    fixture
+        .state
+        .archive
+        .put(&response_locator, response.clone())
+        .await
+        .unwrap();
+    sqlx::query(
+        "UPDATE request_records SET request_object = $1, response_object = $2 WHERE id = $3",
+    )
+    .bind(&request_locator)
+    .bind(&response_locator)
+    .bind(fixture.request_id.to_string())
+    .execute(&db.pool)
+    .await
+    .unwrap();
+    sqlx::query("UPDATE conversation_projection_outbox SET projected_at = 42, lease_owner = NULL, lease_expires_at = NULL, terminal_lease_owner = NULL, terminal_lease_expires_at = NULL, semantic_snapshot_json = NULL, semantic_payload_snapshot_json = NULL WHERE request_id = $1")
+        .bind(fixture.request_id.to_string()).execute(&db.pool).await.unwrap();
+    let financial_before: String = sqlx::query_scalar(
+        "SELECT row_to_json(t)::TEXT FROM terminal_projection_outbox t WHERE request_id = $1",
+    )
+    .bind(fixture.request_id.to_string())
+    .fetch_one(&db.pool)
+    .await
+    .unwrap();
+    let owner = Uuid::now_v7();
+    assert!(
+        !db.claim_exact_session_body_rebuild(
+            fixture.key.tenant_id,
+            fixture.key.key_id,
+            fixture.request_id,
+            41,
+            &request_locator,
+            &response_locator,
+            owner
+        )
+        .await
+        .unwrap()
+    );
+    assert!(
+        db.claim_exact_session_body_rebuild(
+            fixture.key.tenant_id,
+            fixture.key.key_id,
+            fixture.request_id,
+            42,
+            &request_locator,
+            &response_locator,
+            owner
+        )
+        .await
+        .unwrap()
+    );
+    assert!(
+        !db.claim_exact_session_body_rebuild(
+            fixture.key.tenant_id,
+            fixture.key.key_id,
+            fixture.request_id,
+            42,
+            &request_locator,
+            &response_locator,
+            Uuid::now_v7()
+        )
+        .await
+        .unwrap()
+    );
+    assert!(
+        crate::worker::archive_session_body(&fixture.state, owner, fixture.request_id)
+            .await
+            .unwrap()
+    );
+    let snapshot: String = sqlx::query_scalar("SELECT semantic_snapshot_json FROM conversation_projection_outbox WHERE request_id = $1 AND projected_at IS NOT NULL")
+        .bind(fixture.request_id.to_string()).fetch_one(&db.pool).await.unwrap();
+    let snapshot: serde_json::Value = serde_json::from_str(&snapshot).unwrap();
+    assert!(snapshot["leaf"].as_str().is_some());
+    let financial_after: String = sqlx::query_scalar(
+        "SELECT row_to_json(t)::TEXT FROM terminal_projection_outbox t WHERE request_id = $1",
+    )
+    .bind(fixture.request_id.to_string())
+    .fetch_one(&db.pool)
+    .await
+    .unwrap();
+    assert_eq!(financial_before, financial_after);
+    assert_eq!(
+        fixture.state.archive.get(&request_locator).await.unwrap(),
+        request
+    );
+    assert_eq!(
+        fixture.state.archive.get(&response_locator).await.unwrap(),
+        response
+    );
+    isolated.cleanup().await;
+}

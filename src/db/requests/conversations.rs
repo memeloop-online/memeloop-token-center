@@ -476,13 +476,6 @@ impl Database {
         Ok(())
     }
 
-    /// 把已经写过 `projected_at`、并且原始请求 JSON 与原始返回 JSON 的 locator 都还在的行
-    /// 收成小批，交给新 worker 重写会话正文。
-    ///
-    /// 不能只把 `projected_at` 清掉：旧 worker 的第二条领取会忽略主租约，只要快照还在就签收。
-    /// 这里同时清掉两份快照，并把主租约钉在 `session-body-rebuild` 上，直到新 worker 换成自己的领取。
-    /// `statistics_outcome = session_body` 留在完成之后，避免同一行被反复重开。
-    /// locator 缺一就不重开。不改 `request_object` / `response_object`。
     /// Claim one independently verified historical body without claiming any other work.
     /// Source locators and the previous acknowledgement are compared atomically.
     #[allow(clippy::too_many_arguments)]
@@ -535,6 +528,13 @@ impl Database {
         Ok(result.rows_affected() == 1)
     }
 
+    /// 把已经写过 `projected_at`、并且原始请求 JSON 与原始返回 JSON 的 locator 都还在的行
+    /// 收成小批，交给新 worker 重写会话正文。
+    ///
+    /// 不能只把 `projected_at` 清掉：旧 worker 的第二条领取会忽略主租约，只要快照还在就签收。
+    /// 这里同时清掉两份快照，并把主租约钉在 `session-body-rebuild` 上，直到新 worker 换成自己的领取。
+    /// `statistics_outcome = session_body` 留在完成之后，避免同一行被反复重开。
+    /// locator 缺一就不重开。不改 `request_object` / `response_object`。
     pub async fn reopen_session_body_rebuilds(&self, limit: i64) -> Result<u64, AppError> {
         let limit = limit;
         let mut transaction = self.begin_write_transaction().await?;
