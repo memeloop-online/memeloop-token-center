@@ -88,7 +88,20 @@ async fn canonical_training_reads_complete_prefix_without_legacy_root_and_fails_
     let route = format!("/internal/v1/sessions/{session}/requests/{request}/training?{query}");
     let response = http(&state, "GET", &route, &service.token).await;
     assert_eq!(response.status(), StatusCode::OK);
-    let bytes = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+    use futures_util::StreamExt as _;
+    let mut frames = response.into_body().into_data_stream();
+    let mut bytes = Vec::new();
+    let mut frame_count = 0;
+    while let Some(frame) = frames.next().await {
+        let frame = frame.unwrap();
+        assert_eq!(frame.last(), Some(&b'\n'));
+        frame_count += 1;
+        bytes.extend_from_slice(&frame);
+    }
+    assert_eq!(
+        frame_count, 6,
+        "manifest, four turns, and end stream independently"
+    );
     let records: Vec<Value> = std::str::from_utf8(&bytes)
         .unwrap()
         .lines()

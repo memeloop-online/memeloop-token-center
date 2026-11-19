@@ -290,29 +290,32 @@ pub(super) async fn internal_session_training(
     let scope = operator_scope(&state, &headers, &query, session_id, request_id).await?;
     if scope.leaf.as_deref().is_some_and(|leaf| !leaf.is_empty()) {
         let turns = load_canonical_dialogue(&state, &scope).await?;
-        let mut lines = vec![serde_json::json!({
+        let count = turns.len();
+        let manifest = serde_json::json!({
             "record": "manifest", "format_version": 2,
             "contract_version": "session_training_v2", "representation": "session_body",
             "turn_order": "ascending", "request_id": scope.request_id,
             "session_id": scope.session_id, "leaf": scope.leaf,
-        })];
-        let count = turns.len();
-        for (ordinal, turn) in turns.into_iter().enumerate() {
-            lines.push(serde_json::json!({
-                "record": "turn", "ordinal": ordinal, "role": turn.role,
-                "origin": turn.origin, "parts": turn.parts,
-            }));
-        }
-        lines.push(serde_json::json!({"record": "end", "turn_count": count}));
-        let mut bytes = Vec::new();
-        for line in lines {
-            serde_json::to_writer(&mut bytes, &line)
+        });
+        let lines = std::iter::once(manifest)
+            .chain(turns.into_iter().enumerate().map(|(ordinal, turn)| {
+                serde_json::json!({
+                    "record": "turn", "ordinal": ordinal, "role": turn.role,
+                    "origin": turn.origin, "parts": turn.parts,
+                })
+            }))
+            .chain(std::iter::once(
+                serde_json::json!({"record": "end", "turn_count": count}),
+            ));
+        let stream = futures_util::stream::iter(lines.map(|line| {
+            let mut bytes = serde_json::to_vec(&line)
                 .map_err(|_| AppError::internal("session_training_encode_failed"))?;
             bytes.push(b'\n');
-        }
+            Ok::<_, AppError>(bytes::Bytes::from(bytes))
+        }));
         return axum::response::Response::builder()
             .header(axum::http::header::CONTENT_TYPE, "application/x-ndjson")
-            .body(axum::body::Body::from(bytes))
+            .body(axum::body::Body::from_stream(stream))
             .map_err(|_| AppError::internal("conversation_export_response"));
     }
     // Only sessions without a canonical leaf retain the legacy export contract.
