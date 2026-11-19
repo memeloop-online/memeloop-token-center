@@ -493,8 +493,25 @@ async fn verify_scoped_supplier_usage_recovery(db: &Database, tenant: &str, pepp
     let mut newer = value.clone();
     newer.observed_at = now;
     newer.valid_until = now + 40_000;
+    let old_background_lease = Uuid::now_v7();
+    sqlx::query("UPDATE upstream_quota_observations SET lease_id=$2,lease_until=$3 WHERE upstream_account_id=$1")
+        .bind(account.id.to_string()).bind(old_background_lease.to_string()).bind(now+30_000).execute(&db.pool).await.unwrap();
     db.publish_manual_quota_observation(&newer).await.unwrap();
-    db.publish_manual_quota_observation(&value).await.unwrap();
+    let retained_lease: Option<String> = sqlx::query_scalar(
+        "SELECT lease_id FROM upstream_quota_observations WHERE upstream_account_id=$1",
+    )
+    .bind(account.id.to_string())
+    .fetch_one(&db.pool)
+    .await
+    .unwrap();
+    assert_eq!(
+        retained_lease,
+        Some(old_background_lease.to_string()),
+        "manual publication never steals a background lease"
+    );
+    db.finish_quota_observation(&target, old_background_lease, Some(&value), now + 10_000)
+        .await
+        .unwrap();
     let accepted: i64 = sqlx::query_scalar(
         "SELECT observed_at FROM upstream_quota_observations WHERE upstream_account_id=$1",
     )

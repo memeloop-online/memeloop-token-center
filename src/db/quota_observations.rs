@@ -268,7 +268,7 @@ impl Database {
         observation: &RoutingQuotaObservation,
     ) -> Result<(), AppError> {
         let now = unix_millis();
-        if observation.observed_at > now || observation.valid_until <= now {
+        if observation.observed_at > now || observation.valid_until <= observation.observed_at {
             return Ok(());
         }
         let json = serde_json::to_string(observation)
