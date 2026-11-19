@@ -263,6 +263,14 @@ impl BoundedSseFramer {
                         if self.emitted_cr_event_bytes >= self.limits.event_bytes {
                             batch.reject(SseFramerRejection::EventLimit);
                         } else {
+                            if self
+                                .allocation_budget
+                                .as_ref()
+                                .is_some_and(|budget| !budget.reserve_allocation(2))
+                            {
+                                batch.reject(SseFramerRejection::MemoryCapacity);
+                                break;
+                            }
                             Self::emit(
                                 &mut batch,
                                 PendingSseEvent {

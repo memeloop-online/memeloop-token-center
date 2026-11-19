@@ -309,7 +309,8 @@ pub(super) async fn stream_response(input: StreamingResponse<'_>) -> Result<Resp
                         + sse_capture
                             .as_ref()
                             .map_or(0, |state| state.retained_framing_capacity())
-                        + terminal_frames.metadata_capacity();
+                        + terminal_frames.metadata_capacity()
+                        + terminal_delivery.retained_bytes();
                     if !budget.reconcile_retained(retained) {
                         transport_error = Some("upstream_response_memory_capacity");
                         break;
@@ -355,6 +356,15 @@ pub(super) async fn stream_response(input: StreamingResponse<'_>) -> Result<Resp
                             ) else {
                                 progress_heartbeat_deadline = None;
                                 continue;
+                            };
+                            let heartbeat = if let Some(budget) = _sse_streaming_memory.as_ref() {
+                                let Some(bytes) = budget.retain_output(heartbeat) else {
+                                    transport_error = Some("upstream_response_memory_capacity");
+                                    break;
+                                };
+                                bytes
+                            } else {
+                                heartbeat
                             };
                             match waits
                                 .downstream(tokio::time::timeout(
@@ -452,6 +462,7 @@ pub(super) async fn stream_response(input: StreamingResponse<'_>) -> Result<Resp
                             if let Some(capture) = sse_capture.as_mut() {
                                 capture.set_allocation_budget(budget.clone());
                             }
+                            terminal_frames.set_allocation_budget(budget.clone());
                             _sse_streaming_memory = Some(budget);
                         }
                         let raw_chunk_len = raw_chunk.len();
@@ -780,18 +791,6 @@ pub(super) async fn stream_response(input: StreamingResponse<'_>) -> Result<Resp
                                 tokio::time::Instant::now()
                                     + CODEX_RESPONSES_PROGRESS_HEARTBEAT_INTERVAL,
                             );
-                        }
-                        if let Some(budget) = _sse_streaming_memory.as_ref() {
-                            let retained = responses_streaming_sanitizer
-                                .as_ref()
-                                .map_or(0, |state| state.retained_capacity())
-                                + sse_capture
-                                    .as_ref()
-                                    .map_or(0, |state| state.retained_framing_capacity());
-                            if !budget.reconcile_retained(retained) {
-                                transport_error = Some("upstream_response_memory_capacity");
-                                break;
-                            }
                         }
                         if strict_chat_terminal_ready {
                             break;

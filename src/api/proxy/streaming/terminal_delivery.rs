@@ -21,6 +21,13 @@ pub(super) enum ResponsesTerminalDelivery {
 }
 
 impl ResponsesTerminalDelivery {
+    pub(super) fn retained_bytes(&self) -> usize {
+        match self {
+            Self::FlushPending(bytes) => bytes.len(),
+            _ => 0,
+        }
+    }
+
     pub(super) fn take_pending(&mut self) -> Option<Bytes> {
         match std::mem::replace(self, Self::Finished) {
             Self::FlushPending(bytes) => Some(bytes),

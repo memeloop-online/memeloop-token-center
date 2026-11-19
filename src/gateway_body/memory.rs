@@ -196,6 +196,10 @@ impl SseAllocationBudget {
         }
         let memory = self.memory.lock().ok()?;
         let permit = memory.reservation.try_reserve_archive_output(bytes.len())?;
+        // Give the queue an exact-sized backing allocation. The source may
+        // be a slice of a larger Vec; its framing charge remains live until
+        // processing ends, while this independent owner follows all clones.
+        let bytes = axum::body::Bytes::copy_from_slice(&bytes);
         Some(axum::body::Bytes::from_owner(ChargedStreamBytes {
             bytes,
             _memory: permit,
