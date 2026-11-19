@@ -43,6 +43,8 @@ mod cloud_entitlements;
 mod logical_sessions;
 #[path = "steps/security_acceptance.rs"]
 mod security_acceptance;
+#[path = "steps/storage_recovery.rs"]
+mod storage_recovery;
 #[path = "steps/tkmarket_seedance.rs"]
 mod tkmarket_seedance;
 #[path = "steps/wasu_wan.rs"]
@@ -50,6 +52,7 @@ mod wasu_wan;
 
 #[derive(World)]
 struct TokenCenterWorld {
+    recovery: Option<storage_recovery::RecoveryState>,
     client: Client,
     service_url: String,
     state: Option<AppState>,
@@ -102,6 +105,7 @@ struct TokenCenterWorld {
 impl Default for TokenCenterWorld {
     fn default() -> Self {
         Self {
+            recovery: None,
             client: Client::new(),
             service_url: String::new(),
             state: None,
@@ -465,6 +469,11 @@ async fn start_test_service(world: &mut TokenCenterWorld) {
     let state = AppState::initialize(config)
         .await
         .expect("initialize test service");
+    start_test_http_service(world, state, mock).await;
+    world.temp_dir = Some(temp_dir);
+}
+
+async fn start_test_http_service(world: &mut TokenCenterWorld, state: AppState, mock: MockServer) {
     let test_state = state.clone();
     let (worker_shutdown, worker_task) = spawn_test_worker(state.clone());
     let listener = TcpListener::bind("127.0.0.1:0")
@@ -480,7 +489,6 @@ async fn start_test_service(world: &mut TokenCenterWorld) {
     world.service_url = format!("http://{address}");
     world.state = Some(test_state);
     world.mock = Some(mock);
-    world.temp_dir = Some(temp_dir);
     world.server_task = Some(server_task);
     world.worker_shutdown = Some(worker_shutdown);
     world.worker_task = Some(worker_task);
