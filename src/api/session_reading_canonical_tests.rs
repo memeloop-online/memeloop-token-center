@@ -35,16 +35,32 @@ async fn canonical_training_reads_complete_prefix_without_legacy_root_and_fails_
         .await
         .unwrap();
     let request = Uuid::now_v7();
-    let session = state.db.record_conversation_observation(
-        &key, request,
-        &json!({"messages":[
-            {"role":"user","content":"完整问题"},
-            {"role":"assistant","tool_calls":[{"id":"call-1","type":"function","function":{"name":"echo","arguments":"{\"message\":\"完整\"}"}}]},
-            {"role":"tool","tool_call_id":"call-1","content":"完整工具结果"},
-            {"role":"assistant","content":"完整答案"}
-        ]}),
-        &crate::conversation::ConversationHints::default(), Some("canonical-training"),
-    ).await.unwrap();
+    let mut transaction = state.db.begin_write_transaction().await.unwrap();
+    let request_json = json!({"messages":[
+        {"role":"user","content":"完整问题"},
+        {"role":"assistant","tool_calls":[{"id":"call-1","type":"function","function":{"name":"echo","arguments":"{\"message\":\"完整\"}"}}]},
+        {"role":"tool","tool_call_id":"call-1","content":"完整工具结果"},
+        {"role":"assistant","content":"完整答案"}
+    ]});
+    let session = state
+        .db
+        .record_conversation_observation_in_transaction(
+            &mut transaction,
+            crate::db::ConversationObservationInput {
+                key: &key,
+                request_id: request,
+                request_json: &request_json,
+                hints: &crate::conversation::ConversationHints::default(),
+                client_name: Some("canonical-training"),
+                upstream_response_id: None,
+                observed_at: crate::db::unix_millis(),
+                attach_request_record: false,
+                content_materialized: false,
+            },
+        )
+        .await
+        .unwrap();
+    transaction.commit().await.unwrap();
     assert!(
         state
             .archive
