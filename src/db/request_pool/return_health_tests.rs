@@ -8,6 +8,11 @@ impl Drop for RelayGuard {
 }
 
 pub(super) async fn postgres_return_health_timeout_releases_slot(url: &str) {
+    run_return_health_case(url, false).await;
+    run_return_health_case(url, true).await;
+}
+
+async fn run_return_health_case(url: &str, cancel_begin: bool) {
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
     let mut endpoint = url::Url::parse(url).unwrap();
     let host = endpoint.host_str().unwrap().to_owned();
@@ -73,21 +78,33 @@ pub(super) async fn postgres_return_health_timeout_releases_slot(url: &str) {
         .await
         .unwrap();
     gate.send(true).unwrap();
-    connection.finish();
+    let pending_begin = if cancel_begin {
+        Some(tokio::spawn(async move {
+            Transaction::begin(connection.into_pool(), None).await
+        }))
+    } else {
+        connection.finish();
+        None
+    };
     tokio::time::timeout(Duration::from_secs(5), blocked.notified())
         .await
         .expect("real PostgreSQL ping response reached the relay gate");
-    assert_eq!(pool.diagnostics.direct_owned.load(Ordering::Relaxed), 0);
-    assert_eq!(pool.diagnostics.return_requested.load(Ordering::Relaxed), 1);
-    assert_eq!(pool.size(), 1);
-    assert_eq!(pool.num_idle(), 0);
-    tokio::time::timeout(Duration::from_secs(5), async {
-        while pool.size() != 0 {
-            tokio::time::sleep(Duration::from_millis(10)).await;
-        }
-    })
-    .await
-    .expect("return health budget releases the stalled slot");
+    if let Some(pending) = pending_begin {
+        pending.abort();
+        assert!(pending.await.unwrap_err().is_cancelled());
+    } else {
+        assert_eq!(pool.diagnostics.direct_owned.load(Ordering::Relaxed), 0);
+        assert_eq!(pool.diagnostics.return_requested.load(Ordering::Relaxed), 1);
+        assert_eq!(pool.size(), 1);
+        assert_eq!(pool.num_idle(), 0);
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while pool.size() != 0 {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("return health budget releases the stalled slot");
+    }
     gate.send(false).unwrap();
     let mut reused = tokio::time::timeout(Duration::from_secs(5), pool.acquire())
         .await
@@ -100,6 +117,15 @@ pub(super) async fn postgres_return_health_timeout_releases_slot(url: &str) {
     assert_ne!(
         reused_pid, pid,
         "a fresh backend replaces the stalled returned connection"
+    );
+    let status: String =
+        sqlx::query_scalar("SELECT state FROM pg_stat_activity WHERE pid = pg_backend_pid()")
+            .fetch_one(&mut *reused)
+            .await
+            .unwrap();
+    assert_eq!(
+        status, "active",
+        "replacement is outside the cancelled BEGIN transaction"
     );
     let same_pid: i32 = sqlx::query_scalar("SELECT pg_backend_pid()")
         .fetch_one(&mut *reused)
