@@ -7,3 +7,5 @@ Source: sqlx-core 0.9.0, crates.io SHA-256 `05b44e85bf579a8eeb4ceaa77a3a523baf2b
 Upstream Apache-2.0 and MIT licenses are retained.
 
 Pooled `Transaction::begin` additionally preserves close-on-drop until BEGIN confirmation. Cancelled or failed BEGIN closes its owned socket; confirmed BEGIN restores the original caller flag. Borrowed connections and savepoints retain their existing handling.
+
+All five pooled socket close entry points (explicit PoolConnection close and Live/Idle graceful/hard close) share the existing acquire-timeout maintenance budget. Idle close returns its size guard for the caller's replacement connection. The pool exposes a count of confirmed owned pooled Transactions through their Drop boundary; borrowed transactions are excluded.
