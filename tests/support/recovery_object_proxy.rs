@@ -36,6 +36,7 @@ struct Faults {
     gets: HashMap<String, Arc<ObjectReadGate>>,
     puts: HashSet<String>,
     put_prefixes: HashSet<String>,
+    put_scopes: HashSet<(String, String)>,
 }
 struct ProxyState {
     upstream: String,
@@ -108,6 +109,16 @@ impl RecoveryObjectProxy {
             faults.put_prefixes.remove(prefix);
         }
     }
+    pub(super) fn fail_put_scope(&self, prefix: &str, suffix: &str, enabled: bool) {
+        assert!(prefix.starts_with('/') && prefix.len() > 1 && !suffix.is_empty());
+        let mut faults = self.state.faults.lock().unwrap();
+        let scope = (prefix.to_owned(), suffix.to_owned());
+        if enabled {
+            faults.put_scopes.insert(scope);
+        } else {
+            faults.put_scopes.remove(&scope);
+        }
+    }
     pub(super) fn failed_puts(&self) -> usize {
         self.state.failed_puts.load(Ordering::SeqCst)
     }
@@ -135,7 +146,10 @@ async fn forward(State(state): State<Arc<ProxyState>>, request: Request) -> Resp
                     || faults
                         .put_prefixes
                         .iter()
-                        .any(|prefix| path.starts_with(prefix))),
+                        .any(|prefix| path.starts_with(prefix))
+                    || faults.put_scopes.iter().any(|(prefix, suffix)| {
+                        path.starts_with(prefix) && path.ends_with(suffix)
+                    })),
         )
     };
     if let Some(gate) = gate {
