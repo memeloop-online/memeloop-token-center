@@ -8,11 +8,12 @@ impl Drop for RelayGuard {
 }
 
 pub(super) async fn postgres_return_health_timeout_releases_slot(url: &str) {
-    run_return_health_case(url, false).await;
-    run_return_health_case(url, true).await;
+    run_return_health_case(url, false, false).await;
+    run_return_health_case(url, true, false).await;
+    run_return_health_case(url, false, true).await;
 }
 
-async fn run_return_health_case(url: &str, cancel_begin: bool) {
+async fn run_return_health_case(url: &str, cancel_begin: bool, block_close: bool) {
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
     let mut endpoint = url::Url::parse(url).unwrap();
     let host = endpoint.host_str().unwrap().to_owned();
@@ -33,8 +34,30 @@ async fn run_return_health_case(url: &str, cancel_begin: bool) {
                 .unwrap();
             let (mut client_read, mut client_write) = client.into_split();
             let (mut server_read, mut server_write) = server.into_split();
+            let mut upstream_paused = paused.clone();
             let upstream = async {
-                let _ = tokio::io::copy(&mut client_read, &mut server_write).await;
+                let mut bytes = vec![0; 65536];
+                loop {
+                    let n = match client_read.read(&mut bytes).await {
+                        Ok(0) | Err(_) => return,
+                        Ok(n) => n,
+                    };
+                    loop {
+                        let waiting = block_close
+                            && gate_this_connection
+                            && *upstream_paused.borrow_and_update();
+                        if !waiting {
+                            break;
+                        }
+                        relay_blocked.notify_one();
+                        if upstream_paused.changed().await.is_err() {
+                            return;
+                        }
+                    }
+                    if server_write.write_all(&bytes[..n]).await.is_err() {
+                        return;
+                    }
+                }
             };
             let downstream = async {
                 let mut buffer = vec![0; 65536];
@@ -44,7 +67,8 @@ async fn run_return_health_case(url: &str, cancel_begin: bool) {
                         Ok(count) => count,
                     };
                     loop {
-                        let is_paused = gate_this_connection && *paused.borrow_and_update();
+                        let is_paused =
+                            !block_close && gate_this_connection && *paused.borrow_and_update();
                         if !is_paused {
                             break;
                         }
@@ -78,6 +102,32 @@ async fn run_return_health_case(url: &str, cancel_begin: bool) {
         .await
         .unwrap();
     gate.send(true).unwrap();
+    if block_close {
+        let query_text = format!("SELECT 1 /*{}*/", "x".repeat(32 * 1024 * 1024));
+        let mut sending =
+            Box::pin(sqlx::raw_sql(sqlx::AssertSqlSafe(query_text)).execute(&mut *connection));
+        tokio::select! {
+            _ = blocked.notified() => {},
+            result = &mut sending => panic!("large query completed before relay gate: {result:?}"),
+        }
+        assert!(
+            tokio::time::timeout(Duration::from_millis(50), sending.as_mut())
+                .await
+                .is_err(),
+            "client write is blocked behind the real transport gate"
+        );
+        drop(sending);
+        let closing = connection.into_pool().close();
+        let result = tokio::time::timeout(Duration::from_secs(5), closing)
+            .await
+            .expect("close health budget releases a blocked socket");
+        assert!(matches!(result, Err(sqlx::Error::Protocol(_))));
+        assert_eq!(pool.size(), 0);
+        gate.send(false).unwrap();
+        pool.close().await;
+        drop(relay);
+        return;
+    }
     let pending_begin = if cancel_begin {
         Some(tokio::spawn(async move {
             Transaction::begin(connection.into_pool(), None).await
@@ -145,18 +195,29 @@ async fn run_return_health_case(url: &str, cancel_begin: bool) {
     healthy.finish();
     if cancel_begin {
         let mut transaction = pool.begin().await.unwrap();
+        assert_eq!(pool.active_transactions(), 1);
         let transaction_pid: i32 = sqlx::query_scalar("SELECT pg_backend_pid()")
             .fetch_one(&mut *transaction)
             .await
             .unwrap();
         assert_eq!(transaction_pid, reused_pid);
         transaction.commit().await.unwrap();
+        assert_eq!(pool.active_transactions(), 0);
         let mut normal = pool.acquire().await.unwrap();
         let normal_pid: i32 = sqlx::query_scalar("SELECT pg_backend_pid()")
             .fetch_one(&mut *normal)
             .await
             .unwrap();
         assert_eq!(normal_pid, reused_pid, "confirmed BEGIN keeps normal reuse");
+        {
+            let borrowed = sqlx::Connection::begin(&mut *normal).await.unwrap();
+            assert_eq!(
+                pool.active_transactions(),
+                0,
+                "borrowed transactions do not inflate pooled ownership"
+            );
+            borrowed.rollback().await.unwrap();
+        }
         normal.close_on_drop();
         let mut marked = Transaction::begin(normal.into_pool(), None).await.unwrap();
         sqlx::query("SELECT 1").execute(&mut *marked).await.unwrap();

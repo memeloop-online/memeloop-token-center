@@ -89,6 +89,7 @@ where
 {
     connection: MaybePoolConnection<'c, DB>,
     open: bool,
+    counted_pool: Option<crate::pool::Pool<DB>>,
 }
 
 impl<'c, DB> Transaction<'c, DB>
@@ -108,6 +109,7 @@ where
 
                 // If the call to `begin` fails or doesn't complete we want to attempt a rollback in case the transaction was started.
                 open: true,
+                counted_pool: None,
             };
 
             // A cancelled BEGIN can have reached the server before the driver
@@ -125,6 +127,13 @@ where
                 connection.replace_close_on_drop(original);
             }
 
+            if let MaybePoolConnection::PoolConnection(connection) = &tx.connection {
+                connection
+                    .pool
+                    .active_transactions
+                    .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                tx.counted_pool = Some(crate::pool::Pool(connection.pool.clone()));
+            }
             Ok(tx)
         })
     }
@@ -280,6 +289,11 @@ where
     DB: Database,
 {
     fn drop(&mut self) {
+        if let Some(pool) = self.counted_pool.take() {
+            pool.0
+                .active_transactions
+                .fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
+        }
         if self.open {
             // starts a rollback operation
 
