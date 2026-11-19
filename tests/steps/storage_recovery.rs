@@ -124,13 +124,17 @@ async fn exact_originals_and_once(world: &mut TokenCenterWorld) {
     }
     stats_contain_request(world, 1, 10).await;
     assert_eq!(world.response["summary"]["total_cost"], "0.00001");
+    assert_billing(world, 1).await;
+}
+
+pub(super) async fn assert_billing(world: &TokenCenterWorld, requests: i64) {
     let pool = AnyPool::connect(&world.state.as_ref().unwrap().config.database_url)
         .await
         .unwrap();
     let (count, amount): (i64, i64) = sqlx::query_as(
         "SELECT COUNT(*), CAST(COALESCE(SUM(amount_micros), 0) AS BIGINT) FROM ledger_entries WHERE key_id = $1 AND kind = 'usage'"
     ).bind(world.stable_key_id.unwrap().to_string()).fetch_one(&pool).await.unwrap();
-    assert_eq!((count, amount), (1, -10));
+    assert_eq!((count, amount), (requests, -10 * requests));
     pool.close().await;
 }
 
@@ -141,5 +145,12 @@ pub(super) async fn cleanup(world: &mut TokenCenterWorld) {
             let _ = task.await;
         }
         recovery.isolated.cleanup().await;
+    }
+}
+
+pub(super) fn release_faults(world: &mut TokenCenterWorld) {
+    if let Some(recovery) = world.recovery.as_mut() {
+        recovery.proxy.clear_faults();
+        recovery.scheduler.take();
     }
 }

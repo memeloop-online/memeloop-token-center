@@ -224,6 +224,7 @@ async fn fresh_request_progresses(world: &mut TokenCenterWorld) {
     assert_originals(world, fresh).await;
     assert_dialogue(world, fresh).await;
     stats_contain_request(world, 2, 20).await;
+    storage_recovery::assert_billing(world, 2).await;
 }
 
 #[when("historical coverage recovery is released")]
@@ -275,4 +276,5 @@ async fn historical_recovered(world: &mut TokenCenterWorld) {
     assert_originals(world, historical).await;
     assert_dialogue(world, historical).await;
     stats_contain_request(world, 2, 20).await;
+    storage_recovery::assert_billing(world, 2).await;
 }

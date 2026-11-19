@@ -373,6 +373,8 @@ async fn finish_scenario(world: Option<&mut TokenCenterWorld>) {
         return;
     };
 
+    storage_recovery::release_faults(world);
+
     // A generation worker can still make an upstream request after a scenario's final step.
     // Stop and join it before inspecting mock expectations, so any failure belongs to this hook.
     stop_test_worker(world).await;
