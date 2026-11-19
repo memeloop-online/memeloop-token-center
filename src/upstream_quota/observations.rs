@@ -12,6 +12,8 @@ pub(crate) struct RoutingQuotaObservation {
     pub generation: i64,
     pub config_revision: i64,
     pub provider: String,
+    #[serde(default)]
+    pub started_at: i64,
     pub observed_at: i64,
     pub valid_until: i64,
     pub windows: Vec<RoutingQuotaWindow>,
@@ -200,6 +202,12 @@ pub(super) fn project(
         generation: account.credential_generation,
         config_revision: account.updated_at,
         provider: account.driver.clone(),
+        started_at: snapshot.read_started_at.or_else(|| {
+            snapshot
+                .verification_observation
+                .as_ref()
+                .map(|source| source.started_at)
+        })?,
         observed_at,
         valid_until,
         windows,
@@ -697,6 +705,7 @@ mod tests {
             generation: 1,
             config_revision: 10,
             provider: "openai-codex".into(),
+            started_at: 390,
             observed_at: 400,
             valid_until: 30_400,
             windows: Vec::new(),

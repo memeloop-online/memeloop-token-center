@@ -253,6 +253,7 @@ async fn verify(config: Config) {
         config_revision: target.config_revision,
         provider: "kimi-oauth".into(),
         ordinary_code_allowance: None,
+        started_at: 90,
         observed_at: 100,
         valid_until: 200,
         windows: vec![RoutingQuotaWindow {
@@ -511,6 +512,7 @@ async fn verify_scoped_supplier_usage_recovery(db: &Database, tenant: &str, pepp
         generation: account.credential_generation,
         config_revision: account.updated_at,
         provider: "openai-codex".into(),
+        started_at,
         observed_at: now - 10,
         valid_until: now + 30_000,
         windows: vec![RoutingQuotaWindow {
@@ -589,6 +591,7 @@ async fn verify_scoped_supplier_usage_recovery(db: &Database, tenant: &str, pepp
     );
     assert_eq!(dispatched[0].account_id, account.id);
     let mut newer = value.clone();
+    newer.started_at = started_at + 10;
     newer.observed_at = now;
     newer.valid_until = now + 40_000;
     let old_background_lease = Uuid::now_v7();
@@ -607,7 +610,10 @@ async fn verify_scoped_supplier_usage_recovery(db: &Database, tenant: &str, pepp
         Some(old_background_lease.to_string()),
         "manual publication never steals a background lease"
     );
-    db.finish_quota_observation(&target, old_background_lease, Some(&value), now + 10_000)
+    let mut late_old = value.clone();
+    late_old.observed_at = unix_millis();
+    late_old.windows[0].remaining_fraction = Some(0.01);
+    db.finish_quota_observation(&target, old_background_lease, Some(&late_old), now + 10_000)
         .await
         .unwrap();
     let accepted: i64 = sqlx::query_scalar(

@@ -268,25 +268,30 @@ impl Database {
         observation: &RoutingQuotaObservation,
     ) -> Result<(), AppError> {
         let now = unix_millis();
-        if observation.observed_at > now || observation.valid_until <= observation.observed_at {
+        if observation.started_at < 0
+            || observation.started_at > observation.observed_at
+            || observation.observed_at > now
+            || observation.valid_until <= observation.observed_at
+        {
             return Ok(());
         }
         let json = serde_json::to_string(observation)
             .map_err(|_| AppError::internal("quota_observation_serialize"))?;
         let published = sqlx::query("INSERT INTO upstream_quota_observations
-            (upstream_account_id,tenant_id,credential_generation,config_revision,observation_json,valid_until,observed_at)
-            SELECT id,tenant_id,$2,$3,$4,$5,$6 FROM upstream_accounts
+            (upstream_account_id,tenant_id,credential_generation,config_revision,observation_json,valid_until,observed_at,started_at)
+            SELECT id,tenant_id,$2,$3,$4,$5,$6,$7 FROM upstream_accounts
             WHERE id=$1 AND credential_generation=$2 AND updated_at=$3 AND status='active'
             ON CONFLICT(upstream_account_id) DO UPDATE SET
                 tenant_id=excluded.tenant_id,credential_generation=excluded.credential_generation,
                 config_revision=excluded.config_revision,observation_json=excluded.observation_json,
-                valid_until=excluded.valid_until,observed_at=excluded.observed_at
+                valid_until=excluded.valid_until,observed_at=excluded.observed_at,started_at=excluded.started_at
             WHERE upstream_quota_observations.credential_generation<>excluded.credential_generation
                OR upstream_quota_observations.config_revision<>excluded.config_revision
-               OR upstream_quota_observations.observed_at<excluded.observed_at")
+               OR upstream_quota_observations.started_at<excluded.started_at
+               OR (upstream_quota_observations.started_at=excluded.started_at AND upstream_quota_observations.observed_at<excluded.observed_at)")
             .bind(observation.account_id.to_string()).bind(observation.generation)
             .bind(observation.config_revision).bind(json).bind(observation.valid_until)
-            .bind(observation.observed_at).execute(&mut **transaction).await?.rows_affected();
+            .bind(observation.observed_at).bind(observation.started_at).execute(&mut **transaction).await?.rows_affected();
         if published == 1 {
             self.recover_supplier_quota_from_usage(transaction, observation)
                 .await?;

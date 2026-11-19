@@ -353,6 +353,8 @@ pub(crate) struct QuotaSnapshot {
     /// Completion time is never a safe fence for a reset waiter.
     #[serde(skip)]
     verification_observation: Option<VerificationObservation>,
+    #[serde(skip)]
+    read_started_at: Option<i64>,
 }
 
 #[derive(Clone)]
@@ -514,6 +516,7 @@ impl QuotaSnapshot {
             attempts: Vec::new(),
             cache_hit: false,
             verification_observation: None,
+            read_started_at: None,
         }
     }
 }
@@ -768,6 +771,7 @@ impl QuotaCache {
             return fallback("quota_busy");
         };
         // Includes DNS/proxy setup, supplier reads and bounded body decoding.
+        let read_started_at = unix_millis();
         let refresh_started = tokio::time::Instant::now();
         let budget = match codex_quota_budget(&account.config) {
             Ok(budget) => budget,
@@ -836,6 +840,7 @@ impl QuotaCache {
             }
             Err(error) => fallback(error),
         };
+        value.read_started_at = Some(read_started_at);
         value.attempts = session.attempts();
         value.cache_hit = false;
         if value.error_code.is_some() && value.reset_capability.implementation_available {
