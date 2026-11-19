@@ -381,6 +381,8 @@ jobs:
           git rev-parse HEAD
           cargo test --locked --all-features --lib db::tests::terminal_projection::postgres_terminal_writer_does_not_capture_sibling_events -- --ignored --exact --nocapture 2>&1 | tee /tmp/history-writer.log
           grep -F '1 passed; 0 failed' /tmp/history-writer.log
+          cargo test --locked --all-features --lib db::request_history::bootstrap::terminal_projection_guard_tests::request_history_real_services_acceptance_terminal_claim_ignores_export_lock -- --ignored --exact --nocapture 2>&1 | tee /tmp/terminal-guard.log
+          grep -F '1 passed; 0 failed' /tmp/terminal-guard.log
 
   history-capture-981-contract:
     if: inputs.contract == 'history-capture-981'
