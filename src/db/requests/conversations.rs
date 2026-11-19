@@ -914,9 +914,7 @@ impl Database {
         tenant_id: Uuid,
         leaf_node_hash: &str,
     ) -> Result<Vec<crate::conversation::TrainingUtterance>, AppError> {
-        use futures_util::TryStreamExt as _;
-
-        let mut rows = sqlx::query(
+        let rows = sqlx::query(
             "WITH RECURSIVE chain AS (
                 SELECT node_hash, parent_hash, atom_hash, depth FROM context_nodes WHERE tenant_id = $1 AND node_hash = $2
                 UNION
@@ -930,10 +928,12 @@ impl Database {
         )
         .bind(tenant_id.to_string())
         .bind(leaf_node_hash)
-        .fetch(&self.pool);
+        .fetch_all(&self.pool)
+        .await?;
         let mut turns = Vec::new();
         let mut previous = None;
-        while let Some(row) = rows.try_next().await? {
+        // Release the SQL query and its connection before opening body objects.
+        for row in rows {
             let parent: Option<String> = row.try_get("parent_hash")?;
             let depth: i64 = row.try_get("depth")?;
             if depth
