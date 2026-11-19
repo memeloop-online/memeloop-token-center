@@ -245,8 +245,12 @@ async fn assert_event_enrichment(database: &Database) {
         ] {
             assert_eq!(value["supplier_error"], expected);
             assert_eq!(value["status_code"], status);
-            assert_eq!(value["input_tokens"], 100);
-            assert_eq!(value["output_tokens"], 20);
+            assert_eq!(value["input_tokens"], if completed.is_some() { serde_json::json!(100) } else { serde_json::Value::Null });
+            assert_eq!(value["output_tokens"], if completed.is_some() { serde_json::json!(20) } else { serde_json::Value::Null });
+            let baseline = serde_json::to_value(&database.list_requests(key_id, 10).await.unwrap()[0]).unwrap();
+            for field in ["status_code", "input_tokens", "output_tokens", "cost", "duration_ms", "supplier_error"] {
+                assert_eq!(value[field], baseline[field], "overview field {field}");
+            }
         }
         let list = database.list_requests(key_id, 10).await.unwrap();
         let operator = database.list_all_requests(&external, 10).await.unwrap();
