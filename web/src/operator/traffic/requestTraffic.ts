@@ -256,7 +256,8 @@ export function mergeRequestObservations<T extends RequestView>(incoming: T, pre
     ? previousEgress : incomingEgress ?? previousEgress;
   const session = mergeSessionContext(previous?.session_context, incoming);
   return {
-    ...(preservesOperationalReceipt(incoming, previous) ? previous : incoming),
+    ...incoming,
+    ...(preservesOperationalReceipt(incoming, previous) ? previous : {}),
     ...(egress !== undefined ? { egress } : {}),
     ...(session !== undefined ? { session_context: session } : {}),
   };
