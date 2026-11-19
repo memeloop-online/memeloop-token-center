@@ -634,6 +634,29 @@ async fn legacy_bound_archive_without_raw_root_remains_readable() {
         .await
         .unwrap();
     assert_eq!(cas.request_archive_state, RequestArchiveState::Pending);
+    for location in [
+        format!(
+            "stores/training/{}/{}",
+            "a".repeat(64),
+            object.object_locator
+        ),
+        format!(
+            "stores/staging/{}/staging/proxy/{request}/request/body.json",
+            "b".repeat(64)
+        ),
+    ] {
+        let mut qualified = refs.clone();
+        qualified.request_object = location;
+        let qualified = state
+            .db
+            .resolve_raw_archive_roots_with_semantic_authority(tenant, qualified, None)
+            .await
+            .unwrap();
+        assert_eq!(
+            qualified.request_archive_state,
+            RequestArchiveState::Pending
+        );
+    }
     // A real canonical root takes precedence over the legacy source.
     state
         .archive

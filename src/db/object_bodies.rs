@@ -515,6 +515,8 @@ fn legacy_bound_object(state: crate::model::RequestArchiveState, locator: Option
             !path.is_empty()
                 && !path.starts_with("tenants/")
                 && !path.starts_with("objects/blake3/")
+                && !path.starts_with("stores/training/")
+                && !path.starts_with("stores/staging/")
                 && path.bytes().all(|byte| {
                     byte.is_ascii_alphanumeric() || matches!(byte, b'/' | b'.' | b'_' | b'-')
                 })

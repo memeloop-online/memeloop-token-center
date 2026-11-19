@@ -364,6 +364,8 @@ jobs:
           git rev-parse HEAD
           cargo test --locked --all-features --lib api::self_service::requests::tests::legacy_bound_archive_without_raw_root_remains_readable -- --exact --nocapture 2>&1 | tee /tmp/legacy-archive-bound.log
           grep -F '1 passed; 0 failed' /tmp/legacy-archive-bound.log
+          cargo test --locked --all-features --lib api::self_service::requests::tests::retired_raw_detail_uses_lossless_semantic_identity_without_reading_old_body -- --exact --nocapture 2>&1 | tee /tmp/legacy-retirement.log
+          grep -F '1 passed; 0 failed' /tmp/legacy-retirement.log
 
   history-writer-984-contract:
     if: inputs.contract == 'history-writer-984'
