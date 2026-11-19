@@ -219,6 +219,10 @@ jobs:
           grep -F '2 passed; 0 failed' /tmp/staging-db.log
           cargo test --locked --lib archive::routing_tests 2>&1 | tee /tmp/staging-routing.log
           grep -F '6 passed; 0 failed' /tmp/staging-routing.log
+          cargo test --locked --lib api::session_reading::tests::dialogue_parts_preserve_tools_media_and_future_extensions -- --exact 2>&1 | tee /tmp/canonical-parts.log
+          grep -F '1 passed; 0 failed' /tmp/canonical-parts.log
+          cargo test --locked --lib api::session_reading::tests::canonical_training_reads_complete_prefix_without_legacy_root_and_fails_closed -- --exact 2>&1 | tee /tmp/canonical-training.log
+          grep -F '1 passed; 0 failed' /tmp/canonical-training.log
           cargo test --locked --lib training_cas_real_s3_configuration_and_reader -- --ignored 2>&1 | tee /tmp/staging-rustfs.log
           grep -F '1 passed; 0 failed' /tmp/staging-rustfs.log
   next-release-contract:

@@ -14,7 +14,20 @@ fn dialogue_parts_preserve_tools_media_and_future_extensions() {
 
 #[tokio::test]
 async fn canonical_training_reads_complete_prefix_without_legacy_root_and_fails_closed() {
-    let (state, _directory) = crate::api::tests::test_state().await;
+    let directory = tempfile::tempdir().unwrap();
+    let mut config = crate::config::Config::for_test(format!(
+        "sqlite://{}?mode=rwc",
+        directory.path().join("canonical.db").display()
+    ));
+    if let Ok(endpoint) = std::env::var("MTC_RUSTFS_TEST_ENDPOINT") {
+        config.archive_backend = crate::config::ArchiveBackend::S3;
+        config.s3_endpoint = Some(endpoint);
+        config.s3_bucket = Some(std::env::var("MTC_RUSTFS_TEST_BUCKET").unwrap());
+        config.s3_access_key = Some(std::env::var("MTC_RUSTFS_TEST_ACCESS_KEY").unwrap());
+        config.s3_secret_key = Some(std::env::var("MTC_RUSTFS_TEST_SECRET_KEY").unwrap());
+        config.archive_object_compression_enabled = true;
+    }
+    let state = AppState::initialize(config).await.unwrap();
     let owner = client(&state, "canonical-training").await;
     let key = state
         .db
