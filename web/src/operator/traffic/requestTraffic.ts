@@ -209,7 +209,7 @@ export function filtersActive(filters: RequestFilters) {
   return Object.values(filters).some(Boolean);
 }
 
-function mergeArchiveState(previous: RequestView['archive_state'], event: Pick<RequestEvent, 'archive_state'>): RequestView['archive_state'] {
+function mergeArchiveState(previous: RequestView['archive_state'], event: Pick<RequestView, 'archive_state'>): RequestView['archive_state'] {
   const incoming = event.archive_state;
   // A REST snapshot can be newer than the event retained in liveEventsRef.
   // Archive terminal states are monotonic, and gap dominates bound when the
