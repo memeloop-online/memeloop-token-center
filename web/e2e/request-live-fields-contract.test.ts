@@ -193,3 +193,12 @@ test('authoritative receipt permits settlement and prevents applied receipt regr
   assert.deepEqual(requestViewFromEvent(delayed, live), live);
   assert.deepEqual(requestViewFromEvent(event, live), live);
 });
+
+test('partial deltas preserve absent values while authoritative null remains explicit', () => {
+  const partial = { ...event, status_code: undefined, duration_ms: undefined, cost: undefined } as unknown as RequestEvent;
+  assert.deepEqual(requestViewFromEvent(partial, recorded), recorded);
+  const active = { ...recorded, status_code: null, cost: null };
+  const authoritative = { ...event, duration_ms: null,
+    operational_terminal: { completed_at: 800, stage: null, financial_state: 'pending' as const } };
+  assert.equal(requestViewFromEvent(authoritative, active)?.duration_ms, null);
+});

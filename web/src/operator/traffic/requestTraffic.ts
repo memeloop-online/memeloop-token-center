@@ -269,7 +269,8 @@ export function requestViewFromEvent(event: RequestEvent, previous?: RequestView
     || incomingTerminal.completed_at < priorTerminal.completed_at
     || (incomingTerminal.completed_at === priorTerminal.completed_at
       && priorTerminal.financial_state === 'applied' && incomingTerminal.financial_state !== 'applied'));
-  if (previous && preserveReceipt) {
+  const sparseLegacyTerminal = !incomingTerminal && previous?.status_code != null && event.status_code == null;
+  if (previous && (preserveReceipt || sparseLegacyTerminal)) {
     return {
       ...previous,
       ...mergeRequestObservations({ ...previous, egress: event.egress }, previous),
@@ -323,6 +324,14 @@ export function requestViewFromEvent(event: RequestEvent, previous?: RequestView
   const usageBasis = event.usage_basis === undefined ? previous?.usage_basis : event.usage_basis;
   if (usageBasis !== undefined) request.usage_basis = usageBasis;
   if (credentialIdentity !== undefined) request.credential_identity = credentialIdentity;
+  // Absence in a partial delta means unchanged. Explicit null remains a value
+  // from the authoritative producer, rather than an absent property.
+  if (previous) {
+    for (const field of ['protocol', 'model', 'status_code', 'duration_ms', 'input_tokens',
+      'output_tokens', 'cost', 'error_code'] as const) {
+      if (event[field] === undefined) Object.assign(request, { [field]: previous[field] });
+    }
+  }
   return mergeRequestObservations({ ...request, egress: event.egress }, previous);
 }
 
