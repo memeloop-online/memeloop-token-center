@@ -601,6 +601,7 @@ impl ProxyMemoryReservation {
         &self,
         bytes: usize,
         nodes: usize,
+        adapter_envelope: usize,
         projection_bytes: usize,
         projection_weight: usize,
         deadline: tokio::time::Instant,
@@ -612,6 +613,7 @@ impl ProxyMemoryReservation {
             .checked_mul(2)?
             .checked_add(nodes.checked_mul(256)?)?
             .max(bytes.checked_mul(CAPTURE_MEMORY_WEIGHT)?)
+            .max(adapter_envelope.checked_mul(CAPTURE_MEMORY_WEIGHT)?)
             .max(UNIT_BYTES);
         let response_units = u32::try_from(required.div_ceil(UNIT_BYTES)).ok()?;
         let projection_units = u32::try_from(

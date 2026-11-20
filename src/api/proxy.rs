@@ -546,6 +546,7 @@ async fn finish_non_sse_proxy_response(
         MAX_PROXY_RESPONSE_BODY,
         &buffered_request,
         buffered_request.state,
+        false,
     )
     .await
     {
@@ -2072,6 +2073,7 @@ async fn proxy_with_cancellation_guard(
                 MAX_PROXY_RESPONSE_BODY,
                 &buffered_request,
                 buffered_request.state,
+                false,
             )
             .await
             .map(Bytes::from);
@@ -2722,6 +2724,7 @@ impl ProxyConversation {
         memory: &crate::gateway_body::memory::ProxyMemoryReservation,
         bytes: usize,
         nodes: usize,
+        adapter_envelope: usize,
         deadline: tokio::time::Instant,
     ) -> bool {
         let (projection_bytes, projection_weight) = match &self.request_body {
@@ -2734,6 +2737,7 @@ impl ProxyConversation {
             .reserve_buffered_shape_with_projection(
                 bytes,
                 nodes,
+                adapter_envelope,
                 projection_bytes,
                 projection_weight,
                 deadline,
@@ -3201,6 +3205,7 @@ async fn execute_component_provider(
         maximum.min(MAX_PROXY_RESPONSE_BODY),
         &request,
         request.state,
+        true,
     )
     .await
     {

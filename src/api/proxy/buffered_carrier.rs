@@ -8,6 +8,7 @@ pub(super) async fn read(
     maximum: usize,
     request: &BufferedRequest<'_>,
     state: &AppState,
+    component_response: bool,
 ) -> Result<Vec<u8>, BoundedUpstreamError> {
     read_captured(
         response,
@@ -19,6 +20,7 @@ pub(super) async fn read(
             request_id: request.request_id,
             conversation: request.conversation.as_ref(),
             wait: request.memory_admission_wait,
+            adapter_envelope: if component_response { maximum } else { 0 },
             #[cfg(test)]
             conversion_ready: None,
         },
@@ -33,6 +35,7 @@ struct ResponseCaptureContext<'a> {
     request_id: Uuid,
     conversation: Option<&'a ProxyConversation>,
     wait: Duration,
+    adapter_envelope: usize,
     #[cfg(test)]
     conversion_ready: Option<std::sync::Arc<tokio::sync::Notify>>,
 }
@@ -99,11 +102,18 @@ async fn read_captured(
     let nodes = scanner.observe(&[]);
     let reserved = if let Some(conversation) = context.conversation {
         conversation
-            .reserve_for_buffered_shape(memory, length, nodes, deadline)
+            .reserve_for_buffered_shape(memory, length, nodes, context.adapter_envelope, deadline)
             .await
     } else {
         memory
-            .reserve_buffered_shape_with_projection(length, nodes, 0, 1, deadline)
+            .reserve_buffered_shape_with_projection(
+                length,
+                nodes,
+                context.adapter_envelope,
+                0,
+                1,
+                deadline,
+            )
             .await
             .is_some()
     };

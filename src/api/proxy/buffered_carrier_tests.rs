@@ -53,6 +53,7 @@ async fn unknown_length_small_responses_share_actual_budget_and_preserve_bytes()
                     conversation: None,
                     wait: Duration::from_secs(10),
                     conversion_ready: None,
+                    adapter_envelope: 0,
                 },
             )
             .await
@@ -93,6 +94,7 @@ async fn object_capture_replays_large_body_under_pressure_with_one_upstream_pass
             conversation: None,
             wait: Duration::from_secs(10),
             conversion_ready: None,
+            adapter_envelope: 0,
         },
     )
     .await
@@ -135,6 +137,7 @@ async fn cancelled_conversion_wait_releases_capture_without_repolling_upstream()
                 conversation: None,
                 wait: Duration::from_secs(60),
                 conversion_ready: Some(observed_ready),
+                adapter_envelope: 0,
             },
         )
         .await
@@ -161,6 +164,7 @@ async fn conversion_projection_and_component_envelope_outlive_request_owner() {
         .reserve_buffered_shape_with_projection(
             128 * 1024,
             10,
+            0,
             64 * 1024,
             2,
             tokio::time::Instant::now() + Duration::from_secs(1),
@@ -223,6 +227,7 @@ async fn response_and_conversation_projection_share_one_conversion_acquisition()
             conversation: Some(&conversation),
             wait: Duration::from_secs(10),
             conversion_ready: None,
+            adapter_envelope: 0,
         },
     )
     .await
@@ -273,6 +278,7 @@ async fn rustfs_buffered_response_preserves_complete_original_and_releases_ram()
             conversation: None,
             wait: Duration::from_secs(30),
             conversion_ready: None,
+            adapter_envelope: 0,
         },
     )
     .await
@@ -284,5 +290,49 @@ async fn rustfs_buffered_response_preserves_complete_original_and_releases_ram()
     );
     drop(actual);
     drop(memory);
+    assert_eq!(budget.snapshot().0, 0);
+}
+
+#[tokio::test]
+async fn small_component_input_retains_declared_output_envelope() {
+    let budget = Arc::new(crate::gateway_body::memory::ProxyMemoryBudget::new(
+        2 * 1024 * 1024,
+    ));
+    let memory = budget.reservation();
+    let body = read_captured(
+        response(Bytes::from_static(b"{}"), Arc::new(AtomicUsize::new(0))),
+        256 * 1024,
+        ResponseCaptureContext {
+            memory: &memory,
+            budget: budget.clone(),
+            archive: crate::archive::ArchiveStore::memory_for_test(),
+            request_id: Uuid::now_v7(),
+            conversation: None,
+            wait: Duration::from_secs(10),
+            conversion_ready: None,
+            adapter_envelope: 256 * 1024,
+        },
+    )
+    .await
+    .unwrap();
+    assert!(memory.buffered_response_reserved_bytes() >= 3 * 256 * 1024);
+    let envelope = memory.take_response_envelope().unwrap();
+    let (release, wait) = std::sync::mpsc::channel();
+    let (started, ready) = tokio::sync::oneshot::channel();
+    let guest = tokio::task::spawn_blocking(move || {
+        let output = vec![b'x'; 256 * 1024];
+        assert_eq!(body, b"{}");
+        started.send(()).unwrap();
+        wait.recv().unwrap();
+        (output, envelope)
+    });
+    ready.await.unwrap();
+    drop(memory);
+    assert!(budget.snapshot().0 >= 3 * 256 * 1024);
+    release.send(()).unwrap();
+    let (output, envelope) = guest.await.unwrap();
+    assert_eq!(output.len(), 256 * 1024);
+    drop(output);
+    drop(envelope);
     assert_eq!(budget.snapshot().0, 0);
 }
