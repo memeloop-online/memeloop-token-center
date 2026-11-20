@@ -597,15 +597,14 @@ impl ProxyMemoryReservation {
         }
     }
 
-    pub(crate) async fn reserve_buffered_shape_with_projection(
+    fn buffered_shape_units(
         &self,
         bytes: usize,
         nodes: usize,
         adapter_envelope: usize,
         projection_bytes: usize,
         projection_weight: usize,
-        deadline: tokio::time::Instant,
-    ) -> Option<ConversationProjectionPermit> {
+    ) -> Option<(u32, u32)> {
         if self.has_buffered_response() {
             return None;
         }
@@ -629,13 +628,15 @@ impl ProxyMemoryReservation {
         {
             return None;
         }
-        // No response or projection allocation is retained while this atomic
-        // acquisition waits. The source has already moved to typed objects.
-        let mut permit =
-            tokio::time::timeout_at(deadline, self.permits.clone().acquire_many_owned(units))
-                .await
-                .ok()?
-                .ok()?;
+        Some((response_units, projection_units))
+    }
+
+    fn install_buffered_shape(
+        &self,
+        mut permit: OwnedSemaphorePermit,
+        response_units: u32,
+        projection_units: u32,
+    ) -> Option<ConversationProjectionPermit> {
         let projection = permit.split(projection_units as usize)?;
         let mut held = self.held.lock().ok()?;
         held.0 = held.0.checked_add(response_units as usize * UNIT_BYTES)?;
@@ -649,6 +650,57 @@ impl ProxyMemoryReservation {
         Some(ConversationProjectionPermit {
             _permit: projection,
         })
+    }
+
+    pub(crate) fn try_reserve_buffered_shape_with_projection(
+        &self,
+        bytes: usize,
+        nodes: usize,
+        adapter_envelope: usize,
+        projection_bytes: usize,
+        projection_weight: usize,
+    ) -> Option<ConversationProjectionPermit> {
+        let (response_units, projection_units) = self.buffered_shape_units(
+            bytes,
+            nodes,
+            adapter_envelope,
+            projection_bytes,
+            projection_weight,
+        )?;
+        let permit = self
+            .permits
+            .clone()
+            .try_acquire_many_owned(response_units.checked_add(projection_units)?)
+            .ok()?;
+        self.install_buffered_shape(permit, response_units, projection_units)
+    }
+
+    pub(crate) async fn reserve_buffered_shape_with_projection(
+        &self,
+        bytes: usize,
+        nodes: usize,
+        adapter_envelope: usize,
+        projection_bytes: usize,
+        projection_weight: usize,
+        deadline: tokio::time::Instant,
+    ) -> Option<ConversationProjectionPermit> {
+        let (response_units, projection_units) = self.buffered_shape_units(
+            bytes,
+            nodes,
+            adapter_envelope,
+            projection_bytes,
+            projection_weight,
+        )?;
+        let permit = tokio::time::timeout_at(
+            deadline,
+            self.permits
+                .clone()
+                .acquire_many_owned(response_units.checked_add(projection_units)?),
+        )
+        .await
+        .ok()?
+        .ok()?;
+        self.install_buffered_shape(permit, response_units, projection_units)
     }
 
     pub(crate) fn reserve_response_json(&self, body: &[u8]) -> bool {
