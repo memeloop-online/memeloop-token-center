@@ -30,10 +30,12 @@ async fn unknown_length_small_responses_share_actual_budget_and_preserve_bytes()
         4 * 1024 * 1024,
     ));
     let archive = crate::archive::ArchiveStore::memory_for_test();
+    let ready = Arc::new(tokio::sync::Barrier::new(33));
     let mut tasks = Vec::new();
     for _ in 0..32 {
         let budget = budget.clone();
         let archive = archive.clone();
+        let ready = ready.clone();
         tasks.push(tokio::spawn(async move {
             let memory = budget.reservation();
             let polls = Arc::new(AtomicUsize::new(0));
@@ -54,9 +56,12 @@ async fn unknown_length_small_responses_share_actual_budget_and_preserve_bytes()
             .unwrap();
             assert_eq!(actual.as_slice(), expected.as_ref());
             assert_eq!(polls.load(Ordering::SeqCst), 1);
+            ready.wait().await;
             drop(actual);
         }));
     }
+    ready.wait().await;
+    assert!(budget.snapshot().0 > 0);
     for task in tasks {
         task.await.unwrap();
     }
@@ -93,5 +98,140 @@ async fn object_capture_replays_large_body_under_pressure_with_one_upstream_pass
     );
     drop(actual);
     drop(memory);
+    assert_eq!(budget.snapshot().0, 0);
+}
+
+#[tokio::test]
+async fn cancelled_conversion_wait_releases_capture_without_repolling_upstream() {
+    let budget = Arc::new(crate::gateway_body::memory::ProxyMemoryBudget::new(
+        2 * 1024 * 1024,
+    ));
+    let blocker = budget.reservation();
+    assert!(blocker.try_grow(1536 * 1024, 1));
+    let polls = Arc::new(AtomicUsize::new(0));
+    let observed = polls.clone();
+    let task_budget = budget.clone();
+    let task = tokio::spawn(async move {
+        let memory = task_budget.reservation();
+        read_captured(
+            response(
+                Bytes::from(format!("{{\"output\":\"{}\"}}", "x".repeat(256 * 1024))),
+                observed,
+            ),
+            64 * 1024 * 1024,
+            ResponseCaptureContext {
+                memory: &memory,
+                budget: task_budget,
+                archive: crate::archive::ArchiveStore::memory_for_test(),
+                request_id: Uuid::now_v7(),
+                conversation: None,
+                wait: Duration::from_secs(60),
+            },
+        )
+        .await
+    });
+    tokio::time::timeout(Duration::from_secs(10), async {
+        while polls.load(Ordering::SeqCst) < 17 {
+            tokio::task::yield_now().await;
+        }
+        while budget.snapshot().0 != 1536 * 1024 {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .unwrap();
+    assert!(!task.is_finished());
+    task.abort();
+    assert!(task.await.unwrap_err().is_cancelled());
+    assert_eq!(polls.load(Ordering::SeqCst), 17);
+    assert_eq!(budget.snapshot().0, 1536 * 1024);
+    drop(blocker);
+    assert_eq!(budget.snapshot().0, 0);
+}
+
+#[tokio::test]
+async fn conversion_projection_and_component_envelope_outlive_request_owner() {
+    let budget = Arc::new(crate::gateway_body::memory::ProxyMemoryBudget::new(
+        4 * 1024 * 1024,
+    ));
+    let memory = budget.reservation();
+    let projection = memory
+        .reserve_buffered_shape_with_projection(
+            128 * 1024,
+            10,
+            64 * 1024,
+            2,
+            tokio::time::Instant::now() + Duration::from_secs(1),
+        )
+        .await
+        .unwrap();
+    let charged = budget.snapshot().0;
+    assert!(charged >= 512 * 1024);
+    let input_memory = memory.take_response_envelope().unwrap();
+    let (release, wait) = std::sync::mpsc::channel();
+    let (started, ready) = tokio::sync::oneshot::channel();
+    let task = tokio::task::spawn_blocking(move || {
+        started.send(()).unwrap();
+        wait.recv().unwrap();
+        drop(input_memory);
+    });
+    ready.await.unwrap();
+    drop(memory);
+    assert_eq!(budget.snapshot().0, charged);
+    drop(projection);
+    assert!(budget.snapshot().0 > 0);
+    release.send(()).unwrap();
+    task.await.unwrap();
+    assert_eq!(budget.snapshot().0, 0);
+}
+
+#[tokio::test]
+async fn response_and_conversation_projection_share_one_conversion_acquisition() {
+    let budget = Arc::new(crate::gateway_body::memory::ProxyMemoryBudget::new(
+        2 * 1024 * 1024,
+    ));
+    let memory = budget.reservation();
+    let conversation = ProxyConversation {
+        key: crate::model::AuthenticatedKey {
+            key_id: Uuid::nil(),
+            tenant_id: Uuid::nil(),
+            principal_id: Uuid::nil(),
+            account_id: Uuid::nil(),
+            alias: "test".to_owned(),
+            currency: "USD".to_owned(),
+            credential_generation: 0,
+            policy: KeyPolicy::default(),
+        },
+        request_body: ConversationBody::InMemory(Bytes::from_static(
+            b"{\"model\":\"test\",\"input\":\"hello\"}",
+        )),
+        hints: crate::conversation::ConversationHints::default(),
+        client_name: None,
+        projection_admission: std::sync::Mutex::new(ConversationProjectionAdmission::Deferred),
+    };
+    let expected = Bytes::from_static(b"{\"output\":\"complete\"}");
+    let actual = read_captured(
+        response(expected.clone(), Arc::new(AtomicUsize::new(0))),
+        64 * 1024 * 1024,
+        ResponseCaptureContext {
+            memory: &memory,
+            budget: budget.clone(),
+            archive: crate::archive::ArchiveStore::memory_for_test(),
+            request_id: Uuid::now_v7(),
+            conversation: Some(&conversation),
+            wait: Duration::from_secs(10),
+        },
+    )
+    .await
+    .unwrap();
+    assert_eq!(actual.as_slice(), expected.as_ref());
+    assert!(matches!(
+        &*conversation.projection_admission.lock().unwrap(),
+        ConversationProjectionAdmission::Reserved(_)
+    ));
+    drop(actual);
+    drop(memory);
+    assert!(budget.snapshot().0 > 0);
+    drop(conversation);
     assert_eq!(budget.snapshot().0, 0);
 }
