@@ -120,6 +120,33 @@ pub(in crate::api::proxy) fn quota_evidence(
     });
     let deadline = header_deadline.into_iter().chain(reset).max();
     SupplierQuotaEvidence {
+        capacity_scope: error.map_or(crate::db::SupplierQuotaScope::Unknown, |error| {
+            use crate::db::SupplierQuotaScope;
+            let metered = error
+                .get("metered_feature")
+                .filter(|value| !value.is_null());
+            let named = error.get("limit_name").filter(|value| !value.is_null());
+            if metered.is_some_and(|value| !value.is_string())
+                || named.is_some_and(|value| !value.is_string())
+                || matches!((metered, named), (Some(left), Some(right)) if left != right)
+            {
+                return SupplierQuotaScope::Unknown;
+            }
+            match metered.or(named).and_then(Value::as_str) {
+                Some("codex") => SupplierQuotaScope::OrdinaryCode,
+                Some("code_review") => SupplierQuotaScope::CodeReview,
+                Some(_) => SupplierQuotaScope::ModelSpecific,
+                None if error.get("model").is_some_and(|model| !model.is_null()) => {
+                    SupplierQuotaScope::ModelSpecific
+                }
+                None if error.get("type").and_then(Value::as_str)
+                    == Some("usage_limit_reached") =>
+                {
+                    SupplierQuotaScope::OrdinaryCode
+                }
+                None => SupplierQuotaScope::Unknown,
+            }
+        }),
         exhausted: error.is_some(),
         reset_at: deadline,
         reset_source: match (header_deadline, reset) {
@@ -358,6 +385,7 @@ pub(in crate::api::proxy) async fn classify_supplier_quota(
             },
             UpstreamFailureKind::Authentication,
             SupplierQuotaEvidence {
+                capacity_scope: crate::db::SupplierQuotaScope::Unknown,
                 exhausted: false,
                 reset_at: None,
                 reset_source: "unknown",
@@ -693,6 +721,50 @@ mod tests {
         );
         assert!(receiver.await.is_err());
         assert_eq!(memory.snapshot().0, 0);
+    }
+
+    #[test]
+    fn quota_capacity_scope_keeps_ordinary_review_and_named_limits_distinct() {
+        use crate::db::SupplierQuotaScope;
+        for (extra, expected) in [
+            (serde_json::json!({}), SupplierQuotaScope::OrdinaryCode),
+            (
+                serde_json::json!({"metered_feature":"code_review"}),
+                SupplierQuotaScope::CodeReview,
+            ),
+            (
+                serde_json::json!({"limit_name":"model-specific"}),
+                SupplierQuotaScope::ModelSpecific,
+            ),
+            (
+                serde_json::json!({"metered_feature":null,"limit_name":"model-specific"}),
+                SupplierQuotaScope::ModelSpecific,
+            ),
+            (
+                serde_json::json!({"metered_feature":"codex","limit_name":"model-specific"}),
+                SupplierQuotaScope::Unknown,
+            ),
+            (
+                serde_json::json!({"metered_feature":{}}),
+                SupplierQuotaScope::Unknown,
+            ),
+        ] {
+            let mut error =
+                serde_json::json!({"type":"usage_limit_reached","resets_in_seconds":300});
+            error
+                .as_object_mut()
+                .unwrap()
+                .extend(extra.as_object().unwrap().clone());
+            let body = serde_json::to_vec(&serde_json::json!({"error":error})).unwrap();
+            let evidence = quota_evidence(&HeaderMap::new(), Some(&body), NOW);
+            assert!(evidence.exhausted);
+            assert_eq!(evidence.capacity_scope, expected);
+        }
+        let body = br#"{"error":{"code":"insufficient_quota"}}"#;
+        assert_eq!(
+            quota_evidence(&HeaderMap::new(), Some(body), NOW).capacity_scope,
+            SupplierQuotaScope::Unknown
+        );
     }
 
     #[test]

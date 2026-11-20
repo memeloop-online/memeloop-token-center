@@ -125,7 +125,8 @@ mod upstream_account_availability;
 pub(crate) mod upstream_concurrency;
 mod upstream_quota_reset;
 pub(crate) mod upstream_service_probes;
-pub(crate) use upstream_service_probes::SupplierQuotaEvidence;
+pub(crate) use routing::SupplierAvailabilityDecision;
+pub(crate) use upstream_service_probes::{SupplierQuotaEvidence, SupplierQuotaScope};
 mod usage_analysis;
 mod validation;
 

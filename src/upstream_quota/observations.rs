@@ -12,9 +12,23 @@ pub(crate) struct RoutingQuotaObservation {
     pub generation: i64,
     pub config_revision: i64,
     pub provider: String,
+    #[serde(default)]
+    pub started_at: i64,
     pub observed_at: i64,
     pub valid_until: i64,
     pub windows: Vec<RoutingQuotaWindow>,
+    /// Absent in historical percentage-only snapshots: those are not proof
+    /// that the supplier permits ordinary Codex execution.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ordinary_code_allowance: Option<OrdinaryCodeAllowance>,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub(crate) struct OrdinaryCodeAllowance {
+    pub started_at: i64,
+    pub window_ids: Vec<String>,
+    #[serde(default)]
+    pub legacy_fence: Option<(i64, i64)>,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -106,12 +120,11 @@ fn observation_timeout_millis(
     let account_budget = super::codex_quota_budget(&account.config)
         .ok()
         .and_then(|budget| i64::try_from(budget.total.as_millis()).ok())
-        .unwrap_or(configured)
-        ;
+        .unwrap_or(configured);
     configured.max(account_budget)
 }
 
-fn project(
+pub(super) fn project(
     account: &crate::provider::UpstreamAccountView,
     snapshot: &super::QuotaSnapshot,
     now: i64,
@@ -183,15 +196,82 @@ fn project(
     if valid_until <= now || windows.is_empty() {
         return None;
     }
+    let ordinary_code_allowance = ordinary_code_allowance(account, snapshot);
     Some(RoutingQuotaObservation {
         account_id: account.id,
         generation: account.credential_generation,
         config_revision: account.updated_at,
         provider: account.driver.clone(),
+        started_at: snapshot.read_started_at.or_else(|| {
+            snapshot
+                .verification_observation
+                .as_ref()
+                .map(|source| source.started_at)
+        })?,
         observed_at,
         valid_until,
         windows,
+        ordinary_code_allowance,
     })
+}
+
+fn ordinary_code_allowance(
+    account: &crate::provider::UpstreamAccountView,
+    snapshot: &super::QuotaSnapshot,
+) -> Option<OrdinaryCodeAllowance> {
+    if account.driver != "openai-codex" || !conclusively_allows_codex(snapshot) {
+        return None;
+    }
+    let source = snapshot.verification_observation.as_ref()?;
+    if source.account_id != account.id
+        || source.generation != account.credential_generation
+        || source.revision != account.updated_at
+        || source.started_at > snapshot.observed_at?
+    {
+        return None;
+    }
+    let windows = snapshot
+        .windows
+        .iter()
+        .filter(|window| window.id.starts_with("code:"))
+        .collect::<Vec<_>>();
+    Some(OrdinaryCodeAllowance {
+        started_at: source.started_at,
+        window_ids: windows.iter().map(|window| window.id.clone()).collect(),
+        legacy_fence: source.legacy_fence,
+    })
+}
+
+pub(super) fn conclusively_allows_codex(snapshot: &super::QuotaSnapshot) -> bool {
+    if snapshot.provider != "openai-codex"
+        || snapshot.status != "ready"
+        || snapshot.stale
+        || snapshot.freshness != "fresh"
+        || snapshot.error_code.is_some()
+        || snapshot
+            .windows
+            .iter()
+            .any(|window| !window.id.starts_with("code:") && !window.id.starts_with("code_review:"))
+    {
+        return false;
+    }
+    let windows = snapshot
+        .windows
+        .iter()
+        .filter(|window| window.id.starts_with("code:"))
+        .collect::<Vec<_>>();
+    if windows.is_empty()
+        || windows.iter().any(|window| {
+            window.source != "codex_usage"
+                || window.allowed != Some(true)
+                || window.limit_reached != Some(false)
+                || window.period_seconds.is_none_or(|period| period <= 0)
+                || window.used_percent.is_some_and(|used| used >= 100.0)
+        })
+    {
+        return false;
+    }
+    true
 }
 
 pub(crate) async fn run(state: AppState, mut shutdown: tokio::sync::watch::Receiver<bool>) {
@@ -415,6 +495,99 @@ mod tests {
     use serde_json::json;
 
     #[test]
+    fn ordinary_allowance_requires_explicit_all_windows_and_read_identity() {
+        let account: crate::provider::UpstreamAccountView = serde_json::from_value(json!({
+            "id":Uuid::from_u128(1),"tenant_id":Uuid::from_u128(2),"name":"fixture","driver":"openai-codex",
+            "auth_kind":"oauth","connection_method":"native_oauth","credential_generation":2,"status":"active",
+            "config":{},"can_refresh":true,"can_rotate":false,"can_reauthorize":true,"route_count":0,"created_at":0,"updated_at":10
+        })).unwrap();
+        let mut snapshot = super::super::QuotaSnapshot::empty(&account, "tenant", None);
+        snapshot.status = "ready";
+        snapshot.read_started_at = Some(90);
+        snapshot.observed_at = Some(100);
+        snapshot.stale_after = Some(200);
+        snapshot.freshness = "fresh";
+        snapshot.verification_observation = Some(super::super::VerificationObservation {
+            account_id: account.id,
+            generation: 2,
+            revision: 10,
+            started_at: 90,
+            legacy_fence: None,
+        });
+        super::super::normalize::usage(
+            &mut snapshot,
+            &json!({"rate_limit": {
+                "allowed": true, "limit_reached": false,
+                "primary_window":{"used_percent":2,"limit_window_seconds":18000},
+                "secondary_window":{"used_percent":2,"limit_window_seconds":604800}
+            }}),
+            100,
+        )
+        .unwrap();
+        let value = project(&account, &snapshot, 150).unwrap();
+        let proof = value.ordinary_code_allowance.as_ref().unwrap();
+        assert_eq!(proof.started_at, 90);
+        assert_eq!(proof.window_ids.len(), 2);
+
+        snapshot.windows[1].used_percent = Some(100.0);
+        assert!(
+            project(&account, &snapshot, 150)
+                .unwrap()
+                .ordinary_code_allowance
+                .is_none()
+        );
+        snapshot.windows[1].used_percent = Some(2.0);
+        snapshot.windows[0].allowed = None;
+        assert!(
+            project(&account, &snapshot, 150)
+                .unwrap()
+                .ordinary_code_allowance
+                .is_none(),
+            "percent alone is not provider permission"
+        );
+        snapshot.windows[0].allowed = Some(true);
+        snapshot.windows[1].id = "model-specific:secondary_window".into();
+        assert!(
+            project(&account, &snapshot, 150)
+                .unwrap()
+                .ordinary_code_allowance
+                .is_none()
+        );
+        snapshot.windows[1].id = "code:secondary_window".into();
+        snapshot
+            .verification_observation
+            .as_mut()
+            .unwrap()
+            .generation += 1;
+        assert!(
+            project(&account, &snapshot, 150)
+                .unwrap()
+                .ordinary_code_allowance
+                .is_none()
+        );
+        snapshot
+            .verification_observation
+            .as_mut()
+            .unwrap()
+            .generation = 2;
+        snapshot.verification_observation.as_mut().unwrap().revision += 1;
+        assert!(
+            project(&account, &snapshot, 150)
+                .unwrap()
+                .ordinary_code_allowance
+                .is_none()
+        );
+
+        let mut historical = serde_json::to_value(value).unwrap();
+        historical
+            .as_object_mut()
+            .unwrap()
+            .remove("ordinary_code_allowance");
+        let restored: RoutingQuotaObservation = serde_json::from_value(historical).unwrap();
+        assert!(restored.ordinary_code_allowance.is_none());
+    }
+
+    #[test]
     fn projection_preserves_unknowns_and_rejects_stale_failed_or_reset_windows() {
         let account: crate::provider::UpstreamAccountView = serde_json::from_value(json!({
             "id":Uuid::from_u128(1),"tenant_id":Uuid::from_u128(2),"name":"fixture","driver":"kimi-oauth",
@@ -423,6 +596,7 @@ mod tests {
         })).unwrap();
         let mut snapshot = super::super::QuotaSnapshot::empty(&account, "tenant", None);
         snapshot.status = "ready";
+        snapshot.read_started_at = Some(90);
         snapshot.observed_at = Some(100);
         snapshot.stale_after = Some(200);
         snapshot.freshness = "fresh";
@@ -533,9 +707,11 @@ mod tests {
             generation: 1,
             config_revision: 10,
             provider: "openai-codex".into(),
+            started_at: 390,
             observed_at: 400,
             valid_until: 30_400,
             windows: Vec::new(),
+            ordinary_code_allowance: None,
         };
         assert_eq!(
             next_refresh_at(&target, Some(&observation), 0, 400, 10_000, 10_000),
@@ -610,6 +786,7 @@ mod tests {
                 supplier_ticks.push(tick_at);
                 snapshot.status = "ready";
                 snapshot.freshness = "fresh";
+                snapshot.read_started_at = Some(tick_at);
                 snapshot.observed_at = Some(finished_at);
                 snapshot.stale_after = Some(finished_at + 30_000);
             }
