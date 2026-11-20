@@ -223,7 +223,7 @@ test('old settlement receipt protects financial fields while new archive observa
   const oldReceipt = { ...event, archive_state: 'bound' as const, cost: null,
     credential_identity: { ...recorded.credential_identity!, key_alias: 'Updated key' },
     operational_terminal: { completed_at: 800, stage: null, financial_state: 'pending' as const } };
-  const refreshed = mergeRefreshedRequestPage([applied], { requests: [{ ...applied, ...oldReceipt }], next_cursor: null })[0];
+  const refreshed = mergeRefreshedRequestPage([applied], { requests: [{ ...applied, ...oldReceipt, created_at: applied.created_at }], next_cursor: null })[0];
   const streamed = requestViewFromEvent(oldReceipt, applied)!;
   for (const row of [refreshed, streamed]) {
     assert.equal(row.cost, applied.cost);
