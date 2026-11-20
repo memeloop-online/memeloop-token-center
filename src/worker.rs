@@ -1242,6 +1242,25 @@ pub async fn archive_session_body(
     lease_owner: Uuid,
     request_id: Uuid,
 ) -> Result<bool, AppError> {
+    archive_session_body_with_result(state, lease_owner, request_id, false).await
+}
+
+/// Exact repair keeps the same durable retry transition while returning its
+/// underlying failure to the operator instead of collapsing it to `false`.
+pub async fn recover_claimed_session_body(
+    state: &AppState,
+    lease_owner: Uuid,
+    request_id: Uuid,
+) -> Result<bool, AppError> {
+    archive_session_body_with_result(state, lease_owner, request_id, true).await
+}
+
+async fn archive_session_body_with_result(
+    state: &AppState,
+    lease_owner: Uuid,
+    request_id: Uuid,
+    report_deferred_error: bool,
+) -> Result<bool, AppError> {
     tracing::debug!(%request_id, %lease_owner, stage = "context_start", "conversation projection stage");
     let (tenant_id, hints, response_complete) =
         state.db.conversation_object_context(request_id).await?;
@@ -1373,7 +1392,11 @@ pub async fn archive_session_body(
                     .db
                     .defer_session_body_archive(lease_owner, request_id)
                     .await?;
-                return Ok(false);
+                return if report_deferred_error {
+                    Err(error)
+                } else {
+                    Ok(false)
+                };
             }
             if locators.source_identity.is_some() {
                 // The writer's lease has been fenced and its actual source is
