@@ -2521,9 +2521,19 @@ async fn postgres_exact_legacy_body_rebuild_preserves_incomplete_and_financial_r
     sqlx::query("UPDATE conversation_projection_outbox SET projected_at = 42, lease_owner = NULL, lease_expires_at = NULL, terminal_lease_owner = NULL, terminal_lease_expires_at = NULL, semantic_snapshot_json = NULL, semantic_payload_snapshot_json = NULL WHERE request_id = $1")
         .bind(fixture.request_id.to_string()).execute(&db.pool).await.unwrap();
     let financial_before: String = sqlx::query_scalar(
-        "SELECT row_to_json(t)::TEXT FROM terminal_projection_outbox t WHERE request_id = $1",
+        "SELECT (to_jsonb(t) - 'session_id')::TEXT FROM terminal_projection_outbox t WHERE request_id = $1",
     )
     .bind(fixture.request_id.to_string())
+    .fetch_one(&db.pool)
+    .await
+    .unwrap();
+    let ledger_before: (i64, i64) = sqlx::query_as("SELECT COUNT(*), COALESCE(SUM(amount_micros),0)::BIGINT FROM ledger_entries WHERE kind = 'usage' AND source = $1")
+        .bind(fixture.identity.reservation_id.to_string()).fetch_one(&db.pool).await.unwrap();
+    assert_eq!(ledger_before.0, 1);
+    let balance_before: (i64, i64) = sqlx::query_as(
+        "SELECT available_micros, reserved_micros FROM credit_accounts WHERE id = $1",
+    )
+    .bind(fixture.key.account_id.to_string())
     .fetch_one(&db.pool)
     .await
     .unwrap();
@@ -2687,13 +2697,24 @@ async fn postgres_exact_legacy_body_rebuild_preserves_incomplete_and_financial_r
     );
     assert!(manifest.raw_sources.is_some());
     let financial_after: String = sqlx::query_scalar(
-        "SELECT row_to_json(t)::TEXT FROM terminal_projection_outbox t WHERE request_id = $1",
+        "SELECT (to_jsonb(t) - 'session_id')::TEXT FROM terminal_projection_outbox t WHERE request_id = $1",
     )
     .bind(fixture.request_id.to_string())
     .fetch_one(&db.pool)
     .await
     .unwrap();
     assert_eq!(financial_before, financial_after);
+    let ledger_after: (i64, i64) = sqlx::query_as("SELECT COUNT(*), COALESCE(SUM(amount_micros),0)::BIGINT FROM ledger_entries WHERE kind = 'usage' AND source = $1")
+        .bind(fixture.identity.reservation_id.to_string()).fetch_one(&db.pool).await.unwrap();
+    let balance_after: (i64, i64) = sqlx::query_as(
+        "SELECT available_micros, reserved_micros FROM credit_accounts WHERE id = $1",
+    )
+    .bind(fixture.key.account_id.to_string())
+    .fetch_one(&db.pool)
+    .await
+    .unwrap();
+    assert_eq!(ledger_before, ledger_after);
+    assert_eq!(balance_before, balance_after);
     assert_eq!(
         fixture.state.archive.get(&request_locator).await.unwrap(),
         request
