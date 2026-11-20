@@ -261,6 +261,14 @@ async fn rustfs_buffered_response_preserves_complete_original_and_releases_ram()
     let budget = Arc::new(crate::gateway_body::memory::ProxyMemoryBudget::new(
         2 * 1024 * 1024,
     ));
+    let blocker = budget.reservation();
+    assert!(blocker.try_grow(1536 * 1024, 1));
+    let converted = Arc::new(tokio::sync::Notify::new());
+    let release_ready = converted.clone();
+    let release = tokio::spawn(async move {
+        release_ready.notified().await;
+        drop(blocker);
+    });
     let memory = budget.reservation();
     let expected = Bytes::from(format!(
         "{{\"output\":\"{}\"}}",
@@ -277,12 +285,13 @@ async fn rustfs_buffered_response_preserves_complete_original_and_releases_ram()
             request_id: Uuid::now_v7(),
             conversation: None,
             wait: Duration::from_secs(30),
-            conversion_ready: None,
+            conversion_ready: Some(converted),
             adapter_envelope: 0,
         },
     )
     .await
     .unwrap();
+    release.await.unwrap();
     assert_eq!(actual.as_slice(), expected.as_ref());
     assert_eq!(
         polls.load(Ordering::SeqCst),
