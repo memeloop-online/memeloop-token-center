@@ -9,6 +9,35 @@ pub(super) async fn read(
     request: &BufferedRequest<'_>,
     state: &AppState,
 ) -> Result<Vec<u8>, BoundedUpstreamError> {
+    read_captured(
+        response,
+        maximum,
+        ResponseCaptureContext {
+            memory: &request.memory,
+            budget: state.proxy_memory_budget.clone(),
+            archive: state.archive.clone(),
+            request_id: request.request_id,
+            conversation: request.conversation.as_ref(),
+            wait: request.memory_admission_wait,
+        },
+    )
+    .await
+}
+
+struct ResponseCaptureContext<'a> {
+    memory: &'a crate::gateway_body::memory::ProxyMemoryReservation,
+    budget: std::sync::Arc<crate::gateway_body::memory::ProxyMemoryBudget>,
+    archive: crate::archive::ArchiveStore,
+    request_id: Uuid,
+    conversation: Option<&'a ProxyConversation>,
+    wait: Duration,
+}
+
+async fn read_captured(
+    response: UpstreamResponse,
+    maximum: usize,
+    context: ResponseCaptureContext<'_>,
+) -> Result<Vec<u8>, BoundedUpstreamError> {
     if response
         .headers()
         .get_all(header::CONTENT_ENCODING)
@@ -24,7 +53,7 @@ pub(super) async fn read(
         return Err(BoundedUpstreamError::ResponseTooLarge);
     }
     let staging = crate::archive_staging::ArchiveStagingKey::new(
-        crate::archive_staging::ArchiveStagingOwner::ProxyRequest(request.request_id),
+        crate::archive_staging::ArchiveStagingOwner::ProxyRequest(context.request_id),
         crate::archive_staging::ArchiveStagingPurpose::Response,
         Uuid::now_v7(),
     )
@@ -47,11 +76,7 @@ pub(super) async fn read(
     });
     let source = BodyCarrier::capture(
         stream,
-        CarrierCapture::new(
-            state.proxy_memory_budget.clone(),
-            Some(state.archive.clone()),
-            staging,
-        ),
+        CarrierCapture::new(context.budget, Some(context.archive), staging),
     )
     .await;
     let source = source.map_err(|_| failure.unwrap_or(BoundedUpstreamError::Stream))?;
@@ -61,10 +86,10 @@ pub(super) async fn read(
         .seal_to_objects()
         .await
         .map_err(|_| BoundedUpstreamError::Stream)?;
-    let memory = &request.memory;
-    let deadline = tokio::time::Instant::now() + request.memory_admission_wait;
+    let memory = context.memory;
+    let deadline = tokio::time::Instant::now() + context.wait;
     let nodes = scanner.observe(&[]);
-    let reserved = if let Some(conversation) = request.conversation.as_ref() {
+    let reserved = if let Some(conversation) = context.conversation {
         conversation
             .reserve_for_buffered_shape(memory, length, nodes, deadline)
             .await
@@ -79,7 +104,7 @@ pub(super) async fn read(
     }
     let mut guard = super::buffered_upstream::ResponseReadMemory {
         memory,
-        conversation: request.conversation.as_ref(),
+        conversation: context.conversation,
         keep: false,
     };
     let mut body = Vec::new();
@@ -93,3 +118,7 @@ pub(super) async fn read(
     guard.keep = true;
     Ok(body)
 }
+
+#[cfg(test)]
+#[path = "buffered_carrier_tests.rs"]
+mod tests;

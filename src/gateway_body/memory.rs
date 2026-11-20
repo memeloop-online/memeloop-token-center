@@ -621,6 +621,15 @@ impl ProxyMemoryReservation {
         )
         .ok()?;
         let units = response_units.checked_add(projection_units)?;
+        let held_bytes = self.held.lock().ok()?.0;
+        if units as usize
+            > self
+                .capacity
+                .saturating_sub(held_bytes)
+                .div_ceil(UNIT_BYTES)
+        {
+            return None;
+        }
         // No response or projection allocation is retained while this atomic
         // acquisition waits. The source has already moved to typed objects.
         let mut permit =
@@ -641,22 +650,6 @@ impl ProxyMemoryReservation {
         Some(ConversationProjectionPermit {
             _permit: projection,
         })
-    }
-
-    pub(crate) fn reserve_response_json_shape(&self, bytes: usize, nodes: usize) -> bool {
-        bytes
-            .checked_mul(2)
-            .and_then(|tree| {
-                nodes
-                    .checked_mul(256)
-                    .and_then(|nodes| tree.checked_add(nodes))
-            })
-            .and_then(|tree| {
-                bytes
-                    .checked_mul(CAPTURE_MEMORY_WEIGHT)
-                    .map(|copies| copies.max(tree))
-            })
-            .is_some_and(|required| self.resize_buffered_response(required, false))
     }
 
     pub(crate) fn reserve_response_json(&self, body: &[u8]) -> bool {
