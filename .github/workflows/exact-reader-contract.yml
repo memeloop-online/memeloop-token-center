@@ -764,7 +764,7 @@ jobs:
       - name: Run memory framing and live delivery contracts
         run: |
           set -o pipefail
-          for selector in gateway_body::memory::tests api::sse::framer::tests api::proxy::streaming::tests api::proxy::streaming::terminal_delivery::tests; do
+          for selector in gateway_body::memory::tests api::sse::framer::tests api::proxy::streaming::tests api::proxy::streaming::terminal_delivery::tests api::proxy::buffered_carrier::tests; do
             cargo test --locked --lib "$selector" -- --nocapture 2>&1 | tee /tmp/response-memory.log
             grep -E '[1-9][0-9]* passed; 0 failed' /tmp/response-memory.log
           done
