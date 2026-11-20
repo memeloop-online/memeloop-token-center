@@ -97,6 +97,8 @@ mod tests {
             generation: 7,
             config_revision: 9,
             provider: "kimi-oauth".into(),
+            ordinary_code_allowance: None,
+            started_at: 890,
             observed_at: 900,
             valid_until: 1100,
             windows: vec![RoutingQuotaWindow {

@@ -1,4 +1,6 @@
 mod associations;
+mod availability;
+pub(crate) use availability::SupplierAvailabilityDecision;
 mod catalog_policy;
 mod create_idempotency;
 pub mod egress;

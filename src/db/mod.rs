@@ -125,7 +125,8 @@ mod upstream_account_availability;
 pub(crate) mod upstream_concurrency;
 mod upstream_quota_reset;
 pub(crate) mod upstream_service_probes;
-pub(crate) use upstream_service_probes::SupplierQuotaEvidence;
+pub(crate) use routing::SupplierAvailabilityDecision;
+pub(crate) use upstream_service_probes::{SupplierQuotaEvidence, SupplierQuotaScope};
 mod usage_analysis;
 mod validation;
 
@@ -827,6 +828,11 @@ impl Database {
             let pool_size = self.pool.size();
             let pool_idle = self.pool.num_idle();
             let diagnostics = self.pool.diagnostics();
+            tracing::warn!(
+                active_pooled_transactions = self.pool.active_transactions(),
+                pool_label = diagnostics.label,
+                "database pooled transaction ownership"
+            );
             diagnostics.observe_phases();
             let (waiters, initializing, cancelled, failed, returned, discarded) =
                 diagnostics.snapshot();

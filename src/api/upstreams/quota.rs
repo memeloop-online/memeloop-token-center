@@ -168,7 +168,7 @@ async fn read_quota_snapshot(
     fresh: bool,
     trigger: crate::upstream_quota::QuotaReadTrigger,
 ) -> crate::upstream_quota::QuotaSnapshot {
-    if fresh {
+    let mut snapshot = if fresh {
         state
             .upstream_quota
             .read_fresh(state, account, credential, tenant, trigger)
@@ -178,7 +178,13 @@ async fn read_quota_snapshot(
             .upstream_quota
             .read(state, account, credential, tenant, trigger)
             .await
-    }
+    };
+    snapshot.routing_availability = state
+        .db
+        .supplier_availability_decisions(account.id)
+        .await
+        .ok();
+    snapshot
 }
 
 async fn quota_batch_result(

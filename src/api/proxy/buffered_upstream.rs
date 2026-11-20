@@ -4,6 +4,7 @@ use super::*;
 pub(super) enum BoundedUpstreamError {
     ContentEncoding,
     MemoryCapacity,
+    ObjectStore,
     ReadTimeout,
     RequestTimeout,
     ResponseTooLarge,
@@ -28,6 +29,7 @@ impl BoundedUpstreamError {
     pub(super) fn code(self) -> &'static str {
         match self {
             Self::ContentEncoding => "upstream_invalid_content_encoding",
+            Self::ObjectStore => "upstream_response_object_store",
             Self::MemoryCapacity => "upstream_response_memory_capacity",
             Self::ReadTimeout => upstream_response::UPSTREAM_READ_TIMEOUT,
             Self::RequestTimeout => upstream_response::UPSTREAM_REQUEST_TIMEOUT,
@@ -77,6 +79,7 @@ pub(super) fn is_local_response_boundary(error_code: &str) -> bool {
             | "upstream_response_terminal_too_large"
             | "upstream_response_too_large"
             | "upstream_response_memory_capacity"
+            | "upstream_response_object_store"
             | "upstream_unsupported_chat_output"
     )
 }

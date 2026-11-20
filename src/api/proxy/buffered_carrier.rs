@@ -86,13 +86,13 @@ async fn read_captured(
         CarrierCapture::new(context.budget, Some(context.archive), staging),
     )
     .await;
-    let source = source.map_err(|_| failure.unwrap_or(BoundedUpstreamError::Stream))?;
+    let source = source.map_err(|_| failure.unwrap_or(BoundedUpstreamError::ObjectStore))?;
     // Offload all source allocations before acquiring conversion credit: no
     // converter waits while retaining its own partial response in RAM.
     source
         .seal_to_objects()
         .await
-        .map_err(|_| BoundedUpstreamError::Stream)?;
+        .map_err(|_| BoundedUpstreamError::ObjectStore)?;
     #[cfg(test)]
     if let Some(ready) = &context.conversion_ready {
         ready.notify_one();
@@ -132,7 +132,7 @@ async fn read_captured(
     source
         .read_into(0, &mut body)
         .await
-        .map_err(|_| BoundedUpstreamError::Stream)?;
+        .map_err(|_| BoundedUpstreamError::ObjectStore)?;
     guard.keep = true;
     Ok(body)
 }

@@ -225,18 +225,11 @@ impl Database {
         } = selection;
         // Availability is read in the existing candidate snapshot, never by a
         // remote probe or a new per-attempt health query.
-        let rows = sqlx::query(
-             "SELECT r.id AS route_id, r.priority, candidates.scheduling_weight, candidates.upstream_model,
+        let rows = sqlx::query(sqlx::AssertSqlSafe(format!(
+            "SELECT r.id AS route_id, r.priority, candidates.scheduling_weight, candidates.upstream_model,
                      a.id AS account_id, a.driver, a.updated_at AS transport_revision,
                      a.credential_generation,
-                     CAST(CASE
-                       WHEN (quota.reset_at > $6 OR
-                             (quota.reset_at IS NULL AND quota.failure_kind = 'quota_exhausted'))
-                         OR (legacy.cooldown_until > $6 AND legacy.last_failure_kind IN ('quota_exhausted', 'rate_limited'))
-                         THEN 2
-                       WHEN service_probe.status = 'unhealthy' THEN 1
-                       ELSE 0
-                     END AS BIGINT) AS probe_rank
+                     {availability_rank} AS probe_rank
              FROM model_routes r
              JOIN model_route_eligible_upstream_accounts candidates
                ON candidates.tenant_id = r.tenant_id AND candidates.model_route_id = r.id
@@ -266,7 +259,8 @@ impl Database {
                )
              ORDER BY r.priority ASC, r.id ASC, a.id ASC
              LIMIT $5",
-        )
+            availability_rank = super::availability::CANDIDATE_AVAILABILITY_RANK,
+        )))
         .bind(tenant_id.to_string())
         .bind(public_model)
         .bind(protocol)
@@ -355,18 +349,11 @@ impl Database {
         protocol: &str,
     ) -> Result<Vec<AnyRow>, AppError> {
         let limit = PROXY_ROUTING_POLICY.candidate_query_limit();
-        let configured = sqlx::query(
+        let configured = sqlx::query(sqlx::AssertSqlSafe(format!(
             "SELECT r.id AS route_id, r.priority, link.scheduling_weight, r.upstream_model,
                     a.id AS account_id, a.driver, a.updated_at AS transport_revision,
                     a.credential_generation,
-                    CAST(CASE
-                      WHEN (quota.reset_at > $6 OR
-                            (quota.reset_at IS NULL AND quota.failure_kind = 'quota_exhausted'))
-                        OR (legacy.cooldown_until > $6 AND legacy.last_failure_kind IN ('quota_exhausted', 'rate_limited'))
-                        THEN 2
-                      WHEN service_probe.status = 'unhealthy' THEN 1
-                      ELSE 0
-                    END AS BIGINT) AS probe_rank
+                    {availability_rank} AS probe_rank
              FROM model_routes r
              JOIN (
                SELECT direct.tenant_id, direct.model_route_id, direct.upstream_account_id,
@@ -409,7 +396,8 @@ impl Database {
                )
              ORDER BY probe_rank ASC, r.priority ASC, r.id ASC, a.id ASC
              LIMIT $4",
-        )
+            availability_rank = super::availability::CANDIDATE_AVAILABILITY_RANK,
+        )))
         .bind(tenant_id.to_string())
         .bind(public_model)
         .bind(protocol)
@@ -426,18 +414,11 @@ impl Database {
             %tenant_id,
             "no configured upstream was visible; selecting any active account on the route"
         );
-        sqlx::query(
+        sqlx::query(sqlx::AssertSqlSafe(format!(
             "SELECT r.id AS route_id, r.priority, 100 AS scheduling_weight, r.upstream_model,
                     a.id AS account_id, a.driver, a.updated_at AS transport_revision,
                     a.credential_generation,
-                    CAST(CASE
-                      WHEN (quota.reset_at > $6 OR
-                            (quota.reset_at IS NULL AND quota.failure_kind = 'quota_exhausted'))
-                        OR (legacy.cooldown_until > $6 AND legacy.last_failure_kind IN ('quota_exhausted', 'rate_limited'))
-                        THEN 2
-                      WHEN service_probe.status = 'unhealthy' THEN 1
-                      ELSE 0
-                    END AS BIGINT) AS probe_rank
+                    {availability_rank} AS probe_rank
              FROM model_routes r
              JOIN upstream_accounts a
                ON a.id = r.upstream_account_id
@@ -468,7 +449,8 @@ impl Database {
                )
              ORDER BY probe_rank ASC, a.id ASC
              LIMIT $4",
-        )
+            availability_rank = super::availability::CANDIDATE_AVAILABILITY_RANK,
+        )))
         .bind(tenant_id.to_string())
         .bind(public_model)
         .bind(protocol)

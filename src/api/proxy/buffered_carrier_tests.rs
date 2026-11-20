@@ -336,3 +336,20 @@ async fn small_component_input_retains_declared_output_envelope() {
     drop(envelope);
     assert_eq!(budget.snapshot().0, 0);
 }
+
+#[test]
+fn object_store_failure_is_local_health_evidence_with_distinct_code() {
+    let code = BoundedUpstreamError::ObjectStore.code();
+    assert_eq!(code, "upstream_response_object_store");
+    assert!(super::super::buffered_upstream::is_local_response_boundary(
+        code
+    ));
+    assert!(matches!(
+        upstream_error_health_terminal(code),
+        UpstreamAttemptTerminal::Inconclusive
+    ));
+    assert_eq!(
+        BoundedUpstreamError::from_stream_error("upstream_read_timeout").code(),
+        "upstream_read_timeout"
+    );
+}

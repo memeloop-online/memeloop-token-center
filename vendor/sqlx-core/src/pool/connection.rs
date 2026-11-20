@@ -15,6 +15,25 @@ use crate::pool::options::PoolConnectionMetadata;
 
 const CLOSE_ON_DROP_TIMEOUT: Duration = Duration::from_secs(5);
 
+async fn close_with_budget(
+    budget: Duration,
+    close: impl Future<Output = Result<(), Error>>,
+) -> Result<(), Error> {
+    match crate::rt::timeout(budget, close).await {
+        Ok(result) => result,
+        Err(_) => {
+            tracing::warn!(
+                phase = "close_health",
+                error_kind = "close_health_timeout",
+                "database connection close timed out"
+            );
+            Err(Error::Protocol(
+                "database connection close health check timed out".into(),
+            ))
+        }
+    }
+}
+
 /// A connection managed by a [`Pool`][crate::pool::Pool].
 ///
 /// Will be returned to the pool on-drop.
@@ -85,7 +104,8 @@ impl<DB: Database> PoolConnection<DB> {
     /// [`.close()`]: Connection::close
     pub async fn close(mut self) -> Result<(), Error> {
         let floating = self.take_live().float(self.pool.clone());
-        floating.inner.raw.close().await
+        let budget = floating.guard.pool.options.acquire_timeout;
+        close_with_budget(budget, floating.inner.raw.close()).await
     }
 
     /// Close this connection on-drop, instead of returning it to the pool.
@@ -350,13 +370,15 @@ impl<DB: Database> Floating<DB, Live<DB>> {
 
     pub async fn close(self) {
         // This isn't used anywhere that we care about the return value
-        let _ = self.inner.raw.close().await;
+        let budget = self.guard.pool.options.acquire_timeout;
+        let _ = close_with_budget(budget, self.inner.raw.close()).await;
 
         // `guard` is dropped as intended
     }
 
     pub async fn close_hard(self) {
-        let _ = self.inner.raw.close_hard().await;
+        let budget = self.guard.pool.options.acquire_timeout;
+        let _ = close_with_budget(budget, self.inner.raw.close_hard()).await;
     }
 
     pub fn detach(self) -> DB::Connection {
@@ -402,15 +424,14 @@ impl<DB: Database> Floating<DB, Idle<DB>> {
     }
 
     pub async fn close(self) -> DecrementSizeGuard<DB> {
-        if let Err(error) = self.inner.live.raw.close().await {
-            tracing::debug!(%error, "error occurred while closing the pool connection");
-        }
+        let budget = self.guard.pool.options.acquire_timeout;
+        let _ = close_with_budget(budget, self.inner.live.raw.close()).await;
         self.guard
     }
 
     pub async fn close_hard(self) -> DecrementSizeGuard<DB> {
-        let _ = self.inner.live.raw.close_hard().await;
-
+        let budget = self.guard.pool.options.acquire_timeout;
+        let _ = close_with_budget(budget, self.inner.live.raw.close_hard()).await;
         self.guard
     }
 
