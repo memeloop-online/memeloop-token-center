@@ -19,6 +19,8 @@ pub(super) async fn read(
             request_id: request.request_id,
             conversation: request.conversation.as_ref(),
             wait: request.memory_admission_wait,
+            #[cfg(test)]
+            conversion_ready: None,
         },
     )
     .await
@@ -31,6 +33,8 @@ struct ResponseCaptureContext<'a> {
     request_id: Uuid,
     conversation: Option<&'a ProxyConversation>,
     wait: Duration,
+    #[cfg(test)]
+    conversion_ready: Option<std::sync::Arc<tokio::sync::Notify>>,
 }
 
 async fn read_captured(
@@ -86,6 +90,10 @@ async fn read_captured(
         .seal_to_objects()
         .await
         .map_err(|_| BoundedUpstreamError::Stream)?;
+    #[cfg(test)]
+    if let Some(ready) = &context.conversion_ready {
+        ready.notify_one();
+    }
     let memory = context.memory;
     let deadline = tokio::time::Instant::now() + context.wait;
     let nodes = scanner.observe(&[]);

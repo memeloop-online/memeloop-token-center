@@ -31,11 +31,13 @@ async fn unknown_length_small_responses_share_actual_budget_and_preserve_bytes()
     ));
     let archive = crate::archive::ArchiveStore::memory_for_test();
     let ready = Arc::new(tokio::sync::Barrier::new(33));
+    let release = Arc::new(tokio::sync::Barrier::new(33));
     let mut tasks = Vec::new();
     for _ in 0..32 {
         let budget = budget.clone();
         let archive = archive.clone();
         let ready = ready.clone();
+        let release = release.clone();
         tasks.push(tokio::spawn(async move {
             let memory = budget.reservation();
             let polls = Arc::new(AtomicUsize::new(0));
@@ -50,6 +52,7 @@ async fn unknown_length_small_responses_share_actual_budget_and_preserve_bytes()
                     request_id: Uuid::now_v7(),
                     conversation: None,
                     wait: Duration::from_secs(10),
+                    conversion_ready: None,
                 },
             )
             .await
@@ -57,11 +60,13 @@ async fn unknown_length_small_responses_share_actual_budget_and_preserve_bytes()
             assert_eq!(actual.as_slice(), expected.as_ref());
             assert_eq!(polls.load(Ordering::SeqCst), 1);
             ready.wait().await;
+            release.wait().await;
             drop(actual);
         }));
     }
     ready.wait().await;
     assert!(budget.snapshot().0 > 0);
+    release.wait().await;
     for task in tasks {
         task.await.unwrap();
     }
@@ -87,6 +92,7 @@ async fn object_capture_replays_large_body_under_pressure_with_one_upstream_pass
             request_id: Uuid::now_v7(),
             conversation: None,
             wait: Duration::from_secs(10),
+            conversion_ready: None,
         },
     )
     .await
@@ -111,6 +117,8 @@ async fn cancelled_conversion_wait_releases_capture_without_repolling_upstream()
     let polls = Arc::new(AtomicUsize::new(0));
     let observed = polls.clone();
     let task_budget = budget.clone();
+    let conversion_ready = Arc::new(tokio::sync::Notify::new());
+    let observed_ready = conversion_ready.clone();
     let task = tokio::spawn(async move {
         let memory = task_budget.reservation();
         read_captured(
@@ -126,20 +134,14 @@ async fn cancelled_conversion_wait_releases_capture_without_repolling_upstream()
                 request_id: Uuid::now_v7(),
                 conversation: None,
                 wait: Duration::from_secs(60),
+                conversion_ready: Some(observed_ready),
             },
         )
         .await
     });
-    tokio::time::timeout(Duration::from_secs(10), async {
-        while polls.load(Ordering::SeqCst) < 17 {
-            tokio::task::yield_now().await;
-        }
-        while budget.snapshot().0 != 1536 * 1024 {
-            tokio::task::yield_now().await;
-        }
-    })
-    .await
-    .unwrap();
+    tokio::time::timeout(Duration::from_secs(10), conversion_ready.notified())
+        .await
+        .unwrap();
     assert!(!task.is_finished());
     task.abort();
     assert!(task.await.unwrap_err().is_cancelled());
@@ -220,6 +222,7 @@ async fn response_and_conversation_projection_share_one_conversion_acquisition()
             request_id: Uuid::now_v7(),
             conversation: Some(&conversation),
             wait: Duration::from_secs(10),
+            conversion_ready: None,
         },
     )
     .await
@@ -269,6 +272,7 @@ async fn rustfs_buffered_response_preserves_complete_original_and_releases_ram()
             request_id: Uuid::now_v7(),
             conversation: None,
             wait: Duration::from_secs(30),
+            conversion_ready: None,
         },
     )
     .await
