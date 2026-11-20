@@ -623,10 +623,7 @@ impl ProxyMemoryReservation {
         let units = response_units.checked_add(projection_units)?;
         let held_bytes = self.held.lock().ok()?.0;
         if units as usize
-            > self
-                .capacity
-                .saturating_sub(held_bytes)
-                .div_ceil(UNIT_BYTES)
+            > (self.capacity / UNIT_BYTES).saturating_sub(held_bytes.div_ceil(UNIT_BYTES))
         {
             return None;
         }
