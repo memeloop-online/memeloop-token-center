@@ -2725,7 +2725,7 @@ impl ProxyConversation {
         bytes: usize,
         nodes: usize,
         adapter_envelope: usize,
-        deadline: tokio::time::Instant,
+        deadline: Option<tokio::time::Instant>,
     ) -> bool {
         let (projection_bytes, projection_weight) = match &self.request_body {
             ConversationBody::ProjectedSpool {
@@ -2733,20 +2733,30 @@ impl ProxyConversation {
             } => (*json_memory_bytes, 1),
             body => (body.len(), body.projection_weight()),
         };
-        let admission = memory
-            .reserve_buffered_shape_with_projection(
+        let permit = if let Some(deadline) = deadline {
+            memory
+                .reserve_buffered_shape_with_projection(
+                    bytes,
+                    nodes,
+                    adapter_envelope,
+                    projection_bytes,
+                    projection_weight,
+                    deadline,
+                )
+                .await
+        } else {
+            memory.try_reserve_buffered_shape_with_projection(
                 bytes,
                 nodes,
                 adapter_envelope,
                 projection_bytes,
                 projection_weight,
-                deadline,
             )
-            .await
-            .map_or(
-                ConversationProjectionAdmission::Rejected,
-                ConversationProjectionAdmission::Reserved,
-            );
+        };
+        let admission = permit.map_or(
+            ConversationProjectionAdmission::Rejected,
+            ConversationProjectionAdmission::Reserved,
+        );
         let reserved = matches!(&admission, ConversationProjectionAdmission::Reserved(_));
         if let Ok(mut current) = self.projection_admission.lock() {
             *current = admission;

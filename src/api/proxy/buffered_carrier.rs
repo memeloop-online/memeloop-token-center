@@ -87,36 +87,60 @@ async fn read_captured(
     )
     .await;
     let source = source.map_err(|_| failure.unwrap_or(BoundedUpstreamError::ObjectStore))?;
-    // Offload all source allocations before acquiring conversion credit: no
-    // converter waits while retaining its own partial response in RAM.
-    source
-        .seal_to_objects()
-        .await
-        .map_err(|_| BoundedUpstreamError::ObjectStore)?;
-    #[cfg(test)]
-    if let Some(ready) = &context.conversion_ready {
-        ready.notify_one();
-    }
     let memory = context.memory;
-    let deadline = tokio::time::Instant::now() + context.wait;
     let nodes = scanner.observe(&[]);
-    let reserved = if let Some(conversation) = context.conversation {
+    let mut reserved = if let Some(conversation) = context.conversation {
         conversation
-            .reserve_for_buffered_shape(memory, length, nodes, context.adapter_envelope, deadline)
+            .reserve_for_buffered_shape(memory, length, nodes, context.adapter_envelope, None)
             .await
     } else {
         memory
-            .reserve_buffered_shape_with_projection(
+            .try_reserve_buffered_shape_with_projection(
                 length,
                 nodes,
                 context.adapter_envelope,
                 0,
                 1,
-                deadline,
             )
-            .await
             .is_some()
     };
+    if !reserved {
+        // A failed atomic try owns no conversion credit. Offload the source
+        // before joining the shared queue so converters cannot pin fragments
+        // while waiting for each other's memory.
+        source
+            .seal_to_objects()
+            .await
+            .map_err(|_| BoundedUpstreamError::ObjectStore)?;
+        #[cfg(test)]
+        if let Some(ready) = &context.conversion_ready {
+            ready.notify_one();
+        }
+        let deadline = tokio::time::Instant::now() + context.wait;
+        reserved = if let Some(conversation) = context.conversation {
+            conversation
+                .reserve_for_buffered_shape(
+                    memory,
+                    length,
+                    nodes,
+                    context.adapter_envelope,
+                    Some(deadline),
+                )
+                .await
+        } else {
+            memory
+                .reserve_buffered_shape_with_projection(
+                    length,
+                    nodes,
+                    context.adapter_envelope,
+                    0,
+                    1,
+                    deadline,
+                )
+                .await
+                .is_some()
+        };
+    }
     if !reserved {
         return Err(BoundedUpstreamError::MemoryCapacity);
     }

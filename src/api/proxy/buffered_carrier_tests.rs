@@ -353,3 +353,49 @@ fn object_store_failure_is_local_health_evidence_with_distinct_code() {
         "upstream_read_timeout"
     );
 }
+
+#[tokio::test]
+async fn ram_credit_delivers_small_response_with_unreachable_object_backend() {
+    let mut config = crate::config::Config::for_test("sqlite::memory:".into());
+    config.archive_backend = crate::config::ArchiveBackend::S3;
+    config.s3_endpoint = Some("http://127.0.0.1:9".into());
+    config.s3_bucket = Some("unavailable-fixture".into());
+    config.s3_access_key = Some("synthetic-fixture".into());
+    config.s3_secret_key = Some("synthetic-fixture".into());
+    config.s3_region = "us-east-1".into();
+    config.s3_allow_http = true;
+    let archive = crate::archive::ArchiveStore::from_config(&config)
+        .await
+        .unwrap();
+    let budget = Arc::new(crate::gateway_body::memory::ProxyMemoryBudget::new(
+        2 * 1024 * 1024,
+    ));
+    let memory = budget.reservation();
+    let expected = Bytes::from_static(b"{\"output\":\"ram-fast-path\"}");
+    let polls = Arc::new(AtomicUsize::new(0));
+    let actual = tokio::time::timeout(
+        Duration::from_secs(2),
+        read_captured(
+            response(expected.clone(), polls.clone()),
+            64 * 1024 * 1024,
+            ResponseCaptureContext {
+                memory: &memory,
+                budget: budget.clone(),
+                archive,
+                request_id: Uuid::now_v7(),
+                conversation: None,
+                wait: Duration::from_secs(10),
+                conversion_ready: None,
+                adapter_envelope: 0,
+            },
+        ),
+    )
+    .await
+    .unwrap()
+    .unwrap();
+    assert_eq!(actual.as_slice(), expected.as_ref());
+    assert_eq!(polls.load(Ordering::SeqCst), 1);
+    drop(actual);
+    drop(memory);
+    assert_eq!(budget.snapshot().0, 0);
+}
