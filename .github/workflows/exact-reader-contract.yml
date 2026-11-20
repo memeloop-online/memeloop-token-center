@@ -761,6 +761,24 @@ jobs:
       - uses: ./.github/actions/checkout-plugin-examples
       - name: Compile exact response memory contracts
         run: cargo test --locked --lib --no-run
+      - name: Start isolated RustFS fixture
+        env:
+          RUSTFS_ACCESS_KEY: rustfs-test-fixture
+          RUSTFS_SECRET_KEY: synthetic-test-only-secret-707
+        run: |
+          docker run --detach --name rustfs-contract --publish 127.0.0.1:19000:9000 \
+            --memory 1g --cpus 2 --env RUSTFS_ACCESS_KEY --env RUSTFS_SECRET_KEY \
+            --env RUSTFS_ADDRESS=:9000 --env RUSTFS_CONSOLE_ENABLE=false \
+            --env RUSTFS_OBS_LOG_DIRECTORY= --env RUSTFS_OBS_LOGGER_LEVEL=warn \
+            --entrypoint /usr/bin/rustfs \
+            rustfs/rustfs:1.0.4@sha256:ed9210d6411d77ffceb70d94b964a3cb7d225983368bc25bebe01e995293dcc2 /data
+          for attempt in $(seq 1 60); do
+            if curl --fail --silent --aws-sigv4 'aws:amz:us-east-1:s3' \
+              --user "$RUSTFS_ACCESS_KEY:$RUSTFS_SECRET_KEY" \
+              --request PUT http://127.0.0.1:19000/conversation-contract-test; then exit 0; fi
+            sleep 2
+          done
+          exit 1
       - name: Run memory framing and live delivery contracts
         run: |
           set -o pipefail
@@ -768,3 +786,13 @@ jobs:
             cargo test --locked --lib "$selector" -- --nocapture 2>&1 | tee /tmp/response-memory.log
             grep -E '[1-9][0-9]* passed; 0 failed' /tmp/response-memory.log
           done
+      - name: Verify buffered response on real RustFS
+        env:
+          MTC_RUSTFS_TEST_ENDPOINT: http://127.0.0.1:19000
+          MTC_RUSTFS_TEST_BUCKET: conversation-contract-test
+          MTC_RUSTFS_TEST_ACCESS_KEY: rustfs-test-fixture
+          MTC_RUSTFS_TEST_SECRET_KEY: synthetic-test-only-secret-707
+        run: |
+          set -o pipefail
+          cargo test --locked --lib api::proxy::buffered_carrier::tests::rustfs_buffered_response_preserves_complete_original_and_releases_ram -- --ignored --exact --nocapture 2>&1 | tee /tmp/buffered-rustfs.log
+          grep -F '1 passed; 0 failed' /tmp/buffered-rustfs.log
