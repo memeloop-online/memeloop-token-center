@@ -328,12 +328,29 @@ async fn verify(config: Config) {
     db.finish_quota_observation(&target, failure_lease, None, 150)
         .await
         .unwrap();
-    assert!(
+    assert_eq!(
         db.routing_quota_observations(auth.tenant_id, &candidates, 112)
             .await
             .unwrap()
-            .is_empty()
+            .len(),
+        1,
+        "a failed background attempt cannot erase an accepted success"
     );
+    assert!(
+        db.routing_quota_observations(auth.tenant_id, &candidates, 201)
+            .await
+            .unwrap()
+            .is_empty(),
+        "failure does not extend the accepted observation validity"
+    );
+    let retained_valid_until: i64 = sqlx::query_scalar(
+        "SELECT valid_until FROM upstream_quota_observations WHERE upstream_account_id=$1",
+    )
+    .bind(account.id.to_string())
+    .fetch_one(&db.pool)
+    .await
+    .unwrap();
+    assert_eq!(retained_valid_until, value.valid_until);
     let stale_lease = Uuid::now_v7();
     assert!(
         db.claim_quota_observation(&target, stale_lease, 151, 181)

@@ -257,6 +257,7 @@ mod tests {
             attempts: Vec::new(),
             cache_hit: false,
             verification_observation: None,
+            read_started_at: None,
         }
     }
 

@@ -786,6 +786,7 @@ mod tests {
                 supplier_ticks.push(tick_at);
                 snapshot.status = "ready";
                 snapshot.freshness = "fresh";
+                snapshot.read_started_at = Some(tick_at);
                 snapshot.observed_at = Some(finished_at);
                 snapshot.stale_after = Some(finished_at + 30_000);
             }
