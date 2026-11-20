@@ -36,6 +36,7 @@ pub(in crate::api) async fn classify_codex_media_rate_limit(
 #[path = "codex_transport.rs"]
 pub(in crate::api) mod codex_transport;
 
+mod buffered_carrier;
 mod buffered_upstream;
 mod independent_probe;
 pub(in crate::api) use independent_probe::IndependentProbeTarget;
@@ -540,13 +541,12 @@ async fn finish_non_sse_proxy_response(
         proxy_diagnostics::Context::for_request(buffered_request.request_id),
         "buffered_response",
     );
-    let response_body = match read_bounded_upstream(
+    let response_body = match buffered_carrier::read(
         upstream,
         MAX_PROXY_RESPONSE_BODY,
-        &buffered_request.memory,
-        buffered_request.memory_admission_wait,
+        &buffered_request,
+        buffered_request.state,
         false,
-        buffered_request.conversation.as_ref(),
     )
     .await
     {
@@ -2068,13 +2068,12 @@ async fn proxy_with_cancellation_guard(
                 .and_then(|value| value.to_str().ok())
                 .unwrap_or("application/json")
                 .to_owned();
-            let body = read_bounded_upstream(
+            let body = buffered_carrier::read(
                 upstream,
                 MAX_PROXY_RESPONSE_BODY,
-                &buffered_request.memory,
-                buffered_request.memory_admission_wait,
+                &buffered_request,
+                buffered_request.state,
                 false,
-                buffered_request.conversation.as_ref(),
             )
             .await
             .map(Bytes::from);
@@ -2720,6 +2719,41 @@ impl ProxyConversation {
         }
     }
 
+    async fn reserve_for_buffered_shape(
+        &self,
+        memory: &crate::gateway_body::memory::ProxyMemoryReservation,
+        bytes: usize,
+        nodes: usize,
+        adapter_envelope: usize,
+        deadline: tokio::time::Instant,
+    ) -> bool {
+        let (projection_bytes, projection_weight) = match &self.request_body {
+            ConversationBody::ProjectedSpool {
+                json_memory_bytes, ..
+            } => (*json_memory_bytes, 1),
+            body => (body.len(), body.projection_weight()),
+        };
+        let admission = memory
+            .reserve_buffered_shape_with_projection(
+                bytes,
+                nodes,
+                adapter_envelope,
+                projection_bytes,
+                projection_weight,
+                deadline,
+            )
+            .await
+            .map_or(
+                ConversationProjectionAdmission::Rejected,
+                ConversationProjectionAdmission::Reserved,
+            );
+        let reserved = matches!(&admission, ConversationProjectionAdmission::Reserved(_));
+        if let Ok(mut current) = self.projection_admission.lock() {
+            *current = admission;
+        }
+        reserved
+    }
+
     fn reserve_for_buffered_response(
         &self,
         memory: &crate::gateway_body::memory::ProxyMemoryReservation,
@@ -3166,13 +3200,12 @@ async fn execute_component_provider(
         return finish_component_provider_failure(&request, None, "provider_configuration").await;
     };
     let has_content_length = upstream.content_length().is_some();
-    let upstream_body = match read_bounded_upstream(
+    let upstream_body = match buffered_carrier::read(
         upstream,
         maximum.min(MAX_PROXY_RESPONSE_BODY),
-        &request.memory,
-        request.memory_admission_wait,
+        &request,
+        request.state,
         true,
-        request.conversation.as_ref(),
     )
     .await
     {

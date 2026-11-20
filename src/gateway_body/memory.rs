@@ -597,6 +597,60 @@ impl ProxyMemoryReservation {
         }
     }
 
+    pub(crate) async fn reserve_buffered_shape_with_projection(
+        &self,
+        bytes: usize,
+        nodes: usize,
+        adapter_envelope: usize,
+        projection_bytes: usize,
+        projection_weight: usize,
+        deadline: tokio::time::Instant,
+    ) -> Option<ConversationProjectionPermit> {
+        if self.has_buffered_response() {
+            return None;
+        }
+        let required = bytes
+            .checked_mul(2)?
+            .checked_add(nodes.checked_mul(256)?)?
+            .max(bytes.checked_mul(CAPTURE_MEMORY_WEIGHT)?)
+            .max(adapter_envelope.checked_mul(CAPTURE_MEMORY_WEIGHT)?)
+            .max(UNIT_BYTES);
+        let response_units = u32::try_from(required.div_ceil(UNIT_BYTES)).ok()?;
+        let projection_units = u32::try_from(
+            projection_bytes
+                .checked_mul(projection_weight)?
+                .div_ceil(UNIT_BYTES),
+        )
+        .ok()?;
+        let units = response_units.checked_add(projection_units)?;
+        let held_bytes = self.held.lock().ok()?.0;
+        if units as usize
+            > (self.capacity / UNIT_BYTES).saturating_sub(held_bytes.div_ceil(UNIT_BYTES))
+        {
+            return None;
+        }
+        // No response or projection allocation is retained while this atomic
+        // acquisition waits. The source has already moved to typed objects.
+        let mut permit =
+            tokio::time::timeout_at(deadline, self.permits.clone().acquire_many_owned(units))
+                .await
+                .ok()?
+                .ok()?;
+        let projection = permit.split(projection_units as usize)?;
+        let mut held = self.held.lock().ok()?;
+        held.0 = held.0.checked_add(response_units as usize * UNIT_BYTES)?;
+        match held.1.as_mut() {
+            Some(existing) => existing.merge(permit),
+            None => held.1 = Some(permit),
+        }
+        self.response_bytes
+            .store(response_units as usize * UNIT_BYTES, Ordering::Release);
+        self.response_reserved.store(true, Ordering::Release);
+        Some(ConversationProjectionPermit {
+            _permit: projection,
+        })
+    }
+
     pub(crate) fn reserve_response_json(&self, body: &[u8]) -> bool {
         if body.len() > MAX_BUFFERED_RESPONSE_BYTES {
             return false;
