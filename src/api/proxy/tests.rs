@@ -619,12 +619,20 @@ async fn codex_route_fixture_with_archive_directory(
     label: &str,
     archive_directory: &str,
 ) -> CodexRouteFixture {
+    codex_route_fixture_with_database(label, archive_directory, None).await
+}
+
+async fn codex_route_fixture_with_database(
+    label: &str,
+    archive_directory: &str,
+    database_url: Option<String>,
+) -> CodexRouteFixture {
     let directory = tempfile::tempdir().unwrap();
     let archive_path = directory.path().join(archive_directory);
-    let database_url = crate::db::Database::sqlite_database_url(&format!(
+    let database_url = database_url.unwrap_or_else(|| crate::db::Database::sqlite_database_url(&format!(
         "sqlite://{}?mode=rwc",
         directory.path().join(format!("codex-{label}.db")).display()
-    ));
+    )));
     let mut config = Config::for_test(database_url.clone());
     config.archive_backend = ArchiveBackend::Filesystem;
     config.archive_path = Some(archive_path.display().to_string());
