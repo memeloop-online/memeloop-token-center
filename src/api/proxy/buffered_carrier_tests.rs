@@ -235,3 +235,50 @@ async fn response_and_conversation_projection_share_one_conversion_acquisition()
     drop(conversation);
     assert_eq!(budget.snapshot().0, 0);
 }
+
+#[tokio::test]
+#[ignore = "dedicated GHA RustFS fixture"]
+async fn rustfs_buffered_response_preserves_complete_original_and_releases_ram() {
+    let mut config = crate::config::Config::for_test("sqlite::memory:".into());
+    config.archive_backend = crate::config::ArchiveBackend::S3;
+    config.s3_endpoint = Some(std::env::var("MTC_RUSTFS_TEST_ENDPOINT").unwrap());
+    config.s3_bucket = Some(std::env::var("MTC_RUSTFS_TEST_BUCKET").unwrap());
+    config.s3_access_key = Some(std::env::var("MTC_RUSTFS_TEST_ACCESS_KEY").unwrap());
+    config.s3_secret_key = Some(std::env::var("MTC_RUSTFS_TEST_SECRET_KEY").unwrap());
+    config.s3_region = "us-east-1".into();
+    config.s3_allow_http = true;
+    let archive = crate::archive::ArchiveStore::from_config(&config)
+        .await
+        .unwrap();
+    let budget = Arc::new(crate::gateway_body::memory::ProxyMemoryBudget::new(
+        2 * 1024 * 1024,
+    ));
+    let memory = budget.reservation();
+    let expected = Bytes::from(format!(
+        "{{\"output\":\"{}\"}}",
+        "real-object".repeat(20_000)
+    ));
+    let polls = Arc::new(AtomicUsize::new(0));
+    let actual = read_captured(
+        response(expected.clone(), polls.clone()),
+        64 * 1024 * 1024,
+        ResponseCaptureContext {
+            memory: &memory,
+            budget: budget.clone(),
+            archive,
+            request_id: Uuid::now_v7(),
+            conversation: None,
+            wait: Duration::from_secs(30),
+        },
+    )
+    .await
+    .unwrap();
+    assert_eq!(actual.as_slice(), expected.as_ref());
+    assert_eq!(
+        polls.load(Ordering::SeqCst),
+        expected.len().div_ceil(16 * 1024)
+    );
+    drop(actual);
+    drop(memory);
+    assert_eq!(budget.snapshot().0, 0);
+}
