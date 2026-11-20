@@ -2484,3 +2484,247 @@ async fn queued_archive_event_contract(url: String) {
         raw.as_ref()
     );
 }
+
+#[tokio::test]
+async fn postgres_exact_legacy_body_rebuild_preserves_incomplete_and_financial_receipt() {
+    let database_url =
+        std::env::var("MTC_TEST_POSTGRES_URL").expect("exact recovery requires PostgreSQL");
+    let isolated = PostgresTestDatabase::create(&database_url).await;
+    let fixture = Fixture::new(isolated.url().to_owned(), false).await;
+    let db = &fixture.state.db;
+    let request =
+        Bytes::from_static(br#"{"model":"fixture","input":"original question","stream":false}"#);
+    let response = Bytes::from_static(br#"{"object":"response","status":"incomplete","incomplete_details":{"reason":"max_output_tokens"},"output":[{"type":"reasoning","summary":[{"type":"summary_text","text":"reason"}]},{"type":"message","role":"assistant","content":[{"type":"output_text","text":"partial answer"}]}]}"#);
+    let request_locator = format!("legacy-exact/{}/request.json", fixture.request_id);
+    let response_locator = format!("legacy-exact/{}/response.json", fixture.request_id);
+    fixture
+        .state
+        .archive
+        .put(&request_locator, request.clone())
+        .await
+        .unwrap();
+    fixture
+        .state
+        .archive
+        .put(&response_locator, response.clone())
+        .await
+        .unwrap();
+    sqlx::query(
+        "UPDATE request_records SET request_object = $1, response_object = $2 WHERE id = $3",
+    )
+    .bind(&request_locator)
+    .bind(&response_locator)
+    .bind(fixture.request_id.to_string())
+    .execute(&db.pool)
+    .await
+    .unwrap();
+    sqlx::query("UPDATE conversation_projection_outbox SET projected_at = 42, lease_owner = NULL, lease_expires_at = NULL, terminal_lease_owner = NULL, terminal_lease_expires_at = NULL, semantic_snapshot_json = NULL, semantic_payload_snapshot_json = NULL WHERE request_id = $1")
+        .bind(fixture.request_id.to_string()).execute(&db.pool).await.unwrap();
+    let financial_before: String = sqlx::query_scalar(
+        "SELECT (to_jsonb(t) - 'session_id')::TEXT FROM terminal_projection_outbox t WHERE request_id = $1",
+    )
+    .bind(fixture.request_id.to_string())
+    .fetch_one(&db.pool)
+    .await
+    .unwrap();
+    let ledger_before: (i64, i64) = sqlx::query_as("SELECT COUNT(*), COALESCE(SUM(amount_micros),0)::BIGINT FROM ledger_entries WHERE kind = 'usage' AND source = $1")
+        .bind(fixture.identity.reservation_id.to_string()).fetch_one(&db.pool).await.unwrap();
+    assert_eq!(ledger_before.0, 1);
+    let balance_before: (i64, i64) = sqlx::query_as(
+        "SELECT available_micros, reserved_micros FROM credit_accounts WHERE id = $1",
+    )
+    .bind(fixture.key.account_id.to_string())
+    .fetch_one(&db.pool)
+    .await
+    .unwrap();
+    let owner = Uuid::now_v7();
+    assert!(
+        !db.claim_exact_session_body_rebuild(
+            fixture.key.tenant_id,
+            fixture.key.key_id,
+            fixture.request_id,
+            Some(41),
+            &request_locator,
+            &response_locator,
+            owner,
+            None,
+            None
+        )
+        .await
+        .unwrap()
+    );
+    assert!(
+        db.claim_exact_session_body_rebuild(
+            fixture.key.tenant_id,
+            fixture.key.key_id,
+            fixture.request_id,
+            Some(42),
+            &request_locator,
+            &response_locator,
+            owner,
+            None,
+            None
+        )
+        .await
+        .unwrap()
+    );
+    assert!(
+        !db.claim_exact_session_body_rebuild(
+            fixture.key.tenant_id,
+            fixture.key.key_id,
+            fixture.request_id,
+            Some(42),
+            &request_locator,
+            &response_locator,
+            Uuid::now_v7(),
+            None,
+            None
+        )
+        .await
+        .unwrap()
+    );
+    // Interrupt the real writer after durable prepare but before projection ACK.
+    let prepared = fixture
+        .state
+        .archive
+        .prepare_session_body_streamed(
+            fixture.key.tenant_id,
+            fixture.request_id,
+            ConversationHints::default(),
+            request_locator.clone(),
+            Some(response_locator.clone()),
+            true,
+        )
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(
+        db.prepare_archived_session_body_archive(
+            owner,
+            fixture.request_id,
+            prepared.atoms,
+            &prepared.nodes,
+            &prepared.media
+        )
+        .await
+        .unwrap()
+    );
+    let prepared_snapshot: String = sqlx::query_scalar(
+        "SELECT semantic_snapshot_json FROM conversation_projection_outbox WHERE request_id = $1",
+    )
+    .bind(fixture.request_id.to_string())
+    .fetch_one(&db.pool)
+    .await
+    .unwrap();
+    sqlx::query("UPDATE conversation_projection_outbox SET lease_expires_at = 0 WHERE request_id = $1 AND lease_owner = $2")
+        .bind(fixture.request_id.to_string()).bind(owner.to_string()).execute(&db.pool).await.unwrap();
+    let resumed_owner = Uuid::now_v7();
+    assert!(
+        !db.claim_exact_session_body_rebuild(
+            fixture.key.tenant_id,
+            fixture.key.key_id,
+            fixture.request_id,
+            None,
+            &request_locator,
+            &response_locator,
+            resumed_owner,
+            Some(&prepared_snapshot),
+            Some(Uuid::now_v7())
+        )
+        .await
+        .unwrap()
+    );
+    assert!(
+        db.claim_exact_session_body_rebuild(
+            fixture.key.tenant_id,
+            fixture.key.key_id,
+            fixture.request_id,
+            None,
+            &request_locator,
+            &response_locator,
+            resumed_owner,
+            Some(&prepared_snapshot),
+            Some(owner)
+        )
+        .await
+        .unwrap()
+    );
+    let owner = resumed_owner;
+    assert!(
+        crate::worker::archive_session_body(&fixture.state, owner, fixture.request_id)
+            .await
+            .unwrap()
+    );
+    let snapshot: String = sqlx::query_scalar("SELECT semantic_snapshot_json FROM conversation_projection_outbox WHERE request_id = $1 AND projected_at IS NOT NULL")
+        .bind(fixture.request_id.to_string()).fetch_one(&db.pool).await.unwrap();
+    let snapshot: serde_json::Value = serde_json::from_str(&snapshot).unwrap();
+    assert!(
+        snapshot["completed_snapshot_digest_v1"].as_str().is_some()
+            || snapshot["leaf"].as_str().is_some()
+    );
+    let leaf: Option<String> = sqlx::query_scalar(
+        "SELECT leaf_node_hash FROM conversation_observations WHERE request_id = $1",
+    )
+    .bind(fixture.request_id.to_string())
+    .fetch_one(&db.pool)
+    .await
+    .unwrap();
+    assert!(leaf.is_some());
+    let authority = fixture
+        .state
+        .archive
+        .semantic_archive_authority(
+            fixture.key.tenant_id,
+            fixture.request_id,
+            leaf.as_deref().unwrap(),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+    let manifest = fixture
+        .state
+        .archive
+        .get_semantic_manifest_streamed(fixture.key.tenant_id, &authority.publication.manifest)
+        .await
+        .unwrap();
+    assert!(!manifest.coverage.observed_terminal);
+    assert!(
+        manifest
+            .coverage
+            .gaps
+            .iter()
+            .any(|g| g == "response_protocol_incomplete")
+    );
+    assert!(manifest.raw_sources.is_some());
+    let financial_after: String = sqlx::query_scalar(
+        "SELECT (to_jsonb(t) - 'session_id')::TEXT FROM terminal_projection_outbox t WHERE request_id = $1",
+    )
+    .bind(fixture.request_id.to_string())
+    .fetch_one(&db.pool)
+    .await
+    .unwrap();
+    let association: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM terminal_projection_outbox t JOIN conversation_observations o ON o.request_id = t.request_id AND o.key_id = t.key_id JOIN conversation_clusters c ON c.id = o.cluster_id AND c.tenant_id = t.tenant_id WHERE t.request_id = $1 AND t.session_id = o.cluster_id")
+        .bind(fixture.request_id.to_string()).fetch_one(&db.pool).await.unwrap();
+    assert_eq!(association, 1);
+    assert_eq!(financial_before, financial_after);
+    let ledger_after: (i64, i64) = sqlx::query_as("SELECT COUNT(*), COALESCE(SUM(amount_micros),0)::BIGINT FROM ledger_entries WHERE kind = 'usage' AND source = $1")
+        .bind(fixture.identity.reservation_id.to_string()).fetch_one(&db.pool).await.unwrap();
+    let balance_after: (i64, i64) = sqlx::query_as(
+        "SELECT available_micros, reserved_micros FROM credit_accounts WHERE id = $1",
+    )
+    .bind(fixture.key.account_id.to_string())
+    .fetch_one(&db.pool)
+    .await
+    .unwrap();
+    assert_eq!(ledger_before, ledger_after);
+    assert_eq!(balance_before, balance_after);
+    assert_eq!(
+        fixture.state.archive.get(&request_locator).await.unwrap(),
+        request
+    );
+    assert_eq!(
+        fixture.state.archive.get(&response_locator).await.unwrap(),
+        response
+    );
+    isolated.cleanup().await;
+}
