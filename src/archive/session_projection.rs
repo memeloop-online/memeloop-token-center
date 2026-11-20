@@ -1263,18 +1263,9 @@ impl Context {
             && !protocol_incomplete
             && response_valid
             && gaps.is_empty();
-        let backend_identity = atoms
-            .first()
-            .map(|atom| {
-                let reference: ConversationBodyReference =
-                    serde_json::from_value(atom.content.clone()).map_err(|_| invalid())?;
-                Ok::<_, AppError>(
-                    super::routing::split(&reference.conversation_body_v1.object_locator)?
-                        .map(|(identity, _)| identity.to_owned()),
-                )
-            })
-            .transpose()?
-            .flatten();
+        // Metadata is published into the current CAS target. Historical atom
+        // bodies retain their own qualified locators and may live elsewhere.
+        let backend_identity = self.archive.cas_backend_identity()?.map(str::to_owned);
         let mut manifest = super::SemanticManifestV2 {
             format_version: 2,
             projection_version: 2,
