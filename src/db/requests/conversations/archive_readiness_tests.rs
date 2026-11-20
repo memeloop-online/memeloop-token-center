@@ -2703,6 +2703,9 @@ async fn postgres_exact_legacy_body_rebuild_preserves_incomplete_and_financial_r
     .fetch_one(&db.pool)
     .await
     .unwrap();
+    let association: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM terminal_projection_outbox t JOIN conversation_observations o ON o.request_id = t.request_id AND o.key_id = t.key_id JOIN conversation_clusters c ON c.id = o.cluster_id AND c.tenant_id = t.tenant_id WHERE t.request_id = $1 AND t.session_id = o.cluster_id")
+        .bind(fixture.request_id.to_string()).fetch_one(&db.pool).await.unwrap();
+    assert_eq!(association, 1);
     assert_eq!(financial_before, financial_after);
     let ledger_after: (i64, i64) = sqlx::query_as("SELECT COUNT(*), COALESCE(SUM(amount_micros),0)::BIGINT FROM ledger_entries WHERE kind = 'usage' AND source = $1")
         .bind(fixture.identity.reservation_id.to_string()).fetch_one(&db.pool).await.unwrap();
