@@ -2,7 +2,7 @@
 -- No TTL can release a pin or an ambiguous delete on behalf of its owner.
 CREATE TABLE archive_gc_scopes (
     tenant_id TEXT NOT NULL,
-    backend_identity TEXT NOT NULL,
+    backend_identity TEXT NOT NULL CHECK (backend_identity = 'archive-all-backends'),
     root_epoch BIGINT NOT NULL DEFAULT 0 CHECK (root_epoch >= 0),
     phase TEXT NOT NULL DEFAULT 'open' CHECK (phase IN ('open','exclusive','delete_unknown')),
     gc_token TEXT,
@@ -11,7 +11,7 @@ CREATE TABLE archive_gc_scopes (
 );
 CREATE TABLE archive_gc_pins (
     tenant_id TEXT NOT NULL,
-    backend_identity TEXT NOT NULL,
+    backend_identity TEXT NOT NULL CHECK (backend_identity = 'archive-all-backends'),
     token TEXT NOT NULL,
     owner_kind TEXT NOT NULL,
     owner_id TEXT NOT NULL,

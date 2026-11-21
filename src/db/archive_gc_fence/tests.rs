@@ -4,8 +4,8 @@ async fn contract(url: &str) {
     let db = Database::connect_with_max(url, 3).await.unwrap();
     db.migrate().await.unwrap();
     let tenant = Uuid::now_v7();
-    let legacy = ArchiveGcScope::new(tenant, "legacy").unwrap();
-    let training = ArchiveGcScope::new(tenant, &"a".repeat(64)).unwrap();
+    let legacy = ArchiveGcScope::for_tenant(tenant).unwrap();
+    let training = ArchiveGcScope::for_tenant(Uuid::now_v7()).unwrap();
     let owner = Uuid::now_v7();
     let token = Uuid::now_v7();
     let pin = db
@@ -96,7 +96,7 @@ async fn contract(url: &str) {
             .is_none()
         );
     }
-    // Cross-backend acquisition is atomic; no partial training pin leaks.
+    // Cross-tenant acquisition is atomic; no partial training pin leaks.
     assert!(
         db.acquire_archive_gc_pins(
             vec![training.clone(), legacy.clone()],
@@ -116,8 +116,8 @@ async fn contract(url: &str) {
         .unwrap()
         .unwrap();
     assert!(db.finish_archive_gc_exclusive(&training_gc).await.unwrap());
-    // A distinct tenant is independent even on the same physical backend.
-    let foreign = ArchiveGcScope::new(Uuid::now_v7(), "legacy").unwrap();
+    // A distinct tenant remains independently coordinated.
+    let foreign = ArchiveGcScope::for_tenant(Uuid::now_v7()).unwrap();
     let reader = db
         .acquire_archive_gc_pins(
             vec![foreign.clone()],
@@ -138,6 +138,47 @@ async fn contract(url: &str) {
         "active reader protects the stream"
     );
     db.release_archive_gc_pins(&reader).await.unwrap();
+    let raced_scope = ArchiveGcScope::for_tenant(Uuid::now_v7()).unwrap();
+    let seed = db
+        .acquire_archive_gc_pins(
+            vec![raced_scope.clone()],
+            Uuid::now_v7(),
+            "request",
+            owner,
+            ArchiveGcPinPurpose::Writer,
+        )
+        .await
+        .unwrap()
+        .unwrap();
+    db.release_archive_gc_pins(&seed).await.unwrap();
+    let raced_epoch = db
+        .archive_gc_root_epoch(&raced_scope)
+        .await
+        .unwrap()
+        .unwrap();
+    let (writer, gc) = tokio::join!(
+        db.acquire_archive_gc_pins(
+            vec![raced_scope.clone()],
+            Uuid::now_v7(),
+            "request",
+            owner,
+            ArchiveGcPinPurpose::Writer
+        ),
+        db.claim_archive_gc_exclusive(&raced_scope, raced_epoch, Uuid::now_v7()),
+    );
+    let writer = writer.unwrap();
+    let gc = gc.unwrap();
+    assert_ne!(
+        writer.is_some(),
+        gc.is_some(),
+        "only one concurrent pin or GC claim can win"
+    );
+    if let Some(writer) = writer {
+        db.release_archive_gc_pins(&writer).await.unwrap();
+    }
+    if let Some(gc) = gc {
+        assert!(db.finish_archive_gc_exclusive(&gc).await.unwrap());
+    }
     assert!(db.mark_archive_gc_delete_unknown(&exclusive).await.unwrap());
     assert!(
         !db.finish_archive_gc_exclusive(&exclusive).await.unwrap(),

@@ -1,6 +1,6 @@
 //! Durable publication/reader coordination, not reference truth or delete permission.
 //! Callers must pin every backend in the transitive reference closure before
-//! publication starts. No transaction or connection is held during object I/O.
+//! publication starts. All backends of one tenant share the same gate. No transaction or connection is held during object I/O.
 use super::*;
 
 #[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord)]
@@ -10,19 +10,15 @@ pub(crate) struct ArchiveGcScope {
 }
 
 impl ArchiveGcScope {
-    pub(crate) fn new(tenant: Uuid, backend: &str) -> Result<Self, AppError> {
-        if tenant.is_nil()
-            || !(backend == "legacy"
-                || (backend.len() == 64
-                    && backend
-                        .bytes()
-                        .all(|c| c.is_ascii_digit() || (b'a'..=b'f').contains(&c))))
-        {
+    /// One conservative scope covers every backend reachable by this tenant,
+    /// including old aliases. A physical backend label cannot split this gate.
+    pub(crate) fn for_tenant(tenant: Uuid) -> Result<Self, AppError> {
+        if tenant.is_nil() {
             return Err(AppError::storage("archive_gc_scope_invalid"));
         }
         Ok(Self {
             tenant,
-            backend: backend.into(),
+            backend: "archive-all-backends".into(),
         })
     }
 }
@@ -66,7 +62,7 @@ async fn lock_scope(tx: &mut Transaction<'_, Any>, scope: &ArchiveGcScope) -> Re
 }
 
 impl Database {
-    /// One atomic acquisition for all involved scopes, in fixed order. Tokens
+    /// One atomic acquisition for all involved tenant scopes, in fixed order. Tokens
     /// come from existing request/attempt/receipt ownership and survive retries.
     pub(crate) async fn acquire_archive_gc_pins(
         &self,
