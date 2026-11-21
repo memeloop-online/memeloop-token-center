@@ -199,4 +199,6 @@ impl Database {
 }
 
 #[cfg(test)]
+mod load_tests;
+#[cfg(test)]
 mod tests;

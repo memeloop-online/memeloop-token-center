@@ -77,6 +77,8 @@ jobs:
             timeout 180s cargo test --locked --lib "$selector" -- --exact 2>&1 | tee /tmp/orphan-reaper-contract.log
             grep -F '1 passed; 0 failed' /tmp/orphan-reaper-contract.log
           done
+          /usr/bin/time -v timeout 900s cargo test --locked --lib db::archive_gc_fence::load_tests::postgres_archive_gc_pin_reference_curve -- --exact --ignored --nocapture 2>&1 | tee /tmp/gc-pin-reference.log
+          grep -F '1 passed; 0 failed' /tmp/gc-pin-reference.log
   response-carrier-contract:
     if: inputs.contract == 'response-carrier-968'
     runs-on: ubuntu-24.04
@@ -103,6 +105,9 @@ jobs:
           for selector in \
             error::tests::object_storage_classification_preserves_only_typed_safe_facts \
             error::tests::dependency_errors_do_not_retain_secret_bearing_driver_messages \
+            archive::raw_gc_roots::tests::gc_part_parser_skips_body_values_and_rejects_unknown_reference_schema \
+            archive::raw_capture::retirement_contracts::complete_coverage_retires_exact_roots_and_rejects_stale_backend_versions \
+            archive::raw_capture::retirement_contracts::incomplete_protocol_keeps_both_raw_roots_owned \
             response_archive_spool::tests::gc_scope_exclusive_defers_publication_without_losing_complete_original \
             response_archive_spool::tests::late_response_capture_settles_against_retired_semantics_without_restoring_raw_binding \
             response_archive_spool::tests::shared_capture_reaches_eof_while_all_upload_slots_are_held \
@@ -229,6 +234,8 @@ jobs:
           grep -F '1 passed; 0 failed' /tmp/gc-canonical-reader.log
           cargo test --locked --lib api::session_reading::tests::dialogue_parts_preserve_tools_media_and_future_extensions -- --exact 2>&1 | tee /tmp/gc-canonical-parts.log
           grep -F '1 passed; 0 failed' /tmp/gc-canonical-parts.log
+          cargo test --locked --lib archive::raw_capture::retirement_contracts::rustfs_complete_coverage_retires_exact_roots_and_rejects_stale_backend_versions -- --exact --ignored 2>&1 | tee /tmp/gc-roots-rustfs.log
+          grep -F '1 passed; 0 failed' /tmp/gc-roots-rustfs.log
   next-release-contract:
     if: inputs.contract == 'next-release'
     runs-on: ubuntu-24.04
