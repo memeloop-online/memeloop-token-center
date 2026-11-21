@@ -146,3 +146,6 @@ impl PreparedEventCapture {
         insert_envelope_in_transaction(tx, &identity, revision, &envelope).await
     }
 }
+
+#[cfg(test)]
+mod tests;
