@@ -254,7 +254,7 @@ impl Database {
                 upstream_account_id: input.upstream_account_id,
                 model_route_id: input.model_route_id,
             };
-            super::super::requests::lifecycle::insert_request_started_record_in_transaction(
+            super::super::requests::insert_request_started_record_in_transaction(
                 &mut transaction,
                 &started_request,
                 now,
@@ -268,7 +268,7 @@ impl Database {
             .bind(input.key.key_id.to_string())
             .execute(&mut *transaction)
             .await?;
-            super::super::requests::lifecycle::publish_request_started_in_transaction(
+            super::super::requests::publish_request_started_in_transaction(
                 &mut transaction,
                 &started_request,
                 now,
@@ -438,7 +438,7 @@ impl Database {
             upstream_account_id: input.upstream_account_id,
             model_route_id: input.model_route_id,
         };
-        super::super::requests::lifecycle::insert_request_started_record_in_transaction(
+        super::super::requests::insert_request_started_record_in_transaction(
             &mut transaction,
             &started_request,
             now,
@@ -467,7 +467,7 @@ impl Database {
         .bind(&key_id)
         .execute(&mut *transaction)
         .await?;
-        super::super::requests::lifecycle::publish_request_started_in_transaction(
+        super::super::requests::publish_request_started_in_transaction(
             &mut transaction,
             &started_request,
             now,
