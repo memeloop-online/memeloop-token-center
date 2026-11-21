@@ -263,18 +263,16 @@ pub(crate) use requests::{
     FILTERED_ACTIVITY_SOURCE_ROLLUPS,
 };
 pub(crate) use requests::{
-    MAX_STATS_RANGE_MILLIS, ProxyRequestUpstreamAttribution, SessionRoutingTerminalInput,
-    SwitchProxyCandidateInput, allocate_request_event_cursor, is_session_avoid_terminal,
-    normalize_proxy_usage_with_output_limit, price_token_usage,
+    MAX_STATS_RANGE_MILLIS, ProxyRequestUpstreamAttribution, RequestEventCursor,
+    SessionRoutingTerminalInput, SwitchProxyCandidateInput, allocate_request_event_cursor,
+    is_session_avoid_terminal, normalize_proxy_usage_with_output_limit, price_token_usage,
     record_request_finished_in_transaction, record_request_started_in_transaction,
     reserve_usage_in_transaction, search_prefix, settle_token_usage_in_transaction,
     validate_numeric_range,
 };
 pub(crate) use requests::{OrphanReservationScan, RequestArchiveAdmission};
 #[cfg(test)]
-pub(crate) use requests::{
-    RequestEventCursor, claim_request_event_locator, claim_request_record_locator,
-};
+pub(crate) use requests::{claim_request_event_locator, claim_request_record_locator};
 pub use routing::{
     CreateRoutedModelRouteInput, CreateRoutedModelRouteResult, CredentialRoutingView,
     ManagedModelRouteSyncResult, ReplaceCredentialRoutingInput, ReplaceRouteRoutingInput,
