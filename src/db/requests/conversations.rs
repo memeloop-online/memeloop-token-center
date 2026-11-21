@@ -2782,8 +2782,8 @@ pub(crate) async fn attach_conversation_upstream_response_in_transaction(
     request_id: Uuid,
     upstream_response_id: &str,
 ) -> Result<(), AppError> {
-    // This path can reconcile clusters and merge their session projections. Acquire the shared
-    // statistics lock before reading or locking conversation state to preserve the global order.
+    // The owning transaction already holds the exclusive statistics gate before source locks.
+    // This helper can reconcile and replace session projections; it must never upgrade shared mode.
     lock_request_stats_projection_writer_in_transaction(transaction).await?;
     let upstream_response_id = upstream_response_id.trim();
     if upstream_response_id.is_empty()

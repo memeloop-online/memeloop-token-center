@@ -346,3 +346,50 @@ async fn postgres_replacement_gate_precedes_live_fact_and_rolls_back_cleanly() {
         );
     }
 }
+
+#[tokio::test]
+async fn postgres_public_attach_waits_for_writer_before_source_access() {
+    let Ok(url) = std::env::var("MTC_TEST_POSTGRES_URL") else {
+        return;
+    };
+    let fixture = crate::db::test_support::PostgresTestDatabase::create(&url).await;
+    let db = Arc::new(Database::connect_with_max(fixture.url(), 8).await.unwrap());
+    db.migrate().await.unwrap();
+    let mut writer = db.begin_write_transaction().await.unwrap();
+    lock_request_stats_projection_writer_in_transaction(&mut writer)
+        .await
+        .unwrap();
+    let attach_db = db.clone();
+    let attach = tokio::spawn(async move {
+        attach_db
+            .attach_conversation_upstream_response(Uuid::new_v4(), "response-test")
+            .await
+    });
+    tokio::time::timeout(Duration::from_secs(5), async {
+        loop {
+            let waiting: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM pg_locks WHERE locktype='advisory' AND mode='ExclusiveLock' AND NOT granted")
+                .fetch_one(&db.pool).await.unwrap();
+            if waiting > 0 { break; }
+            assert!(!attach.is_finished(), "public attach reached its missing-source error before the exclusive gate");
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    }).await.unwrap();
+    writer.commit().await.unwrap();
+    assert!(
+        tokio::time::timeout(Duration::from_secs(5), attach)
+            .await
+            .unwrap()
+            .unwrap()
+            .is_err()
+    );
+    // The missing-source error must release the exclusive transaction gate.
+    let mut next = db.begin_write_transaction().await.unwrap();
+    tokio::time::timeout(
+        Duration::from_secs(3),
+        lock_request_stats_projection_writer_in_transaction(&mut next),
+    )
+    .await
+    .unwrap()
+    .unwrap();
+    next.rollback().await.unwrap();
+}
