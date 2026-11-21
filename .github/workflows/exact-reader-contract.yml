@@ -629,7 +629,7 @@ jobs:
           git rev-parse HEAD
           cargo test --locked --lib db::history_immutable_outbox::event_capture::tests::postgres_slow_event_preparation_preserves_cursor_progress_originals_and_rollback -- --ignored --exact --nocapture 2>&1 | tee /tmp/pg-executor.log
           grep -F '1 passed; 0 failed' /tmp/pg-executor.log
-          cargo test --locked --lib db::tests::event_cursor::postgres_global_cursor_serializes_independent_database_instances_and_rollback -- --exact --nocapture 2>&1 | tee /tmp/pg-executor.log
+          cargo test --locked --lib db::tests::event_cursor::postgres_global_cursor_lock_orders_commit_visibility -- --exact --nocapture 2>&1 | tee /tmp/pg-executor.log
           grep -F '1 passed; 0 failed' /tmp/pg-executor.log
 
   semantic-reader-scope-contract:
