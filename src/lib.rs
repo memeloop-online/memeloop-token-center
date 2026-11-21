@@ -590,6 +590,26 @@ mod tests {
     };
 
     #[tokio::test]
+    async fn maintenance_initialization_never_starts_customer_recovery_workers() {
+        let directory = tempfile::tempdir().unwrap();
+        let url = format!(
+            "sqlite://{}?mode=rwc",
+            directory.path().join("maintenance.db").display()
+        );
+        let maintenance =
+            super::AppState::initialize_for_maintenance(super::Config::for_test(url.clone()))
+                .await
+                .unwrap();
+        assert!(!maintenance.pending_terminals.background_started_for_test());
+        tokio::task::yield_now().await;
+        assert!(!maintenance.pending_terminals.background_started_for_test());
+        let serve = super::AppState::initialize(super::Config::for_test(url))
+            .await
+            .unwrap();
+        assert!(serve.pending_terminals.background_started_for_test());
+    }
+
+    #[tokio::test]
     async fn shared_http_client_does_not_follow_redirects() {
         let server = MockServer::start().await;
         Mock::given(path("/redirect"))

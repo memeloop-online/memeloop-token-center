@@ -587,6 +587,11 @@ impl Journal {
         journal
     }
 
+    #[cfg(test)]
+    pub(crate) fn background_started_for_test(&self) -> bool {
+        self.worker.lock().unwrap().is_some() || self.recovery_worker.lock().unwrap().is_some()
+    }
+
     pub(crate) async fn drain(&self) {
         self.wake.notify_one();
         loop {

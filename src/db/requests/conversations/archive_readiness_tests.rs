@@ -2537,6 +2537,37 @@ async fn postgres_exact_legacy_body_rebuild_preserves_incomplete_and_financial_r
     .fetch_one(&db.pool)
     .await
     .unwrap();
+    // A missing exact locator must never fall back to scanning partitions.
+    let created_at: i64 = sqlx::query_scalar(
+        "DELETE FROM request_record_locators WHERE id = $1 RETURNING created_at",
+    )
+    .bind(fixture.request_id.to_string())
+    .fetch_one(&db.pool)
+    .await
+    .unwrap();
+    assert!(
+        !db.claim_exact_session_body_rebuild(
+            fixture.key.tenant_id,
+            fixture.key.key_id,
+            fixture.request_id,
+            Some(42),
+            &request_locator,
+            &response_locator,
+            Uuid::now_v7(),
+            None,
+            None
+        )
+        .await
+        .unwrap()
+    );
+    sqlx::query("INSERT INTO request_record_locators (id, created_at, tenant_id, key_id) VALUES ($1,$2,$3,$4)")
+        .bind(fixture.request_id.to_string()).bind(created_at).bind(fixture.key.tenant_id.to_string())
+        .bind(fixture.key.key_id.to_string()).execute(&db.pool).await.unwrap();
+    let maintenance =
+        AppState::initialize_for_maintenance(Config::for_test(isolated.url().to_owned()))
+            .await
+            .unwrap();
+    assert!(!maintenance.pending_terminals.background_started_for_test());
     let owner = Uuid::now_v7();
     assert!(
         !db.claim_exact_session_body_rebuild(
