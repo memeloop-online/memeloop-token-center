@@ -149,28 +149,18 @@ async fn postgres_source_binding_uses_owned_partition_and_preserves_replay() {
         .await
         .unwrap();
     assert_eq!(status, "reserved");
-    let plan=sqlx::query_scalar::<_,serde_json::Value>("EXPLAIN (FORMAT JSON) UPDATE request_records SET request_object=request_object WHERE id=$1 AND tenant_id=$2 AND reservation_id=$3 AND request_object=$4 AND created_at=$5 AND key_id=$6 RETURNING key_id")
-        .bind(request_id.to_string()).bind(fixture.key.tenant_id.to_string()).bind(reservation.id.to_string()).bind(&locator).bind(created_at).bind(fixture.key.key_id.to_string()).fetch_one(&db.pool).await.unwrap();
-    fn scanned_relations(node: &serde_json::Value, out: &mut Vec<String>) {
-        if node.get("Node Type").and_then(|v| v.as_str()) != Some("ModifyTable")
-            && let Some(relation) = node.get("Relation Name").and_then(|v| v.as_str())
-        {
-            out.push(relation.into());
-        }
-        if let Some(children) = node.get("Plans").and_then(|v| v.as_array()) {
-            for child in children {
-                scanned_relations(child, out);
-            }
-        }
-    }
-    let mut relations = Vec::new();
-    scanned_relations(&plan[0]["Plan"], &mut relations);
+    let plan = sqlx::query_scalar::<_, String>("EXPLAIN (FORMAT TEXT) UPDATE request_records SET request_object=request_object WHERE id=$1 AND tenant_id=$2 AND reservation_id=$3 AND request_object=$4 AND created_at=$5 AND key_id=$6 RETURNING key_id")
+        .bind(request_id.to_string()).bind(fixture.key.tenant_id.to_string()).bind(reservation.id.to_string()).bind(&locator).bind(created_at).bind(fixture.key.key_id.to_string()).fetch_all(&db.pool).await.unwrap();
+    let relation_scans: Vec<_> = plan
+        .iter()
+        .filter(|line| line.contains("Scan ") && line.contains("request_records_"))
+        .collect();
     assert_eq!(
-        relations.len(),
+        relation_scans.len(),
         1,
-        "source ownership targets one physical partition: {plan}"
+        "source ownership targets one physical partition: {plan:?}"
     );
-    println!("SOURCE_BINDING_PARTITION_PLAN {plan}");
+    println!("SOURCE_BINDING_PARTITION_PLAN {}", plan.join("\n"));
     db.close().await;
     isolated.cleanup().await;
 }
