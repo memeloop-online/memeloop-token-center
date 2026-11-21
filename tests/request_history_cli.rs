@@ -248,3 +248,62 @@ async fn request_history_cli_backfill_page_queues_without_archive_or_delivery() 
     pool.close().await;
     drop(database);
 }
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn request_history_cli_export_page_reports_safe_materialization_failure_without_ack() {
+    let root = tempfile::tempdir().unwrap();
+    let url = format!(
+        "sqlite://{}?mode=rwc",
+        root.path().join("export-page.db").display()
+    );
+    let database = Database::connect(&url).await.unwrap();
+    database.migrate().await.unwrap();
+    let pool = sqlx::AnyPool::connect(&url).await.unwrap();
+    sqlx::query("UPDATE request_history_state SET mode='shadow' WHERE id=1")
+        .execute(&pool)
+        .await
+        .unwrap();
+    let id = Uuid::now_v7();
+    sqlx::query("INSERT INTO request_history_immutable_outbox (revision,source,request_id,tenant_id,key_id,created_at,snapshot) VALUES (1,'event',$1,$1,$1,1,$2)")
+        .bind(id.to_string()).bind(r#"{"version":999,"private":"never-print-envelope-canary"}"#).execute(&pool).await.unwrap();
+    let archive = root.path().join("archive");
+    let output = tokio::task::spawn_blocking(move || {
+        Command::new(env!("CARGO_BIN_EXE_memeloop-token-center"))
+            .args(["request-history", "export-page", "--page-size", "1"])
+            .env("MTC_KEY_PEPPER", "test-pepper-must-have-at-least-32-bytes")
+            .env("MTC_SERVICE_TOKEN", "s".repeat(32))
+            .env("MTC_DATABASE_URL", url)
+            .env("MTC_ARCHIVE_BACKEND", "filesystem")
+            .env("MTC_ARCHIVE_PATH", archive)
+            .env("MTC_REQUEST_HISTORY_URL", "http://127.0.0.1:9")
+            .env("MTC_REQUEST_HISTORY_DATABASE", "default")
+            .output()
+            .unwrap()
+    })
+    .await
+    .unwrap();
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let stdout = String::from_utf8(output.stdout).unwrap();
+    assert!(!stdout.contains("never-print-envelope-canary"));
+    assert!(!String::from_utf8_lossy(&output.stderr).contains("never-print-envelope-canary"));
+    let report: serde_json::Value = stdout
+        .lines()
+        .filter_map(|line| serde_json::from_str::<serde_json::Value>(line).ok())
+        .find(|value| value.get("status").is_some())
+        .unwrap();
+    assert_eq!(report["status"], "failed");
+    assert_eq!(report["stage"], "capture_materialize");
+    assert_eq!(report["diagnostic"]["category"], "invalid");
+    assert_eq!(report["acked"], 0);
+    let retained: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM request_history_immutable_outbox WHERE revision=1",
+    )
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert_eq!(retained, 1);
+}

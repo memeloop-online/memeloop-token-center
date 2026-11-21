@@ -65,6 +65,11 @@ pub enum HistoryCommand {
         #[arg(long, default_value_t = 64, value_parser = clap::value_parser!(i64).range(1..=64))]
         page_size: i64,
     },
+    /// Export one bounded page through the ordinary lease and exact ACK path.
+    ExportPage {
+        #[arg(long, default_value_t = 64, value_parser = clap::value_parser!(i64).range(1..=500))]
+        page_size: i64,
+    },
     Drain {
         #[arg(long, default_value_t = 500, value_parser = clap::value_parser!(i64).range(1..))]
         page_size: i64,
@@ -134,6 +139,7 @@ pub async fn command(config: &Config, command: HistoryCommand) -> Result<Value, 
         HistoryCommand::Backfill { .. }
             | HistoryCommand::BaselineSource { .. }
             | HistoryCommand::Drain { .. }
+            | HistoryCommand::ExportPage { .. }
             | HistoryCommand::Verify
             | HistoryCommand::Switch
             | HistoryCommand::Refresh
@@ -246,6 +252,22 @@ pub async fn command(config: &Config, command: HistoryCommand) -> Result<Value, 
             }
             drain(&database, &client, page_size).await?;
         }
+        HistoryCommand::ExportPage { page_size } => {
+            let lease_database = database
+                .clone()
+                .with_auxiliary_pool_max_connections(1)
+                .independent_persistence_pool();
+            return Ok(
+                match export_batch(&database, &lease_database, &client, page_size).await {
+                    Ok(report) => {
+                        json!({"status":"completed","attempted":report.attempted,"acked":report.acked,"deferred":report.attempted.saturating_sub(report.acked),"failed":0})
+                    }
+                    Err(failure) => {
+                        json!({"status":"failed","attempted":failure.attempted,"acked":failure.acked,"deferred":failure.attempted.saturating_sub(failure.acked),"failed":1,"stage":failure.stage,"source":failure.source,"revision":failure.revision,"diagnostic":failure.error.safe_diagnostic()})
+                    }
+                },
+            );
+        }
         HistoryCommand::Drain { page_size } => drain(&database, &client, page_size).await?,
         HistoryCommand::Verify => return verify(&database, &client).await,
         HistoryCommand::Switch => {
@@ -284,19 +306,80 @@ async fn export_page_with_lease(
     client: &ClickHouse,
     page_size: i64,
 ) -> Result<usize, HistoryError> {
-    let (mut lease, ceiling) = lease_database.history_delivery_lease().await?;
-    let snapshots = database.history_pending_through(page_size, ceiling).await?;
-    // If the control socket died before selection, a new fence may have been
-    // installed. Validate it after selection and before sending any CH bytes.
+    export_batch(database, lease_database, client, page_size)
+        .await
+        .map(|report| report.attempted)
+        .map_err(|failure| failure.error)
+}
+
+struct ExportReport {
+    attempted: usize,
+    acked: usize,
+}
+struct ExportFailure {
+    stage: &'static str,
+    attempted: usize,
+    acked: usize,
+    source: Option<String>,
+    revision: Option<i64>,
+    error: HistoryError,
+}
+
+async fn export_batch(
+    database: &Database,
+    lease_database: &Database,
+    client: &ClickHouse,
+    page_size: i64,
+) -> Result<ExportReport, ExportFailure> {
+    let failure = |stage, error| ExportFailure {
+        stage,
+        attempted: 0,
+        acked: 0,
+        source: None,
+        revision: None,
+        error,
+    };
+    let (mut lease, ceiling) = lease_database
+        .history_delivery_lease()
+        .await
+        .map_err(|error| failure("lease", error))?;
+    let snapshots = database
+        .history_pending_through(page_size, ceiling)
+        .await
+        .map_err(|error| failure("capture_materialize", error))?;
+    let failure = |stage, error| ExportFailure {
+        stage,
+        attempted: snapshots.len(),
+        acked: 0,
+        source: snapshots.first().map(|row| row.identity.source.clone()),
+        revision: snapshots.first().map(|row| row.revision),
+        error,
+    };
     if let Some(lease) = lease.as_mut() {
-        sqlx::query("SELECT 1").execute(&mut **lease).await?;
+        sqlx::query("SELECT 1")
+            .execute(&mut **lease)
+            .await
+            .map_err(|error| failure("lease_validate", error.into()))?;
     }
-    client.append(&snapshots).await?;
-    database.history_acknowledge(&snapshots).await?;
+    client
+        .append(&snapshots)
+        .await
+        .map_err(|error| failure("append", error))?;
+    let acked = database
+        .history_acknowledge_count(&snapshots)
+        .await
+        .map_err(|error| failure("acknowledge", error))?;
     if let Some(lease) = lease {
-        lease.rollback().await?;
+        lease.rollback().await.map_err(|error| {
+            let mut failure = failure("lease_release", error.into());
+            failure.acked = acked;
+            failure
+        })?;
     }
-    Ok(snapshots.len())
+    Ok(ExportReport {
+        attempted: snapshots.len(),
+        acked,
+    })
 }
 
 pub async fn drain(
@@ -332,6 +415,7 @@ pub(crate) async fn run_worker(state: AppState, mut shutdown: watch::Receiver<bo
         .clone()
         .with_auxiliary_pool_max_connections(1)
         .independent_persistence_pool();
+    let mut last_failure: Option<(String, std::time::Instant, u64)> = None;
     loop {
         if *shutdown.borrow() {
             return;
@@ -340,15 +424,28 @@ pub(crate) async fn run_worker(state: AppState, mut shutdown: watch::Receiver<bo
             _ = shutdown.changed() => return,
             _ = async {
                 if let Some(client) = &client {
-                    let result = async {
-                        if database.history_mode().await? == "off" {
-                            return Ok::<_, HistoryError>(());
+                    let result = match database.history_mode().await {
+                        Ok(mode) if mode == "off" => Ok(ExportReport { attempted:0, acked:0 }),
+                        Ok(_) => export_batch(&database, &lease_database, client, 500).await,
+                        Err(error) => Err(ExportFailure { stage:"mode",attempted:0,acked:0,source:None,revision:None,error }),
+                    };
+                    {
+                        match result {
+                            Ok(_) => { last_failure = None; }
+                            Err(failure) => {
+                                let diagnostic = failure.error.safe_diagnostic();
+                                let key = format!("{}:{diagnostic}", failure.stage);
+                                let now = std::time::Instant::now();
+                                let first = last_failure.is_none();
+                                let entry = last_failure.get_or_insert((key.clone(), now, 0));
+                                let changed = entry.0 != key;
+                                entry.2 += 1;
+                                if first || changed || entry.1.elapsed() >= std::time::Duration::from_secs(60) {
+                                    tracing::warn!(stage=failure.stage, diagnostic=%diagnostic, source=?failure.source, revision=?failure.revision, occurrences=entry.2, "request history export deferred; durable queue retained");
+                                    *entry = (key, now, 0);
+                                }
+                            }
                         }
-                        export_page_with_lease(&database, &lease_database, client, 500).await?;
-                        Ok(())
-                    }.await;
-                    if result.is_err() {
-                        tracing::warn!("request history export deferred; durable queue retained");
                     }
                 }
                 tokio::time::sleep(std::time::Duration::from_secs(1)).await;
