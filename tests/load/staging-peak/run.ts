@@ -89,6 +89,7 @@ export async function run(plan: Plan, env = process.env): Promise<Record<string,
   const version=await versionResponse.json() as {revision?:string};
   if(!versionResponse.ok||version.revision!==actualCandidate.control.source_sha)throw new Error("actual control revision differs from observed candidate");
   const tenant = `staging-peak-${runId}`;
+  enter("upstream_setup");
   const reused = await reuseFixture(control, token, tenant, runId, upstreamBase, [...new Set(plan.arrivals.map(row => row.scenario))], plan.arrivals.length);
   const models: Record<string,string> = {}, routes: string[] = [];
   for (const scenario of new Set(plan.arrivals.map(row => row.scenario))) {
