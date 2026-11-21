@@ -559,3 +559,6 @@ pub(crate) async fn rebuild_request_session_projection_in_transaction(
     }
     Ok(())
 }
+
+#[cfg(test)]
+mod lock_order_tests;
