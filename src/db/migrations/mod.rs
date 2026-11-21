@@ -853,6 +853,11 @@ pub(crate) const SQLITE_MIGRATIONS: &[Migration] = &[
         name: "supplier_quota_capacity_scope",
         sql: include_str!("../../../migrations/common/0161_supplier_quota_capacity_scope.sql"),
     },
+    Migration {
+        version: 162,
+        name: "orphan_settled_request_candidates",
+        sql: include_str!("../../../migrations/common/0162_orphan_settled_request_candidates.sql"),
+    },
 ];
 
 pub(crate) const POSTGRES_MIGRATIONS: &[Migration] = &[
@@ -1680,6 +1685,11 @@ pub(crate) const POSTGRES_MIGRATIONS: &[Migration] = &[
         version: 161,
         name: "supplier_quota_capacity_scope",
         sql: include_str!("../../../migrations/common/0161_supplier_quota_capacity_scope.sql"),
+    },
+    Migration {
+        version: 162,
+        name: "orphan_settled_request_candidates",
+        sql: include_str!("../../../migrations/common/0162_orphan_settled_request_candidates.sql"),
     },
 ];
 

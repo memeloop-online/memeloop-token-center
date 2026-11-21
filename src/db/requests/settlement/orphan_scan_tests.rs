@@ -27,6 +27,117 @@ async fn finance_snapshot(database: &Database, reservation: Uuid) -> FinanceSnap
     }
 }
 
+async fn settled_history_does_not_starve_reserved_contract(database: &Database) {
+    let pepper = b"orphan independent lanes contract pepper";
+    let issued = database
+        .create_key(
+            CreateKeyInput {
+                tenant_external_id: Uuid::now_v7().to_string(),
+                principal_external_id: "member".into(),
+                alias: "orphan-lanes".into(),
+                currency: "USD".into(),
+                policy: KeyPolicy::default(),
+                initial_balance: Decimal::from(10),
+                idempotency_key: None,
+            },
+            pepper,
+        )
+        .await
+        .unwrap();
+    let key = database
+        .authenticate_key(&issued.key, pepper)
+        .await
+        .unwrap();
+    let price = database
+        .upsert_model_price("orphan-lanes", "USD", Decimal::ZERO, Decimal::ONE)
+        .await
+        .unwrap();
+    let old = unix_millis() - 3_600_000;
+    for offset in 0..120_i64 {
+        let reservation = database.reserve_usage(&key, &price, 0, 1).await.unwrap();
+        database.settle_usage(&reservation, 0, 0).await.unwrap();
+        sqlx::query("UPDATE usage_reservations SET created_at = $1 WHERE id = $2")
+            .bind(old - 1000 + offset)
+            .bind(reservation.id.to_string())
+            .execute(&database.pool)
+            .await
+            .unwrap();
+    }
+    let reserved = database.reserve_usage(&key, &price, 0, 1).await.unwrap();
+    sqlx::query("UPDATE usage_reservations SET created_at = $1 WHERE id = $2")
+        .bind(old)
+        .bind(reserved.id.to_string())
+        .execute(&database.pool)
+        .await
+        .unwrap();
+    let mut scan = OrphanReservationScan::default();
+    assert_eq!(
+        database
+            .release_orphaned_reservations_page(1, &mut scan)
+            .await
+            .unwrap(),
+        1,
+        "completed settled history must not consume the reserved page"
+    );
+    let finance = finance_snapshot(database, reserved.id).await;
+    assert_eq!(
+        database
+            .release_orphaned_reservations_page(1, &mut scan)
+            .await
+            .unwrap(),
+        0
+    );
+    assert_eq!(finance_snapshot(database, reserved.id).await, finance);
+
+    // A legacy split writer can have settled finance without a terminal request.
+    let settled = database.reserve_usage(&key, &price, 0, 1).await.unwrap();
+    let request_id = Uuid::now_v7();
+    database
+        .record_request_started(NewRequest {
+            request_id,
+            key_id: key.key_id,
+            tenant_id: key.tenant_id,
+            protocol: "openai".into(),
+            model: "orphan-lanes".into(),
+            request_object: format!("gap://{request_id}/request"),
+            reservation_id: settled.id,
+            upstream_account_id: None,
+            model_route_id: None,
+        })
+        .await
+        .unwrap();
+    database.settle_usage(&settled, 0, 0).await.unwrap();
+    sqlx::query("UPDATE usage_reservations SET created_at = $1 WHERE id = $2")
+        .bind(old)
+        .bind(settled.id.to_string())
+        .execute(&database.pool)
+        .await
+        .unwrap();
+    sqlx::query("UPDATE request_records SET created_at = $1 WHERE id = $2")
+        .bind(old)
+        .bind(request_id.to_string())
+        .execute(&database.pool)
+        .await
+        .unwrap();
+    let finance = finance_snapshot(database, settled.id).await;
+    assert_eq!(
+        database
+            .release_orphaned_reservations_page(1, &mut scan)
+            .await
+            .unwrap(),
+        1
+    );
+    assert_eq!(finance_snapshot(database, settled.id).await, finance);
+    assert_eq!(
+        database
+            .release_orphaned_reservations_page(1, &mut scan)
+            .await
+            .unwrap(),
+        0
+    );
+    assert_eq!(finance_snapshot(database, settled.id).await, finance);
+}
+
 async fn bounded_scan_contract(database: &Database) {
     let pepper = b"bounded orphan reservation scan contract pepper";
     let issued = database
@@ -230,6 +341,7 @@ async fn sqlite_orphan_scan_advances_past_ineligible_rows_and_revisits_late_elig
     .await
     .unwrap();
     database.migrate().await.unwrap();
+    settled_history_does_not_starve_reserved_contract(&database).await;
     request_candidate_contract(&database).await;
     bounded_scan_contract(&database).await;
 }
@@ -255,6 +367,7 @@ async fn postgres_orphan_scan_advances_past_ineligible_rows_and_revisits_late_el
         .append_pair("options", &format!("-csearch_path={schema}"));
     let database = Database::connect(url.as_str()).await.unwrap();
     database.migrate().await.unwrap();
+    settled_history_does_not_starve_reserved_contract(&database).await;
     request_candidate_contract(&database).await;
     bounded_scan_contract(&database).await;
     database.pool.close().await;

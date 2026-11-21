@@ -13,6 +13,9 @@ mod usage_normalization_tests;
 pub(crate) struct OrphanReservationScan {
     request_after: Option<(String, String)>,
     reservation_after: Option<(i64, String)>,
+    reservation_cutoff: Option<i64>,
+    settled_request_after: Option<(i64, String, String, String)>,
+    settled_request_cutoff: Option<i64>,
 }
 
 impl Database {
@@ -157,19 +160,52 @@ impl Database {
                 .bind(now).bind(&id).bind(created).bind(cutoff).execute(&self.pool).await?;
             scan.request_after = Some((candidate.try_get("tenant_id")?, id));
         }
-        let candidates = match &scan.reservation_after {
-            Some((created, id)) => sqlx::query("SELECT id, created_at FROM usage_reservations WHERE status IN ('reserved', 'settled') AND created_at < $1 AND (created_at, id) > ($2, $3) ORDER BY created_at, id LIMIT $4")
-                .bind(cutoff).bind(created).bind(id).bind(limit).fetch_all(&self.pool).await?,
-            None => sqlx::query("SELECT id, created_at FROM usage_reservations WHERE status IN ('reserved', 'settled') AND created_at < $1 ORDER BY created_at, id LIMIT $2")
-                .bind(cutoff).bind(limit).fetch_all(&self.pool).await?,
+        // Each lane gets an index-bounded page on every tick. Completed settled
+        // history must never consume the reserved lane's candidate budget.
+        let reserved_cutoff = *scan.reservation_cutoff.get_or_insert(cutoff);
+        let reserved_page = match &scan.reservation_after {
+            Some((created, id)) => sqlx::query("SELECT id, created_at FROM usage_reservations WHERE status = 'reserved' AND created_at < $1 AND (created_at, id) > ($2, $3) ORDER BY created_at, id LIMIT $4")
+                .bind(reserved_cutoff).bind(created).bind(id).bind(limit).fetch_all(&self.pool).await?,
+            None => sqlx::query("SELECT id, created_at FROM usage_reservations WHERE status = 'reserved' AND created_at < $1 ORDER BY created_at, id LIMIT $2")
+                .bind(reserved_cutoff).bind(limit).fetch_all(&self.pool).await?,
         };
-        if candidates.is_empty() {
+        if reserved_page.is_empty() {
             scan.reservation_after = None;
+            scan.reservation_cutoff = None;
+        }
+        let mut candidates = Vec::new();
+        for row in reserved_page {
+            let id: String = row.try_get("id")?;
+            let created: i64 = row.try_get("created_at")?;
+            scan.reservation_after = Some((created, id.clone()));
+            candidates.push((id, created));
+        }
+        let settled_cutoff = *scan.settled_request_cutoff.get_or_insert(cutoff);
+        let settled_page = match &scan.settled_request_after {
+            Some((created, tenant, key, id)) => sqlx::query("SELECT created_at, tenant_id, key_id, id, reservation_id FROM request_records WHERE completed_at IS NULL AND submission_started_at IS NULL AND created_at < $1 AND (created_at, tenant_id, key_id, id) > ($2, $3, $4, $5) ORDER BY created_at, tenant_id, key_id, id LIMIT $6")
+                .bind(settled_cutoff).bind(created).bind(tenant).bind(key).bind(id).bind(limit).fetch_all(&self.pool).await?,
+            None => sqlx::query("SELECT created_at, tenant_id, key_id, id, reservation_id FROM request_records WHERE completed_at IS NULL AND submission_started_at IS NULL AND created_at < $1 ORDER BY created_at, tenant_id, key_id, id LIMIT $2")
+                .bind(settled_cutoff).bind(limit).fetch_all(&self.pool).await?,
+        };
+        if settled_page.is_empty() {
+            scan.settled_request_after = None;
+            scan.settled_request_cutoff = None;
+        }
+        for row in settled_page {
+            scan.settled_request_after = Some((
+                row.try_get("created_at")?,
+                row.try_get("tenant_id")?,
+                row.try_get("key_id")?,
+                row.try_get("id")?,
+            ));
+            let reservation_id: String = row.try_get("reservation_id")?;
+            if let Some(reservation) = sqlx::query("SELECT id, created_at FROM usage_reservations WHERE id = $1 AND status = 'settled' AND created_at < $2")
+                .bind(reservation_id).bind(settled_cutoff).fetch_optional(&self.pool).await? {
+                candidates.push((reservation.try_get("id")?, reservation.try_get("created_at")?));
+            }
         }
         let mut released = 0_u64;
-        for candidate in candidates {
-            let candidate_id: String = candidate.try_get("id")?;
-            let candidate_created: i64 = candidate.try_get("created_at")?;
+        for (candidate_id, candidate_created) in candidates {
             let rows = sqlx::query(
             "SELECT r.id, r.account_id, r.key_id, r.enforcement_mode, r.reserved_micros, r.reserved_tokens, r.reserved_units, r.billing_unit, r.micros_per_unit, r.rate_window_start, q.id AS request_id, q.created_at AS request_created_at, q.tenant_id AS request_tenant_id, q.error_code AS pending_error_code, q.input_tokens AS pending_input_tokens, q.output_tokens AS pending_output_tokens, q.service_tier AS pending_service_tier FROM usage_reservations r LEFT JOIN request_records q ON q.reservation_id = r.id WHERE (r.status = 'reserved' OR (r.status = 'settled' AND q.id IS NOT NULL)) AND r.created_at < $1 AND r.id = $3 AND r.created_at = $4 AND q.completed_at IS NULL AND q.submission_started_at IS NULL AND (q.proxy_owner_expires_at IS NULL OR q.proxy_owner_expires_at <= $2) AND NOT EXISTS (SELECT 1 FROM pending_proxy_settlements p WHERE p.reservation_id = r.id AND p.state = 'pending') AND NOT EXISTS (SELECT 1 FROM generation_jobs g WHERE g.reservation_id = r.id) AND NOT EXISTS (SELECT 1 FROM synchronous_image_idempotency s WHERE s.reservation_id = r.id AND s.status = 'pending' AND s.lease_expires_at > $2)",
         )
@@ -179,7 +215,6 @@ impl Database {
         .bind(candidate_created)
         .fetch_all(&self.pool)
         .await?;
-            scan.reservation_after = Some((candidate_created, candidate_id));
             for row in rows {
                 let request_id = row
                     .try_get::<Option<String>, _>("request_id")?
