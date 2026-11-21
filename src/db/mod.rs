@@ -961,3 +961,4 @@ pub(crate) mod test_support;
 mod tests;
 
 mod semantic_archive_binding;
+mod raw_gc;

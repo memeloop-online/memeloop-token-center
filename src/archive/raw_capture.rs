@@ -227,7 +227,7 @@ impl ArchiveStore {
         Ok(self.raw_retirement(tenant, request, side).await?.is_some())
     }
 
-    async fn raw_retirement(
+    pub(super) async fn raw_retirement(
         &self,
         tenant: Uuid,
         request: Uuid,

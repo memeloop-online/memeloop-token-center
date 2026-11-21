@@ -36,6 +36,8 @@ mod path;
 mod quota_reset_receipts;
 mod raw_cache;
 mod raw_capture;
+mod raw_gc;
+pub use raw_gc::{RawGcCandidate, RawGcCandidateBatch};
 pub(crate) use raw_capture::RawPublicationSettlement;
 #[cfg(test)]
 mod raw_capture_tests;
