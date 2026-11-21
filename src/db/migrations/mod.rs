@@ -858,6 +858,11 @@ pub(crate) const SQLITE_MIGRATIONS: &[Migration] = &[
         name: "orphan_settled_request_candidates",
         sql: include_str!("../../../migrations/common/0162_orphan_settled_request_candidates.sql"),
     },
+    Migration {
+        version: 164,
+        name: "archive_gc_scope_fences",
+        sql: include_str!("../../../migrations/common/0164_archive_gc_scope_fences.sql"),
+    },
 ];
 
 pub(crate) const POSTGRES_MIGRATIONS: &[Migration] = &[
@@ -1690,6 +1695,11 @@ pub(crate) const POSTGRES_MIGRATIONS: &[Migration] = &[
         version: 162,
         name: "orphan_settled_request_candidates",
         sql: include_str!("../../../migrations/common/0162_orphan_settled_request_candidates.sql"),
+    },
+    Migration {
+        version: 164,
+        name: "archive_gc_scope_fences",
+        sql: include_str!("../../../migrations/common/0164_archive_gc_scope_fences.sql"),
     },
 ];
 

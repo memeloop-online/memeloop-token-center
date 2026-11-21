@@ -68,6 +68,8 @@ jobs:
           test -n "$MTC_TEST_POSTGRES_URL"
           cargo test --locked --lib --no-run
           for selector in \
+            db::archive_gc_fence::tests::sqlite_durable_scope_pin_epoch_and_unknown_delete_contract \
+            db::archive_gc_fence::tests::postgres_durable_scope_pin_epoch_and_unknown_delete_contract \
             db::requests::settlement::orphan_scan_tests::sqlite_orphan_scan_advances_past_ineligible_rows_and_revisits_late_eligibility \
             db::requests::settlement::orphan_scan_tests::postgres_orphan_scan_advances_past_ineligible_rows_and_revisits_late_eligibility
           do

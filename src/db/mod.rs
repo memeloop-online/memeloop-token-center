@@ -51,6 +51,7 @@ use crate::{
 };
 
 mod archive_spool;
+pub(crate) mod archive_gc_fence;
 mod archive_staging;
 mod gateway_persistence;
 mod request_connection;
