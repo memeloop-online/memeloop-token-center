@@ -627,9 +627,9 @@ jobs:
       - run: |
           set -o pipefail
           git rev-parse HEAD
-          cargo test --locked --lib api::proxy::tests::pending_delivery::receipt_durability::postgres_slow_supplier_summary_preserves_terminal_and_recoverable_explanation -- --ignored --exact --nocapture 2>&1 | tee /tmp/pg-executor.log
+          cargo test --locked --lib db::history_immutable_outbox::event_capture::tests::postgres_slow_event_preparation_preserves_cursor_progress_originals_and_rollback -- --ignored --exact --nocapture 2>&1 | tee /tmp/pg-executor.log
           grep -F '1 passed; 0 failed' /tmp/pg-executor.log
-          cargo test --locked --lib api::proxy::tests::pending_delivery::receipt_durability::finance_completes_while_receipt_publication_and_conversation_projection_are_blocked -- --exact --nocapture 2>&1 | tee /tmp/pg-executor.log
+          cargo test --locked --lib db::tests::event_cursor::postgres_global_cursor_serializes_independent_database_instances_and_rollback -- --exact --nocapture 2>&1 | tee /tmp/pg-executor.log
           grep -F '1 passed; 0 failed' /tmp/pg-executor.log
 
   semantic-reader-scope-contract:
