@@ -10,6 +10,8 @@ export async function reuseFixture(control: URL | string, token: string, tenant:
   const names=scenarios.map(s=>`staging-peak-${runId}-${s}`);
   const existing=upstreams.filter(row=>names.includes(row.name));
   if(!existing.length)return null;
+  const prices:any[]=[];let afterModel:string|undefined;
+  for(;;){const q=new URLSearchParams({currency:"USD",limit:"100"});if(afterModel)q.set("after_model",afterModel);const page=await get(`/internal/v1/model-prices?${q}`);if(!Array.isArray(page))throw new Error("fixture prices malformed");prices.push(...page);if(page.length<100)break;const tail=page.at(-1)?.model;if(typeof tail!=="string"||(afterModel!==undefined&&tail<=afterModel))throw new Error("fixture price page did not advance");afterModel=tail;}
   const routes=await list("/internal/v1/model-routes");const selected:Record<string,string>={};
   for(const scenario of scenarios){
     const model=`staging-peak-${runId}-${scenario}`;
@@ -21,11 +23,13 @@ export async function reuseFixture(control: URL | string, token: string, tenant:
     if(found.length!==1)throw new Error("fixture route incomplete or ambiguous");
     const r=found[0];
     if(r.tenant_external_id!==tenant||!r.enabled||r.protocol!=="openai"||r.upstream_model!==model||r.upstream_account_id!==u.id||r.priority!==0||(r.upstream_account_ids??[u.id]).some((id:string)=>id!==u.id)||(r.included_provider_group_ids??[]).length||(r.route_group_ids??[]).length)throw new Error("fixture route differs from isolated mock");
+    const price=prices.filter(row=>row.model===model&&row.currency==="USD");
+    if(price.length!==1||Number(price[0].input_per_million)!==0.01||Number(price[0].output_per_million)!==0.02||(price[0].tiers??[]).some((tier:any)=>tier.service_tier==="default"&&(Number(tier.input_per_million)!==0.01||Number(tier.output_per_million)!==0.02)))throw new Error("fixture price differs from workload");
     selected[scenario]=String(r.id);
   }
   const keys=(await list("/internal/v1/keys",{principal_external_id:`staging-peak-${runId}`,status:"active"})).filter(row=>row.alias===`Isolated ${runId}`);
   if(keys.length!==1)throw new Error("fixture key incomplete or ambiguous");
-  const k=keys[0];if(k.tenant_external_id!==tenant||k.currency!=="USD"||!k.credential_copy_available||k.policy?.max_concurrency<concurrency||k.policy?.enforcement_mode!=="metered_unlimited")throw new Error("fixture key differs from workload");
+  const k=keys[0];if(k.tenant_external_id!==tenant||k.currency!=="USD"||!k.credential_copy_available||!Number.isSafeInteger(k.policy?.max_concurrency)||k.policy.max_concurrency<concurrency||!Number.isSafeInteger(k.policy?.requests_per_minute)||k.policy.requests_per_minute<Math.max(1,concurrency*60)||!Number.isSafeInteger(k.policy?.tokens_per_minute)||k.policy.tokens_per_minute<1_000_000_000||k.policy?.enforcement_mode!=="metered_unlimited"||k.policy.daily_budget!==null||k.policy.weekly_budget!==null||k.policy.lifetime_budget!==null)throw new Error("fixture key differs from workload");
   const binding=await get(`/internal/v1/keys/${k.key_id}/routing?${new URLSearchParams({tenant_external_id:tenant})}`);
   const expected=Object.values(selected).sort();
   if((binding.route_group_ids??[]).length||JSON.stringify([...(binding.effective_route_ids??[])].sort())!==JSON.stringify(expected)||JSON.stringify([...(binding.route_ids??[])].sort())!==JSON.stringify(expected))throw new Error("fixture key routing differs from isolated mock");
