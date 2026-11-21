@@ -1,0 +1,55 @@
+name: staging-peak-mock
+on:
+  workflow_dispatch:
+  pull_request:
+    paths:
+      - tests/load/staging-peak/**
+      - tests/load/benchmark-memory.ts
+      - .github/workflows/staging-peak-mock.yml
+permissions:
+  contents: read
+jobs:
+  harness-contract:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020
+        with:
+          node-version: 24.18.0
+      - run: node --test tests/load/staging-peak/test-framework.ts
+      - name: State evidence boundary
+        run: echo 'Harness contracts only. Historical peak and TEST-cluster lifecycle qualification require measured baseline and a separate cluster run.' >> "$GITHUB_STEP_SUMMARY"
+  package-harness:
+    permissions:
+      contents: read
+      packages: write
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    needs: harness-contract
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
+      - name: Build exact-source isolated mock and load image
+        run: |
+          mkdir -p evidence
+          docker build --build-arg MTC_HARNESS_SOURCE_SHA=${{ github.sha }} --file tests/load/staging-peak/Dockerfile --tag mtc-staging-peak:${{ github.sha }} .
+          docker image inspect mtc-staging-peak:${{ github.sha }} --format '{{.Id}}' > evidence/image-id.txt
+          printf '%s\n' '${{ github.sha }}' > evidence/source-sha.txt
+          docker save mtc-staging-peak:${{ github.sha }} -o evidence/staging-peak-image.tar
+          sha256sum evidence/staging-peak-image.tar > evidence/archive-sha256.txt
+      - name: Publish isolated TEST harness image
+        if: github.event_name == 'workflow_dispatch' || github.event.pull_request.head.repo.full_name == github.repository
+        env:
+          GHCR_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          printf '%s' "$GHCR_TOKEN" | docker login ghcr.io -u '${{ github.actor }}' --password-stdin
+          image='ghcr.io/${{ github.repository }}-staging-peak-mock:${{ github.sha }}'
+          docker tag mtc-staging-peak:${{ github.sha }} "$image"
+          docker push "$image"
+          docker image inspect "$image" --format '{{json .RepoDigests}}' > evidence/registry-digests.json
+          docker logout ghcr.io
+      - uses: actions/upload-artifact@65462800fd760344b1a7b4382951275a0abb4808
+        with:
+          name: staging-peak-harness-${{ github.sha }}
+          path: evidence/
+          retention-days: 7
