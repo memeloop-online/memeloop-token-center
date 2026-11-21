@@ -331,11 +331,22 @@ async fn postgres_slow_supplier_summary_preserves_terminal_and_recoverable_expla
             tokio::task::yield_now().await;
         }
     }).await.expect("SQL observation and conversation enqueue precede slow summary PUT");
-    let requests = s3.received_requests().await.unwrap();
-    assert!(
-        !requests.is_empty(),
-        "real S3 client reached blocked HTTP endpoint"
-    );
+    tokio::time::timeout(Duration::from_secs(5), async {
+        loop {
+            if s3
+                .received_requests()
+                .await
+                .unwrap()
+                .iter()
+                .any(|request| request.method.as_str() == "PUT")
+            {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("real S3 client reached blocked HTTP endpoint");
     fixture.state.pending_terminals.stop_for_test().await;
     // The journal backend is independent of the unavailable summary endpoint.
     let location = format!(
