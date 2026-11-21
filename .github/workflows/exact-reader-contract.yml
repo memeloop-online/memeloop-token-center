@@ -639,6 +639,8 @@ jobs:
           grep -F '1 passed; 0 failed' /tmp/event-backfill.log
           cargo test --locked --lib db::gateway_persistence::tests::source_binding::postgres_source_binding_uses_owned_partition_and_preserves_replay -- --ignored --exact --nocapture 2>&1 | tee /tmp/source-binding.log
           grep -F '1 passed; 0 failed' /tmp/source-binding.log
+          cargo test --locked --test request_history_cli request_history_cli_export_page_reports_safe_materialization_failure_without_ack -- --exact --nocapture 2>&1 | tee /tmp/history-cli-diagnostic.log
+          grep -F '1 passed; 0 failed' /tmp/history-cli-diagnostic.log
 
   semantic-reader-scope-contract:
     if: inputs.contract == 'semantic-reader-scope'
