@@ -227,7 +227,7 @@ impl ArchiveStore {
         Ok(self.raw_retirement(tenant, request, side).await?.is_some())
     }
 
-    async fn raw_retirement(
+    pub(super) async fn raw_retirement(
         &self,
         tenant: Uuid,
         request: Uuid,
@@ -668,6 +668,20 @@ mod retirement_contracts {
             .retire_covered_raw_roots(&prepared.publication, &proof)
             .await
             .unwrap();
+        let inventory = archive
+            .inventory_retired_raw(&prepared.publication)
+            .await
+            .unwrap();
+        assert_eq!(inventory.len(), 2);
+        assert!(
+            inventory
+                .iter()
+                .all(|candidate| candidate.physical_bytes > 0)
+        );
+        let batch =
+            super::super::RawGcCandidateBatch::from_candidates(inventory, Vec::new()).unwrap();
+        assert_eq!(batch.candidates.len(), 2);
+        assert!(batch.unique_physical_bytes > 0);
         for (side, object) in [("request", input), ("response", response)] {
             assert!(
                 archive
@@ -752,6 +766,13 @@ mod retirement_contracts {
                 .retire_covered_raw_roots(&prepared.publication, &proof)
                 .await
                 .is_err()
+        );
+        assert!(
+            archive
+                .inventory_retired_raw(&prepared.publication)
+                .await
+                .unwrap()
+                .is_empty()
         );
         for (side, expected) in [("request", input), ("response", response)] {
             assert_eq!(
