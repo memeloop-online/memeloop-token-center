@@ -88,3 +88,22 @@ test("buffered fixture sends actual large JSON and verifies payload size/content
   const {server}=createStagingMock();await new Promise<void>(resolve=>server.listen(0,"127.0.0.1",resolve));const address=server.address();assert(address&&typeof address!=="string");
   try{for(const protocol of ["chat","responses"] as const){const bytes=256*1024;const response=await fetch(`http://127.0.0.1:${address.port}/scenario/normal/v1/${protocol==="chat"?"chat/completions":"responses"}`,{method:"POST",body:JSON.stringify({model:"synthetic",stream:false,benchmark:{mode:"buffered",bytes}})});const wire=new Uint8Array(await response.arrayBuffer());assert(wire.byteLength>bytes);const verifier=new FixtureVerifier(protocol,false,bytes);verifier.consume(wire);const result=verifier.finish(wire.byteLength);assert.equal(result.verified,true);assert.equal(result.response_payload_bytes,bytes);const wrong=new FixtureVerifier(protocol,false,bytes+1);wrong.consume(wire);assert.equal(wrong.finish(wire.byteLength).verified,false);}}finally{server.closeAllConnections();await new Promise<void>(resolve=>server.close(()=>resolve()));}
 });
+
+import { targetEndpoints } from "./run.ts";
+test("isolated endpoints bind namespace to exact services", () => {
+  const env = { POD_NAMESPACE: "memeloop-token-center-staging", MTC_PEAK_RUN_ID: "tool-fixture-20261118" };
+  const endpoints = targetEndpoints(env);
+  assert.equal(endpoints.gateway.href, "http://mtc-staging-gateway:8080/");
+  assert.equal(endpoints.control.href, "http://mtc-staging-control:8080/");
+  assert.equal(endpoints.mock.href, "http://mtc-staging-mock:18080/");
+  assert.equal(targetEndpoints({ ...env, POD_NAMESPACE: "memeloop-token-center-test" }).gateway.hostname, "memeloop-token-center-test-gateway");
+  for (const invalid of [
+    { ...env, POD_NAMESPACE: "memeloop-token-center" },
+    { ...env, POD_NAMESPACE: undefined },
+    { ...env, MTC_PEAK_RUN_ID: undefined },
+    { ...env, MTC_TEST_GATEWAY_URL: "http://memeloop-token-center-test-gateway:8080" },
+    { ...env, MTC_TEST_CONTROL_URL: "http://mtc-staging-control:8080/private" },
+    { ...env, MTC_TEST_MOCK_URL: "http://mtc-staging-mock:8080" },
+    { ...env, MTC_PEAK_OPERATOR_FORWARD: "1" },
+  ]) assert.throws(() => targetEndpoints(invalid));
+});
