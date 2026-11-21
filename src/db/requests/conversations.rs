@@ -476,6 +476,65 @@ impl Database {
         Ok(())
     }
 
+    /// Claim one independently verified historical body without claiming any other work.
+    /// Source locators and the previous acknowledgement are compared atomically.
+    #[allow(clippy::too_many_arguments)]
+    pub async fn claim_exact_session_body_rebuild(
+        &self,
+        tenant_id: Uuid,
+        key_id: Uuid,
+        request_id: Uuid,
+        expected_projected_at: Option<i64>,
+        request_locator: &str,
+        response_locator: &str,
+        lease_owner: Uuid,
+        prepared_snapshot: Option<&str>,
+        previous_lease_owner: Option<Uuid>,
+    ) -> Result<bool, AppError> {
+        let now = unix_millis();
+        let mut transaction = self.begin_write_transaction().await?;
+        if matches!(self.backend, DatabaseBackend::PostgreSql) {
+            sqlx::query("SET LOCAL lock_timeout = '1s'")
+                .execute(&mut *transaction)
+                .await?;
+            sqlx::query("SET LOCAL statement_timeout = '3s'")
+                .execute(&mut *transaction)
+                .await?;
+        }
+        let result = sqlx::query(
+            "UPDATE conversation_projection_outbox SET projected_at = NULL,
+             lease_owner = $1, lease_expires_at = $2,
+             terminal_lease_owner = NULL, terminal_lease_expires_at = NULL,
+             statistics_outcome = 'session_body', attempts = attempts + 1
+             WHERE request_id = $3 AND tenant_id = $4 AND key_id = $5
+               AND (projected_at = $6 OR (projected_at IS NULL AND $6 IS NULL))
+               AND semantic_payload_snapshot_json IS NULL
+               AND (semantic_snapshot_json IS NULL OR
+                    ($10 IS NOT NULL AND semantic_snapshot_json = $10
+                     AND lease_owner = $11 AND projected_at IS NULL))
+               AND (lease_owner IS NULL OR lease_expires_at <= $7)
+               AND (terminal_lease_owner IS NULL OR terminal_lease_expires_at <= $7)
+               AND EXISTS (SELECT 1 FROM request_records r
+                 WHERE r.id = $3 AND r.tenant_id = $4 AND r.key_id = $5
+                   AND r.request_object = $8 AND r.response_object = $9)",
+        )
+        .bind(lease_owner.to_string())
+        .bind(now.saturating_add(CONVERSATION_PROJECTION_LEASE_MILLIS))
+        .bind(request_id.to_string())
+        .bind(tenant_id.to_string())
+        .bind(key_id.to_string())
+        .bind(expected_projected_at)
+        .bind(now)
+        .bind(request_locator)
+        .bind(response_locator)
+        .bind(prepared_snapshot)
+        .bind(previous_lease_owner.map(|owner| owner.to_string()))
+        .execute(&mut *transaction)
+        .await?;
+        transaction.commit().await?;
+        Ok(result.rows_affected() == 1)
+    }
+
     /// 把已经写过 `projected_at`、并且原始请求 JSON 与原始返回 JSON 的 locator 都还在的行
     /// 收成小批，交给新 worker 重写会话正文。
     ///

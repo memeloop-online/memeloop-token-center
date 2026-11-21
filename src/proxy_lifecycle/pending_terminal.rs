@@ -847,7 +847,6 @@ impl Journal {
             }
             entry.snapshot.clone()
         };
-        snapshot.persist_supplier_summary(database).await?;
         let request_id = snapshot.request_id;
         if snapshot.claim.is_none() {
             // Legacy claimless finish owns both the financial transaction and
@@ -1331,7 +1330,6 @@ impl Journal {
             let task = tokio::spawn(async move {
                 let request_id = snapshot.request_id;
                 let result = async {
-                    snapshot.persist_supplier_summary(&database).await?;
                     let claim = snapshot
                         .claim
                         .as_ref()
@@ -1783,11 +1781,7 @@ impl Journal {
         let mut reconcile = false;
         if !applied {
             let attribution = snapshot.attribution();
-            let result = match snapshot
-                .persist_supplier_summary(&database)
-                .await
-                .and_then(|()| snapshot.terminal())
-            {
+            let result = match snapshot.terminal() {
                 Ok(input) => {
                     if let Some(claim) = snapshot.claim.as_ref() {
                         let evidence = match input.usage_basis {
@@ -1991,6 +1985,16 @@ impl Journal {
                 tracing::error!(%request_id, %receipt_id, "conversation projection remains pending independently of financial settlement");
             }
         }
+        // The durable snapshot retains the complete supplier explanation until
+        // its independently published summary can be acknowledged.
+        let summary_published = match snapshot.persist_supplier_summary(&database).await {
+            Ok(()) => true,
+            Err(error) => {
+                tracing::warn!(%request_id, %receipt_id, error_category = error.diagnostic_category(),
+                    "supplier summary publication deferred; terminal receipt retained");
+                false
+            }
+        };
         let operational_acknowledged = snapshot.claim.is_none()
             || self
                 .pending
@@ -2011,18 +2015,19 @@ impl Journal {
         // A publication owns its PUT and local-cache write until completion.
         // Pin retirement under the same lock used to start publishers so no
         // late writer can recreate a receipt after deletion.
-        let removed = if applied && operational_acknowledged && conversation_complete {
-            let mut pending = self.pending.lock().unwrap_or_else(|e| e.into_inner());
-            pending.get_mut(&receipt_id).is_some_and(|entry| {
-                if entry.publication_running {
-                    return false;
-                }
-                entry.retiring = true;
-                true
-            })
-        } else {
-            false
-        };
+        let removed =
+            if applied && operational_acknowledged && conversation_complete && summary_published {
+                let mut pending = self.pending.lock().unwrap_or_else(|e| e.into_inner());
+                pending.get_mut(&receipt_id).is_some_and(|entry| {
+                    if entry.publication_running {
+                        return false;
+                    }
+                    entry.retiring = true;
+                    true
+                })
+            } else {
+                false
+            };
         if removed {
             if let Some(archive) = &self.archive
                 && archive
@@ -2062,6 +2067,7 @@ impl Journal {
                 && entry.published_revision == Some(entry.snapshot_revision)
         });
         let evict_unknown = compact_published
+            && summary_published
             && (reconcile || applied)
             && operational_acknowledged
             && (conversation_complete
