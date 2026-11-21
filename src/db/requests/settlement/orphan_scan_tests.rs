@@ -354,6 +354,8 @@ async fn sqlite_orphan_scan_advances_past_ineligible_rows_and_revisits_late_elig
 
 #[tokio::test]
 async fn postgres_orphan_scan_advances_past_ineligible_rows_and_revisits_late_eligibility() {
+    super::super::operational_terminal::tests::expired_owner_page_contract().await;
+    super::super::operational_terminal::tests::expired_owner_wait_does_not_block_orphan_lane_contract().await;
     let Ok(database_url) = std::env::var("MTC_TEST_POSTGRES_URL") else {
         assert!(
             std::env::var_os("CI").is_none(),
