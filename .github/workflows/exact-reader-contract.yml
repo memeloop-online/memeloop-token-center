@@ -68,6 +68,8 @@ jobs:
           test -n "$MTC_TEST_POSTGRES_URL"
           cargo test --locked --lib --no-run
           for selector in \
+            db::archive_gc_fence::tests::sqlite_durable_scope_pin_epoch_and_unknown_delete_contract \
+            db::archive_gc_fence::tests::postgres_durable_scope_pin_epoch_and_unknown_delete_contract \
             db::requests::settlement::orphan_scan_tests::sqlite_orphan_scan_advances_past_ineligible_rows_and_revisits_late_eligibility \
             db::requests::settlement::orphan_scan_tests::postgres_orphan_scan_advances_past_ineligible_rows_and_revisits_late_eligibility
           do
@@ -101,6 +103,8 @@ jobs:
           for selector in \
             error::tests::object_storage_classification_preserves_only_typed_safe_facts \
             error::tests::dependency_errors_do_not_retain_secret_bearing_driver_messages \
+            response_archive_spool::tests::gc_scope_exclusive_defers_publication_without_losing_complete_original \
+            response_archive_spool::tests::late_response_capture_settles_against_retired_semantics_without_restoring_raw_binding \
             response_archive_spool::tests::shared_capture_reaches_eof_while_all_upload_slots_are_held \
             response_archive_spool::tests::unavailable_local_directory_does_not_gate_complete_original \
             response_archive_spool::tests::cancelled_unsealed_carrier_releases_owned_capture_without_acknowledging_original \
@@ -218,9 +222,13 @@ jobs:
           cargo test --locked --lib db::archive_staging::backend_tests 2>&1 | tee /tmp/staging-db.log
           grep -F '2 passed; 0 failed' /tmp/staging-db.log
           cargo test --locked --lib archive::routing_tests 2>&1 | tee /tmp/staging-routing.log
-          grep -F '6 passed; 0 failed' /tmp/staging-routing.log
+          grep -F '7 passed; 0 failed' /tmp/staging-routing.log
           cargo test --locked --lib training_cas_real_s3_configuration_and_reader -- --ignored 2>&1 | tee /tmp/staging-rustfs.log
           grep -F '1 passed; 0 failed' /tmp/staging-rustfs.log
+          cargo test --locked --lib api::session_reading::tests::canonical_training_reads_complete_prefix_without_legacy_root_and_fails_closed -- --exact 2>&1 | tee /tmp/gc-canonical-reader.log
+          grep -F '1 passed; 0 failed' /tmp/gc-canonical-reader.log
+          cargo test --locked --lib api::session_reading::tests::dialogue_parts_preserve_tools_media_and_future_extensions -- --exact 2>&1 | tee /tmp/gc-canonical-parts.log
+          grep -F '1 passed; 0 failed' /tmp/gc-canonical-parts.log
   next-release-contract:
     if: inputs.contract == 'next-release'
     runs-on: ubuntu-24.04

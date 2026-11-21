@@ -1267,6 +1267,31 @@ async fn run_response_archive_writer(
         return Ok(WriterOutcome::Abandoned);
     };
     let source = captured.source;
+    // The existing staging attempt is the durable owner of this lifecycle pin.
+    // It protects AlreadyExists reuse through publication and relational binding;
+    // no database transaction or pool connection crosses object I/O.
+    let gc_scope = crate::db::archive_gc_fence::ArchiveGcScope::for_tenant(identity.tenant_id)?;
+    let publication_pin = loop {
+        match state
+            .persistence_db
+            .acquire_archive_gc_pins(
+                vec![gc_scope.clone()],
+                captured.staging.attempt_id,
+                "archive-attempt",
+                captured.staging.attempt_id,
+                crate::db::archive_gc_fence::ArchiveGcPinPurpose::Writer,
+            )
+            .await
+        {
+            Ok(Some(pin)) => break pin,
+            Ok(None) => tokio::time::sleep(std::time::Duration::from_millis(250)).await,
+            Err(error) => {
+                tracing::warn!(request_id = %identity.request_id, error_category = error.diagnostic_category(),
+                    stage = "publication_pin", "complete original retains source while archive publication pin is unavailable");
+                tokio::time::sleep(std::time::Duration::from_millis(250)).await;
+            }
+        }
+    };
     let publication_started = std::time::Instant::now();
     let mut publication_attempt = 0_u64;
     let (staged, staging_owner) = loop {
@@ -1346,9 +1371,11 @@ async fn run_response_archive_writer(
             "late response publisher transferred responsibility to verified semantic retirement");
         // Retirement is not a new raw-root acknowledgement. In particular, a
         // late publisher must not restore the retired SQL locator binding.
+        release_publication_pin(&state, identity, &publication_pin).await;
         return Ok(WriterOutcome::Sealed);
     }
     if matches!(target, CaptureTarget::DiscardedAttempt(_)) {
+        release_publication_pin(&state, identity, &publication_pin).await;
         return Ok(WriterOutcome::Sealed);
     }
     state.db.refresh_closed_persistence_pool();
@@ -1363,7 +1390,21 @@ async fn run_response_archive_writer(
         tracing::warn!(request_id = %identity.request_id, error_category = error.diagnostic_category(),
             "raw response root awaits relational projection");
     }
+    release_publication_pin(&state, identity, &publication_pin).await;
     Ok(WriterOutcome::Sealed)
+}
+
+async fn release_publication_pin(
+    state: &AppState,
+    identity: ArchiveSpoolIdentity,
+    pin: &crate::db::archive_gc_fence::ArchiveGcPins,
+) {
+    if let Err(error) = state.persistence_db.release_archive_gc_pins(pin).await {
+        // The root or semantic retirement is already acknowledged. An unknown
+        // release retains durable coordination; it cannot authorize GC.
+        tracing::warn!(request_id = %identity.request_id, error_category = error.diagnostic_category(),
+            stage = "publication_pin_release", "published original retains durable publication pin for reconciliation");
+    }
 }
 
 #[cfg(test)]

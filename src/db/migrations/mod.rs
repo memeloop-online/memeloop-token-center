@@ -863,6 +863,11 @@ pub(crate) const SQLITE_MIGRATIONS: &[Migration] = &[
         name: "history_event_backfill_cursor",
         sql: include_str!("../../../migrations/common/0163_history_event_backfill_cursor.sql"),
     },
+    Migration {
+        version: 164,
+        name: "archive_gc_scope_fences",
+        sql: include_str!("../../../migrations/common/0164_archive_gc_scope_fences.sql"),
+    },
 ];
 
 pub(crate) const POSTGRES_MIGRATIONS: &[Migration] = &[
@@ -1700,6 +1705,11 @@ pub(crate) const POSTGRES_MIGRATIONS: &[Migration] = &[
         version: 163,
         name: "history_event_backfill_cursor",
         sql: include_str!("../../../migrations/common/0163_history_event_backfill_cursor.sql"),
+    },
+    Migration {
+        version: 164,
+        name: "archive_gc_scope_fences",
+        sql: include_str!("../../../migrations/common/0164_archive_gc_scope_fences.sql"),
     },
 ];
 

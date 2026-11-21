@@ -1433,3 +1433,95 @@ async fn streaming_writer_batches_four_chunks_without_growing_its_memory_reserva
         (4 * super::CHUNK_BYTES) as i64
     );
 }
+
+#[tokio::test]
+async fn gc_scope_exclusive_defers_publication_without_losing_complete_original() {
+    use crate::db::archive_gc_fence::{ArchiveGcPinPurpose, ArchiveGcScope};
+    let (_directory, state, pool, identity) = fixture().await;
+    let scope = ArchiveGcScope::for_tenant(identity.tenant_id).unwrap();
+    let seed = state
+        .persistence_db
+        .acquire_archive_gc_pins(
+            vec![scope.clone()],
+            Uuid::now_v7(),
+            "request",
+            identity.request_id,
+            ArchiveGcPinPurpose::Writer,
+        )
+        .await
+        .unwrap()
+        .unwrap();
+    state
+        .persistence_db
+        .release_archive_gc_pins(&seed)
+        .await
+        .unwrap();
+    let epoch = state
+        .persistence_db
+        .archive_gc_root_epoch(&scope)
+        .await
+        .unwrap()
+        .unwrap();
+    let exclusive = state
+        .persistence_db
+        .claim_archive_gc_exclusive(&scope, epoch, Uuid::now_v7())
+        .await
+        .unwrap()
+        .unwrap();
+    let bytes = Bytes::from_static(br#"{"complete":"original"}"#);
+    let mut producer =
+        ResponseArchiveProducer::begin(&state, identity, state.proxy_memory_budget.reservation())
+            .unwrap();
+    assert!(producer.append_with_backpressure(bytes.clone()).await);
+    let settlement = producer.seal().unwrap();
+    let mut completion = Box::pin(settlement.wait_result_for_test());
+    assert!(
+        tokio::time::timeout(std::time::Duration::from_millis(50), &mut completion)
+            .await
+            .is_err()
+    );
+    assert!(
+        state
+            .archive
+            .raw_capture_reference(identity.tenant_id, identity.request_id, "response")
+            .await
+            .unwrap()
+            .is_none()
+    );
+    assert!(
+        state
+            .persistence_db
+            .finish_archive_gc_exclusive(&exclusive)
+            .await
+            .unwrap()
+    );
+    tokio::time::timeout(std::time::Duration::from_secs(5), completion)
+        .await
+        .unwrap()
+        .unwrap()
+        .unwrap();
+    let reference = state
+        .archive
+        .raw_capture_reference(identity.tenant_id, identity.request_id, "response")
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        state
+            .archive
+            .get_tenant_content(identity.tenant_id, &reference, bytes.len())
+            .await
+            .unwrap(),
+        bytes
+    );
+    let active: i64 =
+        sqlx::query_scalar("SELECT COUNT(*) FROM archive_gc_pins WHERE tenant_id=$1 AND active=1")
+            .bind(identity.tenant_id.to_string())
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+    assert_eq!(
+        active, 0,
+        "root handoff releases its durable publication pin"
+    );
+}
