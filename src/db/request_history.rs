@@ -497,7 +497,7 @@ impl Database {
             ""
         };
         let sql = format!(
-            "SELECT source, after_id FROM request_history_backfill WHERE done = 0 ORDER BY source LIMIT 1{lock}"
+            "SELECT source, after_id, after_created_at FROM request_history_backfill WHERE done = 0 ORDER BY source LIMIT 1{lock}"
         );
         let Some(checkpoint) = sqlx::query(sqlx::AssertSqlSafe(sql))
             .fetch_optional(&mut *transaction)
@@ -507,17 +507,28 @@ impl Database {
         };
         let source: String = checkpoint.try_get("source")?;
         let after: String = checkpoint.try_get("after_id")?;
-        let sql = format!(
-            "SELECT {COLUMNS} FROM request_history_source_ids WHERE source = $1 AND request_id > $2 ORDER BY request_id LIMIT $3"
-        );
-        let rows = sqlx::query(sqlx::AssertSqlSafe(sql))
-            .bind(&source)
-            .bind(&after)
-            .bind(page_size)
-            .fetch_all(&mut *transaction)
-            .await?;
+        let event_after: Option<i64> = checkpoint.try_get("after_created_at")?;
+        let rows = if source == "event" {
+            // Event IDs need not follow event time. A legacy UUID cursor gets
+            // one complete time-ordered pass; existing durable receipts below
+            // preserve revisions already captured or delivered.
+            sqlx::query("SELECT 'event' AS source,event_id AS request_id,tenant_id,key_id,event_at AS created_at FROM request_events WHERE event_at >= $1 AND (event_at,event_id) > ($1,$2) ORDER BY event_at,event_id LIMIT $3")
+                .bind(event_after.unwrap_or(i64::MIN))
+                .bind(if event_after.is_some() { after.as_str() } else { "" })
+                .bind(page_size).fetch_all(&mut *transaction).await?
+        } else {
+            let sql = format!(
+                "SELECT {COLUMNS} FROM request_history_source_ids WHERE source = $1 AND request_id > $2 ORDER BY request_id LIMIT $3"
+            );
+            sqlx::query(sqlx::AssertSqlSafe(sql))
+                .bind(&source)
+                .bind(&after)
+                .bind(page_size)
+                .fetch_all(&mut *transaction)
+                .await?
+        };
         for row in &rows {
-            sqlx::query("INSERT INTO request_history_export (source, request_id, tenant_id, key_id, created_at) VALUES ($1, $2, $3, $4, $5) ON CONFLICT (source, request_id) DO NOTHING")
+            sqlx::query("INSERT INTO request_history_export (source, request_id, tenant_id, key_id, created_at) SELECT $1, $2, $3, $4, $5 WHERE $1 <> 'event' OR NOT EXISTS (SELECT 1 FROM request_history_identities i WHERE i.source=$1 AND i.request_id=$2 AND i.tenant_id=$3 AND i.key_id=$4 AND i.created_at=$5) ON CONFLICT (source, request_id) DO NOTHING")
                 .bind(&source).bind(row.try_get::<String, _>("request_id")?)
                 .bind(row.try_get::<String, _>("tenant_id")?).bind(row.try_get::<String, _>("key_id")?)
                 .bind(row.try_get::<i64, _>("created_at")?).execute(&mut *transaction).await?;
@@ -527,6 +538,15 @@ impl Database {
             .map(|row| row.try_get::<String, _>("request_id"))
             .transpose()?
             .unwrap_or(after);
+        if source == "event" {
+            let time = rows
+                .last()
+                .map(|row| row.try_get::<i64, _>("created_at"))
+                .transpose()?
+                .or(event_after);
+            sqlx::query("UPDATE request_history_backfill SET legacy_after_id=CASE WHEN after_created_at IS NULL THEN after_id ELSE legacy_after_id END,after_created_at=$1 WHERE source='event'")
+                .bind(time).execute(&mut *transaction).await?;
+        }
         sqlx::query(
             "UPDATE request_history_backfill SET after_id = $1, done = $2 WHERE source = $3",
         )
@@ -1190,3 +1210,7 @@ fn history_identity(row: &AnyRow) -> Result<HistoryIdentity, HistoryError> {
 #[cfg(test)]
 #[path = "../request_history/persistence_tests.rs"]
 mod tests;
+
+#[cfg(test)]
+#[path = "request_history/event_backfill_tests.rs"]
+mod event_backfill_tests;
