@@ -3,6 +3,9 @@
 use super::*;
 use sqlx::{Column, ValueRef};
 
+mod event_capture;
+pub(crate) use event_capture::{EventDraft, PreparedEventCapture};
+
 /// Preserve the original scalar types rather than coercing unknown money to zero.
 fn original_row(row: &AnyRow) -> Result<Value, AppError> {
     let mut result = serde_json::Map::new();

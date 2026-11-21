@@ -2347,24 +2347,17 @@ pub(super) async fn emit_conversation_projected_event_in_transaction(
     let request_id = request_id.to_string();
     let tenant_id = tenant_id.to_string();
     let key_id = key_id.to_string();
-    let event =
-        allocate_request_event_cursor(transaction, unix_millis(), &tenant_id, &key_id, &request_id)
-            .await?;
-    // Semantic completion does not imply financial settlement. An authenticated
-    // operational receipt may finish a request whose usage remains unknown.
-    // Keep the event's accounting fields sourced exclusively from the request;
-    // use the receipt only for runtime outcome and eligibility.
-    let inserted = sqlx::query(
-        r#"INSERT INTO request_events (
-               event_id, tenant_id, key_id, request_id, event_at, event_kind,
-               protocol, model, status_code, duration_ms, input_tokens,
-               output_tokens, cost_micros, error_code)
-           SELECT $1, r.tenant_id, r.key_id, r.id, $2, 'projected',
-                  r.protocol, r.model,
-                  COALESCE(o.status_code, r.status_code),
-                  COALESCE(o.duration_ms, r.duration_ms),
-                  r.input_tokens, r.output_tokens, r.cost_micros,
-                  CASE WHEN o.request_id IS NOT NULL THEN o.error_code ELSE r.error_code END
+    super::super::history_immutable_outbox::capture_request_in_transaction(
+        transaction,
+        &request_id,
+    )
+    .await?;
+    let draft_cursor = crate::db::RequestEventCursor {
+        event_id: Uuid::nil().to_string(),
+        event_at: unix_millis(),
+    };
+    let draft_row = sqlx::query(
+        r#"SELECT CAST($1 AS TEXT) AS event_id, CAST(r.tenant_id AS TEXT) AS tenant_id, CAST(r.key_id AS TEXT) AS key_id, CAST(r.id AS TEXT) AS request_id, CAST($2 AS BIGINT) AS event_at, CAST('projected' AS TEXT) AS event_kind, CAST(r.protocol AS TEXT) AS protocol, CAST(r.model AS TEXT) AS model, CAST(COALESCE(o.status_code, r.status_code) AS BIGINT) AS status_code, CAST(COALESCE(o.duration_ms, r.duration_ms) AS BIGINT) AS duration_ms, CAST(r.input_tokens AS BIGINT) AS input_tokens, CAST(r.output_tokens AS BIGINT) AS output_tokens, CAST(r.cost_micros AS BIGINT) AS cost_micros, CAST(CASE WHEN o.request_id IS NOT NULL THEN o.error_code ELSE r.error_code END AS TEXT) AS error_code
              FROM request_records r
              LEFT JOIN proxy_operational_terminals o
                ON o.request_id = r.id AND o.request_created_at = r.created_at
@@ -2372,37 +2365,38 @@ pub(super) async fn emit_conversation_projected_event_in_transaction(
               AND o.reservation_id = r.reservation_id
             WHERE r.id = $3 AND r.tenant_id = $4 AND r.key_id = $5
               AND (r.completed_at IS NOT NULL OR o.request_id IS NOT NULL)
-           UNION ALL
-           SELECT $1, tenant_id, key_id, request_id, $2, 'projected',
-                  protocol, model, status_code, duration_ms, input_tokens,
-                  output_tokens, cost_micros, NULLIF(error_code, '')
+            UNION ALL SELECT CAST($1 AS TEXT) AS event_id, CAST(tenant_id AS TEXT) AS tenant_id, CAST(key_id AS TEXT) AS key_id, CAST(request_id AS TEXT) AS request_id, CAST($2 AS BIGINT) AS event_at, CAST('projected' AS TEXT) AS event_kind, CAST(protocol AS TEXT) AS protocol, CAST(model AS TEXT) AS model, CAST(status_code AS BIGINT) AS status_code, CAST(duration_ms AS BIGINT) AS duration_ms, CAST(input_tokens AS BIGINT) AS input_tokens, CAST(output_tokens AS BIGINT) AS output_tokens, CAST(cost_micros AS BIGINT) AS cost_micros, CAST(NULLIF(error_code, '') AS TEXT) AS error_code
              FROM terminal_projection_outbox
             WHERE request_id = $3 AND tenant_id = $4 AND key_id = $5
               AND NOT EXISTS (SELECT 1 FROM request_records WHERE id = $3)"#,
     )
-    .bind(&event.event_id)
-    .bind(event.event_at)
+    .bind(&draft_cursor.event_id)
+    .bind(draft_cursor.event_at)
     .bind(&request_id)
     .bind(tenant_id)
     .bind(key_id)
-    .execute(&mut **transaction)
+    .fetch_optional(&mut **transaction)
     .await?;
-    super::super::history_immutable_outbox::capture_event_in_transaction(
+    let prepared = match draft_row.as_ref() {
+        Some(row) => Some(
+            crate::db::history_immutable_outbox::EventDraft::from_row(row)?
+                .prepare(transaction)
+                .await?,
+        ),
+        None => None,
+    };
+    let inserted = crate::db::history_immutable_outbox::PreparedEventCapture::publish(
         transaction,
-        &event.event_id.to_string(),
-        event.event_at,
+        prepared,
+        unix_millis(),
     )
     .await?;
-    if inserted.rows_affected() != 1 {
+    if inserted != 1 {
         return Err(AppError::internal(
             "conversations_emit_conversation_projected_event_in_transaction_1",
         ));
     }
-    super::super::history_immutable_outbox::capture_request_in_transaction(
-        transaction,
-        &request_id,
-    )
-    .await?;
+
     Ok(())
 }
 

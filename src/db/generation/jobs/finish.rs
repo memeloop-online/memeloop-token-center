@@ -511,32 +511,42 @@ impl Database {
         let tenant_id: String = job.try_get("tenant_id")?;
         let key_id = key_id.to_string();
         let request_id = input.job_id.to_string();
-        let event =
-            allocate_request_event_cursor(&mut transaction, now, &tenant_id, &key_id, &request_id)
-                .await?;
-        let inserted = sqlx::query(
-            "INSERT INTO request_events (event_id, tenant_id, key_id, request_id, event_at, event_kind, protocol, model, status_code, duration_ms, input_tokens, output_tokens, cost_micros, error_code) SELECT $1, tenant_id, key_id, id, $2, 'finished', 'generation', public_model, CASE WHEN status = 'succeeded' THEN 200 WHEN status = 'cancelled' THEN 499 ELSE 502 END, $3 - created_at, 0, 0, cost_micros, error_code FROM generation_jobs WHERE id = $4",
-        )
-        .bind(&event.event_id)
-        .bind(event.event_at)
-        .bind(now)
-        .bind(&request_id)
-        .execute(&mut *transaction)
-        .await?;
-        super::super::super::history_immutable_outbox::capture_event_in_transaction(
-            &mut transaction,
-            &event.event_id.to_string(),
-            event.event_at,
-        )
-        .await?;
-        if inserted.rows_affected() != 1 {
-            return Err(AppError::internal("finish_site_5"));
-        }
         super::super::super::history_immutable_outbox::capture_generation_in_transaction(
             &mut transaction,
             &request_id,
         )
         .await?;
+        let draft_cursor = crate::db::RequestEventCursor {
+            event_id: Uuid::nil().to_string(),
+            event_at: now,
+        };
+        let draft_row = sqlx::query(
+            r#"SELECT CAST($1 AS TEXT) AS event_id, CAST(tenant_id AS TEXT) AS tenant_id, CAST(key_id AS TEXT) AS key_id, CAST(id AS TEXT) AS request_id, CAST($2 AS BIGINT) AS event_at, CAST('finished' AS TEXT) AS event_kind, CAST('generation' AS TEXT) AS protocol, CAST(public_model AS TEXT) AS model, CAST(CASE WHEN status = 'succeeded' THEN 200 WHEN status = 'cancelled' THEN 499 ELSE 502 END AS BIGINT) AS status_code, CAST($3 - created_at AS BIGINT) AS duration_ms, CAST(0 AS BIGINT) AS input_tokens, CAST(0 AS BIGINT) AS output_tokens, CAST(cost_micros AS BIGINT) AS cost_micros, CAST(error_code AS TEXT) AS error_code FROM generation_jobs WHERE id = $4"#,
+        )
+        .bind(&draft_cursor.event_id)
+        .bind(draft_cursor.event_at)
+        .bind(now)
+        .bind(&request_id)
+        .fetch_optional(&mut *transaction)
+        .await?;
+        let prepared = match draft_row.as_ref() {
+            Some(row) => Some(
+                crate::db::history_immutable_outbox::EventDraft::from_row(row)?
+                    .prepare(&mut transaction)
+                    .await?,
+            ),
+            None => None,
+        };
+        let inserted = crate::db::history_immutable_outbox::PreparedEventCapture::publish(
+            &mut transaction,
+            prepared,
+            now,
+        )
+        .await?;
+        if inserted != 1 {
+            return Err(AppError::internal("finish_site_5"));
+        }
+
         transaction.commit().await?;
         Ok(cost_micros)
     }

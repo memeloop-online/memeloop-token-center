@@ -178,6 +178,9 @@ impl Database {
             {
                 return Err(conflict());
             }
+            super::terminal_projection::enqueue_unknown_terminal_projection_in_transaction(
+                &mut tx, &claim.request_id.to_string(),
+            ).await?;
         } else {
             // Use the frozen contract, not a mutable request/candidate lookup,
             // so recovery has identical attribution after financial completion.
@@ -223,25 +226,24 @@ impl Database {
             // permits and financial projection. Legacy storage requires numeric
             // placeholders; the shared read model emits unknown usage until the
             // authoritative financial source is complete.
-            let event = super::lifecycle::allocate_request_event_cursor(
-                &mut tx, terminal.completed_at, &claim.tenant_id.to_string(),
-                &claim.key_id.to_string(), &claim.request_id.to_string(),
-            ).await?;
-            sqlx::query("INSERT INTO request_events (event_id, tenant_id, key_id, request_id, event_at, event_kind, protocol, model, status_code, duration_ms, input_tokens, output_tokens, cost_micros, error_code) SELECT $1, tenant_id, key_id, id, $2, 'finished', protocol, model, $3, $4, 0, 0, 0, $5 FROM request_records WHERE id = $6 AND created_at = $7 AND tenant_id = $8 AND key_id = $9")
-                .bind(&event.event_id).bind(event.event_at).bind(terminal.status_code)
-                .bind(terminal.duration_ms).bind(&terminal.error_code)
-                .bind(claim.request_id.to_string()).bind(created_at)
-                .bind(claim.tenant_id.to_string()).bind(claim.key_id.to_string())
-                .execute(&mut *tx).await?;
-            super::super::history_immutable_outbox::capture_event_in_transaction(
-                &mut tx, &event.event_id.to_string(), event.event_at,
-            ).await?;
-        }
         super::terminal_projection::enqueue_unknown_terminal_projection_in_transaction(
             &mut tx,
             &claim.request_id.to_string(),
         )
         .await?;
+            let draft_cursor = crate::db::RequestEventCursor { event_id: Uuid::nil().to_string(), event_at: terminal.completed_at };
+            let draft_row = sqlx::query(r#"SELECT CAST($1 AS TEXT) AS event_id, CAST(tenant_id AS TEXT) AS tenant_id, CAST(key_id AS TEXT) AS key_id, CAST(id AS TEXT) AS request_id, CAST($2 AS BIGINT) AS event_at, CAST('finished' AS TEXT) AS event_kind, CAST(protocol AS TEXT) AS protocol, CAST(model AS TEXT) AS model, CAST($3 AS BIGINT) AS status_code, CAST($4 AS BIGINT) AS duration_ms, CAST(0 AS BIGINT) AS input_tokens, CAST(0 AS BIGINT) AS output_tokens, CAST(0 AS BIGINT) AS cost_micros, CAST($5 AS TEXT) AS error_code FROM request_records WHERE id = $6 AND created_at = $7 AND tenant_id = $8 AND key_id = $9"#)
+                .bind(&draft_cursor.event_id).bind(draft_cursor.event_at).bind(terminal.status_code)
+                .bind(terminal.duration_ms).bind(&terminal.error_code)
+                .bind(claim.request_id.to_string()).bind(created_at)
+                .bind(claim.tenant_id.to_string()).bind(claim.key_id.to_string())
+                .fetch_optional(&mut *tx).await?;
+            let prepared = match draft_row.as_ref() {
+                Some(row) => Some(crate::db::history_immutable_outbox::EventDraft::from_row(row)?.prepare(&mut tx).await?),
+                None => None,
+            };
+            crate::db::history_immutable_outbox::PreparedEventCapture::publish(&mut tx, prepared, terminal.completed_at).await?;
+        }
         tx.commit().await?;
         Ok(PendingProxyOperationalTerminalAck {
             request_id: claim.request_id,

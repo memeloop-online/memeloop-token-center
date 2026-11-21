@@ -269,6 +269,33 @@ impl Database {
         .bind(identity.tenant_id.to_string()).bind(identity.key_id.to_string()).bind(identity.created_at)
         .fetch_all(&mut **transaction)
         .await?;
+        Self::enrich_history_event_in_transaction(transaction, rows, identity.tenant_id).await
+    }
+
+    pub(crate) async fn history_draft_event_in_transaction(
+        transaction: &mut Transaction<'_, Any>,
+        draft: &super::super::history_immutable_outbox::EventDraft,
+    ) -> Result<Option<RequestEventView>, AppError> {
+        let sql = enriched_request_events_sql(
+            super::super::history_immutable_outbox::EventDraft::VALUES_SQL,
+        );
+        let rows = draft
+            .bind(sqlx::query(sqlx::AssertSqlSafe(sql)))
+            .fetch_all(&mut **transaction)
+            .await?;
+        Self::enrich_history_event_in_transaction(
+            transaction,
+            rows,
+            parse_uuid(draft.tenant_id.clone())?,
+        )
+        .await
+    }
+
+    async fn enrich_history_event_in_transaction(
+        transaction: &mut Transaction<'_, Any>,
+        rows: Vec<AnyRow>,
+        tenant_id: Uuid,
+    ) -> Result<Option<RequestEventView>, AppError> {
         let Some(mut event) = request_event_views(rows)?.into_iter().next() else {
             return Ok(None);
         };
@@ -281,7 +308,7 @@ impl Database {
             .remove(&event.request_id);
         }
         let row = sqlx::query("SELECT source, request_id, tenant_id, key_id, created_at FROM request_history_source_ids WHERE source IN ('native', 'generation') AND request_id = $1 AND key_id = $2 AND tenant_id = $3")
-            .bind(event.request_id.to_string()).bind(event.key_id.to_string()).bind(identity.tenant_id.to_string()).fetch_optional(&mut **transaction).await?;
+            .bind(event.request_id.to_string()).bind(event.key_id.to_string()).bind(tenant_id.to_string()).fetch_optional(&mut **transaction).await?;
         if let Some(row) = row {
             let identity = crate::request_history::HistoryIdentity {
                 source: row.try_get("source")?,
