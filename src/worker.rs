@@ -343,6 +343,7 @@ pub async fn run_until_shutdown_with_oauth_stop(
         }
     );
     let orphan_reservation_scan = Mutex::new(crate::db::OrphanReservationScan::default());
+    let expired_proxy_owner_scan = Mutex::new(crate::db::ExpiredProxyOwnerScan::default());
     periodic!(
         "projection_outbox_cleanup",
         PROJECTION_OUTBOX_CLEANUP_INTERVAL,
@@ -393,7 +394,19 @@ pub async fn run_until_shutdown_with_oauth_stop(
                     tracing::error!(%error, "worker failed to release orphaned usage reservations");
                 }
             }
-            match state.db.close_expired_proxy_owners(100).await {
+        }
+    );
+    periodic!(
+        "expired_proxy_owners",
+        ORPHANED_RESERVATION_REAPER_INTERVAL,
+        async |state: &AppState, _shutdown: &watch::Receiver<bool>| {
+            let mut scan = expired_proxy_owner_scan.lock().unwrap().clone();
+            let result = state
+                .db
+                .close_expired_proxy_owners_page(100, &mut scan)
+                .await;
+            *expired_proxy_owner_scan.lock().unwrap() = scan;
+            match result {
                 Ok(closed) if closed > 0 => {
                     tracing::warn!(
                         closed,
