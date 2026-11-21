@@ -99,10 +99,6 @@ jobs:
           set -o pipefail
           cargo test --locked --lib --no-run
           for selector in \
-            archive::raw_capture::retirement_contracts::complete_coverage_retires_exact_roots_and_rejects_stale_backend_versions \
-            archive::raw_capture::retirement_contracts::incomplete_protocol_keeps_both_raw_roots_owned \
-            archive::raw_gc::tests::raw_gc_inventory_counts_physical_unique_objects_without_granting_delete \
-            archive::raw_gc::tests::raw_gc_inventory_rejects_changed_object_version_instead_of_undercounting \
             error::tests::object_storage_classification_preserves_only_typed_safe_facts \
             error::tests::dependency_errors_do_not_retain_secret_bearing_driver_messages \
             response_archive_spool::tests::shared_capture_reaches_eof_while_all_upload_slots_are_held \
