@@ -412,7 +412,7 @@ impl Database {
             sqlx::query("UPDATE request_history_activation SET baseline_owner=NULL,baseline_epoch=NULL WHERE id=1")
                 .execute(&mut *tx).await?;
         }
-        sqlx::query("UPDATE request_history_backfill SET after_id = '', done = 0")
+        sqlx::query("UPDATE request_history_backfill SET after_id = '', after_created_at = NULL, legacy_after_id = NULL, done = 0")
             .execute(&mut *tx)
             .await?;
         tx.commit().await?;
@@ -497,7 +497,7 @@ impl Database {
             ""
         };
         let sql = format!(
-            "SELECT source, after_id, after_created_at FROM request_history_backfill WHERE done = 0 ORDER BY source LIMIT 1{lock}"
+            "SELECT source, after_id, after_created_at, legacy_after_id FROM request_history_backfill WHERE done = 0 ORDER BY source LIMIT 1{lock}"
         );
         let Some(checkpoint) = sqlx::query(sqlx::AssertSqlSafe(sql))
             .fetch_optional(&mut *transaction)
@@ -508,6 +508,9 @@ impl Database {
         let source: String = checkpoint.try_get("source")?;
         let after: String = checkpoint.try_get("after_id")?;
         let event_after: Option<i64> = checkpoint.try_get("after_created_at")?;
+        let legacy_after: Option<String> = checkpoint.try_get("legacy_after_id")?;
+        let legacy_scan = source == "event"
+            && (legacy_after.is_some() || (event_after.is_none() && !after.is_empty()));
         let rows = if source == "event" {
             // Event IDs need not follow event time. A legacy UUID cursor gets
             // one complete time-ordered pass; existing durable receipts below
@@ -528,10 +531,10 @@ impl Database {
                 .await?
         };
         for row in &rows {
-            sqlx::query("INSERT INTO request_history_export (source, request_id, tenant_id, key_id, created_at) SELECT $1, $2, $3, $4, $5 WHERE $1 <> 'event' OR NOT EXISTS (SELECT 1 FROM request_history_identities i WHERE i.source=$1 AND i.request_id=$2 AND i.tenant_id=$3 AND i.key_id=$4 AND i.created_at=$5) ON CONFLICT (source, request_id) DO NOTHING")
+            sqlx::query("INSERT INTO request_history_export (source, request_id, tenant_id, key_id, created_at) SELECT $1, $2, $3, $4, $5 WHERE $6 = 0 OR NOT EXISTS (SELECT 1 FROM request_history_identities i WHERE i.source=$1 AND i.request_id=$2 AND i.tenant_id=$3 AND i.key_id=$4 AND i.created_at=$5) ON CONFLICT (source, request_id) DO NOTHING")
                 .bind(&source).bind(row.try_get::<String, _>("request_id")?)
                 .bind(row.try_get::<String, _>("tenant_id")?).bind(row.try_get::<String, _>("key_id")?)
-                .bind(row.try_get::<i64, _>("created_at")?).execute(&mut *transaction).await?;
+                .bind(row.try_get::<i64, _>("created_at")?).bind(i64::from(legacy_scan)).execute(&mut *transaction).await?;
         }
         let after = rows
             .last()
@@ -544,7 +547,7 @@ impl Database {
                 .map(|row| row.try_get::<i64, _>("created_at"))
                 .transpose()?
                 .or(event_after);
-            sqlx::query("UPDATE request_history_backfill SET legacy_after_id=CASE WHEN after_created_at IS NULL THEN after_id ELSE legacy_after_id END,after_created_at=$1 WHERE source='event'")
+            sqlx::query("UPDATE request_history_backfill SET legacy_after_id=CASE WHEN after_created_at IS NULL AND after_id<>'' THEN after_id ELSE legacy_after_id END,after_created_at=$1 WHERE source='event'")
                 .bind(time).execute(&mut *transaction).await?;
         }
         sqlx::query(

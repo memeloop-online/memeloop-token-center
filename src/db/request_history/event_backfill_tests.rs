@@ -93,4 +93,23 @@ async fn assert_event_cursor(database: &Database) {
             .await
             .unwrap();
     assert_eq!(count, 2);
+    sqlx::query("DELETE FROM request_history_export")
+        .execute(&database.pool)
+        .await
+        .unwrap();
+    database.history_refresh().await.unwrap();
+    sqlx::query("UPDATE request_history_backfill SET done=1 WHERE source<>'event'")
+        .execute(&database.pool)
+        .await
+        .unwrap();
+    assert_eq!(database.history_backfill_page(4).await.unwrap(), 3);
+    let refreshed: i64 =
+        sqlx::query_scalar("SELECT COUNT(*) FROM request_history_export WHERE source='event'")
+            .fetch_one(&database.pool)
+            .await
+            .unwrap();
+    assert_eq!(
+        refreshed, 3,
+        "explicit read-model refresh re-exports all retained events"
+    );
 }
