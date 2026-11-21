@@ -113,3 +113,23 @@ test("operator forwarding remains explicit in report inputs", () => {
   const endpoints = targetEndpoints({ POD_NAMESPACE: "memeloop-token-center-test", MTC_PEAK_RUN_ID: "unit", MTC_PEAK_OPERATOR_FORWARD: "1", MTC_TEST_GATEWAY_URL: "http://127.0.0.1:18090", MTC_TEST_CONTROL_URL: "http://127.0.0.1:18089", MTC_TEST_MOCK_URL: "http://127.0.0.1:18091", MTC_PEAK_UPSTREAM_BASE_URL: "http://10.42.8.1:18080", MTC_PEAK_TEST_GATEWAY_POD_IP: "10.42.8.1" });
   assert.equal(endpoints.forwarded, true);
 });
+
+import { reuseFixture } from "./fixture-setup.ts";
+test("existing isolated fixture is verified and copied without creating or rotating entities", async()=>{
+  const tenant="staging-peak-run", model="staging-peak-run-normal";
+  const upstream={id:"u",name:model,tenant_external_id:tenant,driver:"http-json",auth_kind:"none",status:"active",has_proxy:false,config:{base_url:"http://mock:18080/scenario/normal",network_scope:"private"}};
+  const route={id:"r",public_model:model,tenant_external_id:tenant,enabled:true,protocol:"openai",upstream_model:model,upstream_account_id:"u",priority:0};
+  const key={key_id:"k",alias:"Isolated run",tenant_external_id:tenant,currency:"USD",credential_copy_available:true,policy:{max_concurrency:198,enforcement_mode:"metered_unlimited"}};
+  const calls:string[]=[];
+  const request=(async(input:any,init:any)=>{const u=new URL(input);calls.push(`${init?.method??"GET"} ${u.pathname}`);const data=u.pathname.endsWith("/copy")?{key_id:"k",key:"in-memory-fixture"}:u.pathname.endsWith("/routing")?{route_ids:["r"],effective_route_ids:["r"],route_group_ids:[]}:u.pathname.endsWith("/upstreams")?[upstream]:u.pathname.endsWith("/model-routes")?[route]:[key];return new Response(JSON.stringify(data));}) as typeof fetch;
+  assert.deepEqual(await reuseFixture("http://control", "token",tenant,"run","http://mock:18080",["normal"],198,request),{routes:{normal:"r"},key:"in-memory-fixture"});
+  assert.equal(calls.filter(c=>c.startsWith("POST")).join(),"POST /internal/v1/keys/k/copy");
+  upstream.config.base_url="http://real-provider.invalid";
+  await assert.rejects(reuseFixture("http://control","token",tenant,"run","http://mock:18080",["normal"],198,request),/differs/);
+  upstream.config.base_url="http://mock:18080/scenario/normal";
+  await assert.rejects(reuseFixture("http://control","token",tenant,"run","http://mock:18080",["normal","tool-session"],198,request),/incomplete/);
+});
+test("empty isolated fixture preserves first-time setup",async()=>{
+  const request=(async()=>new Response("[]")) as typeof fetch;
+  assert.equal(await reuseFixture("http://control","token","staging-peak-run","run","http://mock:18080",["normal"],198,request),null);
+});

@@ -1,3 +1,4 @@
+import { reuseFixture } from "./fixture-setup.ts";
 import { createHash } from "node:crypto";
 import { readFileSync, writeFileSync } from "node:fs";
 import { setTimeout as delay } from "node:timers/promises";
@@ -87,17 +88,20 @@ export async function run(plan: Plan, env = process.env): Promise<Record<string,
   httpStatus=versionResponse.status;
   const version=await versionResponse.json() as {revision?:string};
   if(!versionResponse.ok||version.revision!==actualCandidate.control.source_sha)throw new Error("actual control revision differs from observed candidate");
-  const tenant = `staging-peak-${runId}`, models: Record<string,string> = {}, routes: string[] = [];
+  const tenant = `staging-peak-${runId}`;
+  const reused = await reuseFixture(control, token, tenant, runId, upstreamBase, [...new Set(plan.arrivals.map(row => row.scenario))], plan.arrivals.length);
+  const models: Record<string,string> = {}, routes: string[] = [];
   for (const scenario of new Set(plan.arrivals.map(row => row.scenario))) {
     setupScenario=scenario; setupIndex=(setupIndex ?? -1)+1;
     const model = `staging-peak-${runId}-${scenario}`;
+    if (reused) { models[scenario]=model; routes.push(reused.routes[scenario]); continue; }
     const upstream = await call("upstream_setup", "/internal/v1/upstreams", { tenant_external_id:tenant, name:model, driver:"http-json", config:{ base_url:new URL(`/scenario/${scenario}`,upstreamBase).href, network_scope:"private" }, credential:{ type:"none" } });
     const route = await call("route_setup", "/internal/v1/model-routes", { tenant_external_id:tenant, public_model:model, upstream_account_id:upstream.id, upstream_model:model, protocol:"openai", priority:0, custom_model_confirmed:true });
     await call("price_setup", `/internal/v1/prices/USD/${model}`, { input_per_million:"0.01", output_per_million:"0.02" });
     models[scenario]=model; routes.push(String(route.id));
   }
   setupScenario=undefined; setupIndex=undefined;
-  const issued = await call("key_setup", "/internal/v1/keys", { tenant_external_id:tenant, principal_external_id:`staging-peak-${runId}`, alias:`Isolated ${runId}`, currency:"USD", initial_balance:"100000", route_ids:routes, policy:{requests_per_minute:Math.max(1,plan.arrivals.length*60), tokens_per_minute:1_000_000_000, max_concurrency:plan.arrivals.length, enforcement_mode:"metered_unlimited", daily_budget:null, weekly_budget:null, lifetime_budget:null} });
+  const issued = reused ? {key:reused.key} : await call("key_setup", "/internal/v1/keys", { tenant_external_id:tenant, principal_external_id:`staging-peak-${runId}`, alias:`Isolated ${runId}`, currency:"USD", initial_balance:"100000", route_ids:routes, policy:{requests_per_minute:Math.max(1,plan.arrivals.length*60), tokens_per_minute:1_000_000_000, max_concurrency:plan.arrivals.length, enforcement_mode:"metered_unlimited", daily_budget:null, weekly_budget:null, lifetime_budget:null} });
   enter("load");
   const key = String(issued.key);
   const requests: Record<string,unknown>[] = [];
