@@ -1454,9 +1454,22 @@ impl Database {
         hints: &ConversationHints,
         client_name: Option<&str>,
     ) -> Result<Uuid, AppError> {
+        // Object storage must finish before the global replacement gate is held.
+        let atoms = extract_atoms(request_json);
+        let nodes = build_prefix(&atoms);
+        let archived_atoms = self.archive_atom_bodies(key.tenant_id, &atoms).await?;
+        let observed_at = unix_millis();
         let mut transaction = self.begin_write_transaction().await?;
         // Identity publication can replace session aggregates. Fence before any source lock.
         lock_request_stats_projection_rebuild_in_transaction(&mut transaction).await?;
+        materialize_conversation_content_in_transaction(
+            &mut transaction,
+            &key.tenant_id.to_string(),
+            &archived_atoms,
+            &nodes,
+            observed_at,
+        )
+        .await?;
         let cluster_id = self
             .record_conversation_observation_in_transaction(
                 &mut transaction,
@@ -1467,9 +1480,9 @@ impl Database {
                     hints,
                     client_name,
                     upstream_response_id: None,
-                    observed_at: unix_millis(),
+                    observed_at,
                     attach_request_record: true,
-                    content_materialized: false,
+                    content_materialized: true,
                 },
             )
             .await?;
@@ -2049,6 +2062,8 @@ impl Database {
         upstream_response_id: &str,
     ) -> Result<(), AppError> {
         let mut transaction = self.begin_write_transaction().await?;
+        // Resolving response references may merge and replace session aggregates.
+        lock_request_stats_projection_rebuild_in_transaction(&mut transaction).await?;
         attach_conversation_upstream_response_in_transaction(
             &mut transaction,
             self.backend,
