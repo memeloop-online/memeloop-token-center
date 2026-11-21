@@ -629,10 +629,12 @@ async fn codex_route_fixture_with_database(
 ) -> CodexRouteFixture {
     let directory = tempfile::tempdir().unwrap();
     let archive_path = directory.path().join(archive_directory);
-    let database_url = database_url.unwrap_or_else(|| crate::db::Database::sqlite_database_url(&format!(
-        "sqlite://{}?mode=rwc",
-        directory.path().join(format!("codex-{label}.db")).display()
-    )));
+    let database_url = database_url.unwrap_or_else(|| {
+        crate::db::Database::sqlite_database_url(&format!(
+            "sqlite://{}?mode=rwc",
+            directory.path().join(format!("codex-{label}.db")).display()
+        ))
+    });
     let mut config = Config::for_test(database_url.clone());
     config.archive_backend = ArchiveBackend::Filesystem;
     config.archive_path = Some(archive_path.display().to_string());
