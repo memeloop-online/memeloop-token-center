@@ -228,7 +228,8 @@ async fn postgres_delta_fallback_releases_aggregate_locks_but_retains_fact_cas()
     )
     .fetch_one(&mut *peer)
     .await
-    .unwrap_err();
+    .err()
+    .expect("outer fact CAS must still hold its row lock");
     assert_eq!(
         err.as_database_error().and_then(|e| e.code()).as_deref(),
         Some("55P03"),
