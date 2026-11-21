@@ -403,6 +403,7 @@ async fn mixed_unlinked_delta_preserves_generation_without_replacement(db: &Data
     insert_fact(&mut tx, "first").await;
     sqlx::query("UPDATE request_stats_facts SET session_id='unlinked:key',created_at=3000 WHERE request_id='first'").execute(&mut *tx).await.unwrap();
     sqlx::query("INSERT INTO generation_stats_facts(job_id,tenant_id,key_id,created_at,model,status_class,error_code,upstream_account_id,duration_ms,cost_micros,billed_units,currency,modality,billing_unit,model_route_id) VALUES ('generation','tenant','key',2000,'image','success','','',5,11,2,'USD','image','image','')").execute(&mut *tx).await.unwrap();
+    sqlx::query("INSERT INTO generation_stats_facts(job_id,tenant_id,key_id,created_at,model,status_class,error_code,upstream_account_id,duration_ms,cost_micros,billed_units,currency,modality,billing_unit,model_route_id) VALUES ('generation-eur','tenant','key',9000,'image','success','','',5,13,3,'EUR','image','image','')").execute(&mut *tx).await.unwrap();
     rebuild_request_session_projection_in_transaction(&mut tx, "tenant", "key", "unlinked:key")
         .await
         .unwrap();
@@ -441,7 +442,7 @@ async fn mixed_unlinked_delta_preserves_generation_without_replacement(db: &Data
     let replay=sqlx::query("UPDATE request_stats_facts SET session_id='new-session' WHERE request_id='first' AND session_id='unlinked:key'").execute(&mut *tx).await.unwrap();
     assert_eq!(replay.rows_affected(), 0);
     tx.commit().await.unwrap();
-    let remaining:(i64,i64,i64,i64)=sqlx::query_as("SELECT requests,generation_units,cost_micros,last_activity_at FROM session_usage_totals WHERE session_id='unlinked:key'").fetch_one(&db.pool).await.unwrap();
+    let remaining:(i64,i64,i64,i64)=sqlx::query_as("SELECT requests,generation_units,cost_micros,last_activity_at FROM session_usage_totals WHERE session_id='unlinked:key' AND currency='USD'").fetch_one(&db.pool).await.unwrap();
     assert_eq!(remaining, (1, 2, 11, 2000));
     for table in [
         "session_usage_totals",
@@ -451,7 +452,7 @@ async fn mixed_unlinked_delta_preserves_generation_without_replacement(db: &Data
         let totals:(i64,i64,i64,i64)=sqlx::query_as(sqlx::AssertSqlSafe(format!("SELECT CAST(SUM(requests) AS BIGINT),CAST(SUM(input_tokens) AS BIGINT),CAST(SUM(generation_units) AS BIGINT),CAST(SUM(cost_micros) AS BIGINT) FROM {table}"))).fetch_one(&db.pool).await.unwrap();
         assert_eq!(
             totals,
-            (2, 20, 2, 18),
+            (3, 20, 5, 31),
             "{table} preserves both sources exactly once"
         );
     }
