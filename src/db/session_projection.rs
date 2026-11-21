@@ -418,20 +418,16 @@ pub(crate) async fn rebuild_request_session_projection_in_transaction(
     session_id: &str,
 ) -> Result<(), AppError> {
     lock_request_stats_projection_writer_in_transaction(tx).await?;
-    for table in [
-        "session_usage_totals",
-        "session_usage_hourly",
-        "session_usage_daily",
-    ] {
-        let statement =
-            format!("DELETE FROM {table} WHERE tenant_id = $1 AND key_id = $2 AND session_id = $3");
-        sqlx::query(sqlx::AssertSqlSafe(statement))
-            .bind(tenant_id)
-            .bind(key_id)
-            .bind(session_id)
-            .execute(&mut **tx)
-            .await?;
-    }
+    // Finish each aggregate table before acquiring locks in the next one.
+    // Deleting all tables first inverts this order when totals are reinserted.
+    sqlx::query(
+        "DELETE FROM session_usage_totals WHERE tenant_id = $1 AND key_id = $2 AND session_id = $3",
+    )
+    .bind(tenant_id)
+    .bind(key_id)
+    .bind(session_id)
+    .execute(&mut **tx)
+    .await?;
 
     sqlx::query(
         r#"INSERT INTO session_usage_totals (
@@ -490,6 +486,14 @@ pub(crate) async fn rebuild_request_session_projection_in_transaction(
         ("session_usage_hourly", "hour_bucket", 3_600_000_i64),
         ("session_usage_daily", "day_bucket", 86_400_000_i64),
     ] {
+        let delete =
+            format!("DELETE FROM {table} WHERE tenant_id = $1 AND key_id = $2 AND session_id = $3");
+        sqlx::query(sqlx::AssertSqlSafe(delete))
+            .bind(tenant_id)
+            .bind(key_id)
+            .bind(session_id)
+            .execute(&mut **tx)
+            .await?;
         let statement = format!(
             r#"INSERT INTO {table} (
                    tenant_id, key_id, session_id, {bucket_column}, model, protocol,
