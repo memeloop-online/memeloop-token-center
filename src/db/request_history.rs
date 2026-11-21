@@ -531,7 +531,7 @@ impl Database {
                 .await?
         };
         for row in &rows {
-            sqlx::query("INSERT INTO request_history_export (source, request_id, tenant_id, key_id, created_at) SELECT $1, $2, $3, $4, $5 WHERE $6 = 0 OR NOT EXISTS (SELECT 1 FROM request_history_identities i WHERE i.source=$1 AND i.request_id=$2 AND i.tenant_id=$3 AND i.key_id=$4 AND i.created_at=$5) ON CONFLICT (source, request_id) DO NOTHING")
+            sqlx::query("INSERT INTO request_history_export (source, request_id, tenant_id, key_id, created_at) SELECT $1, $2, $3, $4, $5 WHERE $6 = 0 OR NOT EXISTS (SELECT 1 FROM request_history_identities i WHERE i.source=$1 AND i.request_id=$2 AND i.tenant_id=$3 AND i.key_id=$4 AND i.created_at=$5 AND ((i.acknowledged_revision=i.head_revision AND i.acknowledged_hash IS NOT NULL AND LENGTH(i.acknowledged_hash)=64) OR EXISTS (SELECT 1 FROM request_history_immutable_outbox o WHERE o.revision=i.head_revision AND o.source=i.source AND o.request_id=i.request_id AND o.tenant_id=i.tenant_id AND o.key_id=i.key_id AND o.created_at=i.created_at))) ON CONFLICT (source, request_id) DO NOTHING")
                 .bind(&source).bind(row.try_get::<String, _>("request_id")?)
                 .bind(row.try_get::<String, _>("tenant_id")?).bind(row.try_get::<String, _>("key_id")?)
                 .bind(row.try_get::<i64, _>("created_at")?).bind(i64::from(legacy_scan)).execute(&mut *transaction).await?;
