@@ -150,8 +150,8 @@ impl Database {
         }
         if require_expired {
             let now = self.request_owner_now(&mut tx).await?;
-            let eligible = sqlx::query("SELECT 1 FROM request_records q WHERE q.id = $1 AND q.created_at = $2 AND q.tenant_id = $3 AND q.key_id = $4 AND q.reservation_id = $5 AND q.completed_at IS NULL AND q.proxy_owner_expires_at IS NOT NULL AND q.proxy_owner_expires_at <= $6 AND NOT EXISTS (SELECT 1 FROM proxy_operational_terminals o WHERE o.request_id = q.id)")
-                .bind(claim.request_id.to_string()).bind(created_at).bind(claim.tenant_id.to_string()).bind(claim.key_id.to_string()).bind(claim.reservation_id.to_string()).bind(now)
+            let eligible = sqlx::query("SELECT 1 FROM request_records q WHERE q.id = $1 AND q.created_at = $2 AND q.tenant_id = $3 AND q.key_id = $4 AND q.reservation_id = $5 AND q.proxy_owner_token = $7 AND q.completed_at IS NULL AND q.proxy_owner_expires_at IS NOT NULL AND q.proxy_owner_expires_at <= $6 AND NOT EXISTS (SELECT 1 FROM proxy_operational_terminals o WHERE o.request_id = q.id)")
+                .bind(claim.request_id.to_string()).bind(created_at).bind(claim.tenant_id.to_string()).bind(claim.key_id.to_string()).bind(claim.reservation_id.to_string()).bind(now).bind(claim.owner_token.to_string())
                 .fetch_optional(&mut *tx).await?;
             if eligible.is_none() {
                 return Err(conflict());

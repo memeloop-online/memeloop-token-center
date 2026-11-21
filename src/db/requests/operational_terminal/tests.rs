@@ -1414,3 +1414,95 @@ pub(crate) async fn expired_owner_page_contract() {
     }
     expired.assert_unsettled().await;
 }
+
+struct AbortExpiredOwnerTestWorker(tokio::task::AbortHandle);
+impl Drop for AbortExpiredOwnerTestWorker {
+    fn drop(&mut self) {
+        self.0.abort();
+    }
+}
+
+pub(crate) async fn expired_owner_wait_does_not_block_orphan_lane_contract() {
+    let Some(fixture) = Fixture::postgres().await else {
+        return;
+    };
+    let db = &fixture.database;
+    sqlx::query("UPDATE request_records SET proxy_owner_expires_at = 0 WHERE id = $1")
+        .bind(fixture.claim.request_id.to_string())
+        .execute(&db.pool)
+        .await
+        .unwrap();
+    let mut lock = db.pool.begin().await.unwrap();
+    let blocker: i64 = sqlx::query_scalar("SELECT CAST(pg_backend_pid() AS BIGINT)")
+        .fetch_one(&mut *lock)
+        .await
+        .unwrap();
+    sqlx::query("UPDATE request_records SET completed_at = completed_at WHERE id = $1")
+        .bind(fixture.claim.request_id.to_string())
+        .execute(&mut *lock)
+        .await
+        .unwrap();
+    let config = crate::Config::for_test(fixture.isolated.as_ref().unwrap().url().to_owned());
+    let state = crate::AppState::initialize_for_maintenance(config)
+        .await
+        .unwrap();
+    let (stop, shutdown) = tokio::sync::watch::channel(false);
+    let worker = tokio::spawn(crate::worker::run_until_shutdown_with_reaper_period(
+        state,
+        shutdown.clone(),
+        shutdown,
+        std::time::Duration::from_millis(20),
+    ));
+    let _cleanup = AbortExpiredOwnerTestWorker(worker.abort_handle());
+    tokio::time::timeout(std::time::Duration::from_secs(10), async {
+        loop {
+            let blocked: i64 = sqlx::query_scalar(
+                "SELECT COUNT(*) FROM pg_stat_activity WHERE $1 = ANY(pg_blocking_pids(pid))",
+            )
+            .bind(blocker as i32)
+            .fetch_one(&db.pool)
+            .await
+            .unwrap();
+            if blocked > 0 {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("expired owner lane must enter its actual row-lock wait");
+    let price = db
+        .upsert_model_price("lane-progress", "USD", Decimal::ZERO, Decimal::ONE)
+        .await
+        .unwrap();
+    let orphan = db.reserve_usage(&fixture.key, &price, 0, 1).await.unwrap();
+    sqlx::query("UPDATE usage_reservations SET created_at = $1 WHERE id = $2")
+        .bind(unix_millis() - 3_600_000)
+        .bind(orphan.id.to_string())
+        .execute(&db.pool)
+        .await
+        .unwrap();
+    tokio::time::timeout(std::time::Duration::from_secs(10), async {
+        loop {
+            let status: String =
+                sqlx::query_scalar("SELECT status FROM usage_reservations WHERE id = $1")
+                    .bind(orphan.id.to_string())
+                    .fetch_one(&db.pool)
+                    .await
+                    .unwrap();
+            if status == "settled" {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("orphan lane must advance while expired owner row remains locked");
+    assert!(!worker.is_finished());
+    lock.rollback().await.unwrap();
+    stop.send(true).unwrap();
+    tokio::time::timeout(std::time::Duration::from_secs(10), worker)
+        .await
+        .unwrap()
+        .unwrap();
+}

@@ -187,6 +187,21 @@ pub async fn run_until_shutdown_with_oauth_stop(
     shutdown: watch::Receiver<bool>,
     oauth_shutdown: watch::Receiver<bool>,
 ) {
+    run_until_shutdown_with_reaper_period(
+        state,
+        shutdown,
+        oauth_shutdown,
+        ORPHANED_RESERVATION_REAPER_INTERVAL,
+    )
+    .await;
+}
+
+pub(crate) async fn run_until_shutdown_with_reaper_period(
+    state: AppState,
+    shutdown: watch::Receiver<bool>,
+    oauth_shutdown: watch::Receiver<bool>,
+    reaper_period: Duration,
+) {
     if *shutdown.borrow() {
         return;
     }
@@ -377,7 +392,7 @@ pub async fn run_until_shutdown_with_oauth_stop(
     );
     periodic!(
         "orphaned_reservations",
-        ORPHANED_RESERVATION_REAPER_INTERVAL,
+        reaper_period,
         async |state: &AppState, _shutdown: &watch::Receiver<bool>| {
             let mut scan = orphan_reservation_scan.lock().unwrap().clone();
             let result = state
@@ -398,7 +413,7 @@ pub async fn run_until_shutdown_with_oauth_stop(
     );
     periodic!(
         "expired_proxy_owners",
-        ORPHANED_RESERVATION_REAPER_INTERVAL,
+        reaper_period,
         async |state: &AppState, _shutdown: &watch::Receiver<bool>| {
             let mut scan = expired_proxy_owner_scan.lock().unwrap().clone();
             let result = state
