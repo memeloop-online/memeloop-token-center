@@ -408,7 +408,7 @@ async fn mixed_unlinked_delta_preserves_generation_without_replacement(db: &Data
         .unwrap();
     tx.commit().await.unwrap();
     // Forbid replacement: the ordinary membership delta must leave generation intact.
-    if db.backend == DatabaseBackend::PostgreSql {
+    if matches!(db.backend, DatabaseBackend::PostgreSql) {
         sqlx::query("CREATE FUNCTION reject_session_replacement() RETURNS trigger LANGUAGE plpgsql AS $$ BEGIN RAISE EXCEPTION 'unexpected full session replacement'; END $$").execute(&db.pool).await.unwrap();
         sqlx::query("CREATE TRIGGER reject_session_replacement BEFORE INSERT ON session_usage_totals FOR EACH ROW WHEN (NEW.session_id='unlinked:key') EXECUTE FUNCTION reject_session_replacement()").execute(&db.pool).await.unwrap();
     } else {
