@@ -691,6 +691,13 @@ jobs:
       - run: |
           set -o pipefail
           git rev-parse HEAD
-          cargo test --locked --lib db::session_projection::lock_order_tests::postgres_rebuild_and_live_add_use_the_same_table_order -- --exact --nocapture 2>&1 | tee /tmp/session-usage-lock.log
-          grep -F '1 passed; 0 failed' /tmp/session-usage-lock.log
+          cargo test --locked --lib --no-run
+          for selector in \
+            postgres_rebuild_and_live_add_use_the_same_table_order \
+            sqlite_delta_fallback_retains_membership_and_exact_totals \
+            postgres_delta_fallback_releases_aggregate_locks_but_retains_fact_cas
+          do
+            timeout 60s cargo test --locked --lib "db::session_projection::lock_order_tests::$selector" -- --exact --nocapture 2>&1 | tee /tmp/session-usage-lock.log
+            grep -F '1 passed; 0 failed' /tmp/session-usage-lock.log
+          done
 
