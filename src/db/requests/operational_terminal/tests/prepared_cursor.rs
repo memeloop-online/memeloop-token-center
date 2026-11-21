@@ -43,10 +43,7 @@ async fn postgres_rich_event_parent_preparation_does_not_hold_global_cursor() {
         sqlx::query("INSERT INTO request_egress_attempts (request_id,attempt_id,outbound_attempt,connect_attempt,route_id,upstream_account_id,credential_generation,transport_revision,observed_at,snapshot_json,transport_json,final_response) VALUES ($1,$2,1,1,$3,$4,1,1,$5,'{\"kind\":\"direct\"}','{}',1)")
             .bind(request.to_string()).bind(Uuid::now_v7().to_string()).bind(Uuid::now_v7().to_string()).bind(Uuid::now_v7().to_string()).bind(unix_millis()).execute(&db.pool).await.unwrap();
     }
-    sqlx::query("UPDATE request_history_state SET mode='shadow' WHERE id=1")
-        .execute(&db.pool)
-        .await
-        .unwrap();
+    db.history_start().await.unwrap();
     // A test-only view makes exactly one native parent's MVCC read wait on a
     // real PG advisory gate; unrelated native parents remain readable.
     sqlx::raw_sql(sqlx::AssertSqlSafe(format!("CREATE FUNCTION prepared_parent_gate(id TEXT) RETURNS BOOLEAN LANGUAGE plpgsql VOLATILE AS $$ BEGIN IF id='{}' THEN PERFORM pg_advisory_xact_lock(91327,1); END IF; RETURN TRUE; END $$; ALTER TABLE request_records RENAME TO prepared_request_records; CREATE VIEW request_records AS SELECT * FROM prepared_request_records WHERE prepared_parent_gate(id)",first_id)))
