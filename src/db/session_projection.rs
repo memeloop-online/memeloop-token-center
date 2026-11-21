@@ -291,7 +291,7 @@ async fn remove_request_fact_from_session_projection_in_transaction(
             .await?;
             if last_activity_at == delta.created_at {
                 let next_activity: Option<i64> = sqlx::query_scalar(
-                    "SELECT MAX(created_at) FROM (SELECT created_at FROM request_stats_facts WHERE tenant_id = $1 AND key_id = $2 AND session_id = $3 AND currency = $4 UNION ALL SELECT created_at FROM generation_stats_facts WHERE tenant_id = $1 AND key_id = $2 AND $3 = 'unlinked:' || key_id AND currency = $4) activity",
+                    "SELECT MAX(created_at) FROM (SELECT MAX(created_at) AS created_at FROM request_stats_facts WHERE tenant_id = $1 AND key_id = $2 AND session_id = $3 AND currency = $4 UNION ALL SELECT MAX(created_at) AS created_at FROM generation_stats_facts WHERE tenant_id = $1 AND key_id = $2 AND $3 = 'unlinked:' || key_id AND currency = $4) activity",
                 )
                 .bind(&delta.tenant_id)
                 .bind(&delta.key_id)
