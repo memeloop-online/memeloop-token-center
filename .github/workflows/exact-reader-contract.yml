@@ -627,6 +627,7 @@ jobs:
       - run: |
           set -o pipefail
           git rev-parse HEAD
+          cargo check --locked --lib
           cargo test --locked --lib db::requests::operational_terminal::tests::prepared_cursor::postgres_rich_event_parent_preparation_does_not_hold_global_cursor -- --ignored --exact --nocapture 2>&1 | tee /tmp/pg-executor.log
           grep -F '1 passed; 0 failed' /tmp/pg-executor.log
           cargo test --locked --lib db::tests::event_cursor::postgres_global_cursor_lock_orders_commit_visibility -- --exact --nocapture 2>&1 | tee /tmp/pg-executor.log
