@@ -33,7 +33,7 @@ pub(crate) use lifecycle::{
 pub(crate) use lifecycle::{claim_request_event_locator, claim_request_record_locator};
 pub use metered_projection::MeteredUsageProjectionTask;
 pub(crate) use operational_terminal::{
-    PendingProxyOperationalTerminal, PendingProxyOperationalTerminalAck,
+    ExpiredProxyOwnerScan, PendingProxyOperationalTerminal, PendingProxyOperationalTerminalAck,
 };
 pub use queries::RequestListFilter;
 pub(crate) use queries::{

@@ -187,6 +187,21 @@ pub async fn run_until_shutdown_with_oauth_stop(
     shutdown: watch::Receiver<bool>,
     oauth_shutdown: watch::Receiver<bool>,
 ) {
+    run_until_shutdown_with_reaper_period(
+        state,
+        shutdown,
+        oauth_shutdown,
+        ORPHANED_RESERVATION_REAPER_INTERVAL,
+    )
+    .await;
+}
+
+pub(crate) async fn run_until_shutdown_with_reaper_period(
+    state: AppState,
+    shutdown: watch::Receiver<bool>,
+    oauth_shutdown: watch::Receiver<bool>,
+    reaper_period: Duration,
+) {
     if *shutdown.borrow() {
         return;
     }
@@ -343,6 +358,7 @@ pub async fn run_until_shutdown_with_oauth_stop(
         }
     );
     let orphan_reservation_scan = Mutex::new(crate::db::OrphanReservationScan::default());
+    let expired_proxy_owner_scan = Mutex::new(crate::db::ExpiredProxyOwnerScan::default());
     periodic!(
         "projection_outbox_cleanup",
         PROJECTION_OUTBOX_CLEANUP_INTERVAL,
@@ -376,7 +392,7 @@ pub async fn run_until_shutdown_with_oauth_stop(
     );
     periodic!(
         "orphaned_reservations",
-        ORPHANED_RESERVATION_REAPER_INTERVAL,
+        reaper_period,
         async |state: &AppState, _shutdown: &watch::Receiver<bool>| {
             let mut scan = orphan_reservation_scan.lock().unwrap().clone();
             let result = state
@@ -393,7 +409,19 @@ pub async fn run_until_shutdown_with_oauth_stop(
                     tracing::error!(%error, "worker failed to release orphaned usage reservations");
                 }
             }
-            match state.db.close_expired_proxy_owners(100).await {
+        }
+    );
+    periodic!(
+        "expired_proxy_owners",
+        reaper_period,
+        async |state: &AppState, _shutdown: &watch::Receiver<bool>| {
+            let mut scan = expired_proxy_owner_scan.lock().unwrap().clone();
+            let result = state
+                .db
+                .close_expired_proxy_owners_page(100, &mut scan)
+                .await;
+            *expired_proxy_owner_scan.lock().unwrap() = scan;
+            match result {
                 Ok(closed) if closed > 0 => {
                     tracing::warn!(
                         closed,
