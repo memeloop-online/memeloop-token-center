@@ -633,6 +633,11 @@ jobs:
           cargo test --locked --lib db::tests::event_cursor::postgres_global_cursor_lock_orders_commit_visibility -- --exact --nocapture 2>&1 | tee /tmp/pg-executor.log
           grep -F '1 passed; 0 failed' /tmp/pg-executor.log
 
+          cargo test --locked --lib db::request_history::event_backfill_tests::sqlite_event_backfill_uses_time_cursor_and_reuses_receipts -- --exact --nocapture 2>&1 | tee /tmp/event-backfill.log
+          grep -F '1 passed; 0 failed' /tmp/event-backfill.log
+          cargo test --locked --lib db::request_history::event_backfill_tests::request_history_real_services_acceptance_event_backfill_time_cursor -- --ignored --exact --nocapture 2>&1 | tee /tmp/event-backfill.log
+          grep -F '1 passed; 0 failed' /tmp/event-backfill.log
+
   semantic-reader-scope-contract:
     if: inputs.contract == 'semantic-reader-scope'
     runs-on: ubuntu-24.04
