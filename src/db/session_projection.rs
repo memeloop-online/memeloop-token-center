@@ -203,7 +203,7 @@ pub(crate) async fn merge_request_session_projection_in_transaction(
     if source_session_id == target_session_id {
         return Ok(());
     }
-    sqlx::query(
+    let moved = sqlx::query(
         "UPDATE request_stats_facts SET session_id = $1 WHERE tenant_id = $2 AND key_id = $3 AND session_id = $4",
     )
     .bind(target_session_id)
@@ -212,6 +212,11 @@ pub(crate) async fn merge_request_session_projection_in_transaction(
     .bind(source_session_id)
     .execute(&mut **tx)
     .await?;
+    // No request membership changed. Generation membership is always unlinked
+    // and is not moved by this operation, so neither session needs replacement.
+    if moved.rows_affected() == 0 {
+        return Ok(());
+    }
     rebuild_request_session_projection_in_transaction(tx, tenant_id, key_id, source_session_id)
         .await?;
     rebuild_request_session_projection_in_transaction(tx, tenant_id, key_id, target_session_id)
@@ -223,15 +228,8 @@ async fn remove_request_fact_from_session_projection_in_transaction(
     tx: &mut Transaction<'_, Any>,
     delta: &RequestSessionDelta,
 ) -> Result<(), AppError> {
-    if delta.previous_session_id == format!("unlinked:{}", delta.key_id) {
-        return rebuild_request_session_projection_in_transaction(
-            tx,
-            &delta.tenant_id,
-            &delta.key_id,
-            &delta.previous_session_id,
-        )
-        .await;
-    }
+    // Unlinked sessions contain request and generation contributions. Subtract only
+    // this request's CAS-owned delta; generation rows and buckets remain unchanged.
     sqlx::query("SAVEPOINT session_usage_delta")
         .execute(&mut **tx)
         .await?;
@@ -293,7 +291,7 @@ async fn remove_request_fact_from_session_projection_in_transaction(
             .await?;
             if last_activity_at == delta.created_at {
                 let next_activity: Option<i64> = sqlx::query_scalar(
-                    "SELECT MAX(created_at) FROM request_stats_facts WHERE tenant_id = $1 AND key_id = $2 AND session_id = $3 AND currency = $4",
+                    "SELECT MAX(created_at) FROM (SELECT created_at FROM request_stats_facts WHERE tenant_id = $1 AND key_id = $2 AND session_id = $3 AND currency = $4 UNION ALL SELECT created_at FROM generation_stats_facts WHERE tenant_id = $1 AND key_id = $2 AND $3 = 'unlinked:' || key_id AND currency = $4) activity",
                 )
                 .bind(&delta.tenant_id)
                 .bind(&delta.key_id)

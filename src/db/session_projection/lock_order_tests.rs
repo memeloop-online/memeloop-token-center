@@ -393,3 +393,82 @@ async fn postgres_public_attach_waits_for_writer_before_source_access() {
     .unwrap();
     next.rollback().await.unwrap();
 }
+
+async fn mixed_unlinked_delta_preserves_generation_without_replacement(db: &Database) {
+    db.migrate().await.unwrap();
+    let mut tx = db.begin_write_transaction().await.unwrap();
+    lock_request_stats_projection_rebuild_in_transaction(&mut tx)
+        .await
+        .unwrap();
+    insert_fact(&mut tx, "first").await;
+    sqlx::query("UPDATE request_stats_facts SET session_id='unlinked:key',created_at=3000 WHERE request_id='first'").execute(&mut *tx).await.unwrap();
+    sqlx::query("INSERT INTO generation_stats_facts(job_id,tenant_id,key_id,created_at,model,status_class,error_code,upstream_account_id,duration_ms,cost_micros,billed_units,currency,modality,billing_unit,model_route_id) VALUES ('generation','tenant','key',2000,'image','success','','',5,11,2,'USD','image','image','')").execute(&mut *tx).await.unwrap();
+    rebuild_request_session_projection_in_transaction(&mut tx, "tenant", "key", "unlinked:key")
+        .await
+        .unwrap();
+    tx.commit().await.unwrap();
+    // Forbid replacement: the ordinary membership delta must leave generation intact.
+    if db.backend == DatabaseBackend::PostgreSql {
+        sqlx::query("CREATE FUNCTION reject_session_replacement() RETURNS trigger LANGUAGE plpgsql AS $$ BEGIN RAISE EXCEPTION 'unexpected full session replacement'; END $$").execute(&db.pool).await.unwrap();
+        sqlx::query("CREATE TRIGGER reject_session_replacement BEFORE INSERT ON session_usage_totals FOR EACH ROW WHEN (NEW.session_id='unlinked:key') EXECUTE FUNCTION reject_session_replacement()").execute(&db.pool).await.unwrap();
+    } else {
+        sqlx::query("CREATE TRIGGER reject_session_replacement BEFORE INSERT ON session_usage_totals WHEN NEW.session_id='unlinked:key' BEGIN SELECT RAISE(ABORT,'unexpected full session replacement'); END").execute(&db.pool).await.unwrap();
+    }
+    let mut tx = db.begin_write_transaction().await.unwrap();
+    lock_request_stats_projection_rebuild_in_transaction(&mut tx)
+        .await
+        .unwrap();
+    let moved = sqlx::query("UPDATE request_stats_facts SET session_id='new-session' WHERE request_id='first' AND session_id='unlinked:key'").execute(&mut *tx).await.unwrap();
+    assert_eq!(moved.rows_affected(), 1);
+    let mut delta = first_delta();
+    delta.previous_session_id = "unlinked:key".into();
+    delta.created_at = 3000;
+    remove_request_fact_from_session_projection_in_transaction(&mut tx, &delta)
+        .await
+        .unwrap();
+    add_request_fact_to_session_projection_in_transaction(&mut tx, "first", 1)
+        .await
+        .unwrap();
+    merge_request_session_projection_in_transaction(
+        &mut tx,
+        "tenant",
+        "key",
+        "unlinked:key",
+        "new-session",
+    )
+    .await
+    .unwrap();
+    let replay=sqlx::query("UPDATE request_stats_facts SET session_id='new-session' WHERE request_id='first' AND session_id='unlinked:key'").execute(&mut *tx).await.unwrap();
+    assert_eq!(replay.rows_affected(), 0);
+    tx.commit().await.unwrap();
+    let remaining:(i64,i64,i64,i64)=sqlx::query_as("SELECT requests,generation_units,cost_micros,last_activity_at FROM session_usage_totals WHERE session_id='unlinked:key'").fetch_one(&db.pool).await.unwrap();
+    assert_eq!(remaining, (1, 2, 11, 2000));
+    for table in [
+        "session_usage_totals",
+        "session_usage_hourly",
+        "session_usage_daily",
+    ] {
+        let totals:(i64,i64,i64,i64)=sqlx::query_as(sqlx::AssertSqlSafe(format!("SELECT CAST(SUM(requests) AS BIGINT),CAST(SUM(input_tokens) AS BIGINT),CAST(SUM(generation_units) AS BIGINT),CAST(SUM(cost_micros) AS BIGINT) FROM {table}"))).fetch_one(&db.pool).await.unwrap();
+        assert_eq!(
+            totals,
+            (2, 20, 2, 18),
+            "{table} preserves both sources exactly once"
+        );
+    }
+}
+
+#[tokio::test]
+async fn postgres_unlinked_membership_uses_delta_and_preserves_generation() {
+    let Ok(url) = std::env::var("MTC_TEST_POSTGRES_URL") else {
+        return;
+    };
+    let fixture = crate::db::test_support::PostgresTestDatabase::create(&url).await;
+    let db = Database::connect_with_max(fixture.url(), 8).await.unwrap();
+    mixed_unlinked_delta_preserves_generation_without_replacement(&db).await;
+}
+
+#[tokio::test]
+async fn sqlite_unlinked_membership_uses_delta_and_preserves_generation() {
+    let db = Database::connect("sqlite::memory:").await.unwrap();
+    mixed_unlinked_delta_preserves_generation_without_replacement(&db).await;
+}
