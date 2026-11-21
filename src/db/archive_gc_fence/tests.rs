@@ -138,6 +138,37 @@ async fn contract(url: &str) {
         "active reader protects the stream"
     );
     db.release_archive_gc_pins(&reader).await.unwrap();
+    use futures_util::StreamExt;
+    let stream_guard = db.pin_archive_reader(foreign.tenant, owner).await.unwrap();
+    let mut protected =
+        Box::pin(stream_guard.protect_stream(futures_util::stream::iter([1_u8, 2])));
+    assert_eq!(protected.next().await, Some(1));
+    let stream_epoch = db.archive_gc_root_epoch(&foreign).await.unwrap().unwrap();
+    assert!(
+        db.claim_archive_gc_exclusive(&foreign, stream_epoch, Uuid::now_v7())
+            .await
+            .unwrap()
+            .is_none()
+    );
+    // Cancel before EOF: the source is dropped before the durable pin release.
+    drop(protected);
+    tokio::time::timeout(std::time::Duration::from_secs(5), async {
+        loop {
+            let active: i64 = sqlx::query_scalar(
+                "SELECT COUNT(*) FROM archive_gc_pins WHERE tenant_id=$1 AND active=1",
+            )
+            .bind(foreign.tenant.to_string())
+            .fetch_one(&db.pool)
+            .await
+            .unwrap();
+            if active == 0 {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .unwrap();
     let raced_scope = ArchiveGcScope::for_tenant(Uuid::now_v7()).unwrap();
     let seed = db
         .acquire_archive_gc_pins(

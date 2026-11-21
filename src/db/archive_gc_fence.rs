@@ -2,6 +2,7 @@
 //! Callers must pin every backend in the transitive reference closure before
 //! publication starts. All backends of one tenant share the same gate. No transaction or connection is held during object I/O.
 use super::*;
+mod read_pin;
 
 #[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord)]
 pub(crate) struct ArchiveGcScope {
