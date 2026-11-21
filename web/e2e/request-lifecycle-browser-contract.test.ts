@@ -5,7 +5,7 @@ import { fileURLToPath } from 'node:url';
 import test from 'node:test';
 import { chromium } from 'playwright';
 import { createServer } from 'vite';
-declare global { interface Window { requestLifecycleFixture: { observe: () => void; finish: () => void; settle: (cost: string, kind: 'finished' | 'projected' | 'archive_bound') => void; replay: () => void; hold: () => void; release: () => void; switchScope: () => void; filter: () => void; failQuery: () => void; held: boolean; queryHeld: boolean; queryCalls: number; detailCalls: number; scopeCommits: { scope: string; drawers: number }[] }; } }
+declare global { interface Window { requestLifecycleFixture: { observe: () => void; finish: () => void; settle: (cost: string, kind: 'finished' | 'projected' | 'archive_bound') => void; replay: () => void; hold: () => void; release: () => void; switchScope: () => void; filter: () => void; failQuery: () => void; failNextQuery: () => void; held: boolean; queryHeld: boolean; queryCalls: number; detailCalls: number; scopeCommits: { scope: string; drawers: number }[] }; } }
 
 test('low-volume terminal events reconcile operational money without opening details or overflowing', { timeout: 45_000 }, async (context) => {
   if (!existsSync(chromium.executablePath())) {
@@ -662,5 +662,41 @@ test('manual refresh updates the selected drawer and row from the same observati
     assert.equal(await page.locator('.drawer').count(), 1);
     assert.equal(await page.evaluate(() => window.requestLifecycleFixture.detailCalls), detailCalls,
       'refresh reuses the loaded detail body rather than reopening the drawer');
+  } finally { await browser.close(); await server.close(); }
+});
+
+
+test('request read freshness advances only for successful current result reads', { timeout: 45_000 }, async context => {
+  if (!existsSync(chromium.executablePath())) {
+    if (process.env.MTC_REQUIRE_BROWSER === '1') throw new Error('Chromium is required');
+    context.skip('Chromium is not installed'); return;
+  }
+  const server = await createServer({ root: fileURLToPath(new URL('..', import.meta.url)), configFile: false, logLevel: 'silent', server: { host: '127.0.0.1', port: 0 } });
+  await server.listen();
+  const address = server.httpServer?.address(); assert.ok(address && typeof address !== 'string');
+  const browser = await chromium.launch({ headless: true });
+  try {
+    const page = await browser.newPage();
+    await page.addInitScript(() => { localStorage.setItem('mtc-locale', 'en'); Date.now = () => 2_000_000_000_000; });
+    await page.goto(`http://127.0.0.1:${address.port}/e2e/fixtures/request-lifecycle.html?quiet-background-help&operational=zero`);
+    const freshness = page.locator('[data-request-read-freshness] time');
+    await freshness.waitFor();
+    const initial = await freshness.getAttribute('datetime');
+    assert.equal(initial, new Date(2_000_000_000_000).toISOString());
+    await page.evaluate(() => { Date.now = () => 2_000_000_010_000; window.requestLifecycleFixture.finish(); });
+    await page.locator('[data-request-fixture-revision="1"]').waitFor();
+    assert.equal(await freshness.getAttribute('datetime'), initial, 'SSE observation is not an authoritative list read');
+    await page.locator('.traffic-heading-actions').getByRole('button', { name: 'Refresh', exact: true }).click();
+    await page.waitForFunction(() => document.querySelector('[data-request-read-freshness] time')?.getAttribute('datetime') === new Date(2_000_000_010_000).toISOString());
+    const refreshed = await freshness.getAttribute('datetime');
+    const row = page.locator('tbody tr').filter({ has: page.getByText('model-a', { exact: true }) });
+    await row.locator('.table-action').click();
+    await page.locator('.drawer').waitFor();
+    await page.evaluate(() => { Date.now = () => 2_000_000_020_000; window.requestLifecycleFixture.failNextQuery(); });
+    await page.locator('.drawer').getByRole('button', { name: 'Refresh', exact: true }).click();
+    await page.getByRole('alert').filter({ hasText: 'HTTP 503' }).waitFor();
+    assert.equal(await freshness.getAttribute('datetime'), refreshed, 'failed refresh retains the last successful read');
+    assert.equal(await row.count(), 1);
+    assert.equal(await page.locator('.drawer').count(), 1, 'failed refresh preserves the selected detail');
   } finally { await browser.close(); await server.close(); }
 });
