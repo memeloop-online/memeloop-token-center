@@ -745,21 +745,25 @@ impl Database {
             let tenant_id = identity.tenant_id.to_string();
             let request_id = identity.request_id.to_string();
             let key_id: String = owned.try_get("key_id")?;
-            let cursor = super::allocate_request_event_cursor(
+            let draft_cursor = crate::db::RequestEventCursor {
+                event_id: Uuid::nil().to_string(),
+                event_at: now,
+            };
+            let draft_row = sqlx::query(r#"SELECT CAST($1 AS TEXT) AS event_id, CAST(tenant_id AS TEXT) AS tenant_id, CAST(key_id AS TEXT) AS key_id, CAST(id AS TEXT) AS request_id, CAST($2 AS BIGINT) AS event_at, CAST($3 AS TEXT) AS event_kind, CAST(protocol AS TEXT) AS protocol, CAST(model AS TEXT) AS model, CAST(status_code AS BIGINT) AS status_code, CAST(duration_ms AS BIGINT) AS duration_ms, CAST(input_tokens AS BIGINT) AS input_tokens, CAST(output_tokens AS BIGINT) AS output_tokens, CAST(cost_micros AS BIGINT) AS cost_micros, CAST(error_code AS TEXT) AS error_code FROM request_records WHERE id = $4 AND tenant_id = $5 AND key_id = $6"#)
+                .bind(&draft_cursor.event_id).bind(draft_cursor.event_at).bind(if success { "archive_bound" } else { "archive_gap" })
+                .bind(request_id).bind(tenant_id).bind(key_id).fetch_optional(&mut *transaction).await?;
+            let prepared = match draft_row.as_ref() {
+                Some(row) => Some(
+                    crate::db::history_immutable_outbox::EventDraft::from_row(row)?
+                        .prepare(&mut transaction)
+                        .await?,
+                ),
+                None => None,
+            };
+            crate::db::history_immutable_outbox::PreparedEventCapture::publish(
                 &mut transaction,
+                prepared,
                 now,
-                &tenant_id,
-                &key_id,
-                &request_id,
-            )
-            .await?;
-            sqlx::query("INSERT INTO request_events (event_id, tenant_id, key_id, request_id, event_at, event_kind, protocol, model, status_code, duration_ms, input_tokens, output_tokens, cost_micros, error_code) SELECT $1, tenant_id, key_id, id, $2, $3, protocol, model, status_code, duration_ms, input_tokens, output_tokens, cost_micros, error_code FROM request_records WHERE id = $4 AND tenant_id = $5 AND key_id = $6")
-                .bind(&cursor.event_id).bind(cursor.event_at).bind(if success { "archive_bound" } else { "archive_gap" })
-                .bind(request_id).bind(tenant_id).bind(key_id).execute(&mut *transaction).await?;
-            super::history_immutable_outbox::capture_event_in_transaction(
-                &mut transaction,
-                &cursor.event_id.to_string(),
-                cursor.event_at,
             )
             .await?;
         }

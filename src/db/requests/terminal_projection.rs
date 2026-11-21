@@ -218,29 +218,6 @@ impl Database {
         let key_id: String = task.try_get("key_id")?;
         // The claimed outbox row and its acknowledgement are the financial
         // publication fence; semantic projections also use this event kind.
-        let event = super::lifecycle::allocate_request_event_cursor(
-            &mut transaction,
-            task.try_get("completed_at")?,
-            &tenant_id,
-            &key_id,
-            &request_id,
-        )
-        .await?;
-        sqlx::query(
-            "INSERT INTO request_events (event_id, tenant_id, key_id, request_id, event_at, event_kind, protocol, model, status_code, duration_ms, input_tokens, output_tokens, cost_micros, error_code)
-             SELECT $1, tenant_id, key_id, request_id, $2, 'projected', protocol, model, status_code, duration_ms, input_tokens, output_tokens, cost_micros, NULLIF(error_code, '') FROM terminal_projection_outbox WHERE request_id = $3",
-        )
-        .bind(&event.event_id)
-        .bind(event.event_at)
-        .bind(&request_id)
-        .execute(&mut *transaction)
-        .await?;
-        super::super::history_immutable_outbox::capture_event_in_transaction(
-            &mut transaction,
-            &event.event_id.to_string(),
-            event.event_at,
-        )
-        .await?;
         let acknowledged = sqlx::query(
             "UPDATE terminal_projection_outbox SET projected_at = $1, statistics_outcome = $2, lease_owner = NULL, lease_expires_at = NULL WHERE request_id = $3 AND projected_at IS NULL AND lease_owner = $4 AND account_projected_at IS NOT NULL",
         )
@@ -258,6 +235,32 @@ impl Database {
         super::super::history_immutable_outbox::capture_native_in_transaction(
             &mut transaction,
             &request_id,
+        )
+        .await?;
+        let draft_cursor = crate::db::RequestEventCursor {
+            event_id: Uuid::nil().to_string(),
+            event_at: task.try_get("completed_at")?,
+        };
+        let draft_row = sqlx::query(
+            r#"SELECT CAST($1 AS TEXT) AS event_id, CAST(tenant_id AS TEXT) AS tenant_id, CAST(key_id AS TEXT) AS key_id, CAST(request_id AS TEXT) AS request_id, CAST($2 AS BIGINT) AS event_at, CAST('projected' AS TEXT) AS event_kind, CAST(protocol AS TEXT) AS protocol, CAST(model AS TEXT) AS model, CAST(status_code AS BIGINT) AS status_code, CAST(duration_ms AS BIGINT) AS duration_ms, CAST(input_tokens AS BIGINT) AS input_tokens, CAST(output_tokens AS BIGINT) AS output_tokens, CAST(cost_micros AS BIGINT) AS cost_micros, CAST(NULLIF(error_code, '') AS TEXT) AS error_code FROM terminal_projection_outbox WHERE request_id = $3"#,
+        )
+        .bind(&draft_cursor.event_id)
+        .bind(draft_cursor.event_at)
+        .bind(&request_id)
+        .fetch_optional(&mut *transaction)
+        .await?;
+        let prepared = match draft_row.as_ref() {
+            Some(row) => Some(
+                crate::db::history_immutable_outbox::EventDraft::from_row(row)?
+                    .prepare(&mut transaction)
+                    .await?,
+            ),
+            None => None,
+        };
+        crate::db::history_immutable_outbox::PreparedEventCapture::publish(
+            &mut transaction,
+            prepared,
+            task.try_get("completed_at")?,
         )
         .await?;
         transaction.commit().await?;

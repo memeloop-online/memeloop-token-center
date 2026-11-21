@@ -283,31 +283,41 @@ impl Database {
         let tenant_id = input.key.tenant_id.to_string();
         let key_id = input.key.key_id.to_string();
         let request_id = input.job_id.to_string();
-        let event =
-            allocate_request_event_cursor(&mut transaction, now, &tenant_id, &key_id, &request_id)
-                .await?;
-        sqlx::query(
-            "INSERT INTO request_events (event_id, tenant_id, key_id, request_id, event_at, event_kind, protocol, model, input_tokens, output_tokens, cost_micros) VALUES ($1, $2, $3, $4, $5, 'started', 'generation', $6, 0, 0, 0)",
-        )
-        .bind(&event.event_id)
-        .bind(&tenant_id)
-        .bind(&key_id)
-        .bind(&request_id)
-        .bind(event.event_at)
-        .bind(&input.public_model)
-        .execute(&mut *transaction)
-        .await?;
-        super::super::history_immutable_outbox::capture_event_in_transaction(
-            &mut transaction,
-            &event.event_id.to_string(),
-            event.event_at,
-        )
-        .await?;
         super::super::history_immutable_outbox::capture_generation_in_transaction(
             &mut transaction,
             &request_id,
         )
         .await?;
+        let draft_cursor = crate::db::RequestEventCursor {
+            event_id: Uuid::nil().to_string(),
+            event_at: now,
+        };
+        let draft_row = sqlx::query(
+            r#"SELECT CAST($1 AS TEXT) AS event_id, CAST($2 AS TEXT) AS tenant_id, CAST($3 AS TEXT) AS key_id, CAST($4 AS TEXT) AS request_id, CAST($5 AS BIGINT) AS event_at, CAST('started' AS TEXT) AS event_kind, CAST('generation' AS TEXT) AS protocol, CAST($6 AS TEXT) AS model, CAST(NULL AS BIGINT) AS status_code, CAST(NULL AS BIGINT) AS duration_ms, CAST(0 AS BIGINT) AS input_tokens, CAST(0 AS BIGINT) AS output_tokens, CAST(0 AS BIGINT) AS cost_micros, CAST(NULL AS TEXT) AS error_code"#,
+        )
+        .bind(&draft_cursor.event_id)
+        .bind(&tenant_id)
+        .bind(&key_id)
+        .bind(&request_id)
+        .bind(draft_cursor.event_at)
+        .bind(&input.public_model)
+        .fetch_optional(&mut *transaction)
+        .await?;
+        let prepared = match draft_row.as_ref() {
+            Some(row) => Some(
+                crate::db::history_immutable_outbox::EventDraft::from_row(row)?
+                    .prepare(&mut transaction)
+                    .await?,
+            ),
+            None => None,
+        };
+        crate::db::history_immutable_outbox::PreparedEventCapture::publish(
+            &mut transaction,
+            prepared,
+            now,
+        )
+        .await?;
+
         transaction.commit().await?;
         Ok(CreateGenerationJobResult::Created(GenerationJobView {
             job_id: input.job_id,
@@ -709,31 +719,41 @@ impl Database {
         let tenant_id = input.key.tenant_id.to_string();
         let key_id = input.key.key_id.to_string();
         let request_id = input.job_id.to_string();
-        let event =
-            allocate_request_event_cursor(&mut transaction, now, &tenant_id, &key_id, &request_id)
-                .await?;
-        sqlx::query(
-            "INSERT INTO request_events (event_id, tenant_id, key_id, request_id, event_at, event_kind, protocol, model, input_tokens, output_tokens, cost_micros) VALUES ($1, $2, $3, $4, $5, 'started', 'generation', $6, 0, 0, 0)",
-        )
-        .bind(&event.event_id)
-        .bind(&tenant_id)
-        .bind(&key_id)
-        .bind(&request_id)
-        .bind(event.event_at)
-        .bind(&input.public_model)
-        .execute(&mut *transaction)
-        .await?;
-        super::super::history_immutable_outbox::capture_event_in_transaction(
-            &mut transaction,
-            &event.event_id.to_string(),
-            event.event_at,
-        )
-        .await?;
         super::super::history_immutable_outbox::capture_generation_in_transaction(
             &mut transaction,
             &request_id,
         )
         .await?;
+        let draft_cursor = crate::db::RequestEventCursor {
+            event_id: Uuid::nil().to_string(),
+            event_at: now,
+        };
+        let draft_row = sqlx::query(
+            r#"SELECT CAST($1 AS TEXT) AS event_id, CAST($2 AS TEXT) AS tenant_id, CAST($3 AS TEXT) AS key_id, CAST($4 AS TEXT) AS request_id, CAST($5 AS BIGINT) AS event_at, CAST('started' AS TEXT) AS event_kind, CAST('generation' AS TEXT) AS protocol, CAST($6 AS TEXT) AS model, CAST(NULL AS BIGINT) AS status_code, CAST(NULL AS BIGINT) AS duration_ms, CAST(0 AS BIGINT) AS input_tokens, CAST(0 AS BIGINT) AS output_tokens, CAST(0 AS BIGINT) AS cost_micros, CAST(NULL AS TEXT) AS error_code"#,
+        )
+        .bind(&draft_cursor.event_id)
+        .bind(&tenant_id)
+        .bind(&key_id)
+        .bind(&request_id)
+        .bind(draft_cursor.event_at)
+        .bind(&input.public_model)
+        .fetch_optional(&mut *transaction)
+        .await?;
+        let prepared = match draft_row.as_ref() {
+            Some(row) => Some(
+                crate::db::history_immutable_outbox::EventDraft::from_row(row)?
+                    .prepare(&mut transaction)
+                    .await?,
+            ),
+            None => None,
+        };
+        crate::db::history_immutable_outbox::PreparedEventCapture::publish(
+            &mut transaction,
+            prepared,
+            now,
+        )
+        .await?;
+
         transaction.commit().await?;
         Ok(CreateGenerationJobResult::Created(GenerationJobView {
             job_id: input.job_id,
@@ -1004,37 +1024,42 @@ impl Database {
         publish_generation_terminal_effects(&mut transaction, &job_id.to_string(), now).await?;
         let key_id_string = key_id.to_string();
         let request_id = job_id.to_string();
-        let event = allocate_request_event_cursor(
-            &mut transaction,
-            now,
-            &tenant_id,
-            &key_id_string,
-            &request_id,
-        )
-        .await?;
-        sqlx::query(
-            "INSERT INTO request_events (event_id, tenant_id, key_id, request_id, event_at, event_kind, protocol, model, status_code, duration_ms, input_tokens, output_tokens, cost_micros, error_code) VALUES ($1, $2, $3, $4, $5, 'finished', 'generation', $6, 499, $7, 0, 0, 0, 'cancelled_by_user')",
-        )
-        .bind(&event.event_id)
-        .bind(&tenant_id)
-        .bind(&key_id_string)
-        .bind(&request_id)
-        .bind(event.event_at)
-        .bind(public_model)
-        .bind(now.saturating_sub(created_at))
-        .execute(&mut *transaction)
-        .await?;
-        super::super::history_immutable_outbox::capture_event_in_transaction(
-            &mut transaction,
-            &event.event_id.to_string(),
-            event.event_at,
-        )
-        .await?;
         super::super::history_immutable_outbox::capture_generation_in_transaction(
             &mut transaction,
             &request_id,
         )
         .await?;
+        let draft_cursor = crate::db::RequestEventCursor {
+            event_id: Uuid::nil().to_string(),
+            event_at: now,
+        };
+        let draft_row = sqlx::query(
+            r#"SELECT CAST($1 AS TEXT) AS event_id, CAST($2 AS TEXT) AS tenant_id, CAST($3 AS TEXT) AS key_id, CAST($4 AS TEXT) AS request_id, CAST($5 AS BIGINT) AS event_at, CAST('finished' AS TEXT) AS event_kind, CAST('generation' AS TEXT) AS protocol, CAST($6 AS TEXT) AS model, CAST(499 AS BIGINT) AS status_code, CAST($7 AS BIGINT) AS duration_ms, CAST(0 AS BIGINT) AS input_tokens, CAST(0 AS BIGINT) AS output_tokens, CAST(0 AS BIGINT) AS cost_micros, CAST('cancelled_by_user' AS TEXT) AS error_code"#,
+        )
+        .bind(&draft_cursor.event_id)
+        .bind(&tenant_id)
+        .bind(&key_id_string)
+        .bind(&request_id)
+        .bind(draft_cursor.event_at)
+        .bind(public_model)
+        .bind(now.saturating_sub(created_at))
+        .fetch_optional(&mut *transaction)
+        .await?;
+        let prepared = match draft_row.as_ref() {
+            Some(row) => Some(
+                crate::db::history_immutable_outbox::EventDraft::from_row(row)?
+                    .prepare(&mut transaction)
+                    .await?,
+            ),
+            None => None,
+        };
+        crate::db::history_immutable_outbox::PreparedEventCapture::publish(
+            &mut transaction,
+            prepared,
+            now,
+        )
+        .await?;
+
         transaction.commit().await?;
         self.generation_job(key_id, job_id).await
     }
@@ -1585,26 +1610,32 @@ async fn fail_preparing_generation_in_transaction(
     let tenant_id: String = row.try_get("tenant_id")?;
     let key_id = key_id.to_string();
     let request_id = job_id.to_string();
-    let event = allocate_request_event_cursor(tx, now, &tenant_id, &key_id, &request_id).await?;
-    sqlx::query(
-        "INSERT INTO request_events (event_id, tenant_id, key_id, request_id, event_at, event_kind, protocol, model, status_code, duration_ms, input_tokens, output_tokens, cost_micros, error_code) VALUES ($1, $2, $3, $4, $5, 'finished', 'generation', $6, 502, $7, 0, 0, 0, $8)",
+    let draft_cursor = crate::db::RequestEventCursor {
+        event_id: Uuid::nil().to_string(),
+        event_at: now,
+    };
+    let draft_row = sqlx::query(
+        r#"SELECT CAST($1 AS TEXT) AS event_id, CAST($2 AS TEXT) AS tenant_id, CAST($3 AS TEXT) AS key_id, CAST($4 AS TEXT) AS request_id, CAST($5 AS BIGINT) AS event_at, CAST('finished' AS TEXT) AS event_kind, CAST('generation' AS TEXT) AS protocol, CAST($6 AS TEXT) AS model, CAST(502 AS BIGINT) AS status_code, CAST($7 AS BIGINT) AS duration_ms, CAST(0 AS BIGINT) AS input_tokens, CAST(0 AS BIGINT) AS output_tokens, CAST(0 AS BIGINT) AS cost_micros, CAST($8 AS TEXT) AS error_code"#,
     )
-    .bind(&event.event_id)
+    .bind(&draft_cursor.event_id)
     .bind(&tenant_id)
     .bind(&key_id)
     .bind(&request_id)
-    .bind(event.event_at)
+    .bind(draft_cursor.event_at)
     .bind(row.try_get::<String, _>("public_model")?)
     .bind(now.saturating_sub(row.try_get("created_at")?))
     .bind(error_code)
-    .execute(&mut **tx)
+    .fetch_optional(&mut **tx)
     .await?;
-    super::super::history_immutable_outbox::capture_event_in_transaction(
-        tx,
-        &event.event_id.to_string(),
-        event.event_at,
-    )
-    .await?;
+    let prepared = match draft_row.as_ref() {
+        Some(row) => Some(
+            crate::db::history_immutable_outbox::EventDraft::from_row(row)?
+                .prepare(tx)
+                .await?,
+        ),
+        None => None,
+    };
+    crate::db::history_immutable_outbox::PreparedEventCapture::publish(tx, prepared, now).await?;
     Ok(true)
 }
 

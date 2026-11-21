@@ -2225,25 +2225,34 @@ impl Database {
         .bind(&model_route_id)
         .execute(&mut *transaction)
         .await?;
-        let event =
-            allocate_request_event_cursor(&mut transaction, now, &tenant_id, &key_id, &request_id)
-                .await?;
-        sqlx::query(
-            "INSERT INTO request_events (event_id, tenant_id, key_id, request_id, event_at, event_kind, protocol, model, input_tokens, output_tokens, cost_micros) VALUES ($1, $2, $3, $4, $5, 'started', $6, $7, 0, 0, 0)",
+        let draft_cursor = crate::db::RequestEventCursor {
+            event_id: Uuid::nil().to_string(),
+            event_at: now,
+        };
+        let draft_row = sqlx::query(
+            r#"SELECT CAST($1 AS TEXT) AS event_id, CAST($2 AS TEXT) AS tenant_id, CAST($3 AS TEXT) AS key_id, CAST($4 AS TEXT) AS request_id, CAST($5 AS BIGINT) AS event_at, CAST('started' AS TEXT) AS event_kind, CAST($6 AS TEXT) AS protocol, CAST($7 AS TEXT) AS model, CAST(NULL AS BIGINT) AS status_code, CAST(NULL AS BIGINT) AS duration_ms, CAST(0 AS BIGINT) AS input_tokens, CAST(0 AS BIGINT) AS output_tokens, CAST(0 AS BIGINT) AS cost_micros, CAST(NULL AS TEXT) AS error_code"#,
         )
-        .bind(&event.event_id)
+        .bind(&draft_cursor.event_id)
         .bind(&tenant_id)
         .bind(&key_id)
         .bind(&request_id)
-        .bind(event.event_at)
+        .bind(draft_cursor.event_at)
         .bind(&request.protocol)
         .bind(&request.model)
-        .execute(&mut *transaction)
+        .fetch_optional(&mut *transaction)
         .await?;
-        super::super::history_immutable_outbox::capture_event_in_transaction(
+        let prepared = match draft_row.as_ref() {
+            Some(row) => Some(
+                crate::db::history_immutable_outbox::EventDraft::from_row(row)?
+                    .prepare(&mut transaction)
+                    .await?,
+            ),
+            None => None,
+        };
+        crate::db::history_immutable_outbox::PreparedEventCapture::publish(
             &mut transaction,
-            &event.event_id.to_string(),
-            event.event_at,
+            prepared,
+            now,
         )
         .await?;
         transaction.commit().await?;
@@ -2482,12 +2491,12 @@ pub(crate) async fn record_request_started_in_transaction(
     now: i64,
 ) -> Result<(), AppError> {
     insert_request_started_record_in_transaction(transaction, request, now).await?;
-    insert_request_started_event_in_transaction(transaction, request, now).await?;
     super::super::history_immutable_outbox::capture_native_in_transaction(
         transaction,
         &request.request_id.to_string(),
     )
-    .await
+    .await?;
+    insert_request_started_event_in_transaction(transaction, request, now).await
 }
 
 async fn insert_request_started_record_in_transaction(
@@ -2534,26 +2543,32 @@ async fn insert_request_started_event_in_transaction(
     let request_id = request.request_id.to_string();
     let tenant_id = request.tenant_id.to_string();
     let key_id = request.key_id.to_string();
-    let event =
-        allocate_request_event_cursor(transaction, now, &tenant_id, &key_id, &request_id).await?;
-    sqlx::query(
-        "INSERT INTO request_events (event_id, tenant_id, key_id, request_id, event_at, event_kind, protocol, model, input_tokens, output_tokens, cost_micros) SELECT $1, $2, $3, $4, $5, 'started', $6, $7, 0, 0, 0 WHERE EXISTS (SELECT 1 FROM request_records WHERE id = $4 AND tenant_id = $2 AND key_id = $3 AND completed_at IS NULL)",
+    let draft_cursor = crate::db::RequestEventCursor {
+        event_id: Uuid::nil().to_string(),
+        event_at: now,
+    };
+    let draft_row = sqlx::query(
+        r#"SELECT CAST($1 AS TEXT) AS event_id, CAST($2 AS TEXT) AS tenant_id, CAST($3 AS TEXT) AS key_id, CAST($4 AS TEXT) AS request_id, CAST($5 AS BIGINT) AS event_at, CAST('started' AS TEXT) AS event_kind, CAST($6 AS TEXT) AS protocol, CAST($7 AS TEXT) AS model, CAST(NULL AS BIGINT) AS status_code, CAST(NULL AS BIGINT) AS duration_ms, CAST(0 AS BIGINT) AS input_tokens, CAST(0 AS BIGINT) AS output_tokens, CAST(0 AS BIGINT) AS cost_micros, CAST(NULL AS TEXT) AS error_code WHERE EXISTS (SELECT 1 FROM request_records WHERE id = $4 AND tenant_id = $2 AND key_id = $3 AND completed_at IS NULL)"#,
     )
-    .bind(&event.event_id)
+    .bind(&draft_cursor.event_id)
     .bind(&tenant_id)
     .bind(&key_id)
     .bind(&request_id)
-    .bind(event.event_at)
+    .bind(draft_cursor.event_at)
     .bind(&request.protocol)
     .bind(&request.model)
-    .execute(&mut **transaction)
+    .fetch_optional(&mut **transaction)
     .await?;
-    super::super::history_immutable_outbox::capture_event_in_transaction(
-        transaction,
-        &event.event_id.to_string(),
-        event.event_at,
-    )
-    .await?;
+    let prepared = match draft_row.as_ref() {
+        Some(row) => Some(
+            crate::db::history_immutable_outbox::EventDraft::from_row(row)?
+                .prepare(transaction)
+                .await?,
+        ),
+        None => None,
+    };
+    crate::db::history_immutable_outbox::PreparedEventCapture::publish(transaction, prepared, now)
+        .await?;
     Ok(())
 }
 
@@ -2885,26 +2900,37 @@ async fn record_request_finished_with_basis_and_metering_in_transaction(
                 .await?;
         }
     }
-    let event =
-        allocate_request_event_cursor(tx, completed_at, &tenant_id, &key_id, &request_id).await?;
-    let inserted = sqlx::query(
-        "INSERT INTO request_events (event_id, tenant_id, key_id, request_id, event_at, event_kind, protocol, model, status_code, duration_ms, input_tokens, output_tokens, cost_micros, error_code) SELECT $1, tenant_id, key_id, id, $2, 'finished', protocol, model, status_code, duration_ms, input_tokens, output_tokens, cost_micros, error_code FROM request_records WHERE id = $3 AND created_at = $4",
+    super::super::history_immutable_outbox::capture_native_in_transaction(tx, &request_id).await?;
+    let draft_cursor = crate::db::RequestEventCursor {
+        event_id: Uuid::nil().to_string(),
+        event_at: completed_at,
+    };
+    let draft_row = sqlx::query(
+        r#"SELECT CAST($1 AS TEXT) AS event_id, CAST(tenant_id AS TEXT) AS tenant_id, CAST(key_id AS TEXT) AS key_id, CAST(id AS TEXT) AS request_id, CAST($2 AS BIGINT) AS event_at, CAST('finished' AS TEXT) AS event_kind, CAST(protocol AS TEXT) AS protocol, CAST(model AS TEXT) AS model, CAST(status_code AS BIGINT) AS status_code, CAST(duration_ms AS BIGINT) AS duration_ms, CAST(input_tokens AS BIGINT) AS input_tokens, CAST(output_tokens AS BIGINT) AS output_tokens, CAST(cost_micros AS BIGINT) AS cost_micros, CAST(error_code AS TEXT) AS error_code FROM request_records WHERE id = $3 AND created_at = $4"#,
     )
-    .bind(&event.event_id)
-    .bind(event.event_at)
+    .bind(&draft_cursor.event_id)
+    .bind(draft_cursor.event_at)
     .bind(&request_id)
     .bind(created_at)
-    .execute(&mut **tx)
+    .fetch_optional(&mut **tx)
     .await?;
-    super::super::history_immutable_outbox::capture_event_in_transaction(
+    let prepared = match draft_row.as_ref() {
+        Some(row) => Some(
+            crate::db::history_immutable_outbox::EventDraft::from_row(row)?
+                .prepare(tx)
+                .await?,
+        ),
+        None => None,
+    };
+    let inserted = crate::db::history_immutable_outbox::PreparedEventCapture::publish(
         tx,
-        &event.event_id.to_string(),
-        event.event_at,
+        prepared,
+        completed_at,
     )
     .await?;
-    if inserted.rows_affected() != 1 {
+    if inserted != 1 {
         return Err(AppError::internal("lifecycle_site_8"));
     }
-    super::super::history_immutable_outbox::capture_native_in_transaction(tx, &request_id).await?;
+
     Ok(true)
 }

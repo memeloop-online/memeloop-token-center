@@ -1488,24 +1488,32 @@ async fn emit_response_archive_transition_event_in_transaction(
     .await?;
     let tenant_id: String = owner.try_get("tenant_id")?;
     let key_id: String = owner.try_get("key_id")?;
-    let cursor = allocate_request_event_cursor(tx, now, &tenant_id, &key_id, &request_id).await?;
-    let inserted = sqlx::query(sqlx::AssertSqlSafe(spool_sql(purpose,
-        "INSERT INTO request_events (event_id, tenant_id, key_id, request_id, event_at, event_kind, protocol, model, status_code, duration_ms, input_tokens, output_tokens, cost_micros, error_code) SELECT $1, tenant_id, key_id, id, $2, $3, protocol, model, status_code, duration_ms, input_tokens, output_tokens, cost_micros, error_code FROM request_records WHERE id = $4 AND tenant_id = $5 AND key_id = $6")))
-    .bind(&cursor.event_id)
-    .bind(cursor.event_at)
+    let draft_cursor = crate::db::RequestEventCursor {
+        event_id: Uuid::nil().to_string(),
+        event_at: now,
+    };
+    let draft_row = sqlx::query(sqlx::AssertSqlSafe(spool_sql(purpose,
+        r#"SELECT CAST($1 AS TEXT) AS event_id, CAST(tenant_id AS TEXT) AS tenant_id, CAST(key_id AS TEXT) AS key_id, CAST(id AS TEXT) AS request_id, CAST($2 AS BIGINT) AS event_at, CAST($3 AS TEXT) AS event_kind, CAST(protocol AS TEXT) AS protocol, CAST(model AS TEXT) AS model, CAST(status_code AS BIGINT) AS status_code, CAST(duration_ms AS BIGINT) AS duration_ms, CAST(input_tokens AS BIGINT) AS input_tokens, CAST(output_tokens AS BIGINT) AS output_tokens, CAST(cost_micros AS BIGINT) AS cost_micros, CAST(error_code AS TEXT) AS error_code FROM request_records WHERE id = $4 AND tenant_id = $5 AND key_id = $6"#)))
+    .bind(&draft_cursor.event_id)
+    .bind(draft_cursor.event_at)
     .bind(event_kind)
     .bind(request_id)
     .bind(tenant_id)
     .bind(key_id)
-    .execute(&mut **tx)
+    .fetch_optional(&mut **tx)
     .await?;
-    super::history_immutable_outbox::capture_event_in_transaction(
-        tx,
-        &cursor.event_id.to_string(),
-        cursor.event_at,
-    )
-    .await?;
-    if inserted.rows_affected() != 1 {
+    let prepared = match draft_row.as_ref() {
+        Some(row) => Some(
+            crate::db::history_immutable_outbox::EventDraft::from_row(row)?
+                .prepare(tx)
+                .await?,
+        ),
+        None => None,
+    };
+    let inserted =
+        crate::db::history_immutable_outbox::PreparedEventCapture::publish(tx, prepared, now)
+            .await?;
+    if inserted != 1 {
         return Err(AppError::internal(
             "archive_spool_emit_response_archive_transition_event_in_transact",
         ));
