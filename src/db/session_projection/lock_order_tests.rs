@@ -469,6 +469,15 @@ async fn postgres_unlinked_membership_uses_delta_and_preserves_generation() {
 
 #[tokio::test]
 async fn sqlite_unlinked_membership_uses_delta_and_preserves_generation() {
-    let db = Database::connect("sqlite::memory:").await.unwrap();
+    let dir = tempfile::tempdir().unwrap();
+    let db = Database::connect_with_max(
+        &format!(
+            "sqlite://{}?mode=rwc",
+            dir.path().join("mixed.db").display()
+        ),
+        4,
+    )
+    .await
+    .unwrap();
     mixed_unlinked_delta_preserves_generation_without_replacement(&db).await;
 }
