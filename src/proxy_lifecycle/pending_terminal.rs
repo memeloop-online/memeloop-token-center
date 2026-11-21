@@ -490,7 +490,7 @@ enum Work {
 impl Journal {
     #[cfg(test)]
     pub(crate) fn new(directory: PathBuf, database: Database) -> Arc<Self> {
-        Self::create(directory, database, None)
+        Self::create(directory, database, None, true)
     }
 
     pub(crate) fn with_archive(
@@ -498,13 +498,23 @@ impl Journal {
         database: Database,
         archive: crate::archive::ArchiveStore,
     ) -> Arc<Self> {
-        Self::create(directory, database, Some(archive))
+        Self::create(directory, database, Some(archive), true)
+    }
+
+    pub(crate) fn with_background(
+        directory: PathBuf,
+        database: Database,
+        archive: crate::archive::ArchiveStore,
+        background: bool,
+    ) -> Arc<Self> {
+        Self::create(directory, database, Some(archive), background)
     }
 
     fn create(
         directory: PathBuf,
         database: Database,
         archive: Option<crate::archive::ArchiveStore>,
+        background: bool,
     ) -> Arc<Self> {
         let journal = Arc::new(Self {
             directory,
@@ -531,6 +541,9 @@ impl Journal {
             #[cfg(test)]
             preparation_gate: Arc::new(tokio::sync::Semaphore::new(1)),
         });
+        if !background {
+            return journal;
+        }
         let recovery_database = database.clone();
         let weak = Arc::downgrade(&journal);
         let worker = tokio::spawn(async move {
@@ -572,6 +585,11 @@ impl Journal {
             .lock()
             .unwrap_or_else(|error| error.into_inner()) = Some(recovery);
         journal
+    }
+
+    #[cfg(test)]
+    pub(crate) fn background_started_for_test(&self) -> bool {
+        self.worker.lock().unwrap().is_some() || self.recovery_worker.lock().unwrap().is_some()
     }
 
     pub(crate) async fn drain(&self) {
