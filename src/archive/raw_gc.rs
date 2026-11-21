@@ -1,6 +1,7 @@
 //! Read-only raw retirement inventory. A candidate is never deletion authority.
 use std::collections::BTreeMap;
 
+use object_store::ObjectStoreExt;
 use serde::Serialize;
 use uuid::Uuid;
 
