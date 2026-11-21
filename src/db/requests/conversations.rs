@@ -1199,7 +1199,7 @@ impl Database {
 
         let mut transaction = self.begin_write_transaction().await?;
         let result: Result<bool, ConversationContentError> = async {
-        lock_request_stats_projection_writer_in_transaction(&mut transaction).await?;
+        lock_request_stats_projection_rebuild_in_transaction(&mut transaction).await?;
         let now = unix_millis();
         let terminal = sqlx::query(
             "SELECT created_at, projected_at FROM terminal_projection_outbox WHERE request_id = $1",
@@ -1455,6 +1455,8 @@ impl Database {
         client_name: Option<&str>,
     ) -> Result<Uuid, AppError> {
         let mut transaction = self.begin_write_transaction().await?;
+        // Identity publication can replace session aggregates. Fence before any source lock.
+        lock_request_stats_projection_rebuild_in_transaction(&mut transaction).await?;
         let cluster_id = self
             .record_conversation_observation_in_transaction(
                 &mut transaction,
@@ -1502,8 +1504,9 @@ impl Database {
             attach_request_record,
             content_materialized,
         } = input;
-        // Join the live projection-writer cohort before request source, explicit-session, or
-        // conversation-reference locks. Full rebuilds take the exclusive form of this advisory.
+        // The owning transaction takes the exclusive projection gate before source locks:
+        // identity publication can reclassify or merge sessions and replace their aggregates.
+        // Re-entering shared mode here never upgrades a writer that already holds source locks.
         lock_request_stats_projection_writer_in_transaction(transaction).await?;
         let atoms = extract_atoms(request_json);
         let nodes = build_prefix(&atoms);
