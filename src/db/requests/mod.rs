@@ -24,15 +24,13 @@ pub use lifecycle::{
     StartMeteredSynchronousRequest, StartProxyRequest,
 };
 pub(crate) use lifecycle::{
-    ProxyRequestUpstreamAttribution, RequestArchiveAdmission, StartedProxyRequest,
-    SwitchProxyCandidateInput, allocate_request_event_cursor,
+    ProxyRequestUpstreamAttribution, RequestArchiveAdmission, RequestEventCursor,
+    StartedProxyRequest, SwitchProxyCandidateInput, allocate_request_event_cursor,
     insert_request_started_record_in_transaction, publish_request_started_in_transaction,
     record_request_finished_in_transaction, record_request_started_in_transaction,
 };
 #[cfg(test)]
-pub(crate) use lifecycle::{
-    RequestEventCursor, claim_request_event_locator, claim_request_record_locator,
-};
+pub(crate) use lifecycle::{claim_request_event_locator, claim_request_record_locator};
 pub use metered_projection::MeteredUsageProjectionTask;
 pub(crate) use operational_terminal::{
     PendingProxyOperationalTerminal, PendingProxyOperationalTerminalAck,
