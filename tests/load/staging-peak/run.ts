@@ -56,14 +56,14 @@ export function targetEndpoints(env: NodeJS.ProcessEnv) {
   } else {
     for (const [url, host] of [[gateway,staging ? "mtc-staging-gateway" : "memeloop-token-center-test-gateway"],[control,staging ? "mtc-staging-control" : "memeloop-token-center-test-control"],[mock,staging ? "mtc-staging-mock" : `mtc-peak-${runId}-mock`]] as const) if (url.protocol !== "http:" || url.hostname !== host || url.port !== (staging && url === mock ? "18080" : "8080") || url.pathname !== "/" || url.username || url.password || url.search || url.hash) throw new Error("isolated service identity mismatch");
   }
-  return { runId, gateway, control, mock, upstreamBase };
+  return { runId, gateway, control, mock, upstreamBase, forwarded };
 }
 
 export async function run(plan: Plan, env = process.env): Promise<Record<string, unknown>> {
   enter("plan_validate");
   validatePlan(plan);
   enter("environment");
-  const { runId, gateway, control, mock, upstreamBase } = targetEndpoints(env);
+  const { runId, gateway, control, mock, upstreamBase, forwarded } = targetEndpoints(env);
   enter("mock_identity");
   const identityResponse=await fetch(new URL("/identity",mock),{signal:AbortSignal.timeout(10_000)});
   httpStatus=identityResponse.status;

@@ -93,6 +93,7 @@ import { targetEndpoints } from "./run.ts";
 test("isolated endpoints bind namespace to exact services", () => {
   const env = { POD_NAMESPACE: "memeloop-token-center-staging", MTC_PEAK_RUN_ID: "tool-fixture-20261118" };
   const endpoints = targetEndpoints(env);
+  assert.equal(endpoints.forwarded, false);
   assert.equal(endpoints.gateway.href, "http://mtc-staging-gateway:8080/");
   assert.equal(endpoints.control.href, "http://mtc-staging-control:8080/");
   assert.equal(endpoints.mock.href, "http://mtc-staging-mock:18080/");
@@ -106,4 +107,9 @@ test("isolated endpoints bind namespace to exact services", () => {
     { ...env, MTC_TEST_MOCK_URL: "http://mtc-staging-mock:8080" },
     { ...env, MTC_PEAK_OPERATOR_FORWARD: "1" },
   ]) assert.throws(() => targetEndpoints(invalid));
+});
+
+test("operator forwarding remains explicit in report inputs", () => {
+  const endpoints = targetEndpoints({ POD_NAMESPACE: "memeloop-token-center-test", MTC_PEAK_RUN_ID: "unit", MTC_PEAK_OPERATOR_FORWARD: "1", MTC_TEST_GATEWAY_URL: "http://127.0.0.1:18090", MTC_TEST_CONTROL_URL: "http://127.0.0.1:18089", MTC_TEST_MOCK_URL: "http://127.0.0.1:18091", MTC_PEAK_UPSTREAM_BASE_URL: "http://10.42.8.1:18080", MTC_PEAK_TEST_GATEWAY_POD_IP: "10.42.8.1" });
+  assert.equal(endpoints.forwarded, true);
 });
