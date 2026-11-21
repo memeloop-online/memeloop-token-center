@@ -501,6 +501,12 @@ impl Database {
                 .execute(&mut *transaction)
                 .await?;
         }
+        let created_at: Option<i64> = sqlx::query_scalar("SELECT created_at FROM request_record_locators WHERE id = $1 AND tenant_id = $2 AND key_id = $3")
+            .bind(request_id.to_string()).bind(tenant_id.to_string()).bind(key_id.to_string())
+            .fetch_optional(&mut *transaction).await?;
+        let Some(created_at) = created_at else {
+            return Ok(false);
+        };
         let result = sqlx::query(
             "UPDATE conversation_projection_outbox SET projected_at = NULL,
              lease_owner = $1, lease_expires_at = $2,
@@ -515,7 +521,7 @@ impl Database {
                AND (lease_owner IS NULL OR lease_expires_at <= $7)
                AND (terminal_lease_owner IS NULL OR terminal_lease_expires_at <= $7)
                AND EXISTS (SELECT 1 FROM request_records r
-                 WHERE r.id = $3 AND r.tenant_id = $4 AND r.key_id = $5
+                 WHERE r.id = $3 AND r.tenant_id = $4 AND r.key_id = $5 AND r.created_at = $12
                    AND r.request_object = $8 AND r.response_object = $9)",
         )
         .bind(lease_owner.to_string())
@@ -529,6 +535,7 @@ impl Database {
         .bind(response_locator)
         .bind(prepared_snapshot)
         .bind(previous_lease_owner.map(|owner| owner.to_string()))
+        .bind(created_at)
         .execute(&mut *transaction)
         .await?;
         transaction.commit().await?;
