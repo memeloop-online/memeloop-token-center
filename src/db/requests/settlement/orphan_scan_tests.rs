@@ -119,6 +119,12 @@ async fn settled_history_does_not_starve_reserved_contract(database: &Database) 
         .execute(&database.pool)
         .await
         .unwrap();
+    sqlx::query("UPDATE request_record_locators SET created_at = $1 WHERE id = $2")
+        .bind(old)
+        .bind(request_id.to_string())
+        .execute(&database.pool)
+        .await
+        .unwrap();
     let finance = finance_snapshot(database, settled.id).await;
     assert_eq!(
         database
