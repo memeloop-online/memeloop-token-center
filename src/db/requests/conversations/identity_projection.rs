@@ -15,7 +15,7 @@ impl Database {
         request_id: Uuid,
     ) -> Result<(), AppError> {
         let mut transaction = self.begin_write_transaction().await?;
-        lock_request_stats_projection_writer_in_transaction(&mut transaction).await?;
+        lock_request_stats_projection_rebuild_in_transaction(&mut transaction).await?;
         let sql = match self.backend {
             DatabaseBackend::PostgreSql => {
                 "SELECT tenant_id, key_id, principal_id, hints_json, key_snapshot_json, client_name, upstream_response_id, observed_at FROM conversation_projection_outbox WHERE request_id = $1 AND projected_at IS NULL AND COALESCE(terminal_lease_owner, lease_owner) = $2 AND COALESCE(terminal_lease_expires_at, lease_expires_at) >= $3 FOR UPDATE"
@@ -158,7 +158,7 @@ impl Database {
                 let mut transaction = self.begin_write_transaction().await?;
                 tracing::debug!(target: "mtc_identity_projection", stage = "stats_lock_start",
                     %request_id, "conversation identity progress");
-                lock_request_stats_projection_writer_in_transaction(&mut transaction).await?;
+                lock_request_stats_projection_rebuild_in_transaction(&mut transaction).await?;
                 tracing::debug!(target: "mtc_identity_projection", stage = "row_lock_start",
                     %request_id, "conversation identity progress");
                 let lock = match self.backend {

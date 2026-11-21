@@ -1202,7 +1202,7 @@ impl Database {
 
         let mut transaction = self.begin_write_transaction().await?;
         let result: Result<bool, ConversationContentError> = async {
-        lock_request_stats_projection_writer_in_transaction(&mut transaction).await?;
+        lock_request_stats_projection_rebuild_in_transaction(&mut transaction).await?;
         let now = unix_millis();
         let terminal = sqlx::query(
             "SELECT created_at, projected_at FROM terminal_projection_outbox WHERE request_id = $1",
@@ -1457,7 +1457,22 @@ impl Database {
         hints: &ConversationHints,
         client_name: Option<&str>,
     ) -> Result<Uuid, AppError> {
+        // Object storage must finish before the global replacement gate is held.
+        let atoms = extract_atoms(request_json);
+        let nodes = build_prefix(&atoms);
+        let archived_atoms = self.archive_atom_bodies(key.tenant_id, &atoms).await?;
+        let observed_at = unix_millis();
         let mut transaction = self.begin_write_transaction().await?;
+        // Identity publication can replace session aggregates. Fence before any source lock.
+        lock_request_stats_projection_rebuild_in_transaction(&mut transaction).await?;
+        materialize_conversation_content_in_transaction(
+            &mut transaction,
+            &key.tenant_id.to_string(),
+            &archived_atoms,
+            &nodes,
+            observed_at,
+        )
+        .await?;
         let cluster_id = self
             .record_conversation_observation_in_transaction(
                 &mut transaction,
@@ -1468,9 +1483,9 @@ impl Database {
                     hints,
                     client_name,
                     upstream_response_id: None,
-                    observed_at: unix_millis(),
+                    observed_at,
                     attach_request_record: true,
-                    content_materialized: false,
+                    content_materialized: true,
                 },
             )
             .await?;
@@ -1505,8 +1520,9 @@ impl Database {
             attach_request_record,
             content_materialized,
         } = input;
-        // Join the live projection-writer cohort before request source, explicit-session, or
-        // conversation-reference locks. Full rebuilds take the exclusive form of this advisory.
+        // The owning transaction takes the exclusive projection gate before source locks:
+        // identity publication can reclassify or merge sessions and replace their aggregates.
+        // Re-entering shared mode here never upgrades a writer that already holds source locks.
         lock_request_stats_projection_writer_in_transaction(transaction).await?;
         let atoms = extract_atoms(request_json);
         let nodes = build_prefix(&atoms);
@@ -2049,6 +2065,8 @@ impl Database {
         upstream_response_id: &str,
     ) -> Result<(), AppError> {
         let mut transaction = self.begin_write_transaction().await?;
+        // Resolving response references may merge and replace session aggregates.
+        lock_request_stats_projection_rebuild_in_transaction(&mut transaction).await?;
         attach_conversation_upstream_response_in_transaction(
             &mut transaction,
             self.backend,
@@ -2767,8 +2785,8 @@ pub(crate) async fn attach_conversation_upstream_response_in_transaction(
     request_id: Uuid,
     upstream_response_id: &str,
 ) -> Result<(), AppError> {
-    // This path can reconcile clusters and merge their session projections. Acquire the shared
-    // statistics lock before reading or locking conversation state to preserve the global order.
+    // The owning transaction already holds the exclusive statistics gate before source locks.
+    // This helper can reconcile and replace session projections; it must never upgrade shared mode.
     lock_request_stats_projection_writer_in_transaction(transaction).await?;
     let upstream_response_id = upstream_response_id.trim();
     if upstream_response_id.is_empty()
