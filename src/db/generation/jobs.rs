@@ -607,11 +607,19 @@ impl Database {
                 "generation request archive owner changed before failure settlement".into(),
             ));
         }
-        fail_preparing_generation_in_transaction(&mut transaction, job_id, error_code, now).await?;
+        let prepared =
+            fail_preparing_generation_in_transaction(&mut transaction, job_id, error_code, now)
+                .await?;
         super::cleanup_archive_staging_purpose_in_transaction(
             &mut transaction,
             ArchiveStagingOwner::GenerationJob(job_id),
             ArchiveStagingPurpose::Request,
+        )
+        .await?;
+        crate::db::history_immutable_outbox::PreparedEventCapture::publish(
+            &mut transaction,
+            prepared,
+            now,
         )
         .await?;
         transaction.commit().await?;
@@ -638,9 +646,10 @@ impl Database {
             .fetch_all(&mut *transaction)
             .await?;
         let mut expired = 0_u64;
+        let mut prepared_events = Vec::new();
         for row in rows {
             let job_id = parse_uuid(row.try_get("id")?)?;
-            if fail_preparing_generation_in_transaction(
+            if let Some(prepared) = fail_preparing_generation_in_transaction(
                 &mut transaction,
                 job_id,
                 "generation_archive_expired",
@@ -654,8 +663,17 @@ impl Database {
                     ArchiveStagingPurpose::Request,
                 )
                 .await?;
+                prepared_events.push(prepared);
                 expired += 1;
             }
+        }
+        for prepared in prepared_events {
+            crate::db::history_immutable_outbox::PreparedEventCapture::publish(
+                &mut transaction,
+                Some(prepared),
+                now,
+            )
+            .await?;
         }
         transaction.commit().await?;
         Ok(expired)
@@ -1550,7 +1568,7 @@ async fn fail_preparing_generation_in_transaction(
     job_id: Uuid,
     error_code: &str,
     now: i64,
-) -> Result<bool, AppError> {
+) -> Result<Option<crate::db::history_immutable_outbox::PreparedEventCapture>, AppError> {
     validate_generation_preparation_error(error_code)?;
     let row = sqlx::query(
         "SELECT j.status, j.created_at, j.tenant_id, j.key_id, j.public_model, r.id AS reservation_id, r.account_id, r.enforcement_mode, r.reserved_micros, r.reserved_tokens, r.rate_window_start, r.status AS reservation_status, r.actual_micros FROM generation_jobs j JOIN usage_reservations r ON r.id = j.reservation_id WHERE j.id = $1",
@@ -1559,10 +1577,10 @@ async fn fail_preparing_generation_in_transaction(
     .fetch_optional(&mut **tx)
     .await?;
     let Some(row) = row else {
-        return Ok(false);
+        return Ok(None);
     };
     if row.try_get::<String, _>("status")? != "preparing" {
-        return Ok(false);
+        return Ok(None);
     }
     let reservation_status: String = row.try_get("reservation_status")?;
     let actual_micros: Option<i64> = row.try_get("actual_micros")?;
@@ -1635,8 +1653,7 @@ async fn fail_preparing_generation_in_transaction(
         ),
         None => None,
     };
-    crate::db::history_immutable_outbox::PreparedEventCapture::publish(tx, prepared, now).await?;
-    Ok(true)
+    Ok(prepared)
 }
 
 pub(super) fn generation_job_view(row: AnyRow) -> Result<GenerationJobView, AppError> {

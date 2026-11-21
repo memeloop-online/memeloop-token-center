@@ -746,7 +746,7 @@ impl Database {
             let request_id = identity.request_id.to_string();
             let key_id: String = owned.try_get("key_id")?;
             let draft_cursor = crate::db::RequestEventCursor {
-                event_id: Uuid::nil().to_string(),
+                event_id: uuid::Uuid::nil().to_string(),
                 event_at: now,
             };
             let draft_row = sqlx::query(r#"SELECT CAST($1 AS TEXT) AS event_id, CAST(tenant_id AS TEXT) AS tenant_id, CAST(key_id AS TEXT) AS key_id, CAST(id AS TEXT) AS request_id, CAST($2 AS BIGINT) AS event_at, CAST($3 AS TEXT) AS event_kind, CAST(protocol AS TEXT) AS protocol, CAST(model AS TEXT) AS model, CAST(status_code AS BIGINT) AS status_code, CAST(duration_ms AS BIGINT) AS duration_ms, CAST(input_tokens AS BIGINT) AS input_tokens, CAST(output_tokens AS BIGINT) AS output_tokens, CAST(cost_micros AS BIGINT) AS cost_micros, CAST(error_code AS TEXT) AS error_code FROM request_records WHERE id = $4 AND tenant_id = $5 AND key_id = $6"#)

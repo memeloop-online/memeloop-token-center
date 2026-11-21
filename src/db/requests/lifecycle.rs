@@ -2491,6 +2491,14 @@ pub(crate) async fn record_request_started_in_transaction(
     now: i64,
 ) -> Result<(), AppError> {
     insert_request_started_record_in_transaction(transaction, request, now).await?;
+    publish_request_started_in_transaction(transaction, request, now).await
+}
+
+pub(crate) async fn publish_request_started_in_transaction(
+    transaction: &mut Transaction<'_, Any>,
+    request: &NewRequest,
+    now: i64,
+) -> Result<(), AppError> {
     super::super::history_immutable_outbox::capture_native_in_transaction(
         transaction,
         &request.request_id.to_string(),
@@ -2499,7 +2507,7 @@ pub(crate) async fn record_request_started_in_transaction(
     insert_request_started_event_in_transaction(transaction, request, now).await
 }
 
-async fn insert_request_started_record_in_transaction(
+pub(crate) async fn insert_request_started_record_in_transaction(
     transaction: &mut Transaction<'_, Any>,
     request: &NewRequest,
     now: i64,
