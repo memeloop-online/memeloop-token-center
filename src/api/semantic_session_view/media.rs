@@ -32,12 +32,8 @@ pub(super) async fn read(
         .open_tenant_content(scope.tenant_id, &object)
         .await?;
     Response::builder()
-        .header(
-            header::CONTENT_TYPE,
-            part.media_type
-                .as_deref()
-                .unwrap_or("application/octet-stream"),
-        )
+        .header(header::CONTENT_TYPE, "application/octet-stream")
+        .header(header::CONTENT_DISPOSITION, "attachment")
         .header(header::CACHE_CONTROL, "private, no-store")
         .header(header::X_CONTENT_TYPE_OPTIONS, "nosniff")
         .body(Body::from_stream(download.stream))

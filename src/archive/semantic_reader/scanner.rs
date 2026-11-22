@@ -160,76 +160,148 @@ impl<R: BufRead> Scanner<R> {
         let mut bytes = Vec::new();
         self.string(true, |part| {
             if bytes.len() + part.len() > 16384 {
-                return Err(invalid());
+                return Ok(());
             }
             bytes.extend_from_slice(part);
             Ok(())
         })?;
         String::from_utf8(bytes).map_err(|_| invalid())
     }
-    fn value(&mut self, depth: usize) -> Result<()> {
-        if depth > 128 {
-            return Err(invalid());
+    fn value(&mut self, _depth: usize) -> Result<()> {
+        // Explicit parser states keep nested tool JSON off the Rust call stack.
+        // Stack memory follows nesting depth, never the size of field text.
+        enum State {
+            Value,
+            ObjectKey(bool),
+            ObjectAfter,
+            ArrayValue(bool),
+            ArrayAfter,
         }
-        self.ws()?;
-        match self.peek()?.ok_or_else(invalid)? {
-            b'"' => self.string(false, |_| Ok(())),
-            b'{' => {
-                self.byte()?;
-                self.ws()?;
-                if self.peek()? == Some(b'}') {
-                    self.byte()?;
-                    return Ok(());
-                }
-                loop {
+        let mut stack = vec![State::Value];
+        while let Some(state) = stack.pop() {
+            self.ws()?;
+            match state {
+                State::Value => match self.peek()?.ok_or_else(invalid)? {
+                    b'"' => self.string(false, |_| Ok(()))?,
+                    b'{' => {
+                        self.byte()?;
+                        stack.push(State::ObjectKey(true));
+                    }
+                    b'[' => {
+                        self.byte()?;
+                        stack.push(State::ArrayValue(true));
+                    }
+                    b't' => {
+                        for b in b"true" {
+                            if self.byte()? != *b {
+                                return Err(invalid());
+                            }
+                        }
+                    }
+                    b'f' => {
+                        for b in b"false" {
+                            if self.byte()? != *b {
+                                return Err(invalid());
+                            }
+                        }
+                    }
+                    b'n' => {
+                        for b in b"null" {
+                            if self.byte()? != *b {
+                                return Err(invalid());
+                            }
+                        }
+                    }
+                    _ => self.number()?,
+                },
+                State::ObjectKey(empty) => {
+                    if empty && self.peek()? == Some(b'}') {
+                        self.byte()?;
+                        continue;
+                    }
                     self.string(false, |_| Ok(()))?;
                     self.expect(b':')?;
-                    self.value(depth + 1)?;
-                    self.ws()?;
-                    match self.byte()? {
-                        b'}' => break,
-                        b',' => {
-                            self.ws()?;
-                        }
-                        _ => return Err(invalid()),
+                    stack.push(State::ObjectAfter);
+                    stack.push(State::Value);
+                }
+                State::ObjectAfter => match self.byte()? {
+                    b'}' => (),
+                    b',' => stack.push(State::ObjectKey(false)),
+                    _ => return Err(invalid()),
+                },
+                State::ArrayValue(empty) => {
+                    if empty && self.peek()? == Some(b']') {
+                        self.byte()?;
+                        continue;
                     }
+                    stack.push(State::ArrayAfter);
+                    stack.push(State::Value);
                 }
-                Ok(())
-            }
-            b'[' => {
-                self.byte()?;
-                self.ws()?;
-                if self.peek()? == Some(b']') {
-                    self.byte()?;
-                    return Ok(());
-                }
-                loop {
-                    self.value(depth + 1)?;
-                    self.ws()?;
-                    match self.byte()? {
-                        b']' => break,
-                        b',' => (),
-                        _ => return Err(invalid()),
-                    }
-                }
-                Ok(())
-            }
-            _ => {
-                let mut token = Vec::new();
-                while self.peek()?.is_some_and(|b| {
-                    !matches!(b, b' ' | b'\n' | b'\r' | b'\t') && !matches!(b, b',' | b']' | b'}')
-                }) {
-                    if token.len() > 128 {
-                        return Err(invalid());
-                    }
-                    token.push(self.byte()?);
-                }
-                serde_json::from_slice::<serde_json::Value>(&token).map_err(|_| invalid())?;
-                Ok(())
+                State::ArrayAfter => match self.byte()? {
+                    b']' => (),
+                    b',' => stack.push(State::ArrayValue(false)),
+                    _ => return Err(invalid()),
+                },
             }
         }
+        Ok(())
     }
-    fn small_value(&mut self) -> Result<serde_json::Value> {
+    fn digits(&mut self) -> Result<usize> {
+        let mut count = 0;
+        while self.peek()?.is_some_and(|b| b.is_ascii_digit()) {
+            self.byte()?;
+            count += 1;
+        }
+        Ok(count)
+    }
+    fn number(&mut self) -> Result<()> {
+        if self.peek()? == Some(b'-') {
+            self.byte()?;
+        }
+        match self.peek()? {
+            Some(b'0') => {
+                self.byte()?;
+            }
+            Some(b'1'..=b'9') => {
+                self.digits()?;
+            }
+            _ => return Err(invalid()),
+        }
+        if self.peek()? == Some(b'.') {
+            self.byte()?;
+            if self.digits()? == 0 {
+                return Err(invalid());
+            }
+        }
+        if matches!(self.peek()?, Some(b'e' | b'E')) {
+            self.byte()?;
+            if matches!(self.peek()?, Some(b'+' | b'-')) {
+                self.byte()?;
+            }
+            if self.digits()? == 0 {
+                return Err(invalid());
+            }
+        }
+        Ok(())
+    }
+    fn small_value(&mut self) -> Result<(serde_json::Value, bool)> {
+        self.ws()?;
+        if self.peek()? == Some(b'"') {
+            let mut bytes = Vec::new();
+            let mut deferred = false;
+            self.string(true, |part| {
+                if !deferred && bytes.len() + part.len() <= 16384 {
+                    bytes.extend_from_slice(part);
+                } else {
+                    deferred = true;
+                }
+                Ok(())
+            })?;
+            return Ok((
+                serde_json::Value::String(String::from_utf8(bytes).map_err(|_| invalid())?),
+                deferred,
+            ));
+        }
         self.capture = Some(Window {
             offset: 0,
             count: 0,
@@ -242,7 +314,10 @@ impl<R: BufRead> Scanner<R> {
         if window.count > 16384 {
             return Err(invalid());
         }
-        serde_json::from_slice(&window.bytes).map_err(|_| invalid())
+        Ok((
+            serde_json::from_slice(&window.bytes).map_err(|_| invalid())?,
+            false,
+        ))
     }
     fn part(
         &mut self,
@@ -253,7 +328,7 @@ impl<R: BufRead> Scanner<R> {
         self.expect(b'{')?;
         let selected = match selection {
             Selection::Parts { start } => ordinal >= *start && ordinal - *start < PAGE,
-            Selection::Media { part } => ordinal == *part,
+            Selection::Media { part } | Selection::Content { part, .. } => ordinal == *part,
             _ => false,
         };
         let mut part = Part {
@@ -261,20 +336,36 @@ impl<R: BufRead> Scanner<R> {
             ordinal,
             ..Default::default()
         };
-        let mut names = std::collections::HashSet::new();
+
         self.ws()?;
         if self.peek()? == Some(b'}') {
             return Err(invalid());
         }
         loop {
             let name = self.small_string()?;
-            if names.len() >= 32 || !names.insert(name.clone()) {
-                return Err(invalid());
-            }
+
             self.expect(b':')?;
             self.ws()?;
-            let text_field = matches!(name.as_str(), "text" | "arguments_text");
-            let field = text_field || matches!(name.as_str(), "arguments" | "result_content");
+            let text_field = matches!(
+                name.as_str(),
+                "text"
+                    | "arguments_text"
+                    | "kind"
+                    | "tool_name"
+                    | "call_id"
+                    | "tool_call_id"
+                    | "completeness"
+                    | "media_type"
+                    | "reasoning_source"
+                    | "arguments_encoding"
+                    | "result_status"
+            );
+            let primary = matches!(
+                name.as_str(),
+                "text" | "arguments_text" | "arguments" | "result_content"
+            );
+            let targeted = matches!(selection,Selection::Content{part,field,..} if *part == ordinal && field == &name);
+            let field = primary || (text_field && targeted);
             if field {
                 let format = if text_field { "text" } else { "json" };
                 if selected {
@@ -324,7 +415,10 @@ impl<R: BufRead> Scanner<R> {
             } else if selected
                 && matches!(
                     name.as_str(),
-                    "part_index"
+                    "reasoning_source"
+                        | "arguments_encoding"
+                        | "result_status"
+                        | "part_index"
                         | "kind"
                         | "tool_name"
                         | "call_id"
@@ -336,7 +430,14 @@ impl<R: BufRead> Scanner<R> {
                         | "content_blake3"
                 )
             {
-                let value = self.small_value()?;
+                let (value, deferred) = self.small_value()?;
+                if deferred && !matches!(name.as_str(), "object_locator" | "content_blake3") {
+                    part.metadata_deferred = true;
+                    part.fields.push(Field {
+                        name: name.clone(),
+                        format: "text".into(),
+                    });
+                }
                 match name.as_str() {
                     "part_index" => {
                         part.part_index = usize::try_from(value.as_u64().ok_or_else(invalid)?)
@@ -365,7 +466,7 @@ impl<R: BufRead> Scanner<R> {
             }
         }
         if selected {
-            if part.kind.is_empty() {
+            if part.kind.is_empty() && !matches!(selection, Selection::Content { .. }) {
                 return Err(invalid());
             }
             projection.parts.push(part);
@@ -404,7 +505,7 @@ pub(super) fn scan_with_output<R: BufRead>(
     let mut seen = std::collections::HashSet::new();
     loop {
         let key = scanner.small_string()?;
-        if seen.len() >= 16 || !seen.insert(key.clone()) {
+        if matches!(key.as_str(), "role" | "parts") && !seen.insert(key.clone()) {
             return Err(invalid());
         }
         scanner.expect(b':')?;

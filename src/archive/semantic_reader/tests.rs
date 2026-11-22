@@ -147,6 +147,7 @@ async fn streamed_field_reads_source_once_and_finishes_after_verified_eof() {
             field: "text".into(),
             offset: 0,
         },
+        None,
     );
     let mut combined = String::new();
     let mut complete = false;
@@ -188,6 +189,7 @@ async fn streamed_integrity_failure_never_marks_complete() {
             field: "text".into(),
             offset: 0,
         },
+        None,
     );
     let mut error = false;
     while let Some(piece) = output.next().await {
@@ -233,6 +235,7 @@ async fn dropping_content_receiver_releases_the_source() {
             field: "text".into(),
             offset: 0,
         },
+        None,
     );
     assert!(!frames.next().await.unwrap().unwrap().complete);
     drop(frames);
@@ -243,4 +246,87 @@ async fn dropping_content_receiver_releases_the_source() {
     })
     .await
     .unwrap();
+}
+
+#[test]
+fn deep_tool_json_and_extensions_have_no_new_total_size_limits() {
+    let nested = format!(
+        "{}{}{}",
+        "[".repeat(2048),
+        "9".repeat(1024),
+        "]".repeat(2048)
+    );
+    let extra = (0..200)
+        .map(|i| format!("\"extension{i}\":true,"))
+        .collect::<String>();
+    let body = format!(
+        "{{\"role\":\"assistant\",\"parts\":[{{{extra}\"kind\":\"tool_result\",\"part_index\":0,\"result_content\":{nested}}}]}}"
+    );
+    let result = scan(
+        body.as_bytes(),
+        Selection::Content {
+            part: 0,
+            field: "result_content".into(),
+            offset: 0,
+        },
+    );
+    assert_eq!(result.text, nested);
+    assert!(result.complete);
+}
+
+#[test]
+fn long_metadata_has_a_preview_and_full_signed_field_route() {
+    let name = "工具😀".repeat(30000);
+    let body = serde_json::to_vec(&json!({"role":"assistant","parts":[{"kind":"tool_call","part_index":7,"tool_name":name,"arguments":{}}]})).unwrap();
+    let page = scan(&body, Selection::Parts { start: 0 });
+    assert!(page.parts[0].metadata_deferred);
+    let preview = page.parts[0].tool_name.as_ref().unwrap();
+    assert!(name.starts_with(preview));
+    assert!(preview.len() <= 16384);
+    assert!(
+        page.parts[0]
+            .fields
+            .iter()
+            .any(|f| f.name == "tool_name" && f.format == "text")
+    );
+    let mut output = String::new();
+    loop {
+        let piece = scan(
+            &body,
+            Selection::Content {
+                part: 0,
+                field: "tool_name".into(),
+                offset: output.len() as u64,
+            },
+        );
+        output.push_str(&piece.text);
+        if piece.complete {
+            break;
+        }
+    }
+    assert_eq!(output, name);
+}
+
+#[tokio::test]
+async fn mismatched_part_index_cannot_complete_a_stream() {
+    let body = serde_json::to_vec(
+        &json!({"role":"user","parts":[{"kind":"text","part_index":7,"text":"read me"}]}),
+    )
+    .unwrap();
+    let size = body.len() as u64;
+    let source = futures_util::stream::once(async move { Ok(Bytes::from(body)) });
+    let mut frames = content_stream(
+        ArchiveDownload {
+            object_size: size,
+            range: 0..size,
+            stream: Box::pin(source),
+        },
+        Selection::Content {
+            part: 0,
+            field: "text".into(),
+            offset: 0,
+        },
+        Some(0),
+    );
+    assert!(frames.next().await.unwrap().is_err());
 }

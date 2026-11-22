@@ -37,6 +37,7 @@ pub(crate) struct Part {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub completeness: Option<String>,
     pub fields: Vec<Field>,
+    pub metadata_deferred: bool,
     #[serde(skip)]
     pub media_type: Option<String>,
     #[serde(skip)]
@@ -115,6 +116,7 @@ pub(crate) struct ContentPiece {
 pub(crate) fn content_stream(
     download: ArchiveDownload,
     selection: Selection,
+    expected_index: Option<usize>,
 ) -> tokio_stream::wrappers::ReceiverStream<std::io::Result<ContentPiece>> {
     let (output, receiver) = tokio::sync::mpsc::channel(2);
     tokio::spawn(async move {
@@ -154,7 +156,14 @@ pub(crate) fn content_stream(
             Err(_) => Err(std::io::Error::other("semantic parser failed")),
         };
         match pumped.and(result) {
-            Ok(projection) => {
+            Ok(projection)
+                if expected_index.is_none_or(|expected| {
+                    projection
+                        .parts
+                        .first()
+                        .is_some_and(|part| part.part_index == expected)
+                }) =>
+            {
                 // Only this terminal frame follows verified source EOF. All
                 // preceding frames explicitly remain incomplete.
                 let end_offset = projection.stream_end.unwrap_or(offset);
@@ -164,6 +173,13 @@ pub(crate) fn content_stream(
                         offset: end_offset,
                         complete: true,
                     }))
+                    .await;
+            }
+            Ok(_) => {
+                let _ = output
+                    .send(Err(std::io::Error::other(
+                        "semantic part identity mismatch",
+                    )))
                     .await;
             }
             Err(error) => {

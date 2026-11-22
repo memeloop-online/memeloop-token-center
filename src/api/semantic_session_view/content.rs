@@ -21,7 +21,9 @@ pub(super) async fn read(
         return Err(invalid());
     };
     let expected = match field.as_str() {
-        "text" | "arguments_text" => "text",
+        "text" | "arguments_text" | "kind" | "tool_name" | "call_id" | "tool_call_id"
+        | "completeness" | "media_type" | "reasoning_source" | "arguments_encoding"
+        | "result_status" => "text",
         "arguments" | "result_content" => "json",
         _ => return Err(invalid()),
     };
@@ -47,7 +49,7 @@ pub(super) async fn read(
     let state = state.clone();
     let (ordinal, part_index, field, format) =
         (*ordinal, *part_index, field.clone(), format.clone());
-    let frames = semantic_reader::content_stream(download,selection).map(move |piece| {
+    let frames = semantic_reader::content_stream(download,selection,Some(part_index)).map(move |piece| {
         let piece = piece?;
         let next = if piece.complete {None} else {Some(reader::token(&state,&original,Position::Content{ordinal,part_index,field:field.clone(),format:format.clone(),offset:piece.offset.checked_add(piece.text.len() as u64).ok_or_else(||std::io::Error::other("content offset overflow"))?}).map_err(|_|std::io::Error::other("cursor encode failed"))?)};
         let mut line = serde_json::to_vec(&serde_json::json!({"manifest_revision":original.revision.to_string(),"instance_id":original.instance_id,"part_index":part_index,"field":field,"format":format,"byte_offset":piece.offset,"text":piece.text,"next_cursor":next,"complete":piece.complete})).map_err(std::io::Error::other)?;
