@@ -31,7 +31,7 @@ export function useSemanticPages(loader: SemanticViewLoader, request: string) {
       revision.current = value.manifest_revision;
       currentPosition.current = target;
       setPosition(target); setPage(value);
-      requestAnimationFrame(() => requestAnimationFrame(() => {
+      if (!refresh) requestAnimationFrame(() => requestAnimationFrame(() => {
         if (controller.signal.aborted) return;
         const saved = scrolls.current[target];
         const viewport = host.current?.querySelector('[data-testid=conversation-viewport]');
