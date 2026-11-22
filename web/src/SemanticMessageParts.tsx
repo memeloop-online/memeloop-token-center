@@ -27,7 +27,7 @@ function ContentField({ loader, request, instance, revision, part, field }: {
     if (anchor) node.scrollTop += anchor.getBoundingClientRect().top - saved.top;
   }, [chunks]);
   const move = async (target: number) => {
-    if (active.current) return;
+    if (active.current || chunksRef.current.some(chunk => chunk.index === target)) return;
     const entry = positions.current[target]; if (!entry) return;
     if (!stream.current || stream.current.nextIndex !== target) {
       stream.current?.controller.abort();
