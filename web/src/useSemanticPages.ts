@@ -51,7 +51,13 @@ export function useSemanticPages(loader: SemanticViewLoader, request: string) {
   return {
     page: visible, error, loading, host,
     refresh: () => read(undefined, 0, true),
-    earlier: async (signal?: AbortSignal) => { if (!loading && visible?.next_cursor) await read(visible.next_cursor, position + 1, false, signal); },
+    earlier: async (signal?: AbortSignal) => {
+      if (loading || !visible?.next_cursor) return;
+      if (history.current.slice(0, position + 1).includes(visible.next_cursor)) {
+        setError(new Error('Repeated semantic page; refresh the conversation')); return;
+      }
+      await read(visible.next_cursor, position + 1, false, signal);
+    },
     newer: async () => { if (!loading && position > 0) await read(history.current[position - 1], position - 1); },
     hasNewer: position > 0,
   };

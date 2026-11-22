@@ -17,7 +17,7 @@ export interface SemanticViewPage {
   next_cursor: string | null;
 }
 export interface SemanticContentField {
-  name: 'text' | 'arguments' | 'arguments_text' | 'result_content';
+  name: 'text' | 'arguments' | 'arguments_text' | 'result_content' | 'tool_name' | 'call_id' | 'tool_call_id' | 'completeness' | 'kind' | 'media_type' | 'reasoning_source' | 'arguments_encoding' | 'result_status';
   format: 'text' | 'json';
   content_cursor: string;
 }
@@ -27,6 +27,7 @@ export interface SemanticPartDescriptor {
   tool_name?: string;
   call_id?: string;
   completeness?: string;
+  metadata_deferred?: boolean;
   fields: SemanticContentField[];
   media?: { media_type?: string; byte_length?: number; read_cursor: string };
 }
@@ -79,7 +80,7 @@ export function createSemanticViewLoader(credential: string, path: (request: str
       const value = await api<SemanticPartsPage>(url(request, 'parts_cursor', cursor), credential, { signal, cache: 'no-store' });
       if (!Array.isArray(value.parts) || typeof value.instance_id !== 'string' || typeof value.manifest_revision !== 'string'
         || !value.parts.every(part => Number.isSafeInteger(part.part_index) && part.part_index >= 0 && typeof part.kind === 'string'
-          && Array.isArray(part.fields) && part.fields.every(field => ['text', 'arguments', 'arguments_text', 'result_content'].includes(field.name)
+          && Array.isArray(part.fields) && part.fields.every(field => ['text', 'arguments', 'arguments_text', 'result_content', 'tool_name', 'call_id', 'tool_call_id', 'completeness', 'kind', 'media_type', 'reasoning_source', 'arguments_encoding', 'result_status'].includes(field.name)
             && ['text', 'json'].includes(field.format) && typeof field.content_cursor === 'string'))
         || !(value.next_cursor === null || typeof value.next_cursor === 'string')) throw new Error('Invalid semantic parts');
       return value;

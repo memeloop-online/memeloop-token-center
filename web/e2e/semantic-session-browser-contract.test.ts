@@ -65,7 +65,11 @@ test('semantic viewer reads verified atoms lazily, preserves parts and pages wit
     assert.equal(await page.locator('[data-semantic-role=agent]').count(), 0);
     assert.equal(await page.locator('[data-semantic-role=unrecorded]').count(), 1);
     await page.goto(`http://127.0.0.1:${address.port}/e2e/fixtures/semantic-session.html?scenario=many`);
-    await page.locator('[data-semantic-ordinal="32"]').scrollIntoViewIfNeeded();
+    for (let step = 0; step < 10; step++) {
+      await page.locator('[data-semantic-ordinal="32"]').scrollIntoViewIfNeeded();
+      if (await page.getByText('Message item-32', { exact: true }).isVisible()) break;
+      await page.waitForTimeout(100);
+    }
     await page.getByText('Message item-32', { exact: true }).waitFor({ timeout: 5000 }).catch(async error => {
       console.log('semantic-many-state', await page.locator('[data-testid=conversation-viewport]').evaluate(node => ({ scroll: node.scrollTop, height: node.clientHeight, total: node.scrollHeight, text: node.textContent?.slice(-4000), children: [...node.querySelectorAll('[data-semantic-ordinal]')].map(item => ({ ordinal: item.getAttribute('data-semantic-ordinal'), rect: item.getBoundingClientRect().toJSON(), text: item.textContent?.slice(0, 120) })) })));
       throw error;
@@ -74,7 +78,11 @@ test('semantic viewer reads verified atoms lazily, preserves parts and pages wit
     await page.getByRole('button', { name: 'Earlier messages', exact: true }).click();
     await page.getByText('Message item-0', { exact: true }).waitFor();
     await page.getByRole('button', { name: 'Newer messages', exact: true }).click();
-    await page.locator('[data-semantic-ordinal="32"]').scrollIntoViewIfNeeded();
+    for (let step = 0; step < 10; step++) {
+      await page.locator('[data-semantic-ordinal="32"]').scrollIntoViewIfNeeded();
+      if (await page.getByText('Message item-32', { exact: true }).isVisible()) break;
+      await page.waitForTimeout(100);
+    }
     await page.getByText('Message item-32', { exact: true }).waitFor({ timeout: 5000 }).catch(async error => {
       console.log('semantic-many-state', await page.locator('[data-testid=conversation-viewport]').evaluate(node => ({ scroll: node.scrollTop, height: node.clientHeight, total: node.scrollHeight, text: node.textContent?.slice(-4000), children: [...node.querySelectorAll('[data-semantic-ordinal]')].map(item => ({ ordinal: item.getAttribute('data-semantic-ordinal'), rect: item.getBoundingClientRect().toJSON(), text: item.textContent?.slice(0, 120) })) })));
       throw error;

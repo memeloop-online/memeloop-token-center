@@ -35,6 +35,10 @@ function ContentField({ loader, request, instance, revision, part, field }: {
       if (frame.done) throw new Error('Semantic content stream ended before verification');
       const value = frame.value;
       stream.current!.nextIndex = target + 1;
+      if (value.complete) {
+        await stream.current!.iterator.return?.();
+        stream.current = null;
+      }
       controller.signal.throwIfAborted();
       if (value.manifest_revision !== revision || value.instance_id !== instance.instance_id
         || value.part_index !== part.part_index || value.field !== field.name || value.format !== field.format
@@ -84,6 +88,7 @@ function ContentField({ loader, request, instance, revision, part, field }: {
       }}>
       {richText ? <MessageContent message={richText} /> : chunks.map(chunk => <span key={chunk.index} data-content-index={chunk.index} style={{ whiteSpace: 'pre-wrap', overflowWrap: 'anywhere' }}>{chunk.value.text}</span>)}
     </div>
+    {!last?.value.complete && <p role="status">{zh ? '已显示部分内容，完整性尚待校验。' : 'Partial content is shown; full verification is pending.'}</p>}
     {error && <p role="alert">{error}</p>}
     {loading && <p role="status">{zh ? '正在读取内容…' : 'Loading content…'}</p>}
     <div>
@@ -111,6 +116,7 @@ function Part({ part, ...props }: { part: SemanticPartDescriptor; loader: Semant
   const content = <>
     {part.call_id && <p>{zh ? '调用标识' : 'Call ID'}: {part.call_id}</p>}
     {part.completeness === 'partial' && <p>{zh ? '此部分仅记录了部分内容。' : 'This part was partially recorded.'}</p>}
+    {part.metadata_deferred && <p>{zh ? '完整详细信息见下方内容。' : 'Full details are available below.'}</p>}
     {fields}
     {!fields.length && !part.media && <p>{zh ? '此内容没有可显示的文本，可导出消息查看原始记录。' : 'This content has no displayable text. Export the message to inspect its recorded form.'}</p>}
     {part.media && <DataSurface><b>{zh ? '附件' : 'Attachment'}</b><p>{part.media.media_type} · {part.media.byte_length}</p>
