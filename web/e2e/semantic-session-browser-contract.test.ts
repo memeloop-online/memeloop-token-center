@@ -102,6 +102,7 @@ test('semantic viewer reads verified atoms lazily, preserves parts and pages wit
       await field.locator(`[data-content-index="${index}"]`).waitFor({ state: 'attached' });
     }
     for (const [title, name] of [['Tool call · lookup', 'arguments'], ['Tool result · lookup', 'result_content']]) {
+      await page.locator(`[data-semantic-part-index="${name === 'arguments' ? 2 : 3}"]`).scrollIntoViewIfNeeded();
       await page.getByRole('button', { name: title, exact: true }).click();
       const toolField = page.locator(`[data-semantic-field=${name}]`);
       await toolField.locator('[data-content-index="0"]').waitFor();

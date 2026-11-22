@@ -154,7 +154,7 @@ function VisiblePart(props: Parameters<typeof Part>[0]) {
     if (host.current) observer.observe(host.current);
     return () => observer.disconnect();
   }, []);
-  return <div ref={host} style={{ minHeight: visible ? undefined : height }}>{visible && <Part {...props} />}</div>;
+  return <div ref={host} data-semantic-part-index={props.part.part_index} style={{ minHeight: visible ? undefined : height }}>{visible && <Part {...props} />}</div>;
 }
 
 function VisibleParts({ loader, request, instance, revision }: { loader: SemanticViewLoader; request: string; instance: SemanticViewInstance; revision: string }) {
