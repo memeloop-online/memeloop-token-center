@@ -168,8 +168,7 @@ impl ArchiveStore {
     ) -> Result<Vec<RawGcReferenceEvidence>, AppError> {
         let object = self
             .request_conversation_reference(tenant, request)
-            .await?
-            .ok_or_else(|| AppError::storage("raw_gc_legacy_root_missing"))?;
+            .await?;
         for candidate in candidates {
             candidate.validate_tenant(tenant)?;
         }
