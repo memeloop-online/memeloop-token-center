@@ -82,3 +82,28 @@ test('stream export orders earlier pages first and selects the complete branch o
     else Reflect.deleteProperty(globalThis, 'window');
   }
 });
+
+test('typed readers preserve owner scope and signed content and attachment cursors', async () => {
+  const old = globalThis.fetch;
+  const seen: URL[] = [];
+  globalThis.fetch = async (input, init) => {
+    const url = new URL(String(input), 'https://fixture.invalid'); seen.push(url);
+    assert.equal(new Headers(init?.headers).get('authorization'), 'Bearer fixture');
+    assert.equal(init?.cache, 'no-store');
+    if (url.searchParams.has('parts_cursor')) return new Response(JSON.stringify({ manifest_revision: '1', instance_id: 'a', role: 'assistant', parts: [], next_cursor: null }));
+    if (url.searchParams.has('content_cursor')) return new Response(JSON.stringify({ manifest_revision: '1', instance_id: 'a', part_index: 0, field: 'text', format: 'text', byte_offset: 0, text: '😀内容', complete: true, next_cursor: null }));
+    return new Response('attachment bytes');
+  };
+  try {
+    const loader = createSemanticViewLoader('fixture', () => '/semantic?tenant_external_id=owner');
+    const signal = new AbortController().signal;
+    await loader.parts!('request-a', 'signed/parts', signal);
+    assert.equal((await loader.content!('request-a', 'signed/content', signal)).text, '😀内容');
+    assert.equal(await (await loader.media!('request-a', 'signed/media', signal)).text(), 'attachment bytes');
+    for (const url of seen) {
+      assert.equal(url.searchParams.get('tenant_external_id'), 'owner');
+      assert.equal([...url.searchParams.keys()].filter(key => key.endsWith('_cursor')).length, 1);
+      assert.equal(url.searchParams.has('object_locator'), false);
+    }
+  } finally { globalThis.fetch = old; }
+});

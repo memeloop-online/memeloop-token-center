@@ -17,7 +17,7 @@ export function SemanticSessionPanel({ detail, loader }: { detail: LogicalSessio
   const { locale } = useI18n(); const zh = locale.startsWith('zh');
   const requests = detail.requests;
   const [requestId, setRequestId] = useState(requests.at(-1)?.request_id ?? '');
-  const { page: visiblePage, error, loading, refresh, earlier, newer, hasNewer } = useSemanticPages(loader, requestId);
+  const { page: visiblePage, error, loading, refresh, earlier, newer, hasNewer, host } = useSemanticPages(loader, requestId);
   const [exportError, setExportError] = useState<Error | null>(null);
   const exportActive = useRef<AbortController | null>(null);
   const [exporting, setExporting] = useState(false);
@@ -40,7 +40,7 @@ export function SemanticSessionPanel({ detail, loader }: { detail: LogicalSessio
     lamportClock: instance.ordinal, timestamp: requests.find(request => request.request_id === requestId)?.created_at ?? 0,
     role, content: '', metadata: { instance_id: instance.instance_id, branch_id: instance.branch_id },
   }]; }), [visibleInstances, revision, detail.session_id, requestId, requests]);
-  return <DataSurface aria-label={zh ? '会话记录' : 'Conversation record'}>
+  return <div ref={host}><DataSurface aria-label={zh ? '会话记录' : 'Conversation record'}>
     <FormSection title={zh ? '会话记录' : 'Conversation record'}>
     <Field label={zh ? '请求上下文' : 'Request context'}><Select value={requestId} onChange={event => setRequestId(event.target.value)}>
       {requests.map(request => <option key={request.request_id} value={request.request_id}>{new Date(request.created_at).toLocaleString(locale)} · {request.model}</option>)}
@@ -75,5 +75,5 @@ export function SemanticSessionPanel({ detail, loader }: { detail: LogicalSessio
           <Button appearance="secondary" disabled={exporting} onClick={() => void exportContext(instance)}>{zh ? '导出消息' : 'Export message'}</Button>
           <SemanticMessageParts loader={loader} request={requestId} instance={instance} revision={revision} /></section>;
       }} />}
-  </DataSurface>;
+  </DataSurface></div>;
 }
