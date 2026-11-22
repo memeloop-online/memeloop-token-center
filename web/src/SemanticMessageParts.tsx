@@ -1,6 +1,6 @@
 import { MessageContent } from '@memeloop/react-ui/chat';
 import type { ConversationMessageListProjection } from 'memeloop';
-import { useEffect, useRef, useState } from 'react';
+import { useEffect, useLayoutEffect, useRef, useState } from 'react';
 import { Button, DataSurface, Disclosure } from './design-system';
 import { useI18n } from './i18n.js';
 import { exportSemanticMedia, type SemanticContentChunk, type SemanticContentField, type SemanticPartDescriptor, type SemanticPartsPage, type SemanticViewInstance, type SemanticViewLoader } from './semanticViewReader.js';
@@ -18,6 +18,14 @@ function ContentField({ loader, request, instance, revision, part, field }: {
   const active = useRef<AbortController | null>(null);
   const stream = useRef<{ nextIndex: number; iterator: AsyncIterator<SemanticContentChunk>; controller: AbortController } | null>(null);
   const viewport = useRef<HTMLDivElement>(null);
+  const pendingAnchor = useRef<{ index: string; top: number } | null>(null);
+  useLayoutEffect(() => {
+    const saved = pendingAnchor.current; pendingAnchor.current = null;
+    const node = viewport.current;
+    if (!saved || !node) return;
+    const anchor = node.querySelector<HTMLElement>(`[data-content-index="${saved.index}"]`);
+    if (anchor) node.scrollTop += anchor.getBoundingClientRect().top - saved.top;
+  }, [chunks]);
   const move = async (target: number) => {
     if (active.current) return;
     const entry = positions.current[target]; if (!entry) return;
@@ -55,13 +63,8 @@ function ContentField({ loader, request, instance, revision, part, field }: {
       const node = viewport.current;
       const anchor = node?.querySelector<HTMLElement>(`[data-content-index="${backwards ? current[0]?.index : current.at(-1)?.index}"]`);
       const top = anchor?.getBoundingClientRect().top;
-      const anchorIndex = anchor?.dataset.contentIndex;
+      if (anchor?.dataset.contentIndex && top !== undefined) pendingAnchor.current = { index: anchor.dataset.contentIndex, top };
       chunksRef.current = next; setChunks(next);
-      requestAnimationFrame(() => {
-        if (!node) return;
-        const restored = node.querySelector<HTMLElement>(`[data-content-index="${anchorIndex}"]`);
-        if (restored && top !== undefined) node.scrollTop += restored.getBoundingClientRect().top - top;
-      });
     } catch (reason) {
       if (!controller.signal.aborted) setError(String(reason));
       stream.current?.controller.abort(); void Promise.resolve(stream.current?.iterator.return?.()).catch(() => undefined); stream.current = null;
