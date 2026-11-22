@@ -91,14 +91,14 @@ test('typed readers preserve owner scope and signed content and attachment curso
     assert.equal(new Headers(init?.headers).get('authorization'), 'Bearer fixture');
     assert.equal(init?.cache, 'no-store');
     if (url.searchParams.has('parts_cursor')) return new Response(JSON.stringify({ manifest_revision: '1', instance_id: 'a', role: 'assistant', parts: [], next_cursor: null }));
-    if (url.searchParams.has('content_cursor')) return new Response(JSON.stringify({ manifest_revision: '1', instance_id: 'a', part_index: 0, field: 'text', format: 'text', byte_offset: 0, text: '😀内容', complete: true, next_cursor: null }));
+    if (url.searchParams.has('content_cursor')) return new Response(JSON.stringify({ manifest_revision: '1', instance_id: 'a', part_index: 0, field: 'text', format: 'text', byte_offset: 0, text: '😀内容', complete: true, next_cursor: null }) + '\n', { headers: { 'content-type': 'application/x-ndjson' } });
     return new Response('attachment bytes');
   };
   try {
     const loader = createSemanticViewLoader('fixture', () => '/semantic?tenant_external_id=owner');
     const signal = new AbortController().signal;
     await loader.parts!('request-a', 'signed/parts', signal);
-    assert.equal((await loader.content!('request-a', 'signed/content', signal)).text, '😀内容');
+    for await (const chunk of loader.content!('request-a', 'signed/content', signal)) assert.equal(chunk.text, '😀内容');
     assert.equal(await (await loader.media!('request-a', 'signed/media', signal)).text(), 'attachment bytes');
     for (const url of seen) {
       assert.equal(url.searchParams.get('tenant_external_id'), 'owner');

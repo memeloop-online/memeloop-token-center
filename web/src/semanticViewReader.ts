@@ -52,7 +52,7 @@ export interface SemanticViewLoader {
   page(request: string, cursor: string | undefined, signal: AbortSignal): Promise<SemanticViewPage>;
   atom(request: string, cursor: string, signal: AbortSignal): Promise<Response>;
   parts?(request: string, cursor: string, signal: AbortSignal): Promise<SemanticPartsPage>;
-  content?(request: string, cursor: string, signal: AbortSignal): Promise<SemanticContentChunk>;
+  content?(request: string, cursor: string, signal: AbortSignal): AsyncIterable<SemanticContentChunk>;
   media?(request: string, cursor: string, signal: AbortSignal): Promise<Response>;
 }
 /** Credentials remain in the owner-scoped transport, never in render props. */
@@ -84,12 +84,37 @@ export function createSemanticViewLoader(credential: string, path: (request: str
         || !(value.next_cursor === null || typeof value.next_cursor === 'string')) throw new Error('Invalid semantic parts');
       return value;
     },
-    async content(request, cursor, signal) {
-      const value = await api<SemanticContentChunk>(url(request, 'content_cursor', cursor), credential, { signal, cache: 'no-store' });
-      if (typeof value.text !== 'string' || !Number.isSafeInteger(value.byte_offset) || value.byte_offset < 0
-        || typeof value.complete !== 'boolean' || value.complete !== (value.next_cursor === null)
-        || !(value.next_cursor === null || typeof value.next_cursor === 'string')) throw new Error('Invalid semantic content chunk');
-      return value;
+    async *content(request, cursor, signal) {
+      const response = await fetch(url(request, 'content_cursor', cursor), { signal, cache: 'no-store', headers: { Authorization: `Bearer ${credential}` } });
+      if (!response.ok) throw new Error(`Semantic content HTTP ${response.status}`);
+      if (!response.headers.get('content-type')?.includes('application/x-ndjson')) throw new Error('Invalid semantic content stream');
+      const reader = response.body?.getReader();
+      if (!reader) throw new Error('Missing semantic content stream');
+      const decoder = new TextDecoder('utf-8', { fatal: true });
+      let buffer = ''; let complete = false;
+      try {
+        while (true) {
+          signal.throwIfAborted();
+          const result = await reader.read();
+          buffer += decoder.decode(result.value, { stream: !result.done });
+          let newline: number;
+          while ((newline = buffer.indexOf('\n')) >= 0) {
+            const line = buffer.slice(0, newline); buffer = buffer.slice(newline + 1);
+            if (!line.trim()) continue;
+            if (complete) throw new Error('Unexpected semantic content after completion');
+            const value = JSON.parse(line) as SemanticContentChunk;
+            if (typeof value.text !== 'string' || !Number.isSafeInteger(value.byte_offset) || value.byte_offset < 0
+              || typeof value.complete !== 'boolean' || value.complete !== (value.next_cursor === null)
+              || !(value.next_cursor === null || typeof value.next_cursor === 'string')) throw new Error('Invalid semantic content chunk');
+            complete = value.complete;
+            yield value;
+          }
+          if (result.done) {
+            if (buffer.trim() || !complete) throw new Error('Semantic content stream ended before verification');
+            break;
+          }
+        }
+      } finally { await reader.cancel(); reader.releaseLock(); }
     },
     async media(request, cursor, signal) {
       const response = await fetch(url(request, 'media_cursor', cursor), { signal, cache: 'no-store', headers: { Authorization: `Bearer ${credential}` } });

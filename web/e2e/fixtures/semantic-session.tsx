@@ -39,12 +39,16 @@ const loader: SemanticViewLoader = {
         { part_index: 2, kind: 'tool_call', tool_name: 'lookup', call_id: 'call-1', fields: [{ name: 'arguments', format: 'json', content_cursor: `${instance}:arguments` }] },
       ] };
   },
-  content: async (_request, cursor) => {
+  content: async function* (_request, cursor) {
     const [instance, field, indexText] = cursor.split(':');
     const index = Number(indexText ?? 0);
-    if (scenario === 'large' && (field === 'text' || field === 'arguments')) return { manifest_revision: revision, instance_id: instance, part_index: field === 'text' ? 0 : 2, field, format: field === 'text' ? 'text' : 'json', byte_offset: index * new TextEncoder().encode(largeChunk).byteLength, text: index === 5 ? 'COMPLETE LARGE FIELD' : largeChunk, next_cursor: index === 5 ? null : `${instance}:${field}:${index + 1}`, complete: index === 5 };
-    if (scenario === 'revision') return { manifest_revision: '2', instance_id: instance, part_index: 0, field: 'text', format: 'text', byte_offset: 0, text: 'Stale content', next_cursor: null, complete: true };
-    return { manifest_revision: '18446744073709551615', instance_id: instance, part_index: field === 'text' ? 0 : field === 'reasoning' ? 1 : 2,
+    if (scenario === 'large' && (field === 'text' || field === 'arguments')) {
+      for (let next = index; next <= 5; next++) {
+        yield { manifest_revision: revision, instance_id: instance, part_index: field === 'text' ? 0 : 2, field, format: field === 'text' ? 'text' : 'json', byte_offset: next * new TextEncoder().encode(largeChunk).byteLength, text: next === 5 ? 'COMPLETE LARGE FIELD' : largeChunk, next_cursor: next === 5 ? null : `${instance}:${field}:${next + 1}`, complete: next === 5 };
+      } return;
+    }
+    if (scenario === 'revision') { yield { manifest_revision: '2', instance_id: instance, part_index: 0, field: 'text', format: 'text', byte_offset: 0, text: 'Stale content', next_cursor: null, complete: true }; return; }
+    yield { manifest_revision: '18446744073709551615', instance_id: instance, part_index: field === 'text' ? 0 : field === 'reasoning' ? 1 : 2,
       field: field === 'arguments' ? 'arguments' : 'text', format: field === 'arguments' ? 'json' : 'text', byte_offset: 0,
       text: field === 'text' ? instance.startsWith('item-') ? `Message ${instance}` : `Verified ${instance === 'latest' ? 'latest' : 'earlier'} answer` : field === 'reasoning' ? 'Separate reasoning' : '{"query": "structured"}',
       next_cursor: null, complete: true };

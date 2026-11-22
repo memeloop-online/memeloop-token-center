@@ -14,7 +14,7 @@ export function semanticMessageId(revision: string, instance: SemanticInstanceId
   if (!revision || !instance.instance_id || !Number.isSafeInteger(instance.ordinal) || instance.ordinal < 0) {
     throw new Error('Invalid semantic message identity');
   }
-  return JSON.stringify([revision, instance.branch_id, instance.instance_id]);
+  return JSON.stringify([revision, instance.request_id, instance.branch_id, instance.instance_id]);
 }
 
 /** A cursor belongs to one immutable manifest revision. Never append a page

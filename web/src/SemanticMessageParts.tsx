@@ -16,15 +16,25 @@ function ContentField({ loader, request, instance, revision, part, field }: {
   const [loading, setLoading] = useState(false);
   const positions = useRef([{ cursor: field.content_cursor, offset: 0 }]);
   const active = useRef<AbortController | null>(null);
+  const stream = useRef<{ nextIndex: number; iterator: AsyncIterator<SemanticContentChunk>; controller: AbortController } | null>(null);
   const viewport = useRef<HTMLDivElement>(null);
   const move = async (target: number) => {
     if (active.current) return;
     const entry = positions.current[target]; if (!entry) return;
-    const controller = new AbortController(); active.current = controller;
+    if (!stream.current || stream.current.nextIndex !== target) {
+      stream.current?.controller.abort();
+      void stream.current?.iterator.return?.();
+      const controller = new AbortController();
+      if (loader.content) stream.current = { nextIndex: target, iterator: loader.content(request, entry.cursor, controller.signal)[Symbol.asyncIterator](), controller };
+    }
+    const controller = stream.current?.controller ?? new AbortController(); active.current = controller;
     setLoading(true); setError('');
     try {
       if (!loader.content) throw new Error(zh ? '当前无法读取消息，请刷新后重试。' : 'Message content is unavailable. Refresh to try again.');
-      const value = await loader.content(request, entry.cursor, controller.signal);
+      const frame = await stream.current!.iterator.next();
+      if (frame.done) throw new Error('Semantic content stream ended before verification');
+      const value = frame.value;
+      stream.current!.nextIndex = target + 1;
       controller.signal.throwIfAborted();
       if (value.manifest_revision !== revision || value.instance_id !== instance.instance_id
         || value.part_index !== part.part_index || value.field !== field.name || value.format !== field.format
@@ -48,10 +58,13 @@ function ContentField({ loader, request, instance, revision, part, field }: {
         const restored = node.querySelector<HTMLElement>(`[data-content-index="${anchorIndex}"]`);
         if (restored && top !== undefined) node.scrollTop += restored.getBoundingClientRect().top - top;
       });
-    } catch (reason) { if (!controller.signal.aborted) setError(String(reason)); }
+    } catch (reason) {
+      if (!controller.signal.aborted) setError(String(reason));
+      stream.current?.controller.abort(); void stream.current?.iterator.return?.(); stream.current = null;
+    }
     finally { if (active.current === controller) { active.current = null; setLoading(false); } }
   };
-  useEffect(() => { void move(0); return () => active.current?.abort(); }, []);
+  useEffect(() => { void move(0); return () => { stream.current?.controller.abort(); void stream.current?.iterator.return?.(); active.current?.abort(); }; }, []);
   const first = chunks[0]; const last = chunks.at(-1);
   const role = instance.role;
   const richText: ConversationMessageListProjection | undefined = field.name === 'text' && field.format === 'text'
@@ -162,10 +175,15 @@ function VisibleParts({ loader, request, instance, revision }: { loader: Semanti
 /** Offscreen message bodies and active readers are released together. */
 export function SemanticMessageParts(props: { loader: SemanticViewLoader; request: string; instance: SemanticViewInstance; revision: string }) {
   const host = useRef<HTMLDivElement>(null); const [visible, setVisible] = useState(false);
+  const [height, setHeight] = useState(64);
   useEffect(() => {
-    const observer = new IntersectionObserver(entries => setVisible(entries.some(entry => entry.isIntersecting)), { rootMargin: '200px' });
+    const observer = new IntersectionObserver(entries => {
+      const next = entries.some(entry => entry.isIntersecting);
+      if (!next && host.current) setHeight(host.current.getBoundingClientRect().height);
+      setVisible(next);
+    }, { rootMargin: '200px' });
     if (host.current) observer.observe(host.current);
     return () => observer.disconnect();
   }, []);
-  return <div ref={host} style={{ minHeight: '4rem' }}>{visible && <VisibleParts key={JSON.stringify([props.revision, props.instance.instance_id, props.instance.atom_cursor])} {...props} />}</div>;
+  return <div ref={host} style={{ minHeight: visible ? undefined : height }}>{visible && <VisibleParts key={JSON.stringify([props.request, props.revision, props.instance.instance_id, props.instance.atom_cursor])} {...props} />}</div>;
 }
