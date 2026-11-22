@@ -104,7 +104,7 @@ impl PartReferences {
 pub struct RawGcReferenceEvidence {
     pub authority: &'static str,
     pub request_id: uuid::Uuid,
-    pub revision: u64,
+    pub revision: Option<u64>,
     pub object: CasArchiveObject,
     pub candidate: CasArchiveObject,
 }
@@ -116,7 +116,27 @@ fn mark(
     evidence: &mut Vec<RawGcReferenceEvidence>,
     authority: &'static str,
 ) -> Result<(), AppError> {
-    object.validate_tenant(publication.tenant_id)?;
+    mark_object(
+        publication.tenant_id,
+        publication.request_id,
+        Some(publication.revision),
+        object,
+        candidates,
+        evidence,
+        authority,
+    )
+}
+
+fn mark_object(
+    tenant: uuid::Uuid,
+    request: uuid::Uuid,
+    revision: Option<u64>,
+    object: &CasArchiveObject,
+    candidates: &[CasArchiveObject],
+    evidence: &mut Vec<RawGcReferenceEvidence>,
+    authority: &'static str,
+) -> Result<(), AppError> {
+    object.validate_tenant(tenant)?;
     for candidate in candidates {
         // Backend aliases may address the same physical namespace. Until
         // equivalence is proven, retain matching content on every backend.
@@ -128,8 +148,8 @@ fn mark(
         }
         evidence.push(RawGcReferenceEvidence {
             authority,
-            request_id: publication.request_id,
-            revision: publication.revision,
+            request_id: request,
+            revision,
             object: object.clone(),
             candidate: candidate.clone(),
         });
@@ -138,6 +158,49 @@ fn mark(
 }
 
 impl ArchiveStore {
+    /// Legacy manifests still own raw captures. Semantic retirement alone does
+    /// not release these independent roots or their media/prefix dependencies.
+    pub async fn trace_legacy_raw_gc_references(
+        &self,
+        tenant: uuid::Uuid,
+        request: uuid::Uuid,
+        candidates: &[CasArchiveObject],
+    ) -> Result<Vec<RawGcReferenceEvidence>, AppError> {
+        let object = self
+            .request_conversation_reference(tenant, request)
+            .await?
+            .ok_or_else(|| AppError::storage("raw_gc_legacy_root_missing"))?;
+        for candidate in candidates {
+            candidate.validate_tenant(tenant)?;
+        }
+        let manifest = self
+            .get_conversation_manifest_streamed(tenant, &object)
+            .await?;
+        let mut evidence = Vec::new();
+        mark_object(
+            tenant,
+            request,
+            None,
+            &object,
+            candidates,
+            &mut evidence,
+            "legacy_manifest",
+        )?;
+        self.visit_conversation_references(&manifest, |object, authority| {
+            mark_object(
+                tenant,
+                request,
+                None,
+                object,
+                candidates,
+                &mut evidence,
+                authority,
+            )
+        })
+        .await?;
+        Ok(evidence)
+    }
+
     /// Traverse one exact immutable publication using the existing decoders and
     /// prefix identity. Only candidate hits are retained; body text is never
     /// collected. All revisions (including partial ones) must be supplied by the

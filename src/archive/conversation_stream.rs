@@ -129,6 +129,17 @@ impl ArchiveStore {
         &self,
         manifest: &ConversationManifest,
     ) -> Result<(), AppError> {
+        self.visit_conversation_references(manifest, |_, _| Ok(()))
+            .await
+    }
+
+    /// Shared ancestry validation with metadata-only edges for read/GC callers.
+    /// The event document is skipped by the existing streaming reference reader.
+    pub(super) async fn visit_conversation_references(
+        &self,
+        manifest: &ConversationManifest,
+        mut visit: impl FnMut(&CasArchiveObject, &'static str) -> Result<(), AppError>,
+    ) -> Result<(), AppError> {
         validate_manifest(manifest.tenant_id, manifest)?;
         let mut cursor = manifest.head.clone();
         let mut remaining = cursor.as_ref().map_or(0, |head| head.event_count);
@@ -139,13 +150,18 @@ impl ArchiveStore {
             if head.event_count != remaining {
                 return Err(AppError::storage("conversation_export_order_invalid"));
             }
+            visit(&head.object, "legacy_prefix")?;
             let node: PrefixNode = self
                 .get_conversation_json(manifest.tenant_id, &head.object, 4096)
                 .await?;
             validate_node(manifest.tenant_id, &head, &node)?;
+            visit(&node.event, "legacy_event")?;
             let event = self
                 .event_references(manifest.tenant_id, &node.event, false)
                 .await?;
+            for media in &event.media {
+                visit(&media.object, "legacy_media")?;
+            }
             if remaining == manifest.head.as_ref().map_or(0, |head| head.event_count)
                 && event.branch_id != manifest.branch_id
             {
@@ -173,6 +189,7 @@ impl ArchiveStore {
             return Err(AppError::storage("conversation_ancestry_incomplete"));
         }
         for capture in &manifest.raw_captures {
+            visit(&capture.object, "legacy_raw_capture")?;
             self.verify_tenant_content(manifest.tenant_id, &capture.object)
                 .await?;
         }
