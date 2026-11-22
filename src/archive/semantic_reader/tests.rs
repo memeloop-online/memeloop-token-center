@@ -119,7 +119,7 @@ async fn streamed_field_reads_source_once_and_finishes_after_verified_eof() {
         Arc,
         atomic::{AtomicUsize, Ordering},
     };
-    let text = "文😀".repeat(300000);
+    let text = "文😀".repeat(2_400_000);
     let body = serde_json::to_vec(
         &json!({"role":"assistant","parts":[{"part_index":0,"kind":"reasoning","text":text}]}),
     )
