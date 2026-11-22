@@ -613,6 +613,13 @@ impl Database {
         &self,
         snapshots: &[HistorySnapshot],
     ) -> Result<(), HistoryError> {
+        self.history_acknowledge_count(snapshots).await.map(|_| ())
+    }
+
+    pub(crate) async fn history_acknowledge_count(
+        &self,
+        snapshots: &[HistorySnapshot],
+    ) -> Result<usize, HistoryError> {
         let mut transaction = self.pool.begin().await?;
         let mut acknowledged = Vec::new();
         const ACK: &str = "DELETE FROM request_history_export WHERE revision = $1 AND source = $2 AND request_id = $3 AND snapshot = $4";
@@ -678,7 +685,7 @@ impl Database {
         self.allocation_history_acknowledged(&mut transaction, &acknowledged)
             .await?;
         transaction.commit().await?;
-        Ok(())
+        Ok(acknowledged.len())
     }
 
     pub async fn history_pending_count(&self) -> Result<i64, HistoryError> {

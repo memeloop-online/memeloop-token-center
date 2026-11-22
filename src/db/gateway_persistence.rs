@@ -651,8 +651,20 @@ impl Database {
             .ok_or_else(|| AppError::internal("gateway_request_source_identity"))?;
         let backend_identity = source_key.backend_identity_text();
         let mut transaction = self.begin_write_transaction().await?;
-        let owned = sqlx::query("UPDATE request_records SET request_object = request_object WHERE id = $1 AND tenant_id = $2 AND reservation_id = $3 AND request_object = $4 RETURNING key_id")
-            .bind(identity.request_id.to_string()).bind(identity.tenant_id.to_string()).bind(identity.reservation_id.to_string()).bind(locator)
+        let record_locator = sqlx::query(
+            "SELECT created_at, key_id FROM request_record_locators WHERE id = $1 AND tenant_id = $2",
+        )
+        .bind(identity.request_id.to_string())
+        .bind(identity.tenant_id.to_string())
+        .fetch_optional(&mut *transaction)
+        .await?;
+        let Some(record_locator) = record_locator else {
+            return Ok(false);
+        };
+        let created_at: i64 = record_locator.try_get("created_at")?;
+        let key_id: String = record_locator.try_get("key_id")?;
+        let owned = sqlx::query("UPDATE request_records SET request_object = request_object WHERE id = $1 AND tenant_id = $2 AND reservation_id = $3 AND request_object = $4 AND created_at = $5 AND key_id = $6 RETURNING key_id")
+            .bind(identity.request_id.to_string()).bind(identity.tenant_id.to_string()).bind(identity.reservation_id.to_string()).bind(locator).bind(created_at).bind(&key_id)
             .fetch_optional(&mut *transaction).await?;
         let Some(owned) = owned else {
             return Ok(false);
@@ -749,9 +761,9 @@ impl Database {
                 event_id: uuid::Uuid::nil().to_string(),
                 event_at: now,
             };
-            let draft_row = sqlx::query(r#"SELECT CAST($1 AS TEXT) AS event_id, CAST(tenant_id AS TEXT) AS tenant_id, CAST(key_id AS TEXT) AS key_id, CAST(id AS TEXT) AS request_id, CAST($2 AS BIGINT) AS event_at, CAST($3 AS TEXT) AS event_kind, CAST(protocol AS TEXT) AS protocol, CAST(model AS TEXT) AS model, CAST(status_code AS BIGINT) AS status_code, CAST(duration_ms AS BIGINT) AS duration_ms, CAST(input_tokens AS BIGINT) AS input_tokens, CAST(output_tokens AS BIGINT) AS output_tokens, CAST(cost_micros AS BIGINT) AS cost_micros, CAST(error_code AS TEXT) AS error_code FROM request_records WHERE id = $4 AND tenant_id = $5 AND key_id = $6"#)
+            let draft_row = sqlx::query(r#"SELECT CAST($1 AS TEXT) AS event_id, CAST(tenant_id AS TEXT) AS tenant_id, CAST(key_id AS TEXT) AS key_id, CAST(id AS TEXT) AS request_id, CAST($2 AS BIGINT) AS event_at, CAST($3 AS TEXT) AS event_kind, CAST(protocol AS TEXT) AS protocol, CAST(model AS TEXT) AS model, CAST(status_code AS BIGINT) AS status_code, CAST(duration_ms AS BIGINT) AS duration_ms, CAST(input_tokens AS BIGINT) AS input_tokens, CAST(output_tokens AS BIGINT) AS output_tokens, CAST(cost_micros AS BIGINT) AS cost_micros, CAST(error_code AS TEXT) AS error_code FROM request_records WHERE id = $4 AND tenant_id = $5 AND key_id = $6 AND created_at = $7"#)
                 .bind(&draft_cursor.event_id).bind(draft_cursor.event_at).bind(if success { "archive_bound" } else { "archive_gap" })
-                .bind(request_id).bind(tenant_id).bind(key_id).fetch_optional(&mut *transaction).await?;
+                .bind(request_id).bind(tenant_id).bind(key_id).bind(created_at).fetch_optional(&mut *transaction).await?;
             let prepared = match draft_row.as_ref() {
                 Some(row) => Some(
                     crate::db::history_immutable_outbox::EventDraft::from_row(row)?
