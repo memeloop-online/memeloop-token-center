@@ -110,8 +110,9 @@ export async function run(plan: Plan, env = process.env): Promise<Record<string,
   const requests: Record<string,unknown>[] = [];
   let active=0, peakActive=0;
   const start=performance.now();
+  let receivedBytes=0;
   const timeline:Record<string,unknown>[]=[];
-  const sample=()=>{const counts:Record<string,number>={};for(const r of requests)counts[String(r.status??"transport")]=(counts[String(r.status??"transport")]??0)+1;timeline.push({utc:new Date().toISOString(),elapsed_ms:performance.now()-start,offered:plan.arrivals.filter(a=>a.at_ms<=performance.now()-start).length,client_active:active,started:requests.length+active,completed:requests.length,status_counts:counts});};
+  const sample=()=>{const counts:Record<string,number>={};for(const r of requests)counts[String(r.status??"transport")]=(counts[String(r.status??"transport")]??0)+1;timeline.push({utc:new Date().toISOString(),elapsed_ms:performance.now()-start,offered:plan.arrivals.filter(a=>a.at_ms<=performance.now()-start).length,client_active:active,received_bytes:receivedBytes,started:requests.length+active,completed:requests.length,status_counts:counts});};
   const sampler=setInterval(sample,1000);sample();
   const tasks: Promise<void>[]=[];
   for (const [index, arrival] of plan.arrivals.entries()) {
@@ -129,7 +130,7 @@ export async function run(plan: Plan, env = process.env): Promise<Record<string,
         const serialized=JSON.stringify(payload);serializedRequestBytes=Buffer.byteLength(serialized);
         const response=await fetch(new URL(arrival.protocol==="responses"?"/v1/responses":"/v1/chat/completions",gateway), {method:"POST",headers:{authorization:`Bearer ${key}`,"content-type":"application/json","x-mtc-conversation-id":session},body:serialized,signal:AbortSignal.timeout(plan.window_ms+plan.drain_timeout_ms)});
         status=response.status;requestId=response.headers.get("x-mtc-request-id");
-        if (response.body) for await (const chunk of response.body) { bytes+=chunk.length; hash.update(chunk); if(status===200&&arrival.scenario!=="tool-session")verifier.consume(chunk); const scan=tail+Buffer.from(chunk).toString("utf8");terminal ||= arrival.protocol==="responses"?scan.includes('"type":"response.completed"'):scan.includes("data: [DONE]");tail=scan.slice(-4096); if(arrival.client_read_delay_ms) await delay(arrival.client_read_delay_ms); }
+        if (response.body) for await (const chunk of response.body) { bytes+=chunk.length; receivedBytes+=chunk.length; hash.update(chunk); if(status===200&&arrival.scenario!=="tool-session")verifier.consume(chunk); const scan=tail+Buffer.from(chunk).toString("utf8");terminal ||= arrival.protocol==="responses"?scan.includes('"type":"response.completed"'):scan.includes("data: [DONE]");tail=scan.slice(-4096); if(arrival.client_read_delay_ms) await delay(arrival.client_read_delay_ms); }
         if(status===200&&arrival.scenario!=="tool-session"){fixtureEvidence=verifier.finish(bytes);if(fixtureEvidence.verified!==true)error="fixture_content_or_size_mismatch";}
         if(status!==arrival.expected_status) error="unexpected_gateway_status";
         if(arrival.stream && status===200 && !terminal) error="missing_stream_terminal";
