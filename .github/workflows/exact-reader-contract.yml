@@ -709,4 +709,6 @@ jobs:
             timeout 60s cargo test --locked --lib "db::requests::terminal_timings::tests::$selector" -- --exact --nocapture 2>&1 | tee /tmp/terminal-timings.log
             grep -F '1 passed; 0 failed' /tmp/terminal-timings.log
           done
+          timeout 60s cargo test --locked --lib db::history_immutable_outbox::reuse_tests::postgres_native_capture_reuse_is_exactly_equal -- --exact --nocapture 2>&1 | tee /tmp/history-reuse.log
+          grep -F '1 passed; 0 failed' /tmp/history-reuse.log
 
