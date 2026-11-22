@@ -3,7 +3,7 @@ import { I18nProvider } from '../../src/i18n';
 import { MtcFluentProvider } from '../../src/design-system';
 import { SemanticSessionPanel } from '../../src/SemanticSessionPanel';
 import type { LogicalSessionDetail } from '../../src/types';
-import type { SemanticViewLoader } from '../../src/semanticViewReader';
+import { createSemanticViewLoader, type SemanticContentChunk, type SemanticViewLoader } from '../../src/semanticViewReader';
 import '../../src/styles.css';
 import '../../src/theme.css';
 
@@ -17,6 +17,40 @@ const detail: LogicalSessionDetail = {
 const revision = '18446744073709551615';
 const largeChunk = '连续内容😀'.repeat(4096);
 const scenario = new URLSearchParams(location.search).get('scenario');
+async function* contentFrames(_request: string, cursor: string): AsyncGenerator<SemanticContentChunk> {
+    const [instance, field, indexText] = cursor.split(':');
+    const index = Number(indexText ?? 0);
+    if (scenario === 'large' && (field === 'text' || field === 'arguments')) {
+      for (let next = index; next <= 5; next++) {
+        yield { manifest_revision: revision, instance_id: instance, part_index: field === 'text' ? 0 : 2, field, format: field === 'text' ? 'text' : 'json', byte_offset: next * new TextEncoder().encode(largeChunk).byteLength, text: next === 5 ? 'COMPLETE LARGE FIELD' : largeChunk, next_cursor: next === 5 ? null : `${instance}:${field}:${next + 1}`, complete: next === 5 };
+      } return;
+    }
+    if (scenario === 'revision') { yield { manifest_revision: '2', instance_id: instance, part_index: 0, field: 'text', format: 'text', byte_offset: 0, text: 'Stale content', next_cursor: null, complete: true }; return; }
+    yield { manifest_revision: '18446744073709551615', instance_id: instance, part_index: field === 'text' ? 0 : field === 'reasoning' ? 1 : 2,
+      field: field === 'arguments' ? 'arguments' : 'text', format: field === 'arguments' ? 'json' : 'text', byte_offset: 0,
+      text: field === 'text' ? instance.startsWith('item-') ? `Message ${instance}` : `Verified ${instance === 'latest' ? 'latest' : 'earlier'} answer` : field === 'reasoning' ? 'Separate reasoning' : '{"query": "structured"}',
+      next_cursor: null, complete: true };
+}
+
+const originalFetch = window.fetch.bind(window);
+window.fetch = async (input, init) => {
+  const url = new URL(String(input), location.origin);
+  if (url.pathname !== '/fixture-content') return originalFetch(input, init);
+  const frames = contentFrames('request-a', url.searchParams.get('content_cursor')!);
+  let pending = new Uint8Array();
+  return new Response(new ReadableStream<Uint8Array>({
+    async pull(controller) {
+      if (!pending.length) {
+        const result = await frames.next();
+        if (result.done) { controller.close(); return; }
+        pending = new TextEncoder().encode(JSON.stringify(result.value) + '\n');
+      }
+      controller.enqueue(pending.slice(0, 8191)); pending = pending.slice(8191);
+    },
+    async cancel() { await frames.return(undefined); },
+  }), { headers: { 'content-type': 'application/x-ndjson' } });
+};
+const contentLoader = createSemanticViewLoader('fixture', () => '/fixture-content');
 const loader: SemanticViewLoader = {
   page: async (_request, cursor) => {
     window.semanticPageReads++;
@@ -39,20 +73,7 @@ const loader: SemanticViewLoader = {
         { part_index: 2, kind: 'tool_call', tool_name: 'lookup', call_id: 'call-1', fields: [{ name: 'arguments', format: 'json', content_cursor: `${instance}:arguments` }] },
       ] };
   },
-  content: async function* (_request, cursor) {
-    const [instance, field, indexText] = cursor.split(':');
-    const index = Number(indexText ?? 0);
-    if (scenario === 'large' && (field === 'text' || field === 'arguments')) {
-      for (let next = index; next <= 5; next++) {
-        yield { manifest_revision: revision, instance_id: instance, part_index: field === 'text' ? 0 : 2, field, format: field === 'text' ? 'text' : 'json', byte_offset: next * new TextEncoder().encode(largeChunk).byteLength, text: next === 5 ? 'COMPLETE LARGE FIELD' : largeChunk, next_cursor: next === 5 ? null : `${instance}:${field}:${next + 1}`, complete: next === 5 };
-      } return;
-    }
-    if (scenario === 'revision') { yield { manifest_revision: '2', instance_id: instance, part_index: 0, field: 'text', format: 'text', byte_offset: 0, text: 'Stale content', next_cursor: null, complete: true }; return; }
-    yield { manifest_revision: '18446744073709551615', instance_id: instance, part_index: field === 'text' ? 0 : field === 'reasoning' ? 1 : 2,
-      field: field === 'arguments' ? 'arguments' : 'text', format: field === 'arguments' ? 'json' : 'text', byte_offset: 0,
-      text: field === 'text' ? instance.startsWith('item-') ? `Message ${instance}` : `Verified ${instance === 'latest' ? 'latest' : 'earlier'} answer` : field === 'reasoning' ? 'Separate reasoning' : '{"query": "structured"}',
-      next_cursor: null, complete: true };
-  },
+  content: (request, cursor, signal) => contentLoader.content!(request, cursor, signal),
   atom: async (_request, cursor) => {
     window.semanticAtomReads++;
     return new Response(JSON.stringify({ role: scenario === 'unknown' ? 'unrecorded-provider-role' : cursor === 'latest-atom' ? 'assistant' : 'user', parts: [
