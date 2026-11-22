@@ -524,7 +524,7 @@ async fn insert_envelope_in_transaction(
 }
 
 /// Decode the frozen capture without rebuilding its source at a newer schema.
-fn decode_captured_envelope(
+pub(super) fn decode_captured_envelope(
     frozen: &str,
     identity: &crate::request_history::HistoryIdentity,
     revision: i64,
