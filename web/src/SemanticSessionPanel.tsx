@@ -71,7 +71,7 @@ export function SemanticSessionPanel({ detail, loader }: { detail: LogicalSessio
       renderMessageContent={message => {
         const instance = visibleInstances.find(item => semanticMessageId(revision, item) === message.messageId);
         if (!instance) return null;
-        return <section data-semantic-role={message.role}>
+        return <section data-semantic-role={message.role} data-semantic-ordinal={instance.ordinal}>
           <Button appearance="secondary" disabled={exporting} onClick={() => void exportContext(instance)}>{zh ? '导出消息' : 'Export message'}</Button>
           <SemanticMessageParts loader={loader} request={requestId} instance={instance} revision={revision} /></section>;
       }} />}
