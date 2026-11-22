@@ -16,13 +16,48 @@ export interface SemanticViewPage {
   instances: SemanticViewInstance[];
   next_cursor: string | null;
 }
+export interface SemanticContentField {
+  name: 'text' | 'arguments' | 'arguments_text' | 'result_content';
+  format: 'text' | 'json';
+  content_cursor: string;
+}
+export interface SemanticPartDescriptor {
+  part_index: number;
+  kind: string;
+  tool_name?: string;
+  call_id?: string;
+  completeness?: string;
+  fields: SemanticContentField[];
+  media?: { media_type?: string; byte_length?: number; read_cursor: string };
+}
+export interface SemanticPartsPage {
+  manifest_revision: string;
+  instance_id: string;
+  role: string | null;
+  parts: SemanticPartDescriptor[];
+  next_cursor: string | null;
+}
+export interface SemanticContentChunk {
+  manifest_revision: string;
+  instance_id: string;
+  part_index: number;
+  field: SemanticContentField['name'];
+  format: SemanticContentField['format'];
+  byte_offset: number;
+  text: string;
+  next_cursor: string | null;
+  complete: boolean;
+}
 export interface SemanticViewLoader {
   page(request: string, cursor: string | undefined, signal: AbortSignal): Promise<SemanticViewPage>;
   atom(request: string, cursor: string, signal: AbortSignal): Promise<Response>;
+  parts?(request: string, cursor: string, signal: AbortSignal): Promise<SemanticPartsPage>;
+  content?(request: string, cursor: string, signal: AbortSignal): Promise<SemanticContentChunk>;
+  media?(request: string, cursor: string, signal: AbortSignal): Promise<Response>;
 }
 /** Credentials remain in the owner-scoped transport, never in render props. */
 export function createSemanticViewLoader(credential: string, path: (request: string) => string): SemanticViewLoader {
-  const url = (request: string, kind: 'cursor' | 'atom_cursor', cursor?: string) => {
+  const url = (request: string, kind: 'cursor' | 'atom_cursor' | 'parts_cursor' | 'content_cursor' | 'media_cursor', cursor?: string) => {
     const base = path(request);
     return cursor ? `${base}${base.includes('?') ? '&' : '?'}${kind}=${encodeURIComponent(cursor)}` : base;
   };
@@ -39,6 +74,27 @@ export function createSemanticViewLoader(credential: string, path: (request: str
         ids.add(instance.instance_id);
       }
       return value;
+    },
+    async parts(request, cursor, signal) {
+      const value = await api<SemanticPartsPage>(url(request, 'parts_cursor', cursor), credential, { signal, cache: 'no-store' });
+      if (!Array.isArray(value.parts) || typeof value.instance_id !== 'string' || typeof value.manifest_revision !== 'string'
+        || !value.parts.every(part => Number.isSafeInteger(part.part_index) && part.part_index >= 0 && typeof part.kind === 'string'
+          && Array.isArray(part.fields) && part.fields.every(field => ['text', 'arguments', 'arguments_text', 'result_content'].includes(field.name)
+            && ['text', 'json'].includes(field.format) && typeof field.content_cursor === 'string'))
+        || !(value.next_cursor === null || typeof value.next_cursor === 'string')) throw new Error('Invalid semantic parts');
+      return value;
+    },
+    async content(request, cursor, signal) {
+      const value = await api<SemanticContentChunk>(url(request, 'content_cursor', cursor), credential, { signal, cache: 'no-store' });
+      if (typeof value.text !== 'string' || !Number.isSafeInteger(value.byte_offset) || value.byte_offset < 0
+        || typeof value.complete !== 'boolean' || value.complete !== (value.next_cursor === null)
+        || !(value.next_cursor === null || typeof value.next_cursor === 'string')) throw new Error('Invalid semantic content chunk');
+      return value;
+    },
+    async media(request, cursor, signal) {
+      const response = await fetch(url(request, 'media_cursor', cursor), { signal, cache: 'no-store', headers: { Authorization: `Bearer ${credential}` } });
+      if (!response.ok) throw new Error(`Semantic attachment HTTP ${response.status}`);
+      return response;
     },
     async atom(request, cursor, signal) {
       const response = await fetch(url(request, 'atom_cursor', cursor), { signal, cache: 'no-store', headers: { Authorization: `Bearer ${credential}` } });
@@ -109,6 +165,28 @@ export async function exportSemanticContext(loader: SemanticViewLoader, request:
       if (only && found) break;
     }
     if (only && !found) throw new Error('Semantic instance is no longer available');
+    await file.close();
+  } catch (reason) { await file.abort(reason); throw reason; }
+}
+
+/** Authorized attachment bytes go directly to disk, without retaining a Blob. */
+export async function exportSemanticMedia(loader: SemanticViewLoader, request: string, cursor: string, signal: AbortSignal): Promise<void> {
+  const picker = (window as Window & { showSaveFilePicker?: SavePicker }).showSaveFilePicker;
+  if (!picker || !loader.media) throw new Error('Streaming attachment download is unavailable in this browser');
+  const handle = await picker.call(window, { suggestedName: 'attachment' });
+  signal.throwIfAborted();
+  const file = await handle.createWritable();
+  try {
+    const response = await loader.media(request, cursor, signal);
+    const reader = response.body?.getReader();
+    if (!reader) throw new Error('Missing attachment stream');
+    try {
+      while (true) {
+        signal.throwIfAborted(); const chunk = await reader.read();
+        if (chunk.done) break;
+        await file.write(chunk.value);
+      }
+    } finally { await reader.cancel(); reader.releaseLock(); }
     await file.close();
   } catch (reason) { await file.abort(reason); throw reason; }
 }
