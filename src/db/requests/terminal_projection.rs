@@ -232,7 +232,7 @@ impl Database {
             )
             .await?;
         }
-        timings.enter(ProjectionStage::HistoryCapture);
+        timings.enter(ProjectionStage::AckUpdate);
         let tenant_id: String = task.try_get("tenant_id")?;
         let key_id: String = task.try_get("key_id")?;
         // The claimed outbox row and its acknowledgement are the financial
@@ -251,11 +251,13 @@ impl Database {
                 "terminal projection owner changed".into(),
             ));
         }
+        timings.enter(ProjectionStage::NativeCapture);
         super::super::history_immutable_outbox::capture_native_in_transaction(
             &mut transaction,
             &request_id,
         )
         .await?;
+        timings.enter(ProjectionStage::EventPrepare);
         let draft_cursor = crate::db::RequestEventCursor {
             event_id: Uuid::nil().to_string(),
             event_at: task.try_get("completed_at")?,
@@ -276,6 +278,7 @@ impl Database {
             ),
             None => None,
         };
+        timings.enter(ProjectionStage::EventPublish);
         crate::db::history_immutable_outbox::PreparedEventCapture::publish(
             &mut transaction,
             prepared,

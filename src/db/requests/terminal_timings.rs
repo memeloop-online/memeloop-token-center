@@ -1,12 +1,15 @@
 use std::time::Instant;
 
-pub(crate) const STAGE_NAMES: [&str; 7] = [
+pub(crate) const STAGE_NAMES: [&str; 10] = [
     "account_receipt",
     "tx_begin",
     "stats_gate",
     "outbox_claim",
     "fact_projection",
-    "history_capture",
+    "ack_update",
+    "native_capture",
+    "event_prepare",
+    "event_publish",
     "commit",
 ];
 #[derive(Clone, Copy)]
@@ -16,12 +19,15 @@ pub(crate) enum ProjectionStage {
     StatsGate,
     OutboxClaim,
     FactProjection,
-    HistoryCapture,
+    AckUpdate,
+    NativeCapture,
+    EventPrepare,
+    EventPublish,
     Commit,
 }
 
 pub(crate) struct TerminalProjectionTimings {
-    pub micros: [u64; 7],
+    pub micros: [u64; 10],
     pub failure_stage: Option<usize>,
     current: ProjectionStage,
     started: Instant,
@@ -29,7 +35,7 @@ pub(crate) struct TerminalProjectionTimings {
 impl TerminalProjectionTimings {
     pub fn new() -> Self {
         Self {
-            micros: [0; 7],
+            micros: [0; 10],
             failure_stage: None,
             current: ProjectionStage::AccountReceipt,
             started: Instant::now(),
@@ -58,9 +64,9 @@ pub(crate) struct TerminalProjectionBatchTimings {
     pub projected: u64,
     pub deferred: u64,
     pub failed: u64,
-    pub stage_sum_us: [u64; 7],
-    pub stage_max_us: [u64; 7],
-    pub stage_failures: [u64; 7],
+    pub stage_sum_us: [u64; 10],
+    pub stage_max_us: [u64; 10],
+    pub stage_failures: [u64; 10],
 }
 impl TerminalProjectionBatchTimings {
     pub fn observe(&mut self, outcome: Option<bool>, timings: &TerminalProjectionTimings) {
@@ -70,7 +76,7 @@ impl TerminalProjectionBatchTimings {
             Some(false) => self.deferred += 1,
             None => self.failed += 1,
         }
-        for i in 0..7 {
+        for i in 0..10 {
             self.stage_sum_us[i] = self.stage_sum_us[i].saturating_add(timings.micros[i]);
             self.stage_max_us[i] = self.stage_max_us[i].max(timings.micros[i]);
         }
@@ -87,7 +93,7 @@ mod tests {
     fn sums_maxima_and_failures_preserve_outcomes() {
         let mut batch = TerminalProjectionBatchTimings::default();
         let mut t = TerminalProjectionTimings::new();
-        t.micros = [1, 2, 3, 4, 5, 6, 7];
+        t.micros = [1, 2, 3, 4, 5, 6, 7, 8, 9, 10];
         batch.observe(Some(true), &t);
         batch.observe(Some(false), &t);
         t.failure_stage = Some(ProjectionStage::StatsGate as usize);
@@ -101,9 +107,9 @@ mod tests {
             ),
             (3, 1, 1, 1)
         );
-        assert_eq!(batch.stage_sum_us, [3, 6, 9, 12, 15, 18, 21]);
-        assert_eq!(batch.stage_max_us, [1, 2, 3, 4, 5, 6, 7]);
-        assert_eq!(batch.stage_failures, [0, 0, 1, 0, 0, 0, 0]);
+        assert_eq!(batch.stage_sum_us, [3, 6, 9, 12, 15, 18, 21, 24, 27, 30]);
+        assert_eq!(batch.stage_max_us, [1, 2, 3, 4, 5, 6, 7, 8, 9, 10]);
+        assert_eq!(batch.stage_failures, [0, 0, 1, 0, 0, 0, 0, 0, 0, 0]);
     }
     #[tokio::test]
     async fn failed_account_receipt_keeps_failure_stage() {
@@ -131,6 +137,6 @@ mod tests {
         assert!(result.is_err());
         assert_eq!(t.failure_stage, Some(0));
         assert!(t.micros[0] > 0);
-        assert_eq!(t.micros[1..], [0; 6]);
+        assert_eq!(t.micros[1..], [0; 9]);
     }
 }
