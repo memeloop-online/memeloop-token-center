@@ -341,9 +341,18 @@ jobs:
           cargo test --locked --lib db::archive_staging::backend_tests 2>&1 | tee /tmp/staging-db.log
           grep -F '2 passed; 0 failed' /tmp/staging-db.log
           cargo test --locked --lib archive::routing_tests 2>&1 | tee /tmp/staging-routing.log
-          grep -F '6 passed; 0 failed' /tmp/staging-routing.log
+          grep -F '7 passed; 0 failed' /tmp/staging-routing.log
           cargo test --locked --lib training_cas_real_s3_configuration_and_reader -- --ignored 2>&1 | tee /tmp/staging-rustfs.log
           grep -F '1 passed; 0 failed' /tmp/staging-rustfs.log
+          for selector in \
+            archive::raw_capture::retirement_contracts::complete_coverage_retires_exact_roots_and_rejects_stale_backend_versions \
+            api::self_service::requests::tests::legacy_bound_archive_without_raw_root_remains_readable
+          do
+            cargo test --locked --lib "$selector" -- --exact 2>&1 | tee /tmp/raw-reader-authority.log
+            grep -F '1 passed; 0 failed' /tmp/raw-reader-authority.log
+          done
+          cargo test --locked --lib archive::raw_capture::retirement_contracts::rustfs_complete_coverage_retires_exact_roots_and_rejects_stale_backend_versions -- --exact --ignored 2>&1 | tee /tmp/raw-reader-authority-s3.log
+          grep -F '1 passed; 0 failed' /tmp/raw-reader-authority-s3.log
   next-release-contract:
     if: inputs.contract == 'next-release'
     runs-on: ubuntu-24.04
