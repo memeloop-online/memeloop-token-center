@@ -128,7 +128,15 @@ impl Database {
         if matches!(scope, HistoryScope::Key { .. }) {
             refs.view.credential_identity = None;
         }
-        Ok(refs)
+        if refs.view.request_id != snapshot.identity.request_id {
+            return Err(AppError::storage("history_archive_identity_mismatch"));
+        }
+        self.resolve_history_raw_archive_roots(
+            snapshot.identity.tenant_id,
+            snapshot.identity.key_id,
+            refs,
+        )
+        .await
     }
 
     pub(crate) async fn history_session_directory(

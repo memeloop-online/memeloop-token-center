@@ -37,6 +37,8 @@ mod quota_reset_receipts;
 mod raw_cache;
 mod raw_capture;
 mod raw_gc;
+mod raw_reader_authority;
+pub use raw_reader_authority::{CanonicalRawProof, RawReaderAuthority};
 pub use raw_gc::{RawGcCandidate, RawGcCandidateBatch};
 pub(crate) use raw_capture::RawPublicationSettlement;
 #[cfg(test)]
