@@ -54,9 +54,7 @@ test('semantic viewer reads verified atoms lazily, preserves parts and pages wit
     assert.equal(await page.locator('[data-semantic-role=user]').count(), 1);
     await page.getByText('Verified earlier answer', { exact: true }).waitFor();
     assert.equal(await page.evaluate(() => window.semanticAtomReads), 2);
-    // Explicit refresh returns to the latest signed manifest without reading its body again.
-    await page.getByRole('button', { name: 'Refresh conversation', exact: true }).click();
-    await page.waitForFunction(() => window.semanticPageReads === 4);
+    await page.getByRole('button', { name: 'Newer messages', exact: true }).click();
     await page.getByText('Verified latest answer', { exact: true }).waitFor();
     assert.equal(await page.evaluate(() => window.semanticAtomReads), 3);
     assert.equal(await page.locator('.semantic-atom-content').count(), 1);
@@ -66,6 +64,29 @@ test('semantic viewer reads verified atoms lazily, preserves parts and pages wit
     await page.getByText('Verified latest answer', { exact: true }).waitFor();
     assert.equal(await page.locator('[data-semantic-role=agent]').count(), 0);
     assert.equal(await page.locator('[data-semantic-role=unrecorded]').count(), 1);
+    await page.goto(`http://127.0.0.1:${address.port}/e2e/fixtures/semantic-session.html?scenario=many`);
+    await page.getByText('Message item-32', { exact: true }).waitFor();
+    assert.ok(await page.locator('[data-semantic-role=assistant]').count() <= 32);
+    await page.getByRole('button', { name: 'Earlier messages', exact: true }).click();
+    await page.getByText('Message item-0', { exact: true }).waitFor();
+    await page.getByRole('button', { name: 'Newer messages', exact: true }).click();
+    await page.getByText('Message item-32', { exact: true }).waitFor();
+    await page.goto(`http://127.0.0.1:${address.port}/e2e/fixtures/semantic-session.html?scenario=large`);
+    const field = page.locator('[data-semantic-field=text]').first();
+    await field.locator('[data-content-index="0"]').waitFor();
+    for (let index = 1; index <= 5; index++) {
+      await field.evaluate(node => { node.scrollTop = node.scrollHeight; });
+      await field.locator(`[data-content-index="${index}"]`).waitFor();
+      assert.ok(await field.locator('[data-content-index]').count() <= 3);
+    }
+    await page.getByText('COMPLETE LARGE FIELD', { exact: true }).waitFor();
+    for (let index = 2; index >= 0; index--) {
+      await field.evaluate(node => { node.scrollTop = 0; });
+      await field.locator(`[data-content-index="${index}"]`).waitFor();
+    }
+    await page.goto(`http://127.0.0.1:${address.port}/e2e/fixtures/semantic-session.html?scenario=revision`);
+    await page.getByText('Error: Semantic content identity or offset changed; refresh the conversation', { exact: true }).waitFor();
+    assert.equal(await page.getByText('Stale content', { exact: true }).count(), 0);
     await page.goto(`http://127.0.0.1:${address.port}/e2e/fixtures/semantic-session.html?scenario=error`);
     await page.getByText('Semantic read HTTP 500', { exact: true }).waitFor();
     assert.equal(await page.getByText('semantic_publication_pending', { exact: true }).count(), 0);

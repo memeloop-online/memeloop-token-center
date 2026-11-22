@@ -14,11 +14,15 @@ const detail: LogicalSessionDetail = {
   requests: [{ request_id: 'request-a', created_at: 1, protocol: 'openai', model: 'fixture', status_code: 200, duration_ms: 1,
     input_tokens: 1, output_tokens: 1, cost: '0', error_code: null, source: 'live', provenance: 'native', unlinked: false }],
 };
+const revision = '18446744073709551615';
+const largeChunk = '连续内容😀'.repeat(4096);
 const scenario = new URLSearchParams(location.search).get('scenario');
 const loader: SemanticViewLoader = {
   page: async (_request, cursor) => {
     window.semanticPageReads++;
     if (scenario === 'error') throw new Error('Semantic read HTTP 500');
+    if (scenario === 'many') return { status: 'published', manifest_revision: revision, coverage: { observed_terminal: true, projection_state: 'complete', gaps: [], omissions: [] },
+      instances: Array.from({ length: cursor ? 1 : 32 }, (_, i) => ({ instance_id: `item-${cursor ? 0 : i + 1}`, request_id: 'request-a', branch_id: 'branch-a', ordinal: cursor ? 0 : i + 1, role: 'assistant', atom_hash: 'same', node_hash: 'same', atom_cursor: `item-${cursor ? 0 : i + 1}`, origin: 'return', terminal_state: 'complete' })), next_cursor: cursor ? null : 'older-page' };
     return { status: 'published', manifest_revision: '18446744073709551615',
       coverage: { observed_terminal: true, projection_state: 'partial', gaps: ['tool_result_not_recorded'], omissions: [] },
       instances: [{ instance_id: cursor ? 'earlier' : 'latest', request_id: 'request-a', branch_id: 'branch-a', ordinal: cursor ? 1 : 2,
@@ -27,7 +31,7 @@ const loader: SemanticViewLoader = {
   },
   parts: async (_request, cursor) => {
     window.semanticAtomReads++;
-    const instance = cursor === 'latest-atom' ? 'latest' : 'earlier';
+    const instance = cursor.startsWith('item-') ? cursor : cursor === 'latest-atom' ? 'latest' : 'earlier';
     return { manifest_revision: '18446744073709551615', instance_id: instance, role: 'assistant', next_cursor: null,
       parts: [
         { part_index: 0, kind: 'text', fields: [{ name: 'text', format: 'text', content_cursor: `${instance}:text` }] },
@@ -36,10 +40,13 @@ const loader: SemanticViewLoader = {
       ] };
   },
   content: async (_request, cursor) => {
-    const [instance, field] = cursor.split(':');
+    const [instance, field, indexText] = cursor.split(':');
+    const index = Number(indexText ?? 0);
+    if (scenario === 'large' && (field === 'text' || field === 'arguments')) return { manifest_revision: revision, instance_id: instance, part_index: field === 'text' ? 0 : 2, field, format: field === 'text' ? 'text' : 'json', byte_offset: index * new TextEncoder().encode(largeChunk).byteLength, text: index === 5 ? 'COMPLETE LARGE FIELD' : largeChunk, next_cursor: index === 5 ? null : `${instance}:${field}:${index + 1}`, complete: index === 5 };
+    if (scenario === 'revision') return { manifest_revision: '2', instance_id: instance, part_index: 0, field: 'text', format: 'text', byte_offset: 0, text: 'Stale content', next_cursor: null, complete: true };
     return { manifest_revision: '18446744073709551615', instance_id: instance, part_index: field === 'text' ? 0 : field === 'reasoning' ? 1 : 2,
       field: field === 'arguments' ? 'arguments' : 'text', format: field === 'arguments' ? 'json' : 'text', byte_offset: 0,
-      text: field === 'text' ? `Verified ${instance === 'latest' ? 'latest' : 'earlier'} answer` : field === 'reasoning' ? 'Separate reasoning' : '{"query": "structured"}',
+      text: field === 'text' ? instance.startsWith('item-') ? `Message ${instance}` : `Verified ${instance === 'latest' ? 'latest' : 'earlier'} answer` : field === 'reasoning' ? 'Separate reasoning' : '{"query": "structured"}',
       next_cursor: null, complete: true };
   },
   atom: async (_request, cursor) => {

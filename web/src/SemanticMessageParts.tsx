@@ -89,6 +89,7 @@ function Part({ part, ...props }: { part: SemanticPartDescriptor; loader: Semant
     {part.call_id && <p>{zh ? '调用标识' : 'Call ID'}: {part.call_id}</p>}
     {part.completeness === 'partial' && <p>{zh ? '此部分仅记录了部分内容。' : 'This part was partially recorded.'}</p>}
     {fields}
+    {!fields.length && !part.media && <p>{zh ? '此内容没有可显示的文本，可导出消息查看原始记录。' : 'This content has no displayable text. Export the message to inspect its recorded form.'}</p>}
     {part.media && <DataSurface><b>{zh ? '附件' : 'Attachment'}</b><p>{part.media.media_type} · {part.media.byte_length}</p>
       <Button appearance="secondary" disabled={saving} onClick={() => void download()}>{zh ? '保存附件' : 'Save attachment'}</Button>
       {saving && <Button appearance="secondary" onClick={() => active.current?.abort()}>{zh ? '取消' : 'Cancel'}</Button>}
@@ -101,6 +102,22 @@ function Part({ part, ...props }: { part: SemanticPartDescriptor; loader: Semant
     : ['tool_result', 'function_call_output', 'tool-result'].includes(part.kind) ? `${zh ? '工具结果' : 'Tool result'} · ${part.tool_name ?? ''}`
     : `${zh ? '内容类型' : 'Content type'} · ${part.kind}`;
   return <Disclosure title={label} open={expanded} onOpenChange={setExpanded}>{expanded && content}</Disclosure>;
+}
+
+function VisiblePart(props: Parameters<typeof Part>[0]) {
+  const host = useRef<HTMLDivElement>(null);
+  const [visible, setVisible] = useState(false);
+  const [height, setHeight] = useState(64);
+  useEffect(() => {
+    const observer = new IntersectionObserver(entries => {
+      const next = entries.some(entry => entry.isIntersecting);
+      if (!next && host.current) setHeight(host.current.getBoundingClientRect().height);
+      setVisible(next);
+    }, { rootMargin: '100px' });
+    if (host.current) observer.observe(host.current);
+    return () => observer.disconnect();
+  }, []);
+  return <div ref={host} style={{ minHeight: visible ? undefined : height }}>{visible && <Part {...props} />}</div>;
 }
 
 function VisibleParts({ loader, request, instance, revision }: { loader: SemanticViewLoader; request: string; instance: SemanticViewInstance; revision: string }) {
@@ -125,7 +142,7 @@ function VisibleParts({ loader, request, instance, revision }: { loader: Semanti
   return <div className="semantic-atom-content">
     {error && <p role="alert">{error}</p>}
     {loading && <p role="status">{zh ? '正在读取消息…' : 'Loading message…'}</p>}
-    {page?.parts.map(part => <Part key={JSON.stringify([revision, instance.instance_id, part.part_index])} part={part} loader={loader} request={request} instance={instance} revision={revision} />)}
+    {page?.parts.map(part => <VisiblePart key={JSON.stringify([revision, instance.instance_id, part.part_index])} part={part} loader={loader} request={request} instance={instance} revision={revision} />)}
     {position > 0 && <Button appearance="secondary" disabled={loading} onClick={() => void read(history.current[position - 1], position - 1)}>{zh ? '前面的内容' : 'Previous parts'}</Button>}
     {page?.next_cursor && <Button appearance="secondary" disabled={loading} onClick={() => void read(page.next_cursor!, position + 1)}>{zh ? '后续内容' : 'More parts'}</Button>}
     {error && <Button appearance="secondary" onClick={() => void read(history.current[position], position)}>{zh ? '重试' : 'Retry'}</Button>}
