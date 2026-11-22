@@ -1125,6 +1125,8 @@ async fn supervise_roles_with_early_oauth_shutdown(
 }
 
 async fn process_terminal_projection_batch(state: &AppState, lease_owner: Uuid) {
+    let batch_started = std::time::Instant::now();
+    let mut batch = crate::db::TerminalProjectionBatchTimings::default();
     let started = std::time::Instant::now();
     tracing::debug!(%lease_owner, stage = "claim_start", "terminal projection stage");
     let tasks = match state
@@ -1143,14 +1145,16 @@ async fn process_terminal_projection_batch(state: &AppState, lease_owner: Uuid) 
     };
     tracing::debug!(%lease_owner, stage = "claim_done", count = tasks.len(),
         elapsed_ms = started.elapsed().as_millis() as u64, "terminal projection stage");
+    let claim_ms = started.elapsed().as_millis() as u64;
     for request_id in tasks {
         let started = std::time::Instant::now();
         tracing::debug!(%lease_owner, %request_id, stage = "apply_start", "terminal projection stage");
-        match state
+        let (result, timings) = state
             .db
-            .project_claimed_terminal_projection_task(lease_owner, request_id)
-            .await
-        {
+            .project_claimed_terminal_projection_with_timings(lease_owner, request_id)
+            .await;
+        batch.observe(result.as_ref().ok().copied(), &timings);
+        match result {
             Ok(projected) => tracing::debug!(%lease_owner, %request_id, stage = "apply_done",
                 projected, elapsed_ms = started.elapsed().as_millis() as u64,
                 "terminal projection stage"),
@@ -1159,6 +1163,16 @@ async fn process_terminal_projection_batch(state: &AppState, lease_owner: Uuid) 
                 error_category = error.diagnostic_category(),
                 "worker failed to apply terminal projection"),
         }
+    }
+    // Nonempty batches emit one bounded diagnostic; idle passes stay silent.
+    if batch.attempted > 0 {
+        tracing::info!(claim_ms, claimed = batch.attempted, projected = batch.projected,
+            deferred = batch.deferred, failed = batch.failed,
+            batch_wall_ms = batch_started.elapsed().as_millis() as u64,
+            stage_names = ?crate::db::TERMINAL_PROJECTION_STAGE_NAMES,
+            stage_sum_us = ?batch.stage_sum_us, stage_max_us = ?batch.stage_max_us,
+            stage_failures = ?batch.stage_failures,
+            "terminal projection batch timing");
     }
 }
 

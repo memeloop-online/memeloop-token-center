@@ -1,4 +1,5 @@
 use super::super::*;
+use super::terminal_timings::{ProjectionStage, TerminalProjectionTimings};
 
 pub(super) async fn enqueue_unknown_terminal_projection_in_transaction(
     transaction: &mut Transaction<'_, Any>,
@@ -139,14 +140,29 @@ impl Database {
         lease_owner: Uuid,
         request_id: Uuid,
     ) -> Result<bool, AppError> {
+        self.project_claimed_terminal_projection_with_timings(lease_owner, request_id)
+            .await
+            .0
+    }
+
+    pub(crate) async fn project_claimed_terminal_projection_with_timings(
+        &self,
+        lease_owner: Uuid,
+        request_id: Uuid,
+    ) -> (Result<bool, AppError>, TerminalProjectionTimings) {
+        let mut timings = TerminalProjectionTimings::new();
+        let result: Result<bool, AppError> = async {
         if !self
             .project_terminal_account_receipt(lease_owner, request_id)
             .await?
         {
             return Ok(false);
         }
+        timings.enter(ProjectionStage::TxBegin);
         let mut transaction = self.begin_write_transaction().await?;
+        timings.enter(ProjectionStage::StatsGate);
         lock_request_stats_projection_writer_in_transaction(&mut transaction).await?;
+        timings.enter(ProjectionStage::OutboxClaim);
         let now = unix_millis();
         let request_id = request_id.to_string();
         let owner = lease_owner.to_string();
@@ -159,9 +175,11 @@ impl Database {
         .fetch_optional(&mut *transaction)
         .await?;
         let Some(task) = claimed else {
+            timings.enter(ProjectionStage::Commit);
             transaction.commit().await?;
             return Ok(false);
         };
+        timings.enter(ProjectionStage::FactProjection);
         let created_at: i64 = task.try_get("created_at")?;
         let pruned = statistics_pruned_in_transaction(&mut transaction, created_at).await?;
         sqlx::query(
@@ -214,6 +232,7 @@ impl Database {
             )
             .await?;
         }
+        timings.enter(ProjectionStage::HistoryCapture);
         let tenant_id: String = task.try_get("tenant_id")?;
         let key_id: String = task.try_get("key_id")?;
         // The claimed outbox row and its acknowledgement are the financial
@@ -263,8 +282,12 @@ impl Database {
             task.try_get("completed_at")?,
         )
         .await?;
+        timings.enter(ProjectionStage::Commit);
         transaction.commit().await?;
         Ok(true)
+        }.await;
+        timings.finish(result.is_err());
+        (result, timings)
     }
 
     async fn project_terminal_account_receipt(
