@@ -23,7 +23,7 @@ function ContentField({ loader, request, instance, revision, part, field }: {
     const entry = positions.current[target]; if (!entry) return;
     if (!stream.current || stream.current.nextIndex !== target) {
       stream.current?.controller.abort();
-      void stream.current?.iterator.return?.();
+      void Promise.resolve(stream.current?.iterator.return?.()).catch(() => undefined);
       const controller = new AbortController();
       if (loader.content) stream.current = { nextIndex: target, iterator: loader.content(request, entry.cursor, controller.signal)[Symbol.asyncIterator](), controller };
     }
@@ -60,11 +60,11 @@ function ContentField({ loader, request, instance, revision, part, field }: {
       });
     } catch (reason) {
       if (!controller.signal.aborted) setError(String(reason));
-      stream.current?.controller.abort(); void stream.current?.iterator.return?.(); stream.current = null;
+      stream.current?.controller.abort(); void Promise.resolve(stream.current?.iterator.return?.()).catch(() => undefined); stream.current = null;
     }
     finally { if (active.current === controller) { active.current = null; setLoading(false); } }
   };
-  useEffect(() => { void move(0); return () => { stream.current?.controller.abort(); void stream.current?.iterator.return?.(); active.current?.abort(); }; }, []);
+  useEffect(() => { void move(0); return () => { stream.current?.controller.abort(); void Promise.resolve(stream.current?.iterator.return?.()).catch(() => undefined); active.current?.abort(); }; }, []);
   const first = chunks[0]; const last = chunks.at(-1);
   const role = instance.role;
   const richText: ConversationMessageListProjection | undefined = field.name === 'text' && field.format === 'text'

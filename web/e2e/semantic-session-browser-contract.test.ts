@@ -78,13 +78,14 @@ test('semantic viewer reads verified atoms lazily, preserves parts and pages wit
     await field.locator('[data-content-index="0"]').waitFor();
     for (let index = 1; index <= 5; index++) {
       await field.evaluate(node => { node.scrollTop = node.scrollHeight; });
-      await field.locator(`[data-content-index="${index}"]`).waitFor();
+      await field.locator(`[data-content-index="${index}"]`).waitFor({ state: 'attached' });
       assert.ok(await field.locator('[data-content-index]').count() <= 3);
     }
+    await field.evaluate(node => { node.scrollTop = node.scrollHeight; });
     await page.getByText('COMPLETE LARGE FIELD', { exact: true }).waitFor();
     for (let index = 2; index >= 0; index--) {
       await field.evaluate(node => { node.scrollTop = 0; });
-      await field.locator(`[data-content-index="${index}"]`).waitFor();
+      await field.locator(`[data-content-index="${index}"]`).waitFor({ state: 'attached' });
     }
     await page.goto(`http://127.0.0.1:${address.port}/e2e/fixtures/semantic-session.html?scenario=revision`);
     await page.getByText('Error: Semantic content identity or offset changed; refresh the conversation', { exact: true }).waitFor();

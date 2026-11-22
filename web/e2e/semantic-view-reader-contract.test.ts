@@ -107,3 +107,35 @@ test('typed readers preserve owner scope and signed content and attachment curso
     }
   } finally { globalThis.fetch = old; }
 });
+
+test('content frames share one UTF8 stream and an unverified EOF remains incomplete', async () => {
+  const old = globalThis.fetch;
+  const encoder = new TextEncoder();
+  let requests = 0;
+  const frames = [
+    { manifest_revision: '1', instance_id: 'a', part_index: 0, field: 'text', format: 'text', byte_offset: 0, text: '😀', complete: false, next_cursor: 'resume-4' },
+    { manifest_revision: '1', instance_id: 'a', part_index: 0, field: 'text', format: 'text', byte_offset: 4, text: '内容', complete: true, next_cursor: null },
+  ];
+  let verified = true;
+  globalThis.fetch = async () => {
+    requests++;
+    const bytes = encoder.encode((verified ? frames : frames.slice(0, 1)).map(frame => JSON.stringify(frame)).join('\n') + '\n');
+    let offset = 0;
+    return new Response(new ReadableStream<Uint8Array>({ pull(controller) {
+      if (offset === bytes.length) { controller.close(); return; }
+      controller.enqueue(bytes.subarray(offset, ++offset));
+    } }), { headers: { 'content-type': 'application/x-ndjson' } });
+  };
+  try {
+    const loader = createSemanticViewLoader('fixture', () => '/semantic');
+    const received = [];
+    for await (const frame of loader.content!('request-a', 'signed', new AbortController().signal)) received.push(frame);
+    assert.equal(requests, 1);
+    assert.equal(received.map(frame => frame.text).join(''), '😀内容');
+    assert.equal(received[1].byte_offset, encoder.encode(received[0].text).byteLength);
+    verified = false;
+    await assert.rejects(async () => {
+      for await (const _frame of loader.content!('request-a', 'signed', new AbortController().signal)) { /* consume to verify EOF */ }
+    }, /ended before verification/);
+  } finally { globalThis.fetch = old; }
+});
