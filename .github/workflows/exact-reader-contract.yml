@@ -682,6 +682,8 @@ jobs:
           set -o pipefail
           git rev-parse HEAD
           test "$(git rev-parse HEAD)" = "${{ inputs.source_revision }}"
+          cargo test --locked --lib archive::semantic_reader::tests -- --nocapture 2>&1 | tee /tmp/semantic-reader-chunks.log
+          grep -F '4 passed; 0 failed' /tmp/semantic-reader-chunks.log
           for backend in sqlite postgres; do
             cargo test --locked --lib "db::session_reading::tests::${backend}_semantic_revision_uses_authorized_request_scope" -- --exact --nocapture 2>&1 | tee /tmp/semantic-reader-scope.log
             grep -F '1 passed; 0 failed' /tmp/semantic-reader-scope.log
