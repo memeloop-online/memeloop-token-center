@@ -94,6 +94,32 @@ async fn missing_response_is_not_fabricated_and_late_capture_preserves_prefix() 
         .await
         .unwrap();
     assert_eq!(manifest.raw_captures.len(), 1);
+    let edges = store
+        .trace_legacy_raw_gc_references(
+            tenant,
+            request_id,
+            &[manifest.raw_captures[0].object.clone(), incomplete.clone()],
+        )
+        .await
+        .unwrap();
+    assert!(
+        edges
+            .iter()
+            .any(|edge| edge.authority == "legacy_raw_capture")
+    );
+    assert!(edges.iter().any(|edge| edge.authority == "legacy_manifest"));
+    assert!(edges.iter().all(|edge| edge.revision.is_none()));
+    assert!(
+        store
+            .trace_legacy_raw_gc_references(
+                Uuid::now_v7(),
+                request_id,
+                &[manifest.raw_captures[0].object.clone()],
+            )
+            .await
+            .is_err()
+    );
+
     assert!(manifest.gaps.iter().any(|gap| gap == "response_missing"));
     assert!(
         store

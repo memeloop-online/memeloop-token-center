@@ -225,6 +225,7 @@ jobs:
             error::tests::object_storage_classification_preserves_only_typed_safe_facts \
             error::tests::dependency_errors_do_not_retain_secret_bearing_driver_messages \
             archive::raw_gc_roots::tests::gc_part_parser_skips_body_values_and_rejects_unknown_reference_schema \
+            archive::conversation_capture_tests::missing_response_is_not_fabricated_and_late_capture_preserves_prefix \
             archive::raw_capture::retirement_contracts::complete_coverage_retires_exact_roots_and_rejects_stale_backend_versions \
             archive::raw_capture::retirement_contracts::incomplete_protocol_keeps_both_raw_roots_owned \
             response_archive_spool::tests::late_response_capture_settles_against_retired_semantics_without_restoring_raw_binding \
