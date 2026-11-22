@@ -65,6 +65,11 @@ pub enum HistoryCommand {
         #[arg(long, default_value_t = 64, value_parser = clap::value_parser!(i64).range(1..=64))]
         page_size: i64,
     },
+    /// Export one bounded page through the ordinary lease and exact ACK path.
+    ExportPage {
+        #[arg(long, default_value_t = 64, value_parser = clap::value_parser!(i64).range(1..=500))]
+        page_size: i64,
+    },
     Drain {
         #[arg(long, default_value_t = 500, value_parser = clap::value_parser!(i64).range(1..))]
         page_size: i64,
@@ -134,6 +139,7 @@ pub async fn command(config: &Config, command: HistoryCommand) -> Result<Value, 
         HistoryCommand::Backfill { .. }
             | HistoryCommand::BaselineSource { .. }
             | HistoryCommand::Drain { .. }
+            | HistoryCommand::ExportPage { .. }
             | HistoryCommand::Verify
             | HistoryCommand::Switch
             | HistoryCommand::Refresh
@@ -246,6 +252,22 @@ pub async fn command(config: &Config, command: HistoryCommand) -> Result<Value, 
             }
             drain(&database, &client, page_size).await?;
         }
+        HistoryCommand::ExportPage { page_size } => {
+            let lease_database = database
+                .clone()
+                .with_auxiliary_pool_max_connections(1)
+                .independent_persistence_pool();
+            return Ok(
+                match export_batch(&database, &lease_database, &client, page_size).await {
+                    Ok(report) => {
+                        json!({"status":"completed","attempted":report.attempted,"acked":report.acked,"deferred":report.attempted.saturating_sub(report.acked),"operation_failed":false})
+                    }
+                    Err(failure) => {
+                        json!({"status":"failed","attempted":failure.attempted,"acked":failure.acked,"deferred":failure.acked.map(|acked| failure.attempted.saturating_sub(acked)),"operation_failed":true,"stage":failure.stage,"batch_first_source":failure.source,"batch_first_revision":failure.revision,"diagnostic":failure.error.safe_diagnostic()})
+                    }
+                },
+            );
+        }
         HistoryCommand::Drain { page_size } => drain(&database, &client, page_size).await?,
         HistoryCommand::Verify => return verify(&database, &client).await,
         HistoryCommand::Switch => {
@@ -284,19 +306,84 @@ async fn export_page_with_lease(
     client: &ClickHouse,
     page_size: i64,
 ) -> Result<usize, HistoryError> {
-    let (mut lease, ceiling) = lease_database.history_delivery_lease().await?;
-    let snapshots = database.history_pending_through(page_size, ceiling).await?;
-    // If the control socket died before selection, a new fence may have been
-    // installed. Validate it after selection and before sending any CH bytes.
+    export_batch(database, lease_database, client, page_size)
+        .await
+        .map(|report| report.attempted)
+        .map_err(|failure| failure.error)
+}
+
+struct ExportReport {
+    attempted: usize,
+    acked: usize,
+}
+struct ExportFailure {
+    stage: &'static str,
+    attempted: usize,
+    acked: Option<usize>,
+    source: Option<String>,
+    revision: Option<i64>,
+    error: HistoryError,
+}
+
+async fn export_batch(
+    database: &Database,
+    lease_database: &Database,
+    client: &ClickHouse,
+    page_size: i64,
+) -> Result<ExportReport, ExportFailure> {
+    let failure = |stage, error| ExportFailure {
+        stage,
+        attempted: 0,
+        acked: Some(0),
+        source: None,
+        revision: None,
+        error,
+    };
+    let (mut lease, ceiling) = lease_database
+        .history_delivery_lease()
+        .await
+        .map_err(|error| failure("lease", error))?;
+    let snapshots = database
+        .history_pending_through(page_size, ceiling)
+        .await
+        .map_err(|error| failure("capture_materialize", error))?;
+    let failure = |stage, error| ExportFailure {
+        stage,
+        attempted: snapshots.len(),
+        acked: Some(0),
+        source: snapshots.first().map(|row| row.identity.source.clone()),
+        revision: snapshots.first().map(|row| row.revision),
+        error,
+    };
     if let Some(lease) = lease.as_mut() {
-        sqlx::query("SELECT 1").execute(&mut **lease).await?;
+        sqlx::query("SELECT 1")
+            .execute(&mut **lease)
+            .await
+            .map_err(|error| failure("lease_validate", error.into()))?;
     }
-    client.append(&snapshots).await?;
-    database.history_acknowledge(&snapshots).await?;
+    client
+        .append(&snapshots)
+        .await
+        .map_err(|error| failure("append", error))?;
+    let acked = database
+        .history_acknowledge_count(&snapshots)
+        .await
+        .map_err(|error| {
+            let mut failure = failure("acknowledge", error);
+            failure.acked = None;
+            failure
+        })?;
     if let Some(lease) = lease {
-        lease.rollback().await?;
+        lease.rollback().await.map_err(|error| {
+            let mut failure = failure("lease_release", error.into());
+            failure.acked = Some(acked);
+            failure
+        })?;
     }
-    Ok(snapshots.len())
+    Ok(ExportReport {
+        attempted: snapshots.len(),
+        acked,
+    })
 }
 
 pub async fn drain(
@@ -332,6 +419,7 @@ pub(crate) async fn run_worker(state: AppState, mut shutdown: watch::Receiver<bo
         .clone()
         .with_auxiliary_pool_max_connections(1)
         .independent_persistence_pool();
+    let mut failure_buckets = BTreeMap::new();
     loop {
         if *shutdown.borrow() {
             return;
@@ -340,20 +428,111 @@ pub(crate) async fn run_worker(state: AppState, mut shutdown: watch::Receiver<bo
             _ = shutdown.changed() => return,
             _ = async {
                 if let Some(client) = &client {
-                    let result = async {
-                        if database.history_mode().await? == "off" {
-                            return Ok::<_, HistoryError>(());
+                    let result = match database.history_mode().await {
+                        Ok(mode) if mode == "off" => Ok(ExportReport { attempted:0, acked:0 }),
+                        Ok(_) => export_batch(&database, &lease_database, client, 500).await,
+                        Err(error) => Err(ExportFailure { stage:"mode",attempted:0,acked:Some(0),source:None,revision:None,error }),
+                    };
+                    {
+                        match result {
+                            Ok(_) => {}
+                            Err(failure) => {
+                                let diagnostic = failure.error.safe_diagnostic();
+                                if let Some(occurrences) = failure_log_occurrences(&mut failure_buckets, failure.stage, &diagnostic, std::time::Instant::now()) {
+                                    tracing::warn!(stage=failure.stage, diagnostic=%diagnostic, batch_first_source=?failure.source, batch_first_revision=?failure.revision, occurrences, "request history export deferred; durable queue retained");
+                                }
+                            }
                         }
-                        export_page_with_lease(&database, &lease_database, client, 500).await?;
-                        Ok(())
-                    }.await;
-                    if result.is_err() {
-                        tracing::warn!("request history export deferred; durable queue retained");
                     }
                 }
                 tokio::time::sleep(std::time::Duration::from_secs(1)).await;
             } => {}
         }
+    }
+}
+
+fn failure_log_occurrences(
+    buckets: &mut BTreeMap<(&'static str, &'static str), (std::time::Instant, u64)>,
+    stage: &'static str,
+    diagnostic: &Value,
+    now: std::time::Instant,
+) -> Option<u64> {
+    // The bucket space is the fixed export stages and fixed safe categories.
+    // SQLSTATE/reason/identity values never create additional log buckets.
+    let category = match diagnostic["category"].as_str() {
+        Some("invalid") => "invalid",
+        Some("verification") => "verification",
+        Some("sql") => "sql",
+        Some("clickhouse_rejected") => "clickhouse_rejected",
+        Some("unavailable") => "unavailable",
+        Some("changed") => "changed",
+        Some("mismatch") => "mismatch",
+        Some("database") => "database",
+        Some("json") => "json",
+        _ => "unknown",
+    };
+    match buckets.entry((stage, category)) {
+        std::collections::btree_map::Entry::Vacant(entry) => {
+            entry.insert((now, 0));
+            Some(1)
+        }
+        std::collections::btree_map::Entry::Occupied(mut entry) => {
+            let (last, count) = entry.get_mut();
+            *count += 1;
+            if now.duration_since(*last) < std::time::Duration::from_secs(60) {
+                return None;
+            }
+            let occurrences = *count;
+            *last = now;
+            *count = 0;
+            Some(occurrences)
+        }
+    }
+}
+
+#[cfg(test)]
+mod export_diagnostic_tests {
+    use super::*;
+    #[test]
+    fn request_history_export_log_buckets_count_alternating_failures_independently() {
+        let mut buckets = BTreeMap::new();
+        let now = std::time::Instant::now();
+        for category in ["sql", "database"] {
+            assert_eq!(
+                failure_log_occurrences(
+                    &mut buckets,
+                    "capture_materialize",
+                    &json!({"category":category}),
+                    now
+                ),
+                Some(1)
+            );
+        }
+        for _ in 0..3 {
+            for category in ["sql", "database"] {
+                assert_eq!(
+                    failure_log_occurrences(
+                        &mut buckets,
+                        "capture_materialize",
+                        &json!({"category":category}),
+                        now
+                    ),
+                    None
+                );
+            }
+        }
+        for category in ["sql", "database"] {
+            assert_eq!(
+                failure_log_occurrences(
+                    &mut buckets,
+                    "capture_materialize",
+                    &json!({"category":category}),
+                    now + std::time::Duration::from_secs(60)
+                ),
+                Some(4)
+            );
+        }
+        assert_eq!(buckets.len(), 2);
     }
 }
 
