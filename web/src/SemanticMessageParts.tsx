@@ -1,3 +1,5 @@
+import { MessageContent } from '@memeloop/react-ui/chat';
+import type { ConversationMessageListProjection } from 'memeloop';
 import { useEffect, useRef, useState } from 'react';
 import { Button, DataSurface, Disclosure } from './design-system';
 import { useI18n } from './i18n.js';
@@ -51,6 +53,14 @@ function ContentField({ loader, request, instance, revision, part, field }: {
   };
   useEffect(() => { void move(0); return () => active.current?.abort(); }, []);
   const first = chunks[0]; const last = chunks.at(-1);
+  const role = instance.role;
+  const richText: ConversationMessageListProjection | undefined = field.name === 'text' && field.format === 'text'
+    && chunks.length === 1 && first?.index === 0 && first.value.complete
+    && (role === 'user' || role === 'assistant' || role === 'tool' || role === 'agent' || role === 'error') ? {
+      messageId: JSON.stringify([revision, instance.instance_id, part.part_index]), conversationId: request,
+      turnId: instance.turn_id ?? instance.instance_id, role, content: first.value.text,
+      originNodeId: instance.origin, originSequence: instance.ordinal, lamportClock: instance.ordinal, timestamp: 0,
+    } : undefined;
   return <section aria-label={field.name}>
     <div ref={viewport} tabIndex={0} data-semantic-field={field.name} style={{ maxHeight: '24rem', overflow: 'auto', overflowAnchor: 'none' }}
       onScroll={event => {
@@ -59,7 +69,7 @@ function ContentField({ loader, request, instance, revision, part, field }: {
         if (node.scrollTop < 32 && first && first.index > 0) void move(first.index - 1);
         else if (node.scrollTop + node.clientHeight >= node.scrollHeight - 64 && last?.value.next_cursor) void move(last.index + 1);
       }}>
-      {chunks.map(chunk => <span key={chunk.index} data-content-index={chunk.index} style={{ whiteSpace: 'pre-wrap', overflowWrap: 'anywhere' }}>{chunk.value.text}</span>)}
+      {richText ? <MessageContent message={richText} /> : chunks.map(chunk => <span key={chunk.index} data-content-index={chunk.index} style={{ whiteSpace: 'pre-wrap', overflowWrap: 'anywhere' }}>{chunk.value.text}</span>)}
     </div>
     {error && <p role="alert">{error}</p>}
     {loading && <p role="status">{zh ? '正在读取内容…' : 'Loading content…'}</p>}
