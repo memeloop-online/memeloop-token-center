@@ -25,6 +25,23 @@ const loader: SemanticViewLoader = {
         role: scenario === 'unknown' ? null : cursor ? 'user' : 'assistant', atom_hash: 'a'.repeat(64), node_hash: 'b'.repeat(64), atom_cursor: cursor ?? 'latest-atom', origin: 'return', terminal_state: 'complete' }],
       next_cursor: cursor ? null : 'older-page' };
   },
+  parts: async (_request, cursor) => {
+    window.semanticAtomReads++;
+    const instance = cursor === 'latest-atom' ? 'latest' : 'earlier';
+    return { manifest_revision: '18446744073709551615', instance_id: instance, role: 'assistant', next_cursor: null,
+      parts: [
+        { part_index: 0, kind: 'text', fields: [{ name: 'text', format: 'text', content_cursor: `${instance}:text` }] },
+        { part_index: 1, kind: 'reasoning', fields: [{ name: 'text', format: 'text', content_cursor: `${instance}:reasoning` }] },
+        { part_index: 2, kind: 'tool_call', tool_name: 'lookup', call_id: 'call-1', fields: [{ name: 'arguments', format: 'json', content_cursor: `${instance}:arguments` }] },
+      ] };
+  },
+  content: async (_request, cursor) => {
+    const [instance, field] = cursor.split(':');
+    return { manifest_revision: '18446744073709551615', instance_id: instance, part_index: field === 'text' ? 0 : field === 'reasoning' ? 1 : 2,
+      field: field === 'arguments' ? 'arguments' : 'text', format: field === 'arguments' ? 'json' : 'text', byte_offset: 0,
+      text: field === 'text' ? `Verified ${instance === 'latest' ? 'latest' : 'earlier'} answer` : field === 'reasoning' ? 'Separate reasoning' : '{"query": "structured"}',
+      next_cursor: null, complete: true };
+  },
   atom: async (_request, cursor) => {
     window.semanticAtomReads++;
     return new Response(JSON.stringify({ role: scenario === 'unknown' ? 'unrecorded-provider-role' : cursor === 'latest-atom' ? 'assistant' : 'user', parts: [

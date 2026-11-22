@@ -8,14 +8,14 @@ function ContentField({ loader, request, instance, revision, part, field }: {
   part: SemanticPartDescriptor; field: SemanticContentField;
 }) {
   const { locale } = useI18n(); const zh = locale.startsWith('zh');
-  const [chunk, setChunk] = useState<SemanticContentChunk>();
-  const [position, setPosition] = useState(0);
+  const [chunks, setChunks] = useState<{ index: number; value: SemanticContentChunk }[]>([]);
+  const chunksRef = useRef(chunks); chunksRef.current = chunks;
   const [error, setError] = useState('');
   const [loading, setLoading] = useState(false);
   const positions = useRef([{ cursor: field.content_cursor, offset: 0 }]);
   const active = useRef<AbortController | null>(null);
   const viewport = useRef<HTMLDivElement>(null);
-  const move = async (target: number, fromEnd = false) => {
+  const move = async (target: number) => {
     if (active.current) return;
     const entry = positions.current[target]; if (!entry) return;
     const controller = new AbortController(); active.current = controller;
@@ -32,37 +32,48 @@ function ContentField({ loader, request, instance, revision, part, field }: {
         if (!size || positions.current.slice(0, target + 1).some(item => item.cursor === value.next_cursor)) throw new Error('Semantic content continuation did not advance');
         positions.current[target + 1] = { cursor: value.next_cursor, offset: value.byte_offset + size };
       }
-      setChunk(value); setPosition(target);
+      const current = chunksRef.current;
+      const backwards = current.length > 0 && target < current[0].index;
+      const next = backwards ? [{ index: target, value }, ...current].slice(0, 3)
+        : [...current, { index: target, value }].slice(-3);
+      const node = viewport.current;
+      const anchor = node?.querySelector<HTMLElement>(`[data-content-index="${backwards ? current[0]?.index : current.at(-1)?.index}"]`);
+      const top = anchor?.getBoundingClientRect().top;
+      const anchorIndex = anchor?.dataset.contentIndex;
+      chunksRef.current = next; setChunks(next);
       requestAnimationFrame(() => {
-        const node = viewport.current;
-        if (node) node.scrollTop = fromEnd ? Math.max(0, node.scrollHeight - node.clientHeight - 1) : 1;
+        if (!node) return;
+        const restored = node.querySelector<HTMLElement>(`[data-content-index="${anchorIndex}"]`);
+        if (restored && top !== undefined) node.scrollTop += restored.getBoundingClientRect().top - top;
       });
     } catch (reason) { if (!controller.signal.aborted) setError(String(reason)); }
     finally { if (active.current === controller) { active.current = null; setLoading(false); } }
   };
   useEffect(() => { void move(0); return () => active.current?.abort(); }, []);
+  const first = chunks[0]; const last = chunks.at(-1);
   return <section aria-label={field.name}>
-    <div ref={viewport} tabIndex={0} style={{ maxHeight: '24rem', overflow: 'auto', overflowAnchor: 'none' }}
+    <div ref={viewport} tabIndex={0} data-semantic-field={field.name} style={{ maxHeight: '24rem', overflow: 'auto', overflowAnchor: 'none' }}
       onScroll={event => {
         if (loading) return;
         const node = event.currentTarget;
-        if (node.scrollTop === 0 && position > 0) void move(position - 1, true);
-        else if (node.scrollTop + node.clientHeight >= node.scrollHeight - 1 && chunk?.next_cursor) void move(position + 1);
+        if (node.scrollTop < 32 && first && first.index > 0) void move(first.index - 1);
+        else if (node.scrollTop + node.clientHeight >= node.scrollHeight - 64 && last?.value.next_cursor) void move(last.index + 1);
       }}>
-      <pre className="break-anywhere" style={{ whiteSpace: 'pre-wrap', margin: 0 }}>{chunk?.text}</pre>
+      {chunks.map(chunk => <span key={chunk.index} data-content-index={chunk.index} style={{ whiteSpace: 'pre-wrap', overflowWrap: 'anywhere' }}>{chunk.value.text}</span>)}
     </div>
     {error && <p role="alert">{error}</p>}
     {loading && <p role="status">{zh ? '正在读取内容…' : 'Loading content…'}</p>}
     <div>
-      {position > 0 && <Button appearance="secondary" disabled={loading} onClick={() => void move(position - 1, true)}>{zh ? '上一段内容' : 'Previous content'}</Button>}
-      {chunk?.next_cursor && <Button appearance="secondary" disabled={loading} onClick={() => void move(position + 1)}>{zh ? '下一段内容' : 'Next content'}</Button>}
-      {error && <Button appearance="secondary" disabled={loading} onClick={() => void move(position)}>{zh ? '重试' : 'Retry'}</Button>}
+      {first && first.index > 0 && <Button appearance="secondary" disabled={loading} onClick={() => void move(first.index - 1)}>{zh ? '前面的内容' : 'Previous content'}</Button>}
+      {last?.value.next_cursor && <Button appearance="secondary" disabled={loading} onClick={() => void move(last.index + 1)}>{zh ? '后续内容' : 'More content'}</Button>}
+      {error && <Button appearance="secondary" disabled={loading} onClick={() => void move(last ? last.index + 1 : 0)}>{zh ? '重试' : 'Retry'}</Button>}
     </div>
   </section>;
 }
 
 function Part({ part, ...props }: { part: SemanticPartDescriptor; loader: SemanticViewLoader; request: string; instance: SemanticViewInstance; revision: string }) {
   const { locale } = useI18n(); const zh = locale.startsWith('zh');
+  const [expanded, setExpanded] = useState(false);
   const [error, setError] = useState(''); const [saving, setSaving] = useState(false);
   const active = useRef<AbortController | null>(null);
   useEffect(() => () => active.current?.abort(), []);
@@ -89,7 +100,7 @@ function Part({ part, ...props }: { part: SemanticPartDescriptor; loader: Semant
     : ['tool_call', 'function_call', 'tool-call'].includes(part.kind) ? `${zh ? '工具调用' : 'Tool call'} · ${part.tool_name ?? ''}`
     : ['tool_result', 'function_call_output', 'tool-result'].includes(part.kind) ? `${zh ? '工具结果' : 'Tool result'} · ${part.tool_name ?? ''}`
     : `${zh ? '内容类型' : 'Content type'} · ${part.kind}`;
-  return <Disclosure title={label}>{content}</Disclosure>;
+  return <Disclosure title={label} open={expanded} onOpenChange={setExpanded}>{expanded && content}</Disclosure>;
 }
 
 function VisibleParts({ loader, request, instance, revision }: { loader: SemanticViewLoader; request: string; instance: SemanticViewInstance; revision: string }) {

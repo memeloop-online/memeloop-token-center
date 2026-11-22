@@ -133,6 +133,10 @@ globalThis.fetch = async (input: RequestInfo | URL, init?: RequestInit) => {
     edges: [], has_more: false, next_cursor: null, edges_truncated: false,
   });
   if (url.pathname.endsWith('/semantic-view')) {
+    if (url.searchParams.has('parts_cursor')) return json({ manifest_revision: '1', instance_id: 'checklist-answer', role: 'assistant', next_cursor: null,
+      parts: [{ part_index: 0, kind: 'text', fields: [{ name: 'text', format: 'text', content_cursor: 'checklist-text' }] }] });
+    if (url.searchParams.has('content_cursor')) return json({ manifest_revision: '1', instance_id: 'checklist-answer', part_index: 0, field: 'text', format: 'text', byte_offset: 0,
+      text: 'The checklist is ready for review.', next_cursor: null, complete: true });
     if (url.searchParams.has('atom_cursor')) return json({ role: 'assistant', parts: [{ kind: 'text', text: 'The checklist is ready for review.' }] });
     return json({ status: 'published', manifest_revision: '1',
       coverage: { observed_terminal: true, projection_state: 'complete', gaps: [], omissions: [] },
