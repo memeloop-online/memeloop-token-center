@@ -346,7 +346,9 @@ jobs:
           grep -F '1 passed; 0 failed' /tmp/staging-rustfs.log
           for selector in \
             archive::raw_capture::retirement_contracts::complete_coverage_retires_exact_roots_and_rejects_stale_backend_versions \
-            api::self_service::requests::tests::legacy_bound_archive_without_raw_root_remains_readable
+            api::self_service::requests::tests::legacy_bound_archive_without_raw_root_remains_readable \
+            db::requests::conversations::archive_readiness_tests::sqlite_semantic_coverage_recovers_committed_projection_and_failed_put \
+            db::requests::conversations::archive_readiness_tests::postgres_semantic_coverage_recovers_committed_projection_and_failed_put
           do
             cargo test --locked --lib "$selector" -- --exact 2>&1 | tee /tmp/raw-reader-authority.log
             grep -F '1 passed; 0 failed' /tmp/raw-reader-authority.log
