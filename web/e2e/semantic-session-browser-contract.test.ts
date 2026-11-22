@@ -65,13 +65,13 @@ test('semantic viewer reads verified atoms lazily, preserves parts and pages wit
     assert.equal(await page.locator('[data-semantic-role=agent]').count(), 0);
     assert.equal(await page.locator('[data-semantic-role=unrecorded]').count(), 1);
     await page.goto(`http://127.0.0.1:${address.port}/e2e/fixtures/semantic-session.html?scenario=many`);
-    await page.locator('[data-semantic-ordinal=32]').scrollIntoViewIfNeeded();
+    await page.locator('[data-semantic-ordinal="32"]').scrollIntoViewIfNeeded();
     await page.getByText('Message item-32', { exact: true }).waitFor();
     assert.ok(await page.locator('[data-semantic-role=assistant]').count() <= 32);
     await page.getByRole('button', { name: 'Earlier messages', exact: true }).click();
     await page.getByText('Message item-0', { exact: true }).waitFor();
     await page.getByRole('button', { name: 'Newer messages', exact: true }).click();
-    await page.locator('[data-semantic-ordinal=32]').scrollIntoViewIfNeeded();
+    await page.locator('[data-semantic-ordinal="32"]').scrollIntoViewIfNeeded();
     await page.getByText('Message item-32', { exact: true }).waitFor();
     await page.goto(`http://127.0.0.1:${address.port}/e2e/fixtures/semantic-session.html?scenario=large`);
     const field = page.locator('[data-semantic-field=text]').first();
