@@ -101,6 +101,18 @@ test('semantic viewer reads verified atoms lazily, preserves parts and pages wit
       await field.evaluate(node => { node.scrollTop = 0; node.dispatchEvent(new WheelEvent('wheel', { deltaY: -300, bubbles: true })); });
       await field.locator(`[data-content-index="${index}"]`).waitFor({ state: 'attached' });
     }
+    for (const [title, name] of [['Tool call · lookup', 'arguments'], ['Tool result · lookup', 'result_content']]) {
+      await page.getByRole('button', { name: title, exact: true }).click();
+      const toolField = page.locator(`[data-semantic-field=${name}]`);
+      await toolField.locator('[data-content-index="0"]').waitFor();
+      for (let index = 1; index <= 5; index++) {
+        await toolField.evaluate(node => { node.scrollTop = node.scrollHeight; node.dispatchEvent(new WheelEvent('wheel', { deltaY: 300, bubbles: true })); });
+        await toolField.locator(`[data-content-index="${index}"]`).waitFor({ state: 'attached' });
+        assert.ok(await toolField.locator('[data-content-index]').count() <= 3);
+      }
+      await toolField.evaluate(node => { node.scrollTop = node.scrollHeight; });
+      await toolField.getByText('COMPLETE LARGE FIELD', { exact: true }).waitFor();
+    }
     await page.goto(`http://127.0.0.1:${address.port}/e2e/fixtures/semantic-session.html?scenario=revision`);
     await page.getByText('Error: Semantic content identity or offset changed; refresh the conversation', { exact: true }).waitFor();
     assert.equal(await page.getByText('Stale content', { exact: true }).count(), 0);

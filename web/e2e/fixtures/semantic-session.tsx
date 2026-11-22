@@ -20,9 +20,9 @@ const scenario = new URLSearchParams(location.search).get('scenario');
 async function* contentFrames(_request: string, cursor: string): AsyncGenerator<SemanticContentChunk> {
     const [instance, field, indexText] = cursor.split(':');
     const index = Number(indexText ?? 0);
-    if (scenario === 'large' && (field === 'text' || field === 'arguments')) {
+    if (scenario === 'large' && (field === 'text' || field === 'arguments' || field === 'result_content')) {
       for (let next = index; next <= 5; next++) {
-        yield { manifest_revision: revision, instance_id: instance, part_index: field === 'text' ? 0 : 2, field, format: field === 'text' ? 'text' : 'json', byte_offset: next * new TextEncoder().encode(largeChunk).byteLength, text: next === 5 ? 'COMPLETE LARGE FIELD' : largeChunk, next_cursor: next === 5 ? null : `${instance}:${field}:${next + 1}`, complete: next === 5 };
+        yield { manifest_revision: revision, instance_id: instance, part_index: field === 'text' ? 0 : field === 'arguments' ? 2 : 3, field, format: field === 'text' ? 'text' : 'json', byte_offset: next * new TextEncoder().encode(largeChunk).byteLength, text: next === 5 ? 'COMPLETE LARGE FIELD' : largeChunk, next_cursor: next === 5 ? null : `${instance}:${field}:${next + 1}`, complete: next === 5 };
       } return;
     }
     if (scenario === 'revision') { yield { manifest_revision: '2', instance_id: instance, part_index: 0, field: 'text', format: 'text', byte_offset: 0, text: 'Stale content', next_cursor: null, complete: true }; return; }
@@ -71,6 +71,7 @@ const loader: SemanticViewLoader = {
         { part_index: 0, kind: 'text', fields: [{ name: 'text', format: 'text', content_cursor: `${instance}:text` }] },
         { part_index: 1, kind: 'reasoning', fields: [{ name: 'text', format: 'text', content_cursor: `${instance}:reasoning` }] },
         { part_index: 2, kind: 'tool_call', tool_name: 'lookup', call_id: 'call-1', fields: [{ name: 'arguments', format: 'json', content_cursor: `${instance}:arguments` }] },
+        ...(scenario === 'large' ? [{ part_index: 3, kind: 'tool_result', tool_name: 'lookup', call_id: 'call-1', fields: [{ name: 'result_content' as const, format: 'json' as const, content_cursor: `${instance}:result_content` }] }] : []),
       ] };
   },
   content: (request, cursor, signal) => contentLoader.content!(request, cursor, signal),
