@@ -11,6 +11,7 @@ mod session_routing;
 mod settlement;
 mod stats;
 mod terminal_projection;
+pub(crate) mod terminal_timings;
 
 pub use conversations::ConversationProjectionTask;
 pub use conversations::{ConversationDetailFilter, ConversationListFilter};
