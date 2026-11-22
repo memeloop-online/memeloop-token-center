@@ -1275,3 +1275,6 @@ mod tests {
         server.abort();
     }
 }
+
+#[cfg(test)]
+mod reuse_tests;
