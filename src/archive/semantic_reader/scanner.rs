@@ -8,22 +8,53 @@ fn invalid() -> io::Error {
 struct Scanner<R> {
     input: R,
     capture: Option<Window>,
+    output: Option<tokio::sync::mpsc::Sender<std::io::Result<ContentPiece>>>,
 }
 struct Window {
     offset: u64,
     count: u64,
     bytes: Vec<u8>,
+    output: Option<tokio::sync::mpsc::Sender<std::io::Result<ContentPiece>>>,
+    emitted: u64,
 }
 impl Window {
-    fn push(&mut self, byte: u8) {
-        if self.count >= self.offset && self.bytes.len() < CHUNK + 4 {
+    fn push(&mut self, byte: u8) -> Result<()> {
+        if self.count >= self.offset && (self.output.is_some() || self.bytes.len() < CHUNK + 4) {
             self.bytes.push(byte);
         }
         self.count += 1;
+        if self.output.is_some() && self.bytes.len() >= CHUNK {
+            let mut end = CHUNK;
+            while std::str::from_utf8(&self.bytes[..end]).is_err() {
+                if CHUNK - end >= 3 {
+                    return Err(invalid());
+                }
+                end -= 1;
+            }
+            let text = std::str::from_utf8(&self.bytes[..end])
+                .map_err(|_| invalid())?
+                .to_owned();
+            self.output
+                .as_ref()
+                .ok_or_else(invalid)?
+                .blocking_send(Ok(ContentPiece {
+                    text,
+                    offset: self.offset + self.emitted,
+                    complete: false,
+                }))
+                .map_err(|_| invalid())?;
+            self.emitted += end as u64;
+            self.bytes.drain(..end);
+        }
+        Ok(())
     }
     fn finish(mut self) -> Result<(String, bool)> {
         if self.offset > self.count {
             return Err(invalid());
+        }
+        if self.output.is_some() {
+            let text = String::from_utf8(self.bytes).map_err(|_| invalid())?;
+            return Ok((text, true));
         }
         let mut end = self.bytes.len().min(CHUNK);
         while std::str::from_utf8(&self.bytes[..end]).is_err() {
@@ -48,7 +79,7 @@ impl<R: BufRead> Scanner<R> {
         let byte = self.peek()?.ok_or_else(invalid)?;
         self.input.consume(1);
         if let Some(window) = &mut self.capture {
-            window.push(byte);
+            window.push(byte)?;
         }
         Ok(byte)
     }
@@ -201,6 +232,8 @@ impl<R: BufRead> Scanner<R> {
             offset: 0,
             count: 0,
             bytes: Vec::new(),
+            output: None,
+            emitted: 0,
         });
         self.value(0)?;
         let window = self.capture.take().ok_or_else(invalid)?;
@@ -263,11 +296,13 @@ impl<R: BufRead> Scanner<R> {
                         offset: *offset,
                         count: 0,
                         bytes: Vec::with_capacity(CHUNK + 4),
+                        output: self.output.take(),
+                        emitted: 0,
                     };
                     if text_field {
                         self.string(true, |bytes| {
                             for byte in bytes {
-                                window.push(*byte);
+                                window.push(*byte)?;
                             }
                             Ok(())
                         })?;
@@ -276,6 +311,7 @@ impl<R: BufRead> Scanner<R> {
                         self.value(0)?;
                         window = self.capture.take().ok_or_else(invalid)?;
                     }
+                    projection.stream_end = Some(window.offset + window.emitted);
                     let (text, complete) = window.finish()?;
                     projection.text = text;
                     projection.complete = complete;
@@ -341,9 +377,17 @@ impl<R: BufRead> Scanner<R> {
     }
 }
 pub(super) fn scan<R: BufRead>(input: R, selection: Selection) -> Result<Projection> {
+    scan_with_output(input, selection, None)
+}
+pub(super) fn scan_with_output<R: BufRead>(
+    input: R,
+    selection: Selection,
+    output: Option<tokio::sync::mpsc::Sender<std::io::Result<ContentPiece>>>,
+) -> Result<Projection> {
     let mut scanner = Scanner {
         input,
         capture: None,
+        output,
     };
     let mut projection = Projection {
         role: None,
@@ -352,6 +396,7 @@ pub(super) fn scan<R: BufRead>(input: R, selection: Selection) -> Result<Project
         text: String::new(),
         complete: false,
         format: None,
+        stream_end: None,
     };
     scanner.expect(b'{')?;
     let mut seen = std::collections::HashSet::new();

@@ -112,3 +112,89 @@ async fn verified_stream_errors_never_return_a_projection() {
             .is_err()
     );
 }
+
+#[tokio::test]
+async fn streamed_field_reads_source_once_and_finishes_after_verified_eof() {
+    use std::sync::{
+        Arc,
+        atomic::{AtomicUsize, Ordering},
+    };
+    let text = "文😀".repeat(300000);
+    let body = serde_json::to_vec(
+        &json!({"role":"assistant","parts":[{"part_index":0,"kind":"reasoning","text":text}]}),
+    )
+    .unwrap();
+    let size = body.len();
+    let count = Arc::new(AtomicUsize::new(0));
+    let observed = count.clone();
+    let chunks = body
+        .chunks(8192)
+        .map(Bytes::copy_from_slice)
+        .collect::<Vec<_>>();
+    let source = futures_util::stream::iter(chunks).map(move |bytes| {
+        observed.fetch_add(bytes.len(), Ordering::SeqCst);
+        Ok(bytes)
+    });
+    let download = ArchiveDownload {
+        object_size: size as u64,
+        range: 0..size as u64,
+        stream: Box::pin(source),
+    };
+    let mut output = content_stream(
+        download,
+        Selection::Content {
+            part: 0,
+            field: "text".into(),
+            offset: 0,
+        },
+    );
+    let mut combined = String::new();
+    let mut complete = false;
+    while let Some(piece) = output.next().await {
+        let piece = piece.unwrap();
+        assert!(!complete);
+        assert_eq!(piece.offset, combined.len() as u64);
+        assert!(piece.text.len() <= CHUNK);
+        combined.push_str(&piece.text);
+        complete = piece.complete;
+        if complete {
+            assert_eq!(count.load(Ordering::SeqCst), size);
+        }
+    }
+    assert!(complete);
+    assert_eq!(combined, text);
+    assert_eq!(count.load(Ordering::SeqCst), size);
+}
+
+#[tokio::test]
+async fn streamed_integrity_failure_never_marks_complete() {
+    let body = serde_json::to_vec(
+        &json!({"role":"user","parts":[{"part_index":0,"kind":"text","text":"x".repeat(CHUNK*3)}]}),
+    )
+    .unwrap();
+    let size = body.len() as u64;
+    let source = futures_util::stream::iter(vec![
+        Ok(Bytes::from(body)),
+        Err(std::io::Error::other("bad CAS tail")),
+    ]);
+    let mut output = content_stream(
+        ArchiveDownload {
+            object_size: size,
+            range: 0..size,
+            stream: Box::pin(source),
+        },
+        Selection::Content {
+            part: 0,
+            field: "text".into(),
+            offset: 0,
+        },
+    );
+    let mut error = false;
+    while let Some(piece) = output.next().await {
+        match piece {
+            Ok(piece) => assert!(!piece.complete),
+            Err(_) => error = true,
+        }
+    }
+    assert!(error);
+}

@@ -58,6 +58,7 @@ pub(crate) struct Projection {
     pub text: String,
     pub complete: bool,
     pub format: Option<String>,
+    pub stream_end: Option<u64>,
 }
 
 pub(crate) async fn project(
@@ -101,3 +102,74 @@ pub(crate) async fn project(
 
 #[cfg(test)]
 mod tests;
+
+pub(crate) struct ContentPiece {
+    pub text: String,
+    pub offset: u64,
+    pub complete: bool,
+}
+
+/// One request scans the atom once. Backpressure bounds both the source and
+/// decoded output queues. Dropping the HTTP body closes the output receiver,
+/// which stops the pump and releases the verified object-store stream.
+pub(crate) fn content_stream(
+    download: ArchiveDownload,
+    selection: Selection,
+) -> tokio_stream::wrappers::ReceiverStream<std::io::Result<ContentPiece>> {
+    let (output, receiver) = tokio::sync::mpsc::channel(2);
+    tokio::spawn(async move {
+        let (sender, input) = tokio::sync::mpsc::channel(2);
+        let frames = output.clone();
+        let offset = match &selection {
+            Selection::Content { offset, .. } => *offset,
+            _ => 0,
+        };
+        let parsed = tokio::task::spawn_blocking(move || {
+            scanner::scan_with_output(
+                BufReader::with_capacity(
+                    8192,
+                    Chunks {
+                        receiver: input,
+                        current: Bytes::new(),
+                    },
+                ),
+                selection,
+                Some(frames),
+            )
+        });
+        let mut source = download.stream;
+        let pumped = async {
+            loop {
+                let next = tokio::select! { _ = output.closed() => return Err(std::io::Error::other("reader closed")), next = source.next() => next };
+                let Some(chunk) = next else {break;};
+                for piece in chunk?.chunks(CHUNK) {
+                    tokio::select! { _ = output.closed() => return Err(std::io::Error::other("reader closed")), result = sender.send(Bytes::copy_from_slice(piece)) => result.map_err(|_| std::io::Error::other("invalid semantic atom"))? }
+                }
+            }
+            Ok::<_,std::io::Error>(())
+        }.await;
+        drop(sender);
+        let result = match parsed.await {
+            Ok(result) => result,
+            Err(_) => Err(std::io::Error::other("semantic parser failed")),
+        };
+        match pumped.and(result) {
+            Ok(projection) => {
+                // Only this terminal frame follows verified source EOF. All
+                // preceding frames explicitly remain incomplete.
+                let end_offset = projection.stream_end.unwrap_or(offset);
+                let _ = output
+                    .send(Ok(ContentPiece {
+                        text: projection.text,
+                        offset: end_offset,
+                        complete: true,
+                    }))
+                    .await;
+            }
+            Err(error) => {
+                let _ = output.send(Err(error)).await;
+            }
+        }
+    });
+    tokio_stream::wrappers::ReceiverStream::new(receiver)
+}
