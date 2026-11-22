@@ -523,6 +523,31 @@ async fn insert_envelope_in_transaction(
     Ok(())
 }
 
+/// Decode the frozen capture without rebuilding its source at a newer schema.
+fn decode_captured_envelope(
+    frozen: &str,
+    identity: &crate::request_history::HistoryIdentity,
+    revision: i64,
+) -> Result<Value, crate::request_history::HistoryError> {
+    use crate::request_history::{HistoryError, HistoryIdentity};
+    let envelope: Value = serde_json::from_str(frozen)?;
+    if envelope["version"].as_i64() != Some(1)
+        || !matches!(
+            envelope["source"].as_str(),
+            Some("native" | "generation" | "archive" | "event")
+        )
+    {
+        return Err(HistoryError::Invalid(
+            "immutable history envelope version or source",
+        ));
+    }
+    let captured: HistoryIdentity = serde_json::from_value(envelope.clone())?;
+    if captured != *identity || envelope["revision"].as_i64() != Some(revision) {
+        return Err(HistoryError::Invalid("immutable history envelope revision"));
+    }
+    Ok(envelope)
+}
+
 impl Database {
     pub(crate) async fn history_native_business_originals(
         &self,
@@ -685,6 +710,26 @@ impl Database {
             if locked.is_none() {
                 continue;
             }
+            // A committed immutable capture owns this revision even when the
+            // source or its DTO has since changed or retired.
+            if let Some(captured) = sqlx::query("SELECT source,request_id,tenant_id,key_id,created_at,snapshot FROM request_history_immutable_outbox WHERE revision=$1")
+                .bind(revision).fetch_optional(&mut *transaction).await?
+            {
+                let stored_identity = crate::request_history::HistoryIdentity {
+                    source: captured.try_get("source")?,
+                    request_id: parse_uuid(captured.try_get("request_id")?)?,
+                    tenant_id: parse_uuid(captured.try_get("tenant_id")?)?,
+                    key_id: parse_uuid(captured.try_get("key_id")?)?,
+                    created_at: captured.try_get("created_at")?,
+                };
+                if stored_identity != identity {
+                    return Err(AppError::storage("immutable_history_capture_identity"));
+                }
+                let frozen: String = captured.try_get("snapshot")?;
+                decode_captured_envelope(&frozen, &identity, revision).map_err(AppError::from)?;
+                transaction.commit().await?;
+                continue;
+            }
             let request_id = identity.request_id.to_string();
             if identity.source == "event" {
                 capture_event_envelope_in_transaction(&mut transaction, &identity, revision)
@@ -791,21 +836,8 @@ impl Database {
                 continue;
             }
             let original: String = row.try_get("snapshot")?;
-            let envelope: Value = serde_json::from_str(&original)?;
-            if envelope["version"].as_i64() != Some(1)
-                || !matches!(
-                    envelope["source"].as_str(),
-                    Some("native" | "generation" | "archive" | "event")
-                )
-            {
-                return Err(HistoryError::Invalid(
-                    "immutable history envelope version or source",
-                ));
-            }
-            let identity: HistoryIdentity = serde_json::from_value(envelope.clone())?;
-            if identity != stored_identity || envelope["revision"].as_i64() != Some(revision) {
-                return Err(HistoryError::Invalid("immutable history envelope revision"));
-            }
+            let envelope = decode_captured_envelope(&original, &stored_identity, revision)?;
+            let identity = stored_identity.clone();
             // A previously frozen legacy delivery remains authoritative for
             // this exact revision during the incremental producer rollout.
             let existing: Option<String> = sqlx::query_scalar("SELECT snapshot FROM request_history_export WHERE revision=$1 AND source=$2 AND request_id=$3")
@@ -838,6 +870,74 @@ impl Database {
 mod tests {
     use super::*;
     use crate::request_history::{HistoryIdentity, HistorySnapshot};
+
+    #[tokio::test]
+    async fn request_history_capture_reuses_legacy_immutable_without_source() {
+        let directory = tempfile::tempdir().unwrap();
+        let db = Database::connect(&format!(
+            "sqlite://{}?mode=rwc",
+            directory.path().join("frozen.sqlite").display()
+        ))
+        .await
+        .unwrap();
+        db.migrate().await.unwrap();
+        sqlx::query("UPDATE request_history_state SET mode='shadow' WHERE id=1")
+            .execute(&db.pool)
+            .await
+            .unwrap();
+        let identity = HistoryIdentity {
+            source: "event".into(),
+            request_id: Uuid::now_v7(),
+            tenant_id: Uuid::now_v7(),
+            key_id: Uuid::now_v7(),
+            created_at: 42,
+        };
+        // The source has retired; this old schema deliberately lacks new DTO fields.
+        let envelope = serde_json::json!({"version":1,"source":"event","revision":7,"request_id":identity.request_id,"tenant_id":identity.tenant_id,"key_id":identity.key_id,"created_at":42,"payload":null,"read_model":null,"statistics":null,"filter_cost_micros":null});
+        let frozen = serde_json::to_string(&envelope).unwrap();
+        sqlx::query("INSERT INTO request_history_export (revision,source,request_id,tenant_id,key_id,created_at) VALUES (7,'event',$1,$2,$3,42)")
+            .bind(identity.request_id.to_string()).bind(identity.tenant_id.to_string()).bind(identity.key_id.to_string()).execute(&db.pool).await.unwrap();
+        sqlx::query("INSERT INTO request_history_immutable_outbox (revision,source,request_id,tenant_id,key_id,created_at,snapshot) VALUES (7,'event',$1,$2,$3,42,$4)")
+            .bind(identity.request_id.to_string()).bind(identity.tenant_id.to_string()).bind(identity.key_id.to_string()).bind(&frozen).execute(&db.pool).await.unwrap();
+        for _ in 0..2 {
+            db.history_capture_pending(64).await.unwrap();
+            let stored: String = sqlx::query_scalar(
+                "SELECT snapshot FROM request_history_immutable_outbox WHERE revision=7",
+            )
+            .fetch_one(&db.pool)
+            .await
+            .unwrap();
+            assert_eq!(stored, frozen);
+        }
+        let snapshots = db.history_immutable_pending(64, None).await.unwrap();
+        assert_eq!(snapshots.len(), 1);
+        assert_eq!(snapshots[0].identity, identity);
+        assert_eq!(snapshots[0].revision, 7);
+        let hash = crate::request_history::canonical_hash(&snapshots[0]).unwrap();
+        assert_eq!(
+            crate::request_history::canonical_hash(
+                &db.history_immutable_pending(64, None).await.unwrap()[0]
+            )
+            .unwrap(),
+            hash
+        );
+        for field in ["source", "request_id", "tenant_id", "key_id", "created_at"] {
+            let mut wrong = envelope.clone();
+            wrong[field] = if field == "created_at" {
+                Value::from(43)
+            } else if field == "source" {
+                Value::from("native")
+            } else {
+                Value::from(Uuid::now_v7().to_string())
+            };
+            sqlx::query("UPDATE request_history_immutable_outbox SET snapshot=$1 WHERE revision=7")
+                .bind(serde_json::to_string(&wrong).unwrap())
+                .execute(&db.pool)
+                .await
+                .unwrap();
+            assert!(db.history_capture_pending(64).await.is_err(), "{field}");
+        }
+    }
 
     async fn compact_identity_receipt_contract(database: &Database) {
         database.migrate().await.unwrap();
