@@ -83,6 +83,11 @@ function ContentField({ loader, request, instance, revision, part, field }: {
     } : undefined;
   return <section aria-label={field.name}>
     <div ref={viewport} tabIndex={0} data-semantic-field={field.name} style={{ maxHeight: '24rem', overflow: 'auto', overflowAnchor: 'none' }}
+      onWheel={event => {
+        const node = event.currentTarget;
+        if (event.deltaY > 0 && node.scrollTop + node.clientHeight >= node.scrollHeight - 64 && last?.value.next_cursor) void move(last.index + 1);
+        else if (event.deltaY < 0 && node.scrollTop < 32 && first && first.index > 0) void move(first.index - 1);
+      }}
       onScroll={event => {
         if (loading) return;
         const node = event.currentTarget;

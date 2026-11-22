@@ -91,14 +91,14 @@ test('semantic viewer reads verified atoms lazily, preserves parts and pages wit
     const field = page.locator('[data-semantic-field=text]').first();
     await field.locator('[data-content-index="0"]').waitFor();
     for (let index = 1; index <= 5; index++) {
-      await field.evaluate(node => { node.scrollTop = node.scrollHeight; });
+      await field.evaluate(node => { node.scrollTop = node.scrollHeight; node.dispatchEvent(new WheelEvent('wheel', { deltaY: 300, bubbles: true })); });
       await field.locator(`[data-content-index="${index}"]`).waitFor({ state: 'attached' });
       assert.ok(await field.locator('[data-content-index]').count() <= 3);
     }
-    await field.evaluate(node => { node.scrollTop = node.scrollHeight; });
+    await field.evaluate(node => { node.scrollTop = node.scrollHeight; node.dispatchEvent(new WheelEvent('wheel', { deltaY: 300, bubbles: true })); });
     await page.getByText('COMPLETE LARGE FIELD', { exact: true }).waitFor();
     for (let index = 2; index >= 0; index--) {
-      await field.evaluate(node => { node.scrollTop = 0; });
+      await field.evaluate(node => { node.scrollTop = 0; node.dispatchEvent(new WheelEvent('wheel', { deltaY: -300, bubbles: true })); });
       await field.locator(`[data-content-index="${index}"]`).waitFor({ state: 'attached' });
     }
     await page.goto(`http://127.0.0.1:${address.port}/e2e/fixtures/semantic-session.html?scenario=revision`);
