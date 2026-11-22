@@ -198,3 +198,49 @@ async fn streamed_integrity_failure_never_marks_complete() {
     }
     assert!(error);
 }
+
+#[tokio::test]
+async fn dropping_content_receiver_releases_the_source() {
+    use std::sync::{
+        Arc,
+        atomic::{AtomicBool, Ordering},
+    };
+    struct SourceGuard(Arc<AtomicBool>);
+    impl Drop for SourceGuard {
+        fn drop(&mut self) {
+            self.0.store(true, Ordering::SeqCst);
+        }
+    }
+    let released = Arc::new(AtomicBool::new(false));
+    let guard = SourceGuard(released.clone());
+    let body = serde_json::to_vec(&json!({"role":"user","parts":[{"part_index":0,"kind":"text","text":"x".repeat(CHUNK*100)}]})).unwrap();
+    let size = body.len() as u64;
+    let chunks = body
+        .chunks(8192)
+        .map(Bytes::copy_from_slice)
+        .collect::<std::collections::VecDeque<_>>();
+    let source = futures_util::stream::unfold((chunks, guard), |(mut chunks, guard)| async move {
+        chunks.pop_front().map(|chunk| (Ok(chunk), (chunks, guard)))
+    });
+    let mut frames = content_stream(
+        ArchiveDownload {
+            object_size: size,
+            range: 0..size,
+            stream: Box::pin(source),
+        },
+        Selection::Content {
+            part: 0,
+            field: "text".into(),
+            offset: 0,
+        },
+    );
+    assert!(!frames.next().await.unwrap().unwrap().complete);
+    drop(frames);
+    tokio::time::timeout(std::time::Duration::from_secs(3), async {
+        while !released.load(Ordering::SeqCst) {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .unwrap();
+}

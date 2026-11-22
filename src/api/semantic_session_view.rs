@@ -354,3 +354,55 @@ mod tests {
         assert!(decode(&forged, &original, b"test-pepper").is_err());
     }
 }
+
+#[cfg(test)]
+mod reader_cursor_tests {
+    use super::*;
+    fn scope() -> SessionContextScope {
+        SessionContextScope {
+            tenant_id: Uuid::now_v7(),
+            key_id: Uuid::now_v7(),
+            session_id: Uuid::now_v7(),
+            request_id: Uuid::now_v7(),
+            leaf: None,
+        }
+    }
+    #[test]
+    fn typed_cursor_preserves_occurrence_field_offset_and_scope() {
+        let scope = scope();
+        let mut position = Continuation {
+            tenant_id: scope.tenant_id,
+            key_id: scope.key_id,
+            session_id: scope.session_id,
+            request_id: scope.request_id,
+            revision: 9,
+            page: None,
+            instance_id: Some("occurrence-a".into()),
+            reader: Some(reader::Position::Content {
+                ordinal: 2,
+                part_index: 7,
+                field: "arguments".into(),
+                format: "json".into(),
+                offset: 65535,
+            }),
+        };
+        let a = encode(&position, b"test").unwrap();
+        position.instance_id = Some("occurrence-b".into());
+        let b = encode(&position, b"test").unwrap();
+        assert_ne!(a, b);
+        let decoded = decode(&a, &scope, b"test").unwrap();
+        assert_eq!(decoded.instance_id.as_deref(), Some("occurrence-a"));
+        assert!(matches!(
+            decoded.reader,
+            Some(reader::Position::Content {
+                ordinal: 2,
+                part_index: 7,
+                offset: 65535,
+                ..
+            })
+        ));
+        let mut other_scope = scope.clone();
+        other_scope.key_id = Uuid::now_v7();
+        assert!(decode(&a, &other_scope, b"test").is_err());
+    }
+}

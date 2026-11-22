@@ -84,7 +84,10 @@ impl<R: BufRead> Scanner<R> {
         Ok(byte)
     }
     fn ws(&mut self) -> Result<()> {
-        while self.peek()?.is_some_and(|b| b.is_ascii_whitespace()) {
+        while self
+            .peek()?
+            .is_some_and(|b| matches!(b, b' ' | b'\n' | b'\r' | b'\t'))
+        {
             self.byte()?;
         }
         Ok(())
@@ -213,10 +216,9 @@ impl<R: BufRead> Scanner<R> {
             }
             _ => {
                 let mut token = Vec::new();
-                while self
-                    .peek()?
-                    .is_some_and(|b| !b.is_ascii_whitespace() && !matches!(b, b',' | b']' | b'}'))
-                {
+                while self.peek()?.is_some_and(|b| {
+                    !matches!(b, b' ' | b'\n' | b'\r' | b'\t') && !matches!(b, b',' | b']' | b'}')
+                }) {
                     if token.len() > 128 {
                         return Err(invalid());
                     }
