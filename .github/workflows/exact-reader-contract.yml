@@ -10,6 +10,7 @@ on:
         required: true
         type: choice
         options:
+          - metadata-refresh
           - request-carrier-958
           - response-carrier-968
           - orphan-reaper-971
@@ -32,6 +33,26 @@ on:
 permissions:
   contents: read
 jobs:
+  metadata-refresh-contract:
+    if: inputs.contract == 'metadata-refresh'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    steps:
+      - name: Require an exact source commit
+        env:
+          SOURCE_REVISION: ${{ inputs.source_revision }}
+        run: '[[ "$SOURCE_REVISION" =~ ^[0-9a-f]{40}$ ]]'
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+        with:
+          ref: ${{ inputs.source_revision }}
+          persist-credentials: false
+      - run: git rev-parse HEAD
+      - name: Verify metadata refresh using synthetic fixtures
+        run: |
+          set -o pipefail
+          python3 -m unittest discover -s scripts/maintenance -p test_metadata_refresh.py 2>&1 | tee /tmp/metadata-refresh.log
+          grep -E '^Ran [1-9][0-9]* tests? in ' /tmp/metadata-refresh.log
+          grep -Fx 'OK' /tmp/metadata-refresh.log
   orphan-reaper-contract:
     if: inputs.contract == 'orphan-reaper-971'
     runs-on: ubuntu-24.04
