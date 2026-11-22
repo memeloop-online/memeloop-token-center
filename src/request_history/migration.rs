@@ -260,10 +260,10 @@ pub async fn command(config: &Config, command: HistoryCommand) -> Result<Value, 
             return Ok(
                 match export_batch(&database, &lease_database, &client, page_size).await {
                     Ok(report) => {
-                        json!({"status":"completed","attempted":report.attempted,"acked":report.acked,"deferred":report.attempted.saturating_sub(report.acked),"failed":0})
+                        json!({"status":"completed","attempted":report.attempted,"acked":report.acked,"deferred":report.attempted.saturating_sub(report.acked),"operation_failed":false})
                     }
                     Err(failure) => {
-                        json!({"status":"failed","attempted":failure.attempted,"acked":failure.acked,"deferred":failure.attempted.saturating_sub(failure.acked),"failed":1,"stage":failure.stage,"source":failure.source,"revision":failure.revision,"diagnostic":failure.error.safe_diagnostic()})
+                        json!({"status":"failed","attempted":failure.attempted,"acked":failure.acked,"deferred":failure.acked.map(|acked| failure.attempted.saturating_sub(acked)),"operation_failed":true,"stage":failure.stage,"batch_first_source":failure.source,"batch_first_revision":failure.revision,"diagnostic":failure.error.safe_diagnostic()})
                     }
                 },
             );
@@ -319,7 +319,7 @@ struct ExportReport {
 struct ExportFailure {
     stage: &'static str,
     attempted: usize,
-    acked: usize,
+    acked: Option<usize>,
     source: Option<String>,
     revision: Option<i64>,
     error: HistoryError,
@@ -334,7 +334,7 @@ async fn export_batch(
     let failure = |stage, error| ExportFailure {
         stage,
         attempted: 0,
-        acked: 0,
+        acked: Some(0),
         source: None,
         revision: None,
         error,
@@ -350,7 +350,7 @@ async fn export_batch(
     let failure = |stage, error| ExportFailure {
         stage,
         attempted: snapshots.len(),
-        acked: 0,
+        acked: Some(0),
         source: snapshots.first().map(|row| row.identity.source.clone()),
         revision: snapshots.first().map(|row| row.revision),
         error,
@@ -368,11 +368,15 @@ async fn export_batch(
     let acked = database
         .history_acknowledge_count(&snapshots)
         .await
-        .map_err(|error| failure("acknowledge", error))?;
+        .map_err(|error| {
+            let mut failure = failure("acknowledge", error);
+            failure.acked = None;
+            failure
+        })?;
     if let Some(lease) = lease {
         lease.rollback().await.map_err(|error| {
             let mut failure = failure("lease_release", error.into());
-            failure.acked = acked;
+            failure.acked = Some(acked);
             failure
         })?;
     }
@@ -415,7 +419,7 @@ pub(crate) async fn run_worker(state: AppState, mut shutdown: watch::Receiver<bo
         .clone()
         .with_auxiliary_pool_max_connections(1)
         .independent_persistence_pool();
-    let mut last_failure: Option<(String, std::time::Instant, u64)> = None;
+    let mut failure_buckets = BTreeMap::new();
     loop {
         if *shutdown.borrow() {
             return;
@@ -427,22 +431,15 @@ pub(crate) async fn run_worker(state: AppState, mut shutdown: watch::Receiver<bo
                     let result = match database.history_mode().await {
                         Ok(mode) if mode == "off" => Ok(ExportReport { attempted:0, acked:0 }),
                         Ok(_) => export_batch(&database, &lease_database, client, 500).await,
-                        Err(error) => Err(ExportFailure { stage:"mode",attempted:0,acked:0,source:None,revision:None,error }),
+                        Err(error) => Err(ExportFailure { stage:"mode",attempted:0,acked:Some(0),source:None,revision:None,error }),
                     };
                     {
                         match result {
-                            Ok(_) => { last_failure = None; }
+                            Ok(_) => {}
                             Err(failure) => {
                                 let diagnostic = failure.error.safe_diagnostic();
-                                let key = format!("{}:{diagnostic}", failure.stage);
-                                let now = std::time::Instant::now();
-                                let first = last_failure.is_none();
-                                let entry = last_failure.get_or_insert((key.clone(), now, 0));
-                                let changed = entry.0 != key;
-                                entry.2 += 1;
-                                if first || changed || entry.1.elapsed() >= std::time::Duration::from_secs(60) {
-                                    tracing::warn!(stage=failure.stage, diagnostic=%diagnostic, source=?failure.source, revision=?failure.revision, occurrences=entry.2, "request history export deferred; durable queue retained");
-                                    *entry = (key, now, 0);
+                                if let Some(occurrences) = failure_log_occurrences(&mut failure_buckets, failure.stage, &diagnostic, std::time::Instant::now()) {
+                                    tracing::warn!(stage=failure.stage, diagnostic=%diagnostic, batch_first_source=?failure.source, batch_first_revision=?failure.revision, occurrences, "request history export deferred; durable queue retained");
                                 }
                             }
                         }
@@ -451,6 +448,91 @@ pub(crate) async fn run_worker(state: AppState, mut shutdown: watch::Receiver<bo
                 tokio::time::sleep(std::time::Duration::from_secs(1)).await;
             } => {}
         }
+    }
+}
+
+fn failure_log_occurrences(
+    buckets: &mut BTreeMap<(&'static str, &'static str), (std::time::Instant, u64)>,
+    stage: &'static str,
+    diagnostic: &Value,
+    now: std::time::Instant,
+) -> Option<u64> {
+    // The bucket space is the fixed export stages and fixed safe categories.
+    // SQLSTATE/reason/identity values never create additional log buckets.
+    let category = match diagnostic["category"].as_str() {
+        Some("invalid") => "invalid",
+        Some("verification") => "verification",
+        Some("sql") => "sql",
+        Some("clickhouse_rejected") => "clickhouse_rejected",
+        Some("unavailable") => "unavailable",
+        Some("changed") => "changed",
+        Some("mismatch") => "mismatch",
+        Some("database") => "database",
+        Some("json") => "json",
+        _ => "unknown",
+    };
+    match buckets.entry((stage, category)) {
+        std::collections::btree_map::Entry::Vacant(entry) => {
+            entry.insert((now, 0));
+            Some(1)
+        }
+        std::collections::btree_map::Entry::Occupied(mut entry) => {
+            let (last, count) = entry.get_mut();
+            *count += 1;
+            if now.duration_since(*last) < std::time::Duration::from_secs(60) {
+                return None;
+            }
+            let occurrences = *count;
+            *last = now;
+            *count = 0;
+            Some(occurrences)
+        }
+    }
+}
+
+#[cfg(test)]
+mod export_diagnostic_tests {
+    use super::*;
+    #[test]
+    fn request_history_export_log_buckets_count_alternating_failures_independently() {
+        let mut buckets = BTreeMap::new();
+        let now = std::time::Instant::now();
+        for category in ["sql", "database"] {
+            assert_eq!(
+                failure_log_occurrences(
+                    &mut buckets,
+                    "capture_materialize",
+                    &json!({"category":category}),
+                    now
+                ),
+                Some(1)
+            );
+        }
+        for _ in 0..3 {
+            for category in ["sql", "database"] {
+                assert_eq!(
+                    failure_log_occurrences(
+                        &mut buckets,
+                        "capture_materialize",
+                        &json!({"category":category}),
+                        now
+                    ),
+                    None
+                );
+            }
+        }
+        for category in ["sql", "database"] {
+            assert_eq!(
+                failure_log_occurrences(
+                    &mut buckets,
+                    "capture_materialize",
+                    &json!({"category":category}),
+                    now + std::time::Duration::from_secs(60)
+                ),
+                Some(4)
+            );
+        }
+        assert_eq!(buckets.len(), 2);
     }
 }
 
