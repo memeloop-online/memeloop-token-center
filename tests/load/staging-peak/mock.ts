@@ -9,15 +9,21 @@ export function createStagingMock() {
   const server = createMockServer(state);
   const fallback = server.listeners("request")[0] as (request: IncomingMessage, response: ServerResponse) => void;
   server.removeAllListeners("request");
-  const counters = { requests: 0, injected_errors: 0, injected_disconnects: 0 };
+  const counters = { requests: 0, injected_errors: 0, injected_disconnects: 0, accepted_active:0, accepted_total:0, completed:0 };
+  const timeline:Record<string,unknown>[]=[];
+  const sample=()=>timeline.push({utc:new Date().toISOString(),accepted_active:counters.accepted_active,accepted_total:counters.accepted_total,completed:counters.completed,active_streams:state.activeStreams});
+  const sampler=setInterval(sample,1000);sampler.unref();server.once("close",()=>clearInterval(sampler));
   server.on("request", (request, response) => {
     const execute = async () => {
       if (request.url === "/healthz") { response.writeHead(200); response.end("ok"); return; }
       if (request.url === "/identity") { response.setHeader("content-type", "application/json"); response.end(JSON.stringify({run_id:process.env.MTC_PEAK_RUN_ID??"contract",source_sha:process.env.MTC_HARNESS_SOURCE_SHA??null})); return; }
-      if (request.url === "/evidence") { response.setHeader("content-type", "application/json"); response.end(JSON.stringify({ ...counters, active_streams: state.activeStreams, peak_streams: state.peakStreams })); return; }
+      if (request.url === "/evidence") { response.setHeader("content-type", "application/json"); response.end(JSON.stringify({ ...counters, timeline, active_streams: state.activeStreams, peak_streams: state.peakStreams })); return; }
       counters.requests++;
       const match = /^\/scenario\/(normal|slow-read|upstream-error|disconnect|tool-session)(\/.*)$/.exec(request.url ?? "");
       if (!match) { response.writeHead(404); response.end(); return; }
+      counters.accepted_total++;counters.accepted_active++;
+      let ended=false;const finish=()=>{if(ended)return;ended=true;counters.accepted_active--;counters.completed++;};
+      response.once("finish",finish);response.once("close",finish);
       request.url = match[2];
       if (match[1] === "upstream-error") { counters.injected_errors++; request.resume(); response.writeHead(503, { "content-type": "application/json", "retry-after": "1" }); response.end(JSON.stringify({ error: { type: "mock_unavailable", message: "isolated test upstream" } })); return; }
       if (match[1] === "disconnect") { counters.injected_disconnects++; request.destroy(); return; }
