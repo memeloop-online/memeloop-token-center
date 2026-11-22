@@ -356,6 +356,13 @@ jobs:
           cargo test --locked --lib archive::raw_capture::retirement_contracts::rustfs_complete_coverage_retires_exact_roots_and_rejects_stale_backend_versions -- --exact --ignored 2>&1 | tee /tmp/gc-roots-rustfs.log
           grep -F '1 passed; 0 failed' /tmp/gc-roots-rustfs.log
           python3 tests/support/s3_conditional_delete_contract.py
+          for selector in \
+            archive::raw_gc_roots::tests::gc_part_parser_skips_body_values_and_rejects_unknown_reference_schema \
+            archive::conversation_capture_tests::missing_response_is_not_fabricated_and_late_capture_preserves_prefix
+          do
+            cargo test --locked --lib "$selector" -- --exact 2>&1 | tee /tmp/gc-typed-roots.log
+            grep -F '1 passed; 0 failed' /tmp/gc-typed-roots.log
+          done
   next-release-contract:
     if: inputs.contract == 'next-release'
     runs-on: ubuntu-24.04
