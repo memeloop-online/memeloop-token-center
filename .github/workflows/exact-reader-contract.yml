@@ -704,4 +704,9 @@ jobs:
             timeout 60s cargo test --locked --lib "db::session_projection::lock_order_tests::$selector" -- --exact --nocapture 2>&1 | tee /tmp/session-usage-lock.log
             grep -F '1 passed; 0 failed' /tmp/session-usage-lock.log
           done
+          for selector in sums_maxima_and_failures_preserve_outcomes failed_account_receipt_keeps_failure_stage
+          do
+            timeout 60s cargo test --locked --lib "db::requests::terminal_timings::tests::$selector" -- --exact --nocapture 2>&1 | tee /tmp/terminal-timings.log
+            grep -F '1 passed; 0 failed' /tmp/terminal-timings.log
+          done
 
