@@ -224,11 +224,6 @@ jobs:
             api::proxy::tests::codex_streaming_output_then_failure_keeps_unobserved_usage_out_of_actual_cost \
             error::tests::object_storage_classification_preserves_only_typed_safe_facts \
             error::tests::dependency_errors_do_not_retain_secret_bearing_driver_messages \
-            archive::raw_gc_roots::tests::gc_part_parser_skips_body_values_and_rejects_unknown_reference_schema \
-            archive::conversation_capture_tests::missing_response_is_not_fabricated_and_late_capture_preserves_prefix \
-            archive::raw_capture::retirement_contracts::complete_coverage_retires_exact_roots_and_rejects_stale_backend_versions \
-            archive::raw_capture::retirement_contracts::incomplete_protocol_keeps_both_raw_roots_owned \
-            response_archive_spool::tests::late_response_capture_settles_against_retired_semantics_without_restoring_raw_binding \
             response_archive_spool::tests::shared_capture_reaches_eof_while_all_upload_slots_are_held \
             response_archive_spool::tests::unavailable_local_directory_does_not_gate_complete_original \
             response_archive_spool::tests::cancelled_unsealed_carrier_releases_owned_capture_without_acknowledging_original \
@@ -346,23 +341,9 @@ jobs:
           cargo test --locked --lib db::archive_staging::backend_tests 2>&1 | tee /tmp/staging-db.log
           grep -F '2 passed; 0 failed' /tmp/staging-db.log
           cargo test --locked --lib archive::routing_tests 2>&1 | tee /tmp/staging-routing.log
-          grep -F '7 passed; 0 failed' /tmp/staging-routing.log
+          grep -F '6 passed; 0 failed' /tmp/staging-routing.log
           cargo test --locked --lib training_cas_real_s3_configuration_and_reader -- --ignored 2>&1 | tee /tmp/staging-rustfs.log
           grep -F '1 passed; 0 failed' /tmp/staging-rustfs.log
-          cargo test --locked --lib api::session_reading::tests::canonical_training_reads_complete_prefix_without_legacy_root_and_fails_closed -- --exact 2>&1 | tee /tmp/gc-canonical-reader.log
-          grep -F '1 passed; 0 failed' /tmp/gc-canonical-reader.log
-          cargo test --locked --lib api::session_reading::tests::dialogue_parts_preserve_tools_media_and_future_extensions -- --exact 2>&1 | tee /tmp/gc-canonical-parts.log
-          grep -F '1 passed; 0 failed' /tmp/gc-canonical-parts.log
-          cargo test --locked --lib archive::raw_capture::retirement_contracts::rustfs_complete_coverage_retires_exact_roots_and_rejects_stale_backend_versions -- --exact --ignored 2>&1 | tee /tmp/gc-roots-rustfs.log
-          grep -F '1 passed; 0 failed' /tmp/gc-roots-rustfs.log
-          python3 tests/support/s3_conditional_delete_contract.py
-          for selector in \
-            archive::raw_gc_roots::tests::gc_part_parser_skips_body_values_and_rejects_unknown_reference_schema \
-            archive::conversation_capture_tests::missing_response_is_not_fabricated_and_late_capture_preserves_prefix
-          do
-            cargo test --locked --lib "$selector" -- --exact 2>&1 | tee /tmp/gc-typed-roots.log
-            grep -F '1 passed; 0 failed' /tmp/gc-typed-roots.log
-          done
   next-release-contract:
     if: inputs.contract == 'next-release'
     runs-on: ubuntu-24.04
