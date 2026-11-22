@@ -134,10 +134,6 @@ async fn page(
             ));
         }
         let instance = position.instance_id.as_deref().ok_or_else(invalid)?;
-        let reader_pin = state
-            .db
-            .pin_archive_reader(scope.tenant_id, scope.request_id)
-            .await?;
         let download = state
             .archive
             .open_semantic_view_atom(
@@ -153,7 +149,7 @@ async fn page(
                 (header::CONTENT_TYPE, "application/json"),
                 (header::CACHE_CONTROL, "private, no-store"),
             ],
-            Body::from_stream(reader_pin.protect_stream(download.stream)),
+            Body::from_stream(download.stream),
         )
             .into_response());
     }

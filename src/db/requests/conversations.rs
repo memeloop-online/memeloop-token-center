@@ -980,9 +980,6 @@ impl Database {
         tenant_id: Uuid,
         leaf_node_hash: &str,
     ) -> Result<Vec<crate::conversation::TrainingUtterance>, AppError> {
-        // Covers metadata traversal through the last object read; the returned
-        // materialized turns no longer depend on source object availability.
-        let _reader_pin = self.pin_archive_reader(tenant_id, Uuid::now_v7()).await?;
         let rows = sqlx::query(
             "WITH RECURSIVE chain AS (
                 SELECT node_hash, parent_hash, atom_hash, depth FROM context_nodes WHERE tenant_id = $1 AND node_hash = $2
