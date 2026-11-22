@@ -649,21 +649,10 @@ jobs:
           set -o pipefail
           git rev-parse HEAD
           cargo check --locked --lib
-          cargo test --locked --lib db::requests::operational_terminal::tests::prepared_cursor::postgres_rich_event_parent_preparation_does_not_hold_global_cursor -- --ignored --exact --nocapture 2>&1 | tee /tmp/pg-executor.log
-          grep -F '1 passed; 0 failed' /tmp/pg-executor.log
-          cargo test --locked --lib db::tests::event_cursor::postgres_global_cursor_lock_orders_commit_visibility -- --exact --nocapture 2>&1 | tee /tmp/pg-executor.log
-          grep -F '1 passed; 0 failed' /tmp/pg-executor.log
-
-          cargo test --locked --lib db::request_history::event_backfill_tests::sqlite_event_backfill_uses_time_cursor_and_reuses_receipts -- --exact --nocapture 2>&1 | tee /tmp/event-backfill.log
-          grep -F '1 passed; 0 failed' /tmp/event-backfill.log
-          cargo test --locked --lib db::request_history::event_backfill_tests::request_history_real_services_acceptance_event_backfill_time_cursor -- --ignored --exact --nocapture 2>&1 | tee /tmp/event-backfill.log
-          grep -F '1 passed; 0 failed' /tmp/event-backfill.log
-          cargo test --locked --lib db::gateway_persistence::tests::source_binding::postgres_source_binding_uses_owned_partition_and_preserves_replay -- --ignored --exact --nocapture 2>&1 | tee /tmp/source-binding.log
-          grep -F '1 passed; 0 failed' /tmp/source-binding.log
-          cargo test --locked --test request_history_cli request_history_cli_export_page_reports_safe_materialization_failure_without_ack -- --exact --nocapture 2>&1 | tee /tmp/history-cli-diagnostic.log
-          grep -F '1 passed; 0 failed' /tmp/history-cli-diagnostic.log
-          cargo test --locked --lib request_history::migration::export_diagnostic_tests::request_history_export_log_buckets_count_alternating_failures_independently -- --exact --nocapture 2>&1 | tee /tmp/history-log-buckets.log
-          grep -F '1 passed; 0 failed' /tmp/history-log-buckets.log
+          cargo test --locked --lib db::history_immutable_outbox::tests::request_history_capture_reuses_legacy_immutable_without_source -- --exact --nocapture 2>&1 | tee /tmp/history-frozen.log
+          grep -F '1 passed; 0 failed' /tmp/history-frozen.log
+          cargo test --locked --lib db::history_immutable_outbox::tests::postgres_history_capture_skips_locked_identity_and_commits_progress -- --ignored --exact --nocapture 2>&1 | tee /tmp/history-capture.log
+          grep -F '1 passed; 0 failed' /tmp/history-capture.log
 
   semantic-reader-scope-contract:
     if: inputs.contract == 'semantic-reader-scope'
