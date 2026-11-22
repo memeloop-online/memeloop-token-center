@@ -58,7 +58,7 @@ impl Window {
         }
         let mut end = self.bytes.len().min(CHUNK);
         while std::str::from_utf8(&self.bytes[..end]).is_err() {
-            if end == 0 || self.bytes.len() - end > 4 {
+            if end == 0 || CHUNK.saturating_sub(end) > 3 {
                 return Err(invalid());
             }
             end -= 1;
