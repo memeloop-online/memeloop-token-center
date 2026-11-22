@@ -144,6 +144,10 @@ async fn postgres_native_capture_reuse_is_exactly_equal() {
     let tenant = Uuid::now_v7().to_string();
     let key = Uuid::now_v7().to_string();
     sqlx::query("INSERT INTO request_records(id,tenant_id,key_id,created_at,protocol,model,input_tokens,output_tokens,cost_micros,request_object,reservation_id,currency) VALUES($1,$2,$3,1000,'openai','fixture',1,2,3,'gap://fixture/request',$4,'USD')").bind(&request).bind(&tenant).bind(&key).bind(Uuid::now_v7().to_string()).execute(&db.pool).await.unwrap();
+    for observed in [2000_i64, 1000] {
+        sqlx::query("INSERT INTO request_upstream_transport_diagnostics(request_id,route_id,upstream_account_id,credential_generation,transport_revision,failure_kind,failure_stage,gateway_pod,gateway_node,failure_domain,observed_at) VALUES($1,$2,$3,1,1,'transport','connect','fixture',NULL,'fixture',$4)")
+            .bind(&request).bind(Uuid::now_v7().to_string()).bind(Uuid::now_v7().to_string()).bind(observed).execute(&db.pool).await.unwrap();
+    }
     let mut tx = db.begin_write_transaction().await.unwrap();
     let identity=sqlx::query("SELECT CAST(1 AS BIGINT) revision,CAST($1 AS TEXT) tenant_id,CAST($2 AS TEXT) key_id,CAST(1000 AS BIGINT) created_at").bind(&tenant).bind(&key).fetch_one(&mut *tx).await.unwrap();
     let before = original_native_envelope(&mut tx, &request, &identity)
@@ -153,6 +157,14 @@ async fn postgres_native_capture_reuse_is_exactly_equal() {
         .await
         .unwrap();
     assert_eq!(before.0, after.0);
+    assert_eq!(
+        after.1["read_model"]["transport_diagnostics"][0]["observed_at"],
+        1000
+    );
+    assert_eq!(
+        after.1["read_model"]["transport_diagnostics"][1]["observed_at"],
+        2000
+    );
     assert_eq!(
         before.1, after.1,
         "all original/read-model fields and None values remain equal"
