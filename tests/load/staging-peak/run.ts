@@ -88,13 +88,15 @@ export async function run(plan: Plan, env = process.env): Promise<Record<string,
   httpStatus=versionResponse.status;
   const version=await versionResponse.json() as {revision?:string};
   if(!versionResponse.ok||version.revision!==actualCandidate.control.source_sha)throw new Error("actual control revision differs from observed candidate");
-  const tenant = `staging-peak-${runId}`;
+  const fixtureId=env.MTC_PEAK_FIXTURE_ID??runId;
+  if(!/^[a-zA-Z0-9:_-]+$/.test(fixtureId))throw new Error("invalid isolated fixture identity");
+  const tenant = `staging-peak-${fixtureId}`;
   enter("upstream_setup");
-  const reused = await reuseFixture(control, token, tenant, runId, upstreamBase, [...new Set(plan.arrivals.map(row => row.scenario))], plan.arrivals.length);
+  const reused = await reuseFixture(control, token, tenant, fixtureId, upstreamBase, [...new Set(plan.arrivals.map(row => row.scenario))], plan.arrivals.length);
   const models: Record<string,string> = {}, routes: string[] = [];
   for (const scenario of new Set(plan.arrivals.map(row => row.scenario))) {
     setupScenario=scenario; setupIndex=(setupIndex ?? -1)+1;
-    const model = `staging-peak-${runId}-${scenario}`;
+    const model = `staging-peak-${fixtureId}-${scenario}`;
     if (reused) { models[scenario]=model; routes.push(reused.routes[scenario]); continue; }
     const upstream = await call("upstream_setup", "/internal/v1/upstreams", { tenant_external_id:tenant, name:model, driver:"http-json", config:{ base_url:new URL(`/scenario/${scenario}`,upstreamBase).href, network_scope:"private" }, credential:{ type:"none" } });
     const route = await call("route_setup", "/internal/v1/model-routes", { tenant_external_id:tenant, public_model:model, upstream_account_id:upstream.id, upstream_model:model, protocol:"openai", priority:0, custom_model_confirmed:true });
@@ -102,12 +104,15 @@ export async function run(plan: Plan, env = process.env): Promise<Record<string,
     models[scenario]=model; routes.push(String(route.id));
   }
   setupScenario=undefined; setupIndex=undefined;
-  const issued = reused ? {key:reused.key} : await call("key_setup", "/internal/v1/keys", { tenant_external_id:tenant, principal_external_id:`staging-peak-${runId}`, alias:`Isolated ${runId}`, currency:"USD", initial_balance:"100000", route_ids:routes, policy:{requests_per_minute:Math.max(1,plan.arrivals.length*60), tokens_per_minute:1_000_000_000, max_concurrency:plan.arrivals.length, enforcement_mode:"metered_unlimited", daily_budget:null, weekly_budget:null, lifetime_budget:null} });
+  const issued = reused ? {key:reused.key} : await call("key_setup", "/internal/v1/keys", { tenant_external_id:tenant, principal_external_id:`staging-peak-${fixtureId}`, alias:`Isolated ${fixtureId}`, currency:"USD", initial_balance:"100000", route_ids:routes, policy:{requests_per_minute:Math.max(1,plan.arrivals.length*60), tokens_per_minute:1_000_000_000, max_concurrency:plan.arrivals.length, enforcement_mode:"metered_unlimited", daily_budget:null, weekly_budget:null, lifetime_budget:null} });
   enter("load");
   const key = String(issued.key);
   const requests: Record<string,unknown>[] = [];
   let active=0, peakActive=0;
   const start=performance.now();
+  const timeline:Record<string,unknown>[]=[];
+  const sample=()=>{const counts:Record<string,number>={};for(const r of requests)counts[String(r.status??"transport")]=(counts[String(r.status??"transport")]??0)+1;timeline.push({utc:new Date().toISOString(),elapsed_ms:performance.now()-start,offered:plan.arrivals.filter(a=>a.at_ms<=performance.now()-start).length,client_active:active,started:requests.length+active,completed:requests.length,status_counts:counts});};
+  const sampler=setInterval(sample,1000);sample();
   const tasks: Promise<void>[]=[];
   for (const [index, arrival] of plan.arrivals.entries()) {
     const remaining=start+arrival.at_ms-performance.now(); if (remaining>0) await delay(remaining);
@@ -123,7 +128,7 @@ export async function run(plan: Plan, env = process.env): Promise<Record<string,
         if(arrival.protocol==="responses"){payload.input=payload.messages;delete payload.messages;}
         const serialized=JSON.stringify(payload);serializedRequestBytes=Buffer.byteLength(serialized);
         const response=await fetch(new URL(arrival.protocol==="responses"?"/v1/responses":"/v1/chat/completions",gateway), {method:"POST",headers:{authorization:`Bearer ${key}`,"content-type":"application/json","x-mtc-conversation-id":session},body:serialized,signal:AbortSignal.timeout(plan.window_ms+plan.drain_timeout_ms)});
-        status=response.status;requestId=response.headers.get("x-request-id");
+        status=response.status;requestId=response.headers.get("x-mtc-request-id");
         if (response.body) for await (const chunk of response.body) { bytes+=chunk.length; hash.update(chunk); if(status===200&&arrival.scenario!=="tool-session")verifier.consume(chunk); const scan=tail+Buffer.from(chunk).toString("utf8");terminal ||= arrival.protocol==="responses"?scan.includes('"type":"response.completed"'):scan.includes("data: [DONE]");tail=scan.slice(-4096); if(arrival.client_read_delay_ms) await delay(arrival.client_read_delay_ms); }
         if(status===200&&arrival.scenario!=="tool-session"){fixtureEvidence=verifier.finish(bytes);if(fixtureEvidence.verified!==true)error="fixture_content_or_size_mismatch";}
         if(status!==arrival.expected_status) error="unexpected_gateway_status";
@@ -141,12 +146,12 @@ export async function run(plan: Plan, env = process.env): Promise<Record<string,
       finally { active--; requests.push({index,session,...fixtureEvidence,request_padding_bytes:arrival.request_padding_bytes,serialized_request_bytes:serializedRequestBytes,protocol:arrival.protocol,http_exchanges:exchanges,request_id:requestId,scenario:arrival.scenario,offered_at_ms:arrival.at_ms,started_at_ms:began-start,generator_lag_ms:lag,status,response_wire_bytes:bytes,response_sha256:hash.digest("hex"),latency_ms:performance.now()-began,error}); }
     })());
   }
-  await Promise.all(tasks);
+  try { await Promise.all(tasks); } finally { clearInterval(sampler); sample(); }
   if(performance.now()-start<plan.window_ms) await delay(plan.window_ms-(performance.now()-start));
   let baselineHash:string|undefined, baselineError:string|undefined;
   try { baselineHash=baselineIdentity(validateBaseline(plan.baseline)); } catch { baselineError="historical_peak_coverage_incomplete"; }
   const latencies=requests.map(row=>Number(row.latency_ms));
-  return {topology:forwarded?"same-pod-mock+port-forward":"cross-pod",schema_version:1,run_id:runId,release_batch:plan.release_batch,source_sha:env.MTC_HARNESS_SOURCE_SHA??null,harness_source_sha:env.MTC_HARNESS_SOURCE_SHA??null,candidate:actualCandidate,candidate_evidence_sha256:artifactHash(plan.candidate_evidence),plan_sha256:artifactHash(plan),tenant,offered:plan.arrivals.length,started:requests.length,completed:requests.filter(row=>!row.error).length,failed:requests.filter(row=>row.error).length,unissued:plan.arrivals.length-requests.length,peak_active:peakActive,http_exchanges:requests.reduce((sum,row)=>sum+Number(row.http_exchanges),0),latency_ms:{p50:percentile(latencies,.5),p95:percentile(latencies,.95),p99:percentile(latencies,.99),max:Math.max(...latencies)},baseline_sha256:artifactHash(plan.baseline),validated_baseline_sha256:baselineHash,baseline_error:baselineError,qualification:"NOT_EVALUATED",missing_evidence:["complete historical multidimensional peak","financial exactly-once assertions","semantic/archive API payload verification","PG poolwait/IO/locks and memory recovery","archive debt drain confirmation"],requests};
+  return {topology:forwarded?"same-pod-mock+port-forward":"cross-pod",schema_version:1,run_id:runId,release_batch:plan.release_batch,source_sha:env.MTC_HARNESS_SOURCE_SHA??null,harness_source_sha:env.MTC_HARNESS_SOURCE_SHA??null,candidate:actualCandidate,candidate_evidence_sha256:artifactHash(plan.candidate_evidence),plan_sha256:artifactHash(plan),tenant,fixture_id:fixtureId,timeline,offered:plan.arrivals.length,started:requests.length,completed:requests.filter(row=>!row.error).length,failed:requests.filter(row=>row.error).length,unissued:plan.arrivals.length-requests.length,peak_active:peakActive,http_exchanges:requests.reduce((sum,row)=>sum+Number(row.http_exchanges),0),latency_ms:{p50:percentile(latencies,.5),p95:percentile(latencies,.95),p99:percentile(latencies,.99),max:Math.max(...latencies)},baseline_sha256:artifactHash(plan.baseline),validated_baseline_sha256:baselineHash,baseline_error:baselineError,qualification:"NOT_EVALUATED",missing_evidence:["complete historical multidimensional peak","financial exactly-once assertions","semantic/archive API payload verification","PG poolwait/IO/locks and memory recovery","archive debt drain confirmation"],requests};
 }
 if(process.argv[1] && import.meta.url===pathToFileURL(process.argv[1]).href) {
   try { enter("plan_read"); const plan=JSON.parse(readFileSync(process.env.MTC_PEAK_PLAN_FILE??"/plan/plan.json","utf8")); enter("plan_validate"); const report=await run(validatePlan(plan)); enter("report_write"); writeFileSync(process.env.MTC_PEAK_REPORT_FILE??"/evidence/report.json",JSON.stringify(report,null,2)); console.log(JSON.stringify(report)); process.exitCode=Number(report.failed)>0?2:0; }
