@@ -2498,10 +2498,10 @@ async fn raw_read_lost_owner_returns_without_shutdown(database_url: String) {
 async fn postgres_coverage_read_does_not_block_body_worker() {
     let url = std::env::var("MTC_TEST_POSTGRES_URL").expect("requires CI PostgreSQL");
     let isolated = PostgresTestDatabase::create(&url).await;
+    fair_projection_queue_contract(isolated.url().to_owned()).await;
     coverage_read_does_not_block_body_worker_contract(isolated.url().to_owned()).await;
     raw_read_does_not_block_next_claim_contract(isolated.url().to_owned()).await;
     raw_read_lost_owner_returns_without_shutdown(isolated.url().to_owned()).await;
-    fair_projection_queue_contract(isolated.url().to_owned()).await;
     isolated.cleanup().await;
 }
 
