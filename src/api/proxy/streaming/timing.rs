@@ -6,6 +6,7 @@ use serde_json::Value;
 pub(super) struct OutputTiming {
     first: Option<i64>,
     terminal: Option<i64>,
+    last_content_at: Option<i64>,
 }
 
 impl OutputTiming {
@@ -25,17 +26,19 @@ impl OutputTiming {
         if self.terminal.is_some() {
             return;
         }
+        if has_output_delta(frame) {
+            self.first.get_or_insert(elapsed_ms);
+            self.last_content_at = Some(elapsed_ms);
+        }
         if terminal {
             self.terminal = Some(elapsed_ms);
-        } else if self.first.is_none() && has_output_delta(frame) {
-            self.first = Some(elapsed_ms);
         }
     }
 
     pub(super) fn finish(&self, succeeded: bool) -> (Option<i64>, Option<i64>) {
-        let duration = if succeeded {
+        let duration = if succeeded && self.terminal.is_some() {
             self.first
-                .zip(self.terminal)
+                .zip(self.last_content_at)
                 .and_then(|(first, last)| (last > first).then_some(last - first))
         } else {
             None
@@ -123,10 +126,11 @@ mod tests {
             context.elapsed_millis_at(ingress + Duration::from_millis(700)),
         );
         timing.observe(
-            b"data: {}\n\n",
-            true,
+            b"data: {\"type\":\"response.output_text.delta\",\"delta\":\"y\"}\n\n",
+            false,
             context.elapsed_millis_at(ingress + Duration::from_millis(800)),
         );
+        timing.observe(b"data: {}\n\n", true, 850);
         let finalized = ingress + Duration::from_millis(900);
         assert_eq!(
             timing.finish_with_duration(true, context, finalized),
@@ -153,10 +157,30 @@ mod tests {
             false,
             300,
         );
+        timing.observe(
+            b"data: {\"type\":\"response.reasoning_text.delta\",\"delta\":\"x\"}\n\n",
+            false,
+            400,
+        );
         timing.observe(b"data: {}\n\n", true, 500);
         timing.observe(b"data: {}\n\n", true, 900);
-        assert_eq!(timing.finish(true), (Some(300), Some(200)));
+        assert_eq!(timing.finish(true), (Some(300), Some(100)));
         assert_eq!(timing.finish(false), (Some(300), None));
+    }
+
+    #[test]
+    fn incomplete_or_single_content_observation_does_not_invent_generation_time() {
+        let mut timing = OutputTiming::default();
+        let delta = b"data: {\"type\":\"response.output_text.delta\",\"delta\":\"x\"}\n\n";
+        timing.observe(delta, false, 100);
+        timing.observe(b"data: {}\n\n", true, 900);
+        assert_eq!(timing.finish(true), (Some(100), None));
+        let mut timing = OutputTiming::default();
+        timing.observe(delta, false, 100);
+        timing.observe(delta, false, 200);
+        assert_eq!(timing.finish(true), (Some(100), None));
+        timing.observe(b"data: {}\n\n", true, 900);
+        assert_eq!(timing.finish(true), (Some(100), Some(100)));
     }
 
     #[test]
