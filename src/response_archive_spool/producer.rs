@@ -515,7 +515,7 @@ struct CaptureReceipt {
 
 struct CarrierCaptureInput {
     budget: Arc<crate::gateway_body::memory::ProxyMemoryBudget>,
-    source: Option<tokio::sync::mpsc::Sender<CaptureChunk>>,
+    source: Option<tokio::sync::mpsc::UnboundedSender<CaptureChunk>>,
     progress: tokio::sync::watch::Sender<(u64, bool)>,
     length: u64,
     #[cfg(test)]
@@ -542,13 +542,10 @@ impl CarrierCaptureInput {
                     #[cfg(test)]
                     pause: self.write_pause.take(),
                 })
-                .await
                 .map_err(|_| std::io::Error::other("capture closed"))?;
             // The receiver acknowledges only when capture has taken ownership
             // of the previous chunk, rather than merely queueing its bytes.
-            completion
-                .await
-                .map_err(|_| std::io::Error::other("capture closed"))?;
+            completion.map_err(|_| std::io::Error::other("capture closed"))?;
             self.length += (end - offset) as u64;
             self.progress.send_replace((self.length, false));
         }
@@ -557,7 +554,7 @@ impl CarrierCaptureInput {
 }
 
 fn carrier_capture_stream(
-    receiver: tokio::sync::mpsc::Receiver<CaptureChunk>,
+    receiver: tokio::sync::mpsc::UnboundedReceiver<CaptureChunk>,
 ) -> impl futures_util::Stream<Item = Result<Bytes, AppError>> + Send {
     futures_util::stream::unfold(
         (receiver, None::<CaptureReceipt>),
@@ -784,7 +781,7 @@ impl ResponseArchiveProducer {
             reservation: memory,
             _archive_permit: archive_permit,
         });
-        let (source, source_receiver) = tokio::sync::mpsc::channel(1);
+        let (source, source_receiver) = tokio::sync::mpsc::unbounded_channel();
         let (progress, progress_receiver) = tokio::sync::watch::channel((0_u64, false));
         let active = Arc::new(AtomicBool::new(true));
         let writer_active = active.clone();
@@ -907,6 +904,9 @@ impl ResponseArchiveProducer {
     /// Nonblocking archival offer. Failure fences this incomplete capture;
     /// accepted chunks remain ordered in the existing single carrier queue.
     pub(crate) fn try_offer(&mut self, bytes: Bytes) -> bool {
+        if bytes.is_empty() {
+            return self.active.load(Ordering::Acquire);
+        }
         let Some(credit) = self.capture.budget.try_reserve_ingress_bytes(bytes.len()) else {
             self.abandon("capture_byte_budget_unavailable");
             return false;
@@ -924,7 +924,7 @@ impl ResponseArchiveProducer {
             .capture
             .source
             .as_ref()
-            .is_some_and(|source| source.try_send(chunk).is_ok());
+            .is_some_and(|source| source.send(chunk).is_ok());
         if !accepted {
             self.abandon("capture_queue_unavailable");
             return false;

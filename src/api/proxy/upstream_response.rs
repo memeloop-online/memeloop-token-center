@@ -619,6 +619,34 @@ impl From<reqwest::Response> for UpstreamResponse {
 mod tests {
     use super::*;
 
+    #[tokio::test]
+    async fn pending_archive_admission_never_blocks_original_chunks_or_empty_eof() {
+        for chunks in [
+            vec![],
+            vec![
+                Bytes::from_static(b"data: one\n\n"),
+                Bytes::from_static(b"data: [DONE]\n\n"),
+            ],
+        ] {
+            let expected = chunks.clone();
+            let mut captured = CapturedUpstream {
+                upstream: Some(Box::pin(stream::iter(chunks.into_iter().map(Ok)))),
+                capture: None,
+                admission: Some(Box::pin(std::future::pending())),
+                pending: None,
+            };
+            let mut actual = Vec::new();
+            while let Some(chunk) =
+                tokio::time::timeout(std::time::Duration::from_secs(1), captured.next())
+                    .await
+                    .unwrap()
+            {
+                actual.push(chunk.unwrap());
+            }
+            assert_eq!(actual, expected);
+        }
+    }
+
     #[test]
     fn upstream_headers_cannot_assert_validated_compact_provenance() {
         let mut headers = HeaderMap::new();
