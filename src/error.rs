@@ -266,6 +266,13 @@ impl AppError {
         Self::storage_with(code, ErrorFacts::new())
     }
 
+    pub(crate) fn storage_phase(mut self, phase: &'static str) -> Self {
+        if let Self::Storage { facts, .. } = &mut self {
+            facts.phase = Some(phase);
+        }
+        self
+    }
+
     pub(crate) fn storage_with(code: &'static str, facts: ErrorFacts) -> Self {
         Self::Storage { code, facts }
     }
