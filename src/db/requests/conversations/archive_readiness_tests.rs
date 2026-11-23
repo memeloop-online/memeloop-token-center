@@ -62,6 +62,18 @@ async fn fair_projection_queue_contract(database_url: String) {
         }
     }
     assert_eq!(db.reopen_session_body_rebuilds(8).await.unwrap(), 0);
+    // A continuously refilled single slot must retain the same weighted lanes.
+    for (turn, expected) in [&fresh, &fresh, &retries, &rebuilds]
+        .into_iter()
+        .enumerate()
+    {
+        let claimed = db
+            .claim_conversation_projection_tasks_from_turn(Uuid::now_v7(), 1, turn)
+            .await
+            .unwrap();
+        assert_eq!(claimed.len(), 1);
+        assert!(expected.contains(&claimed[0].request_id));
+    }
     let owner = Uuid::now_v7();
     let first = db
         .claim_conversation_projection_tasks(owner, 32)
