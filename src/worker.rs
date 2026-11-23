@@ -1361,6 +1361,13 @@ async fn archive_session_body_with_result(
         .raw_capture_reference(tenant_id, request_id, "response")
         .await?
     {
+        if !state
+            .db
+            .renew_session_body_archive(lease_owner, request_id)
+            .await?
+        {
+            return Ok(false);
+        }
         state
             .db
             .bind_raw_capture(tenant_id, request_id, "response", &response)
@@ -1381,6 +1388,13 @@ async fn archive_session_body_with_result(
         .raw_capture_reference(tenant_id, request_id, "request")
         .await?
     {
+        if !state
+            .db
+            .renew_session_body_archive(lease_owner, request_id)
+            .await?
+        {
+            return Ok(false);
+        }
         state
             .db
             .bind_raw_capture(tenant_id, request_id, "request", &request)
