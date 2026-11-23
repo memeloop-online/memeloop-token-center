@@ -1212,7 +1212,7 @@ fn publish_durable(shared: &Arc<SharedBody>) {
                                     tracing::error!(
                                         "request source durable handoff rejected; retaining source for retry"
                                     );
-                                    tokio::time::sleep(Duration::from_millis(250)).await;
+                                    tokio::time::sleep(std::time::Duration::from_millis(250)).await;
                                 }
                             }
                             Some(settlement)
