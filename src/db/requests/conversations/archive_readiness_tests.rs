@@ -2383,11 +2383,79 @@ async fn coverage_read_does_not_block_body_worker_contract(database_url: String)
         .unwrap();
 }
 
+async fn raw_read_does_not_block_next_claim_contract(database_url: String) {
+    let historical = Fixture::new(database_url.clone(), true).await;
+    historical.capture().await;
+    assert!(response_archive_spool::process_one_for_test(&historical.state).await);
+    assert!(response_archive_spool::process_one_for_test(&historical.state).await);
+    let gate = Database::gate_coverage_read_for_test(historical.request_id);
+    let (stop, shutdown) = tokio::sync::watch::channel(false);
+    let worker = tokio::spawn(crate::worker::run_until_shutdown(
+        historical.state.clone(),
+        shutdown,
+    ));
+    let _cleanup = CoverageWorkerGuard {
+        request: historical.request_id,
+        gate: gate.clone(),
+        worker: worker.abort_handle(),
+    };
+    tokio::time::timeout(std::time::Duration::from_secs(10), gate.0.notified())
+        .await
+        .unwrap();
+    let mut fresh = Fixture::new(database_url, true).await;
+    fresh.state.archive = historical.state.archive.clone();
+    fresh.state.db = fresh
+        .state
+        .db
+        .clone()
+        .with_archive(fresh.state.archive.clone());
+    fresh.capture().await;
+    assert!(response_archive_spool::process_one_for_test(&fresh.state).await);
+    assert!(response_archive_spool::process_one_for_test(&fresh.state).await);
+    tokio::time::timeout(std::time::Duration::from_secs(10), async {
+        loop {
+            let done: Option<i64> = sqlx::query_scalar(
+                "SELECT projected_at FROM conversation_projection_outbox WHERE request_id=$1",
+            )
+            .bind(fresh.request_id.to_string())
+            .fetch_one(&fresh.state.db.pool)
+            .await
+            .unwrap();
+            if done.is_some() {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+    })
+    .await
+    .expect("blocked raw GET must not stop the next claim");
+    sqlx::query("UPDATE conversation_projection_outbox SET lease_owner='replacement',terminal_lease_owner='replacement' WHERE request_id=$1").bind(historical.request_id.to_string()).execute(&fresh.state.db.pool).await.unwrap();
+    gate.1.notify_one();
+    stop.send(true).unwrap();
+    tokio::time::timeout(std::time::Duration::from_secs(10), worker)
+        .await
+        .unwrap()
+        .unwrap();
+    let ack: Option<i64> = sqlx::query_scalar(
+        "SELECT projected_at FROM conversation_projection_outbox WHERE request_id=$1",
+    )
+    .bind(historical.request_id.to_string())
+    .fetch_one(&fresh.state.db.pool)
+    .await
+    .unwrap();
+    assert!(
+        ack.is_none(),
+        "lost owner must not acknowledge the blocked task"
+    );
+}
+
 #[tokio::test]
 async fn postgres_coverage_read_does_not_block_body_worker() {
     let url = std::env::var("MTC_TEST_POSTGRES_URL").expect("requires CI PostgreSQL");
     let isolated = PostgresTestDatabase::create(&url).await;
     coverage_read_does_not_block_body_worker_contract(isolated.url().to_owned()).await;
+    raw_read_does_not_block_next_claim_contract(isolated.url().to_owned()).await;
+    fair_projection_queue_contract(isolated.url().to_owned()).await;
     isolated.cleanup().await;
 }
 

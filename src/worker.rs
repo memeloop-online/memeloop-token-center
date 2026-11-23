@@ -1355,6 +1355,8 @@ async fn archive_session_body_with_result(
         )
         .await;
     };
+    #[cfg(test)]
+    crate::db::Database::wait_raw_projection_gate_for_test(request_id).await;
     tracing::debug!(%request_id, %lease_owner, stage = "raw_response_reference_start", "conversation projection stage");
     if let Some(response) = state
         .archive
