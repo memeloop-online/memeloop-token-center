@@ -262,7 +262,14 @@ impl Database {
         .bind(request_id.to_string())
         .fetch_all(&mut **transaction)
         .await?;
-        rows.into_iter()
+        Self::history_egress_from_rows(request_id, &rows)
+    }
+
+    pub(crate) fn history_egress_from_rows(
+        request_id: Uuid,
+        rows: &[sqlx::any::AnyRow],
+    ) -> Result<Vec<RequestEgressAttempt>, AppError> {
+        rows.iter()
             .map(|row| {
                 Ok(RequestEgressAttempt {
                     request_id,

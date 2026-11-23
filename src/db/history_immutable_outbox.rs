@@ -80,6 +80,7 @@ pub(super) async fn source_native_envelope_in_transaction(
         }
     }
     originals.insert("terminal".into(), terminal_original);
+    let mut captured_rows = std::collections::BTreeMap::new();
     for (name, sql) in [
         (
             "statistics",
@@ -106,6 +107,7 @@ pub(super) async fn source_native_envelope_in_transaction(
             name.into(),
             Value::Array(rows.iter().map(original_row).collect::<Result<_, _>>()?),
         );
+        captured_rows.insert(name, rows);
     }
     let tenant: String = identity.try_get("tenant_id")?;
     let key: String = identity.try_get("key_id")?;
@@ -128,20 +130,23 @@ pub(super) async fn source_native_envelope_in_transaction(
     let fact =
         Database::history_analysis_fact_in_transaction(transaction, &history_identity).await?;
     let egress =
-        Database::history_egress_in_transaction(transaction, history_identity.request_id).await?;
-    let transport =
-        Database::history_transport_in_transaction(transaction, history_identity.request_id)
-            .await?;
-    let observation = sqlx::query("SELECT * FROM conversation_observations WHERE request_id=$1 AND key_id=$2 AND cluster_id=$3")
-        .bind(request_id).bind(&key).bind(payload_json["session_context"]["session_id"].as_str())
-        .fetch_optional(&mut **transaction).await?;
+        Database::history_egress_from_rows(history_identity.request_id, &captured_rows["egress"])?;
+    let transport = Database::history_transport_from_rows(&captured_rows["transport"])?;
+    let mut observation = None;
+    for row in &captured_rows["observations"] {
+        if row.try_get::<String, _>("key_id")? == key
+            && Some(row.try_get::<String, _>("cluster_id")?.as_str())
+                == payload_json["session_context"]["session_id"].as_str()
+        {
+            observation = Some(row);
+            break;
+        }
+    }
     let execution = observation
-        .as_ref()
         .map(super::requests::conversations::execution_metadata_from_row)
         .transpose()?
         .flatten();
     let structure = observation
-        .as_ref()
         .map(super::requests::conversations::execution_structure_from_row)
         .transpose()?
         .flatten();
@@ -1270,3 +1275,6 @@ mod tests {
         server.abort();
     }
 }
+
+#[cfg(test)]
+mod reuse_tests;
