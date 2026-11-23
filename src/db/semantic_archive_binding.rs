@@ -19,6 +19,18 @@ static COVERAGE_READ_GATES: std::sync::LazyLock<
 
 impl Database {
     #[cfg(test)]
+    pub(crate) async fn wait_raw_projection_gate_for_test(request: Uuid) {
+        let gate = COVERAGE_READ_GATES
+            .lock()
+            .unwrap()
+            .remove(&request.to_string());
+        if let Some(gate) = gate {
+            gate.0.notify_one();
+            gate.1.notified().await;
+        }
+    }
+
+    #[cfg(test)]
     pub(crate) fn gate_coverage_read_for_test(
         request: Uuid,
     ) -> std::sync::Arc<(tokio::sync::Notify, tokio::sync::Notify)> {

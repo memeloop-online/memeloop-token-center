@@ -163,6 +163,36 @@ impl Database {
         side: &str,
         object: &crate::archive::CasArchiveObject,
     ) -> Result<bool, AppError> {
+        self.bind_raw_capture_with_projection_owner(tenant_id, request_id, side, object, None)
+            .await
+    }
+
+    pub(crate) async fn bind_raw_capture_for_projection(
+        &self,
+        tenant_id: Uuid,
+        request_id: Uuid,
+        side: &str,
+        object: &crate::archive::CasArchiveObject,
+        owner: Uuid,
+    ) -> Result<bool, AppError> {
+        self.bind_raw_capture_with_projection_owner(
+            tenant_id,
+            request_id,
+            side,
+            object,
+            Some(owner),
+        )
+        .await
+    }
+
+    async fn bind_raw_capture_with_projection_owner(
+        &self,
+        tenant_id: Uuid,
+        request_id: Uuid,
+        side: &str,
+        object: &crate::archive::CasArchiveObject,
+        owner: Option<Uuid>,
+    ) -> Result<bool, AppError> {
         let archive = self.body_archive()?;
         let effective = match archive
             .verified_published_raw_capture(tenant_id, request_id, side, object)
@@ -184,6 +214,15 @@ impl Database {
             _ => return Err(AppError::BadRequest("invalid raw archive side".into())),
         };
         let mut transaction = self.begin_write_transaction().await?;
+        if let Some(owner) = owner {
+            let now = unix_millis();
+            let fenced = sqlx::query("UPDATE conversation_projection_outbox SET attempts=attempts WHERE request_id=$1 AND tenant_id=$2 AND projected_at IS NULL AND COALESCE(terminal_lease_owner,lease_owner)=$3 AND COALESCE(terminal_lease_expires_at,lease_expires_at)>$4")
+                .bind(request_id.to_string()).bind(tenant_id.to_string()).bind(owner.to_string()).bind(now)
+                .execute(&mut *transaction).await?;
+            if fenced.rows_affected() != 1 {
+                return Ok(false);
+            }
+        }
         let changed = sqlx::query(statement)
             .bind(&effective.object_locator)
             .bind(request_id.to_string())
