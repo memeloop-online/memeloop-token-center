@@ -1372,7 +1372,13 @@ async fn archive_session_body_with_result(
         }
         state
             .db
-            .bind_raw_capture(tenant_id, request_id, "response", &response)
+            .bind_raw_capture_for_projection(
+                tenant_id,
+                request_id,
+                "response",
+                &response,
+                lease_owner,
+            )
             .await?;
         locators.response = Some(response.object_locator);
         locators.pending = false;
@@ -1399,7 +1405,13 @@ async fn archive_session_body_with_result(
         }
         state
             .db
-            .bind_raw_capture(tenant_id, request_id, "request", &request)
+            .bind_raw_capture_for_projection(
+                tenant_id,
+                request_id,
+                "request",
+                &request,
+                lease_owner,
+            )
             .await?;
         locators.request = request.object_locator;
         locators.source_identity = None;
@@ -1527,7 +1539,7 @@ async fn archive_session_body_with_result(
         {
             state
                 .db
-                .bind_raw_capture(tenant_id, request_id, side, &object)
+                .bind_raw_capture_for_projection(tenant_id, request_id, side, &object, lease_owner)
                 .await?;
         }
     }
