@@ -189,9 +189,9 @@ impl Database {
             DatabaseBackend::PostgreSql => " FOR UPDATE OF f",
             DatabaseBackend::Sqlite => "",
         };
-        let existing_fact = sqlx::query(&format!(
+        let existing_fact = sqlx::query(sqlx::AssertSqlSafe(format!(
             "SELECT CAST(CASE WHEN f.input_tokens = 0 AND f.output_tokens = 0 AND f.cached_input_tokens = 0 AND f.cache_write_tokens = 0 AND f.cost_micros = 0 AND EXISTS (SELECT 1 FROM pending_proxy_settlements p WHERE p.request_id = f.request_id AND p.tenant_id = f.tenant_id AND p.key_id = f.key_id AND p.unknown_reason IS NOT NULL) THEN 1 ELSE 0 END AS BIGINT) AS replaceable FROM request_stats_facts f WHERE f.request_id = $1{fact_lock}"
-        ))
+        )))
         .bind(&request_id)
         .fetch_optional(&mut *transaction)
         .await?;
