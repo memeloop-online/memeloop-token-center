@@ -4,7 +4,9 @@ use super::*;
 use sqlx::{Column, ValueRef};
 
 mod event_capture;
+mod summary_batch;
 pub(crate) use event_capture::{EventDraft, PreparedEventCapture};
+pub(super) use summary_batch::SummaryBatch;
 
 /// Preserve the original scalar types rather than coercing unknown money to zero.
 fn original_row(row: &AnyRow) -> Result<Value, AppError> {
@@ -603,6 +605,22 @@ impl Database {
         identity: crate::request_history::HistoryIdentity,
         revision: i64,
     ) -> Result<crate::request_history::HistorySnapshot, crate::request_history::HistoryError> {
+        self.history_materialize_envelope_with_batch(
+            envelope,
+            identity,
+            revision,
+            &mut SummaryBatch::default(),
+        )
+        .await
+    }
+
+    pub(crate) async fn history_materialize_envelope_with_batch(
+        &self,
+        envelope: &Value,
+        identity: crate::request_history::HistoryIdentity,
+        revision: i64,
+        summaries: &mut SummaryBatch,
+    ) -> Result<crate::request_history::HistorySnapshot, crate::request_history::HistoryError> {
         use crate::request_history::{HistoryError, HistorySnapshot};
         let mut payload: Option<Value> = serde_json::from_value(envelope["payload"].clone())?;
         let mut read_model = envelope["read_model"].clone();
@@ -642,9 +660,13 @@ impl Database {
             let native_request = envelope["archive_identity"]["request_id"]
                 .as_str()
                 .ok_or(HistoryError::Invalid("immutable event archive identity"))?;
-            if let Some(summary) = self
-                .body_archive()?
-                .supplier_summary(identity.tenant_id, parse_uuid(native_request.to_owned())?)
+            let request = parse_uuid(native_request.to_owned())?;
+            if let Some(summary) = summaries
+                .get_or_load(identity.tenant_id, request, || async {
+                    self.body_archive()?
+                        .supplier_summary(identity.tenant_id, request)
+                        .await
+                })
                 .await?
             {
                 payload["supplier_error"] = serde_json::to_value(summary)?;
@@ -823,6 +845,7 @@ impl Database {
         let rows = sqlx::query("SELECT revision,source,request_id,tenant_id,key_id,created_at,snapshot,delivery_snapshot FROM request_history_immutable_outbox WHERE revision <= COALESCE($2,9223372036854775807) ORDER BY revision LIMIT $1")
             .bind(page_size).bind(ceiling).fetch_all(&self.pool).await?;
         let mut snapshots = Vec::with_capacity(rows.len());
+        let mut summaries = SummaryBatch::default();
         for row in rows {
             let revision: i64 = row.try_get("revision")?;
             let stored_identity = HistoryIdentity {
@@ -853,7 +876,12 @@ impl Database {
             } else {
                 serde_json::to_string(
                     &self
-                        .history_materialize_envelope(&envelope, identity, revision)
+                        .history_materialize_envelope_with_batch(
+                            &envelope,
+                            identity,
+                            revision,
+                            &mut summaries,
+                        )
                         .await?,
                 )?
             };

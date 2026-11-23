@@ -241,36 +241,73 @@ impl ClickHouse {
         &self,
         identity: &super::HistoryIdentity,
     ) -> Result<Option<HistorySnapshot>, HistoryError> {
+        Ok(self
+            .baseline_snapshots(std::slice::from_ref(identity))
+            .await?
+            .pop()
+            .flatten())
+    }
+
+    /// One authorized physical-identity query for a complete maintenance page.
+    pub(crate) async fn baseline_snapshots(
+        &self,
+        identities: &[super::HistoryIdentity],
+    ) -> Result<Vec<Option<HistorySnapshot>>, HistoryError> {
+        if identities.is_empty() {
+            return Ok(Vec::new());
+        }
         #[derive(serde::Deserialize)]
         struct Stored {
+            tenant_id: uuid::Uuid,
+            key_id: uuid::Uuid,
+            request_id: uuid::Uuid,
+            source: String,
+            physical_created_at: String,
             snapshot: String,
             snapshot_hash: String,
         }
         let mut query = BoundQuery::new("");
-        let tenant = query.bind(identity.tenant_id, "UUID");
-        let key = query.bind(identity.key_id, "UUID");
-        let request = query.bind(identity.request_id, "UUID");
-        let source = query.bind(&identity.source, "String");
-        let created = query.bind(identity.created_at, "Int64");
+        let mut clauses = Vec::with_capacity(identities.len());
+        for identity in identities {
+            let tenant = query.bind(identity.tenant_id, "UUID");
+            let key = query.bind(identity.key_id, "UUID");
+            let request = query.bind(identity.request_id, "UUID");
+            let source = query.bind(&identity.source, "String");
+            let created = query.bind(identity.created_at, "Int64");
+            clauses.push(format!("(tenant_id={tenant} AND key_id={key} AND request_id={request} AND source={source} AND created_at={created})"));
+        }
         query.sql = format!(
-            "SELECT snapshot,snapshot_hash FROM request_history_v1 FINAL WHERE tenant_id={tenant} AND key_id={key} AND request_id={request} AND source={source} AND created_at={created} FORMAT JSONEachRow"
+            "SELECT tenant_id,key_id,request_id,source,toString(created_at) AS physical_created_at,snapshot,snapshot_hash FROM request_history_v1 FINAL WHERE {} FORMAT JSONEachRow",
+            clauses.join(" OR ")
         );
         let rows = self.rows::<Stored>(query).await?;
-        if rows.len() > 1 {
-            return Err(HistoryError::Mismatch);
+        let mut result = vec![None; identities.len()];
+        for row in rows {
+            let snapshot: HistorySnapshot = serde_json::from_str(&row.snapshot)?;
+            let physical = super::HistoryIdentity {
+                tenant_id: row.tenant_id,
+                key_id: row.key_id,
+                request_id: row.request_id,
+                source: row.source,
+                created_at: row
+                    .physical_created_at
+                    .parse()
+                    .map_err(|_| HistoryError::Mismatch)?,
+            };
+            if physical != snapshot.identity {
+                return Err(HistoryError::Mismatch);
+            }
+            let position = identities
+                .iter()
+                .position(|identity| *identity == snapshot.identity)
+                .ok_or(HistoryError::Mismatch)?;
+            if result[position].is_some() || super::canonical_hash(&snapshot)? != row.snapshot_hash
+            {
+                return Err(HistoryError::Mismatch);
+            }
+            result[position] = Some(snapshot);
         }
-        rows.into_iter()
-            .next()
-            .map(|row| {
-                let snapshot: HistorySnapshot = serde_json::from_str(&row.snapshot)?;
-                if snapshot.identity != *identity
-                    || super::canonical_hash(&snapshot)? != row.snapshot_hash
-                {
-                    return Err(HistoryError::Mismatch);
-                }
-                Ok(snapshot)
-            })
-            .transpose()
+        Ok(result)
     }
 
     pub async fn snapshots(
