@@ -1229,6 +1229,20 @@ async fn run_response_archive_writer(
     // Upload concurrency and multipart memory belong to this background task,
     // never to admission of the supplier/client stream. Shared carrier capture
     // runs independently; the handoff channel holds one acknowledged chunk.
+    #[cfg(test)]
+    pause_begin_for_test(&state).await;
+    #[cfg(test)]
+    pause_begin_ack_for_test(&state).await;
+    let Some(captured) =
+        captured_source(&mut source_task, identity, progress, active.clone()).await?
+    else {
+        return Ok(WriterOutcome::Abandoned);
+    };
+    let source = captured.source;
+    let publication_started = std::time::Instant::now();
+    let mut publication_attempt = 0_u64;
+    let (staged, staging_owner) = loop {
+        let staged_attempt = async {
     let _upload_memory = if memory._archive_permit.is_none() {
         let permits = state.proxy_archive_stream_permits.clone();
         let permit = tokio::select! {
@@ -1257,20 +1271,9 @@ async fn run_response_archive_writer(
         crate::metrics::MemoryComponent::StreamCapture,
         super::CAPTURE_MEMORY_BYTES,
     );
-    #[cfg(test)]
-    pause_begin_for_test(&state).await;
-    #[cfg(test)]
-    pause_begin_ack_for_test(&state).await;
-    let Some(captured) =
-        captured_source(&mut source_task, identity, progress, active.clone()).await?
-    else {
-        return Ok(WriterOutcome::Abandoned);
-    };
-    let source = captured.source;
-    let publication_started = std::time::Instant::now();
-    let mut publication_attempt = 0_u64;
-    let (staged, staging_owner) = loop {
-        match stage_captured_response(&state, &source, captured.staging).await {
+            stage_captured_response(&state, &source, captured.staging).await
+        }.await;
+        match staged_attempt {
             Ok(staged) => break staged,
             Err(error @ AppError::Storage { .. }) => {
                 publication_attempt = publication_attempt.saturating_add(1);
