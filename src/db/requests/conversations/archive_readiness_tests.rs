@@ -2457,6 +2457,7 @@ async fn raw_read_lost_owner_returns_without_shutdown(database_url: String) {
     assert!(response_archive_spool::process_one_for_test(&fixture.state).await);
     assert!(response_archive_spool::process_one_for_test(&fixture.state).await);
     let owner = fixture.claim().await;
+    let before: (Option<String>,Option<String>)=sqlx::query_as("SELECT semantic_snapshot_json,semantic_payload_snapshot_json FROM conversation_projection_outbox WHERE request_id=$1").bind(fixture.request_id.to_string()).fetch_one(&fixture.state.db.pool).await.unwrap();
     let gate = Database::gate_coverage_read_for_test(fixture.request_id);
     let state = fixture.state.clone();
     let request = fixture.request_id;
@@ -2481,7 +2482,12 @@ async fn raw_read_lost_owner_returns_without_shutdown(database_url: String) {
             .unwrap()
             .unwrap()
     );
-    let unchanged: i64=sqlx::query_scalar("SELECT COUNT(*) FROM conversation_projection_outbox WHERE request_id=$1 AND projected_at IS NULL AND semantic_snapshot_json IS NULL AND semantic_payload_snapshot_json IS NULL AND terminal_lease_owner='replacement'").bind(request.to_string()).fetch_one(&fixture.state.db.pool).await.unwrap();
+    let unchanged: i64=sqlx::query_scalar("SELECT COUNT(*) FROM conversation_projection_outbox WHERE request_id=$1 AND projected_at IS NULL AND terminal_lease_owner='replacement'").bind(request.to_string()).fetch_one(&fixture.state.db.pool).await.unwrap();
+    let after: (Option<String>,Option<String>)=sqlx::query_as("SELECT semantic_snapshot_json,semantic_payload_snapshot_json FROM conversation_projection_outbox WHERE request_id=$1").bind(request.to_string()).fetch_one(&fixture.state.db.pool).await.unwrap();
+    assert_eq!(
+        after, before,
+        "lost owner must preserve the original terminal snapshots"
+    );
     assert_eq!(
         unchanged, 1,
         "lost owner must return naturally without preparing or acknowledging"
