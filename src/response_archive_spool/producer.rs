@@ -1236,6 +1236,34 @@ async fn run_response_archive_writer(
     // Upload concurrency and multipart memory belong to this background task,
     // never to admission of the supplier/client stream. Shared carrier capture
     // runs independently; the handoff channel holds one acknowledged chunk.
+    let _upload_memory = if memory._archive_permit.is_none() {
+        let permits = state.proxy_archive_stream_permits.clone();
+        let permit = tokio::select! {
+            permit = permits.acquire_owned() => permit
+                .map_err(|_| AppError::internal("capture_upload_admission_closed"))?,
+            () = capture_abandoned(progress.clone(), active.clone()) =>
+                return Ok(writer_interrupted(identity, "abandoned_before_upload")),
+        };
+        let reservation = tokio::select! {
+            reservation = state.persistence.stream_memory.temporary_wait(
+                super::CAPTURE_MEMORY_BYTES,
+                crate::gateway_body::memory::CAPTURE_MEMORY_WEIGHT,
+            ) => reservation.ok_or_else(|| AppError::internal("capture_upload_memory_closed"))?,
+            () = capture_abandoned(progress.clone(), active.clone()) =>
+                return Ok(writer_interrupted(identity, "abandoned_before_upload_memory")),
+        };
+        Some(CaptureQueueMemory {
+            _local_metrics: None,
+            _archive_permit: Some(permit),
+            reservation: Some(reservation),
+        })
+    } else {
+        None
+    };
+    let _upload_metrics = state.metrics.memory_usage(
+        crate::metrics::MemoryComponent::StreamCapture,
+        super::CAPTURE_MEMORY_BYTES,
+    );
     #[cfg(test)]
     pause_begin_for_test(&state).await;
     #[cfg(test)]
@@ -1249,38 +1277,7 @@ async fn run_response_archive_writer(
     let publication_started = std::time::Instant::now();
     let mut publication_attempt = 0_u64;
     let (staged, staging_owner) = loop {
-        let staged_attempt = async {
-            let _upload_memory = if memory._archive_permit.is_none() {
-                let permits = state.proxy_archive_stream_permits.clone();
-                let permit = permits
-                    .acquire_owned()
-                    .await
-                    .map_err(|_| AppError::internal("capture_upload_admission_closed"))?;
-                let reservation = state
-                    .persistence
-                    .stream_memory
-                    .temporary_wait(
-                        super::CAPTURE_MEMORY_BYTES,
-                        crate::gateway_body::memory::CAPTURE_MEMORY_WEIGHT,
-                    )
-                    .await
-                    .ok_or_else(|| AppError::internal("capture_upload_memory_closed"))?;
-                Some(CaptureQueueMemory {
-                    _local_metrics: None,
-                    _archive_permit: Some(permit),
-                    reservation: Some(reservation),
-                })
-            } else {
-                None
-            };
-            let _upload_metrics = state.metrics.memory_usage(
-                crate::metrics::MemoryComponent::StreamCapture,
-                super::CAPTURE_MEMORY_BYTES,
-            );
-            stage_captured_response(&state, &source, captured.staging).await
-        }
-        .await;
-        match staged_attempt {
+        match stage_captured_response(&state, &source, captured.staging).await {
             Ok(staged) => break staged,
             Err(error @ AppError::Storage { .. }) => {
                 publication_attempt = publication_attempt.saturating_add(1);
