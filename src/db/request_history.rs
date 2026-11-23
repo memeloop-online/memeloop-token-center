@@ -594,8 +594,19 @@ impl Database {
         page_size: i64,
         ceiling: Option<i64>,
     ) -> Result<Vec<HistorySnapshot>, HistoryError> {
+        let started = std::time::Instant::now();
         self.history_capture_pending(page_size).await?;
+        let capture_ms = started.elapsed().as_millis() as u64;
+        let phase = std::time::Instant::now();
         let immutable = self.history_immutable_pending(page_size, ceiling).await?;
+        if !immutable.is_empty() {
+            tracing::info!(
+                rows = immutable.len(),
+                capture_ms,
+                materialize_ms = phase.elapsed().as_millis() as u64,
+                "request history capture materialization timings"
+            );
+        }
         if !immutable.is_empty() {
             return Ok(immutable);
         }

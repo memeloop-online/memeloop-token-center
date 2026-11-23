@@ -292,27 +292,36 @@ impl HistorySourceSnapshot {
         let Some(page) = self.next_envelopes(page_size).await? else {
             return Ok(0);
         };
+        let identities = page
+            .rows
+            .iter()
+            .map(|row| row.0.clone())
+            .collect::<Vec<_>>();
+        let existing = reader.baseline_snapshots(&identities).await?;
+        let mut summaries = history_immutable_outbox::SummaryBatch::default();
         let mut expected = Vec::with_capacity(page.rows.len());
         let mut missing = Vec::new();
-        for (identity, revision, authority) in &page.rows {
+        for ((identity, revision, authority), existing) in page.rows.iter().zip(existing) {
             let row = match authority {
                 BaselineAuthority::Captured(envelope) => {
                     database
-                        .history_materialize_envelope(envelope, identity.clone(), *revision)
+                        .history_materialize_envelope_with_batch(
+                            envelope,
+                            identity.clone(),
+                            *revision,
+                            &mut summaries,
+                        )
                         .await?
                 }
                 BaselineAuthority::Frozen(snapshot) => snapshot.clone(),
-                BaselineAuthority::Acknowledged(hash) => acknowledged_baseline_snapshot(
-                    identity,
-                    *revision,
-                    hash,
-                    reader.baseline_snapshot(identity).await?,
-                )?,
+                BaselineAuthority::Acknowledged(hash) => {
+                    acknowledged_baseline_snapshot(identity, *revision, hash, existing.clone())?
+                }
             };
             if row.identity != *identity || row.revision != *revision {
                 return Err(HistoryError::Mismatch);
             }
-            match reader.baseline_snapshot(identity).await? {
+            match existing {
                 Some(existing) if existing.revision > *revision => {
                     return Err(HistoryError::Changed);
                 }
@@ -326,15 +335,12 @@ impl HistorySourceSnapshot {
             expected.push(row);
         }
         writer.append(&missing).await?;
-        let mut target = Vec::with_capacity(expected.len());
-        for row in &expected {
-            target.push(
-                reader
-                    .baseline_snapshot(&row.identity)
-                    .await?
-                    .ok_or(HistoryError::Mismatch)?,
-            );
-        }
+        let target = reader
+            .baseline_snapshots(&identities)
+            .await?
+            .into_iter()
+            .map(|row| row.ok_or(HistoryError::Mismatch))
+            .collect::<Result<Vec<_>, _>>()?;
         self.acknowledge_page(database, page.token, &expected, &target)
             .await?;
         Ok(expected.len())
