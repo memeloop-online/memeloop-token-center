@@ -129,18 +129,15 @@ pub(super) fn prepare_forwarded_request(
     route: &ResolvedUpstream,
     protocol: Protocol,
     request: &Value,
-    prepare_plaintext_collaboration: bool,
-    normalize_multi_agent: bool,
+    bridge_multi_agent: bool,
     responses_via_chat_dialect: Option<crate::provider::ResponsesViaChatDialect>,
 ) -> Result<(Value, Option<responses_via_chat::Context>), AppError> {
     let mut forwarded = request.clone();
-    if prepare_plaintext_collaboration {
+    if bridge_multi_agent {
         crate::api::request_normalization::prepare_plaintext_collaboration_tools(
             &mut forwarded,
             true,
         )?;
-    }
-    if normalize_multi_agent {
         crate::api::request_normalization::normalize_codex_multi_agent_v2(&mut forwarded, true)?;
     }
     let is_kimi_route = route.driver == crate::oauth::managed::kimi::PROVIDER_DRIVER;

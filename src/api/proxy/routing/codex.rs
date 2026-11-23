@@ -146,11 +146,13 @@ pub(super) fn validate_route(route: &ResolvedUpstream, protocol: Protocol) -> Re
     codex_transport::validate_route_config(&route.config)
 }
 
+#[allow(clippy::too_many_arguments)]
 pub(super) async fn send_proxy_route(
     state: &AppState,
     headers: &HeaderMap,
     request_id: Uuid,
     route: &PreparedProxyRoute,
+    plan: &codex_transport::PreparedCodexRequest,
     candidate_rank: usize,
     outbound_attempt: usize,
     h2_recovery_available: &mut bool,
@@ -165,15 +167,12 @@ pub(super) async fn send_proxy_route(
     .await
     .map_err(|_| ProxySendError::CandidateUnavailable)?;
     let target_url = network::upstream_api_url(&outbound_base_url, codex_transport::RESPONSES_PATH);
-    let session_id = route
-        .codex_session_id
-        .as_deref()
-        .ok_or(ProxySendError::Credential)?;
+    let session_id = plan.session_id.as_str();
     // `prepare_request_with_id` has forced the exact outbound document to be
     // non-persistent. An HTTP 400 is still replayable only after a complete,
     // bounded, domain-level classification identifies known transient
     // semantics.
-    let mut retry = CodexRetryState::new(route.codex_store_disabled);
+    let mut retry = CodexRetryState::new(plan.store_disabled);
     let transport_policy = runtime_transport_policy(
         &route.route.config,
         state.config.upstream_health.shared_probe_attempts,

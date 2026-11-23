@@ -228,6 +228,7 @@ fn bounded_visible_ascii(value: &str, max_bytes: usize) -> bool {
 
 pub(super) struct PreparedCodexRequest {
     pub downstream_stream: bool,
+    pub store_disabled: bool,
     pub output_token_ceiling: i64,
     pub session_id: String,
 }
@@ -463,6 +464,7 @@ pub(super) fn prepare_request_with_id(
 
     Ok(PreparedCodexRequest {
         downstream_stream,
+        store_disabled: request.get("store").and_then(Value::as_bool) == Some(false),
         output_token_ceiling,
         session_id,
     })

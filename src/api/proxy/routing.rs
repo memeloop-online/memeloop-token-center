@@ -175,7 +175,6 @@ pub(super) fn plan_proxy_route(
                         protocol,
                         request_json,
                         bridge_multi_agent && responses_via_chat_dialect.is_some(),
-                        bridge_multi_agent && responses_via_chat_dialect.is_some(),
                         responses_via_chat_dialect,
                     )
                 },
@@ -282,12 +281,6 @@ pub(super) fn plan_proxy_route(
     } else {
         None
     };
-    let codex_downstream_stream = codex_plan
-        .as_ref()
-        .is_some_and(|plan| plan.downstream_stream);
-    let codex_store_disabled =
-        codex_plan.is_some() && forwarded_json.get("store").and_then(Value::as_bool) == Some(false);
-    let codex_session_id = codex_plan.map(|plan| plan.session_id);
     let plugins = wire_shim_runtime(state);
     let wire_protocol = if responses_anthropic.is_some() {
         "anthropic"
@@ -306,7 +299,7 @@ pub(super) fn plan_proxy_route(
             config_json: "{}".to_owned(),
         },
     );
-    let wait_for_compaction = is_codex
+    let wait_for_compaction = codex_plan.is_some()
         && (matches!(protocol, Protocol::OpenAiResponsesCompact)
             || (matches!(protocol, Protocol::OpenAiResponses)
                 && crate::api::new_api_transport::has_compaction_trigger(request_json)));
@@ -318,9 +311,7 @@ pub(super) fn plan_proxy_route(
         output_token_ceiling,
         output_token_limit,
         upstream_stream,
-        codex_downstream_stream,
-        codex_store_disabled,
-        codex_session_id,
+        codex: codex_plan,
         component_context,
         responses_chat,
         upstream_path,
@@ -522,9 +513,7 @@ pub(super) async fn materialize_proxy_route(
         forwarded_body: Bytes::from(forwarded_body),
         component_input_bytes,
         upstream_stream: planned.upstream_stream,
-        codex_downstream_stream: planned.codex_downstream_stream,
-        codex_store_disabled: planned.codex_store_disabled,
-        codex_session_id: planned.codex_session_id,
+        codex: planned.codex,
         component_request,
         responses_chat: planned.responses_chat,
         upstream_path: planned.upstream_path,
@@ -552,12 +541,13 @@ pub(super) async fn send_proxy_route(
     if route.route.driver == crate::cursor_native::DRIVER {
         return Err(ProxySendError::CandidateUnavailable);
     }
-    if route.is_codex() {
+    if let Some(plan) = &route.codex {
         return codex::send_proxy_route(
             state,
             headers,
             request_id,
             route,
+            plan,
             candidate_rank,
             outbound_attempt,
             h2_recovery_available,
@@ -666,7 +656,6 @@ mod compact_bridge_tests {
                 &route,
                 Protocol::OpenAiResponses,
                 &request,
-                false,
                 false,
                 None,
             )

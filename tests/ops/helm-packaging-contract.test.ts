@@ -134,6 +134,11 @@ test('Helm chart packaging, security, ingress, and schema contracts', () => {
       hostAlias: render('host-alias', ['--show-only', 'templates/deployment.yaml', '--set-string', 'hostAliases[0].ip=10.28.0.22', '--set-string', 'hostAliases[0].hostnames[0]=private-upstream.example.test']),
       recreate: render('recreate', ['--set', 'deploymentStrategy=Recreate']),
       archiveReadyBoundary: render('archive-ready-boundary', ['--set', 'config.s3.readinessDeadlineMillis=5001', '--set', 'probes.readiness.timeoutSeconds=8']),
+      transportLimits: render('transport-limits', [
+        '--set', 'config.maxTcpConnections=4096',
+        '--set', 'config.maxTcpConnectionsPerIp=2048',
+        '--set', 'config.maxHttp2ConcurrentStreams=4294967295',
+      ]),
       proxyMemory: render('proxy-memory', ['--set', 'config.proxyMemoryBudgetBytes=536870912', '--set', 'roles.gateway.resources.requests.memory=512Mi', '--set', 'roles.gateway.resources.limits.memory=768Mi']),
       fractionalMemory: render('fractional-memory', ['--set', 'config.proxyMemoryBudgetBytes=536870912', '--set', 'roles.gateway.resources.limits.memory=0.75Gi']),
       maximumBodyMemory: render('maximum-body-memory', ['--set', 'config.responsesBodyMaxBytes=67108864', '--set', 'config.proxyMemoryBudgetBytes=1073741824', '--set', 'roles.gateway.resources.requests.memory=1Gi', '--set', 'roles.gateway.resources.limits.memory=1280Mi']),
@@ -240,6 +245,15 @@ test('Helm chart packaging, security, ingress, and schema contracts', () => {
     }
 
     has('default', 'kind: NetworkPolicy'); has('default', 'kind: PodDisruptionBudget');
+    for (const [name, value] of [
+      ['MTC_MAX_TCP_CONNECTIONS', '4096'],
+      ['MTC_MAX_TCP_CONNECTIONS_PER_IP', '2048'],
+      ['MTC_MAX_HTTP2_CONCURRENT_STREAMS', '4294967295'],
+    ] as const) {
+      lacks('default', `name: ${name}`);
+      lacks('dev', `name: ${name}`);
+      count('transportLimits', new RegExp(`name: ${name}\\n\\s+value: "${value}"`), 3);
+    }
     count('default', /name: MTC_PROXY_MEMORY_BUDGET_BYTES\n\s+value: "2147483648"/, 3);
     count('proxyMemory', /name: MTC_PROXY_MEMORY_BUDGET_BYTES\n\s+value: "536870912"/, 3);
     count('dev', /name: MTC_PROXY_MEMORY_BUDGET_BYTES\n\s+value: "536870912"/, 1);
@@ -380,6 +394,15 @@ test('Helm chart packaging, security, ingress, and schema contracts', () => {
       const result = spawnSync(helm, ['template', 'invalid-archive-budget', chart, ...values.flatMap((value) => ['--set', value])], { cwd: repository, encoding: 'utf8', shell: false });
       assert.notEqual(result.status, 0, `archive cross-field validation accepted ${values.join(',')}`);
       assert.match(result.stderr, /archive deadline rounded up plus 2 seconds|connectTimeoutMillis must not exceed requestTimeoutMillis/);
+    }
+    for (const [key, value] of [
+      ['maxTcpConnections', '0'],
+      ['maxTcpConnectionsPerIp', '-1'],
+      ['maxHttp2ConcurrentStreams', '4294967296'],
+    ] as const) {
+      const result = spawnSync(helm, ['template', 'invalid-transport-limit', chart, '--set', `config.${key}=${value}`], { cwd: repository, encoding: 'utf8', shell: false });
+      assert.notEqual(result.status, 0, `chart accepted config.${key}=${value}`);
+      assert.ok(result.stderr.includes(key), `expected validation error for config.${key}: ${result.stderr}`);
     }
     const oldSchema = spawnSync(helm, ['template', 'invalid-old-schema', chart, '--set', 'migration.schemaVersion=58'], { cwd: repository, encoding: 'utf8', shell: false });
     for (const values of [

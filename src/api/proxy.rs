@@ -293,7 +293,7 @@ async fn next_sendable_proxy_route(
             );
             continue;
         }
-        if !codex_transport::is_driver(&planned.route.driver)
+        if !planned.is_codex()
             && refresh_route_snapshot(state, &mut planned.route).await?
                 != PreparedRouteReadiness::Ready
         {
@@ -1218,7 +1218,7 @@ async fn proxy_with_cancellation_guard(
     let primary = route_plan.primary_route();
     let upstream_account_id = Some(primary.account_id);
     let model_route_id = Some(primary.route_id);
-    let mut dispatch_permit = if codex_transport::is_driver(&primary.driver) {
+    let mut dispatch_permit = if route_plan.primary.is_codex() {
         match state
             .codex_clients
             .acquire_dispatch(primary, &state.metrics)
@@ -1235,7 +1235,7 @@ async fn proxy_with_cancellation_guard(
     } else {
         None
     };
-    let memory_wait = if codex_transport::is_driver(&primary.driver) {
+    let memory_wait = if route_plan.primary.is_codex() {
         crate::provider::CodexTransportPolicy::parse(primary.config.get("transport_policy"))
             .map_err(|_| AppError::BadRequest("invalid Codex transport policy".into()))?
             .memory_admission_wait_millis
@@ -2039,7 +2039,7 @@ async fn proxy_with_cancellation_guard(
         buffered_request.memory.release_unretained_json();
     }
     let is_codex_route = active_route.is_codex();
-    let codex_downstream_stream = active_route.codex_downstream_stream;
+    let buffer_codex_response = active_route.buffers_codex_response();
     let upstream_account_id = Some(active_route.route.account_id);
     let route_driver = Some(active_route.route.driver.as_str());
     let response_headers = if protocol.is_anthropic() || responses_anthropic_route {
@@ -2168,8 +2168,8 @@ async fn proxy_with_cancellation_guard(
         .and_then(|value| value.to_str().ok())
         .and_then(|value| value.split(';').next())
         .is_some_and(|value| value.trim().eq_ignore_ascii_case("text/event-stream"));
-    let will_buffer_response = !validated_compact
-        && ((is_codex_route && !codex_downstream_stream) || (!is_sse && !strict_openai_chat_usage));
+    let will_buffer_response =
+        !validated_compact && (buffer_codex_response || (!is_sse && !strict_openai_chat_usage));
     if requested_native_stream
         && will_buffer_response
         && let Some(conversation) = buffered_request.conversation.as_ref()
@@ -2193,7 +2193,7 @@ async fn proxy_with_cancellation_guard(
         codex_retry.complete(CodexRetryTerminal::Failed);
         return result;
     }
-    if is_codex_route && !codex_downstream_stream && !validated_compact {
+    if buffer_codex_response && !validated_compact {
         let buffer_phase = proxy_diagnostics::Phase::account(
             diagnostic_context,
             "codex_buffered_response",
