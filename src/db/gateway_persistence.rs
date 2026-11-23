@@ -68,7 +68,10 @@ impl GatewayPersistence {
             .unwrap_or(acquire_timeout);
         let application_name = super::postgres_application_name("mtc-gateway-archive");
         let pool = AnyPoolOptions::new()
-            .max_connections(1)
+            .max_connections(match backend {
+                DatabaseBackend::PostgreSql => TASK_LIMIT as u32,
+                DatabaseBackend::Sqlite => 1,
+            })
             .test_before_acquire(matches!(backend, DatabaseBackend::Sqlite))
             .min_connections(0)
             .acquire_timeout(acquire_timeout)
