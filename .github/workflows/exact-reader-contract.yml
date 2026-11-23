@@ -655,8 +655,14 @@ jobs:
       - run: |
           set -o pipefail
           git rev-parse HEAD
-          cargo test --locked --lib db::history_source_snapshot::tests::request_history_real_services_acceptance_source_baseline_receipts_and_abort -- --ignored --exact --nocapture 2>&1 | tee /tmp/history-batch.log
-          grep -F '1 passed; 0 failed' /tmp/history-batch.log
+          cargo test --locked --lib db::history_source_snapshot::tests::request_history_baseline_ack_authority_keeps_exact_frozen_revision -- --exact --nocapture 2>&1 | tee /tmp/source-baseline.log
+          grep -F '1 passed; 0 failed' /tmp/source-baseline.log
+          cargo test --locked --lib db::history_source_snapshot::tests::request_history_baseline_event_cursor_reuses_frozen_authority -- --exact --nocapture 2>&1 | tee /tmp/source-baseline.log
+          grep -F '1 passed; 0 failed' /tmp/source-baseline.log
+          cargo test --locked --lib db::history_source_snapshot::tests::request_history_real_services_acceptance_source_snapshot_barrier_order -- --ignored --exact --nocapture 2>&1 | tee /tmp/source-baseline.log
+          grep -F '1 passed; 0 failed' /tmp/source-baseline.log
+          cargo test --locked --lib db::history_source_snapshot::tests::request_history_real_services_acceptance_source_baseline_receipts_and_abort -- --ignored --exact --nocapture 2>&1 | tee /tmp/source-baseline.log
+          grep -F '1 passed; 0 failed' /tmp/source-baseline.log
 
   semantic-reader-scope-contract:
     if: inputs.contract == 'semantic-reader-scope'
