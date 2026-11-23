@@ -494,6 +494,7 @@ struct CapturedResponse {
 
 struct CaptureChunk {
     bytes: Bytes,
+    credit: Option<tokio::sync::OwnedSemaphorePermit>,
     acknowledged: tokio::sync::oneshot::Sender<()>,
     #[cfg(test)]
     pause: Option<(
@@ -503,6 +504,7 @@ struct CaptureChunk {
 }
 
 struct CaptureReceipt {
+    _credit: Option<tokio::sync::OwnedSemaphorePermit>,
     acknowledged: tokio::sync::oneshot::Sender<()>,
     #[cfg(test)]
     pause: Option<(
@@ -512,6 +514,7 @@ struct CaptureReceipt {
 }
 
 struct CarrierCaptureInput {
+    budget: Arc<crate::gateway_body::memory::ProxyMemoryBudget>,
     source: Option<tokio::sync::mpsc::Sender<CaptureChunk>>,
     progress: tokio::sync::watch::Sender<(u64, bool)>,
     length: u64,
@@ -534,6 +537,7 @@ impl CarrierCaptureInput {
                 .ok_or_else(|| std::io::Error::other("capture closed"))?
                 .send(CaptureChunk {
                     bytes: bytes.slice(offset..end),
+                    credit: None,
                     acknowledged,
                     #[cfg(test)]
                     pause: self.write_pause.take(),
@@ -572,6 +576,7 @@ fn carrier_capture_stream(
                 (
                     receiver,
                     Some(CaptureReceipt {
+                        _credit: chunk.credit,
                         acknowledged: chunk.acknowledged,
                         #[cfg(test)]
                         pause: chunk.pause,
@@ -857,6 +862,7 @@ impl ResponseArchiveProducer {
             #[cfg(test)]
             state: state.clone(),
             capture: CarrierCaptureInput {
+                budget: state.proxy_memory_budget.clone(),
                 source: Some(source),
                 progress,
                 length: 0,
@@ -896,6 +902,38 @@ impl ResponseArchiveProducer {
             self.abandon("carrier_capture_unavailable");
             false
         }
+    }
+
+    /// Nonblocking archival offer. Failure fences this incomplete capture;
+    /// accepted chunks remain ordered in the existing single carrier queue.
+    pub(crate) fn try_offer(&mut self, bytes: Bytes) -> bool {
+        let Some(credit) = self.capture.budget.try_reserve_ingress_bytes(bytes.len()) else {
+            self.abandon("capture_byte_budget_unavailable");
+            return false;
+        };
+        let (acknowledged, _completion) = tokio::sync::oneshot::channel();
+        let length = bytes.len() as u64;
+        let chunk = CaptureChunk {
+            bytes,
+            credit: Some(credit),
+            acknowledged,
+            #[cfg(test)]
+            pause: self.capture.write_pause.take(),
+        };
+        let accepted = self
+            .capture
+            .source
+            .as_ref()
+            .is_some_and(|source| source.try_send(chunk).is_ok());
+        if !accepted {
+            self.abandon("capture_queue_unavailable");
+            return false;
+        }
+        self.capture.length = self.capture.length.saturating_add(length);
+        self.capture
+            .progress
+            .send_replace((self.capture.length, false));
+        true
     }
 
     fn abandon(&mut self, reason: &'static str) {
