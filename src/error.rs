@@ -1935,6 +1935,18 @@ mod tests {
     }
 
     #[test]
+    fn storage_operation_phase_keeps_safe_facts_without_source_secrets() {
+        let error = AppError::from(object_store::Error::Generic {
+            store: "SECRET_URL",
+            source: Box::new(std::io::Error::other("SECRET_TOKEN")),
+        })
+        .storage_phase("multipart_begin");
+        assert!(matches!(&error, AppError::Storage { facts, .. }
+            if facts.phase == Some("multipart_begin") && facts.kind == Some("transport_or_service")));
+        assert!(!format!("{error:?}").contains("SECRET"));
+    }
+
+    #[test]
     fn object_storage_classification_preserves_only_typed_safe_facts() {
         let cases = [
             (

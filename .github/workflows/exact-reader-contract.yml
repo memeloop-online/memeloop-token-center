@@ -216,6 +216,8 @@ jobs:
           set -o pipefail
           cargo test --locked --lib --no-run
           for selector in \
+            error::tests::storage_operation_phase_keeps_safe_facts_without_source_secrets \
+            error::tests::object_storage_classification_preserves_only_typed_safe_facts \
             supplier_error::tests::shared_projection_preserves_explanation_and_removes_credentials \
             supplier_error::tests::credential_echoes_include_authorization_payload_and_decoded_password \
             supplier_error::tests::credential_projection_handles_url_and_known_secret_echoes \
