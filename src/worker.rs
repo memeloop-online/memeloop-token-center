@@ -1370,7 +1370,7 @@ async fn archive_session_body_with_result(
         {
             return Ok(false);
         }
-        state
+        if !state
             .db
             .bind_raw_capture_for_projection(
                 tenant_id,
@@ -1379,7 +1379,10 @@ async fn archive_session_body_with_result(
                 &response,
                 lease_owner,
             )
-            .await?;
+            .await?
+        {
+            return Ok(false);
+        }
         locators.response = Some(response.object_locator);
         locators.pending = false;
     } else if state
@@ -1403,7 +1406,7 @@ async fn archive_session_body_with_result(
         {
             return Ok(false);
         }
-        state
+        if !state
             .db
             .bind_raw_capture_for_projection(
                 tenant_id,
@@ -1412,7 +1415,10 @@ async fn archive_session_body_with_result(
                 &request,
                 lease_owner,
             )
-            .await?;
+            .await?
+        {
+            return Ok(false);
+        }
         locators.request = request.object_locator;
         locators.source_identity = None;
     }
@@ -1537,10 +1543,13 @@ async fn archive_session_body_with_result(
             .raw_capture_reference(tenant_id, request_id, side)
             .await?
         {
-            state
+            if !state
                 .db
                 .bind_raw_capture_for_projection(tenant_id, request_id, side, &object, lease_owner)
-                .await?;
+                .await?
+            {
+                return Ok(false);
+            }
         }
     }
     let crate::archive::PreparedSessionBody {
