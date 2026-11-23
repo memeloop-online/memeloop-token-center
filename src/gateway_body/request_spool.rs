@@ -1209,6 +1209,9 @@ fn publish_durable(shared: &Arc<SharedBody>) {
                         } else {
                             None
                         };
+                        release_resident_memory(&source);
+                        residency.durable_settled.store(true, Ordering::Release);
+                        residency.release_if_idle();
                         let permit = if matches!(
                             settlement.as_ref(),
                             Some(crate::archive::RawPublicationSettlement::Retired { .. })
@@ -1219,9 +1222,6 @@ fn publish_durable(shared: &Arc<SharedBody>) {
                         } else {
                             Some(database.request_source_completion().await)
                         };
-                        release_resident_memory(&source);
-                        residency.durable_settled.store(true, Ordering::Release);
-                        residency.release_if_idle();
                         (permit, settlement)
                     };
                     let (wrote, (permit, settlement)) = tokio::join!(lease, handoff);
