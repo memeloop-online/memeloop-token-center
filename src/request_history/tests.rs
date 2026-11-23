@@ -112,6 +112,12 @@ async fn baseline_page_reads_use_two_http_calls_and_validate_identity_hash() {
         Arc, Mutex,
         atomic::{AtomicUsize, Ordering},
     };
+    fn stored(physical: &HistorySnapshot, payload: &HistorySnapshot) -> serde_json::Value {
+        json!({"tenant_id":physical.identity.tenant_id,"key_id":physical.identity.key_id,
+            "request_id":physical.identity.request_id,"source":physical.identity.source,
+            "created_at":physical.identity.created_at.to_string(),
+            "snapshot":serde_json::to_string(payload).unwrap(),"snapshot_hash":canonical_hash(payload).unwrap()})
+    }
     let rows = (0..64)
         .map(|_| HistorySnapshot {
             identity: HistoryIdentity {
@@ -128,7 +134,11 @@ async fn baseline_page_reads_use_two_http_calls_and_validate_identity_hash() {
             filter_cost_micros: None,
         })
         .collect::<Vec<_>>();
-    let encoded = rows.iter().map(|row| json!({"snapshot":serde_json::to_string(row).unwrap(),"snapshot_hash":canonical_hash(row).unwrap()}).to_string()).collect::<Vec<_>>().join("\n");
+    let encoded = rows
+        .iter()
+        .map(|row| stored(row, row).to_string())
+        .collect::<Vec<_>>()
+        .join("\n");
     let reply = Arc::new(Mutex::new(encoded));
     let calls = Arc::new(AtomicUsize::new(0));
     let handler_reply = reply.clone();
@@ -169,14 +179,20 @@ async fn baseline_page_reads_use_two_http_calls_and_validate_identity_hash() {
         }
     }
     assert_eq!(calls.load(Ordering::SeqCst), 2);
-    let one = json!({"snapshot":serde_json::to_string(&rows[0]).unwrap(),"snapshot_hash":canonical_hash(&rows[0]).unwrap()}).to_string();
+    let one = stored(&rows[0], &rows[0]).to_string();
     *reply.lock().unwrap() = format!("{one}\n{one}");
     assert!(client.baseline_snapshots(&ids).await.is_err());
     *reply.lock().unwrap() = one;
     assert!(client.baseline_snapshots(&ids[1..]).await.is_err());
-    *reply.lock().unwrap() =
-        json!({"snapshot":serde_json::to_string(&rows[0]).unwrap(),"snapshot_hash":"bad"})
-            .to_string();
+    let mut bad = stored(&rows[0], &rows[0]);
+    bad["snapshot_hash"] = json!("bad");
+    *reply.lock().unwrap() = bad.to_string();
+    assert!(client.baseline_snapshots(&ids).await.is_err());
+    *reply.lock().unwrap() = format!(
+        "{}\n{}",
+        stored(&rows[0], &rows[1]),
+        stored(&rows[1], &rows[0])
+    );
     assert!(client.baseline_snapshots(&ids).await.is_err());
     server.abort();
 }
