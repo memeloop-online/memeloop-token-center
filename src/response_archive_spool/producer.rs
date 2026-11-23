@@ -1293,7 +1293,12 @@ async fn run_response_archive_writer(
                     attempt = publication_attempt,
                     elapsed_ms = publication_started.elapsed().as_millis() as u64,
                     "complete carrier source awaits object storage publication");
-                tokio::time::sleep(std::time::Duration::from_millis(250)).await;
+                let delay = crate::archive_staging::cleanup_backoff_with_jitter(
+                    identity.request_id,
+                    publication_attempt.min(u32::MAX as u64) as u32,
+                )
+                .min(30_000);
+                tokio::time::sleep(std::time::Duration::from_millis(delay as u64)).await;
             }
             Err(error) => return Err(error),
         }
@@ -1315,7 +1320,12 @@ async fn run_response_archive_writer(
                     stage = "cas_promote", error_kind = kind, attempt = publication_attempt,
                     elapsed_ms = publication_started.elapsed().as_millis() as u64,
                     "sealed original awaits immutable CAS promotion");
-                tokio::time::sleep(std::time::Duration::from_millis(250)).await;
+                let delay = crate::archive_staging::cleanup_backoff_with_jitter(
+                    identity.request_id,
+                    publication_attempt.min(u32::MAX as u64) as u32,
+                )
+                .min(30_000);
+                tokio::time::sleep(std::time::Duration::from_millis(delay as u64)).await;
             }
             Err(error) => return Err(error),
         }
@@ -1333,7 +1343,12 @@ async fn run_response_archive_writer(
                     stage = "root_publish", error_kind = kind, attempt = publication_attempt,
                     elapsed_ms = publication_started.elapsed().as_millis() as u64,
                     "immutable original awaits durable root publication");
-                tokio::time::sleep(std::time::Duration::from_millis(250)).await;
+                let delay = crate::archive_staging::cleanup_backoff_with_jitter(
+                    identity.request_id,
+                    publication_attempt.min(u32::MAX as u64) as u32,
+                )
+                .min(30_000);
+                tokio::time::sleep(std::time::Duration::from_millis(delay as u64)).await;
             }
             Err(error) => return Err(error),
         }
