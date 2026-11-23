@@ -8,6 +8,7 @@ use memeloop_token_center::{
         Database, FAILED_REQUEST_COST_BACKFILL_MAX_BATCH_SIZE, FailedRequestCostBackfillCursor,
         FailedRequestCostBackfillExactManifest, FailedRequestCostBackfillInput,
     },
+    server::{self, ServerLimits},
     worker::{self, wait_for_server_shutdown},
 };
 use tokio::{net::TcpListener, sync::watch};
@@ -307,6 +308,10 @@ async fn run() -> Result<(), &'static str> {
             println!("{output}");
         }
         Command::Serve { role } => {
+            let limits = ServerLimits::from_env().map_err(|error| {
+                error!(%error, "invalid HTTP server limits");
+                "configuration_invalid"
+            })?;
             let address: SocketAddr = config
                 .listen
                 .parse()
@@ -379,10 +384,10 @@ async fn run() -> Result<(), &'static str> {
             serve_with_worker_shutdown(
                 listener,
                 app,
+                limits,
                 shutdown_signal(),
                 Some(worker_task),
-                Some(worker_shutdown),
-                Some(oauth_shutdown),
+                (Some(worker_shutdown), Some(oauth_shutdown)),
                 async move {
                     if let Some(state) = proxy_state.get() {
                         state.drain_proxy_tasks().await;
@@ -399,19 +404,25 @@ async fn run() -> Result<(), &'static str> {
 async fn serve_with_worker_shutdown(
     listener: TcpListener,
     app: axum::Router,
+    limits: ServerLimits,
     signal: impl std::future::Future<Output = ()>,
     mut worker_task: Option<tokio::task::JoinHandle<()>>,
-    worker_shutdown: Option<watch::Sender<bool>>,
-    oauth_shutdown: Option<watch::Sender<bool>>,
+    shutdown_senders: (Option<watch::Sender<bool>>, Option<watch::Sender<bool>>),
     proxy_drain: impl std::future::Future<Output = ()>,
 ) -> Result<(), &'static str> {
+    let (worker_shutdown, oauth_shutdown) = shutdown_senders;
     let mut worker_failed = false;
-    let result = memeloop_token_center::server::serve(listener, app, async {
-        worker_failed = wait_for_server_shutdown(signal, &mut worker_task).await;
-        if let Some(sender) = &oauth_shutdown {
-            let _ = sender.send(true);
-        }
-    })
+    let result = server::serve_with_limits(
+        listener,
+        app,
+        async {
+            worker_failed = wait_for_server_shutdown(signal, &mut worker_task).await;
+            if let Some(sender) = &oauth_shutdown {
+                let _ = sender.send(true);
+            }
+        },
+        limits,
+    )
     .await;
     proxy_drain.await;
     if let Some(sender) = oauth_shutdown {
@@ -533,10 +544,10 @@ mod lifecycle_tests {
         let process = tokio::spawn(serve_with_worker_shutdown(
             listener,
             app,
+            ServerLimits::default(),
             async { termination.await.unwrap() },
             Some(worker),
-            Some(worker_stop),
-            Some(oauth_stop),
+            (Some(worker_stop), Some(oauth_stop)),
             async {},
         ));
         let request = tokio::spawn(async move {

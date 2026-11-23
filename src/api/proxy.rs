@@ -2657,8 +2657,8 @@ enum ConversationProjectionAdmission {
 
 struct ProxyConversationProjection<'a> {
     conversation: &'a ProxyConversation,
-    request_json: std::sync::Arc<Value>,
-    _memory: Option<crate::gateway_body::memory::ConversationProjectionPermit>,
+    request_json: Value,
+    permit: crate::gateway_body::memory::ConversationProjectionPermit,
 }
 
 impl ProxyConversation {
@@ -2826,8 +2826,8 @@ impl ProxyConversation {
             .map_err(|_| AppError::internal("proxy_project_2"))?;
         Ok(ProxyConversationProjection {
             conversation: self,
-            request_json: std::sync::Arc::new(request_json),
-            _memory: Some(projection_memory),
+            request_json,
+            permit: projection_memory,
         })
     }
 
@@ -2841,18 +2841,6 @@ impl ProxyConversation {
     }
 }
 
-impl<'a> ProxyConversationProjection<'a> {
-    fn input<'b>(&'b self, upstream_response_id: Option<&'b str>) -> ProxyConversationInput<'b> {
-        ProxyConversationInput {
-            key: &self.conversation.key,
-            request_json: &self.request_json,
-            hints: &self.conversation.hints,
-            client_name: self.conversation.client_name.as_deref(),
-            upstream_response_id,
-        }
-    }
-}
-
 async fn prepare_terminal_conversation(
     conversation: Option<ProxyConversation>,
     memory: std::sync::Arc<crate::gateway_body::memory::ProxyMemoryReservation>,
@@ -2863,13 +2851,18 @@ async fn prepare_terminal_conversation(
     let conversation = conversation?;
     match conversation.project(&memory, deadline).await {
         Ok(projection) => {
-            let conversation = crate::proxy_lifecycle::pending_terminal::OwnedConversation::capture(
-                projection.input(response_id.as_deref()),
-            );
+            let conversation =
+                crate::proxy_lifecycle::pending_terminal::OwnedConversation::capture_owned(
+                    &projection.conversation.key,
+                    projection.request_json,
+                    &projection.conversation.hints,
+                    projection.conversation.client_name.as_deref(),
+                    response_id,
+                );
             Some(
                 crate::proxy_lifecycle::pending_terminal::PreparedConversation {
                     conversation,
-                    retained: Box::new((projection._memory, memory)),
+                    retained: Box::new((projection.permit, memory)),
                 },
             )
         }

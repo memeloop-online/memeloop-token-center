@@ -1,17 +1,19 @@
 use std::collections::BTreeMap;
 
 use serde::Serialize;
-use sqlx::{Row, any::AnyRow};
+use sqlx::Row;
 
-use super::{
-    AppError, Database, DatabaseBackend, MAX_STATS_RANGE_MILLIS, micros_to_decimal_string,
-    unix_millis,
+use super::monitoring_snapshot::window_metrics::{
+    BucketPlan, MetricsAccumulator, MonitoringFact, MonitoringGranularity, MonitoringRange,
+    metric_sums, validate_window,
 };
-use crate::model::{MonitoringMetrics, MonitoringTerminalOutcome, TokenUsage, UsageAnalysisCost};
+use super::{AppError, Database, DatabaseBackend, unix_millis};
+use crate::model::{MonitoringMetrics, MonitoringTerminalOutcome};
 
-const HOUR_MILLIS: i64 = 3_600_000;
-const DAY_MILLIS: i64 = 86_400_000;
-const HOUR_RANGE_LIMIT: i64 = 31 * DAY_MILLIS;
+#[cfg(test)]
+use super::MAX_STATS_RANGE_MILLIS;
+#[cfg(test)]
+use super::monitoring_snapshot::window_metrics::{DAY_MILLIS, HOUR_MILLIS, HOUR_RANGE_LIMIT};
 
 /// An exact inclusive traffic window for the tenant's current upstream
 /// accounts. This is deliberately account-scoped rather than a top-model
@@ -44,221 +46,6 @@ pub struct UpstreamAccountAvailability {
     /// `source` remains explicit so a generation fact is never presented as a
     /// synchronous request.
     pub terminal_outcomes: Vec<MonitoringTerminalOutcome>,
-}
-
-#[derive(Clone, Copy, Debug)]
-enum AvailabilityGranularity {
-    Hour,
-    Day,
-}
-
-impl AvailabilityGranularity {
-    fn as_str(self) -> &'static str {
-        match self {
-            Self::Hour => "hour",
-            Self::Day => "day",
-        }
-    }
-
-    fn bucket_millis(self) -> i64 {
-        match self {
-            Self::Hour => HOUR_MILLIS,
-            Self::Day => DAY_MILLIS,
-        }
-    }
-}
-
-struct AvailabilityRange {
-    from_created_at: i64,
-    to_created_at: i64,
-    granularity: AvailabilityGranularity,
-}
-
-#[derive(Clone, Copy)]
-struct BucketPlan {
-    rollup_from_bucket: i64,
-    rollup_to_bucket: i64,
-    left_from_created_at: i64,
-    left_to_created_at: i64,
-    right_from_created_at: i64,
-    right_to_created_at: i64,
-}
-
-impl BucketPlan {
-    /// Match the monitoring snapshot's exact inclusive window semantics:
-    /// complete buckets use immutable rollups and only the two partial edges
-    /// read terminal facts.
-    fn new(from_created_at: i64, to_created_at: i64, bucket_millis: i64) -> Self {
-        let bucket_millis = i128::from(bucket_millis);
-        let from = i128::from(from_created_at);
-        let to_exclusive = to_created_at
-            .checked_add(1)
-            .map(i128::from)
-            .unwrap_or_else(|| i128::from(i64::MAX) + 1);
-        let from_bucket = from.div_euclid(bucket_millis);
-        let rollup_from = if from.rem_euclid(bucket_millis) == 0 {
-            from_bucket
-        } else {
-            from_bucket.saturating_add(1)
-        };
-        let rollup_to = to_exclusive.div_euclid(bucket_millis);
-        let full_from = rollup_from.saturating_mul(bucket_millis);
-        let full_to = rollup_to.saturating_mul(bucket_millis);
-        let rollup_from_bucket = i64::try_from(rollup_from)
-            .expect("non-negative timestamps have representable bucket indices");
-        let rollup_to_bucket = i64::try_from(rollup_to)
-            .expect("non-negative timestamps have representable bucket indices");
-        if full_from < full_to {
-            let (left_from_created_at, left_to_created_at) =
-                inclusive_bounds(from, full_from.min(to_exclusive));
-            let (right_from_created_at, right_to_created_at) =
-                inclusive_bounds(full_to.max(from), to_exclusive);
-            Self {
-                rollup_from_bucket,
-                rollup_to_bucket,
-                left_from_created_at,
-                left_to_created_at,
-                right_from_created_at,
-                right_to_created_at,
-            }
-        } else {
-            Self {
-                rollup_from_bucket,
-                rollup_to_bucket,
-                left_from_created_at: from_created_at,
-                left_to_created_at: to_created_at,
-                right_from_created_at: 0,
-                right_to_created_at: -1,
-            }
-        }
-    }
-}
-
-fn inclusive_bounds(from: i128, to_exclusive: i128) -> (i64, i64) {
-    if from >= to_exclusive {
-        return (0, -1);
-    }
-    (
-        i64::try_from(from).expect("fact-bound start is representable"),
-        i64::try_from(to_exclusive - 1).expect("fact-bound end is representable"),
-    )
-}
-
-#[derive(Default)]
-struct MetricsAccumulator {
-    requests: i64,
-    successful_requests: i64,
-    failed_requests: i64,
-    input_tokens: i64,
-    output_tokens: i64,
-    cached_input_tokens: i64,
-    cache_write_tokens: i64,
-    duration_count: i64,
-    duration_sum_ms: i64,
-    duration_buckets: [i64; 12],
-    costs: BTreeMap<String, i64>,
-}
-
-impl MetricsAccumulator {
-    fn accumulate(&mut self, row: &AnyRow) -> Result<(), AppError> {
-        let currency: Option<String> = row.try_get("currency")?;
-        let Some(currency) = currency else {
-            // The left join deliberately emits one null metric row for a
-            // current account with no terminal traffic in the selected window.
-            return Ok(());
-        };
-        if currency.is_empty() {
-            return Err(AppError::internal(
-                "upstream_account_availability_accumulate_1",
-            ));
-        }
-        self.requests = self.requests.saturating_add(row.try_get("requests")?);
-        self.successful_requests = self
-            .successful_requests
-            .saturating_add(row.try_get("successful_requests")?);
-        self.failed_requests = self
-            .failed_requests
-            .saturating_add(row.try_get("failed_requests")?);
-        self.input_tokens = self
-            .input_tokens
-            .saturating_add(row.try_get("input_tokens")?);
-        self.output_tokens = self
-            .output_tokens
-            .saturating_add(row.try_get("output_tokens")?);
-        self.cached_input_tokens = self
-            .cached_input_tokens
-            .saturating_add(row.try_get("cached_input_tokens")?);
-        self.cache_write_tokens = self
-            .cache_write_tokens
-            .saturating_add(row.try_get("cache_write_tokens")?);
-        self.duration_count = self
-            .duration_count
-            .saturating_add(row.try_get("duration_count")?);
-        self.duration_sum_ms = self
-            .duration_sum_ms
-            .saturating_add(row.try_get("duration_sum_ms")?);
-        for (index, bucket) in self.duration_buckets.iter_mut().enumerate() {
-            let column = format!("duration_bucket_{index}");
-            *bucket = bucket.saturating_add(row.try_get(column.as_str())?);
-        }
-        let cost = self.costs.entry(currency).or_default();
-        *cost = cost.saturating_add(row.try_get("cost_micros")?);
-        Ok(())
-    }
-
-    fn finish(self) -> MonitoringMetrics {
-        let usage = TokenUsage {
-            input_tokens: self.input_tokens,
-            output_tokens: self.output_tokens,
-            cached_input_tokens: self.cached_input_tokens,
-            cache_write_tokens: self.cache_write_tokens,
-            service_tier: None,
-            cache_coverage: None,
-        };
-        MonitoringMetrics {
-            requests: self.requests,
-            successful_requests: self.successful_requests,
-            failed_requests: self.failed_requests,
-            total_tokens: usage.total_tokens(),
-            cache_rate: usage.cache_rate(),
-            avg_duration_ms: (self.duration_count > 0)
-                .then(|| self.duration_sum_ms as f64 / self.duration_count as f64),
-            p95_duration_ms: approximate_quantile(95, self.duration_count, &self.duration_buckets),
-            p95_is_capped: super::usage_analysis::histogram_p95_is_capped(
-                self.duration_count,
-                &self.duration_buckets,
-            ),
-            costs: self
-                .costs
-                .into_iter()
-                .map(|(currency, micros)| UsageAnalysisCost {
-                    currency,
-                    cost: micros_to_decimal_string(micros),
-                })
-                .collect(),
-        }
-    }
-}
-
-fn approximate_quantile(percentile: i64, count: i64, buckets: &[i64; 12]) -> Option<i64> {
-    if count <= 0 {
-        return None;
-    }
-    let target = count
-        .saturating_mul(percentile)
-        .saturating_add(99)
-        .div_euclid(100);
-    let upper_bounds = [
-        10, 50, 100, 250, 500, 1_000, 2_500, 5_000, 10_000, 30_000, 60_000, 60_000,
-    ];
-    let mut cumulative = 0_i64;
-    for (bucket, upper_bound) in buckets.iter().zip(upper_bounds) {
-        cumulative = cumulative.saturating_add(*bucket);
-        if cumulative >= target {
-            return Some(upper_bound);
-        }
-    }
-    Some(60_000)
 }
 
 impl Database {
@@ -334,10 +121,11 @@ impl Database {
         let mut metrics_by_account = BTreeMap::<String, MetricsAccumulator>::new();
         for row in rows {
             let account_id: String = row.try_get("upstream_account_id")?;
-            metrics_by_account
-                .entry(account_id)
-                .or_default()
-                .accumulate(&row)?;
+            let metrics = metrics_by_account.entry(account_id).or_default();
+            // A current account with no traffic has a null metric row from the left join.
+            if let Some(currency) = row.try_get::<Option<String>, _>("currency")? {
+                metrics.accumulate(&row, currency, "upstream_account_availability_accumulate_1")?;
+            }
         }
 
         let outcome_rows = sqlx::query(sqlx::AssertSqlSafe(terminal_outcomes_sql()))
@@ -400,49 +188,28 @@ impl Database {
     }
 }
 
-fn validate_range(
-    filter: UpstreamAccountAvailabilityFilter,
-) -> Result<AvailabilityRange, AppError> {
+fn validate_range(filter: UpstreamAccountAvailabilityFilter) -> Result<MonitoringRange, AppError> {
     validate_range_with_limits(filter, true)
 }
 
 fn validate_range_with_limits(
     filter: UpstreamAccountAvailabilityFilter,
     bounded: bool,
-) -> Result<AvailabilityRange, AppError> {
-    if filter.from_created_at < 0
-        || filter.to_created_at < 0
-        || filter.from_created_at > filter.to_created_at
-    {
-        return Err(AppError::BadRequest(
-            "upstream availability requires a valid non-negative inclusive time window".into(),
-        ));
-    }
-    let width = filter.to_created_at.saturating_sub(filter.from_created_at);
-    if bounded && width > MAX_STATS_RANGE_MILLIS {
-        return Err(AppError::BadRequest(
-            "upstream availability window must not exceed 93 days".into(),
-        ));
-    }
-    Ok(AvailabilityRange {
-        from_created_at: filter.from_created_at,
-        to_created_at: filter.to_created_at,
-        granularity: if width <= HOUR_RANGE_LIMIT {
-            AvailabilityGranularity::Hour
-        } else {
-            AvailabilityGranularity::Day
-        },
-    })
+) -> Result<MonitoringRange, AppError> {
+    validate_window(
+        filter.from_created_at,
+        filter.to_created_at,
+        bounded,
+        "upstream availability requires a valid non-negative inclusive time window",
+        "upstream availability window must not exceed 93 days",
+    )
 }
 
 /// One account-complete aggregate. The account CTE is the tenant boundary and
 /// makes the left join preserve unobserved current accounts without inventing
 /// a terminal result. The four source arms exactly cover the inclusive window.
-fn window_metrics_sql(granularity: AvailabilityGranularity) -> String {
-    let (table, bucket_column) = match granularity {
-        AvailabilityGranularity::Hour => ("usage_analysis_hourly", "hour_bucket"),
-        AvailabilityGranularity::Day => ("usage_analysis_daily", "day_bucket"),
-    };
+fn window_metrics_sql(granularity: MonitoringGranularity) -> String {
+    let (table, bucket_column) = granularity.rollup();
     let rollup = format!(
         r#"SELECT aggregate.upstream_account_id, aggregate.status_class, aggregate.currency,
                   aggregate.requests, aggregate.input_tokens, aggregate.output_tokens,
@@ -461,10 +228,10 @@ fn window_metrics_sql(granularity: AvailabilityGranularity) -> String {
               AND aggregate.{bucket_column} >= $2
               AND aggregate.{bucket_column} < $3"#,
     );
-    let left_requests = fact_metrics_sql("request_stats_facts", "f", "$4", "$5");
-    let left_generations = fact_metrics_sql("generation_stats_facts", "f", "$4", "$5");
-    let right_requests = fact_metrics_sql("request_stats_facts", "f", "$6", "$7");
-    let right_generations = fact_metrics_sql("generation_stats_facts", "f", "$6", "$7");
+    let left_requests = fact_metrics_sql(MonitoringFact::Request, "$4", "$5");
+    let left_generations = fact_metrics_sql(MonitoringFact::Generation, "$4", "$5");
+    let right_requests = fact_metrics_sql(MonitoringFact::Request, "$6", "$7");
+    let right_generations = fact_metrics_sql(MonitoringFact::Generation, "$6", "$7");
     format!(
         r#"WITH tenant_scope AS MATERIALIZED (
     SELECT tenant.id AS tenant_id
@@ -521,49 +288,20 @@ SELECT account.upstream_account_id, metrics.currency,
     )
 }
 
-fn fact_metrics_sql(table: &str, alias: &str, from_parameter: &str, to_parameter: &str) -> String {
-    let token_projection = if table == "request_stats_facts" {
-        format!(
-            r#"CASE
-                      WHEN {alias}.input_tokens >= {alias}.cached_input_tokens + {alias}.cache_write_tokens
-                          THEN {alias}.input_tokens - {alias}.cached_input_tokens - {alias}.cache_write_tokens
-                      ELSE 0
-                  END AS input_tokens,
-                  {alias}.output_tokens, {alias}.cached_input_tokens, {alias}.cache_write_tokens"#,
-        )
-    } else {
-        r#"CAST(0 AS BIGINT) AS input_tokens,
-                  CAST(0 AS BIGINT) AS output_tokens,
-                  CAST(0 AS BIGINT) AS cached_input_tokens,
-                  CAST(0 AS BIGINT) AS cache_write_tokens"#
-            .to_owned()
-    };
+fn fact_metrics_sql(fact: MonitoringFact, from_parameter: &str, to_parameter: &str) -> String {
+    let table = fact.table();
+    let metrics = fact.metrics_projection();
     format!(
-        r#"SELECT {alias}.upstream_account_id, {alias}.status_class, {alias}.currency,
-                  CAST(1 AS BIGINT) AS requests,
-                  {token_projection},
-                  CAST(1 AS BIGINT) AS duration_count, {alias}.duration_ms AS duration_sum_ms,
-                  CASE WHEN {alias}.duration_ms <= 10 THEN 1 ELSE 0 END AS duration_bucket_0,
-                  CASE WHEN {alias}.duration_ms > 10 AND {alias}.duration_ms <= 50 THEN 1 ELSE 0 END AS duration_bucket_1,
-                  CASE WHEN {alias}.duration_ms > 50 AND {alias}.duration_ms <= 100 THEN 1 ELSE 0 END AS duration_bucket_2,
-                  CASE WHEN {alias}.duration_ms > 100 AND {alias}.duration_ms <= 250 THEN 1 ELSE 0 END AS duration_bucket_3,
-                  CASE WHEN {alias}.duration_ms > 250 AND {alias}.duration_ms <= 500 THEN 1 ELSE 0 END AS duration_bucket_4,
-                  CASE WHEN {alias}.duration_ms > 500 AND {alias}.duration_ms <= 1000 THEN 1 ELSE 0 END AS duration_bucket_5,
-                  CASE WHEN {alias}.duration_ms > 1000 AND {alias}.duration_ms <= 2500 THEN 1 ELSE 0 END AS duration_bucket_6,
-                  CASE WHEN {alias}.duration_ms > 2500 AND {alias}.duration_ms <= 5000 THEN 1 ELSE 0 END AS duration_bucket_7,
-                  CASE WHEN {alias}.duration_ms > 5000 AND {alias}.duration_ms <= 10000 THEN 1 ELSE 0 END AS duration_bucket_8,
-                  CASE WHEN {alias}.duration_ms > 10000 AND {alias}.duration_ms <= 30000 THEN 1 ELSE 0 END AS duration_bucket_9,
-                  CASE WHEN {alias}.duration_ms > 30000 AND {alias}.duration_ms <= 60000 THEN 1 ELSE 0 END AS duration_bucket_10,
-                  CASE WHEN {alias}.duration_ms > 60000 THEN 1 ELSE 0 END AS duration_bucket_11,
-                  {alias}.cost_micros
-             FROM {table} {alias}
+        r#"SELECT f.upstream_account_id, f.status_class, f.currency,
+                  {metrics}
+             FROM {table} f
              JOIN accounts account
-               ON account.upstream_account_id = {alias}.upstream_account_id
-              AND account.tenant_id = {alias}.tenant_id
+               ON account.upstream_account_id = f.upstream_account_id
+              AND account.tenant_id = f.tenant_id
             WHERE CAST({from_parameter} AS BIGINT) <= CAST({to_parameter} AS BIGINT)
-              AND {alias}.tenant_id = (SELECT tenant_id FROM tenant_scope)
-              AND {alias}.created_at >= {from_parameter}
-              AND {alias}.created_at <= {to_parameter}"#,
+              AND f.tenant_id = (SELECT tenant_id FROM tenant_scope)
+              AND f.created_at >= {from_parameter}
+              AND f.created_at <= {to_parameter}"#,
     )
 }
 
@@ -613,31 +351,6 @@ SELECT upstream_account_id, id, source, created_at, status_class, duration_ms, e
  ORDER BY upstream_account_id ASC, created_at DESC, source ASC, id DESC"#
 }
 
-fn metric_sums() -> &'static str {
-    r#"CAST(COALESCE(SUM(requests), 0) AS BIGINT) AS requests,
-       CAST(COALESCE(SUM(CASE WHEN status_class = 'success' THEN requests ELSE 0 END), 0) AS BIGINT) AS successful_requests,
-       CAST(COALESCE(SUM(CASE WHEN status_class = 'failure' THEN requests ELSE 0 END), 0) AS BIGINT) AS failed_requests,
-       CAST(COALESCE(SUM(input_tokens), 0) AS BIGINT) AS input_tokens,
-       CAST(COALESCE(SUM(output_tokens), 0) AS BIGINT) AS output_tokens,
-       CAST(COALESCE(SUM(cached_input_tokens), 0) AS BIGINT) AS cached_input_tokens,
-       CAST(COALESCE(SUM(cache_write_tokens), 0) AS BIGINT) AS cache_write_tokens,
-       CAST(COALESCE(SUM(duration_count), 0) AS BIGINT) AS duration_count,
-       CAST(COALESCE(SUM(duration_sum_ms), 0) AS BIGINT) AS duration_sum_ms,
-       CAST(COALESCE(SUM(duration_bucket_0), 0) AS BIGINT) AS duration_bucket_0,
-       CAST(COALESCE(SUM(duration_bucket_1), 0) AS BIGINT) AS duration_bucket_1,
-       CAST(COALESCE(SUM(duration_bucket_2), 0) AS BIGINT) AS duration_bucket_2,
-       CAST(COALESCE(SUM(duration_bucket_3), 0) AS BIGINT) AS duration_bucket_3,
-       CAST(COALESCE(SUM(duration_bucket_4), 0) AS BIGINT) AS duration_bucket_4,
-       CAST(COALESCE(SUM(duration_bucket_5), 0) AS BIGINT) AS duration_bucket_5,
-       CAST(COALESCE(SUM(duration_bucket_6), 0) AS BIGINT) AS duration_bucket_6,
-       CAST(COALESCE(SUM(duration_bucket_7), 0) AS BIGINT) AS duration_bucket_7,
-       CAST(COALESCE(SUM(duration_bucket_8), 0) AS BIGINT) AS duration_bucket_8,
-       CAST(COALESCE(SUM(duration_bucket_9), 0) AS BIGINT) AS duration_bucket_9,
-       CAST(COALESCE(SUM(duration_bucket_10), 0) AS BIGINT) AS duration_bucket_10,
-       CAST(COALESCE(SUM(duration_bucket_11), 0) AS BIGINT) AS duration_bucket_11,
-       CAST(COALESCE(SUM(cost_micros), 0) AS BIGINT) AS cost_micros"#
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -650,13 +363,13 @@ mod tests {
             to_created_at: HOUR_RANGE_LIMIT,
         })
         .expect("hourly maximum is valid");
-        assert!(matches!(hourly.granularity, AvailabilityGranularity::Hour));
+        assert!(matches!(hourly.granularity, MonitoringGranularity::Hour));
         let daily = validate_range(UpstreamAccountAvailabilityFilter {
             from_created_at: 0,
             to_created_at: HOUR_RANGE_LIMIT + 1,
         })
         .expect("daily window is valid");
-        assert!(matches!(daily.granularity, AvailabilityGranularity::Day));
+        assert!(matches!(daily.granularity, MonitoringGranularity::Day));
         assert!(
             validate_range(UpstreamAccountAvailabilityFilter {
                 from_created_at: 0,
@@ -710,7 +423,7 @@ mod tests {
 
     #[test]
     fn account_window_sql_is_tenant_bound_complete_and_not_top_model_sampled() {
-        for granularity in [AvailabilityGranularity::Hour, AvailabilityGranularity::Day] {
+        for granularity in [MonitoringGranularity::Hour, MonitoringGranularity::Day] {
             let sql = window_metrics_sql(granularity);
             assert!(sql.contains("FROM tenants tenant"), "{sql}");
             assert!(sql.contains("tenant.external_id = $1"), "{sql}");

@@ -11,6 +11,7 @@ use crate::model::{ArchivedGenerationAsset, ProviderGenerationAsset};
 
 use super::super::MAX_IMAGE_RESPONSE;
 use super::{
+    image_payload::{ImageParseError, borrowed_image_range},
     responses_tool_image::{SanitizedImageUsage, parse_image_usage},
     synchronous_image::is_valid_bounded_base64,
 };
@@ -18,12 +19,6 @@ use super::{
 const MAX_REVISED_PROMPT_BYTES: usize = 32_000;
 const MAX_REVISED_PROMPT_JSON_BYTES: usize = MAX_REVISED_PROMPT_BYTES * 6 + 2;
 const MAX_PROVIDER_URL_JSON_BYTES: usize = 16 * 1024;
-
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub(super) enum OpenAiImageParseError {
-    InvalidJson,
-    InvalidPayload,
-}
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(super) enum OpenAiImageBuildError {
@@ -77,27 +72,27 @@ impl std::error::Error for PayloadError {}
 pub(super) fn parse_openai_image_response(
     bytes: &Bytes,
     expected_count: i64,
-) -> Result<ParsedOpenAiImageResponse, OpenAiImageParseError> {
+) -> Result<ParsedOpenAiImageResponse, ImageParseError> {
     let root: &RawValue =
-        serde_json::from_slice(bytes).map_err(|_| OpenAiImageParseError::InvalidJson)?;
+        serde_json::from_slice(bytes).map_err(|_| ImageParseError::InvalidJson)?;
     if !root.get().starts_with('{') {
-        return Err(OpenAiImageParseError::InvalidPayload);
+        return Err(ImageParseError::InvalidPayload);
     }
     let mut deserializer = serde_json::Deserializer::from_str(root.get());
     let fields = deserializer
         .deserialize_map(RootVisitor)
-        .map_err(|_| OpenAiImageParseError::InvalidPayload)?;
+        .map_err(|_| ImageParseError::InvalidPayload)?;
     let expected_count = usize::try_from(expected_count)
         .ok()
         .filter(|count| (1..=10).contains(count))
-        .ok_or(OpenAiImageParseError::InvalidPayload)?;
-    let data = fields.data.ok_or(OpenAiImageParseError::InvalidPayload)?;
+        .ok_or(ImageParseError::InvalidPayload)?;
+    let data = fields.data.ok_or(ImageParseError::InvalidPayload)?;
     let mut data_deserializer = serde_json::Deserializer::from_str(data.get());
     let raw_items = data_deserializer
         .deserialize_seq(DataVisitor)
-        .map_err(|_| OpenAiImageParseError::InvalidPayload)?;
+        .map_err(|_| ImageParseError::InvalidPayload)?;
     if raw_items.len() != expected_count {
-        return Err(OpenAiImageParseError::InvalidPayload);
+        return Err(ImageParseError::InvalidPayload);
     }
 
     let mut items = Vec::with_capacity(raw_items.len());
@@ -105,7 +100,7 @@ pub(super) fn parse_openai_image_response(
         let mut item_deserializer = serde_json::Deserializer::from_str(raw.get());
         let item = item_deserializer
             .deserialize_map(ItemVisitor)
-            .map_err(|_| OpenAiImageParseError::InvalidPayload)?;
+            .map_err(|_| ImageParseError::InvalidPayload)?;
         items.push(item.into_item(bytes)?);
     }
     Ok(ParsedOpenAiImageResponse {
@@ -191,7 +186,7 @@ struct RawItem<'input> {
 }
 
 impl RawItem<'_> {
-    fn into_item(self, bytes: &Bytes) -> Result<OpenAiImageItem, OpenAiImageParseError> {
+    fn into_item(self, bytes: &Bytes) -> Result<OpenAiImageItem, ImageParseError> {
         let b64 = match self.b64 {
             Some(encoded)
                 if serde_json::from_str::<&str>(encoded.get()).is_ok_and(str::is_empty) =>
@@ -203,12 +198,12 @@ impl RawItem<'_> {
         match (self.url, b64) {
             (Some(url), None) => {
                 if url.get().len() > MAX_PROVIDER_URL_JSON_BYTES {
-                    return Err(OpenAiImageParseError::InvalidPayload);
+                    return Err(ImageParseError::InvalidPayload);
                 }
                 let url = serde_json::from_str::<String>(url.get())
                     .ok()
                     .filter(|url| !url.trim().is_empty())
-                    .ok_or(OpenAiImageParseError::InvalidPayload)?;
+                    .ok_or(ImageParseError::InvalidPayload)?;
                 Ok(OpenAiImageItem::Url {
                     url,
                     revised_prompt: self.revised_prompt,
@@ -221,18 +216,13 @@ impl RawItem<'_> {
                 let encoded = serde_json::from_str::<&str>(encoded.get())
                     .ok()
                     .filter(|encoded| is_valid_bounded_base64(encoded, MAX_IMAGE_RESPONSE))
-                    .ok_or(OpenAiImageParseError::InvalidPayload)?;
-                let base = bytes.as_ptr() as usize;
-                let start = (encoded.as_ptr() as usize)
-                    .checked_sub(base)
-                    .filter(|start| start.saturating_add(encoded.len()) <= bytes.len())
-                    .ok_or(OpenAiImageParseError::InvalidPayload)?;
+                    .ok_or(ImageParseError::InvalidPayload)?;
                 Ok(OpenAiImageItem::Base64 {
-                    range: start..start + encoded.len(),
+                    range: borrowed_image_range(bytes, encoded)?,
                     revised_prompt: self.revised_prompt,
                 })
             }
-            _ => Err(OpenAiImageParseError::InvalidPayload),
+            _ => Err(ImageParseError::InvalidPayload),
         }
     }
 }
@@ -631,7 +621,7 @@ mod tests {
         ] {
             assert_eq!(
                 parse_openai_image_response(&Bytes::copy_from_slice(invalid), 1).err(),
-                Some(OpenAiImageParseError::InvalidPayload)
+                Some(ImageParseError::InvalidPayload)
             );
         }
     }
@@ -668,7 +658,7 @@ mod tests {
         let bytes = body(json!({"data": [{"url": url}]}));
         assert_eq!(
             parse_openai_image_response(&bytes, 1).err(),
-            Some(OpenAiImageParseError::InvalidPayload)
+            Some(ImageParseError::InvalidPayload)
         );
     }
 
@@ -676,7 +666,7 @@ mod tests {
     fn malformed_json_is_classified_separately() {
         assert_eq!(
             parse_openai_image_response(&Bytes::from_static(br#"{"data":["#), 1).err(),
-            Some(OpenAiImageParseError::InvalidJson)
+            Some(ImageParseError::InvalidJson)
         );
     }
 

@@ -143,12 +143,28 @@ pub(crate) struct OwnedConversation {
 
 impl OwnedConversation {
     pub(crate) fn capture(input: crate::db::ProxyConversationInput<'_>) -> Self {
+        Self::capture_owned(
+            input.key,
+            input.request_json.clone(),
+            input.hints,
+            input.client_name,
+            input.upstream_response_id.map(str::to_owned),
+        )
+    }
+
+    pub(crate) fn capture_owned(
+        key: &AuthenticatedKey,
+        request_json: serde_json::Value,
+        hints: &crate::conversation::ConversationHints,
+        client_name: Option<&str>,
+        upstream_response_id: Option<String>,
+    ) -> Self {
         Self {
-            key: input.key.clone(),
-            request_json: input.request_json.clone(),
-            hints: input.hints.clone(),
-            client_name: input.client_name.map(str::to_owned),
-            upstream_response_id: input.upstream_response_id.map(str::to_owned),
+            key: key.clone(),
+            request_json,
+            hints: hints.clone(),
+            client_name: client_name.map(str::to_owned),
+            upstream_response_id,
         }
     }
 }
@@ -2346,6 +2362,29 @@ mod tests {
         key.policy = crate::model::KeyPolicy::default();
         assert_ne!(captured.key.alias, key.alias);
         captured
+    }
+
+    #[test]
+    fn owned_conversation_capture_moves_json_and_preserves_wire_shape() {
+        let borrowed = owned_conversation();
+        let request_json = borrowed.request_json.clone();
+        let input_allocation = request_json["input"].as_str().unwrap().as_ptr();
+        let moved = OwnedConversation::capture_owned(
+            &borrowed.key,
+            request_json,
+            &borrowed.hints,
+            borrowed.client_name.as_deref(),
+            borrowed.upstream_response_id.clone(),
+        );
+
+        assert_eq!(
+            moved.request_json["input"].as_str().unwrap().as_ptr(),
+            input_allocation
+        );
+        assert_eq!(
+            serde_json::to_value(&moved).unwrap(),
+            serde_json::to_value(&borrowed).unwrap()
+        );
     }
 
     #[test]

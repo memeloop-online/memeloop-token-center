@@ -252,11 +252,9 @@ pub(super) async fn create_audio_transcription(
             if upstream_status == StatusCode::TOO_MANY_REQUESTS {
                 let kind = super::proxy::classify_archived_media_rate_limit(upstream).await;
                 attempt
-                    .complete(MediaAttemptTerminal::Failed {
+                    .complete(crate::generation::group_routing::media_rate_limit_terminal(
                         kind,
-                        reason: crate::metrics::UpstreamHealthReason::RateLimited,
-                        failure_stage: "upstream_response",
-                    })
+                    ))
                     .await;
                 finish_audio_failure(
                     &state,
@@ -271,24 +269,9 @@ pub(super) async fn create_audio_transcription(
                 return Err(AppError::upstream("audio_upstream_rate_limited"));
             }
             if !upstream_status.is_success() {
-                let terminal = if matches!(
-                    upstream_status,
-                    StatusCode::UNAUTHORIZED | StatusCode::FORBIDDEN
-                ) {
-                    MediaAttemptTerminal::Failed {
-                        kind: crate::db::UpstreamFailureKind::Authentication,
-                        reason: crate::metrics::UpstreamHealthReason::Unavailable,
-                        failure_stage: "upstream_response",
-                    }
-                } else if upstream_status.is_server_error() {
-                    MediaAttemptTerminal::Failed {
-                        kind: crate::db::UpstreamFailureKind::Unavailable,
-                        reason: crate::metrics::UpstreamHealthReason::Unavailable,
-                        failure_stage: "upstream_response",
-                    }
-                } else {
-                    MediaAttemptTerminal::Inconclusive
-                };
+                let terminal =
+                    crate::generation::group_routing::media_rejection_terminal(upstream_status)
+                        .unwrap_or(MediaAttemptTerminal::Inconclusive);
                 attempt.complete(terminal).await;
                 let rejection = crate::api::proxy::upstream_error::read_rejection(upstream).await;
                 let error_code = rejection

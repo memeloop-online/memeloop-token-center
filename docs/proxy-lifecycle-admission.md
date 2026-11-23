@@ -22,3 +22,24 @@ ledger entry and one terminal event per request. A separate regression exhausts
 the real byte budget and verifies that requests are still rejected. Existing
 pre-header cancellation and streaming handoff tests retain their settlement and
 owner-release assertions. Validation runs in GitHub Actions only.
+
+
+The HTTP server also enforces three independent transport limits:
+
+| Environment variable | Helm setting under `config` | Default | Scope |
+| --- | --- | ---: | --- |
+| `MTC_MAX_TCP_CONNECTIONS` | `maxTcpConnections` | 2048 | TCP connections per server process |
+| `MTC_MAX_TCP_CONNECTIONS_PER_IP` | `maxTcpConnectionsPerIp` | 512 | TCP connections per socket peer IP in each process |
+| `MTC_MAX_HTTP2_CONCURRENT_STREAMS` | `maxHttp2ConcurrentStreams` | 256 | Concurrent HTTP/2 streams per TCP connection |
+
+Unset values use the defaults. Set positive integers; TCP values must fit the
+process semaphore and HTTP/2 accepts up to 4,294,967,295. An invalid value stops
+the HTTP server at startup and names the offending setting in the startup log.
+
+The peer IP comes from the accepted socket. A reverse proxy can therefore
+aggregate many clients under one peer IP. The per-process TCP limit delays
+accepting another socket when all permits are in use; the per-peer limit closes
+newly accepted sockets from that peer. The HTTP/2 limit is advertised to the
+peer. These counts do not set a request rate or the total number of active
+requests, and increasing them does not itself establish capacity. Measure TCP
+connections, concurrent requests, throughput, and resource use separately.

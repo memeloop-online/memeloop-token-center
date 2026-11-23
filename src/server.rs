@@ -1,5 +1,6 @@
 use std::{
     collections::HashMap,
+    env,
     future::Future,
     io,
     net::IpAddr,
@@ -39,7 +40,7 @@ mod rejected_upload;
 pub(crate) struct RejectedUpload;
 
 #[derive(Clone, Copy)]
-struct ServerLimits {
+pub struct ServerLimits {
     max_connections: usize,
     max_connections_per_ip: usize,
     max_http1_headers: usize,
@@ -63,6 +64,55 @@ impl Default for ServerLimits {
     }
 }
 
+impl ServerLimits {
+    pub fn from_env() -> io::Result<Self> {
+        let defaults = Self::default();
+        Ok(Self {
+            max_connections: connection_limit_from_env(
+                "MTC_MAX_TCP_CONNECTIONS",
+                defaults.max_connections,
+                Semaphore::MAX_PERMITS,
+            )?,
+            max_connections_per_ip: connection_limit_from_env(
+                "MTC_MAX_TCP_CONNECTIONS_PER_IP",
+                defaults.max_connections_per_ip,
+                Semaphore::MAX_PERMITS,
+            )?,
+            max_http2_concurrent_streams: connection_limit_from_env(
+                "MTC_MAX_HTTP2_CONCURRENT_STREAMS",
+                defaults.max_http2_concurrent_streams,
+                u32::MAX,
+            )?,
+            ..defaults
+        })
+    }
+}
+
+fn connection_limit_from_env<T>(name: &'static str, default: T, max: T) -> io::Result<T>
+where
+    T: std::str::FromStr + From<u8> + PartialOrd + std::fmt::Display,
+{
+    match env::var(name) {
+        Err(env::VarError::NotPresent) => Ok(default),
+        value => parse_connection_limit(name, value.as_deref().ok(), max),
+    }
+}
+
+fn parse_connection_limit<T>(name: &str, value: Option<&str>, max: T) -> io::Result<T>
+where
+    T: std::str::FromStr + From<u8> + PartialOrd + std::fmt::Display,
+{
+    value
+        .and_then(|value| value.parse::<T>().ok())
+        .filter(|value| *value >= T::from(1) && *value <= max)
+        .ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::InvalidInput,
+                format!("{name} must be an integer from 1 to {max}"),
+            )
+        })
+}
+
 struct PeerConnectionGuard {
     peer: IpAddr,
     peers: Arc<Mutex<HashMap<IpAddr, usize>>>,
@@ -76,19 +126,17 @@ impl PeerConnectionGuard {
         global: tokio::sync::OwnedSemaphorePermit,
         per_ip_limit: usize,
     ) -> Option<Self> {
-        let admitted = {
+        {
             let mut counts = peers
                 .lock()
                 .unwrap_or_else(|poisoned| poisoned.into_inner());
             let count = counts.entry(peer).or_default();
             if *count >= per_ip_limit {
-                false
-            } else {
-                *count += 1;
-                true
+                return None;
             }
-        };
-        admitted.then_some(Self {
+            *count += 1;
+        }
+        Some(Self {
             peer,
             peers,
             _global: global,
@@ -136,7 +184,7 @@ where
     serve_with_limits(listener, app, shutdown, ServerLimits::default()).await
 }
 
-async fn serve_with_limits<F>(
+pub async fn serve_with_limits<F>(
     listener: TcpListener,
     app: Router,
     shutdown: F,
@@ -454,6 +502,32 @@ mod tests {
         task.await.unwrap();
     }
 
+    #[test]
+    fn connection_limits_reject_invalid_values() {
+        let name = "MTC_MAX_HTTP2_CONCURRENT_STREAMS";
+        for value in [None, Some(""), Some("0"), Some("-1"), Some("4294967296")] {
+            let error = parse_connection_limit(name, value, u32::MAX).unwrap_err();
+            assert!(error.to_string().contains(name));
+        }
+        assert_eq!(
+            parse_connection_limit(name, Some("1"), u32::MAX).unwrap(),
+            1
+        );
+        assert_eq!(
+            parse_connection_limit(name, Some("4294967295"), u32::MAX).unwrap(),
+            u32::MAX
+        );
+        let above_permits = (Semaphore::MAX_PERMITS + 1).to_string();
+        assert!(
+            parse_connection_limit(
+                "MTC_MAX_TCP_CONNECTIONS",
+                Some(&above_permits),
+                Semaphore::MAX_PERMITS,
+            )
+            .is_err()
+        );
+    }
+
     #[tokio::test]
     async fn per_ip_connection_limit_releases_on_drop() {
         let peers = Arc::new(Mutex::new(HashMap::new()));
@@ -466,16 +540,22 @@ mod tests {
             1,
         )
         .unwrap();
-        assert!(
-            PeerConnectionGuard::try_new(
-                peer,
-                peers.clone(),
-                permits.clone().acquire_owned().await.unwrap(),
-                1,
-            )
-            .is_none()
-        );
+        for _ in 0..2 {
+            assert!(
+                PeerConnectionGuard::try_new(
+                    peer,
+                    peers.clone(),
+                    permits.clone().acquire_owned().await.unwrap(),
+                    1,
+                )
+                .is_none()
+            );
+            assert_eq!(peers.lock().unwrap().get(&peer), Some(&1));
+            assert_eq!(permits.available_permits(), 2);
+        }
         drop(first);
+        assert!(peers.lock().unwrap().is_empty());
+        assert_eq!(permits.available_permits(), 3);
         assert!(
             PeerConnectionGuard::try_new(peer, peers, permits.acquire_owned().await.unwrap(), 1,)
                 .is_some()

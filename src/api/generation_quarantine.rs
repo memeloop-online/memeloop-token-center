@@ -14,10 +14,10 @@ use uuid::Uuid;
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 pub(super) struct ListQuery {
-    tenant_external_id: String,
+    pub(super) tenant_external_id: String,
     #[serde(default = "default_limit")]
-    limit: i64,
-    after_id: Option<Uuid>,
+    pub(super) limit: i64,
+    pub(super) after_id: Option<Uuid>,
 }
 
 fn default_limit() -> i64 {
@@ -27,7 +27,7 @@ fn default_limit() -> i64 {
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 pub(super) struct DetailQuery {
-    tenant_external_id: String,
+    pub(super) tenant_external_id: String,
 }
 
 #[derive(Deserialize)]
@@ -47,7 +47,7 @@ fn present_upstream_id<'de, D: serde::Deserializer<'de>>(
     String::deserialize(value).map(Some)
 }
 
-async fn actor(
+pub(super) async fn actor(
     headers: &HeaderMap,
     state: &AppState,
     tenant: &str,
@@ -107,19 +107,11 @@ pub(super) async fn get_generation_quarantine(
     ))
 }
 
-pub(super) async fn resolve_generation_quarantine(
-    State(state): State<AppState>,
-    headers: HeaderMap,
-    Path(job_id): Path<Uuid>,
-    Json(body): Json<ResolveRequest>,
-) -> Result<Json<GenerationQuarantineResolution>, AppError> {
-    let (actor_service_id, actor_credential_generation) = actor(
-        &headers,
-        &state,
-        &body.tenant_external_id,
-        "generations:reconcile",
-    )
-    .await?;
+pub(super) fn idempotency_hash(
+    headers: &HeaderMap,
+    pepper: &[u8],
+    context: &str,
+) -> Result<String, AppError> {
     let mut values = headers.get_all("idempotency-key").iter();
     let key = values
         .next()
@@ -140,13 +132,30 @@ pub(super) async fn resolve_generation_quarantine(
             "exactly one Idempotency-Key is required".into(),
         ));
     }
-    let hash_key = blake3::derive_key(
-        "generation-quarantine-idempotency-v1",
-        state.config.key_pepper.as_bytes(),
-    );
-    let idempotency_hash = blake3::keyed_hash(&hash_key, key.as_bytes())
+    let hash_key = blake3::derive_key(context, pepper);
+    Ok(blake3::keyed_hash(&hash_key, key.as_bytes())
         .to_hex()
-        .to_string();
+        .to_string())
+}
+
+pub(super) async fn resolve_generation_quarantine(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path(job_id): Path<Uuid>,
+    Json(body): Json<ResolveRequest>,
+) -> Result<Json<GenerationQuarantineResolution>, AppError> {
+    let (actor_service_id, actor_credential_generation) = actor(
+        &headers,
+        &state,
+        &body.tenant_external_id,
+        "generations:reconcile",
+    )
+    .await?;
+    let idempotency_hash = idempotency_hash(
+        &headers,
+        state.config.key_pepper.as_bytes(),
+        "generation-quarantine-idempotency-v1",
+    )?;
     Ok(Json(
         state
             .db

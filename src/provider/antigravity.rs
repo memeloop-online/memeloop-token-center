@@ -13,6 +13,12 @@ pub const DRIVER: &str = "google-antigravity";
 pub const BASE_URL: &str = "https://daily-cloudcode-pa.googleapis.com";
 pub const CONTROL_URL: &str = "https://cloudcode-pa.googleapis.com";
 
+pub(crate) const GENERATE_CONTENT_PATH: &str = "/v1internal:generateContent";
+
+pub(crate) fn supports_image_mime(mime: &str) -> bool {
+    matches!(mime, "image/png" | "image/jpeg" | "image/webp")
+}
+
 const IMAGE_LIMIT: usize = 32 * 1024 * 1024;
 
 #[derive(Clone, Serialize, Deserialize)]
@@ -42,6 +48,14 @@ impl Config {
         request: reqwest::RequestBuilder,
     ) -> Result<reqwest::RequestBuilder, AppError> {
         Ok(request.headers(self.validated_headers()?))
+    }
+
+    pub(crate) fn authorize_request(
+        &self,
+        credential: &UpstreamCredential,
+        request: reqwest::RequestBuilder,
+    ) -> Result<reqwest::RequestBuilder, AppError> {
+        self.apply_headers(credential.apply(request, crate::db::unix_millis())?)
     }
 
     fn validated_headers(&self) -> Result<reqwest::header::HeaderMap, AppError> {
@@ -177,10 +191,9 @@ impl NativeClient<'_> {
         )
         .await?;
         let request = http.post(endpoint).json(body);
-        let request = self.credential.apply(request, crate::db::unix_millis())?;
         let response = self
             .config
-            .apply_headers(request)?
+            .authorize_request(self.credential, request)?
             .send()
             .await
             .map_err(|_| AppError::upstream("antigravity_request_failed"))?;
@@ -262,11 +275,7 @@ impl NativeClient<'_> {
         self.validate_project()?;
         let payload = image_request(model, &self.config.project_id, request)?;
         let response = self
-            .post(
-                &self.config.base_url,
-                "/v1internal:generateContent",
-                &payload,
-            )
+            .post(&self.config.base_url, GENERATE_CONTENT_PATH, &payload)
             .await?;
         decode_images(&response)
     }
@@ -438,7 +447,7 @@ pub fn decode_images(envelope: &Value) -> Result<ImageResponse, AppError> {
                     .get("mimeType")
                     .or_else(|| inline.get("mime_type"))
                     .and_then(Value::as_str)
-                    .filter(|mime| matches!(*mime, "image/png" | "image/jpeg" | "image/webp"))
+                    .filter(|mime| supports_image_mime(mime))
                     .ok_or_else(|| {
                         AppError::upstream("antigravity_image_mime_type_is_unsupported")
                     })?;

@@ -29,6 +29,7 @@ pub(in crate::api) async fn create_image_generation(
         let result = async move {
             let value: Value = serde_json::from_slice(&body)
                 .map_err(|_| AppError::BadRequest("request body must be valid JSON".into()))?;
+            drop(body);
             if value.get("input").is_some() {
                 let request = serde_json::from_value(value).map_err(|_| {
                     AppError::BadRequest("model and generation input are required".into())
@@ -42,7 +43,7 @@ pub(in crate::api) async fn create_image_generation(
                 )
                 .await;
             }
-            proxy_openai_image_generation(state, headers, body, value).await
+            proxy_openai_image_generation(state, headers, value).await
         }
         .await;
         result.map(|response| super::super::auth::hold_response_body_permit(response, resources))
@@ -58,7 +59,6 @@ pub(in crate::api) async fn create_image_generation(
 async fn proxy_openai_image_generation(
     state: AppState,
     headers: HeaderMap,
-    body: Bytes,
     request_json: Value,
 ) -> Result<Response, AppError> {
     let key = authenticate_downstream(&headers, &state).await?;
@@ -180,10 +180,12 @@ async fn proxy_openai_image_generation(
         } else {
             ImageResponseFormat::OpenAi
         };
-        let (upstream_path, forwarded) = if antigravity {
-            let config = crate::provider::antigravity::Config::from_account(&route.config)?;
+        let antigravity_config = antigravity
+            .then(|| crate::provider::antigravity::Config::from_account(&route.config))
+            .transpose()?;
+        let (upstream_path, forwarded) = if let Some(config) = &antigravity_config {
             (
-                "/v1internal:generateContent",
+                crate::provider::antigravity::GENERATE_CONTENT_PATH,
                 crate::provider::antigravity::openai_image_request(
                     &route.upstream_model,
                     &config.project_id,
@@ -234,11 +236,11 @@ async fn proxy_openai_image_generation(
             if let Some(upstream_idempotency) = upstream_idempotency.as_deref() {
                 request = request.header("idempotency-key", upstream_idempotency);
             }
-            request = route.credential.apply(request, unix_millis())?;
-            if antigravity {
-                let config = crate::provider::antigravity::Config::from_account(&route.config)?;
-                request = config.apply_headers(request)?;
-            }
+            request = if let Some(config) = &antigravity_config {
+                config.authorize_request(&route.credential, request)?
+            } else {
+                route.credential.apply(request, unix_millis())?
+            };
             SynchronousImageUpstreamRequest::Reqwest(request)
         };
         Ok::<_, AppError>((
@@ -330,16 +332,7 @@ async fn proxy_openai_image_generation(
         invalid_response: std::sync::atomic::AtomicBool::new(false),
         confirmed_rejection: std::sync::atomic::AtomicBool::new(false),
     };
-    match execute_synchronous_image_request(
-        &context,
-        body,
-        &staged_request_object,
-        &route,
-        request,
-        response_format,
-    )
-    .await
-    {
+    match execute_synchronous_image_request(&context, &route, request, response_format).await {
         Err(_)
             if context.arm_state.load(std::sync::atomic::Ordering::Acquire)
                 != super::synchronous_image::ARM_NOT_STARTED =>
