@@ -1237,6 +1237,7 @@ async fn process_session_body_rebuild_recovery(state: &AppState) {
 
 async fn run_conversation_projection(state: &AppState, mut shutdown: watch::Receiver<bool>) {
     let mut running = JoinSet::new();
+    let mut claim_turn = 0usize;
     let mut ticks = tokio::time::interval(PROJECTION_INTERVAL);
     ticks.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
     loop {
@@ -1259,10 +1260,11 @@ async fn run_conversation_projection(state: &AppState, mut shutdown: watch::Rece
         let owner = Uuid::now_v7();
         match state
             .db
-            .claim_conversation_projection_tasks(owner, available)
+            .claim_conversation_projection_tasks_from_turn(owner, available, claim_turn)
             .await
         {
             Ok(tasks) => {
+                claim_turn = claim_turn.wrapping_add(available as usize);
                 for task in tasks {
                     let state = state.clone();
                     running.spawn(async move {
