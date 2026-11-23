@@ -2,6 +2,8 @@ mod activation;
 mod bootstrap;
 use super::*;
 
+pub(super) const EVENT_SOURCE_PAGE_SQL: &str = "SELECT 'event' AS source,event_id AS request_id,tenant_id,key_id,event_at AS created_at FROM request_events WHERE event_at >= $1 AND (event_at,event_id) > ($1,$2) ORDER BY event_at,event_id LIMIT $3";
+
 const PENDING_COUNT_SQL: &str = "SELECT (SELECT COUNT(*) FROM request_history_export) + (SELECT COUNT(*) FROM request_history_immutable_outbox i WHERE NOT EXISTS (SELECT 1 FROM request_history_export e WHERE e.revision=i.revision))";
 use crate::request_history::{
     HistoryError, HistoryIdentity, HistoryScope, HistorySnapshot, HistoryStatistics,
@@ -451,8 +453,12 @@ impl Database {
         after_id: Option<Uuid>,
         limit: i64,
     ) -> Result<Vec<HistoryIdentity>, HistoryError> {
-        let rows=sqlx::query("SELECT 'event' AS source, event_id AS request_id, event_at AS created_at, tenant_id, key_id FROM request_events WHERE (event_at > $1 OR (event_at = $1 AND event_id > $2)) ORDER BY event_at, event_id LIMIT $3")
-            .bind(after).bind(after_id.map(|id|id.to_string()).unwrap_or_default()).bind(limit).fetch_all(&self.pool).await?;
+        let rows = sqlx::query(EVENT_SOURCE_PAGE_SQL)
+            .bind(after)
+            .bind(after_id.map(|id| id.to_string()).unwrap_or_default())
+            .bind(limit)
+            .fetch_all(&self.pool)
+            .await?;
         rows.iter().map(history_identity).collect()
     }
 
@@ -515,10 +521,16 @@ impl Database {
             // Event IDs need not follow event time. A legacy UUID cursor gets
             // one complete time-ordered pass; existing durable receipts below
             // preserve revisions already captured or delivered.
-            sqlx::query("SELECT 'event' AS source,event_id AS request_id,tenant_id,key_id,event_at AS created_at FROM request_events WHERE event_at >= $1 AND (event_at,event_id) > ($1,$2) ORDER BY event_at,event_id LIMIT $3")
+            sqlx::query(EVENT_SOURCE_PAGE_SQL)
                 .bind(event_after.unwrap_or(i64::MIN))
-                .bind(if event_after.is_some() { after.as_str() } else { "" })
-                .bind(page_size).fetch_all(&mut *transaction).await?
+                .bind(if event_after.is_some() {
+                    after.as_str()
+                } else {
+                    ""
+                })
+                .bind(page_size)
+                .fetch_all(&mut *transaction)
+                .await?
         } else {
             let sql = format!(
                 "SELECT {COLUMNS} FROM request_history_source_ids WHERE source = $1 AND request_id > $2 ORDER BY request_id LIMIT $3"
