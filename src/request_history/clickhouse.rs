@@ -258,6 +258,11 @@ impl ClickHouse {
         }
         #[derive(serde::Deserialize)]
         struct Stored {
+            tenant_id: uuid::Uuid,
+            key_id: uuid::Uuid,
+            request_id: uuid::Uuid,
+            source: String,
+            created_at: String,
             snapshot: String,
             snapshot_hash: String,
         }
@@ -272,13 +277,23 @@ impl ClickHouse {
             clauses.push(format!("(tenant_id={tenant} AND key_id={key} AND request_id={request} AND source={source} AND created_at={created})"));
         }
         query.sql = format!(
-            "SELECT snapshot,snapshot_hash FROM request_history_v1 FINAL WHERE {} FORMAT JSONEachRow",
+            "SELECT tenant_id,key_id,request_id,source,toString(created_at) AS created_at,snapshot,snapshot_hash FROM request_history_v1 FINAL WHERE {} FORMAT JSONEachRow",
             clauses.join(" OR ")
         );
         let rows = self.rows::<Stored>(query).await?;
         let mut result = vec![None; identities.len()];
         for row in rows {
             let snapshot: HistorySnapshot = serde_json::from_str(&row.snapshot)?;
+            let physical = super::HistoryIdentity {
+                tenant_id: row.tenant_id,
+                key_id: row.key_id,
+                request_id: row.request_id,
+                source: row.source,
+                created_at: row.created_at.parse().map_err(|_| HistoryError::Mismatch)?,
+            };
+            if physical != snapshot.identity {
+                return Err(HistoryError::Mismatch);
+            }
             let position = identities
                 .iter()
                 .position(|identity| *identity == snapshot.identity)
