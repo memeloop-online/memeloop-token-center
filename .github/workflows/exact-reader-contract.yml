@@ -626,6 +626,12 @@ jobs:
     runs-on: ubuntu-24.04
     timeout-minutes: 30
     services:
+      clickhouse:
+        image: clickhouse/clickhouse-server:25.8
+        env:
+          CLICKHOUSE_SKIP_USER_SETUP: "1"
+        ports: ["8123:8123"]
+        options: --health-cmd "clickhouse-client --query 'SELECT 1'" --health-interval 5s --health-timeout 3s --health-retries 20
       postgres:
         image: postgres:16-alpine
         env:
@@ -635,6 +641,7 @@ jobs:
         ports: ['5432:5432']
         options: --health-cmd pg_isready --health-interval 5s --health-timeout 5s --health-retries 10
     env:
+      MTC_TEST_CLICKHOUSE_URL: http://127.0.0.1:8123
       MTC_TEST_POSTGRES_URL: postgres://token_center:token_center@127.0.0.1:5432/token_center_test
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
@@ -649,10 +656,14 @@ jobs:
           set -o pipefail
           git rev-parse HEAD
           cargo check --locked --lib
-          cargo test --locked --lib db::history_immutable_outbox::tests::request_history_capture_reuses_legacy_immutable_without_source -- --exact --nocapture 2>&1 | tee /tmp/history-frozen.log
-          grep -F '1 passed; 0 failed' /tmp/history-frozen.log
-          cargo test --locked --lib db::history_immutable_outbox::tests::postgres_history_capture_skips_locked_identity_and_commits_progress -- --ignored --exact --nocapture 2>&1 | tee /tmp/history-capture.log
-          grep -F '1 passed; 0 failed' /tmp/history-capture.log
+          cargo test --locked --lib request_history::tests::baseline_page_reads_use_two_http_calls_and_validate_identity_hash -- --exact --nocapture 2>&1 | tee /tmp/history-batch.log
+          grep -F '1 passed; 0 failed' /tmp/history-batch.log
+          cargo test --locked --lib db::history_immutable_outbox::summary_batch::tests::summary_batch_reuses_absence_and_keeps_scope_and_errors -- --exact --nocapture 2>&1 | tee /tmp/history-batch.log
+          grep -F '1 passed; 0 failed' /tmp/history-batch.log
+          cargo test --locked --lib db::request_history::bootstrap::tests::request_history_real_services_acceptance_bootstrap_partial_recovery_and_activation_barrier -- --ignored --exact --nocapture 2>&1 | tee /tmp/history-batch.log
+          grep -F '1 passed; 0 failed' /tmp/history-batch.log
+          cargo test --locked --lib request_history::persistence_tests::request_history_real_services_acceptance -- --ignored --exact --nocapture 2>&1 | tee /tmp/history-batch.log
+          grep -F '1 passed; 0 failed' /tmp/history-batch.log
 
   semantic-reader-scope-contract:
     if: inputs.contract == 'semantic-reader-scope'
