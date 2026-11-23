@@ -139,9 +139,13 @@ async fn immutable_metadata(
         .await
     {
         Ok(_) | Err(object_store::Error::AlreadyExists { .. }) => {}
-        Err(error) => return Err(error.into()),
+        Err(error) => return Err(AppError::from(error).storage_phase("owner_receipt_put")),
     }
-    if read_metadata(store, path).await? != bytes {
+    if read_metadata(store, path)
+        .await
+        .map_err(|error| error.storage_phase("owner_receipt_get"))?
+        != bytes
+    {
         return Err(invalid());
     }
     Ok(())
