@@ -115,7 +115,7 @@ async fn baseline_page_reads_use_two_http_calls_and_validate_identity_hash() {
     fn stored(physical: &HistorySnapshot, payload: &HistorySnapshot) -> serde_json::Value {
         json!({"tenant_id":physical.identity.tenant_id,"key_id":physical.identity.key_id,
             "request_id":physical.identity.request_id,"source":physical.identity.source,
-            "created_at":physical.identity.created_at.to_string(),
+            "physical_created_at":physical.identity.created_at.to_string(),
             "snapshot":serde_json::to_string(payload).unwrap(),"snapshot_hash":canonical_hash(payload).unwrap()})
     }
     let rows = (0..64)
