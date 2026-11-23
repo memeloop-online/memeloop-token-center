@@ -655,14 +655,7 @@ jobs:
       - run: |
           set -o pipefail
           git rev-parse HEAD
-          cargo check --locked --lib
-          cargo test --locked --lib request_history::tests::baseline_page_reads_use_two_http_calls_and_validate_identity_hash -- --exact --nocapture 2>&1 | tee /tmp/history-batch.log
-          grep -F '1 passed; 0 failed' /tmp/history-batch.log
-          cargo test --locked --lib db::history_immutable_outbox::summary_batch::tests::summary_batch_reuses_absence_and_keeps_scope_and_errors -- --exact --nocapture 2>&1 | tee /tmp/history-batch.log
-          grep -F '1 passed; 0 failed' /tmp/history-batch.log
-          cargo test --locked --lib db::request_history::bootstrap::tests::request_history_real_services_acceptance_bootstrap_partial_recovery_and_activation_barrier -- --ignored --exact --nocapture 2>&1 | tee /tmp/history-batch.log
-          grep -F '1 passed; 0 failed' /tmp/history-batch.log
-          cargo test --locked --lib request_history::persistence_tests::request_history_real_services_acceptance -- --ignored --exact --nocapture 2>&1 | tee /tmp/history-batch.log
+          cargo test --locked --lib db::history_source_snapshot::tests::request_history_real_services_acceptance_source_baseline_receipts_and_abort -- --ignored --exact --nocapture 2>&1 | tee /tmp/history-batch.log
           grep -F '1 passed; 0 failed' /tmp/history-batch.log
 
   semantic-reader-scope-contract:
