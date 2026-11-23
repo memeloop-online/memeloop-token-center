@@ -97,7 +97,7 @@ export async function run(plan: Plan, env = process.env): Promise<Record<string,
   for (const scenario of new Set(plan.arrivals.map(row => row.scenario))) {
     setupScenario=scenario; setupIndex=(setupIndex ?? -1)+1;
     const model = `staging-peak-${fixtureId}-${scenario}`;
-    if (reused) { models[scenario]=model; routes.push(reused.routes[scenario]); continue; }
+    if (reused) { const routeId=reused.routes[scenario]; if(!routeId)throw new Error("verified fixture route is missing"); models[scenario]=model; routes.push(routeId); continue; }
     const upstream = await call("upstream_setup", "/internal/v1/upstreams", { tenant_external_id:tenant, name:model, driver:"http-json", config:{ base_url:new URL(`/scenario/${scenario}`,upstreamBase).href, network_scope:"private" }, credential:{ type:"none" } });
     const route = await call("route_setup", "/internal/v1/model-routes", { tenant_external_id:tenant, public_model:model, upstream_account_id:upstream.id, upstream_model:model, protocol:"openai", priority:0, custom_model_confirmed:true });
     await call("price_setup", `/internal/v1/prices/USD/${model}`, { input_per_million:"0.01", output_per_million:"0.02" });
