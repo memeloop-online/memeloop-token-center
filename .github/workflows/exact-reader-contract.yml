@@ -712,3 +712,10 @@ jobs:
           timeout 60s cargo test --locked --lib db::history_immutable_outbox::reuse_tests::postgres_native_capture_reuse_is_exactly_equal -- --exact --nocapture 2>&1 | tee /tmp/history-reuse.log
           grep -F '1 passed; 0 failed' /tmp/history-reuse.log
 
+          for selector in sqlite_terminal_fact_read_preserves_unknown_replacement_and_conflict postgres_terminal_fact_read_preserves_unknown_replacement_and_conflict
+          do
+            timeout 90s cargo test --locked --lib "db::tests::terminal_projection::fact_read::$selector" -- --exact --nocapture 2>&1 | tee /tmp/terminal-fact-read.log
+            grep -F '1 passed; 0 failed' /tmp/terminal-fact-read.log
+          done
+          timeout 90s cargo test --locked --lib db::tests::terminal_projection::sqlite_terminal_ack_failure_recovers_across_pools_without_recharging -- --exact --nocapture 2>&1 | tee /tmp/terminal-ack-rollback.log
+          grep -F '1 passed; 0 failed' /tmp/terminal-ack-rollback.log
