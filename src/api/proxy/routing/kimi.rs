@@ -133,13 +133,10 @@ pub(super) fn prepare_forwarded_request(
     responses_via_chat_dialect: Option<crate::provider::ResponsesViaChatDialect>,
 ) -> Result<(Value, Option<responses_via_chat::Context>), AppError> {
     let mut forwarded = request.clone();
-    if bridge_multi_agent {
-        crate::api::request_normalization::prepare_plaintext_collaboration_tools(
-            &mut forwarded,
-            true,
-        )?;
-        crate::api::request_normalization::normalize_codex_multi_agent_v2(&mut forwarded, true)?;
-    }
+    crate::api::request_normalization::normalize_codex_multi_agent_v2(
+        &mut forwarded,
+        bridge_multi_agent,
+    )?;
     let is_kimi_route = route.driver == crate::oauth::managed::kimi::PROVIDER_DRIVER;
     if is_kimi_route {
         if route.base_url != crate::oauth::managed::kimi::BASE_URL {
@@ -573,15 +570,9 @@ mod tests {
         let dialect_driver = "responses-chat-custom";
         let mut opted = route(dialect_driver);
         opted.config = json!({"responses_via_chat_compaction": true});
-        let (forwarded, _) = prepare_forwarded_request(
-            &opted,
-            Protocol::OpenAiResponses,
-            &request,
-            false,
-            false,
-            dialect,
-        )
-        .unwrap();
+        let (forwarded, _) =
+            prepare_forwarded_request(&opted, Protocol::OpenAiResponses, &request, false, dialect)
+                .unwrap();
         let messages = forwarded["messages"].as_array().unwrap();
         assert_eq!(messages[0]["role"], "user");
         assert_eq!(messages[0]["content"], "earlier work");
@@ -597,15 +588,8 @@ mod tests {
 
         let plain = route(dialect_driver);
         assert!(
-            prepare_forwarded_request(
-                &plain,
-                Protocol::OpenAiResponses,
-                &request,
-                false,
-                false,
-                dialect,
-            )
-            .is_err()
+            prepare_forwarded_request(&plain, Protocol::OpenAiResponses, &request, false, dialect,)
+                .is_err()
         );
     }
 
@@ -683,8 +667,8 @@ mod tests {
     }
 
     #[test]
-    fn native_parent_route_marks_collaboration_messages_plaintext_only() {
-        let request = json!({
+    fn plaintext_preparation_preserves_collaboration_tool_envelopes() {
+        let mut forwarded = json!({
             "model": "public-model",
             "tools": [{"type":"namespace","name":"collaboration","tools":[{
                 "type":"function","name":"spawn_agent","parameters":{
@@ -697,13 +681,9 @@ mod tests {
                 }
             }]}]}]
         });
-        let (forwarded, _) = prepare_forwarded_request(
-            &route("openai-codex"),
-            Protocol::OpenAiResponses,
-            &request,
+        crate::api::request_normalization::prepare_plaintext_collaboration_tools(
+            &mut forwarded,
             true,
-            false,
-            None,
         )
         .unwrap();
 
@@ -747,7 +727,6 @@ mod tests {
             Protocol::OpenAiResponses,
             &request,
             false,
-            false,
             None,
         )
         .unwrap();
@@ -779,7 +758,6 @@ mod tests {
                 Protocol::OpenAiResponses,
                 &request,
                 false,
-                false,
                 None,
             )
             .unwrap();
@@ -809,7 +787,6 @@ mod tests {
             Protocol::OpenAiResponses,
             &request,
             true,
-            true,
             Some(crate::provider::ResponsesViaChatDialect::KimiV1),
         )
         .unwrap();
@@ -836,7 +813,6 @@ mod tests {
             &kimi_route(),
             Protocol::OpenAiResponses,
             &request,
-            true,
             true,
             Some(crate::provider::ResponsesViaChatDialect::KimiV1),
         ) {
