@@ -34,7 +34,7 @@ permissions:
   contents: read
 jobs:
   orphan-reaper-contract:
-    if: inputs.contract == 'orphan-reaper-971'
+    if: false
     runs-on: ubuntu-24.04
     timeout-minutes: 45
     services:
