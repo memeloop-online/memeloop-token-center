@@ -1,0 +1,136 @@
+name: MTC paired PostgreSQL long-prefix diagnosis
+on:
+  push:
+    branches: [ci/mtc-refactor-proof-1041]
+    paths: [.github/workflows/refactor-prefix-pair.yml]
+permissions:
+  contents: read
+jobs:
+  pair:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 85
+    env:
+      BASE: 1f107fd5e38d7ffa52a1167c19e57c99eff7122c
+      HEAD_SHA: 4633e10e6743bba5e8cc179778002c2f1d1a132e
+      CARGO_BUILD_JOBS: "2"
+      CARGO_INCREMENTAL: "0"
+      CARGO_PROFILE_TEST_DEBUG: "0"
+      CARGO_PROFILE_DEV_DEBUG: "0"
+      PGHOST: 127.0.0.1
+      PGPORT: "5432"
+      PGUSER: token_center
+      PGPASSWORD: token_center
+      PGDATABASE: postgres
+      TARGET_CASE: db::requests::conversations::prefix_storage::tests::postgres_long_prefix_storage_and_lossless_replay
+      BG_CASE: db::tests::terminal_cause::postgres_terminal_cause_is_allowlisted_and_first_terminal_writer_wins
+    services:
+      postgres:
+        image: postgres:16-alpine
+        env:
+          POSTGRES_USER: token_center
+          POSTGRES_PASSWORD: token_center
+        ports: ["5432:5432"]
+        options: --health-cmd pg_isready --health-interval 5s --health-timeout 3s --health-retries 20
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+        with:
+          ref: 4633e10e6743bba5e8cc179778002c2f1d1a132e
+          fetch-depth: 0
+          persist-credentials: false
+      - uses: ./.github/actions/checkout-plugin-examples
+      - uses: dtolnay/rust-toolchain@4360b52568e2003a75bf9bc1d59f33a8e3fc893c
+        with:
+          toolchain: 1.95.0
+          targets: wasm32-unknown-unknown
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6
+      - name: Compile both full libtest executables with identical phase markers
+        run: |
+          set -euo pipefail
+          proof="$RUNNER_TEMP/long-prefix"
+          mkdir -p "$proof/evidence"
+          sourcefile=src/db/requests/conversations/prefix_storage/tests.rs
+          for side in base head; do
+            if [[ "$side" == base ]]; then revision=$BASE; else revision=$HEAD_SHA; fi
+            git switch --detach "$revision"
+            test "$(git rev-parse HEAD)" = "$revision"
+            python3 - "$sourcefile" <<'PY'
+          import pathlib,sys
+          fn=pathlib.Path(sys.argv[1]); s=fn.read_text()
+          def before(anchor,text):
+              global s
+              assert s.count(anchor)==1,anchor
+              s=s.replace(anchor,text+'\n'+anchor)
+          before('    let database = Database::connect_with_max(url, 8)', '    let clock = std::time::Instant::now();\n    let phase = |msg: &str| eprintln!("PHASE t_ms={} {}", clock.elapsed().as_millis(), msg);\n    phase("connect");')
+          for anchor, phase in [('    database.migrate().await.unwrap();','migrate'),('    let first = key(&database,','keys'),('    let base_id =','first-observation'),('    // Fifty observations','shared-candidate-readback'),('    let retry = Uuid','retry-and-scope'),('    let rolled_back =','rollback'),('    let projected =','terminal-prepare'),('    let mut transaction = database.begin_write_transaction().await.unwrap();\n    let input = ConversationProjectionEnqueueInput','terminal-finished'),('    let crashed =','claim'),('    let atoms = extract_atoms(&base_body);','archive-prepare-project'),('    let empty_request =','remaining-corruption-cases'),('    database.pool.close().await;','pool-close')]:
+              before(anchor,'    phase("'+phase+'");')
+          before('        let mut messages = base.clone();','        if index % 16 == 0 { eprintln!("PHASE t_ms={} prefix-round={}", clock.elapsed().as_millis(), index); }')
+          before('    contract(isolated.as_str()).await;', '    let total = std::time::Instant::now();\n    eprintln!("PHASE schema-ready");')
+          before('    sqlx::query(sqlx::AssertSqlSafe(format!("DROP SCHEMA','    eprintln!("PHASE t_schema_ms={} drop-schema", total.elapsed().as_millis());')
+          fn.write_text(s)
+          PY
+            git diff -- "$sourcefile" > "$proof/evidence/$side-instrumentation.patch"
+            printf '%s\n' "$revision" > "$proof/evidence/$side-revision.txt"
+            cargo test --locked --all-features --lib --no-run --message-format=json-render-diagnostics > "$proof/$side-build.json"
+            exe=$(jq -rs '[.[]|select(.reason=="compiler-artifact" and .profile.test and .executable!=null and (.target.kind|index("lib")))][-1].executable // empty' "$proof/$side-build.json")
+            test -x "$exe"
+            cp "$exe" "$proof/$side-tests"
+            "$proof/$side-tests" --list | grep -F -x "$TARGET_CASE: test" > "$proof/evidence/$side-cases.txt"
+            "$proof/$side-tests" --list | grep -F -x "$BG_CASE: test" >> "$proof/evidence/$side-cases.txt"
+            git restore -- "$sourcefile"
+          done
+          sha256sum "$proof"/{base,head}-tests > "$proof/evidence/binary-hashes.txt"
+          uname -a > "$proof/evidence/runner.txt"
+          lscpu >> "$proof/evidence/runner.txt"
+          psql -Atc 'select version()' >> "$proof/evidence/runner.txt"
+      - name: Cross over same runner, same baseline neighbour, strict 120 seconds
+        run: |
+          set -euo pipefail
+          python3 - <<'PY'
+          import json,os,pathlib,subprocess,time,signal,sys
+          root=pathlib.Path(os.environ['RUNNER_TEMP'])/'long-prefix'; ev=root/'evidence'
+          def sql(stmt):return subprocess.check_output(['psql','-XAt','-v','ON_ERROR_STOP=1','-c',stmt],text=True,timeout=5).strip()
+          def url(db,tag):return f'postgres://token_center:token_center@127.0.0.1:5432/{db}?application_name={tag}'
+          total=[]; failed=False
+          # One fixed background process: a real successful neighbour from the original hash:4/4.
+          # Fresh databases every period; both sides get AB and BA in each condition.
+          schedule=[('schema','base'),('schema','head'),('database','head'),('database','base'),
+                    ('database','base'),('database','head'),('schema','head'),('schema','base')]
+          for seq,(condition,side) in enumerate(schedule,1):
+              name=f'{seq:02}-{condition}-{side}'; work='prefix_work_'+str(seq); other='prefix_other_'+str(seq)
+              sql('create database '+work)
+              if condition=='database':sql('create database '+other)
+              bgdb=other if condition=='database' else work
+              bt=ev/(name+'-bg.log'); tt=ev/(name+'-target.log')
+              def start(exe,case,db,tag,file,timeout):
+                  return subprocess.Popen(['timeout','--signal=TERM','--kill-after=5s',f'{timeout}s',str(root/(exe+'-tests')),case,'--exact','--nocapture'],env=dict(os.environ,MTC_TEST_POSTGRES_URL=url(db,tag)),stdout=file,stderr=subprocess.STDOUT,start_new_session=True)
+              with bt.open('w') as b,tt.open('w') as t,(ev/(name+'-samples.jsonl')).open('w') as samples:
+                  bg=start('base',os.environ['BG_CASE'],bgdb,'prefix_neighbour',b,120)
+                  st=time.monotonic()
+                  target=start(side,os.environ['TARGET_CASE'],work,'prefix_target',t,120)
+                  while target.poll() is None:
+                      sampling="""select coalesce(json_agg(o),'[]') from
+                        (select pid,datname,application_name,state,wait_event_type,wait_event,pg_blocking_pids(pid) as blockers,
+                         (select json_agg(json_build_array(locktype,mode,granted)) from pg_locks l where l.pid=a.pid and (not l.granted or l.locktype='advisory')) locks
+                         from pg_stat_activity a where application_name in ('prefix_target','prefix_neighbour')) o"""
+                      try: active=json.loads(sql(sampling))
+                      except (ValueError,subprocess.SubprocessError) as e: active={'sample_error':str(type(e).__name__)}
+                      cpu=pathlib.Path('/proc/stat').read_text().splitlines()[0]
+                      print(json.dumps(dict(t=round(time.monotonic()-st,3),cpu=cpu,pg=active)),file=samples,flush=True)
+                      time.sleep(1)
+                  rc=target.returncode
+                  observed_wall=round(time.monotonic()-st,3)
+                  bgrc=bg.wait(timeout=130)
+              output=tt.read_text(); bgtext=bt.read_text()
+              ok=rc==0 and 'test result: ok. 1 passed;' in output and 'PREFIX_STORAGE prefix_atoms=4096 observations=96' in output and 'drop-schema' in output and bgrc==0 and 'test result: ok. 1 passed;' in bgtext
+              row=dict(seq=seq,condition=condition,side=side,target_exit=rc,target_observed_wall_s=observed_wall,background_exit=bgrc,pass_gate=ok,phases=[l for l in output.splitlines() if 'PHASE' in l])
+              print(json.dumps(row),flush=True);total.append(row);failed|=not ok
+              (ev/'summary.json').write_text(json.dumps(total,indent=2))
+              for db in ([work,other] if condition=='database' else [work]):sql('drop database '+db+' with (force)')
+          sys.exit(int(failed))
+          PY
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        if: always()
+        with:
+          name: paired-prefix-phases-and-pg-waits
+          path: ${{ runner.temp }}/long-prefix/evidence/
+          if-no-files-found: error
