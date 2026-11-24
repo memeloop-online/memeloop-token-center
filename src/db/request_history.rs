@@ -522,7 +522,7 @@ impl Database {
             ""
         };
         let sql = format!(
-            "SELECT source, after_id, after_created_at, legacy_after_id FROM request_history_backfill WHERE done = 0 AND ($1 IS NULL OR source=$1) ORDER BY source LIMIT 1{lock}"
+            "SELECT source, after_id, after_created_at, legacy_after_id FROM request_history_backfill WHERE done = 0 AND (CAST($1 AS TEXT) IS NULL OR source=$1) ORDER BY source LIMIT 1{lock}"
         );
         let Some(checkpoint) = sqlx::query(sqlx::AssertSqlSafe(sql))
             .bind(source.map(crate::request_history::HistorySource::as_str))
