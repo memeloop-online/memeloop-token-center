@@ -1,5 +1,5 @@
 //! Non-secret identity of the actual history table, independent of endpoint or
-//! credentials. Replicas use their shared replication path, local tables UUID.
+//! credentials. Local tables use their UUID; unproven replica authority is rejected.
 use super::*;
 use serde::{Deserialize, Serialize};
 
@@ -35,22 +35,17 @@ impl ClickHouse {
         if columns.is_empty() {
             return Err(HistoryError::Mismatch);
         }
-        let authority = if table.engine.starts_with("Replicated") {
-            #[derive(Deserialize)]
-            struct Replica {
-                zookeeper_path: String,
-            }
-            let rows:Vec<Replica>=self.rows(query::BoundQuery::new("SELECT zookeeper_path FROM system.replicas WHERE database=currentDatabase() AND table='request_history_v1' FORMAT JSONEachRow")).await?;
-            let [replica] = rows.as_slice() else {
-                return Err(HistoryError::Mismatch);
-            };
-            format!("replicated:{}", replica.zookeeper_path)
-        } else {
-            if table.uuid == "00000000-0000-0000-0000-000000000000" {
-                return Err(HistoryError::Mismatch);
-            }
-            format!("table:{}", table.uuid)
-        };
+        // A Keeper path alone cannot distinguish independent Keeper clusters.
+        // This proof currently supports local table UUID authority only.
+        if table.engine.starts_with("Replicated") {
+            return Err(HistoryError::Invalid(
+                "replicated history target requires verified cluster authority",
+            ));
+        }
+        if table.uuid == "00000000-0000-0000-0000-000000000000" {
+            return Err(HistoryError::Mismatch);
+        }
+        let authority = format!("table:{}", table.uuid);
         Ok(HistoryTargetIdentity {
             database: table.database.clone(),
             table: table.name.clone(),
