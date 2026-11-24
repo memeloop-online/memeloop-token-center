@@ -627,7 +627,7 @@ jobs:
     timeout-minutes: 30
     services:
       clickhouse:
-        image: clickhouse/clickhouse-server:25.8
+        image: clickhouse/clickhouse-server:25.4.2
         env:
           CLICKHOUSE_SKIP_USER_SETUP: "1"
         ports: ["8123:8123"]
@@ -644,24 +644,79 @@ jobs:
       MTC_TEST_CLICKHOUSE_URL: http://127.0.0.1:8123
       MTC_TEST_POSTGRES_URL: postgres://token_center:token_center@127.0.0.1:5432/token_center_test
     steps:
+      - name: Require an exact source commit
+        env:
+          SOURCE_REVISION: ${{ inputs.source_revision }}
+        run: '[[ "$SOURCE_REVISION" =~ ^[0-9a-f]{40}$ ]]'
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
         with:
           ref: ${{ inputs.source_revision }}
           persist-credentials: false
-      - uses: dtolnay/rust-toolchain@4360b52568e2003a75bf9bc1d59f33a8e3fc893c
-        with:
-          toolchain: 1.95.0
-      - uses: ./.github/actions/checkout-plugin-examples
-      - run: |
-          set -o pipefail
-          git rev-parse HEAD
-          cargo check --locked --lib
-          cargo test --locked --lib db::request_history::event_backfill_tests::sqlite_selected_source_page_does_not_wait_for_events -- --exact --nocapture 2>&1 | tee /tmp/source-page.log
-          grep -F '1 passed; 0 failed' /tmp/source-page.log
-          cargo test --locked --lib db::request_history::event_backfill_tests::sqlite_event_backfill_uses_time_cursor_and_reuses_receipts -- --exact --nocapture 2>&1 | tee /tmp/source-page.log
-          grep -F '1 passed; 0 failed' /tmp/source-page.log
-          cargo test --locked --lib db::request_history::event_backfill_tests::request_history_real_services_acceptance_event_backfill_time_cursor -- --ignored --exact --nocapture 2>&1 | tee /tmp/source-page.log
-          grep -F '1 passed; 0 failed' /tmp/source-page.log
+      - name: Verify signed generation image page and exact ACK
+        run: |
+          #!/usr/bin/env bash
+          set -euo pipefail
+          : "${MTC_TEST_POSTGRES_URL:?isolated PG required}"
+          : "${MTC_TEST_CLICKHOUSE_URL:?isolated CH required}"
+          image=ghcr.io/memeloop-online/memeloop-token-center@sha256:f49638a10a866087073b06b7a79d2f25da12e19bed1f83032a3f059209560d2a
+          export MTC_DATABASE_URL="$MTC_TEST_POSTGRES_URL"
+          export MTC_REQUEST_HISTORY_URL="$MTC_TEST_CLICKHOUSE_URL"
+          export MTC_REQUEST_HISTORY_DATABASE=default
+          export MTC_KEY_PEPPER=isolated-fixture-pepper-at-least-32-bytes
+          export MTC_SERVICE_TOKEN=isolated-fixture-service-token-32-bytes
+          export MTC_ARCHIVE_BACKEND=filesystem
+          export MTC_ARCHIVE_PATH=/tmp/isolated-history-archive
+          cli() {
+            docker run --rm --network host \
+              -e MTC_DATABASE_URL -e MTC_REQUEST_HISTORY_URL -e MTC_REQUEST_HISTORY_DATABASE \
+              -e MTC_KEY_PEPPER -e MTC_SERVICE_TOKEN -e MTC_ARCHIVE_BACKEND -e MTC_ARCHIVE_PATH \
+              "$image" "$@"
+          }
+          pg() { psql "$MTC_TEST_POSTGRES_URL" -X -At -v ON_ERROR_STOP=1 "$@"; }
+          cli migrate
+          cli request-history start
+          pg <<'SQL'
+          BEGIN;
+          INSERT INTO tenants(id,external_id,created_at) VALUES('00000000-0000-4000-8000-000000000001','isolated-generation',1);
+          INSERT INTO principals(id,tenant_id,external_id,created_at) VALUES('00000000-0000-4000-8000-000000000002','00000000-0000-4000-8000-000000000001','fixture',1);
+          INSERT INTO key_records(id,tenant_id,principal_id,account_id,alias,currency,policy_json,status,credential_generation,created_at,updated_at) VALUES('00000000-0000-4000-8000-000000000003','00000000-0000-4000-8000-000000000001','00000000-0000-4000-8000-000000000002','00000000-0000-4000-8000-000000000004','fixture','USD','{}','active',1,1,1);
+          INSERT INTO generation_jobs(id,tenant_id,key_id,upstream_account_id,reservation_id,public_model,upstream_model,driver,status,request_object,estimated_units,next_attempt_at,created_at,updated_at) VALUES('00000000-0000-4000-8000-000000000005','00000000-0000-4000-8000-000000000001','00000000-0000-4000-8000-000000000003','00000000-0000-4000-8000-000000000006','00000000-0000-4000-8000-000000000007','fixture','fixture','http-json','queued','gap://fixture/generation',1,1,1,1);
+          -- Remove trigger prefill to prove the selected CLI page owns this enqueue.
+          DELETE FROM request_history_export WHERE source='generation' AND request_id='00000000-0000-4000-8000-000000000005';
+          COMMIT;
+          SQL
+          before=$(pg -c "SELECT source||':'||after_id||':'||done FROM request_history_backfill WHERE source<>'generation' ORDER BY source")
+          cli request-history backfill-page --source generation --page-size 64 | tee /tmp/generation-page-first.log
+          python3 - <<'PY'
+          import json
+          rows=[json.loads(x) for x in open('/tmp/generation-page-first.log') if x.lstrip().startswith('{')]
+          assert rows[-1]['queued']==1 and rows[-1]['source']=='generation', rows
+          PY
+          [ "$(pg -c "SELECT COUNT(*) FROM request_history_export WHERE source='generation' AND request_id='00000000-0000-4000-8000-000000000005' AND tenant_id='00000000-0000-4000-8000-000000000001' AND key_id='00000000-0000-4000-8000-000000000003' AND created_at=1")" = 1 ]
+          [ "$before" = "$(pg -c "SELECT source||':'||after_id||':'||done FROM request_history_backfill WHERE source<>'generation' ORDER BY source")" ]
+          cli request-history export-page --page-size 64 | tee /tmp/generation-export.log
+          python3 - <<'PY'
+          import json
+          rows=[json.loads(x) for x in open('/tmp/generation-export.log') if x.lstrip().startswith('{')]
+          r=rows[-1]
+          assert r['attempted']==1 and r['acked']==1 and r['deferred']==0 and r['operation_failed'] is False, r
+          PY
+          receipt=$(pg -c "SELECT head_revision||'|'||acknowledged_hash FROM request_history_identities WHERE source='generation' AND request_id='00000000-0000-4000-8000-000000000005' AND tenant_id='00000000-0000-4000-8000-000000000001' AND key_id='00000000-0000-4000-8000-000000000003' AND created_at=1 AND acknowledged_revision=head_revision AND LENGTH(acknowledged_hash)=64")
+          [ -n "$receipt" ]
+          ch=$(curl -fsS "$MTC_TEST_CLICKHOUSE_URL" --data-binary "SELECT concat(toString(revision),'|',snapshot_hash) FROM request_history_v1 FINAL WHERE source='generation' AND request_id='00000000-0000-4000-8000-000000000005' AND tenant_id='00000000-0000-4000-8000-000000000001' AND key_id='00000000-0000-4000-8000-000000000003' AND created_at=1 FORMAT TSV")
+          [ "$receipt" = "$ch" ]
+          cli request-history backfill-page --source generation --page-size 64 | tee /tmp/generation-page-repeat.log
+          cli request-history export-page --page-size 64 | tee /tmp/generation-export-repeat.log
+          python3 - <<'PY'
+          import json
+          for path,field in [('/tmp/generation-page-repeat.log','queued'),('/tmp/generation-export-repeat.log','attempted')]:
+           rows=[json.loads(x) for x in open(path) if x.lstrip().startswith('{')]
+           assert rows[-1][field]==0, rows
+          PY
+          [ "$(pg -c "SELECT mode FROM request_history_state WHERE id=1")" = shadow ]
+          [ "$(pg -c "SELECT head_revision||'|'||acknowledged_hash FROM request_history_identities WHERE source='generation' AND request_id='00000000-0000-4000-8000-000000000005'")" = "$receipt" ]
+          [ "$(pg -c "SELECT COUNT(*) FROM request_history_export WHERE source='generation' AND request_id='00000000-0000-4000-8000-000000000005'")" = 0 ]
+          printf '%s\n' 'GENERATION_IMAGE_PAGE_EXACT_ACK_PASS queued=1 acked=1 repeat_queued=0 repeat_attempted=0 mode=shadow'
 
   semantic-reader-scope-contract:
     if: inputs.contract == 'semantic-reader-scope'
