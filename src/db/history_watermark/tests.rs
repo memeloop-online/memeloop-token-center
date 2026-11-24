@@ -17,6 +17,29 @@ async fn postgres_clickhouse_watermark_keeps_frozen_head_across_coalescing_and_s
     let database = Database::connect(url.as_str()).await.unwrap();
     database.migrate().await.unwrap();
     database.history_start().await.unwrap();
+    for source in [
+        crate::request_history::HistorySource::Native,
+        crate::request_history::HistorySource::Generation,
+        crate::request_history::HistorySource::Archive,
+        crate::request_history::HistorySource::Event,
+    ] {
+        assert_eq!(
+            database
+                .history_backfill_source_page(64, Some(source))
+                .await
+                .unwrap(),
+            0
+        );
+    }
+    let unfinished: i64 =
+        sqlx::query_scalar("SELECT COUNT(*) FROM request_history_backfill WHERE done=0")
+            .fetch_one(&database.pool)
+            .await
+            .unwrap();
+    assert_eq!(
+        unfinished, 0,
+        "empty source backfill must complete before W"
+    );
     reqwest::Client::new()
         .post(&endpoint)
         .body(format!("CREATE DATABASE {schema}"))
@@ -131,7 +154,9 @@ async fn postgres_clickhouse_watermark_keeps_frozen_head_across_coalescing_and_s
         .await
         .unwrap();
     let started = std::time::Instant::now();
-    assert!(database.history_verify_watermark(&client).await.is_err());
+    let blocked = database.history_verify_watermark(&client).await;
+    assert!(blocked.is_err(), "blocked scan must fail: {blocked:?}");
+    eprintln!("WATERMARK_BLOCKED_SCAN_RESULT {blocked:?}");
     let elapsed = started.elapsed();
     assert!(elapsed >= std::time::Duration::from_secs(2));
     assert!(elapsed < std::time::Duration::from_secs(6));
