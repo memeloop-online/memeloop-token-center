@@ -668,6 +668,8 @@ jobs:
           git rev-parse HEAD
           test "$(git rev-parse HEAD)" = "${{ inputs.source_revision }}"
           cargo check --locked --lib
+          cargo test --locked --lib db::history_source_snapshot::parity::tests::baseline_scope_parity_rejects_equal_count_swapped_key_payload -- --exact --nocapture 2>&1 | tee /tmp/watermark-cutover.log
+          grep -F '1 passed; 0 failed' /tmp/watermark-cutover.log
           cargo test --locked --lib db::history_watermark::tests::postgres_clickhouse_watermark_keeps_frozen_head_across_coalescing_and_switch -- --ignored --exact --nocapture 2>&1 | tee /tmp/watermark-cutover.log
           grep -F '1 passed; 0 failed' /tmp/watermark-cutover.log
           cargo test --locked --lib db::history_source_snapshot::tests::request_history_real_services_acceptance_source_baseline_receipts_and_abort -- --ignored --exact --nocapture 2>&1 | tee /tmp/watermark-cutover.log
