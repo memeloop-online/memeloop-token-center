@@ -2,6 +2,64 @@ use sqlx::{Any, Transaction};
 
 use crate::error::AppError;
 
+use super::super::usage_rollup_sql::generation_dimensions_sql;
+
+macro_rules! generation_analysis_sql {
+    ($table:literal, $bucket:literal, $divisor:literal) => {
+        concat!(
+            "INSERT INTO ", $table, " (\n",
+            "               tenant_id, key_id, ", $bucket, ", source_kind, model, protocol, status_class,\n",
+            r#"               error_code, upstream_account_id, model_route_id, service_tier, currency,
+               requests, input_tokens, output_tokens, cached_input_tokens, cache_write_tokens,
+               generation_units, duration_count, duration_sum_ms, duration_bucket_0,
+               duration_bucket_1, duration_bucket_2, duration_bucket_3, duration_bucket_4,
+               duration_bucket_5, duration_bucket_6, duration_bucket_7, duration_bucket_8,
+               duration_bucket_9, duration_bucket_10, duration_bucket_11, cost_micros)
+"#,
+            "           SELECT g.tenant_id, g.key_id, g.created_at / ", $divisor, ", 'generation', g.model,\n",
+            r#"                  'generation', g.status_class, g.error_code, g.upstream_account_id, g.model_route_id,
+                  'default', g.currency, 1, 0, 0, 0, 0, g.billed_units, 1, g.duration_ms,
+                  CASE WHEN g.duration_ms <= 10 THEN 1 ELSE 0 END,
+                  CASE WHEN g.duration_ms > 10 AND g.duration_ms <= 50 THEN 1 ELSE 0 END,
+                  CASE WHEN g.duration_ms > 50 AND g.duration_ms <= 100 THEN 1 ELSE 0 END,
+                  CASE WHEN g.duration_ms > 100 AND g.duration_ms <= 250 THEN 1 ELSE 0 END,
+                  CASE WHEN g.duration_ms > 250 AND g.duration_ms <= 500 THEN 1 ELSE 0 END,
+                  CASE WHEN g.duration_ms > 500 AND g.duration_ms <= 1000 THEN 1 ELSE 0 END,
+                  CASE WHEN g.duration_ms > 1000 AND g.duration_ms <= 2500 THEN 1 ELSE 0 END,
+                  CASE WHEN g.duration_ms > 2500 AND g.duration_ms <= 5000 THEN 1 ELSE 0 END,
+                  CASE WHEN g.duration_ms > 5000 AND g.duration_ms <= 10000 THEN 1 ELSE 0 END,
+                  CASE WHEN g.duration_ms > 10000 AND g.duration_ms <= 30000 THEN 1 ELSE 0 END,
+                  CASE WHEN g.duration_ms > 30000 AND g.duration_ms <= 60000 THEN 1 ELSE 0 END,
+                  CASE WHEN g.duration_ms > 60000 THEN 1 ELSE 0 END,
+                  g.cost_micros
+             FROM generation_stats_facts g
+            WHERE g.job_id = $1
+"#,
+            "           ON CONFLICT (tenant_id, key_id, ", $bucket, ", source_kind, model, protocol,\n",
+            r#"                        status_class, error_code, upstream_account_id, model_route_id,
+                        service_tier, currency)
+"#,
+            "           DO UPDATE SET requests = ", $table, ".requests + excluded.requests,\n",
+            "               generation_units = ", $table, ".generation_units + excluded.generation_units,\n",
+            "               duration_count = ", $table, ".duration_count + excluded.duration_count,\n",
+            "               duration_sum_ms = ", $table, ".duration_sum_ms + excluded.duration_sum_ms,\n",
+            "               duration_bucket_0 = ", $table, ".duration_bucket_0 + excluded.duration_bucket_0,\n",
+            "               duration_bucket_1 = ", $table, ".duration_bucket_1 + excluded.duration_bucket_1,\n",
+            "               duration_bucket_2 = ", $table, ".duration_bucket_2 + excluded.duration_bucket_2,\n",
+            "               duration_bucket_3 = ", $table, ".duration_bucket_3 + excluded.duration_bucket_3,\n",
+            "               duration_bucket_4 = ", $table, ".duration_bucket_4 + excluded.duration_bucket_4,\n",
+            "               duration_bucket_5 = ", $table, ".duration_bucket_5 + excluded.duration_bucket_5,\n",
+            "               duration_bucket_6 = ", $table, ".duration_bucket_6 + excluded.duration_bucket_6,\n",
+            "               duration_bucket_7 = ", $table, ".duration_bucket_7 + excluded.duration_bucket_7,\n",
+            "               duration_bucket_8 = ", $table, ".duration_bucket_8 + excluded.duration_bucket_8,\n",
+            "               duration_bucket_9 = ", $table, ".duration_bucket_9 + excluded.duration_bucket_9,\n",
+            "               duration_bucket_10 = ", $table, ".duration_bucket_10 + excluded.duration_bucket_10,\n",
+            "               duration_bucket_11 = ", $table, ".duration_bucket_11 + excluded.duration_bucket_11,\n",
+            "               cost_micros = ", $table, ".cost_micros + excluded.cost_micros",
+        )
+    };
+}
+
 /// Adds a terminal generation job to the daily aggregate exactly once.
 ///
 /// The marker and aggregate update deliberately share the caller's transaction with the terminal
@@ -130,143 +188,39 @@ pub(super) async fn aggregate_terminal_generation_job(
     if aggregated.rows_affected() != 1 {
         return Err(AppError::internal("aggregation_site_1"));
     }
-    sqlx::query(
-        r#"INSERT INTO usage_analysis_hourly (
-               tenant_id, key_id, hour_bucket, source_kind, model, protocol, status_class,
-               error_code, upstream_account_id, model_route_id, service_tier, currency,
-               requests, input_tokens, output_tokens, cached_input_tokens, cache_write_tokens,
-               generation_units, duration_count, duration_sum_ms, duration_bucket_0,
-               duration_bucket_1, duration_bucket_2, duration_bucket_3, duration_bucket_4,
-               duration_bucket_5, duration_bucket_6, duration_bucket_7, duration_bucket_8,
-               duration_bucket_9, duration_bucket_10, duration_bucket_11, cost_micros)
-           SELECT g.tenant_id, g.key_id, g.created_at / 3600000, 'generation', g.model,
-                  'generation', g.status_class, g.error_code, g.upstream_account_id, g.model_route_id,
-                  'default', g.currency, 1, 0, 0, 0, 0, g.billed_units, 1, g.duration_ms,
-                  CASE WHEN g.duration_ms <= 10 THEN 1 ELSE 0 END,
-                  CASE WHEN g.duration_ms > 10 AND g.duration_ms <= 50 THEN 1 ELSE 0 END,
-                  CASE WHEN g.duration_ms > 50 AND g.duration_ms <= 100 THEN 1 ELSE 0 END,
-                  CASE WHEN g.duration_ms > 100 AND g.duration_ms <= 250 THEN 1 ELSE 0 END,
-                  CASE WHEN g.duration_ms > 250 AND g.duration_ms <= 500 THEN 1 ELSE 0 END,
-                  CASE WHEN g.duration_ms > 500 AND g.duration_ms <= 1000 THEN 1 ELSE 0 END,
-                  CASE WHEN g.duration_ms > 1000 AND g.duration_ms <= 2500 THEN 1 ELSE 0 END,
-                  CASE WHEN g.duration_ms > 2500 AND g.duration_ms <= 5000 THEN 1 ELSE 0 END,
-                  CASE WHEN g.duration_ms > 5000 AND g.duration_ms <= 10000 THEN 1 ELSE 0 END,
-                  CASE WHEN g.duration_ms > 10000 AND g.duration_ms <= 30000 THEN 1 ELSE 0 END,
-                  CASE WHEN g.duration_ms > 30000 AND g.duration_ms <= 60000 THEN 1 ELSE 0 END,
-                  CASE WHEN g.duration_ms > 60000 THEN 1 ELSE 0 END,
-                  g.cost_micros
-             FROM generation_stats_facts g
-            WHERE g.job_id = $1
-           ON CONFLICT (tenant_id, key_id, hour_bucket, source_kind, model, protocol,
-                        status_class, error_code, upstream_account_id, model_route_id,
-                        service_tier, currency)
-           DO UPDATE SET requests = usage_analysis_hourly.requests + excluded.requests,
-               generation_units = usage_analysis_hourly.generation_units + excluded.generation_units,
-               duration_count = usage_analysis_hourly.duration_count + excluded.duration_count,
-               duration_sum_ms = usage_analysis_hourly.duration_sum_ms + excluded.duration_sum_ms,
-               duration_bucket_0 = usage_analysis_hourly.duration_bucket_0 + excluded.duration_bucket_0,
-               duration_bucket_1 = usage_analysis_hourly.duration_bucket_1 + excluded.duration_bucket_1,
-               duration_bucket_2 = usage_analysis_hourly.duration_bucket_2 + excluded.duration_bucket_2,
-               duration_bucket_3 = usage_analysis_hourly.duration_bucket_3 + excluded.duration_bucket_3,
-               duration_bucket_4 = usage_analysis_hourly.duration_bucket_4 + excluded.duration_bucket_4,
-               duration_bucket_5 = usage_analysis_hourly.duration_bucket_5 + excluded.duration_bucket_5,
-               duration_bucket_6 = usage_analysis_hourly.duration_bucket_6 + excluded.duration_bucket_6,
-               duration_bucket_7 = usage_analysis_hourly.duration_bucket_7 + excluded.duration_bucket_7,
-               duration_bucket_8 = usage_analysis_hourly.duration_bucket_8 + excluded.duration_bucket_8,
-               duration_bucket_9 = usage_analysis_hourly.duration_bucket_9 + excluded.duration_bucket_9,
-               duration_bucket_10 = usage_analysis_hourly.duration_bucket_10 + excluded.duration_bucket_10,
-               duration_bucket_11 = usage_analysis_hourly.duration_bucket_11 + excluded.duration_bucket_11,
-               cost_micros = usage_analysis_hourly.cost_micros + excluded.cost_micros"#,
-    )
-    .bind(job_id)
-    .execute(&mut **transaction)
-    .await?;
-    sqlx::query(
-        r#"INSERT INTO usage_analysis_daily (
-               tenant_id, key_id, day_bucket, source_kind, model, protocol, status_class,
-               error_code, upstream_account_id, model_route_id, service_tier, currency,
-               requests, input_tokens, output_tokens, cached_input_tokens, cache_write_tokens,
-               generation_units, duration_count, duration_sum_ms, duration_bucket_0,
-               duration_bucket_1, duration_bucket_2, duration_bucket_3, duration_bucket_4,
-               duration_bucket_5, duration_bucket_6, duration_bucket_7, duration_bucket_8,
-               duration_bucket_9, duration_bucket_10, duration_bucket_11, cost_micros)
-           SELECT g.tenant_id, g.key_id, g.created_at / 86400000, 'generation', g.model,
-                  'generation', g.status_class, g.error_code, g.upstream_account_id, g.model_route_id,
-                  'default', g.currency, 1, 0, 0, 0, 0, g.billed_units, 1, g.duration_ms,
-                  CASE WHEN g.duration_ms <= 10 THEN 1 ELSE 0 END,
-                  CASE WHEN g.duration_ms > 10 AND g.duration_ms <= 50 THEN 1 ELSE 0 END,
-                  CASE WHEN g.duration_ms > 50 AND g.duration_ms <= 100 THEN 1 ELSE 0 END,
-                  CASE WHEN g.duration_ms > 100 AND g.duration_ms <= 250 THEN 1 ELSE 0 END,
-                  CASE WHEN g.duration_ms > 250 AND g.duration_ms <= 500 THEN 1 ELSE 0 END,
-                  CASE WHEN g.duration_ms > 500 AND g.duration_ms <= 1000 THEN 1 ELSE 0 END,
-                  CASE WHEN g.duration_ms > 1000 AND g.duration_ms <= 2500 THEN 1 ELSE 0 END,
-                  CASE WHEN g.duration_ms > 2500 AND g.duration_ms <= 5000 THEN 1 ELSE 0 END,
-                  CASE WHEN g.duration_ms > 5000 AND g.duration_ms <= 10000 THEN 1 ELSE 0 END,
-                  CASE WHEN g.duration_ms > 10000 AND g.duration_ms <= 30000 THEN 1 ELSE 0 END,
-                  CASE WHEN g.duration_ms > 30000 AND g.duration_ms <= 60000 THEN 1 ELSE 0 END,
-                  CASE WHEN g.duration_ms > 60000 THEN 1 ELSE 0 END,
-                  g.cost_micros
-             FROM generation_stats_facts g
-            WHERE g.job_id = $1
-           ON CONFLICT (tenant_id, key_id, day_bucket, source_kind, model, protocol,
-                        status_class, error_code, upstream_account_id, model_route_id,
-                        service_tier, currency)
-           DO UPDATE SET requests = usage_analysis_daily.requests + excluded.requests,
-               generation_units = usage_analysis_daily.generation_units + excluded.generation_units,
-               duration_count = usage_analysis_daily.duration_count + excluded.duration_count,
-               duration_sum_ms = usage_analysis_daily.duration_sum_ms + excluded.duration_sum_ms,
-               duration_bucket_0 = usage_analysis_daily.duration_bucket_0 + excluded.duration_bucket_0,
-               duration_bucket_1 = usage_analysis_daily.duration_bucket_1 + excluded.duration_bucket_1,
-               duration_bucket_2 = usage_analysis_daily.duration_bucket_2 + excluded.duration_bucket_2,
-               duration_bucket_3 = usage_analysis_daily.duration_bucket_3 + excluded.duration_bucket_3,
-               duration_bucket_4 = usage_analysis_daily.duration_bucket_4 + excluded.duration_bucket_4,
-               duration_bucket_5 = usage_analysis_daily.duration_bucket_5 + excluded.duration_bucket_5,
-               duration_bucket_6 = usage_analysis_daily.duration_bucket_6 + excluded.duration_bucket_6,
-               duration_bucket_7 = usage_analysis_daily.duration_bucket_7 + excluded.duration_bucket_7,
-               duration_bucket_8 = usage_analysis_daily.duration_bucket_8 + excluded.duration_bucket_8,
-               duration_bucket_9 = usage_analysis_daily.duration_bucket_9 + excluded.duration_bucket_9,
-               duration_bucket_10 = usage_analysis_daily.duration_bucket_10 + excluded.duration_bucket_10,
-               duration_bucket_11 = usage_analysis_daily.duration_bucket_11 + excluded.duration_bucket_11,
-               cost_micros = usage_analysis_daily.cost_micros + excluded.cost_micros"#,
-    )
-    .bind(job_id)
-    .execute(&mut **transaction)
-    .await?;
-    sqlx::query(
-        r#"INSERT INTO generation_usage_dimensions_hourly (
-               tenant_id, key_id, hour_bucket, model, status_class, error_code,
-               upstream_account_id, model_route_id, modality, billing_unit,
-               currency, units)
-           SELECT tenant_id, key_id, created_at / 3600000, model, status_class,
-                  error_code, upstream_account_id, model_route_id, modality,
-                  billing_unit, currency, billed_units
-             FROM generation_stats_facts
-            WHERE job_id = $1
-           ON CONFLICT (
-               tenant_id, key_id, hour_bucket, model, status_class, error_code,
-               upstream_account_id, model_route_id, modality, billing_unit, currency)
-           DO UPDATE SET units = generation_usage_dimensions_hourly.units + excluded.units"#,
-    )
-    .bind(job_id)
-    .execute(&mut **transaction)
-    .await?;
-    sqlx::query(
-        r#"INSERT INTO generation_usage_dimensions_daily (
-               tenant_id, key_id, day_bucket, model, status_class, error_code,
-               upstream_account_id, model_route_id, modality, billing_unit,
-               currency, units)
-           SELECT tenant_id, key_id, created_at / 86400000, model, status_class,
-                  error_code, upstream_account_id, model_route_id, modality,
-                  billing_unit, currency, billed_units
-             FROM generation_stats_facts
-            WHERE job_id = $1
-           ON CONFLICT (
-               tenant_id, key_id, day_bucket, model, status_class, error_code,
-               upstream_account_id, model_route_id, modality, billing_unit, currency)
-           DO UPDATE SET units = generation_usage_dimensions_daily.units + excluded.units"#,
-    )
-    .bind(job_id)
-    .execute(&mut **transaction)
-    .await?;
+    for statement in [
+        generation_analysis_sql!("usage_analysis_hourly", "hour_bucket", "3600000"),
+        generation_analysis_sql!("usage_analysis_daily", "day_bucket", "86400000"),
+    ] {
+        sqlx::query(statement)
+            .bind(job_id)
+            .execute(&mut **transaction)
+            .await?;
+    }
+    for statement in [
+        generation_dimensions_sql!(
+            "generation_usage_dimensions_hourly",
+            "hour_bucket",
+            "3600000",
+            "modality",
+            "billed_units",
+            "generation_stats_facts",
+            "job_id = $1"
+        ),
+        generation_dimensions_sql!(
+            "generation_usage_dimensions_daily",
+            "day_bucket",
+            "86400000",
+            "modality",
+            "billed_units",
+            "generation_stats_facts",
+            "job_id = $1"
+        ),
+    ] {
+        sqlx::query(statement)
+            .bind(job_id)
+            .execute(&mut **transaction)
+            .await?;
+    }
     Ok(())
 }

@@ -668,21 +668,15 @@ mod retirement_contracts {
             .retire_covered_raw_roots(&prepared.publication, &proof)
             .await
             .unwrap();
-        let inventory = archive
-            .inventory_retired_raw(&prepared.publication)
-            .await
-            .unwrap();
-        assert_eq!(inventory.len(), 2);
-        assert!(
-            inventory
-                .iter()
-                .all(|candidate| candidate.physical_bytes > 0)
-        );
-        let batch =
-            super::super::RawGcCandidateBatch::from_candidates(inventory, Vec::new()).unwrap();
-        assert_eq!(batch.candidates.len(), 2);
-        assert!(batch.unique_physical_bytes > 0);
         for (side, object) in [("request", input), ("response", response)] {
+            let fence = archive
+                .raw_retirement(tenant, request, side)
+                .await
+                .unwrap()
+                .expect("each retired root has a validated retirement receipt");
+            assert_eq!(fence.semantic_revision, prepared.publication.revision);
+            assert_eq!(fence.semantic_leaf, proof.node_hash);
+            assert_eq!(fence.source, object);
             assert!(
                 archive
                     .raw_capture_reference(tenant, request, side)
@@ -767,14 +761,13 @@ mod retirement_contracts {
                 .await
                 .is_err()
         );
-        assert!(
-            archive
-                .inventory_retired_raw(&prepared.publication)
-                .await
-                .unwrap()
-                .is_empty()
-        );
         for (side, expected) in [("request", input), ("response", response)] {
+            assert!(
+                !archive
+                    .raw_capture_is_retired(tenant, request, side)
+                    .await
+                    .unwrap()
+            );
             assert_eq!(
                 archive
                     .raw_capture_reference(tenant, request, side)

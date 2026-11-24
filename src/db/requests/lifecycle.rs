@@ -14,6 +14,78 @@ use crate::archive_staging::{
 use crate::model::MeteredUsageReservation;
 use tracing::Instrument;
 
+use super::super::usage_rollup_sql::generation_dimensions_sql;
+
+macro_rules! request_analysis_sql {
+    ($table:literal, $bucket:literal, $divisor:literal) => {
+        concat!(
+            "INSERT INTO ", $table, " (\n",
+            "                   tenant_id, key_id, ", $bucket, ", source_kind, model, protocol, status_class,\n",
+            r#"                   error_code, upstream_account_id, model_route_id, service_tier, currency,
+                   requests, input_tokens, output_tokens, cached_input_tokens,
+                   cache_write_tokens, generation_units, duration_count, duration_sum_ms,
+                   duration_bucket_0, duration_bucket_1, duration_bucket_2, duration_bucket_3,
+                   duration_bucket_4, duration_bucket_5, duration_bucket_6, duration_bucket_7,
+                   duration_bucket_8, duration_bucket_9, duration_bucket_10,
+                   duration_bucket_11, cost_micros)
+"#,
+            "               SELECT tenant_id, key_id, created_at / ", $divisor, ",\n",
+            r#"                      CASE WHEN protocol = 'audio-transcription' THEN 'generation' ELSE 'request' END,
+                      model,
+                      CASE WHEN protocol = 'anthropic' OR protocol LIKE 'anthropic-%'
+                           THEN 'anthropic' WHEN protocol = 'openai-image' THEN 'openai-image'
+                           WHEN protocol = 'audio-transcription' THEN 'audio-transcription'
+                           ELSE 'openai' END,
+                      status_class, error_code, upstream_account_id, model_route_id,
+                      service_tier, currency, 1,
+                      CASE WHEN input_tokens >= cached_input_tokens + cache_write_tokens
+                           THEN input_tokens - cached_input_tokens - cache_write_tokens ELSE 0 END,
+                      output_tokens, cached_input_tokens, cache_write_tokens, generation_units,
+                      1, duration_ms,
+                      CASE WHEN duration_ms <= 10 THEN 1 ELSE 0 END,
+                      CASE WHEN duration_ms > 10 AND duration_ms <= 50 THEN 1 ELSE 0 END,
+                      CASE WHEN duration_ms > 50 AND duration_ms <= 100 THEN 1 ELSE 0 END,
+                      CASE WHEN duration_ms > 100 AND duration_ms <= 250 THEN 1 ELSE 0 END,
+                      CASE WHEN duration_ms > 250 AND duration_ms <= 500 THEN 1 ELSE 0 END,
+                      CASE WHEN duration_ms > 500 AND duration_ms <= 1000 THEN 1 ELSE 0 END,
+                      CASE WHEN duration_ms > 1000 AND duration_ms <= 2500 THEN 1 ELSE 0 END,
+                      CASE WHEN duration_ms > 2500 AND duration_ms <= 5000 THEN 1 ELSE 0 END,
+                      CASE WHEN duration_ms > 5000 AND duration_ms <= 10000 THEN 1 ELSE 0 END,
+                      CASE WHEN duration_ms > 10000 AND duration_ms <= 30000 THEN 1 ELSE 0 END,
+                      CASE WHEN duration_ms > 30000 AND duration_ms <= 60000 THEN 1 ELSE 0 END,
+                      CASE WHEN duration_ms > 60000 THEN 1 ELSE 0 END,
+                      cost_micros
+                 FROM request_stats_facts WHERE request_id = $1
+"#,
+            "               ON CONFLICT (tenant_id, key_id, ", $bucket, ", source_kind, model, protocol,\n",
+            r#"                            status_class, error_code, upstream_account_id, model_route_id,
+                            service_tier, currency)
+"#,
+            "               DO UPDATE SET requests = ", $table, ".requests + excluded.requests,\n",
+            "                   input_tokens = ", $table, ".input_tokens + excluded.input_tokens,\n",
+            "                   output_tokens = ", $table, ".output_tokens + excluded.output_tokens,\n",
+            "                   cached_input_tokens = ", $table, ".cached_input_tokens + excluded.cached_input_tokens,\n",
+            "                   cache_write_tokens = ", $table, ".cache_write_tokens + excluded.cache_write_tokens,\n",
+            "                   generation_units = ", $table, ".generation_units + excluded.generation_units,\n",
+            "                   duration_count = ", $table, ".duration_count + excluded.duration_count,\n",
+            "                   duration_sum_ms = ", $table, ".duration_sum_ms + excluded.duration_sum_ms,\n",
+            "                   duration_bucket_0 = ", $table, ".duration_bucket_0 + excluded.duration_bucket_0,\n",
+            "                   duration_bucket_1 = ", $table, ".duration_bucket_1 + excluded.duration_bucket_1,\n",
+            "                   duration_bucket_2 = ", $table, ".duration_bucket_2 + excluded.duration_bucket_2,\n",
+            "                   duration_bucket_3 = ", $table, ".duration_bucket_3 + excluded.duration_bucket_3,\n",
+            "                   duration_bucket_4 = ", $table, ".duration_bucket_4 + excluded.duration_bucket_4,\n",
+            "                   duration_bucket_5 = ", $table, ".duration_bucket_5 + excluded.duration_bucket_5,\n",
+            "                   duration_bucket_6 = ", $table, ".duration_bucket_6 + excluded.duration_bucket_6,\n",
+            "                   duration_bucket_7 = ", $table, ".duration_bucket_7 + excluded.duration_bucket_7,\n",
+            "                   duration_bucket_8 = ", $table, ".duration_bucket_8 + excluded.duration_bucket_8,\n",
+            "                   duration_bucket_9 = ", $table, ".duration_bucket_9 + excluded.duration_bucket_9,\n",
+            "                   duration_bucket_10 = ", $table, ".duration_bucket_10 + excluded.duration_bucket_10,\n",
+            "                   duration_bucket_11 = ", $table, ".duration_bucket_11 + excluded.duration_bucket_11,\n",
+            "                   cost_micros = ", $table, ".cost_micros + excluded.cost_micros",
+        )
+    };
+}
+
 const ADMISSION_UPSTREAM_MODEL_UPDATE: &str = "UPDATE request_records SET upstream_model = $1 WHERE id = $2 AND reservation_id = $3 AND created_at = $4";
 
 #[cfg(test)]
@@ -2745,164 +2817,36 @@ async fn record_request_finished_with_basis_and_metering_in_transaction(
         .execute(&mut **tx)
         .await?;
         add_request_fact_to_session_projection_in_transaction(tx, &request_id, 1).await?;
-        sqlx::query(
-            r#"INSERT INTO usage_analysis_hourly (
-                   tenant_id, key_id, hour_bucket, source_kind, model, protocol, status_class,
-                   error_code, upstream_account_id, model_route_id, service_tier, currency,
-                   requests, input_tokens, output_tokens, cached_input_tokens,
-                   cache_write_tokens, generation_units, duration_count, duration_sum_ms,
-                   duration_bucket_0, duration_bucket_1, duration_bucket_2, duration_bucket_3,
-                   duration_bucket_4, duration_bucket_5, duration_bucket_6, duration_bucket_7,
-                   duration_bucket_8, duration_bucket_9, duration_bucket_10,
-                   duration_bucket_11, cost_micros)
-               SELECT tenant_id, key_id, created_at / 3600000,
-                      CASE WHEN protocol = 'audio-transcription' THEN 'generation' ELSE 'request' END,
-                      model,
-                      CASE WHEN protocol = 'anthropic' OR protocol LIKE 'anthropic-%'
-                           THEN 'anthropic' WHEN protocol = 'openai-image' THEN 'openai-image'
-                           WHEN protocol = 'audio-transcription' THEN 'audio-transcription'
-                           ELSE 'openai' END,
-                      status_class, error_code, upstream_account_id, model_route_id,
-                      service_tier, currency, 1,
-                      CASE WHEN input_tokens >= cached_input_tokens + cache_write_tokens
-                           THEN input_tokens - cached_input_tokens - cache_write_tokens ELSE 0 END,
-                      output_tokens, cached_input_tokens, cache_write_tokens, generation_units,
-                      1, duration_ms,
-                      CASE WHEN duration_ms <= 10 THEN 1 ELSE 0 END,
-                      CASE WHEN duration_ms > 10 AND duration_ms <= 50 THEN 1 ELSE 0 END,
-                      CASE WHEN duration_ms > 50 AND duration_ms <= 100 THEN 1 ELSE 0 END,
-                      CASE WHEN duration_ms > 100 AND duration_ms <= 250 THEN 1 ELSE 0 END,
-                      CASE WHEN duration_ms > 250 AND duration_ms <= 500 THEN 1 ELSE 0 END,
-                      CASE WHEN duration_ms > 500 AND duration_ms <= 1000 THEN 1 ELSE 0 END,
-                      CASE WHEN duration_ms > 1000 AND duration_ms <= 2500 THEN 1 ELSE 0 END,
-                      CASE WHEN duration_ms > 2500 AND duration_ms <= 5000 THEN 1 ELSE 0 END,
-                      CASE WHEN duration_ms > 5000 AND duration_ms <= 10000 THEN 1 ELSE 0 END,
-                      CASE WHEN duration_ms > 10000 AND duration_ms <= 30000 THEN 1 ELSE 0 END,
-                      CASE WHEN duration_ms > 30000 AND duration_ms <= 60000 THEN 1 ELSE 0 END,
-                      CASE WHEN duration_ms > 60000 THEN 1 ELSE 0 END,
-                      cost_micros
-                 FROM request_stats_facts WHERE request_id = $1
-               ON CONFLICT (tenant_id, key_id, hour_bucket, source_kind, model, protocol,
-                            status_class, error_code, upstream_account_id, model_route_id,
-                            service_tier, currency)
-               DO UPDATE SET requests = usage_analysis_hourly.requests + excluded.requests,
-                   input_tokens = usage_analysis_hourly.input_tokens + excluded.input_tokens,
-                   output_tokens = usage_analysis_hourly.output_tokens + excluded.output_tokens,
-                   cached_input_tokens = usage_analysis_hourly.cached_input_tokens + excluded.cached_input_tokens,
-                   cache_write_tokens = usage_analysis_hourly.cache_write_tokens + excluded.cache_write_tokens,
-                   generation_units = usage_analysis_hourly.generation_units + excluded.generation_units,
-                   duration_count = usage_analysis_hourly.duration_count + excluded.duration_count,
-                   duration_sum_ms = usage_analysis_hourly.duration_sum_ms + excluded.duration_sum_ms,
-                   duration_bucket_0 = usage_analysis_hourly.duration_bucket_0 + excluded.duration_bucket_0,
-                   duration_bucket_1 = usage_analysis_hourly.duration_bucket_1 + excluded.duration_bucket_1,
-                   duration_bucket_2 = usage_analysis_hourly.duration_bucket_2 + excluded.duration_bucket_2,
-                   duration_bucket_3 = usage_analysis_hourly.duration_bucket_3 + excluded.duration_bucket_3,
-                   duration_bucket_4 = usage_analysis_hourly.duration_bucket_4 + excluded.duration_bucket_4,
-                   duration_bucket_5 = usage_analysis_hourly.duration_bucket_5 + excluded.duration_bucket_5,
-                   duration_bucket_6 = usage_analysis_hourly.duration_bucket_6 + excluded.duration_bucket_6,
-                   duration_bucket_7 = usage_analysis_hourly.duration_bucket_7 + excluded.duration_bucket_7,
-                   duration_bucket_8 = usage_analysis_hourly.duration_bucket_8 + excluded.duration_bucket_8,
-                   duration_bucket_9 = usage_analysis_hourly.duration_bucket_9 + excluded.duration_bucket_9,
-                   duration_bucket_10 = usage_analysis_hourly.duration_bucket_10 + excluded.duration_bucket_10,
-                   duration_bucket_11 = usage_analysis_hourly.duration_bucket_11 + excluded.duration_bucket_11,
-                   cost_micros = usage_analysis_hourly.cost_micros + excluded.cost_micros"#,
-        )
-        .bind(&request_id)
-        .execute(&mut **tx)
-        .await?;
-        sqlx::query(
-            r#"INSERT INTO usage_analysis_daily (
-                   tenant_id, key_id, day_bucket, source_kind, model, protocol, status_class,
-                   error_code, upstream_account_id, model_route_id, service_tier, currency,
-                   requests, input_tokens, output_tokens, cached_input_tokens,
-                   cache_write_tokens, generation_units, duration_count, duration_sum_ms,
-                   duration_bucket_0, duration_bucket_1, duration_bucket_2, duration_bucket_3,
-                   duration_bucket_4, duration_bucket_5, duration_bucket_6, duration_bucket_7,
-                   duration_bucket_8, duration_bucket_9, duration_bucket_10,
-                   duration_bucket_11, cost_micros)
-               SELECT tenant_id, key_id, created_at / 86400000,
-                      CASE WHEN protocol = 'audio-transcription' THEN 'generation' ELSE 'request' END,
-                      model,
-                      CASE WHEN protocol = 'anthropic' OR protocol LIKE 'anthropic-%'
-                           THEN 'anthropic' WHEN protocol = 'openai-image' THEN 'openai-image'
-                           WHEN protocol = 'audio-transcription' THEN 'audio-transcription'
-                           ELSE 'openai' END,
-                      status_class, error_code, upstream_account_id, model_route_id,
-                      service_tier, currency, 1,
-                      CASE WHEN input_tokens >= cached_input_tokens + cache_write_tokens
-                           THEN input_tokens - cached_input_tokens - cache_write_tokens ELSE 0 END,
-                      output_tokens, cached_input_tokens, cache_write_tokens, generation_units,
-                      1, duration_ms,
-                      CASE WHEN duration_ms <= 10 THEN 1 ELSE 0 END,
-                      CASE WHEN duration_ms > 10 AND duration_ms <= 50 THEN 1 ELSE 0 END,
-                      CASE WHEN duration_ms > 50 AND duration_ms <= 100 THEN 1 ELSE 0 END,
-                      CASE WHEN duration_ms > 100 AND duration_ms <= 250 THEN 1 ELSE 0 END,
-                      CASE WHEN duration_ms > 250 AND duration_ms <= 500 THEN 1 ELSE 0 END,
-                      CASE WHEN duration_ms > 500 AND duration_ms <= 1000 THEN 1 ELSE 0 END,
-                      CASE WHEN duration_ms > 1000 AND duration_ms <= 2500 THEN 1 ELSE 0 END,
-                      CASE WHEN duration_ms > 2500 AND duration_ms <= 5000 THEN 1 ELSE 0 END,
-                      CASE WHEN duration_ms > 5000 AND duration_ms <= 10000 THEN 1 ELSE 0 END,
-                      CASE WHEN duration_ms > 10000 AND duration_ms <= 30000 THEN 1 ELSE 0 END,
-                      CASE WHEN duration_ms > 30000 AND duration_ms <= 60000 THEN 1 ELSE 0 END,
-                      CASE WHEN duration_ms > 60000 THEN 1 ELSE 0 END,
-                      cost_micros
-                 FROM request_stats_facts WHERE request_id = $1
-               ON CONFLICT (tenant_id, key_id, day_bucket, source_kind, model, protocol,
-                            status_class, error_code, upstream_account_id, model_route_id,
-                            service_tier, currency)
-               DO UPDATE SET requests = usage_analysis_daily.requests + excluded.requests,
-                   input_tokens = usage_analysis_daily.input_tokens + excluded.input_tokens,
-                   output_tokens = usage_analysis_daily.output_tokens + excluded.output_tokens,
-                   cached_input_tokens = usage_analysis_daily.cached_input_tokens + excluded.cached_input_tokens,
-                   cache_write_tokens = usage_analysis_daily.cache_write_tokens + excluded.cache_write_tokens,
-                   generation_units = usage_analysis_daily.generation_units + excluded.generation_units,
-                   duration_count = usage_analysis_daily.duration_count + excluded.duration_count,
-                   duration_sum_ms = usage_analysis_daily.duration_sum_ms + excluded.duration_sum_ms,
-                   duration_bucket_0 = usage_analysis_daily.duration_bucket_0 + excluded.duration_bucket_0,
-                   duration_bucket_1 = usage_analysis_daily.duration_bucket_1 + excluded.duration_bucket_1,
-                   duration_bucket_2 = usage_analysis_daily.duration_bucket_2 + excluded.duration_bucket_2,
-                   duration_bucket_3 = usage_analysis_daily.duration_bucket_3 + excluded.duration_bucket_3,
-                   duration_bucket_4 = usage_analysis_daily.duration_bucket_4 + excluded.duration_bucket_4,
-                   duration_bucket_5 = usage_analysis_daily.duration_bucket_5 + excluded.duration_bucket_5,
-                   duration_bucket_6 = usage_analysis_daily.duration_bucket_6 + excluded.duration_bucket_6,
-                   duration_bucket_7 = usage_analysis_daily.duration_bucket_7 + excluded.duration_bucket_7,
-                   duration_bucket_8 = usage_analysis_daily.duration_bucket_8 + excluded.duration_bucket_8,
-                   duration_bucket_9 = usage_analysis_daily.duration_bucket_9 + excluded.duration_bucket_9,
-                   duration_bucket_10 = usage_analysis_daily.duration_bucket_10 + excluded.duration_bucket_10,
-                   duration_bucket_11 = usage_analysis_daily.duration_bucket_11 + excluded.duration_bucket_11,
-                   cost_micros = usage_analysis_daily.cost_micros + excluded.cost_micros"#,
-        )
-        .bind(&request_id)
-        .execute(&mut **tx)
-        .await?;
-        for (table, bucket_column, divisor) in [
-            (
+        for statement in [
+            request_analysis_sql!("usage_analysis_hourly", "hour_bucket", "3600000"),
+            request_analysis_sql!("usage_analysis_daily", "day_bucket", "86400000"),
+        ] {
+            sqlx::query(statement)
+                .bind(&request_id)
+                .execute(&mut **tx)
+                .await?;
+        }
+        for statement in [
+            generation_dimensions_sql!(
                 "generation_usage_dimensions_hourly",
                 "hour_bucket",
-                3_600_000_i64,
+                "3600000",
+                "'audio'",
+                "generation_units",
+                "request_stats_facts",
+                "request_id = $1 AND protocol = 'audio-transcription'"
             ),
-            (
+            generation_dimensions_sql!(
                 "generation_usage_dimensions_daily",
                 "day_bucket",
-                86_400_000_i64,
+                "86400000",
+                "'audio'",
+                "generation_units",
+                "request_stats_facts",
+                "request_id = $1 AND protocol = 'audio-transcription'"
             ),
         ] {
-            let statement = format!(
-                r#"INSERT INTO {table} (
-                       tenant_id, key_id, {bucket_column}, model, status_class, error_code,
-                       upstream_account_id, model_route_id, modality, billing_unit,
-                       currency, units)
-                   SELECT tenant_id, key_id, created_at / {divisor}, model, status_class,
-                          error_code, upstream_account_id, model_route_id, 'audio', billing_unit,
-                          currency, generation_units
-                     FROM request_stats_facts
-                    WHERE request_id = $1 AND protocol = 'audio-transcription'
-                   ON CONFLICT (
-                       tenant_id, key_id, {bucket_column}, model, status_class, error_code,
-                       upstream_account_id, model_route_id, modality, billing_unit, currency)
-                   DO UPDATE SET units = {table}.units + excluded.units"#,
-            );
-            sqlx::query(sqlx::AssertSqlSafe(statement))
+            sqlx::query(statement)
                 .bind(&request_id)
                 .execute(&mut **tx)
                 .await?;
