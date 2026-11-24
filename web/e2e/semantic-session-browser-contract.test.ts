@@ -7,7 +7,7 @@ import test from 'node:test';
 import { chromium } from 'playwright';
 import { createServer } from 'vite';
 
-declare global { interface Window { semanticAtomReads: number; semanticPageReads: number; semanticPageRequest: string; semanticContentReads: number } }
+declare global { interface Window { semanticAtomReads: number; semanticPageReads: number; semanticPageRequest: string; semanticContentReads: number; semanticContentCursors: string[] } }
 
 test('semantic viewer reads verified atoms lazily, preserves parts and pages without resident history growth', { timeout: 45_000 }, async () => {
   if (!existsSync(chromium.executablePath())) {
@@ -126,6 +126,21 @@ test('semantic viewer reads verified atoms lazily, preserves parts and pages wit
     await page.getByRole('button', { name: 'More content', exact: true }).click();
     await page.getByText('tail after preview', { exact: false }).waitFor();
     assert.equal(await page.evaluate(() => window.semanticContentReads), 1, 'partial preview resumes at the UTF8 cursor');
+    await page.goto(`http://127.0.0.1:${address.port}/e2e/fixtures/semantic-session.html?scenario=preview-partial-large`);
+    const previewField = page.locator('[data-semantic-field=text]').first();
+    await page.getByText('😀首窗', { exact: true }).waitFor();
+    for (let index = 1; index <= 5; index++) {
+      await previewField.evaluate(node => { node.scrollTop = node.scrollHeight; node.dispatchEvent(new WheelEvent('wheel', { deltaY: 300, bubbles: true })); });
+      await previewField.locator(`[data-content-index="${index}"]`).waitFor({ state: 'attached' });
+    }
+    for (let index = 2; index >= 0; index--) {
+      await previewField.evaluate(node => { node.scrollTop = 0; node.dispatchEvent(new WheelEvent('wheel', { deltaY: -300, bubbles: true })); });
+      await previewField.locator(`[data-content-index="${index}"]`).waitFor({ state: 'attached' });
+    }
+    assert.equal(await previewField.locator('[data-content-index="0"]').textContent(), '😀首窗');
+    const resumed = await page.evaluate(() => window.semanticContentCursors);
+    assert.ok(resumed.every(cursor => !cursor.endsWith(':text')), 'returning to the shared preview must not request a different chunk at offset zero');
+    assert.equal(await page.getByRole('alert').count(), 0);
     await page.goto(`http://127.0.0.1:${address.port}/e2e/fixtures/semantic-session.html?scenario=scope`);
     await page.waitForFunction(() => window.semanticPageRequest === 'request-a');
     await page.getByRole('button', { name: 'Open another session', exact: true }).click();

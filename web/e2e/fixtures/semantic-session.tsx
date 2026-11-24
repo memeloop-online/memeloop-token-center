@@ -10,8 +10,8 @@ import '../../src/theme.css';
 
 declare global { interface Window { semanticAtomReads: number; semanticPageReads: number } }
 window.semanticAtomReads = 0; window.semanticPageReads = 0;
-declare global { interface Window { semanticPageRequest: string; semanticContentReads: number } }
-window.semanticPageRequest = ''; window.semanticContentReads = 0;
+declare global { interface Window { semanticPageRequest: string; semanticContentReads: number; semanticContentCursors: string[] } }
+window.semanticPageRequest = ''; window.semanticContentReads = 0; window.semanticContentCursors = [];
 const detail: LogicalSessionDetail = {
   session_id: 'session-a', cluster_id: null, unlinked: false, edges: [], edges_truncated: false, has_more: false, next_cursor: null,
   requests: [{ request_id: 'request-a', created_at: 1, protocol: 'openai', model: 'fixture', status_code: 200, duration_ms: 1,
@@ -28,6 +28,10 @@ async function* contentFrames(_request: string, cursor: string): AsyncGenerator<
         yield { manifest_revision: revision, instance_id: instance, part_index: field === 'text' ? 0 : field === 'arguments' ? 2 : 3, field, format: field === 'text' ? 'text' : 'json', byte_offset: next * new TextEncoder().encode(largeChunk).byteLength, text: next === 5 ? 'COMPLETE LARGE FIELD' : largeChunk, next_cursor: next === 5 ? null : `${instance}:${field}:${next + 1}`, complete: next === 5 };
       } return;
     }
+    if (scenario === 'preview-partial-large' && field === 'text') {
+      for (let next = index; next <= 5; next++) yield { manifest_revision: revision, instance_id: instance, part_index: 0, field: 'text', format: 'text', byte_offset: 10 + (next - 1) * new TextEncoder().encode(largeChunk).byteLength, text: next === 5 ? 'COMPLETE LARGE FIELD' : largeChunk, next_cursor: next === 5 ? null : `${instance}:text:${next + 1}`, complete: next === 5 };
+      return;
+    }
     if (scenario === 'preview' || scenario === 'preview-partial') { yield { manifest_revision: revision, instance_id: instance, part_index: 0, field: 'text', format: 'text', byte_offset: 10, text: ' tail after preview', next_cursor: null, complete: true }; return; }
     if (scenario === 'revision') { yield { manifest_revision: '2', instance_id: instance, part_index: 0, field: 'text', format: 'text', byte_offset: 0, text: 'Stale content', next_cursor: null, complete: true }; return; }
     yield { manifest_revision: '18446744073709551615', instance_id: instance, part_index: field === 'text' ? 0 : field === 'reasoning' ? 1 : 2,
@@ -40,7 +44,7 @@ const originalFetch = window.fetch.bind(window);
 window.fetch = async (input, init) => {
   const url = new URL(String(input), location.origin);
   if (url.pathname !== '/fixture-content') return originalFetch(input, init);
-  window.semanticContentReads++;
+  window.semanticContentReads++; window.semanticContentCursors.push(url.searchParams.get('content_cursor')!);
   const frames = contentFrames('request-a', url.searchParams.get('content_cursor')!);
   let pending = new Uint8Array();
   return new Response(new ReadableStream<Uint8Array>({
