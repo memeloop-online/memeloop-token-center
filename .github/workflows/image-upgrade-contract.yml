@@ -4,8 +4,8 @@ on:
     inputs:
       image:
         description: Exact candidate image digest
-        required: false
-        default: ghcr.io/memeloop-online/memeloop-token-center@sha256:f49638a10a866087073b06b7a79d2f25da12e19bed1f83032a3f059209560d2a
+        required: true
+        type: string
 permissions:
   contents: read
 jobs:
@@ -62,7 +62,7 @@ jobs:
           test "$(docker exec -e PGPASSWORD="$E2E_PG_PASSWORD" image-e2e-postgres psql -U token_center -d token_center_test -Atqc 'SELECT max(version) FROM schema_migrations')" = 163
       - name: Start exact candidate
         env:
-          IMAGE: ${{ inputs.image || 'ghcr.io/memeloop-online/memeloop-token-center@sha256:f49638a10a866087073b06b7a79d2f25da12e19bed1f83032a3f059209560d2a' }}
+          IMAGE: ${{ inputs.image }}
         run: |
           [[ "$IMAGE" =~ ^ghcr\.io/memeloop-online/memeloop-token-center@sha256:[0-9a-f]{64}$ ]]
           docker run -d --name image-e2e-service --network host \
