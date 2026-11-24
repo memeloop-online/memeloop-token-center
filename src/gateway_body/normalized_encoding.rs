@@ -44,7 +44,9 @@ pub(crate) async fn encode(
         }
         size = (size / 2).max(1);
     };
-    let upload_memory = upload.multipart_workspace().await?;
+    let upload_memory = upload
+        .multipart_workspace(crate::api::proxy::persistence::WorkspaceRole::Normalized)
+        .await?;
     let scope = Arc::new(ScratchScope::new(archive, database, staging)?);
     let (archive, selected) = scope.begin_body_write().await?;
     let mut writer = archive

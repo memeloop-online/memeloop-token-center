@@ -177,7 +177,10 @@ impl DurableRequestBodies {
                 // Its existing independent upload envelope must own those
                 // copies; retaining the source pool's replay lease here would
                 // wait on the very bytes queued in the multipart writer.
-                let workspace = upload.multipart_workspace().await.map_err(|_| ())?;
+                let workspace = upload
+                    .multipart_workspace(crate::api::proxy::persistence::WorkspaceRole::RequestRaw)
+                    .await
+                    .map_err(|_| ())?;
                 let mut writer = archive.start_writer(key).await.map_err(|_| ())?;
                 writer.retain_workspace(workspace.clone());
                 let mut stream = source.open_stream_with_workspace(workspace);

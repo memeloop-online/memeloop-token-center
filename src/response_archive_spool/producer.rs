@@ -592,6 +592,7 @@ struct CaptureQueueMemory {
     _local_metrics: Option<crate::metrics::MemoryUsageGuard>,
     _archive_permit: Option<tokio::sync::OwnedSemaphorePermit>,
     reservation: Option<Arc<crate::gateway_body::memory::ProxyMemoryReservation>>,
+    workspace: Option<Arc<crate::api::proxy::persistence::WorkspaceGuard>>,
 }
 
 impl Drop for CaptureQueueMemory {
@@ -784,6 +785,7 @@ impl ResponseArchiveProducer {
         let queue_memory = Arc::new(CaptureQueueMemory {
             _local_metrics: None,
             reservation: memory,
+            workspace: None,
             _archive_permit: archive_permit,
         });
         let (source, source_receiver) = tokio::sync::mpsc::unbounded_channel();
@@ -1320,7 +1322,9 @@ async fn run_response_archive_writer(
                     .acquire_owned()
                     .await
                     .map_err(|_| AppError::internal("capture_upload_admission_closed"))?;
-                let reservation = match state.persistence.try_multipart_workspace() {
+                let reservation = match state.persistence.try_multipart_workspace(
+                    crate::api::proxy::persistence::WorkspaceRole::ResponseStage,
+                ) {
                     Ok(reservation) => reservation,
                     Err(_) => {
                         // Complete source bytes already have an owner. Release
@@ -1334,7 +1338,8 @@ async fn run_response_archive_writer(
                 Some(Arc::new(CaptureQueueMemory {
                     _local_metrics: None,
                     _archive_permit: Some(permit),
-                    reservation: Some(reservation),
+                    reservation: None,
+                    workspace: Some(reservation),
                 }))
             } else {
                 None

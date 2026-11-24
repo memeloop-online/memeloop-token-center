@@ -477,7 +477,9 @@ impl BodyCarrier {
             .as_ref()
             .map(|owner| {
                 owner
-                    .try_multipart_workspace()
+                    .try_multipart_workspace(
+                        crate::api::proxy::persistence::WorkspaceRole::CarrierSpill,
+                    )
                     .map_err(|_| AppError::storage("carrier_workspace_unavailable"))
             })
             .transpose()?;
