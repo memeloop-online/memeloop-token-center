@@ -171,6 +171,8 @@ fn requires_strict_openai_chat_usage(
 }
 
 struct AuthorizedProxyRoutes {
+    // One request-owned metadata snapshot; never contains decrypted secrets.
+    refreshed_candidates: Option<Vec<AuthorizedUpstreamCandidate>>,
     primary: PlannedProxyRoute,
     remaining_candidates: std::vec::IntoIter<AuthorizedUpstreamCandidate>,
     input_token_ceiling: i64,
@@ -221,6 +223,7 @@ async fn prepare_authorized_proxy_routes(
         .collect::<Vec<_>>();
     let mut remaining_candidates = candidates.into_iter();
     let mut summary = CandidatePreparationSummary::default();
+    let mut refreshed_candidates = None;
     let mut primary = next_planned_proxy_candidate(
         request,
         &mut remaining_candidates,
@@ -256,6 +259,7 @@ async fn prepare_authorized_proxy_routes(
                 .position(|pair| *pair == (candidate.route_id, candidate.account_id))
                 .unwrap_or(usize::MAX)
         });
+        refreshed_candidates = Some(refreshed.clone());
         remaining_candidates = refreshed.into_iter();
         tracing::info!(
             stage = "candidate_snapshot_refresh",
@@ -279,6 +283,7 @@ async fn prepare_authorized_proxy_routes(
     let (input_token_ceiling, output_token_ceiling, output_token_limit) =
         candidate_reservation_bounds(&primary, original_body_length, output_choice_count)?;
     Ok(AuthorizedProxyRoutes {
+        refreshed_candidates,
         primary,
         remaining_candidates,
         input_token_ceiling,
@@ -1190,7 +1195,7 @@ async fn proxy_with_cancellation_guard(
         )
         .await?;
     }
-    let strategy_candidates =
+    let mut strategy_candidates =
         crate::group_routing::candidate_snapshot_if_enabled(&state, &candidates);
     let request_context = ProxyRequestContext {
         state: &state,
@@ -1211,6 +1216,11 @@ async fn proxy_with_cancellation_guard(
         snapshot_refresh_used: &mut snapshot_refresh_used,
     })
     .await?;
+    if strategy_candidates.is_some()
+        && let Some(refreshed) = route_plan.refreshed_candidates.take()
+    {
+        strategy_candidates = Some(refreshed);
+    }
     let primary = route_plan.primary_route();
     // Freeze before reservation and archive work: later candidates/reloads may
     // change account transport settings, never replenish the request budget.
