@@ -726,9 +726,11 @@ test('account workspace returns without retained details, shares list tracks and
         await page.screenshot({ path: `${artifacts}/denied-${locale}-${width}.png`, fullPage: true });
         state = 'slow';
         const statisticsBeforeLoading = statisticsReads;
-        const statisticsStarted = Promise.withResolvers<void>();
-        const statisticsResponse = Promise.withResolvers<void>();
-        holdStatistics = { started: statisticsStarted.resolve, response: statisticsResponse.promise };
+        let startStatistics!: () => void;
+        let releaseStatistics!: () => void;
+        const statisticsStarted = new Promise<void>(resolve => { startStatistics = resolve; });
+        const statisticsResponse = new Promise<void>(resolve => { releaseStatistics = resolve; });
+        holdStatistics = { started: startStatistics, response: statisticsResponse };
         try {
           const reading = new Promise<void>(resolve => { readStarted = resolve; });
           await page.goto(fixture); await reading;
@@ -739,11 +741,11 @@ test('account workspace returns without retained details, shares list tracks and
             'the service credential stays out of the loading DOM');
           await page.screenshot({ path: `${artifacts}/slow-${locale}-${width}.png`, fullPage: true });
           releasePendingRoutes();
-          await statisticsStarted.promise;
+          await statisticsStarted;
           await rows.nth(2).waitFor();
         } finally {
           releasePendingRoutes();
-          statisticsResponse.resolve();
+          releaseStatistics();
           holdStatistics = undefined;
         }
         assert.equal(await details.count(), 0);

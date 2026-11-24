@@ -51,12 +51,7 @@ test('client credential creation names the principal once and binds existing pri
     for (const locale of ['zh-CN', 'en'] as const) {
       const english = locale === 'en';
       const page = await browser.newPage();
-      await page.addInitScript(value => {
-        localStorage.setItem('mtc-locale', value);
-        Object.defineProperty(navigator, 'clipboard', { value: {
-          writeText: async (text: string) => { document.documentElement.dataset.issuedClipboard = text; },
-        } });
-      }, locale);
+      await page.addInitScript(value => localStorage.setItem('mtc-locale', value), locale);
       await page.goto(`${origin}/e2e/fixtures/operator-credential-workspace.html?scenario=client-form`);
       await page.getByText(english ? 'Research workspace' : '研发工作区', { exact: true }).waitFor();
       const create = page.locator('.create-journey');
@@ -83,8 +78,18 @@ test('client credential creation names the principal once and binds existing pri
       await create.locator('button[type="submit"]').click();
       await page.locator('.one-time').getByText('mtc_fixture_created', { exact: true }).waitFor();
       const issuedCopy = page.locator('.one-time').getByRole('button', { name: english ? 'Copy credential' : '复制凭据', exact: true });
+      const clipboardWrites: string[] = [];
+      await page.exposeFunction('recordIssuedClipboard', (text: string) => { clipboardWrites.push(text); });
+      await issuedCopy.evaluate(button => {
+        const recordClipboard = Reflect.get(window, 'recordIssuedClipboard') as (text: string) => Promise<void>;
+        Object.defineProperty(button.ownerDocument.defaultView!.navigator, 'clipboard', {
+          configurable: true,
+          value: { writeText: recordClipboard },
+        });
+      });
       await issuedCopy.click();
-      await page.waitForFunction(() => document.documentElement.dataset.issuedClipboard === 'mtc_fixture_created');
+      await page.locator('.one-time').getByRole('button', { name: english ? 'Copied' : '已复制', exact: true }).waitFor();
+      assert.deepEqual(clipboardWrites, ['mtc_fixture_created'], 'the clipboard receives the issued plaintext, not key-created');
       assert.equal(await page.evaluate(() => window.credentialFixture.requests.some(request => request.path === '/internal/v1/keys/key-created/credential')), false, 'copying the issued key does not fetch it again');
       let posts = await createdPosts();
       assert.equal(posts.length, 1);
