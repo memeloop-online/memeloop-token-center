@@ -200,7 +200,7 @@ async fn real_s3_small_spill_lost_ack_retains_source_and_routes_both_backends() 
 #[ignore = "requires isolated RustFS fixture"]
 async fn real_s3_small_spill_compares_previous_multipart_at_same_distribution_and_concurrency() {
     let endpoint = std::env::var("MTC_RUSTFS_TEST_ENDPOINT").unwrap();
-    for previous in [true, false] {
+    for previous in [true, false, false, true] {
         let proxy = RecoveryObjectProxy::start(&endpoint).await;
         let archive = ArchiveStore::from_config(&config(&proxy).await)
             .await
@@ -241,12 +241,18 @@ async fn real_s3_small_spill_compares_previous_multipart_at_same_distribution_an
                         let owner =
                             CarrierObjectOwner::new(carrier.staging, locator.clone(), &bytes)
                                 .unwrap();
+                        carrier
+                            .owned_objects
+                            .lock()
+                            .unwrap()
+                            .push((owner.clone(), false));
                         archive.begin_carrier_object(&owner).await.unwrap();
                         let mut writer = archive.start_writer(&locator).await.unwrap();
                         writer.retain_workspace(workspace);
                         writer.write(bytes.clone()).await.unwrap();
                         let staged = writer.finish_staged().await.unwrap();
                         hold_us = began.elapsed().as_micros() as u64;
+                        carrier.owned_objects.lock().unwrap()[0].1 = true;
                         assert_eq!(staged.size_bytes, size as u64);
                         assert_eq!(staged.blake3_digest, carrier.digest());
                         assert_eq!(
@@ -257,7 +263,6 @@ async fn real_s3_small_spill_compares_previous_multipart_at_same_distribution_an
                             bytes
                         );
                         drop(bytes);
-                        drop(carrier);
                     } else {
                         assert!(carrier.offload_one().await.unwrap());
                         hold_us = began.elapsed().as_micros() as u64;
@@ -269,7 +274,12 @@ async fn real_s3_small_spill_compares_previous_multipart_at_same_distribution_an
                             archive.get_bounded(&locator, size).await.unwrap(),
                             Bytes::from(vec![b'x'; size])
                         );
-                        drop(carrier);
+                    }
+                    let objects = std::mem::take(&mut *carrier.owned_objects.lock().unwrap());
+                    drop(carrier);
+                    for (owner, settled) in objects {
+                        assert!(settled);
+                        archive.release_carrier_object(&owner).await.unwrap();
                     }
                     assert_eq!(memory.snapshot().0, 0);
                     hold_us
