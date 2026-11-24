@@ -454,7 +454,7 @@ async fn unavailable_snapshot_reasons_preserve_fail_closed_materialization() {
 async fn stale_snapshot_refresh_is_request_bounded_and_does_not_restore_revoked_candidates() {
     let fixture = codex_route_fixture("snapshot-one-refresh").await;
     let standby =
-        add_codex_standby_route(&fixture, "snapshot-refresh-standby", "account-456").await;
+        add_codex_standby_route(&fixture, "codex-route-snapshot-one-refresh", "account-456").await;
     let key = fixture
         .state
         .db
@@ -480,13 +480,13 @@ async fn stale_snapshot_refresh_is_request_bounded_and_does_not_restore_revoked_
         .await
         .unwrap();
     assert_eq!(candidates.len(), 2);
-    for candidate in &mut candidates {
-        if candidate.account_id == fixture.upstream_account_id {
-            candidate.transport_revision -= 1;
-            candidate.credential_generation -= 1;
-        }
-    }
     let pool = sqlx::AnyPool::connect(&fixture.database_url).await.unwrap();
+    let mut rotation = pool.begin().await.unwrap();
+    sqlx::query("INSERT INTO upstream_credentials (id,upstream_account_id,generation,credential_ciphertext,expires_at,created_at) SELECT $2,upstream_account_id,generation + 1,credential_ciphertext,expires_at,created_at FROM upstream_credentials WHERE upstream_account_id = $1 AND generation = (SELECT credential_generation FROM upstream_accounts WHERE id = $1)")
+        .bind(fixture.upstream_account_id.to_string()).execute(&mut *rotation).await.unwrap();
+    sqlx::query("UPDATE upstream_accounts SET credential_generation = credential_generation + 1, updated_at = updated_at + 1 WHERE id = $1")
+        .bind(fixture.upstream_account_id.to_string()).execute(&mut *rotation).await.unwrap();
+    rotation.commit().await.unwrap();
     sqlx::query("UPDATE upstream_credentials SET revoked_at = $1 WHERE upstream_account_id = $2")
         .bind(crate::db::unix_millis())
         .bind(standby.to_string())
