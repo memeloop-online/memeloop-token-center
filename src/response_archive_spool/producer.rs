@@ -614,6 +614,9 @@ async fn fence_failed_capture(
     super::fence_probe::observe(state).await;
     let result = target.publish_failure(&state.archive, identity).await;
     if let Err(error) = &result {
+        // Keep only the failure fact when object storage cannot acknowledge it.
+        // The existing background owner retries it; incomplete bytes never seal.
+        crate::api::proxy::persistence::record_capture_failure_target(state, identity, target);
         tracing::warn!(
             request_id = %identity.request_id,
             stage = "response_spool_failed_ack_fence",
