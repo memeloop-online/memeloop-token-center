@@ -32,6 +32,7 @@ assert any(c.get('delta',{}).get('content') for frame in parsed[:finish[0]] for 
 marker=hashlib.sha256(('synthetic image e2e '+NONCE).encode()).hexdigest()
 with open('/tmp/mtc-image-e2e-mock.jsonl') as evidence: observed=[json.loads(line) for line in evidence]
 assert sum(row['marker_sha256']==marker for row in observed)==1
+open('/tmp/session-e2e-request-id','w').write(rid)
 print(json.dumps({'request_id':rid,'stream_status':200,'stream_bytes':len(body),'stream_sha256':hashlib.sha256(body).hexdigest(),'terminal':True}))
 for i in range(90):
  try:
