@@ -76,6 +76,26 @@ async fn exact_contract(db: &Database) {
         .await
         .unwrap();
     let ledger_before:i64=sqlx::query_scalar("SELECT SUM(amount_micros) FROM ledger_entries WHERE account_id=$1 AND key_id=$2 AND source=$3 AND kind='usage'").bind(key.account_id.to_string()).bind(key.key_id.to_string()).bind(reservation.id.to_string()).fetch_one(&db.pool).await.unwrap();
+    if db.backend == DatabaseBackend::PostgreSql {
+        let mut blocker = db.begin_write_transaction().await.unwrap();
+        sqlx::query(
+            "SELECT request_id FROM terminal_projection_outbox WHERE request_id=$1 FOR UPDATE",
+        )
+        .bind(id.to_string())
+        .fetch_one(&mut *blocker)
+        .await
+        .unwrap();
+        let skipped = tokio::time::timeout(
+            Duration::from_secs(3),
+            db.recover_one_terminal_projection(identity, true),
+        )
+        .await
+        .expect("exact claim must skip locked row")
+        .unwrap();
+        assert_eq!(skipped.state, "not_claimed");
+        assert!(!skipped.applied);
+        blocker.rollback().await.unwrap();
+    }
     let first = db
         .recover_one_terminal_projection(identity, true)
         .await
@@ -90,12 +110,35 @@ async fn exact_contract(db: &Database) {
             .fetch_one(&db.pool)
             .await
             .unwrap();
+    let account_total: i64 = sqlx::query_scalar(
+        "SELECT settled_lifetime_micros FROM account_usage_state WHERE account_id=$1",
+    )
+    .bind(key.account_id.to_string())
+    .fetch_one(&db.pool)
+    .await
+    .unwrap();
     let second = db
         .recover_one_terminal_projection(identity, true)
         .await
         .unwrap();
     assert!(!second.applied && !second.replay_applied);
     assert_eq!(second.state, "already_done");
+    let replay_total: i64 = sqlx::query_scalar(
+        "SELECT settled_lifetime_micros FROM account_usage_state WHERE account_id=$1",
+    )
+    .bind(key.account_id.to_string())
+    .fetch_one(&db.pool)
+    .await
+    .unwrap();
+    assert_eq!(account_total, replay_total);
+    let reservation_state =
+        sqlx::query("SELECT status,actual_micros FROM usage_reservations WHERE id=$1")
+            .bind(reservation.id.to_string())
+            .fetch_one(&db.pool)
+            .await
+            .unwrap();
+    assert_eq!(reservation_state.get::<String, _>("status"), "settled");
+    assert_eq!(reservation_state.get::<i64, _>("actual_micros"), 10);
     let row=sqlx::query("SELECT (SELECT COUNT(*) FROM ledger_entries WHERE account_id=$1 AND key_id=$2 AND source=$3 AND kind='usage') AS ledger_count,(SELECT SUM(amount_micros) FROM ledger_entries WHERE account_id=$1 AND key_id=$2 AND source=$3 AND kind='usage') AS ledger_amount,(SELECT COUNT(*) FROM request_stats_facts WHERE request_id=$4) AS facts,(SELECT attempts FROM terminal_projection_outbox WHERE request_id=$5) AS neighbor_attempts,(SELECT requests FROM request_daily_aggregates WHERE key_id=$2) AS requests")
         .bind(key.account_id.to_string()).bind(key.key_id.to_string()).bind(reservation.id.to_string()).bind(id.to_string()).bind(neighbor.to_string()).fetch_one(&db.pool).await.unwrap();
     assert_eq!(row.get::<i64, _>("ledger_count"), 1);
