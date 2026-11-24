@@ -32,20 +32,8 @@ pub(crate) async fn encode(
         }
         Err(overflow) => overflow,
     };
-    let upload_memory = upload
-        .stream_memory
-        .temporary_wait(
-            crate::archive::ARCHIVE_MULTIPART_PART_BYTES + 5 * 64 * 1024,
-            super::memory::CAPTURE_MEMORY_WEIGHT,
-        )
-        .await
-        .ok_or_else(|| AppError::internal("normalized_upload_envelope"))?;
-    let scope = Arc::new(ScratchScope::new(archive, database, staging)?);
-    let (archive, selected) = scope.begin_body_write().await?;
-    let writer = archive
-        .start_writer(&format!("{}/normalized.json", selected.canonical_prefix()))
-        .await?;
-    let runtime = tokio::runtime::Handle::current();
+    // Borrow only already-owned JSON workspace before waiting for upload.
+    // Holding an upload envelope must never lead to another source acquisition.
     let mut size = 64 * 1024;
     let workspace = loop {
         if let Some(guard) = previous.borrow_route_workspace(size) {
@@ -56,11 +44,18 @@ pub(crate) async fn encode(
         }
         size = (size / 2).max(1);
     };
+    let upload_memory = upload.multipart_workspace().await?;
+    let scope = Arc::new(ScratchScope::new(archive, database, staging)?);
+    let (archive, selected) = scope.begin_body_write().await?;
+    let mut writer = archive
+        .start_writer(&format!("{}/normalized.json", selected.canonical_prefix()))
+        .await?;
+    writer.retain_workspace(upload_memory);
+    let runtime = tokio::runtime::Handle::current();
     let (cancel_on_drop, cancelled) = tokio::sync::oneshot::channel::<()>();
     let writer_scope = scope.clone();
     let staged = tokio::task::spawn_blocking(move || {
         let _scope = writer_scope;
-        let _upload_memory = upload_memory;
         struct Writer {
             runtime: tokio::runtime::Handle,
             writer: crate::archive::ArchiveWriter,
@@ -134,11 +129,11 @@ mod cancellation_contracts {
             let upload = Arc::new(crate::api::proxy::persistence::Persistence::default());
             let bytes = crate::archive::ARCHIVE_MULTIPART_PART_BYTES + 5 * 64 * 1024;
             let envelope = upload
-                .stream_memory
+                .upload_workspace
                 .temporary_wait(bytes, super::super::memory::CAPTURE_MEMORY_WEIGHT)
                 .await
                 .unwrap();
-            assert!(upload.stream_memory.snapshot().0 >= bytes);
+            assert!(upload.upload_workspace.snapshot().0 >= bytes);
             let (cancel, mut cancelled) = tokio::sync::oneshot::channel();
             let (entered, started) = tokio::sync::oneshot::channel();
             let runtime = tokio::runtime::Handle::current();
@@ -157,7 +152,7 @@ mod cancellation_contracts {
                 "pending {phase} must exit after caller cancellation"
             );
             assert_eq!(
-                upload.stream_memory.snapshot().0,
+                upload.upload_workspace.snapshot().0,
                 0,
                 "{phase} must return the full multipart envelope"
             );

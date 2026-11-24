@@ -1,4 +1,5 @@
 use super::super::*;
+use super::terminal_timings::{ProjectionStage, TerminalProjectionTimings};
 
 pub(super) async fn enqueue_unknown_terminal_projection_in_transaction(
     transaction: &mut Transaction<'_, Any>,
@@ -139,14 +140,29 @@ impl Database {
         lease_owner: Uuid,
         request_id: Uuid,
     ) -> Result<bool, AppError> {
+        self.project_claimed_terminal_projection_with_timings(lease_owner, request_id)
+            .await
+            .0
+    }
+
+    pub(crate) async fn project_claimed_terminal_projection_with_timings(
+        &self,
+        lease_owner: Uuid,
+        request_id: Uuid,
+    ) -> (Result<bool, AppError>, TerminalProjectionTimings) {
+        let mut timings = TerminalProjectionTimings::new();
+        let result: Result<bool, AppError> = async {
         if !self
             .project_terminal_account_receipt(lease_owner, request_id)
             .await?
         {
             return Ok(false);
         }
+        timings.enter(ProjectionStage::TxBegin);
         let mut transaction = self.begin_write_transaction().await?;
+        timings.enter(ProjectionStage::StatsGate);
         lock_request_stats_projection_writer_in_transaction(&mut transaction).await?;
+        timings.enter(ProjectionStage::OutboxClaim);
         let now = unix_millis();
         let request_id = request_id.to_string();
         let owner = lease_owner.to_string();
@@ -159,31 +175,38 @@ impl Database {
         .fetch_optional(&mut *transaction)
         .await?;
         let Some(task) = claimed else {
+            timings.enter(ProjectionStage::Commit);
             transaction.commit().await?;
             return Ok(false);
         };
+        timings.enter(ProjectionStage::FactProjection);
         let created_at: i64 = task.try_get("created_at")?;
         let pruned = statistics_pruned_in_transaction(&mut transaction, created_at).await?;
-        sqlx::query(
-            "UPDATE request_stats_facts SET cost_micros = cost_micros WHERE request_id = $1",
-        )
+        // Lock the existing contribution once without issuing a no-op UPDATE
+        // (which would also run history capture triggers). Preserve the exact
+        // unknown-placeholder replacement predicate while checking existence.
+        let fact_lock = match self.backend {
+            DatabaseBackend::PostgreSql => " FOR UPDATE OF f",
+            DatabaseBackend::Sqlite => "",
+        };
+        let existing_fact = sqlx::query(sqlx::AssertSqlSafe(format!(
+            "SELECT CAST(CASE WHEN f.input_tokens = 0 AND f.output_tokens = 0 AND f.cached_input_tokens = 0 AND f.cache_write_tokens = 0 AND f.cost_micros = 0 AND EXISTS (SELECT 1 FROM pending_proxy_settlements p WHERE p.request_id = f.request_id AND p.tenant_id = f.tenant_id AND p.key_id = f.key_id AND p.unknown_reason IS NOT NULL) THEN 1 ELSE 0 END AS BIGINT) AS replaceable FROM request_stats_facts f WHERE f.request_id = $1{fact_lock}"
+        )))
         .bind(&request_id)
-        .execute(&mut *transaction)
+        .fetch_optional(&mut *transaction)
         .await?;
-        let previous = sqlx::query("SELECT f.tenant_id, f.key_id, f.currency, f.session_id FROM request_stats_facts f JOIN pending_proxy_settlements p ON p.request_id = f.request_id AND p.tenant_id = f.tenant_id AND p.key_id = f.key_id WHERE f.request_id = $1 AND p.unknown_reason IS NOT NULL AND f.input_tokens = 0 AND f.output_tokens = 0 AND f.cached_input_tokens = 0 AND f.cache_write_tokens = 0 AND f.cost_micros = 0")
-            .bind(&request_id).fetch_optional(&mut *transaction).await?;
-        let fact_exists: i64 =
-            sqlx::query_scalar("SELECT COUNT(*) FROM request_stats_facts WHERE request_id = $1")
-                .bind(&request_id)
-                .fetch_one(&mut *transaction)
-                .await?;
-        if fact_exists != i64::from(previous.is_some()) {
+        let replacing_unknown = existing_fact
+            .as_ref()
+            .map(|row| row.try_get::<i64, _>("replaceable"))
+            .transpose()?
+            == Some(1);
+        if existing_fact.is_some() && !replacing_unknown {
             return Err(AppError::Conflict(
                 "unacknowledged terminal projection already has a fact".into(),
             ));
         }
         if !pruned {
-            if previous.is_some() {
+            if replacing_unknown {
                 super::metered_projection::project_metered_request_fact_in_transaction(
                     &mut transaction,
                     &request_id,
@@ -214,6 +237,7 @@ impl Database {
             )
             .await?;
         }
+        timings.enter(ProjectionStage::AckUpdate);
         let tenant_id: String = task.try_get("tenant_id")?;
         let key_id: String = task.try_get("key_id")?;
         // The claimed outbox row and its acknowledgement are the financial
@@ -232,11 +256,13 @@ impl Database {
                 "terminal projection owner changed".into(),
             ));
         }
+        timings.enter(ProjectionStage::NativeCapture);
         super::super::history_immutable_outbox::capture_native_in_transaction(
             &mut transaction,
             &request_id,
         )
         .await?;
+        timings.enter(ProjectionStage::EventPrepare);
         let draft_cursor = crate::db::RequestEventCursor {
             event_id: Uuid::nil().to_string(),
             event_at: task.try_get("completed_at")?,
@@ -257,14 +283,19 @@ impl Database {
             ),
             None => None,
         };
+        timings.enter(ProjectionStage::EventPublish);
         crate::db::history_immutable_outbox::PreparedEventCapture::publish(
             &mut transaction,
             prepared,
             task.try_get("completed_at")?,
         )
         .await?;
+        timings.enter(ProjectionStage::Commit);
         transaction.commit().await?;
         Ok(true)
+        }.await;
+        timings.finish(result.is_err());
+        (result, timings)
     }
 
     async fn project_terminal_account_receipt(

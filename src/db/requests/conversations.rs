@@ -618,6 +618,16 @@ impl Database {
         lease_owner: Uuid,
         limit: i64,
     ) -> Result<Vec<ConversationProjectionTask>, AppError> {
+        self.claim_conversation_projection_tasks_from_turn(lease_owner, limit, 0)
+            .await
+    }
+
+    pub(crate) async fn claim_conversation_projection_tasks_from_turn(
+        &self,
+        lease_owner: Uuid,
+        limit: i64,
+        turn: usize,
+    ) -> Result<Vec<ConversationProjectionTask>, AppError> {
         let now = unix_millis();
         let expires_at = now.saturating_add(CONVERSATION_PROJECTION_LEASE_MILLIS);
         let limit = limit;
@@ -631,21 +641,29 @@ impl Database {
         // others. Both primary and terminal-snapshot claims share these budgets.
         // Retry order uses the previous deadline so one old failing row cannot
         // repeatedly jump ahead of other eligible work.
-        let rebuild_budget = limit / 4;
-        let retry_budget = limit / 4;
-        let fresh_budget = limit - rebuild_budget - retry_budget;
         let primary = "(lease_owner = 'session-body-rebuild' OR lease_expires_at IS NULL OR lease_expires_at <= $3)";
         let ordinary = "COALESCE(statistics_outcome, '') <> 'session_body' AND COALESCE(lease_owner, '') <> 'session-body-rebuild'";
-        let lanes = [
-            (format!("{ordinary} AND attempts = 0"), fresh_budget),
-            (format!("{ordinary} AND attempts > 0"), retry_budget),
-            (
-                "(statistics_outcome = 'session_body' OR lease_owner = 'session-body-rebuild')"
-                    .to_owned(),
-                rebuild_budget,
-            ),
-            ("1 = 1".to_owned(), limit),
+        let predicates = [
+            format!("{ordinary} AND attempts = 0"),
+            format!("{ordinary} AND attempts > 0"),
+            "(statistics_outcome = 'session_body' OR lease_owner = 'session-body-rebuild')"
+                .to_owned(),
         ];
+        let schedule = [0usize, 0, 1, 2];
+        let mut budgets = [0i64; 3];
+        let mut order = Vec::new();
+        for offset in 0..limit.max(0) as usize {
+            let lane = schedule[(turn.wrapping_add(offset)) % schedule.len()];
+            budgets[lane] += 1;
+            if !order.contains(&lane) {
+                order.push(lane);
+            }
+        }
+        let mut lanes: Vec<(String, i64)> = order
+            .into_iter()
+            .map(|lane| (predicates[lane].clone(), budgets[lane]))
+            .collect();
+        lanes.push(("1 = 1".to_owned(), limit));
         let mut rows = Vec::new();
         for (lane, lane_budget) in lanes {
             let budget = lane_budget.min(limit - rows.len() as i64);

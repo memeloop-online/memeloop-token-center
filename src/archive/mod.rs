@@ -1,3 +1,5 @@
+#[cfg(test)]
+pub(crate) mod multipart_test_gate;
 use std::{sync::Arc, time::Duration};
 
 use object_store::ObjectStore;
@@ -37,8 +39,8 @@ mod quota_reset_receipts;
 mod raw_cache;
 mod raw_capture;
 mod raw_gc;
-pub use raw_gc::{RawGcCandidate, RawGcCandidateBatch};
 pub(crate) use raw_capture::RawPublicationSettlement;
+pub use raw_gc::{RawGcCandidate, RawGcCandidateBatch};
 #[cfg(test)]
 mod raw_capture_tests;
 mod readiness;

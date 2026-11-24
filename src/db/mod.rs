@@ -960,3 +960,5 @@ mod tests;
 
 mod raw_gc;
 mod semantic_archive_binding;
+
+pub(crate) use requests::terminal_timings::{TerminalProjectionBatchTimings, STAGE_NAMES as TERMINAL_PROJECTION_STAGE_NAMES};

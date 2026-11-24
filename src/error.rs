@@ -266,6 +266,13 @@ impl AppError {
         Self::storage_with(code, ErrorFacts::new())
     }
 
+    pub(crate) fn storage_phase(mut self, phase: &'static str) -> Self {
+        if let Self::Storage { facts, .. } = &mut self {
+            facts.phase = Some(phase);
+        }
+        self
+    }
+
     pub(crate) fn storage_with(code: &'static str, facts: ErrorFacts) -> Self {
         Self::Storage { code, facts }
     }
@@ -1925,6 +1932,18 @@ mod tests {
                 .unwrap();
         assert_eq!(body["error"]["code"], "service_overloaded");
         assert!(body["error"].get("reason").is_none());
+    }
+
+    #[test]
+    fn storage_operation_phase_keeps_safe_facts_without_source_secrets() {
+        let error = AppError::from(object_store::Error::Generic {
+            store: "SECRET_URL",
+            source: Box::new(std::io::Error::other("SECRET_TOKEN")),
+        })
+        .storage_phase("multipart_begin");
+        assert!(matches!(&error, AppError::Storage { facts, .. }
+            if facts.phase == Some("multipart_begin") && facts.kind == Some("transport_or_service")));
+        assert!(!format!("{error:?}").contains("SECRET"));
     }
 
     #[test]

@@ -10,6 +10,7 @@ const BYTES: usize = 4 * 1024 * 1024 * 1024;
 
 pub(crate) struct Persistence {
     pub(crate) stream_memory: crate::gateway_body::memory::ProxyMemoryBudget,
+    pub(crate) upload_workspace: crate::gateway_body::memory::ProxyMemoryBudget,
     jobs: Arc<tokio::sync::Semaphore>,
     bytes: Arc<tokio::sync::Semaphore>,
     accepted: AtomicU64,
@@ -32,8 +33,11 @@ impl Drop for ArchiveActivity {
 impl Default for Persistence {
     fn default() -> Self {
         Self {
-            stream_memory: crate::gateway_body::memory::ProxyMemoryBudget::new(
-                crate::response_archive_spool::RAW_STREAM_MEMORY_BYTES as u64,
+            stream_memory: crate::gateway_body::memory::ProxyMemoryBudget::new_archive_source(
+                crate::response_archive_spool::RAW_SOURCE_MEMORY_BYTES as u64,
+            ),
+            upload_workspace: crate::gateway_body::memory::ProxyMemoryBudget::new(
+                crate::response_archive_spool::RAW_UPLOAD_WORKSPACE_BYTES as u64,
             ),
             jobs: Arc::new(tokio::sync::Semaphore::new(JOBS)),
             bytes: Arc::new(tokio::sync::Semaphore::new(BYTES)),
@@ -47,6 +51,29 @@ impl Default for Persistence {
 }
 
 impl Persistence {
+    /// One multipart envelope for every archive writer. Source credit is never
+    /// borrowed here; callers retain this owner through finish or abort.
+    pub(crate) async fn multipart_workspace(
+        &self,
+    ) -> Result<Arc<crate::gateway_body::memory::ProxyMemoryReservation>, AppError> {
+        self.upload_workspace
+            .temporary_wait(
+                crate::response_archive_spool::CAPTURE_MEMORY_BYTES,
+                crate::gateway_body::memory::CAPTURE_MEMORY_WEIGHT,
+            )
+            .await
+            .ok_or_else(|| AppError::internal("archive_workspace_closed"))
+    }
+
+    pub(crate) fn try_multipart_workspace(
+        &self,
+    ) -> Result<Arc<crate::gateway_body::memory::ProxyMemoryReservation>, AppError> {
+        self.upload_workspace.temporary(
+            crate::response_archive_spool::CAPTURE_MEMORY_BYTES
+                * crate::gateway_body::memory::CAPTURE_MEMORY_WEIGHT,
+        )
+    }
+
     pub(crate) fn register_archive(self: &Arc<Self>) -> ArchiveActivity {
         self.archives.fetch_add(1, Ordering::Release);
         ArchiveActivity(self.clone())
@@ -173,6 +200,8 @@ impl Persistence {
             "# TYPE memeloop_token_center_deferred_stream_memory_bytes gauge\nmemeloop_token_center_deferred_stream_memory_bytes {}\n# TYPE memeloop_token_center_deferred_stream_memory_limit_bytes gauge\nmemeloop_token_center_deferred_stream_memory_limit_bytes {}\n",
             stream_used, stream_limit,
         ));
+        let (workspace_used, workspace_limit, _, _) = self.upload_workspace.snapshot();
+        output.push_str(&format!("# TYPE memeloop_token_center_archive_workspace_memory_bytes gauge\nmemeloop_token_center_archive_workspace_memory_bytes {}\n# TYPE memeloop_token_center_archive_workspace_memory_limit_bytes gauge\nmemeloop_token_center_archive_workspace_memory_limit_bytes {}\n", workspace_used, workspace_limit));
         output
     }
 }
@@ -193,13 +222,20 @@ pub(crate) fn record_capture_failure_target(
     let background = state.clone();
     state.persistence.archives.fetch_add(1, Ordering::Release);
     tokio::spawn(async move {
+        let mut attempt = 0_u32;
         loop {
             match target.publish_failure(&background.archive, identity).await {
                 Ok(()) => break,
                 Err(error) => {
                     tracing::warn!(request_id = %identity.request_id, error_category = error.diagnostic_category(),
                         "raw response capture admission failure awaits durable evidence");
-                    tokio::time::sleep(Duration::from_millis(250)).await;
+                    attempt = attempt.saturating_add(1);
+                    let delay = crate::archive_staging::cleanup_backoff_with_jitter(
+                        identity.request_id,
+                        attempt,
+                    )
+                    .min(30_000);
+                    tokio::time::sleep(Duration::from_millis(delay as u64)).await;
                 }
             }
         }

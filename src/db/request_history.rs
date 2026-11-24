@@ -2,6 +2,8 @@ mod activation;
 mod bootstrap;
 use super::*;
 
+pub(super) const EVENT_SOURCE_PAGE_SQL: &str = "SELECT 'event' AS source,event_id AS request_id,tenant_id,key_id,event_at AS created_at FROM request_events WHERE event_at >= $1 AND (event_at,event_id) > ($1,$2) ORDER BY event_at,event_id LIMIT $3";
+
 const PENDING_COUNT_SQL: &str = "SELECT (SELECT COUNT(*) FROM request_history_export) + (SELECT COUNT(*) FROM request_history_immutable_outbox i WHERE NOT EXISTS (SELECT 1 FROM request_history_export e WHERE e.revision=i.revision))";
 use crate::request_history::{
     HistoryError, HistoryIdentity, HistoryScope, HistorySnapshot, HistoryStatistics,
@@ -451,8 +453,12 @@ impl Database {
         after_id: Option<Uuid>,
         limit: i64,
     ) -> Result<Vec<HistoryIdentity>, HistoryError> {
-        let rows=sqlx::query("SELECT 'event' AS source, event_id AS request_id, event_at AS created_at, tenant_id, key_id FROM request_events WHERE (event_at > $1 OR (event_at = $1 AND event_id > $2)) ORDER BY event_at, event_id LIMIT $3")
-            .bind(after).bind(after_id.map(|id|id.to_string()).unwrap_or_default()).bind(limit).fetch_all(&self.pool).await?;
+        let rows = sqlx::query(EVENT_SOURCE_PAGE_SQL)
+            .bind(after)
+            .bind(after_id.map(|id| id.to_string()).unwrap_or_default())
+            .bind(limit)
+            .fetch_all(&self.pool)
+            .await?;
         rows.iter().map(history_identity).collect()
     }
 
@@ -464,6 +470,25 @@ impl Database {
     pub(super) async fn history_backfill_page_after_ready(
         &self,
         page_size: i64,
+        ready: impl std::future::Future<Output = Result<(), HistoryError>>,
+    ) -> Result<usize, HistoryError> {
+        self.history_backfill_source_page_after_ready(page_size, None, ready)
+            .await
+    }
+
+    pub async fn history_backfill_source_page(
+        &self,
+        page_size: i64,
+        source: Option<crate::request_history::HistorySource>,
+    ) -> Result<usize, HistoryError> {
+        self.history_backfill_source_page_after_ready(page_size, source, std::future::ready(Ok(())))
+            .await
+    }
+
+    async fn history_backfill_source_page_after_ready(
+        &self,
+        page_size: i64,
+        source: Option<crate::request_history::HistorySource>,
         ready: impl std::future::Future<Output = Result<(), HistoryError>>,
     ) -> Result<usize, HistoryError> {
         if page_size <= 0 || self.history_mode().await? == "off" {
@@ -497,9 +522,10 @@ impl Database {
             ""
         };
         let sql = format!(
-            "SELECT source, after_id, after_created_at, legacy_after_id FROM request_history_backfill WHERE done = 0 ORDER BY source LIMIT 1{lock}"
+            "SELECT source, after_id, after_created_at, legacy_after_id FROM request_history_backfill WHERE done = 0 AND (CAST($1 AS TEXT) IS NULL OR source=$1) ORDER BY source LIMIT 1{lock}"
         );
         let Some(checkpoint) = sqlx::query(sqlx::AssertSqlSafe(sql))
+            .bind(source.map(crate::request_history::HistorySource::as_str))
             .fetch_optional(&mut *transaction)
             .await?
         else {
@@ -515,10 +541,16 @@ impl Database {
             // Event IDs need not follow event time. A legacy UUID cursor gets
             // one complete time-ordered pass; existing durable receipts below
             // preserve revisions already captured or delivered.
-            sqlx::query("SELECT 'event' AS source,event_id AS request_id,tenant_id,key_id,event_at AS created_at FROM request_events WHERE event_at >= $1 AND (event_at,event_id) > ($1,$2) ORDER BY event_at,event_id LIMIT $3")
+            sqlx::query(EVENT_SOURCE_PAGE_SQL)
                 .bind(event_after.unwrap_or(i64::MIN))
-                .bind(if event_after.is_some() { after.as_str() } else { "" })
-                .bind(page_size).fetch_all(&mut *transaction).await?
+                .bind(if event_after.is_some() {
+                    after.as_str()
+                } else {
+                    ""
+                })
+                .bind(page_size)
+                .fetch_all(&mut *transaction)
+                .await?
         } else {
             let sql = format!(
                 "SELECT {COLUMNS} FROM request_history_source_ids WHERE source = $1 AND request_id > $2 ORDER BY request_id LIMIT $3"
@@ -582,8 +614,19 @@ impl Database {
         page_size: i64,
         ceiling: Option<i64>,
     ) -> Result<Vec<HistorySnapshot>, HistoryError> {
+        let started = std::time::Instant::now();
         self.history_capture_pending(page_size).await?;
+        let capture_ms = started.elapsed().as_millis() as u64;
+        let phase = std::time::Instant::now();
         let immutable = self.history_immutable_pending(page_size, ceiling).await?;
+        if !immutable.is_empty() {
+            tracing::info!(
+                rows = immutable.len(),
+                capture_ms,
+                materialize_ms = phase.elapsed().as_millis() as u64,
+                "request history capture materialization timings"
+            );
+        }
         if !immutable.is_empty() {
             return Ok(immutable);
         }
@@ -613,6 +656,13 @@ impl Database {
         &self,
         snapshots: &[HistorySnapshot],
     ) -> Result<(), HistoryError> {
+        self.history_acknowledge_count(snapshots).await.map(|_| ())
+    }
+
+    pub(crate) async fn history_acknowledge_count(
+        &self,
+        snapshots: &[HistorySnapshot],
+    ) -> Result<usize, HistoryError> {
         let mut transaction = self.pool.begin().await?;
         let mut acknowledged = Vec::new();
         const ACK: &str = "DELETE FROM request_history_export WHERE revision = $1 AND source = $2 AND request_id = $3 AND snapshot = $4";
@@ -678,7 +728,7 @@ impl Database {
         self.allocation_history_acknowledged(&mut transaction, &acknowledged)
             .await?;
         transaction.commit().await?;
-        Ok(())
+        Ok(acknowledged.len())
     }
 
     pub async fn history_pending_count(&self) -> Result<i64, HistoryError> {
