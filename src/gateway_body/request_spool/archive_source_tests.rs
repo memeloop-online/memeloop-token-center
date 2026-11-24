@@ -111,8 +111,18 @@ async fn late_request_capture_retires_source_metadata_without_rebinding_after_co
             .unwrap(),
     );
     let locator = source.object_locator().unwrap().to_owned();
+    let key_id = uuid::Uuid::now_v7();
+    sqlx::query(
+        "INSERT INTO request_record_locators (id,tenant_id,key_id,created_at) VALUES ($1,$2,$3,1)",
+    )
+    .bind(identity.request_id.to_string())
+    .bind(identity.tenant_id.to_string())
+    .bind(key_id.to_string())
+    .execute(&pool)
+    .await
+    .unwrap();
     sqlx::query("INSERT INTO request_records (id,tenant_id,key_id,created_at,protocol,model,input_tokens,output_tokens,cost_micros,request_object,reservation_id) VALUES ($1,$2,$3,1,'openai','test',0,0,0,$4,$5)")
-        .bind(identity.request_id.to_string()).bind(identity.tenant_id.to_string()).bind(uuid::Uuid::now_v7().to_string()).bind(&locator).bind(identity.reservation_id.to_string()).execute(&pool).await.unwrap();
+        .bind(identity.request_id.to_string()).bind(identity.tenant_id.to_string()).bind(key_id.to_string()).bind(&locator).bind(identity.reservation_id.to_string()).execute(&pool).await.unwrap();
     source.retain_for_archive(database.clone(), identity);
     let mut mismatched = original.clone();
     mismatched.size_bytes += 1;
