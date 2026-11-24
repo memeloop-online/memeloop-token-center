@@ -1,6 +1,7 @@
 //! Maintenance-only consistent source reader. Never used by request completion.
 use super::*;
 use crate::request_history::{HistoryError, HistoryIdentity};
+mod parity;
 
 pub(crate) struct HistorySourceSnapshot {
     pub(crate) receipt: Value,
@@ -13,6 +14,9 @@ pub(crate) struct HistorySourceSnapshot {
     epoch: i64,
     ordinal: i64,
     activation_epoch: i64,
+    manifest: sha2::Sha256,
+    parity: parity::BaselineParity,
+    parity_verified: bool,
 }
 
 #[derive(Clone)]
@@ -97,7 +101,7 @@ impl Database {
         )
         .fetch_one(&mut *barrier)
         .await?;
-        if mode == "off" {
+        if mode != "shadow" {
             return Err(HistoryError::Changed);
         }
         let active: Option<String> = sqlx::query_scalar(
@@ -108,6 +112,7 @@ impl Database {
         if active.is_some() {
             return Err(HistoryError::Changed);
         }
+        sqlx::query("UPDATE request_history_state SET verified_revision=NULL,verification_json=NULL WHERE id=1").execute(&mut *barrier).await?;
         let ceiling:i64=sqlx::query_scalar("SELECT CASE WHEN is_called THEN last_value ELSE 0 END FROM request_history_export_revision_seq")
             .fetch_one(&mut *barrier).await?;
         // The optimistic preflight can race a new activation. Revalidate under
@@ -127,8 +132,9 @@ impl Database {
         let epoch:i64=sqlx::query_scalar("UPDATE request_history_delivery_control SET epoch=epoch+1,owner=$1,ceiling=$2 WHERE id=1 RETURNING epoch")
             .bind(owner.to_string()).bind(ceiling).fetch_one(&mut *barrier).await?;
         let now = chrono::Utc::now().timestamp_millis();
-        sqlx::query("INSERT INTO request_history_baseline_runs (owner,epoch,ceiling,source_snapshot,status,created_at,updated_at) VALUES ($1,$2,$3,$4,'active',$5,$5)")
+        sqlx::query("INSERT INTO request_history_baseline_runs (owner,epoch,ceiling,source_snapshot,status,created_at,updated_at,read_model_version,activation_epoch) VALUES ($1,$2,$3,$4,'active',$5,$5,$6,$7)")
             .bind(owner.to_string()).bind(epoch).bind(ceiling).bind(&snapshot).bind(now)
+            .bind(crate::request_history::READ_MODEL_VERSION).bind(activation_epoch)
             .execute(&mut *barrier).await?;
         barrier.commit().await?;
         Ok(HistorySourceSnapshot {
@@ -142,6 +148,9 @@ impl Database {
             epoch,
             ordinal: 0,
             activation_epoch,
+            manifest: sha2::Digest::new(),
+            parity: parity::BaselineParity::default(),
+            parity_verified: false,
         })
     }
 }
@@ -346,6 +355,22 @@ impl HistorySourceSnapshot {
         Ok(expected.len())
     }
 
+    pub(crate) async fn verify_surface_parity(
+        &mut self,
+        database: &Database,
+        reader: &crate::request_history::ClickHouse,
+    ) -> Result<(), HistoryError> {
+        if self.source != 4 || self.pending.is_some() {
+            return Err(HistoryError::Changed);
+        }
+        self.parity_verified = false;
+        std::mem::take(&mut self.parity)
+            .verify(database, &mut self.transaction, reader)
+            .await?;
+        self.parity_verified = true;
+        Ok(())
+    }
+
     /// End the source MVCC lifetime once every bounded page has a durable
     /// readback receipt. Delivery stays fenced for the separate delta/final
     /// validation phase; this receipt never authorizes cutover or source GC.
@@ -360,8 +385,13 @@ impl HistorySourceSnapshot {
         if fence != Some(self.epoch) {
             return Err(HistoryError::Changed);
         }
-        let updated = sqlx::query("UPDATE request_history_baseline_runs SET status='source_complete',updated_at=$3 WHERE owner=$1 AND epoch=$2 AND status='active'")
+        let manifest_hash = format!("{:x}", sha2::Digest::finalize(self.manifest));
+        let parity = self.parity_verified.then(|| serde_json::json!({"read_model_version":crate::request_history::READ_MODEL_VERSION,"activation_epoch":self.activation_epoch,"baseline_owner":self.owner,"baseline_epoch":self.epoch,"ceiling":self.receipt["ceiling"],"manifest_hash":manifest_hash,"surface_parity":true,"query_version":1}).to_string());
+        let updated = sqlx::query("UPDATE request_history_baseline_runs SET status='source_complete',updated_at=$3,chunk_count=$4,manifest_hash=$5,sources_complete=$6,parity_json=$9 WHERE owner=$1 AND epoch=$2 AND status='active' AND read_model_version=$7 AND activation_epoch=$8")
             .bind(self.owner.to_string()).bind(self.epoch).bind(chrono::Utc::now().timestamp_millis())
+            .bind(self.ordinal).bind(&manifest_hash)
+            .bind(r#"["native","generation","archive","event"]"#)
+            .bind(crate::request_history::READ_MODEL_VERSION).bind(self.activation_epoch).bind(parity)
             .execute(&mut *transaction).await?;
         if updated.rows_affected() != 1 {
             return Err(HistoryError::Changed);
@@ -428,6 +458,18 @@ impl HistorySourceSnapshot {
             return Err(HistoryError::Mismatch);
         }
         transaction.commit().await?;
+        sha2::Digest::update(
+            &mut self.manifest,
+            canonical_hash(&(
+                self.ordinal,
+                &page.rows[0].0.source,
+                baseline_range_cursor(&self.after, self.after_created_at),
+                baseline_range_cursor(&page.after, page.after_created_at),
+                page.rows.len(),
+                &source_hash,
+            ))?,
+        );
+        self.parity.accumulate(expected)?;
         self.source = page.source;
         self.after.clone_from(&page.after);
         self.after_created_at = page.after_created_at;
@@ -688,6 +730,10 @@ mod tests {
             .unwrap()
             != 0
         {}
+        snapshot
+            .verify_surface_parity(&database, &client)
+            .await
+            .unwrap();
         let receipt = snapshot.finish(&database).await.unwrap();
         assert!(database.history_activation_baseline_proved().await.unwrap());
         assert_eq!(receipt["status"], "source_complete");

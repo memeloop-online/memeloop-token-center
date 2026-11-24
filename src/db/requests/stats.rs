@@ -615,6 +615,19 @@ impl Database {
         tenant_external_id: Option<&str>,
         filter: &StatsFilter,
     ) -> Result<OperatorStats, AppError> {
+        self.source_history_stats_with_executor(tenant_external_id, filter, &self.pool)
+            .await
+    }
+
+    pub(crate) async fn source_history_stats_with_executor<'e, E>(
+        &self,
+        tenant_external_id: Option<&str>,
+        filter: &StatsFilter,
+        executor: E,
+    ) -> Result<OperatorStats, AppError>
+    where
+        E: sqlx::Executor<'e, Database = sqlx::Any>,
+    {
         validate_stats_filter(filter)?;
         let tenant_external_id = tenant_external_id.unwrap_or_default();
         let key_id = filter.key_id.map(|id| id.to_string()).unwrap_or_default();
@@ -844,7 +857,7 @@ SELECT bucket_kind, name, day_bucket, requests, successful_requests,
         // exclusively from the module constants above. All request filters remain binds;
         // no caller-provided text is interpolated into this generated statement.
         let rows = bind_activity_filter!(sqlx::query(sqlx::AssertSqlSafe(stats_sql)))
-            .fetch_all(&self.pool)
+            .fetch_all(executor)
             .await?;
         let mut projections: BTreeMap<(String, String, i64), StatsProjectionAccumulator> =
             BTreeMap::new();

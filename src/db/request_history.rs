@@ -773,6 +773,9 @@ impl Database {
     }
 
     pub async fn history_switch(&self, clickhouse: bool) -> Result<(), HistoryError> {
+        if clickhouse && matches!(self.backend, DatabaseBackend::PostgreSql) {
+            return self.history_switch_watermark().await;
+        }
         if clickhouse && !self.history_activation_baseline_proved().await? {
             return Err(HistoryError::Changed);
         }

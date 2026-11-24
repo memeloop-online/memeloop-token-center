@@ -199,6 +199,7 @@ pub async fn command(config: &Config, command: HistoryCommand) -> Result<Value, 
                     .await?
                     != 0
                 {}
+                source.verify_surface_parity(&database, &reader).await?;
                 source.finish(&database).await
             })
             .await
@@ -562,6 +563,9 @@ mod export_diagnostic_tests {
 }
 
 pub async fn verify(database: &Database, client: &ClickHouse) -> Result<Value, HistoryError> {
+    if database.history_uses_watermark_proof() {
+        return database.history_verify_watermark().await;
+    }
     if !database.history_activation_baseline_proved().await?
         || !database.history_backfill_done().await?
         || database.history_pending_count().await? != 0
@@ -790,9 +794,9 @@ pub async fn verify(database: &Database, client: &ClickHouse) -> Result<Value, H
     Ok(report)
 }
 
-type DailyKey = (i64, String, Option<String>, Option<String>);
+pub(crate) type DailyKey = (i64, String, Option<String>, Option<String>);
 
-fn daily_key(bucket: &DailyBucket) -> DailyKey {
+pub(crate) fn daily_key(bucket: &DailyBucket) -> DailyKey {
     (
         bucket.day_bucket,
         bucket.outcome.clone(),
@@ -801,7 +805,7 @@ fn daily_key(bucket: &DailyBucket) -> DailyKey {
     )
 }
 
-fn add_daily(
+pub(crate) fn add_daily(
     buckets: &mut BTreeMap<DailyKey, DailyBucket>,
     row: &Value,
 ) -> Result<(), HistoryError> {

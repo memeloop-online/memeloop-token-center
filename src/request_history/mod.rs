@@ -10,6 +10,7 @@ mod query;
 mod session_tasks;
 mod sessions;
 mod statistics;
+pub(crate) use statistics::StatisticsAccumulator;
 mod usage;
 
 pub use clickhouse::ClickHouse;
