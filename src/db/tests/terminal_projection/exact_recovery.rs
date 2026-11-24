@@ -75,7 +75,7 @@ async fn exact_contract(db: &Database) {
         .execute(&db.pool)
         .await
         .unwrap();
-    let ledger_before:i64=sqlx::query_scalar("SELECT SUM(amount_micros) FROM ledger_entries WHERE account_id=$1 AND key_id=$2 AND source=$3 AND kind='usage'").bind(key.account_id.to_string()).bind(key.key_id.to_string()).bind(reservation.id.to_string()).fetch_one(&db.pool).await.unwrap();
+    let ledger_before:i64=sqlx::query_scalar("SELECT CAST(SUM(amount_micros) AS BIGINT) FROM ledger_entries WHERE account_id=$1 AND key_id=$2 AND source=$3 AND kind='usage'").bind(key.account_id.to_string()).bind(key.key_id.to_string()).bind(reservation.id.to_string()).fetch_one(&db.pool).await.unwrap();
     if db.backend == DatabaseBackend::PostgreSql {
         let mut blocker = db.begin_write_transaction().await.unwrap();
         sqlx::query(
@@ -139,7 +139,7 @@ async fn exact_contract(db: &Database) {
             .unwrap();
     assert_eq!(reservation_state.get::<String, _>("status"), "settled");
     assert_eq!(reservation_state.get::<i64, _>("actual_micros"), 10);
-    let row=sqlx::query("SELECT (SELECT COUNT(*) FROM ledger_entries WHERE account_id=$1 AND key_id=$2 AND source=$3 AND kind='usage') AS ledger_count,(SELECT SUM(amount_micros) FROM ledger_entries WHERE account_id=$1 AND key_id=$2 AND source=$3 AND kind='usage') AS ledger_amount,(SELECT COUNT(*) FROM request_stats_facts WHERE request_id=$4) AS facts,(SELECT attempts FROM terminal_projection_outbox WHERE request_id=$5) AS neighbor_attempts,(SELECT requests FROM request_daily_aggregates WHERE key_id=$2) AS requests")
+    let row=sqlx::query("SELECT (SELECT COUNT(*) FROM ledger_entries WHERE account_id=$1 AND key_id=$2 AND source=$3 AND kind='usage') AS ledger_count,(SELECT CAST(SUM(amount_micros) AS BIGINT) FROM ledger_entries WHERE account_id=$1 AND key_id=$2 AND source=$3 AND kind='usage') AS ledger_amount,(SELECT COUNT(*) FROM request_stats_facts WHERE request_id=$4) AS facts,(SELECT attempts FROM terminal_projection_outbox WHERE request_id=$5) AS neighbor_attempts,(SELECT requests FROM request_daily_aggregates WHERE key_id=$2) AS requests")
         .bind(key.account_id.to_string()).bind(key.key_id.to_string()).bind(reservation.id.to_string()).bind(id.to_string()).bind(neighbor.to_string()).fetch_one(&db.pool).await.unwrap();
     assert_eq!(row.get::<i64, _>("ledger_count"), 1);
     assert_eq!(row.get::<i64, _>("ledger_amount"), ledger_before);
