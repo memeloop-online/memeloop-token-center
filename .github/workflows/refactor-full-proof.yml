@@ -15,9 +15,9 @@ jobs:
       matrix:
         revision:
           - name: base
-            sha: 59e110fdcb8a4dacc8321005274bcdbed4a51e71
+            sha: 45073750a9bcb696d4225a38d088f30069e561e3
           - name: head
-            sha: 43891c323558212f067f4723de34f1c5b349869c
+            sha: 412aa4d82242ccf82382bbffb51e97133d517a27
         shard: [1, 2, 3, 4]
     env:
       CARGO_BUILD_JOBS: "2"
