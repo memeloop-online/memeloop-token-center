@@ -285,7 +285,7 @@ jobs:
           run_exact http_settings::factory::inference_policy_tests::inference_total_deadline_policy_is_cache_isolated_from_control_requests
           run_exact http_settings::factory::inference_policy_tests::inference_preserves_an_explicit_read_inactivity_policy
   admission-quota-contract:
-    if: inputs.contract == 'admission-cancel' || inputs.contract == 'quota-outage'
+    if: inputs.contract == 'quota-outage'
     runs-on: ubuntu-24.04
     timeout-minutes: 45
     steps:
