@@ -29,6 +29,68 @@ async fn exact_contract(db: &Database) {
     assert_eq!(before.state, "eligible");
     assert!(!before.applied);
     assert!(!before.fact_exists);
+    if db.backend == DatabaseBackend::PostgreSql {
+        let role = format!("terminal_inspect_{}", Uuid::now_v7().simple());
+        for statement in [
+            format!("CREATE ROLE {role} NOLOGIN"),
+            format!("GRANT USAGE ON SCHEMA public TO {role}"),
+            format!("GRANT SELECT ON ALL TABLES IN SCHEMA public TO {role}"),
+        ] {
+            sqlx::query(sqlx::AssertSqlSafe(statement))
+                .execute(&db.pool)
+                .await
+                .unwrap();
+        }
+        let selected_role = role.clone();
+        let pool = sqlx::any::AnyPoolOptions::new()
+            .max_connections(1)
+            .after_connect(move |connection, _| {
+                let statement = format!("SET ROLE {selected_role}");
+                Box::pin(async move {
+                    sqlx::query(sqlx::AssertSqlSafe(statement))
+                        .execute(connection)
+                        .await?;
+                    Ok(())
+                })
+            })
+            .connect_with((*db.pool.connect_options()).clone())
+            .await
+            .unwrap();
+        let mut readonly = db.clone();
+        readonly.pool = pool;
+        assert_eq!(
+            readonly
+                .recover_one_terminal_projection(identity, false)
+                .await
+                .unwrap()
+                .state,
+            "eligible"
+        );
+        assert!(
+            readonly
+                .recover_one_terminal_projection(identity, true)
+                .await
+                .is_err()
+        );
+        readonly.pool.close().await;
+        let attempts: i64 = sqlx::query_scalar(
+            "SELECT attempts FROM terminal_projection_outbox WHERE request_id=$1",
+        )
+        .bind(id.to_string())
+        .fetch_one(&db.pool)
+        .await
+        .unwrap();
+        assert_eq!(attempts, 0);
+        sqlx::query(sqlx::AssertSqlSafe(format!("DROP OWNED BY {role}")))
+            .execute(&db.pool)
+            .await
+            .unwrap();
+        sqlx::query(sqlx::AssertSqlSafe(format!("DROP ROLE {role}")))
+            .execute(&db.pool)
+            .await
+            .unwrap();
+    }
+
     for wrong in [
         TerminalRecoveryIdentity {
             tenant_id: Uuid::now_v7(),
