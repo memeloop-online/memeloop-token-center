@@ -149,7 +149,7 @@ test('semantic viewer reads verified atoms lazily, preserves parts and pages wit
     const requestsTab = page.getByRole('tab', { name: 'Requests', exact: true });
     await requestsTab.focus();
     await requestsTab.press('ArrowRight');
-    const generationsTab = page.getByRole('tab', { name: 'Generations', exact: true });
+    const generationsTab = page.getByRole('tab', { name: 'Generation jobs', exact: true });
     assert.equal(await generationsTab.evaluate(node => document.activeElement === node), true);
     await generationsTab.press('End');
     const sessionsTab = page.getByRole('tab', { name: 'Sessions', exact: true });
