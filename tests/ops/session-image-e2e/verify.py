@@ -8,7 +8,7 @@ u=post('/internal/v1/upstreams',{'tenant_external_id':TENANT,'name':MODEL,'drive
 r=post('/internal/v1/model-routes',{'tenant_external_id':TENANT,'public_model':MODEL,'upstream_account_id':u['id'],'upstream_model':MODEL,'protocol':'openai','priority':0,'custom_model_confirmed':True})
 post('/internal/v1/prices/USD/'+MODEL,{'input_per_million':'0.01','output_per_million':'0.02'})
 k=post('/internal/v1/keys',{'tenant_external_id':TENANT,'principal_external_id':TENANT,'alias':'isolated image e2e','currency':'USD','initial_balance':'100','route_ids':[r['id']],'policy':{'requests_per_minute':60,'tokens_per_minute':100000,'max_concurrency':1,'enforcement_mode':'metered_unlimited','daily_budget':None,'weekly_budget':None,'lifetime_budget':None}})['key']
-messages=[{'role':'user','content':'synthetic image e2e '+NONCE}]+[{'role':'user','content':f'page-marker-{NONCE}-{i}'} for i in range(1,35)]
+messages=[{'role':'user','content':'synthetic image e2e '+NONCE}]+[{'role':'user','content':f'page-marker-{NONCE}-{i}'} for i in range(1,67)]
 messages[1]['content']='large-body-'+NONCE+'😀'*40000
 messages[33]={'role':'user','content':[{'type':'image_url','image_url':{'url':'data:image/png;base64,c3ludGhldGljLW1lZGlh'}}]}
 mode=os.environ.get('E2E_FAULT_MODE','normal')
@@ -81,7 +81,8 @@ while True:
  pages+=1;instances.extend(page['instances']);cursor=page.get('next_cursor')
  if not cursor:break
  status,_,raw=request(path+'?'+urllib.parse.urlencode({'cursor':cursor}),token=k);page=json.loads(raw)
-assert pages>=2 and len(instances)>=35
+print(json.dumps({'semantic_pages':pages,'semantic_instances':len(instances),'request_id':rid}),flush=True)
+assert pages>=2 and len(instances)>=67
 assert len({item['instance_id'] for item in instances})==len(instances)
 found_media=False;found_large=False
 for item in instances:
