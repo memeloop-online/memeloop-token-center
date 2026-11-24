@@ -662,20 +662,16 @@ jobs:
         with:
           toolchain: 1.95.0
       - uses: ./.github/actions/checkout-plugin-examples
-      - name: Verify command-only immutable capture
+      - name: Verify frozen watermark cutover
         run: |
           set -euo pipefail
           git rev-parse HEAD
           test "$(git rev-parse HEAD)" = "${{ inputs.source_revision }}"
           cargo check --locked --lib
-          cargo test --locked --lib db::history_immutable_outbox::command_only_tests::immutable_capture_command_only_keeps_identity_and_exact_bytes -- --exact --nocapture 2>&1 | tee /tmp/command-only.log
-          grep -F '1 passed; 0 failed' /tmp/command-only.log
-          cargo test --locked --lib db::history_immutable_outbox::command_only_tests::postgres_immutable_capture_command_only_keeps_identity_and_exact_bytes -- --ignored --exact --nocapture 2>&1 | tee /tmp/command-only.log
-          grep -F '1 passed; 0 failed' /tmp/command-only.log
-          cargo test --locked --lib db::request_pool::tests::postgres_paused_returning_stream_retains_transaction_until_drop_but_execute_commits -- --exact --nocapture 2>&1 | tee /tmp/command-only.log
-          grep -F '1 passed; 0 failed' /tmp/command-only.log
-          cargo test --locked --lib db::history_immutable_outbox::event_capture_tests::postgres_clickhouse_event_single_source_capture_matches_original_envelopes -- --ignored --exact --nocapture 2>&1 | tee /tmp/command-only.log
-          grep -F '1 passed; 0 failed' /tmp/command-only.log
+          cargo test --locked --lib db::history_watermark::tests::postgres_clickhouse_watermark_keeps_frozen_head_across_coalescing_and_switch -- --ignored --exact --nocapture 2>&1 | tee /tmp/watermark-cutover.log
+          grep -F '1 passed; 0 failed' /tmp/watermark-cutover.log
+          cargo test --locked --lib db::history_source_snapshot::tests::request_history_real_services_acceptance_source_baseline_receipts_and_abort -- --ignored --exact --nocapture 2>&1 | tee /tmp/watermark-cutover.log
+          grep -F '1 passed; 0 failed' /tmp/watermark-cutover.log
 
   semantic-reader-scope-contract:
     if: inputs.contract == 'semantic-reader-scope'
