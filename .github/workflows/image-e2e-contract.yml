@@ -34,8 +34,12 @@ jobs:
           node-version: 24.18.0
       - name: Generate isolated credentials
         run: |
-          echo "E2E_SERVICE_TOKEN=$(openssl rand -hex 32)" >> "$GITHUB_ENV"
-          echo "E2E_KEY_PEPPER=$(openssl rand -hex 32)" >> "$GITHUB_ENV"
+          service_token=$(openssl rand -hex 32)
+          pepper=$(openssl rand -hex 32)
+          echo "::add-mask::$service_token"
+          echo "::add-mask::$pepper"
+          echo "E2E_SERVICE_TOKEN=$service_token" >> "$GITHUB_ENV"
+          echo "E2E_KEY_PEPPER=$pepper" >> "$GITHUB_ENV"
       - name: Start isolated synthetic mock
         run: |
           MTC_MOCK_PORT=18082 node tests/load/staging-peak/mock.ts >"$RUNNER_TEMP/mock.log" 2>&1 &

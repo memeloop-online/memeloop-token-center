@@ -30,8 +30,12 @@ assert archives['response']==body
 for i in range(90):
  status,_,raw=request('/self/v1/sessions?limit=100',token=k); listing=json.loads(raw); matched=[x for x in listing['sessions'] if x['session_id']==SESSION]
  if len(matched)==1:
-  status,_,raw=request('/self/v1/sessions/'+urllib.parse.quote(matched[0]['session_id'],safe=''),token=k);session=json.loads(raw)
-  if status==200 and any(x.get('request_id')==rid for x in session['requests']):break
+  try:
+   status,_,raw=request('/self/v1/sessions/'+urllib.parse.quote(matched[0]['session_id'],safe=''),token=k);session=json.loads(raw)
+   if status==200 and any(x.get('request_id')==rid for x in session['requests']):break
+  except urllib.error.HTTPError:pass
  time.sleep(2)
-else:raise RuntimeError('same request did not appear in session projection')
+else:
+ print(json.dumps({'session_list_count':len(listing['sessions']),'matching_external_id':len(matched),'request_id':rid,'worker_role':'all'}),flush=True)
+ raise RuntimeError('same request did not appear in session projection')
 print(json.dumps({'request_id':rid,'session_status':status,'usage':d['usage'],'archive_complete':True}))
