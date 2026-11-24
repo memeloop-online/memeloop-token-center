@@ -45,6 +45,7 @@ impl JsonMemoryScanner {
 
 pub(crate) struct ProxyMemoryBudget {
     capacity: usize,
+    unit_bytes: usize,
     permits: Arc<Semaphore>,
     retained_requests: Arc<Semaphore>,
 }
@@ -58,16 +59,28 @@ impl ProxyMemoryBudget {
     }
 
     pub(crate) fn new(bytes: u64) -> Self {
-        // Production configuration is validated before constructing the budget.
-        // The bound is the semaphore's representation, not a fixed pod size.
         assert!(
             Self::supports(bytes),
             "memory budget exceeds counter representation"
         );
+        Self::with_unit(bytes, UNIT_BYTES)
+    }
+
+    /// Archive ingress includes many small wire fragments. A 256-byte quantum
+    /// bounds metadata without charging each fragment as a 64-KiB allocation.
+    pub(crate) fn new_archive_source(bytes: u64) -> Self {
+        Self::with_unit(bytes, 256)
+    }
+
+    fn with_unit(bytes: u64, unit_bytes: usize) -> Self {
+        let capacity = usize::try_from(bytes).expect("memory budget representation");
+        let units = capacity / unit_bytes;
+        assert!(units <= u32::MAX as usize && units <= Semaphore::MAX_PERMITS);
         Self {
-            capacity: bytes as usize,
-            permits: Arc::new(Semaphore::new(bytes as usize / UNIT_BYTES)),
-            retained_requests: Arc::new(Semaphore::new(bytes as usize / 4 / UNIT_BYTES)),
+            capacity,
+            unit_bytes,
+            permits: Arc::new(Semaphore::new(units)),
+            retained_requests: Arc::new(Semaphore::new(capacity / 4 / unit_bytes)),
         }
     }
 
@@ -75,6 +88,7 @@ impl ProxyMemoryBudget {
         Arc::new(ProxyMemoryReservation {
             permits: self.permits.clone(),
             capacity: self.capacity,
+            unit_bytes: self.unit_bytes,
             held: Mutex::new((0, None)),
             response_reserved: AtomicBool::new(false),
             response_bytes: AtomicUsize::new(0),
@@ -95,8 +109,8 @@ impl ProxyMemoryBudget {
         weight: usize,
     ) -> Option<Arc<ProxyMemoryReservation>> {
         let weighted = bytes.checked_mul(weight)?;
-        let units = u32::try_from(weighted.div_ceil(UNIT_BYTES)).ok()?;
-        if units as usize > self.capacity / UNIT_BYTES {
+        let units = u32::try_from(weighted.div_ceil(self.unit_bytes)).ok()?;
+        if units as usize > self.capacity / self.unit_bytes {
             return None;
         }
         let permit = self.permits.clone().acquire_many_owned(units).await.ok()?;
@@ -106,12 +120,13 @@ impl ProxyMemoryBudget {
     }
 
     pub(crate) fn snapshot(&self) -> (usize, usize, usize, usize) {
-        let lifecycle_limit = self.capacity / UNIT_BYTES * UNIT_BYTES;
-        let retained_limit = self.capacity / 4 / UNIT_BYTES * UNIT_BYTES;
+        let lifecycle_limit = self.capacity / self.unit_bytes * self.unit_bytes;
+        let retained_limit = self.capacity / 4 / self.unit_bytes * self.unit_bytes;
         (
-            lifecycle_limit.saturating_sub(self.permits.available_permits() * UNIT_BYTES),
+            lifecycle_limit.saturating_sub(self.permits.available_permits() * self.unit_bytes),
             lifecycle_limit,
-            retained_limit.saturating_sub(self.retained_requests.available_permits() * UNIT_BYTES),
+            retained_limit
+                .saturating_sub(self.retained_requests.available_permits() * self.unit_bytes),
             retained_limit,
         )
     }
@@ -133,7 +148,7 @@ impl ProxyMemoryBudget {
         &self,
         bytes: usize,
     ) -> Option<OwnedSemaphorePermit> {
-        let units = u32::try_from(bytes.div_ceil(UNIT_BYTES)).ok()?;
+        let units = u32::try_from(bytes.div_ceil(self.unit_bytes)).ok()?;
         self.retained_requests
             .clone()
             .try_acquire_many_owned(units)
@@ -144,7 +159,7 @@ impl ProxyMemoryBudget {
         &self,
         bytes: usize,
     ) -> Option<(OwnedSemaphorePermit, OwnedSemaphorePermit)> {
-        let units = u32::try_from(bytes.div_ceil(UNIT_BYTES)).ok()?;
+        let units = u32::try_from(bytes.div_ceil(self.unit_bytes)).ok()?;
         let retained = self
             .retained_requests
             .clone()
@@ -158,7 +173,7 @@ impl ProxyMemoryBudget {
         &self,
         bytes: usize,
     ) -> Result<OwnedSemaphorePermit, crate::error::AppError> {
-        let units = u32::try_from(bytes.div_ceil(UNIT_BYTES))
+        let units = u32::try_from(bytes.div_ceil(self.unit_bytes))
             .map_err(|_| crate::error::AppError::internal("carrier_allocation_overflow"))?;
         self.permits
             .clone()
@@ -168,13 +183,14 @@ impl ProxyMemoryBudget {
     }
 
     pub(crate) fn try_reserve_ingress_bytes(&self, bytes: usize) -> Option<OwnedSemaphorePermit> {
-        let units = u32::try_from(bytes.div_ceil(UNIT_BYTES)).ok()?;
+        let units = u32::try_from(bytes.div_ceil(self.unit_bytes)).ok()?;
         self.permits.clone().try_acquire_many_owned(units).ok()
     }
 }
 
 pub(crate) struct ProxyMemoryReservation {
     capacity: usize,
+    unit_bytes: usize,
     permits: Arc<Semaphore>,
     held: Mutex<(usize, Option<OwnedSemaphorePermit>)>,
     response_reserved: AtomicBool,
@@ -351,6 +367,7 @@ impl ProxyMemoryReservation {
     pub(crate) fn shared_budget(&self) -> Arc<ProxyMemoryBudget> {
         Arc::new(ProxyMemoryBudget {
             capacity: self.capacity,
+            unit_bytes: self.unit_bytes,
             permits: self.permits.clone(),
             retained_requests: self.retained_requests.clone(),
         })
@@ -358,7 +375,7 @@ impl ProxyMemoryReservation {
 
     // Existing request-source ingress uses the same global allocation permits.
     pub(crate) fn try_reserve_ingress_bytes(&self, bytes: usize) -> Option<OwnedSemaphorePermit> {
-        let units = u32::try_from(bytes.div_ceil(UNIT_BYTES)).ok()?;
+        let units = u32::try_from(bytes.div_ceil(self.unit_bytes)).ok()?;
         self.permits.clone().try_acquire_many_owned(units).ok()
     }
 
@@ -449,7 +466,7 @@ impl ProxyMemoryReservation {
             let Ok(held) = self.held.lock() else {
                 return false;
             };
-            let Ok(units) = u32::try_from(held.0.div_ceil(UNIT_BYTES)) else {
+            let Ok(units) = u32::try_from(held.0.div_ceil(self.unit_bytes)) else {
                 return false;
             };
             units
@@ -494,7 +511,7 @@ impl ProxyMemoryReservation {
             else {
                 return false;
             };
-            let Ok(units) = u32::try_from(bytes.div_ceil(UNIT_BYTES)) else {
+            let Ok(units) = u32::try_from(bytes.div_ceil(self.unit_bytes)) else {
                 return false;
             };
             units
@@ -536,19 +553,19 @@ impl ProxyMemoryReservation {
         }
         let bytes = maximum
             .saturating_mul(CAPTURE_MEMORY_WEIGHT)
-            .max(UNIT_BYTES);
-        let units = bytes.div_ceil(UNIT_BYTES) as u32;
+            .max(self.unit_bytes);
+        let units = bytes.div_ceil(self.unit_bytes) as u32;
         let Some(permit) = Self::acquire(&self.permits, units) else {
             return false;
         };
-        held.0 += units as usize * UNIT_BYTES;
+        held.0 += units as usize * self.unit_bytes;
         match held.1.as_mut() {
             Some(existing) => existing.merge(permit),
             None => held.1 = Some(permit),
         }
         self.response_reserved.store(true, Ordering::Release);
         self.response_bytes
-            .store(units as usize * UNIT_BYTES, Ordering::Release);
+            .store(units as usize * self.unit_bytes, Ordering::Release);
         true
     }
 
@@ -570,21 +587,23 @@ impl ProxyMemoryReservation {
         }
         let response_bytes = maximum
             .saturating_mul(CAPTURE_MEMORY_WEIGHT)
-            .max(UNIT_BYTES);
-        let response_units = u32::try_from(response_bytes.div_ceil(UNIT_BYTES)).ok()?;
+            .max(self.unit_bytes);
+        let response_units = u32::try_from(response_bytes.div_ceil(self.unit_bytes)).ok()?;
         let projection_bytes = projection_bytes.checked_mul(projection_weight)?;
-        let projection_units = u32::try_from(projection_bytes.div_ceil(UNIT_BYTES)).ok()?;
+        let projection_units = u32::try_from(projection_bytes.div_ceil(self.unit_bytes)).ok()?;
         let total_units = response_units.checked_add(projection_units)?;
         let mut permit = Self::acquire(&self.permits, total_units)?;
         let projection = permit.split(projection_units as usize)?;
-        held.0 = held.0.checked_add(response_units as usize * UNIT_BYTES)?;
+        held.0 = held
+            .0
+            .checked_add(response_units as usize * self.unit_bytes)?;
         match held.1.as_mut() {
             Some(existing) => existing.merge(permit),
             None => held.1 = Some(permit),
         }
         self.response_reserved.store(true, Ordering::Release);
         self.response_bytes
-            .store(response_units as usize * UNIT_BYTES, Ordering::Release);
+            .store(response_units as usize * self.unit_bytes, Ordering::Release);
         Some(ConversationProjectionPermit {
             _permit: projection,
         })
@@ -624,18 +643,18 @@ impl ProxyMemoryReservation {
             .checked_add(nodes.checked_mul(256)?)?
             .max(bytes.checked_mul(CAPTURE_MEMORY_WEIGHT)?)
             .max(adapter_envelope.checked_mul(CAPTURE_MEMORY_WEIGHT)?)
-            .max(UNIT_BYTES);
-        let response_units = u32::try_from(required.div_ceil(UNIT_BYTES)).ok()?;
+            .max(self.unit_bytes);
+        let response_units = u32::try_from(required.div_ceil(self.unit_bytes)).ok()?;
         let projection_units = u32::try_from(
             projection_bytes
                 .checked_mul(projection_weight)?
-                .div_ceil(UNIT_BYTES),
+                .div_ceil(self.unit_bytes),
         )
         .ok()?;
         let units = response_units.checked_add(projection_units)?;
         let held_bytes = self.held.lock().ok()?.0;
         if units as usize
-            > (self.capacity / UNIT_BYTES).saturating_sub(held_bytes.div_ceil(UNIT_BYTES))
+            > (self.capacity / self.unit_bytes).saturating_sub(held_bytes.div_ceil(self.unit_bytes))
         {
             return None;
         }
@@ -650,13 +669,15 @@ impl ProxyMemoryReservation {
     ) -> Option<ConversationProjectionPermit> {
         let projection = permit.split(projection_units as usize)?;
         let mut held = self.held.lock().ok()?;
-        held.0 = held.0.checked_add(response_units as usize * UNIT_BYTES)?;
+        held.0 = held
+            .0
+            .checked_add(response_units as usize * self.unit_bytes)?;
         match held.1.as_mut() {
             Some(existing) => existing.merge(permit),
             None => held.1 = Some(permit),
         }
         self.response_bytes
-            .store(response_units as usize * UNIT_BYTES, Ordering::Release);
+            .store(response_units as usize * self.unit_bytes, Ordering::Release);
         self.response_reserved.store(true, Ordering::Release);
         Some(ConversationProjectionPermit {
             _permit: projection,
@@ -736,9 +757,9 @@ impl ProxyMemoryReservation {
             return false;
         }
         let Some(required) = required
-            .max(UNIT_BYTES)
-            .div_ceil(UNIT_BYTES)
-            .checked_mul(UNIT_BYTES)
+            .max(self.unit_bytes)
+            .div_ceil(self.unit_bytes)
+            .checked_mul(self.unit_bytes)
         else {
             return false;
         };
@@ -748,7 +769,7 @@ impl ProxyMemoryReservation {
             let Some(total) = held.0.checked_add(extra) else {
                 return false;
             };
-            let Ok(units) = u32::try_from(extra / UNIT_BYTES) else {
+            let Ok(units) = u32::try_from(extra / self.unit_bytes) else {
                 return false;
             };
             let Some(permit) = Self::acquire(&self.permits, units) else {
@@ -762,7 +783,7 @@ impl ProxyMemoryReservation {
         } else if shrink {
             let released = previous - required;
             if let Some(permit) = held.1.as_mut() {
-                drop(permit.split(released / UNIT_BYTES));
+                drop(permit.split(released / self.unit_bytes));
             }
             held.0 -= released;
         } else {
@@ -778,7 +799,7 @@ impl ProxyMemoryReservation {
         };
         let released = self.response_bytes.swap(0, Ordering::AcqRel);
         if let Some(permit) = held.1.as_mut() {
-            drop(permit.split(released / UNIT_BYTES));
+            drop(permit.split(released / self.unit_bytes));
         }
         held.0 = held.0.saturating_sub(released);
         self.response_reserved.store(false, Ordering::Release);
@@ -787,7 +808,7 @@ impl ProxyMemoryReservation {
     pub(crate) fn take_response_envelope(&self) -> Option<BufferedResponsePermit> {
         let mut held = self.held.lock().ok()?;
         let previous = self.response_bytes.load(Ordering::Acquire);
-        let permit = held.1.as_mut()?.split(previous / UNIT_BYTES)?;
+        let permit = held.1.as_mut()?.split(previous / self.unit_bytes)?;
         held.0 -= previous;
         self.response_bytes.store(0, Ordering::Release);
         self.response_reserved.store(false, Ordering::Release);
@@ -801,7 +822,7 @@ impl ProxyMemoryReservation {
         if self.has_buffered_response() {
             return false;
         }
-        let bytes = permit.0.num_permits() * UNIT_BYTES;
+        let bytes = permit.0.num_permits() * self.unit_bytes;
         held.0 += bytes;
         match held.1.as_mut() {
             Some(existing) => existing.merge(permit.0),
@@ -825,8 +846,8 @@ impl ProxyMemoryReservation {
         let required = bytes.len().checked_mul(CAPTURE_MEMORY_WEIGHT)?;
         let mut held = self.held.lock().ok()?;
         let previous = self.response_bytes.load(Ordering::Acquire);
-        let units = u32::try_from(required.div_ceil(UNIT_BYTES)).ok()?;
-        let previous_units = previous / UNIT_BYTES;
+        let units = u32::try_from(required.div_ceil(self.unit_bytes)).ok()?;
+        let previous_units = previous / self.unit_bytes;
         let permit = if units == 0 {
             Self::acquire(&self.permits, 0)?
         } else if units as usize <= previous_units {
@@ -855,7 +876,7 @@ impl ProxyMemoryReservation {
             return;
         };
         let total = held.0.saturating_sub(bytes.saturating_mul(weight));
-        let units = held.0.div_ceil(UNIT_BYTES) - total.div_ceil(UNIT_BYTES);
+        let units = held.0.div_ceil(self.unit_bytes) - total.div_ceil(self.unit_bytes);
         if let Some(permit) = held.1.as_mut() {
             drop(permit.split(units));
         }
@@ -910,8 +931,8 @@ impl ProxyMemoryReservation {
     /// for a permit held by the old JSON tree itself.
     pub(crate) fn try_extend_normalized_envelope(&self, bytes: usize) -> bool {
         let Some(rounded) = bytes
-            .checked_add(UNIT_BYTES - 1)
-            .map(|value| value / UNIT_BYTES * UNIT_BYTES)
+            .checked_add(self.unit_bytes - 1)
+            .map(|value| value / self.unit_bytes * self.unit_bytes)
         else {
             return false;
         };
@@ -937,11 +958,11 @@ impl ProxyMemoryReservation {
     ) -> Option<OwnedSemaphorePermit> {
         let mut held = self.held.lock().ok()?;
         let reserved = self.json_reserved_bytes.load(Ordering::Acquire);
-        let units = encoded_len.div_ceil(UNIT_BYTES);
-        if reserved == 0 || units > reserved / UNIT_BYTES {
+        let units = encoded_len.div_ceil(self.unit_bytes);
+        if reserved == 0 || units > reserved / self.unit_bytes {
             return None;
         }
-        let transferred = units.checked_mul(UNIT_BYTES)?;
+        let transferred = units.checked_mul(self.unit_bytes)?;
         let remaining = held.0.checked_sub(transferred)?;
         let lease = held.1.as_mut()?.split(units)?;
         held.0 = remaining;
@@ -965,7 +986,7 @@ impl ProxyMemoryReservation {
         _deadline: tokio::time::Instant,
     ) -> Option<ConversationProjectionPermit> {
         let weighted = bytes.checked_mul(weight)?;
-        let units = u32::try_from(weighted.div_ceil(UNIT_BYTES)).ok()?;
+        let units = u32::try_from(weighted.div_ceil(self.unit_bytes)).ok()?;
         Self::acquire(&self.permits, units)
             .map(|permit| ConversationProjectionPermit { _permit: permit })
     }
@@ -990,7 +1011,7 @@ impl ProxyMemoryReservation {
         let json = bytes.checked_mul(3)?.checked_add(nodes.checked_mul(256)?)?;
         let working = 64 * 1024;
         let total = json.checked_add(working)?;
-        if total.div_ceil(UNIT_BYTES) > self.capacity / UNIT_BYTES {
+        if total.div_ceil(self.unit_bytes) > self.capacity / self.unit_bytes {
             return None;
         }
         loop {
@@ -1051,8 +1072,8 @@ impl ProxyMemoryReservation {
         };
         let Ok(units) = u32::try_from(
             total
-                .div_ceil(UNIT_BYTES)
-                .saturating_sub(held.0.div_ceil(UNIT_BYTES)),
+                .div_ceil(self.unit_bytes)
+                .saturating_sub(held.0.div_ceil(self.unit_bytes)),
         ) else {
             return false;
         };
