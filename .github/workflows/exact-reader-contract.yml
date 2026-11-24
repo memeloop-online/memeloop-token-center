@@ -700,7 +700,7 @@ jobs:
           git rev-parse HEAD
           test "$(git rev-parse HEAD)" = "${{ inputs.source_revision }}"
           cargo test --locked --lib archive::semantic_reader::tests -- --nocapture 2>&1 | tee /tmp/semantic-reader-chunks.log
-          grep -F '10 passed; 0 failed' /tmp/semantic-reader-chunks.log
+          grep -F '11 passed; 0 failed' /tmp/semantic-reader-chunks.log
           cargo test --locked --lib api::semantic_session_view::reader_cursor_tests -- --nocapture 2>&1 | tee /tmp/reader-cursor.log
           grep -E '[1-9][0-9]* passed; 0 failed' /tmp/reader-cursor.log
           for backend in sqlite postgres; do
