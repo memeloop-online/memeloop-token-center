@@ -74,6 +74,7 @@ async fn canonical_http_fields_match_training_and_keep_occurrence_scope() {
     messages[34] = messages[0].clone();
     messages[1] = json!({"role":"assistant","tool_calls":[{"id":"call","type":"function","function":{"name":"echo","arguments":serde_json::to_string(&json!({"input":long})).unwrap()}}]});
     messages[2] = json!({"role":"tool","tool_call_id":"call","content":long});
+    messages[33] = json!({"role":"user","content":[{"type":"image_url","image_url":{"url":"data:image/png;base64,cmVhZGVyLW1lZGlh"}}]});
     let document = json!({"messages":messages});
     let request = Uuid::now_v7();
     let mut transaction = state.db.begin_write_transaction().await.unwrap();
@@ -96,7 +97,24 @@ async fn canonical_http_fields_match_training_and_keep_occurrence_scope() {
         .await
         .unwrap();
     transaction.commit().await.unwrap();
-    let body = crate::conversation::session_body_from_documents(&document, &json!({}));
+    let mut body = crate::conversation::session_body_from_documents(&document, &json!({}));
+    let mut media_count = 0;
+    for turn in &mut body.turns {
+        for part in &mut turn.parts {
+            if let Some(bytes) = part.media_bytes.take() {
+                let object = state
+                    .archive
+                    .put_tenant_content(key.tenant_id, Bytes::from(bytes))
+                    .await
+                    .unwrap();
+                part.byte_length = Some(object.size_bytes);
+                part.content_blake3 = Some(object.blake3_digest);
+                part.object_locator = Some(object.object_locator);
+                media_count += 1;
+            }
+        }
+    }
+    assert_eq!(media_count, 1);
     let (atoms, nodes) = body.into_prefix();
     assert_eq!(atoms.len(), 35);
     assert_eq!(atoms[0].content_hash, atoms[34].content_hash);
@@ -243,6 +261,27 @@ async fn canonical_http_fields_match_training_and_keep_occurrence_scope() {
         .await;
         assert_eq!(parts["instance_id"], id);
         for part in parts["parts"].as_array().unwrap() {
+            if let Some(cursor) = part["media"]["read_cursor"].as_str() {
+                let response = get(
+                    &state,
+                    &format!("{path}?media_cursor={cursor}"),
+                    &issued.key,
+                )
+                .await;
+                assert_eq!(response.status(), StatusCode::OK);
+                assert_eq!(
+                    response.headers()[header::CONTENT_TYPE],
+                    "application/octet-stream"
+                );
+                assert_eq!(
+                    response.headers()[header::CONTENT_DISPOSITION],
+                    "attachment"
+                );
+                assert_eq!(
+                    &to_bytes(response.into_body(), usize::MAX).await.unwrap()[..],
+                    b"reader-media"
+                );
+            }
             for field in part["fields"].as_array().unwrap() {
                 let response = get(
                     &state,
