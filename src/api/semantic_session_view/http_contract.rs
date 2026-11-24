@@ -317,6 +317,32 @@ async fn canonical_http_fields_match_training_and_keep_occurrence_scope() {
                 } else {
                     assert_eq!(Some(text.as_str()), expected.as_str());
                 }
+                if let Some(preview) = field.get("preview") {
+                    let prefix = preview["text"].as_str().unwrap();
+                    assert_eq!(preview["byte_offset"], 0);
+                    assert!(text.starts_with(prefix));
+                    if preview["complete"] == true {
+                        assert_eq!(prefix, text);
+                        assert!(preview["next_cursor"].is_null());
+                    } else {
+                        let cursor = preview["next_cursor"].as_str().unwrap();
+                        let response = get(
+                            &state,
+                            &format!("{path}?content_cursor={cursor}"),
+                            &issued.key,
+                        )
+                        .await;
+                        assert_eq!(response.status(), StatusCode::OK);
+                        let bytes = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+                        let mut resumed = prefix.to_owned();
+                        for line in bytes.split(|b| *b == b'\n').filter(|line| !line.is_empty()) {
+                            let frame: Value = serde_json::from_slice(line).unwrap();
+                            assert_eq!(frame["byte_offset"], resumed.len() as u64);
+                            resumed.push_str(frame["text"].as_str().unwrap());
+                        }
+                        assert_eq!(resumed, text);
+                    }
+                }
             }
         }
     }
