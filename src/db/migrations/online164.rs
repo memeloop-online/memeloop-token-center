@@ -145,7 +145,7 @@ pub(super) async fn apply(c: &mut AnyConnection, source: &str) -> Result<(), sql
     }
     let exists: bool=sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM pg_attribute WHERE attrelid='request_records'::regclass AND attname='started_event_pending' AND NOT attisdropped)").fetch_one(&mut *c).await?;
     if !exists {
-        sqlx::raw_sql(source).execute(&mut *c).await?;
+        sqlx::raw_sql(SOURCE).execute(&mut *c).await?;
     }
     verify(c).await
 }
