@@ -346,3 +346,92 @@ async fn header_application_expiry_skips_to_standby_without_breaker_failure() {
     assert_eq!(primary_failure_count, 0);
     pool.close().await;
 }
+
+#[tokio::test]
+async fn unavailable_snapshot_reasons_preserve_fail_closed_materialization() {
+    let fixture = codex_route_fixture("snapshot-reasons").await;
+    let key = fixture
+        .state
+        .db
+        .authenticate_key(&fixture.key, fixture.state.config.key_pepper.as_bytes())
+        .await
+        .unwrap();
+    let mut candidates = fixture
+        .state
+        .db
+        .list_authorized_upstream_candidates_with_hint(
+            key.key_id,
+            key.tenant_id,
+            &fixture.model,
+            Protocol::OpenAiResponses.name(),
+            RouteSelectionOptions {
+                upstream_account_hint: None,
+                avoid_route_account: None,
+                selection_seed: Uuid::now_v7(),
+            },
+        )
+        .await
+        .unwrap();
+    let candidate = candidates.remove(0);
+    let pepper = fixture.state.config.key_pepper.as_bytes();
+    let (ready, reason) = fixture
+        .state
+        .db
+        .materialize_authorized_upstream_candidate_diagnostic(&candidate, pepper)
+        .await
+        .unwrap();
+    assert!(ready.is_some());
+    assert_eq!(reason, None);
+    for (revision, generation, expected) in [
+        (
+            candidate.transport_revision - 1,
+            candidate.credential_generation,
+            "transport_revision_changed",
+        ),
+        (
+            candidate.transport_revision,
+            candidate.credential_generation - 1,
+            "credential_generation_changed",
+        ),
+    ] {
+        let stale = AuthorizedUpstreamCandidate {
+            transport_revision: revision,
+            credential_generation: generation,
+            ..candidate.clone()
+        };
+        let (route, reason) = fixture
+            .state
+            .db
+            .materialize_authorized_upstream_candidate_diagnostic(&stale, pepper)
+            .await
+            .unwrap();
+        assert!(route.is_none());
+        assert_eq!(reason, Some(expected));
+    }
+    let pool = sqlx::AnyPool::connect(&fixture.database_url).await.unwrap();
+    // Invalid ciphertext must never be opened for a revoked credential.
+    sqlx::query("UPDATE upstream_credentials SET revoked_at = $1, credential_ciphertext = 'invalid' WHERE upstream_account_id = $2 AND generation = $3")
+        .bind(crate::db::unix_millis()).bind(candidate.account_id.to_string()).bind(candidate.credential_generation).execute(&pool).await.unwrap();
+    let (route, reason) = fixture
+        .state
+        .db
+        .materialize_authorized_upstream_candidate_diagnostic(&candidate, pepper)
+        .await
+        .unwrap();
+    assert!(route.is_none());
+    assert_eq!(reason, Some("credential_revoked"));
+    sqlx::query("UPDATE model_routes SET enabled = 0 WHERE id = $1")
+        .bind(candidate.route_id.to_string())
+        .execute(&pool)
+        .await
+        .unwrap();
+    let (route, reason) = fixture
+        .state
+        .db
+        .materialize_authorized_upstream_candidate_diagnostic(&candidate, pepper)
+        .await
+        .unwrap();
+    assert!(route.is_none());
+    assert_eq!(reason, Some("route_disabled"));
+    pool.close().await;
+}
