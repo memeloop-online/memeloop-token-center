@@ -152,7 +152,7 @@ async fn canonical_http_fields_match_training_and_keep_occurrence_scope() {
                     node_hash: node.node_hash.clone(),
                     parent_hash: node.parent_hash.clone(),
                     atom_hash: node.atom_hash.clone(),
-                    depth: node.depth,
+                    depth: node.depth as u64,
                 },
             )
             .await
