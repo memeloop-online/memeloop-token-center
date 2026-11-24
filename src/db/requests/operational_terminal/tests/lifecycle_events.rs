@@ -22,7 +22,7 @@ async fn lifecycle_events_contract(fixture: Fixture) {
         .upsert_model_price("operational-model", "USD", Decimal::ONE, Decimal::ONE)
         .await
         .unwrap();
-    let mut cursor_gate = if fixture.database.backend == DatabaseBackend::PostgreSql {
+    let mut cursor_gate = if matches!(fixture.database.backend, DatabaseBackend::PostgreSql) {
         let mut tx = fixture.database.begin_write_transaction().await.unwrap();
         sqlx::query("SELECT pg_advisory_xact_lock($1, $2)")
             .bind(0x4d54_4345_i32)

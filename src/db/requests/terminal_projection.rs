@@ -66,6 +66,24 @@ impl Database {
         for row in rows {
             let id: String = row.try_get("id")?;
             let mut transaction = self.begin_write_transaction().await?;
+            if matches!(self.backend, DatabaseBackend::PostgreSql) {
+                // Never wait behind a terminal owner, or hold its row while
+                // waiting for the global observation cursor.
+                let locked = sqlx::query("SELECT id FROM request_records WHERE id = $1 AND started_event_pending = 1 FOR UPDATE SKIP LOCKED")
+                    .bind(&id).fetch_optional(&mut *transaction).await?;
+                if locked.is_none() {
+                    continue;
+                }
+                let cursor_available: bool =
+                    sqlx::query_scalar("SELECT pg_try_advisory_xact_lock($1, $2)")
+                        .bind(0x4d54_4345_i32)
+                        .bind(1_i32)
+                        .fetch_one(&mut *transaction)
+                        .await?;
+                if !cursor_available {
+                    continue;
+                }
+            }
             super::lifecycle::publish_pending_started_in_transaction(&mut transaction, &id).await?;
             transaction.commit().await?;
         }

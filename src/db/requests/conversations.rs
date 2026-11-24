@@ -2390,6 +2390,7 @@ pub(super) async fn emit_conversation_projected_event_in_transaction(
     let request_id = request_id.to_string();
     let tenant_id = tenant_id.to_string();
     let key_id = key_id.to_string();
+    super::lifecycle::publish_pending_started_in_transaction(transaction, &request_id).await?;
     super::super::history_immutable_outbox::capture_request_in_transaction(
         transaction,
         &request_id,
