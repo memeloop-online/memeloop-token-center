@@ -7,7 +7,7 @@ import test from 'node:test';
 import { chromium } from 'playwright';
 import { createServer } from 'vite';
 
-declare global { interface Window { semanticAtomReads: number; semanticPageReads: number } }
+declare global { interface Window { semanticAtomReads: number; semanticPageReads: number; semanticPageRequest: string } }
 
 test('semantic viewer reads verified atoms lazily, preserves parts and pages without resident history growth', { timeout: 45_000 }, async () => {
   if (!existsSync(chromium.executablePath())) {
