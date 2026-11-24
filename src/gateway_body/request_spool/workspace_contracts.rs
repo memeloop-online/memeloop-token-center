@@ -91,8 +91,43 @@ async fn raw_and_normalized_writers_share_workspace_without_consuming_response_s
         .unwrap();
     assert!(response.try_offer(response_bytes.clone()));
     let response = response.seal().unwrap();
+    // A third complete original owns source bytes while both real writers hold
+    // the two envelopes. Its pending upload must not acquire another source lease.
+    let waiting_bytes = Bytes::from(vec![b'x'; 256 * 1024]);
+    let waiting_key = ArchiveStagingKey::new(
+        ArchiveStagingOwner::ProxyRequest(identity.request_id),
+        ArchiveStagingPurpose::Request,
+        uuid::Uuid::now_v7(),
+    )
+    .unwrap();
+    let waiting_location = format!("{}/body.json", waiting_key.canonical_prefix());
+    let waiting_memory = Arc::new(ProxyMemoryBudget::new(1024 * 1024));
+    let waiting_store = DurableRequestBodies::Archive(state.archive.clone());
+    let waiting_source = BodyCarrier::capture(
+        stream::iter([Ok::<_, std::io::Error>(waiting_bytes.clone())]),
+        CarrierCapture::new(waiting_memory.clone(), None, waiting_key),
+    )
+    .await
+    .unwrap();
+    let source_before_wait = waiting_memory.snapshot().0;
+    let mut third =
+        Box::pin(waiting_store.put_carrier(&waiting_location, &waiting_source, &state.persistence));
+    assert!(futures_util::poll!(&mut third).is_pending());
+    assert_eq!(waiting_memory.snapshot().0, source_before_wait);
+    assert!(
+        state
+            .persistence
+            .render()
+            .contains("archive_workspace_waiting{operation=\"request_raw\"} 1")
+    );
     raw_release.send(()).unwrap();
     normalized_release.send(()).unwrap();
+    third.await.unwrap();
+    assert_eq!(
+        state.archive.get(&waiting_location).await.unwrap(),
+        waiting_bytes
+    );
+    drop(waiting_source);
     tokio::time::timeout(Duration::from_secs(15), raw_task)
         .await
         .unwrap()

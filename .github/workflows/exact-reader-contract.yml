@@ -216,21 +216,9 @@ jobs:
           set -o pipefail
           cargo test --locked --lib --no-run
           for selector in \
-            supplier_error::tests::shared_projection_preserves_explanation_and_removes_credentials \
-            supplier_error::tests::credential_echoes_include_authorization_payload_and_decoded_password \
-            supplier_error::tests::credential_projection_handles_url_and_known_secret_echoes \
-            supplier_error::tests::record_details_above_old_inline_limit_preserve_unknown_fields \
-            supplier_error::tests::known_and_unknown_details_survive_http_stream_and_record_projection \
-            api::proxy::tests::codex_streaming_output_then_failure_keeps_unobserved_usage_out_of_actual_cost \
-            error::tests::object_storage_classification_preserves_only_typed_safe_facts \
-            error::tests::dependency_errors_do_not_retain_secret_bearing_driver_messages \
-            response_archive_spool::tests::shared_capture_reaches_eof_while_all_upload_slots_are_held \
-            response_archive_spool::tests::unavailable_local_directory_does_not_gate_complete_original \
-            response_archive_spool::tests::cancelled_unsealed_carrier_releases_owned_capture_without_acknowledging_original \
-            response_archive_spool::tests::empty_shared_carrier_publishes_the_exact_empty_original \
-            response_archive_spool::tests::original_stream_capture_uses_selected_backend_without_legacy_body_copy \
-            api::proxy::tests::persistence_isolation::pending_response_archive_begin_does_not_hold_first_byte_or_eof \
-            api::proxy::tests::sse_delivery::large_source_backed_conversation_stream_releases_raw_bytes_before_terminal_projection
+            api::proxy::persistence::workspace_observation::tests::workspace_observation_counts_shared_owner_once_and_cancellation \
+            gateway_body::request_spool::workspace_contracts::raw_and_normalized_writers_share_workspace_without_consuming_response_source \
+            gateway_body::request_spool::workspace_contracts::normalized_overflow_waits_only_on_workspace_and_cancels_without_leaking_source
           do
             echo "Contract: $selector"
             timeout 180s cargo test --locked --lib "$selector" -- --exact 2>&1 | tee /tmp/response-carrier-contract.log
