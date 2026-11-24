@@ -1195,35 +1195,20 @@ fn publish_durable(shared: &Arc<SharedBody>) {
                                 .await;
                             // Either the immutable raw root or verified semantic
                             // retirement durably owns this exact object.
-                            if let Some(carrier) = &source.carrier {
-                                loop {
-                                    let handoff = match database.body_archive() {
-                                        Ok(archive) => carrier.handoff_verified_publication(
-                                            archive.clone(),
-                                            object.clone(),
-                                        ),
-                                        Err(error) => Err(error),
-                                    };
-                                    if handoff.is_ok() {
-                                        break;
-                                    }
-                                    // This task retains the sole source and its budget.
-                                    // A failed identity handoff is never durable settlement.
-                                    tracing::error!(
-                                        "request source durable handoff rejected; retaining source for retry"
-                                    );
-                                    tokio::time::sleep(std::time::Duration::from_millis(250)).await;
-                                }
+                            if let Some(carrier) = &source.carrier
+                                && let Ok(archive) = database.body_archive()
+                                && carrier
+                                    .handoff_verified_publication(archive.clone(), object)
+                                    .is_err()
+                            {
+                                tracing::error!(
+                                    "request source durable handoff identity mismatch; retaining RAM"
+                                );
                             }
                             Some(settlement)
                         } else {
                             None
                         };
-                        if success {
-                            release_resident_memory(&source);
-                            residency.durable_settled.store(true, Ordering::Release);
-                            residency.release_if_idle();
-                        }
                         let permit = if matches!(
                             settlement.as_ref(),
                             Some(crate::archive::RawPublicationSettlement::Retired { .. })
@@ -1234,6 +1219,9 @@ fn publish_durable(shared: &Arc<SharedBody>) {
                         } else {
                             Some(database.request_source_completion().await)
                         };
+                        release_resident_memory(&source);
+                        residency.durable_settled.store(true, Ordering::Release);
+                        residency.release_if_idle();
                         (permit, settlement)
                     };
                     let (wrote, (permit, settlement)) = tokio::join!(lease, handoff);

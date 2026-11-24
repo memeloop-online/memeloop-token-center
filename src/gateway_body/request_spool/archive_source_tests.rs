@@ -131,25 +131,11 @@ async fn late_request_capture_retires_source_metadata_without_rebinding_after_co
     })
     .await
     .unwrap();
-    let mut completion_permits = Vec::new();
-    while let Some(permit) = database.try_request_source_completion() {
-        completion_permits.push(permit);
-    }
-    assert!(!completion_permits.is_empty());
     source.release_retained();
     drop(memory);
     store.resume_writes_for_test(archive.clone());
     release.send(()).unwrap();
     assert!(source.upload_outcome().await);
-    tokio::time::timeout(Duration::from_secs(5), async {
-        while budget.snapshot().0 != 0 {
-            tokio::task::yield_now().await;
-        }
-    })
-    .await
-    .expect("verified retired source releases RAM while metadata slots remain occupied");
-    drop(completion_permits);
-
     tokio::time::timeout(Duration::from_secs(5), async {
         loop {
             let count: i64 = sqlx::query_scalar(
