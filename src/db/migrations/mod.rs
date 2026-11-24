@@ -9,6 +9,7 @@ mod observation_prefix;
 mod online147;
 #[cfg(test)]
 mod online147_tests;
+mod online164;
 mod plaintext_sweep;
 #[cfg(test)]
 mod transport_policy_tests;
@@ -1756,6 +1757,7 @@ impl Database {
                 .execute(&mut *connection)
                 .await?;
             online147::prepare(&mut connection).await?;
+            online164::prepare(&mut connection).await?;
         }
         let mut transaction = connection.begin().await?;
         if matches!(self.backend, DatabaseBackend::PostgreSql) {
@@ -1968,15 +1970,18 @@ pub(super) async fn apply_migration_range(
             .execute(&mut **transaction)
             .await?;
         }
-        let execution =
-            if migration.version == 147 && transaction.as_mut().backend_name() == "PostgreSQL" {
-                online147::apply(&mut *transaction, migration.sql).await
-            } else {
-                sqlx::raw_sql(migration.sql)
-                    .execute(&mut **transaction)
-                    .await
-                    .map(|_| ())
-            };
+        let execution = if migration.version == 147
+            && transaction.as_mut().backend_name() == "PostgreSQL"
+        {
+            online147::apply(&mut *transaction, migration.sql).await
+        } else if migration.version == 164 && transaction.as_mut().backend_name() == "PostgreSQL" {
+            online164::apply(&mut *transaction, migration.sql).await
+        } else {
+            sqlx::raw_sql(migration.sql)
+                .execute(&mut **transaction)
+                .await
+                .map(|_| ())
+        };
         if let Err(error) = execution {
             tracing::error!(
                 migration_version = migration.version,
