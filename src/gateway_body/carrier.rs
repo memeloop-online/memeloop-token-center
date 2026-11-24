@@ -21,7 +21,7 @@ pub(crate) type CarrierStream = Pin<Box<dyn Stream<Item = Result<Bytes, AppError
 
 pub(crate) struct CarrierCapture {
     memory: Arc<ProxyMemoryBudget>,
-    workspace: Option<Arc<ProxyMemoryBudget>>,
+    workspace: Option<Arc<crate::api::proxy::persistence::Persistence>>,
     archive: Option<ArchiveStore>,
     staging: ArchiveStagingKey,
     parent: Option<Arc<BodyCarrier>>,
@@ -42,7 +42,10 @@ impl CarrierCapture {
         }
     }
 
-    pub(crate) fn with_workspace_budget(mut self, workspace: Arc<ProxyMemoryBudget>) -> Self {
+    pub(crate) fn with_upload_workspace(
+        mut self,
+        workspace: Arc<crate::api::proxy::persistence::Persistence>,
+    ) -> Self {
         self.workspace = Some(workspace);
         self
     }
@@ -82,7 +85,7 @@ enum Segment {
 
 pub(crate) struct BodyCarrier {
     memory: Arc<ProxyMemoryBudget>,
-    workspace: Option<Arc<ProxyMemoryBudget>>,
+    workspace: Option<Arc<crate::api::proxy::persistence::Persistence>>,
     archive: Option<ArchiveStore>,
     staging: ArchiveStagingKey,
     segments: Vec<Mutex<Segment>>,
@@ -472,12 +475,9 @@ impl BodyCarrier {
         let workspace = self
             .workspace
             .as_ref()
-            .map(|budget| {
-                budget
-                    .temporary(
-                        crate::response_archive_spool::CAPTURE_MEMORY_BYTES
-                            * super::memory::CAPTURE_MEMORY_WEIGHT,
-                    )
+            .map(|owner| {
+                owner
+                    .try_multipart_workspace()
                     .map_err(|_| AppError::storage("carrier_workspace_unavailable"))
             })
             .transpose()?;

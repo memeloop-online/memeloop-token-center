@@ -51,6 +51,29 @@ impl Default for Persistence {
 }
 
 impl Persistence {
+    /// One multipart envelope for every archive writer. Source credit is never
+    /// borrowed here; callers retain this owner through finish or abort.
+    pub(crate) async fn multipart_workspace(
+        &self,
+    ) -> Result<Arc<crate::gateway_body::memory::ProxyMemoryReservation>, AppError> {
+        self.upload_workspace
+            .temporary_wait(
+                crate::response_archive_spool::CAPTURE_MEMORY_BYTES,
+                crate::gateway_body::memory::CAPTURE_MEMORY_WEIGHT,
+            )
+            .await
+            .ok_or_else(|| AppError::internal("archive_workspace_closed"))
+    }
+
+    pub(crate) fn try_multipart_workspace(
+        &self,
+    ) -> Result<Arc<crate::gateway_body::memory::ProxyMemoryReservation>, AppError> {
+        self.upload_workspace.temporary(
+            crate::response_archive_spool::CAPTURE_MEMORY_BYTES
+                * crate::gateway_body::memory::CAPTURE_MEMORY_WEIGHT,
+        )
+    }
+
     pub(crate) fn register_archive(self: &Arc<Self>) -> ArchiveActivity {
         self.archives.fetch_add(1, Ordering::Release);
         ArchiveActivity(self.clone())

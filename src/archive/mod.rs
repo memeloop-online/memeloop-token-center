@@ -1,3 +1,5 @@
+#[cfg(test)]
+pub(crate) mod multipart_test_gate;
 use std::{sync::Arc, time::Duration};
 
 use object_store::ObjectStore;
