@@ -2390,6 +2390,8 @@ pub(super) async fn emit_conversation_projected_event_in_transaction(
     let request_id = request_id.to_string();
     let tenant_id = tenant_id.to_string();
     let key_id = key_id.to_string();
+    let pending_started =
+        super::lifecycle::prepare_pending_started_in_transaction(transaction, &request_id).await?;
     super::super::history_immutable_outbox::capture_request_in_transaction(
         transaction,
         &request_id,
@@ -2428,6 +2430,12 @@ pub(super) async fn emit_conversation_projected_event_in_transaction(
         ),
         None => None,
     };
+    crate::db::history_immutable_outbox::PreparedEventCapture::publish(
+        transaction,
+        pending_started,
+        unix_millis(),
+    )
+    .await?;
     let inserted = crate::db::history_immutable_outbox::PreparedEventCapture::publish(
         transaction,
         prepared,

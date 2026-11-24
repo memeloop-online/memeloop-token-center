@@ -498,7 +498,7 @@ impl Database {
         upstream_model: Option<&str>,
         output_token_limit: Option<i64>,
     ) -> Result<UsageReservation, AppError> {
-        self.start_proxy_request_inner(input, None, true, upstream_model, output_token_limit)
+        self.start_proxy_request_inner(input, None, false, upstream_model, output_token_limit)
             .await
             .map(|started| started.reservation)
             .map_err(|error| match error {
@@ -526,10 +526,13 @@ impl Database {
         let Some(row) = row else {
             return Ok(());
         };
+        publish_pending_started_in_transaction(&mut transaction, &identity.request_id.to_string())
+            .await?;
         let published: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM request_events WHERE request_id = $1 AND tenant_id = $2 AND event_kind = 'started'")
             .bind(identity.request_id.to_string()).bind(identity.tenant_id.to_string())
             .fetch_one(&mut *transaction).await?;
         if published != 0 {
+            transaction.commit().await?;
             return Ok(());
         }
         let started = NewRequest {
@@ -836,6 +839,12 @@ impl Database {
         if publish_started {
             insert_request_started_event_in_transaction(&mut transaction, &started_request, now)
                 .await?;
+        }
+        if !publish_started {
+            sqlx::query("UPDATE request_records SET started_event_pending = 1 WHERE id = $1 AND reservation_id = $2")
+                .bind(started_request.request_id.to_string())
+                .bind(started_request.reservation_id.to_string())
+                .execute(&mut *transaction).await?;
         }
         // No cancellation deadline: only a positively observed COMMIT permits
         // dispatch. Unknown COMMIT returns unavailable, leaving orphan recovery
@@ -2543,11 +2552,86 @@ pub(crate) async fn insert_request_started_record_in_transaction(
     Ok(())
 }
 
+pub(super) async fn publish_pending_started_in_transaction(
+    transaction: &mut Transaction<'_, Any>,
+    request_id: &str,
+) -> Result<(), AppError> {
+    let prepared = prepare_pending_started_in_transaction(transaction, request_id).await?;
+    crate::db::history_immutable_outbox::PreparedEventCapture::publish(
+        transaction,
+        prepared,
+        unix_millis(),
+    )
+    .await?;
+    Ok(())
+}
+
+pub(super) async fn try_request_event_cursor(
+    transaction: &mut Transaction<'_, Any>,
+) -> Result<bool, AppError> {
+    if transaction.as_mut().backend_name() != "PostgreSQL" {
+        return Ok(true);
+    }
+    Ok(
+        sqlx::query_scalar("SELECT pg_try_advisory_xact_lock($1, $2)")
+            .bind(REQUEST_EVENT_CURSOR_LOCK_NAMESPACE)
+            .bind(REQUEST_EVENT_CURSOR_LOCK_KEY)
+            .fetch_one(&mut **transaction)
+            .await?,
+    )
+}
+
+pub(super) async fn prepare_pending_started_in_transaction(
+    transaction: &mut Transaction<'_, Any>,
+    request_id: &str,
+) -> Result<Option<crate::db::history_immutable_outbox::PreparedEventCapture>, AppError> {
+    // The row lock serializes recovery with terminal publishers. Clearing the
+    // obligation and publishing the event share a commit, including retries.
+    let row = sqlx::query("UPDATE request_records SET started_event_pending = started_event_pending WHERE id = $1 AND started_event_pending = 1 RETURNING *")
+        .bind(request_id).fetch_optional(&mut **transaction).await?;
+    let Some(row) = row else {
+        return Ok(None);
+    };
+    let request = NewRequest {
+        request_id: parse_uuid(row.try_get("id")?)?,
+        tenant_id: parse_uuid(row.try_get("tenant_id")?)?,
+        key_id: parse_uuid(row.try_get("key_id")?)?,
+        reservation_id: parse_uuid(row.try_get("reservation_id")?)?,
+        protocol: row.try_get("protocol")?,
+        model: row.try_get("model")?,
+        request_object: row.try_get("request_object")?,
+        upstream_account_id: None,
+        model_route_id: None,
+    };
+    let prepared = prepare_request_started_event_in_transaction(
+        transaction,
+        &request,
+        row.try_get("created_at")?,
+    )
+    .await?;
+    sqlx::query("UPDATE request_records SET started_event_pending = 0 WHERE id = $1")
+        .bind(request_id)
+        .execute(&mut **transaction)
+        .await?;
+    Ok(prepared)
+}
+
 async fn insert_request_started_event_in_transaction(
     transaction: &mut Transaction<'_, Any>,
     request: &NewRequest,
     now: i64,
 ) -> Result<(), AppError> {
+    let prepared = prepare_request_started_event_in_transaction(transaction, request, now).await?;
+    crate::db::history_immutable_outbox::PreparedEventCapture::publish(transaction, prepared, now)
+        .await?;
+    Ok(())
+}
+
+async fn prepare_request_started_event_in_transaction(
+    transaction: &mut Transaction<'_, Any>,
+    request: &NewRequest,
+    now: i64,
+) -> Result<Option<crate::db::history_immutable_outbox::PreparedEventCapture>, AppError> {
     let request_id = request.request_id.to_string();
     let tenant_id = request.tenant_id.to_string();
     let key_id = request.key_id.to_string();
@@ -2556,7 +2640,7 @@ async fn insert_request_started_event_in_transaction(
         event_at: now,
     };
     let draft_row = sqlx::query(
-        r#"SELECT CAST($1 AS TEXT) AS event_id, CAST($2 AS TEXT) AS tenant_id, CAST($3 AS TEXT) AS key_id, CAST($4 AS TEXT) AS request_id, CAST($5 AS BIGINT) AS event_at, CAST('started' AS TEXT) AS event_kind, CAST($6 AS TEXT) AS protocol, CAST($7 AS TEXT) AS model, CAST(NULL AS BIGINT) AS status_code, CAST(NULL AS BIGINT) AS duration_ms, CAST(0 AS BIGINT) AS input_tokens, CAST(0 AS BIGINT) AS output_tokens, CAST(0 AS BIGINT) AS cost_micros, CAST(NULL AS TEXT) AS error_code WHERE EXISTS (SELECT 1 FROM request_records WHERE id = $4 AND tenant_id = $2 AND key_id = $3 AND completed_at IS NULL)"#,
+        r#"SELECT CAST($1 AS TEXT) AS event_id, CAST($2 AS TEXT) AS tenant_id, CAST($3 AS TEXT) AS key_id, CAST($4 AS TEXT) AS request_id, CAST($5 AS BIGINT) AS event_at, CAST('started' AS TEXT) AS event_kind, CAST($6 AS TEXT) AS protocol, CAST($7 AS TEXT) AS model, CAST(NULL AS BIGINT) AS status_code, CAST(NULL AS BIGINT) AS duration_ms, CAST(0 AS BIGINT) AS input_tokens, CAST(0 AS BIGINT) AS output_tokens, CAST(0 AS BIGINT) AS cost_micros, CAST(NULL AS TEXT) AS error_code WHERE EXISTS (SELECT 1 FROM request_records WHERE id = $4 AND tenant_id = $2 AND key_id = $3)"#,
     )
     .bind(&draft_cursor.event_id)
     .bind(&tenant_id)
@@ -2575,9 +2659,7 @@ async fn insert_request_started_event_in_transaction(
         ),
         None => None,
     };
-    crate::db::history_immutable_outbox::PreparedEventCapture::publish(transaction, prepared, now)
-        .await?;
-    Ok(())
+    Ok(prepared)
 }
 
 pub(crate) async fn record_request_finished_in_transaction(
@@ -2908,6 +2990,7 @@ async fn record_request_finished_with_basis_and_metering_in_transaction(
                 .await?;
         }
     }
+    let pending_started = prepare_pending_started_in_transaction(tx, &request_id).await?;
     super::super::history_immutable_outbox::capture_native_in_transaction(tx, &request_id).await?;
     let draft_cursor = crate::db::RequestEventCursor {
         event_id: Uuid::nil().to_string(),
@@ -2930,6 +3013,12 @@ async fn record_request_finished_with_basis_and_metering_in_transaction(
         ),
         None => None,
     };
+    crate::db::history_immutable_outbox::PreparedEventCapture::publish(
+        tx,
+        pending_started,
+        completed_at,
+    )
+    .await?;
     let inserted = crate::db::history_immutable_outbox::PreparedEventCapture::publish(
         tx,
         prepared,
