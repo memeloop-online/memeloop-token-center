@@ -218,6 +218,50 @@ impl Database {
         selection: RouteSelectionOptions,
         recovery_probe: bool,
     ) -> Result<Vec<AuthorizedUpstreamCandidate>, AppError> {
+        self.list_dispatch_candidates_snapshot(
+            key_id,
+            tenant_id,
+            public_model,
+            protocol,
+            selection,
+            recovery_probe,
+            true,
+        )
+        .await
+    }
+
+    /// Fresh dispatch admission always repeats grants, eligibility and quota
+    /// filters; it cannot use the legacy empty-eligibility fallback.
+    pub(crate) async fn refresh_authorized_dispatch_candidates(
+        &self,
+        key_id: Uuid,
+        tenant_id: Uuid,
+        public_model: &str,
+        protocol: &str,
+        selection: RouteSelectionOptions,
+    ) -> Result<Vec<AuthorizedUpstreamCandidate>, AppError> {
+        self.list_dispatch_candidates_snapshot(
+            key_id,
+            tenant_id,
+            public_model,
+            protocol,
+            selection,
+            false,
+            false,
+        )
+        .await
+    }
+
+    async fn list_dispatch_candidates_snapshot(
+        &self,
+        key_id: Uuid,
+        tenant_id: Uuid,
+        public_model: &str,
+        protocol: &str,
+        selection: RouteSelectionOptions,
+        recovery_probe: bool,
+        allow_empty_fallback: bool,
+    ) -> Result<Vec<AuthorizedUpstreamCandidate>, AppError> {
         let RouteSelectionOptions {
             upstream_account_hint,
             avoid_route_account,
@@ -269,7 +313,7 @@ impl Database {
         .bind(unix_millis())
         .fetch_all(&self.pool)
         .await?;
-        let rows = if rows.is_empty() {
+        let rows = if rows.is_empty() && allow_empty_fallback {
             // An empty authorized set must not stop the request. Catalog
             // eligibility and grants can hide every account; dispatch still
             // needs one active upstream on this route.
