@@ -1704,3 +1704,60 @@ async fn failed_capture_fact_is_retried_after_object_storage_recovers() {
     );
     assert_eq!(state.persistence.stream_memory.snapshot().0, 0);
 }
+
+#[tokio::test]
+async fn concurrent_staging_keeps_large_segments_under_source_credit_without_workspace_copy() {
+    let (_dir, state, pool, first) = fixture().await;
+    let second = ArchiveSpoolIdentity {
+        request_id: Uuid::new_v4(),
+        tenant_id: first.tenant_id,
+        reservation_id: Uuid::new_v4(),
+    };
+    sqlx::query("INSERT INTO request_records (id, tenant_id, key_id, created_at, protocol, model, input_tokens, output_tokens, cost_micros, request_object, reservation_id) VALUES ($1, $2, $3, 1, 'responses', 'test', 0, 0, 0, 'gap://test/request', $4)")
+        .bind(second.request_id.to_string()).bind(second.tenant_id.to_string()).bind(Uuid::new_v4().to_string()).bind(second.reservation_id.to_string()).execute(&pool).await.unwrap();
+    let large = Bytes::from(vec![b'l'; 17 * 1024 * 1024]);
+    let partner = Bytes::from(vec![b'p'; 8 * 1024 * 1024]);
+    assert!(
+        large.len()
+            > super::CAPTURE_MEMORY_BYTES * crate::gateway_body::memory::CAPTURE_MEMORY_WEIGHT
+    );
+    let mut a = ResponseArchiveProducer::begin_original(&state, first)
+        .await
+        .unwrap();
+    let mut b = ResponseArchiveProducer::begin_original(&state, second)
+        .await
+        .unwrap();
+    assert!(a.try_offer(large.clone()));
+    assert!(b.try_offer(partner.clone()));
+    let source_used = state.persistence.stream_memory.snapshot().0;
+    assert!(source_used >= large.len() + partner.len());
+    assert!(source_used <= super::RAW_SOURCE_MEMORY_BYTES);
+    let (a, b) = (a.seal().unwrap(), b.seal().unwrap());
+    tokio::time::timeout(std::time::Duration::from_secs(30), async {
+        tokio::join!(a.wait(), b.wait());
+    })
+    .await
+    .unwrap();
+    for (identity, expected) in [(first, large), (second, partner)] {
+        let reference = state
+            .archive
+            .raw_capture_reference(identity.tenant_id, identity.request_id, "response")
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            reference.blake3_digest,
+            blake3::hash(&expected).to_hex().to_string()
+        );
+        assert_eq!(
+            state
+                .archive
+                .get_tenant_content(identity.tenant_id, &reference, expected.len())
+                .await
+                .unwrap(),
+            expected
+        );
+    }
+    assert_eq!(state.persistence.stream_memory.snapshot().0, 0);
+    assert_eq!(state.persistence.upload_workspace.snapshot().0, 0);
+}

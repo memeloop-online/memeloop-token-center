@@ -222,6 +222,7 @@ jobs:
             response_archive_spool::tests::concurrent_byte_charged_taps_preserve_every_original \
             response_archive_spool::tests::exhausted_archival_credit_records_failure_without_a_prefix_root \
             response_archive_spool::tests::source_credit_survives_four_upload_contenders_without_cross_pool_starvation \
+            response_archive_spool::tests::concurrent_staging_keeps_large_segments_under_source_credit_without_workspace_copy \
             response_archive_spool::tests::failed_capture_fact_is_retried_after_object_storage_recovers
           do
             echo "Contract: $selector"
