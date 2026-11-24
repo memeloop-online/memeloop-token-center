@@ -58,7 +58,25 @@ async fn postgres164_nowait_preserves_frontend_and_resumes_partition_indexes() {
     let absent:bool=sqlx::query_scalar("SELECT NOT EXISTS(SELECT 1 FROM pg_attribute WHERE attrelid='request_records'::regclass AND attname='started_event_pending')").fetch_one(&db.pool).await.unwrap();
     assert!(absent);
     holder.rollback().await.unwrap();
+    // Simulate a process exit after the committed column and first leaf CIC.
+    sqlx::query(
+        "ALTER TABLE request_records ADD COLUMN started_event_pending BIGINT NOT NULL DEFAULT 0",
+    )
+    .execute(&mut *c)
+    .await
+    .unwrap();
+    let oid: i64 = sqlx::query_scalar("SELECT 'request_records_p0'::regclass::oid::bigint")
+        .fetch_one(&mut *c)
+        .await
+        .unwrap();
+    sqlx::query(sqlx::AssertSqlSafe(format!("CREATE INDEX CONCURRENTLY mtc164_{oid} ON request_records_p0(created_at,id) WHERE started_event_pending=1"))).execute(&mut *c).await.unwrap();
+    let mut resumed_reader = db.pool.begin().await.unwrap();
+    sqlx::query("LOCK TABLE request_records_p0 IN ACCESS SHARE MODE")
+        .execute(&mut *resumed_reader)
+        .await
+        .unwrap();
     online164::prepare(&mut c).await.unwrap();
+    resumed_reader.rollback().await.unwrap();
     online164::prepare(&mut c).await.unwrap();
     let mut tx = c.begin().await.unwrap();
     apply_migration_range(&mut tx, POSTGRES_MIGRATIONS, 164, 164)
