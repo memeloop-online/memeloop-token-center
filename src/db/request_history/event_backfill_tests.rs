@@ -179,6 +179,10 @@ async fn sqlite_selected_source_page_does_not_wait_for_events() {
 
 async fn assert_selected_source(database: &Database) {
     use crate::request_history::HistorySource;
+    sqlx::query("UPDATE request_history_state SET mode='shadow' WHERE id=1")
+        .execute(&database.pool)
+        .await
+        .unwrap();
     let id = Uuid::now_v7();
     let tenant = Uuid::now_v7();
     let key = Uuid::now_v7();
