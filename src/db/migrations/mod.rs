@@ -868,6 +868,11 @@ pub(crate) const SQLITE_MIGRATIONS: &[Migration] = &[
         name: "proxy_started_obligation",
         sql: include_str!("../../../migrations/common/0164_proxy_started_obligation.sql"),
     },
+    Migration {
+        version: 165,
+        name: "history_watermark_proof",
+        sql: include_str!("../../../migrations/common/0165_history_watermark_proof.sql"),
+    },
 ];
 
 pub(crate) const POSTGRES_MIGRATIONS: &[Migration] = &[
@@ -1710,6 +1715,11 @@ pub(crate) const POSTGRES_MIGRATIONS: &[Migration] = &[
         version: 164,
         name: "proxy_started_obligation",
         sql: include_str!("../../../migrations/common/0164_proxy_started_obligation.sql"),
+    },
+    Migration {
+        version: 165,
+        name: "history_watermark_proof",
+        sql: include_str!("../../../migrations/common/0165_history_watermark_proof.sql"),
     },
 ];
 

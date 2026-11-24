@@ -70,6 +70,7 @@ mod group_routing;
 mod groups;
 mod history_delivery;
 mod history_source_snapshot;
+mod history_watermark;
 mod http_settings;
 mod migrations;
 mod monitoring_snapshot;
