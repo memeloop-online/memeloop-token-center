@@ -14,10 +14,9 @@ jobs:
       max-parallel: 4
       matrix:
         revision:
-          - name: base
-            sha: 46926d5993fdd36224eeea584b915102c1cea2ae
+          # Baseline shards are already captured by run 45412878130.
           - name: head
-            sha: c8fae3428bae53bdd33749397a3fea7cd58f6139
+            sha: 335dd01de4d6eee64c9d39638168a5e3eefe9cd9
         shard: [1, 2, 3, 4]
     env:
       CARGO_BUILD_JOBS: "2"
