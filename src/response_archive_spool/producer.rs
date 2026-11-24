@@ -605,7 +605,7 @@ impl Drop for CaptureQueueMemory {
     }
 }
 
-async fn fence_failed_capture(
+pub(super) async fn fence_failed_capture(
     state: &AppState,
     identity: ArchiveSpoolIdentity,
     target: CaptureTarget,

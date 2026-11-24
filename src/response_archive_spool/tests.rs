@@ -1623,3 +1623,73 @@ async fn sealed_source_releases_credit_before_retrying_saturated_upload_workspac
     );
     assert_eq!(state.persistence.stream_memory.snapshot().0, 0);
 }
+
+#[tokio::test]
+async fn failed_capture_fact_is_retried_after_object_storage_recovers() {
+    use std::sync::{
+        Arc,
+        atomic::{AtomicBool, AtomicUsize, Ordering},
+    };
+    use wiremock::{Mock, MockServer, ResponseTemplate, matchers::any};
+    let server = MockServer::start().await;
+    let healthy = Arc::new(AtomicBool::new(false));
+    let accepted = Arc::new(AtomicUsize::new(0));
+    let health = healthy.clone();
+    let acknowledgements = accepted.clone();
+    Mock::given(any())
+        .respond_with(move |_request: &wiremock::Request| {
+            if health.load(Ordering::Acquire) {
+                acknowledgements.fetch_add(1, Ordering::Release);
+                ResponseTemplate::new(200)
+            } else {
+                ResponseTemplate::new(503)
+            }
+        })
+        .mount(&server)
+        .await;
+    let (_dir, mut state, _pool, identity) = fixture().await;
+    let mut config = (*state.config).clone();
+    config.archive_backend = crate::config::ArchiveBackend::S3;
+    config.s3_endpoint = Some(server.uri());
+    config.s3_bucket = Some("failure-fact-contract".into());
+    config.s3_access_key = Some("synthetic".into());
+    config.s3_secret_key = Some("synthetic".into());
+    config.s3_allow_http = true;
+    state.archive = crate::archive::ArchiveStore::from_config(&config)
+        .await
+        .unwrap();
+    assert!(
+        tokio::time::timeout(
+            std::time::Duration::from_secs(20),
+            producer::fence_failed_capture(&state, identity, CaptureTarget::Response)
+        )
+        .await
+        .unwrap()
+        .is_err()
+    );
+    assert!(
+        tokio::time::timeout(
+            std::time::Duration::from_millis(100),
+            state.persistence.drain()
+        )
+        .await
+        .is_err(),
+        "existing background owner must retain the missing failure fact"
+    );
+    healthy.store(true, Ordering::Release);
+    tokio::time::timeout(
+        std::time::Duration::from_secs(20),
+        state.persistence.drain(),
+    )
+    .await
+    .expect("background owner must finish after the failure fact PUT is acknowledged");
+    assert!(accepted.load(Ordering::Acquire) > 0);
+    let requests = server.received_requests().await.unwrap();
+    assert!(
+        requests
+            .iter()
+            .all(|r| r.method.as_str() == "PUT" && r.url.path().ends_with("/response.json.failed")),
+        "only the failure fact may publish; no prefix root or supplier replay"
+    );
+    assert_eq!(state.persistence.stream_memory.snapshot().0, 0);
+}
