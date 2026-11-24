@@ -10,7 +10,7 @@ post('/internal/v1/prices/USD/'+MODEL,{'input_per_million':'0.01','output_per_mi
 k=post('/internal/v1/keys',{'tenant_external_id':TENANT,'principal_external_id':TENANT,'alias':'isolated image e2e','currency':'USD','initial_balance':'100','route_ids':[r['id']],'policy':{'requests_per_minute':60,'tokens_per_minute':100000,'max_concurrency':1,'enforcement_mode':'metered_unlimited','daily_budget':None,'weekly_budget':None,'lifetime_budget':None}})['key']
 req=urllib.request.Request(BASE+'/v1/chat/completions',data=json.dumps({'model':MODEL,'messages':[{'role':'user','content':'synthetic image e2e'}],'stream':True,'max_tokens':1,'benchmark':{'mode':'stream','bytes':4096,'chunk_bytes':4096,'delay_ms':0}}).encode(),headers={'Authorization':'Bearer '+k,'Content-Type':'application/json','x-mtc-conversation-id':SESSION},method='POST')
 with urllib.request.urlopen(req,timeout=60) as x:
- rid=x.headers.get('x-mtc-request-id'); body=x.read(); assert x.status==200 and rid and b'data: [DONE]' in body
+ rid=x.headers.get('x-mtc-request-id'); body=x.read(); assert x.status==200 and rid and body.count(b'data: [DONE]')==1
 print(json.dumps({'request_id':rid,'stream_status':200,'stream_bytes':len(body),'stream_sha256':hashlib.sha256(body).hexdigest(),'terminal':True}))
 for i in range(90):
  try:
@@ -20,6 +20,7 @@ for i in range(90):
  time.sleep(2)
 else:raise RuntimeError('request terminal, usage and archive did not converge')
 assert d['request_id']==rid
+assert d['usage']['tokens']['input_tokens']==2 and d['usage']['tokens']['output_tokens']==1
 for side in ('request','response'):
  status,_,raw=request('/self/v1/requests/'+rid+'/archive/'+side,token=k);assert status==200 and raw
  print(json.dumps({'request_id':rid,'side':side,'status':status,'bytes':len(raw),'sha256':hashlib.sha256(raw).hexdigest()}))

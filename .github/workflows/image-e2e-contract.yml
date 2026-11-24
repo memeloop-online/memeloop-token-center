@@ -40,10 +40,10 @@ jobs:
           docker run -d --name image-e2e-rustfs --network host --memory 1g --env RUSTFS_ACCESS_KEY --env RUSTFS_SECRET_KEY --env RUSTFS_ADDRESS=:19000 --env RUSTFS_CONSOLE_ENABLE=false --env RUSTFS_OBS_LOG_DIRECTORY= --entrypoint /usr/bin/rustfs rustfs/rustfs:1.0.4@sha256:ed9210d6411d77ffceb70d94b964a3cb7d225983368bc25bebe01e995293dcc2 /data
           for n in $(seq 1 60); do curl -fsS --aws-sigv4 'aws:amz:us-east-1:s3' --user "$RUSTFS_ACCESS_KEY:$RUSTFS_SECRET_KEY" -X PUT http://127.0.0.1:19000/image-e2e && exit 0; sleep 2; done
           exit 1
-      - name: Start exact signed candidate
+      - name: Start exact candidate
         run: |
           docker run -d --name image-e2e-service --network host \
-            -e MTC_LISTEN=0.0.0.0:18080 \
+            -e MTC_LISTEN=127.0.0.1:18080 -e MTC_ALLOW_OAUTH_LOOPBACK=true \
             -e MTC_DATABASE_URL=postgres://token_center:synthetic-test-only@127.0.0.1:5432/token_center_test \
             -e MTC_KEY_PEPPER=synthetic-pepper-0123456789abcdef \
             -e MTC_SERVICE_TOKEN=synthetic-service-token-0123456789abcdef \
