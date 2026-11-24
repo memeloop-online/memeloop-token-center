@@ -341,7 +341,8 @@ jobs:
           cargo test --locked --lib --no-run
           for selector in \
             gateway_body::carrier::small_put_tests::real_s3_small_spill_uses_one_put_and_large_boundary_keeps_multipart \
-            gateway_body::carrier::small_put_tests::real_s3_small_spill_lost_ack_retains_source_and_routes_both_backends
+            gateway_body::carrier::small_put_tests::real_s3_small_spill_lost_ack_retains_source_and_routes_both_backends \
+            gateway_body::carrier::small_put_tests::real_s3_small_spill_compares_previous_multipart_at_same_distribution_and_concurrency
           do
             timeout 180s cargo test --locked --lib "$selector" -- --ignored --exact --nocapture 2>&1 | tee /tmp/carrier-put-contract.log
             grep -F '1 passed; 0 failed' /tmp/carrier-put-contract.log

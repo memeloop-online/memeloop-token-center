@@ -178,3 +178,105 @@ async fn real_s3_small_spill_lost_ack_retains_source_and_routes_both_backends() 
         assert_eq!(upload.upload_workspace.snapshot().0, 0);
     }
 }
+
+#[tokio::test]
+#[ignore = "requires isolated RustFS fixture"]
+async fn real_s3_small_spill_compares_previous_multipart_at_same_distribution_and_concurrency() {
+    let endpoint = std::env::var("MTC_RUSTFS_TEST_ENDPOINT").unwrap();
+    for previous in [true, false] {
+        let proxy = RecoveryObjectProxy::start(&endpoint).await;
+        let archive = ArchiveStore::from_config(&config(&proxy).await)
+            .await
+            .unwrap();
+        let upload = Arc::new(crate::api::proxy::persistence::Persistence::default());
+        let sizes: Vec<usize> = [1024, 4096, 16384, 65536]
+            .into_iter()
+            .cycle()
+            .take(16)
+            .collect();
+        let total: usize = sizes.iter().sum();
+        let started = std::time::Instant::now();
+        let samples: Vec<u64> = stream::iter(sizes)
+            .map(|size| {
+                let archive = archive.clone();
+                let upload = upload.clone();
+                async move {
+                    let (carrier, memory) = source(&archive, size, upload.clone(), key()).await;
+                    let began = std::time::Instant::now();
+                    if previous {
+                        // Exact prior offload sequence, same receipt and envelope.
+                        let workspace = upload
+                            .multipart_workspace(
+                                crate::api::proxy::persistence::WorkspaceRole::CarrierSpill,
+                            )
+                            .await
+                            .unwrap();
+                        let bytes = match &*carrier.segments[0].lock().unwrap() {
+                            Segment::Ram(b) => b.clone(),
+                            _ => unreachable!(),
+                        };
+                        let locator = format!(
+                            "{}/carrier-{}",
+                            carrier.staging.canonical_prefix(),
+                            uuid::Uuid::now_v7()
+                        );
+                        let owner =
+                            CarrierObjectOwner::new(carrier.staging, locator.clone(), &bytes)
+                                .unwrap();
+                        archive.begin_carrier_object(&owner).await.unwrap();
+                        let mut writer = archive.start_writer(&locator).await.unwrap();
+                        writer.retain_workspace(workspace);
+                        writer.write(bytes.clone()).await.unwrap();
+                        let staged = writer.finish_staged().await.unwrap();
+                        assert_eq!(staged.size_bytes, size as u64);
+                        assert_eq!(staged.blake3_digest, carrier.digest());
+                        assert_eq!(
+                            archive
+                                .get_bounded(&staged.object_locator, size)
+                                .await
+                                .unwrap(),
+                            bytes
+                        );
+                        drop(bytes);
+                        drop(carrier);
+                    } else {
+                        assert!(carrier.offload_one().await.unwrap());
+                        let locator = match &*carrier.segments[0].lock().unwrap() {
+                            Segment::Object(r) => r.object_locator.clone(),
+                            _ => unreachable!(),
+                        };
+                        assert_eq!(
+                            archive.get_bounded(&locator, size).await.unwrap(),
+                            Bytes::from(vec![b'x'; size])
+                        );
+                        drop(carrier);
+                    }
+                    assert_eq!(memory.snapshot().0, 0);
+                    began.elapsed().as_micros() as u64
+                }
+            })
+            .buffer_unordered(2)
+            .collect()
+            .await;
+        let elapsed = started.elapsed();
+        let mut ordered = samples;
+        ordered.sort_unstable();
+        let counts = proxy.counts();
+        if previous {
+            assert_eq!(counts.get("multipart_create"), Some(&16));
+            assert_eq!(counts.get("multipart_complete"), Some(&16));
+        } else {
+            assert_eq!(counts.get("body_put"), Some(&16));
+            assert_eq!(counts.get("multipart_create").copied().unwrap_or(0), 0);
+        }
+        assert_eq!(upload.upload_workspace.snapshot().0, 0);
+        eprintln!(
+            "synthetic_spill_comparison previous={previous} concurrency=2 objects=16 bytes={total} elapsed_us={} throughput_bytes_s={:.2} lifetime_p50_us={} lifetime_p95_us={} lifetime_p99_us={} operations={counts:?}",
+            elapsed.as_micros(),
+            total as f64 / elapsed.as_secs_f64(),
+            ordered[7],
+            ordered[15],
+            ordered[15]
+        );
+    }
+}
