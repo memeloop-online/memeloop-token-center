@@ -293,11 +293,18 @@ async fn rewrite_session_body_observation_in_transaction(
     tenant_id: &str,
     request_id: &str,
     snapshot: &ConversationSemanticSnapshot,
+    prepared_paths: Option<&prefix_storage::PreparedCandidatePaths>,
 ) -> Result<bool, ConversationContentError> {
     if let Some(leaf) = snapshot.leaf.as_deref() {
         let mut roots = std::collections::BTreeSet::new();
         roots.insert(leaf.to_owned());
-        let graph = prefix_storage::load_paths(transaction, tenant_id, roots).await?;
+        let loaded;
+        let graph = if let Some(prepared) = prepared_paths {
+            prepared.for_fresh_candidates(tenant_id, &[], Some(leaf))?
+        } else {
+            loaded = prefix_storage::load_paths(transaction, tenant_id, roots).await?;
+            &loaded
+        };
         let full = graph.hashes(Some(leaf), None)?;
         if full
             .iter()
@@ -355,6 +362,7 @@ async fn rewrite_reopened_session_body_if_present(
         &tenant_id,
         &request_id,
         &snapshot,
+        None,
     )
     .await?;
     Ok(())
@@ -1404,6 +1412,7 @@ impl Database {
                 &tenant,
                 &request,
                 snapshot,
+                Some(&prepared_paths),
             )
             .await?
         } else {

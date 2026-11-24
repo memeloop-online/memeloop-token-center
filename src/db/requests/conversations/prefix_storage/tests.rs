@@ -727,7 +727,7 @@ async fn postgres_prefix_preload_releases_projection_scope_before_graph_receive(
     sqlx::query("INSERT INTO conversation_projection_outbox(request_id,tenant_id,key_id,principal_id,request_json,hints_json,observed_at,semantic_snapshot_json,lease_owner,lease_expires_at) VALUES($1,$2,$3,$4,'{}',$5,$6,$7,$8,$9)")
         .bind(request.to_string()).bind(actor.tenant_id.to_string()).bind(actor.key_id.to_string()).bind(actor.principal_id.to_string()).bind(serde_json::to_string(&hints).unwrap()).bind(now+1).bind(&snapshot).bind(owner.to_string()).bind(now+60000).execute(&database.pool).await.unwrap();
     // A real recursive SELECT is suspended before its result is received.
-    sqlx::raw_sql("CREATE FUNCTION prefix_receive_gate() RETURNS BOOLEAN LANGUAGE plpgsql VOLATILE AS $$ BEGIN PERFORM pg_advisory_xact_lock(91844,1); RETURN TRUE; END $$; ALTER TABLE context_nodes RENAME TO prefix_nodes; CREATE VIEW context_nodes AS SELECT * FROM prefix_nodes WHERE prefix_receive_gate()")
+    sqlx::raw_sql("CREATE FUNCTION prefix_receive_gate() RETURNS BOOLEAN LANGUAGE plpgsql VOLATILE AS $$ BEGIN IF EXISTS (SELECT 1 FROM pg_locks WHERE pid=pg_backend_pid() AND relation='request_records'::regclass AND mode IN ('RowShareLock','RowExclusiveLock') AND granted) THEN RAISE EXCEPTION 'recursive prefix received under request scope lock'; END IF; PERFORM pg_advisory_xact_lock(91844,1); RETURN TRUE; END $$; ALTER TABLE context_nodes RENAME TO prefix_nodes; CREATE VIEW context_nodes AS SELECT * FROM prefix_nodes WHERE prefix_receive_gate()")
         .execute(&database.pool).await.unwrap();
     let mut blocker = database.pool.begin().await.unwrap();
     sqlx::query("SELECT pg_advisory_xact_lock(91844,1)")
@@ -791,8 +791,6 @@ async fn postgres_prefix_preload_releases_projection_scope_before_graph_receive(
             .await
             .unwrap();
     assert_eq!(count, 0);
-    sqlx::raw_sql("DROP VIEW context_nodes; ALTER TABLE prefix_nodes RENAME TO context_nodes; DROP FUNCTION prefix_receive_gate()")
-        .execute(&database.pool).await.unwrap();
     assert!(
         database
             .project_claimed_conversation_projection_task(replacement, request)
@@ -812,6 +810,8 @@ async fn postgres_prefix_preload_releases_projection_scope_before_graph_receive(
             .await
             .unwrap();
     assert_eq!(cluster, expected_cluster.to_string());
+    sqlx::raw_sql("DROP VIEW context_nodes; ALTER TABLE prefix_nodes RENAME TO context_nodes; DROP FUNCTION prefix_receive_gate()")
+        .execute(&database.pool).await.unwrap();
     database.pool.close().await;
     sqlx::query(sqlx::AssertSqlSafe(format!("DROP SCHEMA {schema} CASCADE")))
         .execute(&admin)
