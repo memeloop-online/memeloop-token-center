@@ -97,6 +97,7 @@ async fn credential_expiring_after_resolution_skips_to_prepared_standby() {
     assert_eq!(candidates[0].account_id, fixture.upstream_account_id);
     expire_current_credential_metadata(&fixture).await;
 
+    let mut snapshot_refresh_used = false;
     let prepared = prepare_authorized_proxy_routes(AuthorizedProxyRoutesInput {
         request: ProxyRequestContext {
             state: &fixture.state,
@@ -110,6 +111,12 @@ async fn credential_expiring_after_resolution_skips_to_prepared_standby() {
         },
         original_body_length: serde_json::to_vec(&request).unwrap().len(),
         candidates,
+        selection: RouteSelectionOptions {
+            upstream_account_hint: None,
+            avoid_route_account: None,
+            selection_seed: request_id,
+        },
+        snapshot_refresh_used: &mut snapshot_refresh_used,
     })
     .await
     .unwrap();
@@ -201,6 +208,7 @@ async fn local_codex_chat_protocol_keeps_priority_over_native_candidate() {
         "messages": [{"role": "user", "content": "local mismatch"}],
         "stream": false
     });
+    let mut snapshot_refresh_used = false;
     let prepared = prepare_authorized_proxy_routes(AuthorizedProxyRoutesInput {
         request: ProxyRequestContext {
             state: &fixture.state,
@@ -214,6 +222,12 @@ async fn local_codex_chat_protocol_keeps_priority_over_native_candidate() {
         },
         original_body_length: serde_json::to_vec(&request).unwrap().len(),
         candidates,
+        selection: RouteSelectionOptions {
+            upstream_account_hint: None,
+            avoid_route_account: None,
+            selection_seed: request_id,
+        },
+        snapshot_refresh_used: &mut snapshot_refresh_used,
     })
     .await
     .unwrap();
@@ -433,5 +447,222 @@ async fn unavailable_snapshot_reasons_preserve_fail_closed_materialization() {
         .unwrap();
     assert!(route.is_none());
     assert_eq!(reason, Some("route_disabled"));
+    pool.close().await;
+}
+
+#[tokio::test]
+async fn stale_snapshot_refresh_is_request_bounded_and_does_not_restore_revoked_candidates() {
+    let fixture = codex_route_fixture("snapshot-one-refresh").await;
+    let standby =
+        add_codex_standby_route(&fixture, "snapshot-refresh-standby", "account-456").await;
+    let key = fixture
+        .state
+        .db
+        .authenticate_key(&fixture.key, fixture.state.config.key_pepper.as_bytes())
+        .await
+        .unwrap();
+    let request_id = Uuid::now_v7();
+    let selection = RouteSelectionOptions {
+        upstream_account_hint: None,
+        avoid_route_account: None,
+        selection_seed: request_id,
+    };
+    let mut candidates = fixture
+        .state
+        .db
+        .list_authorized_upstream_candidates_with_hint(
+            key.key_id,
+            key.tenant_id,
+            &fixture.model,
+            Protocol::OpenAiResponses.name(),
+            selection,
+        )
+        .await
+        .unwrap();
+    assert_eq!(candidates.len(), 2);
+    for candidate in &mut candidates {
+        if candidate.account_id == fixture.upstream_account_id {
+            candidate.transport_revision -= 1;
+            candidate.credential_generation -= 1;
+        }
+    }
+    let pool = sqlx::AnyPool::connect(&fixture.database_url).await.unwrap();
+    sqlx::query("UPDATE upstream_credentials SET revoked_at = $1 WHERE upstream_account_id = $2")
+        .bind(crate::db::unix_millis())
+        .bind(standby.to_string())
+        .execute(&pool)
+        .await
+        .unwrap();
+    let request =
+        json!({"model": fixture.model, "input": "fresh snapshot contract", "stream": false});
+    let context = ProxyRequestContext {
+        state: &fixture.state,
+        key: &key,
+        model: &fixture.model,
+        protocol: Protocol::OpenAiResponses,
+        request_id,
+        request_json: &request,
+        request_memory: None,
+        codex_multi_agent_v2_request: false,
+    };
+    let mut used = false;
+    let plan = prepare_authorized_proxy_routes(AuthorizedProxyRoutesInput {
+        request: context,
+        original_body_length: 100,
+        candidates: candidates.clone(),
+        selection,
+        snapshot_refresh_used: &mut used,
+    })
+    .await
+    .unwrap();
+    assert!(used);
+    assert_eq!(plan.primary.route.account_id, fixture.upstream_account_id);
+    assert!(
+        plan.remaining_candidates
+            .as_slice()
+            .iter()
+            .all(|candidate| candidate.account_id != standby)
+    );
+    // The second preparation (including group-policy replan) cannot acquire a
+    // second refresh allowance, even if the same stale tuple is supplied.
+    assert!(
+        prepare_authorized_proxy_routes(AuthorizedProxyRoutesInput {
+            request: context,
+            original_body_length: 100,
+            candidates,
+            selection,
+            snapshot_refresh_used: &mut used
+        })
+        .await
+        .is_err()
+    );
+    pool.close().await;
+}
+
+#[tokio::test]
+async fn stale_snapshot_refresh_rechecks_revoked_grants() {
+    let fixture = codex_route_fixture("snapshot-grant-revoked").await;
+    let key = fixture
+        .state
+        .db
+        .authenticate_key(&fixture.key, fixture.state.config.key_pepper.as_bytes())
+        .await
+        .unwrap();
+    let request_id = Uuid::now_v7();
+    let selection = RouteSelectionOptions {
+        upstream_account_hint: None,
+        avoid_route_account: None,
+        selection_seed: request_id,
+    };
+    let mut candidates = fixture
+        .state
+        .db
+        .list_authorized_upstream_candidates_with_hint(
+            key.key_id,
+            key.tenant_id,
+            &fixture.model,
+            Protocol::OpenAiResponses.name(),
+            selection,
+        )
+        .await
+        .unwrap();
+    for candidate in &mut candidates {
+        candidate.transport_revision -= 1;
+    }
+    let pool = sqlx::AnyPool::connect(&fixture.database_url).await.unwrap();
+    sqlx::query("DELETE FROM routing_grants WHERE key_id = $1")
+        .bind(key.key_id.to_string())
+        .execute(&pool)
+        .await
+        .unwrap();
+    let request =
+        json!({"model": fixture.model, "input": "revoked grant contract", "stream": false});
+    let mut used = false;
+    assert!(
+        prepare_authorized_proxy_routes(AuthorizedProxyRoutesInput {
+            request: ProxyRequestContext {
+                state: &fixture.state,
+                key: &key,
+                model: &fixture.model,
+                protocol: Protocol::OpenAiResponses,
+                request_id,
+                request_json: &request,
+                request_memory: None,
+                codex_multi_agent_v2_request: false
+            },
+            original_body_length: 100,
+            candidates,
+            selection,
+            snapshot_refresh_used: &mut used
+        })
+        .await
+        .is_err()
+    );
+    assert!(used);
+    pool.close().await;
+}
+
+#[tokio::test]
+async fn stale_snapshot_refresh_does_not_admit_real_quota_exhaustion() {
+    let fixture = codex_route_fixture("snapshot-quota-exhausted").await;
+    let key = fixture
+        .state
+        .db
+        .authenticate_key(&fixture.key, fixture.state.config.key_pepper.as_bytes())
+        .await
+        .unwrap();
+    let request_id = Uuid::now_v7();
+    let selection = RouteSelectionOptions {
+        upstream_account_hint: None,
+        avoid_route_account: None,
+        selection_seed: request_id,
+    };
+    let mut candidates = fixture
+        .state
+        .db
+        .list_authorized_upstream_candidates_with_hint(
+            key.key_id,
+            key.tenant_id,
+            &fixture.model,
+            Protocol::OpenAiResponses.name(),
+            selection,
+        )
+        .await
+        .unwrap();
+    for candidate in &mut candidates {
+        candidate.transport_revision -= 1;
+    }
+    let pool = sqlx::AnyPool::connect(&fixture.database_url).await.unwrap();
+    sqlx::query("INSERT INTO upstream_account_health (upstream_account_id,consecutive_failures,cooldown_until,probe_lease_until,probe_lease_token,credential_generation,transport_revision,last_failure_kind,updated_at) SELECT id,1,$1,0,'',credential_generation,updated_at,'quota_exhausted',$2 FROM upstream_accounts WHERE id = $3")
+        .bind(crate::db::unix_millis() + 3_600_000)
+        .bind(crate::db::unix_millis())
+        .bind(fixture.upstream_account_id.to_string())
+        .execute(&pool)
+        .await
+        .unwrap();
+    let request =
+        json!({"model": fixture.model, "input": "revoked grant contract", "stream": false});
+    let mut used = false;
+    assert!(
+        prepare_authorized_proxy_routes(AuthorizedProxyRoutesInput {
+            request: ProxyRequestContext {
+                state: &fixture.state,
+                key: &key,
+                model: &fixture.model,
+                protocol: Protocol::OpenAiResponses,
+                request_id,
+                request_json: &request,
+                request_memory: None,
+                codex_multi_agent_v2_request: false
+            },
+            original_body_length: 100,
+            candidates,
+            selection,
+            snapshot_refresh_used: &mut used
+        })
+        .await
+        .is_err()
+    );
+    assert!(used);
     pool.close().await;
 }
