@@ -2,6 +2,7 @@ import { useState } from 'react';
 import { createRoot } from 'react-dom/client';
 import { I18nProvider } from '../../src/i18n';
 import { MtcFluentProvider } from '../../src/design-system';
+import { RequestWorkspaceTabs } from '../../src/operator/RequestWorkspaceTabs';
 import { SemanticSessionPanel } from '../../src/SemanticSessionPanel';
 import type { LogicalSessionDetail } from '../../src/types';
 import { createSemanticViewLoader, type SemanticContentChunk, type SemanticViewLoader } from '../../src/semanticViewReader';
@@ -95,7 +96,8 @@ const loader: SemanticViewLoader = {
 };
 function SessionFixture() {
   const [other, setOther] = useState(false);
+  const [tab, setTab] = useState<'requests' | 'generations' | 'sessions'>('requests');
   const selected = other ? { ...detail, session_id: 'session-b', requests: detail.requests.map(request => ({ ...request, request_id: 'request-b' })) } : detail;
-  return <>{scenario === 'scope' && <button onClick={() => setOther(true)}>Open another session</button>}<SemanticSessionPanel detail={selected} loader={loader} /></>;
+  return <>{scenario === 'tabs' && <RequestWorkspaceTabs selected={tab} onRequests={() => setTab('requests')} onGenerations={() => setTab('generations')} onSessions={() => setTab('sessions')} />}{scenario === 'scope' && <button onClick={() => setOther(true)}>Open another session</button>}<SemanticSessionPanel detail={selected} loader={loader} /></>;
 }
 createRoot(document.getElementById('root')!).render(<I18nProvider><MtcFluentProvider><SessionFixture /></MtcFluentProvider></I18nProvider>);
