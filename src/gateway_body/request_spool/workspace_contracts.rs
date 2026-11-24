@@ -137,8 +137,16 @@ async fn raw_and_normalized_writers_share_workspace_without_consuming_response_s
 #[tokio::test]
 async fn normalized_overflow_waits_only_on_workspace_and_cancels_without_leaking_source() {
     let (_dir, state, _pool, identity) = crate::response_archive_spool::tests::fixture().await;
-    let occupied = state.persistence.multipart_workspace().await.unwrap();
-    let occupied2 = state.persistence.multipart_workspace().await.unwrap();
+    let occupied = state
+        .persistence
+        .multipart_workspace(crate::api::proxy::persistence::WorkspaceRole::RequestRaw)
+        .await
+        .unwrap();
+    let occupied2 = state
+        .persistence
+        .multipart_workspace(crate::api::proxy::persistence::WorkspaceRole::RequestRaw)
+        .await
+        .unwrap();
     let json_memory = Arc::new(ProxyMemoryBudget::new(64 * 1024));
     let previous = json_memory.reservation();
     assert!(previous.try_reserve_json_shape(16 * 1024 + 64, 2));
