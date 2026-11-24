@@ -90,6 +90,7 @@ mod projection_lock;
 mod providers;
 mod request_history;
 mod requests;
+mod usage_rollup_sql;
 pub(crate) use requests::EarlyRequestTerminal;
 #[allow(unused_imports)] // Consumed by the separately owned API receipt integration.
 pub(crate) use requests::pending_settlement::{
@@ -214,10 +215,10 @@ pub use failed_request_cost_backfill::{
     FailedRequestCostCorrectionPreview,
 };
 pub use generation::{
-    AttachGenerationJobResult, AttachSynchronousImageRequestObject, CreateGenerationJobInput,
-    CreateGenerationJobResult, FinishGenerationJobInput, FinishSynchronousImageRequest,
-    FinishSynchronousImageResult, GenerationJobIdempotency, GenerationQuarantineResolution,
-    GenerationQuarantineView, ImageGenerationQuarantineResolution, ImageGenerationQuarantineView,
+    AttachGenerationJobResult, CreateGenerationJobInput, CreateGenerationJobResult,
+    FinishGenerationJobInput, FinishSynchronousImageRequest, FinishSynchronousImageResult,
+    GenerationJobIdempotency, GenerationQuarantineResolution, GenerationQuarantineView,
+    ImageGenerationQuarantineResolution, ImageGenerationQuarantineView,
     ResolveGenerationQuarantine, ResolveImageGenerationQuarantine, StartGenerationJobInput,
     StartSynchronousImageRequest, StartSynchronousImageResult, SynchronousImageIdempotencyClaim,
 };
@@ -958,7 +959,6 @@ pub(crate) mod test_support;
 #[cfg(test)]
 mod tests;
 
-mod raw_gc;
 mod semantic_archive_binding;
 
 pub(crate) use requests::terminal_timings::{TerminalProjectionBatchTimings, STAGE_NAMES as TERMINAL_PROJECTION_STAGE_NAMES};

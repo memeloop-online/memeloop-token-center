@@ -75,15 +75,6 @@ pub enum StartSynchronousImageResult {
     Replay(SynchronousImageIdempotencyClaim),
 }
 
-pub struct AttachSynchronousImageRequestObject<'a> {
-    pub key_id: Uuid,
-    pub idempotency_key: Option<&'a str>,
-    pub request_id: Uuid,
-    pub reservation_id: Uuid,
-    pub expected_staging_object: &'a str,
-    pub request_object: &'a str,
-}
-
 pub struct FinishSynchronousImageRequest<'a> {
     pub key_id: Uuid,
     pub idempotency_key: Option<&'a str>,
@@ -477,148 +468,6 @@ impl Database {
         Ok(StartSynchronousImageResult::Started(reservation))
     }
 
-    /// Replaces the local staging digest with the durable CAS locator after
-    /// admission succeeds. Idempotent requests additionally compare the live
-    /// claim owner, so a worker that lost its lease can never attach an object
-    /// to the replacement request.
-    pub async fn attach_synchronous_image_request_object(
-        &self,
-        input: AttachSynchronousImageRequestObject<'_>,
-    ) -> Result<(), AppError> {
-        if !input
-            .expected_staging_object
-            .starts_with("staging://blake3/")
-            || !input.request_object.starts_with("objects/blake3/")
-        {
-            return Err(AppError::BadRequest(
-                "synchronous image archive locator is invalid".into(),
-            ));
-        }
-        if let Some(idempotency_key) = input.idempotency_key {
-            validate_idempotency_key(idempotency_key, "Idempotency-Key")?;
-        }
-        let key_id = input.key_id.to_string();
-        let request_id = input.request_id.to_string();
-        let reservation_id = input.reservation_id.to_string();
-        let mut transaction = self.pool.begin().await?;
-        if let Some(idempotency_key) = input.idempotency_key {
-            let owner = sqlx::query(
-                "UPDATE synchronous_image_idempotency SET lease_expires_at = lease_expires_at WHERE key_id = $1 AND idempotency_key = $2 AND request_id = $3 AND reservation_id = $4 AND status = 'pending'",
-            )
-            .bind(&key_id)
-            .bind(idempotency_key)
-            .bind(&request_id)
-            .bind(&reservation_id)
-            .execute(&mut *transaction)
-            .await?;
-            if owner.rows_affected() != 1 {
-                return Err(AppError::NotFound);
-            }
-        }
-        let attached = sqlx::query(
-            "UPDATE request_records SET request_object = $1 WHERE id = $2 AND key_id = $3 AND reservation_id = $4 AND request_object = $5 AND completed_at IS NULL",
-        )
-        .bind(input.request_object)
-        .bind(&request_id)
-        .bind(&key_id)
-        .bind(&reservation_id)
-        .bind(input.expected_staging_object)
-        .execute(&mut *transaction)
-        .await?;
-        if attached.rows_affected() != 1 {
-            return Err(AppError::NotFound);
-        }
-        transaction.commit().await?;
-        Ok(())
-    }
-
-    /// Atomically replaces the admission placeholder and binds the unique
-    /// request object. A fenced staging writer cannot publish its locator.
-    pub async fn attach_synchronous_image_request_object_staged(
-        &self,
-        input: AttachSynchronousImageRequestObject<'_>,
-        staging_lease: &ArchiveStagingWriteLease,
-    ) -> Result<(), AppError> {
-        if staging_lease.key.owner != ArchiveStagingOwner::SynchronousRequest(input.request_id)
-            || staging_lease.key.purpose != ArchiveStagingPurpose::Request
-        {
-            return Err(AppError::BadRequest(
-                "synchronous image request staging owner is invalid".into(),
-            ));
-        }
-        if let Some(idempotency_key) = input.idempotency_key {
-            validate_idempotency_key(idempotency_key, "Idempotency-Key")?;
-        }
-        let key_id = input.key_id.to_string();
-        let request_id = input.request_id.to_string();
-        let reservation_id = input.reservation_id.to_string();
-        let mut transaction = self.pool.begin().await?;
-        if let Some(idempotency_key) = input.idempotency_key {
-            let owner = sqlx::query(
-                "UPDATE synchronous_image_idempotency SET lease_expires_at = lease_expires_at WHERE key_id = $1 AND idempotency_key = $2 AND request_id = $3 AND reservation_id = $4 AND status = 'pending'",
-            )
-            .bind(&key_id)
-            .bind(idempotency_key)
-            .bind(&request_id)
-            .bind(&reservation_id)
-            .execute(&mut *transaction)
-            .await?;
-            if owner.rows_affected() != 1 {
-                super::cleanup_archive_staging_attempt_in_transaction(
-                    &mut transaction,
-                    staging_lease.key,
-                )
-                .await?;
-                transaction.commit().await?;
-                return Err(AppError::NotFound);
-            }
-        }
-        let attached = sqlx::query(
-            "UPDATE request_records SET request_object = $1 WHERE id = $2 AND key_id = $3 AND reservation_id = $4 AND request_object = $5 AND completed_at IS NULL",
-        )
-        .bind(input.request_object)
-        .bind(&request_id)
-        .bind(&key_id)
-        .bind(&reservation_id)
-        .bind(input.expected_staging_object)
-        .execute(&mut *transaction)
-        .await?;
-        if attached.rows_affected() != 1 {
-            let existing: Option<String> = sqlx::query_scalar(
-                "SELECT request_object FROM request_records WHERE id = $1 AND key_id = $2 AND reservation_id = $3",
-            )
-            .bind(&request_id)
-            .bind(&key_id)
-            .bind(&reservation_id)
-            .fetch_optional(&mut *transaction)
-            .await?;
-            if existing.as_deref() != Some(input.request_object) {
-                super::cleanup_archive_staging_attempt_in_transaction(
-                    &mut transaction,
-                    staging_lease.key,
-                )
-                .await?;
-                transaction.commit().await?;
-                return Err(AppError::NotFound);
-            }
-        }
-        let bound = super::super::archive_staging::bind_archive_staging_attempt_in_transaction(
-            &mut transaction,
-            self.backend,
-            staging_lease,
-            input.request_object,
-        )
-        .await?;
-        if !bound {
-            transaction.rollback().await?;
-            return Err(AppError::Conflict(
-                "synchronous image request staging writer was fenced".into(),
-            ));
-        }
-        transaction.commit().await?;
-        Ok(())
-    }
-
     pub async fn finish_synchronous_image_request(
         &self,
         input: FinishSynchronousImageRequest<'_>,
@@ -892,44 +741,6 @@ impl Database {
         } else {
             Err(AppError::NotFound)
         }
-    }
-
-    pub async fn record_synchronous_generation_assets(
-        &self,
-        request_id: Uuid,
-        assets: &[ArchivedGenerationAsset],
-    ) -> Result<(), AppError> {
-        if assets.is_empty() {
-            return Ok(());
-        }
-        let now = unix_millis();
-        let mut transaction = self.pool.begin().await?;
-        let request_exists =
-            sqlx::query("SELECT 1 FROM request_record_locators WHERE id = $1 LIMIT 1")
-                .bind(request_id.to_string())
-                .fetch_optional(&mut *transaction)
-                .await?
-                .is_some();
-        if !request_exists {
-            return Err(AppError::NotFound);
-        }
-        for asset in assets {
-            sqlx::query(
-                "INSERT INTO generation_assets (id, request_id, asset_index, object_locator, mime_type, size_bytes, filename, created_at) VALUES ($1, $2, $3, $4, $5, $6, $7, $8)",
-            )
-            .bind(asset.asset_id.to_string())
-            .bind(request_id.to_string())
-            .bind(asset.index)
-            .bind(&asset.object_locator)
-            .bind(&asset.mime_type)
-            .bind(asset.size_bytes)
-            .bind(&asset.filename)
-            .bind(now)
-            .execute(&mut *transaction)
-            .await?;
-        }
-        transaction.commit().await?;
-        Ok(())
     }
 
     pub async fn synchronous_generation_assets(

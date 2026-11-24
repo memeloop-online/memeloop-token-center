@@ -563,7 +563,12 @@ mod tests {
         let requests = upstream.received_requests().await.unwrap();
         let request: Value = requests[0].body_json().unwrap();
         assert_eq!(request["project"], "fixture-project");
+        assert_eq!(request["model"], "gemini-3-pro-image");
         assert_eq!(request["requestType"], "image_gen");
+        assert_eq!(
+            request["request"]["generationConfig"]["responseModalities"],
+            json!(["TEXT", "IMAGE"])
+        );
     }
 
     #[tokio::test]

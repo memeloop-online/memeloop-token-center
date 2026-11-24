@@ -1,4 +1,4 @@
-pub mod antigravity;
+pub(crate) mod antigravity;
 mod catalog;
 mod codex_agent_profile;
 mod credential;
