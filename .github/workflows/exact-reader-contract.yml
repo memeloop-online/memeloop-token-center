@@ -747,7 +747,7 @@ jobs:
       - run: |
           set -o pipefail
           git rev-parse HEAD
-          for selector in expired_primary_credential_is_filtered_before_healthy_standby credential_expiring_after_resolution_skips_to_prepared_standby
+          for selector in expired_primary_credential_is_filtered_before_healthy_standby credential_expiring_after_resolution_skips_to_prepared_standby unavailable_snapshot_reasons_preserve_fail_closed_materialization
           do
             cargo test --locked --lib "api::proxy::tests::credential_readiness::$selector" -- --exact --nocapture 2>&1 | tee /tmp/routing-snapshot.log
             grep -F '1 passed; 0 failed' /tmp/routing-snapshot.log
