@@ -144,7 +144,6 @@ async fn late_request_capture_retires_source_metadata_without_rebinding_after_co
     })
     .await
     .unwrap();
-    source.release_retained();
     drop(memory);
     // Saturate metadata completion after durable retirement. The bytes must
     // transfer before this unrelated semaphore is available.

@@ -1154,11 +1154,12 @@ fn publish_durable(shared: &Arc<SharedBody>) {
                     }
                     Err(_) => {}
                 }
-                if source.archived.load(Ordering::Acquire) {
-                    release_resident_memory(&source);
+                // Archive-bound originals still require the typed publication
+                // handoff below. A successful staging PUT alone is not that ACK.
+                if !source.archived.load(Ordering::Acquire) {
+                    residency.durable_settled.store(true, Ordering::Release);
+                    residency.release_if_idle();
                 }
-                residency.durable_settled.store(true, Ordering::Release);
-                residency.release_if_idle();
             } else {
                 tracing::warn!("request body stayed in memory; object storage write failed");
             }
