@@ -111,9 +111,32 @@ async fn late_request_capture_retires_source_metadata_without_rebinding_after_co
             .unwrap(),
     );
     let locator = source.object_locator().unwrap().to_owned();
+    let key_id = uuid::Uuid::now_v7();
+    sqlx::query(
+        "INSERT INTO request_record_locators (id,tenant_id,key_id,created_at) VALUES ($1,$2,$3,1)",
+    )
+    .bind(identity.request_id.to_string())
+    .bind(identity.tenant_id.to_string())
+    .bind(key_id.to_string())
+    .execute(&pool)
+    .await
+    .unwrap();
     sqlx::query("INSERT INTO request_records (id,tenant_id,key_id,created_at,protocol,model,input_tokens,output_tokens,cost_micros,request_object,reservation_id) VALUES ($1,$2,$3,1,'openai','test',0,0,0,$4,$5)")
-        .bind(identity.request_id.to_string()).bind(identity.tenant_id.to_string()).bind(uuid::Uuid::now_v7().to_string()).bind(&locator).bind(identity.reservation_id.to_string()).execute(&pool).await.unwrap();
+        .bind(identity.request_id.to_string()).bind(identity.tenant_id.to_string()).bind(key_id.to_string()).bind(&locator).bind(identity.reservation_id.to_string()).execute(&pool).await.unwrap();
     source.retain_for_archive(database.clone(), identity);
+    let mut mismatched = original.clone();
+    mismatched.size_bytes += 1;
+    let before_conflict = budget.snapshot().0;
+    assert!(handoff_verified_request_source(&source.shared, &database, &mismatched).is_err());
+    assert_eq!(budget.snapshot().0, before_conflict);
+    assert!(
+        !source
+            .shared
+            .residency
+            .durable_settled
+            .load(Ordering::Acquire)
+    );
+
     tokio::time::timeout(Duration::from_secs(5), async {
         loop {
             let count: i64 = sqlx::query_scalar(
@@ -131,11 +154,27 @@ async fn late_request_capture_retires_source_metadata_without_rebinding_after_co
     })
     .await
     .unwrap();
-    source.release_retained();
     drop(memory);
+    // Saturate metadata completion after durable retirement. The bytes must
+    // transfer before this unrelated semaphore is available.
+    let mut completion_slots = Vec::new();
+    while let Some(slot) = database.try_request_source_completion() {
+        completion_slots.push(slot);
+    }
+    assert!(!completion_slots.is_empty());
     store.resume_writes_for_test(archive.clone());
     release.send(()).unwrap();
     assert!(source.upload_outcome().await);
+    tokio::time::timeout(Duration::from_secs(5), async {
+        while budget.snapshot().0 != 0 {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("verified original releases RAM before metadata slot");
+    assert!(database.try_request_source_completion().is_none());
+    assert_eq!(source.read_all().await.unwrap(), body);
+    drop(completion_slots);
     tokio::time::timeout(Duration::from_secs(5), async {
         loop {
             let count: i64 = sqlx::query_scalar(
