@@ -7,7 +7,7 @@ import test from 'node:test';
 import { chromium } from 'playwright';
 import { createServer } from 'vite';
 
-declare global { interface Window { semanticAtomReads: number; semanticPageReads: number; semanticPageRequest: string } }
+declare global { interface Window { semanticAtomReads: number; semanticPageReads: number; semanticPageRequest: string; semanticContentReads: number } }
 
 test('semantic viewer reads verified atoms lazily, preserves parts and pages without resident history growth', { timeout: 45_000 }, async () => {
   if (!existsSync(chromium.executablePath())) {
@@ -117,6 +117,15 @@ test('semantic viewer reads verified atoms lazily, preserves parts and pages wit
     await page.goto(`http://127.0.0.1:${address.port}/e2e/fixtures/semantic-session.html?scenario=revision`);
     await page.getByText('Error: Semantic content identity or offset changed; refresh the conversation', { exact: true }).waitFor();
     assert.equal(await page.getByText('Stale content', { exact: true }).count(), 0);
+    await page.goto(`http://127.0.0.1:${address.port}/e2e/fixtures/semantic-session.html?scenario=preview`);
+    await page.getByText('😀首窗', { exact: true }).waitFor();
+    assert.equal(await page.evaluate(() => window.semanticContentReads), 0, 'verified preview needs no extra content request');
+    await page.goto(`http://127.0.0.1:${address.port}/e2e/fixtures/semantic-session.html?scenario=preview-partial`);
+    await page.getByText('😀首窗', { exact: true }).waitFor();
+    assert.equal(await page.evaluate(() => window.semanticContentReads), 0);
+    await page.getByRole('button', { name: 'More content', exact: true }).click();
+    await page.getByText('tail after preview', { exact: false }).waitFor();
+    assert.equal(await page.evaluate(() => window.semanticContentReads), 1, 'partial preview resumes at the UTF8 cursor');
     await page.goto(`http://127.0.0.1:${address.port}/e2e/fixtures/semantic-session.html?scenario=scope`);
     await page.waitForFunction(() => window.semanticPageRequest === 'request-a');
     await page.getByRole('button', { name: 'Open another session', exact: true }).click();

@@ -10,8 +10,8 @@ import '../../src/theme.css';
 
 declare global { interface Window { semanticAtomReads: number; semanticPageReads: number } }
 window.semanticAtomReads = 0; window.semanticPageReads = 0;
-declare global { interface Window { semanticPageRequest: string } }
-window.semanticPageRequest = '';
+declare global { interface Window { semanticPageRequest: string; semanticContentReads: number } }
+window.semanticPageRequest = ''; window.semanticContentReads = 0;
 const detail: LogicalSessionDetail = {
   session_id: 'session-a', cluster_id: null, unlinked: false, edges: [], edges_truncated: false, has_more: false, next_cursor: null,
   requests: [{ request_id: 'request-a', created_at: 1, protocol: 'openai', model: 'fixture', status_code: 200, duration_ms: 1,
@@ -28,6 +28,7 @@ async function* contentFrames(_request: string, cursor: string): AsyncGenerator<
         yield { manifest_revision: revision, instance_id: instance, part_index: field === 'text' ? 0 : field === 'arguments' ? 2 : 3, field, format: field === 'text' ? 'text' : 'json', byte_offset: next * new TextEncoder().encode(largeChunk).byteLength, text: next === 5 ? 'COMPLETE LARGE FIELD' : largeChunk, next_cursor: next === 5 ? null : `${instance}:${field}:${next + 1}`, complete: next === 5 };
       } return;
     }
+    if (scenario === 'preview' || scenario === 'preview-partial') { yield { manifest_revision: revision, instance_id: instance, part_index: 0, field: 'text', format: 'text', byte_offset: 10, text: ' tail after preview', next_cursor: null, complete: true }; return; }
     if (scenario === 'revision') { yield { manifest_revision: '2', instance_id: instance, part_index: 0, field: 'text', format: 'text', byte_offset: 0, text: 'Stale content', next_cursor: null, complete: true }; return; }
     yield { manifest_revision: '18446744073709551615', instance_id: instance, part_index: field === 'text' ? 0 : field === 'reasoning' ? 1 : 2,
       field: field === 'arguments' ? 'arguments' : 'text', format: field === 'arguments' ? 'json' : 'text', byte_offset: 0,
@@ -39,6 +40,7 @@ const originalFetch = window.fetch.bind(window);
 window.fetch = async (input, init) => {
   const url = new URL(String(input), location.origin);
   if (url.pathname !== '/fixture-content') return originalFetch(input, init);
+  window.semanticContentReads++;
   const frames = contentFrames('request-a', url.searchParams.get('content_cursor')!);
   let pending = new Uint8Array();
   return new Response(new ReadableStream<Uint8Array>({
@@ -71,7 +73,7 @@ const loader: SemanticViewLoader = {
     const instance = cursor.startsWith('item-') ? cursor : cursor === 'latest-atom' ? 'latest' : 'earlier';
     return { manifest_revision: '18446744073709551615', instance_id: instance, role: 'assistant', next_cursor: null,
       parts: [
-        { part_index: 0, kind: 'text', fields: [{ name: 'text', format: 'text', content_cursor: `${instance}:text` }] },
+        { part_index: 0, kind: 'text', fields: [{ name: 'text', format: 'text', content_cursor: `${instance}:text`, ...(scenario?.startsWith('preview') ? { preview: { text: '😀首窗', byte_offset: 0 as const, complete: scenario === 'preview', next_cursor: scenario === 'preview' ? null : `${instance}:text:1` } } : {}) }] },
         { part_index: 1, kind: 'reasoning', fields: [{ name: 'text', format: 'text', content_cursor: `${instance}:reasoning` }] },
         { part_index: 2, kind: 'tool_call', tool_name: 'lookup', call_id: 'call-1', fields: [{ name: 'arguments', format: 'json', content_cursor: `${instance}:arguments` }] },
         ...(scenario === 'large' ? [{ part_index: 3, kind: 'tool_result', tool_name: 'lookup', call_id: 'call-1', fields: [{ name: 'result_content' as const, format: 'json' as const, content_cursor: `${instance}:result_content` }] }] : []),
