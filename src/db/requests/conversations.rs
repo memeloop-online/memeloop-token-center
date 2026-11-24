@@ -434,48 +434,6 @@ impl Database {
         Ok(())
     }
 
-    #[allow(dead_code)]
-    async fn materialize_conversation_content(
-        &self,
-        request_id: Uuid,
-        lease_owner: Uuid,
-        tenant_id: &str,
-        request_json: &serde_json::Value,
-        observed_at: i64,
-    ) -> Result<(), AppError> {
-        let atoms = extract_atoms(request_json);
-        let nodes = build_prefix(&atoms);
-        let atoms = self
-            .archive_atom_bodies(parse_uuid(tenant_id.to_owned())?, &atoms)
-            .await?;
-        let mut transaction = self.begin_write_transaction().await?;
-        let result = materialize_conversation_content_with_statement_error(
-            &mut transaction,
-            tenant_id,
-            &atoms,
-            &nodes,
-            observed_at,
-        )
-        .await;
-        if let Err(error) = result {
-            let retryable_sqlstate = error.retryable_sqlstate();
-            let rollback_confirmed = transaction.rollback().await.is_ok();
-            tracing::warn!(
-                %request_id,
-                rollback_confirmed,
-                sqlstate = retryable_sqlstate.unwrap_or("unclassified"),
-                "conversation content transaction failed"
-            );
-            if rollback_confirmed && retryable_sqlstate.is_some() {
-                self.try_schedule_rolled_back_conversation_retry(request_id, lease_owner)
-                    .await;
-            }
-            return Err(error.into());
-        }
-        transaction.commit().await?;
-        Ok(())
-    }
-
     /// Claim one independently verified historical body without claiming any other work.
     /// Source locators and the previous acknowledgement are compared atomically.
     #[allow(clippy::too_many_arguments)]

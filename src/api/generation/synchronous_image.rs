@@ -1,10 +1,9 @@
+use futures_util::TryStreamExt;
+
 use super::super::*;
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(in crate::api) enum ImageResponseReadError {
-    Transport,
-    TooLarge,
-}
+pub(in crate::api) use super::super::media_body::MediaBodyReadError as ImageResponseReadError;
+use super::super::media_body::collect_bounded;
 
 pub(in crate::api) fn scoped_upstream_image_idempotency(
     pepper: &[u8],
@@ -316,17 +315,19 @@ pub(super) async fn execute_synchronous_image_request(
     if !renew_image_request_claim(context).await? {
         return Ok(replayed_image_failure(request_id, "idempotency_claim_lost"));
     }
-    let mut attempt =
-        match crate::generation::group_routing::admit(state, context.tenant_id, request_id, route)
-            .await
-        {
-            Ok(attempt) => attempt,
-            Err(error) => {
-                // No request has been sent: ordinary terminal cleanup is safe.
-                let _ = fail_image_request(context, "upstream_unavailable").await?;
-                return Err(error);
-            }
-        };
+    let mut attempt = match crate::generation::group_routing::admit(
+        state,
+        context.tenant_id,
+        request_id,
+        route,
+    ) {
+        Ok(attempt) => attempt,
+        Err(error) => {
+            // No request has been sent: ordinary terminal cleanup is safe.
+            let _ = fail_image_request(context, "upstream_unavailable").await?;
+            return Err(error);
+        }
+    };
     // Archival/admission may have waited since preparation. Recheck expiry
     // before arming, while a local credential failure is still non-dispatched.
     // Preparation already attached the credential. Revalidate its lifetime,
@@ -535,23 +536,14 @@ pub(in crate::api) async fn read_image_response_bounded(
 async fn read_synchronous_image_response_bounded(
     response: reqwest::Response,
 ) -> Result<Bytes, ImageResponseReadError> {
-    let mut body = Vec::new();
-    let mut stream = response.bytes_stream();
-    while let Some(chunk) = stream.next().await {
-        let chunk = chunk.map_err(|error| {
-            tracing::warn!(
-                is_timeout = error.is_timeout(),
-                is_connect = error.is_connect(),
-                "synchronous image upstream response stream failed"
-            );
-            ImageResponseReadError::Transport
-        })?;
-        if body.len().saturating_add(chunk.len()) > MAX_IMAGE_RESPONSE {
-            return Err(ImageResponseReadError::TooLarge);
-        }
-        body.extend_from_slice(&chunk);
-    }
-    Ok(Bytes::from(body))
+    let stream = response.bytes_stream().inspect_err(|error| {
+        tracing::warn!(
+            is_timeout = error.is_timeout(),
+            is_connect = error.is_connect(),
+            "synchronous image upstream response stream failed"
+        );
+    });
+    collect_bounded(stream, MAX_IMAGE_RESPONSE).await
 }
 
 #[allow(clippy::too_many_arguments)]

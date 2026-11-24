@@ -1,7 +1,10 @@
 use axum::extract::{Extension, Multipart, multipart::MultipartRejection};
 use reqwest::multipart::{Form, Part};
 
-use super::*;
+use super::{
+    media_body::{MediaBodyReadError, collect_bounded},
+    *,
+};
 
 const AUDIO_PROTOCOL: &str = "openai-audio";
 const AUDIO_AUDIT_PROTOCOL: &str = "audio-transcription";
@@ -194,9 +197,7 @@ pub(super) async fn create_audio_transcription(
                 key.tenant_id,
                 request_id,
                 &route,
-            )
-            .await
-            {
+            ) {
                 Ok(attempt) => attempt,
                 Err(error) => {
                     super::proxy::persistence::record_capture_failure(&state, identity);
@@ -297,7 +298,16 @@ pub(super) async fn create_audio_transcription(
             let upstream_body = match read_audio_response_bounded(upstream).await {
                 Ok(body) => body,
                 Err(error) => {
-                    attempt.complete(error.terminal()).await;
+                    let (code, terminal) = match error {
+                        MediaBodyReadError::Transport => {
+                            ("audio_upstream_response_stream", audio_transport_failure())
+                        }
+                        MediaBodyReadError::TooLarge => (
+                            "audio_upstream_response_too_large",
+                            MediaAttemptTerminal::invalid_response(),
+                        ),
+                    };
+                    attempt.complete(terminal).await;
                     finish_audio_failure(
                         &state,
                         &reservation,
@@ -305,7 +315,7 @@ pub(super) async fn create_audio_transcription(
                         key.tenant_id,
                         audio,
                         started,
-                        error.code(),
+                        code,
                     )
                     .await?;
                     return Err(AppError::upstream_with(
@@ -667,28 +677,6 @@ fn upstream_form(
     Ok(form)
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum AudioResponseReadError {
-    TooLarge,
-    Transport,
-}
-
-impl AudioResponseReadError {
-    fn code(self) -> &'static str {
-        match self {
-            Self::TooLarge => "audio_upstream_response_too_large",
-            Self::Transport => "audio_upstream_response_stream",
-        }
-    }
-
-    fn terminal(self) -> MediaAttemptTerminal {
-        match self {
-            Self::Transport => audio_transport_failure(),
-            Self::TooLarge => MediaAttemptTerminal::invalid_response(),
-        }
-    }
-}
-
 fn audio_transport_failure() -> MediaAttemptTerminal {
     MediaAttemptTerminal::Failed {
         kind: crate::db::UpstreamFailureKind::Connection,
@@ -699,34 +687,14 @@ fn audio_transport_failure() -> MediaAttemptTerminal {
 
 async fn read_audio_response_bounded(
     response: super::proxy::upstream_response::UpstreamResponse,
-) -> Result<Bytes, AudioResponseReadError> {
+) -> Result<Bytes, MediaBodyReadError> {
     if response
         .content_length()
         .is_some_and(|length| length > MAX_AUDIO_RESPONSE_BODY as u64)
     {
-        return Err(AudioResponseReadError::TooLarge);
+        return Err(MediaBodyReadError::TooLarge);
     }
-    collect_audio_response_stream(response.bytes_stream()).await
-}
-
-async fn collect_audio_response_stream<S, E>(stream: S) -> Result<Bytes, AudioResponseReadError>
-where
-    S: futures_util::Stream<Item = Result<Bytes, E>>,
-{
-    futures_util::pin_mut!(stream);
-    let mut body = Vec::new();
-    loop {
-        let next = stream.next().await;
-        let Some(chunk) = next else {
-            break;
-        };
-        let chunk = chunk.map_err(|_| AudioResponseReadError::Transport)?;
-        if body.len().saturating_add(chunk.len()) > MAX_AUDIO_RESPONSE_BODY {
-            return Err(AudioResponseReadError::TooLarge);
-        }
-        body.extend_from_slice(&chunk);
-    }
-    Ok(Bytes::from(body))
+    collect_bounded(response.bytes_stream(), MAX_AUDIO_RESPONSE_BODY).await
 }
 
 fn normalize_audio_response(
@@ -930,7 +898,10 @@ async fn finish_audio_request(
 
 #[cfg(test)]
 mod tests {
-    use super::*;
+    use super::{
+        media_body::{MediaBodyReadError, collect_bounded},
+        *,
+    };
     use axum::{body::Body, http::Request};
     use rust_decimal::Decimal;
     use tower::ServiceExt;
@@ -1028,7 +999,9 @@ mod tests {
             tokio::time::sleep(Duration::from_secs(11 * 60)).await;
             Ok::<_, std::io::Error>(Bytes::from_static(br#"{"text":"complete"}"#))
         });
-        let body = collect_audio_response_stream(stream).await.unwrap();
+        let body = collect_bounded(stream, MAX_AUDIO_RESPONSE_BODY)
+            .await
+            .unwrap();
         assert_eq!(body, br#"{"text":"complete"}"#[..]);
     }
 

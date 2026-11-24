@@ -34,17 +34,14 @@ impl<'a> Attempt<'a> {
         }
     }
 
-    pub(super) async fn admit(&mut self) -> Result<(), AppError> {
+    pub(super) fn admit(&mut self) -> Result<(), AppError> {
         if self.guard.is_none() {
-            self.guard = Some(
-                super::group_routing::admit(
-                    self.state,
-                    self.job.tenant_id,
-                    self.job.job_id,
-                    self.route,
-                )
-                .await?,
-            );
+            self.guard = Some(super::group_routing::admit(
+                self.state,
+                self.job.tenant_id,
+                self.job.job_id,
+                self.route,
+            )?);
         }
         Ok(())
     }
@@ -94,7 +91,7 @@ impl<'a> Attempt<'a> {
         }
         self.valid = false;
         self.terminal = MediaAttemptTerminal::Inconclusive;
-        self.admit().await
+        self.admit()
     }
 
     pub(super) async fn finish(mut self, result: Result<(), AppError>) -> Result<(), AppError> {

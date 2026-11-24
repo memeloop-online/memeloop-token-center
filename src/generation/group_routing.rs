@@ -104,7 +104,7 @@ pub(crate) async fn prepare_route_for_protocol(
     Err(AppError::upstream("candidates_are_unavailable"))
 }
 
-pub(crate) async fn admit(
+pub(crate) fn admit(
     state: &AppState,
     tenant_id: Uuid,
     request_id: Uuid,

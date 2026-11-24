@@ -556,7 +556,7 @@ async fn submit(
     let mut attempt = attempt::Attempt::new(state, worker_id, job, route);
     // Admission precedes even the durable submitting transition: an unsent
     // cooldown rejection must remain safely queued, never delivery-unknown.
-    attempt.admit().await?;
+    attempt.admit()?;
     let result = submit_attempt(state, worker_id, job, route, &mut attempt).await;
     attempt.finish(result).await
 }
@@ -872,7 +872,7 @@ async fn poll_siliconflow_video(
         .active_upstream(&route.driver, "generation_poll");
     let upstream_started = std::time::Instant::now();
     let request = route.credential.apply(request, unix_millis())?;
-    attempt.admit().await?;
+    attempt.admit()?;
     let response_result = request.send().await;
     state.metrics.observe_upstream(
         &route.driver,
@@ -990,7 +990,7 @@ async fn poll_seedance(
         .active_upstream(&route.driver, "generation_poll");
     let upstream_started = std::time::Instant::now();
     let request = route.credential.apply(request, unix_millis())?;
-    attempt.admit().await?;
+    attempt.admit()?;
     let response_result = request.send().await;
     state.metrics.observe_upstream(
         &route.driver,
@@ -1186,7 +1186,7 @@ async fn authenticated_json(
         .metrics
         .active_upstream(&route.driver, "generation_poll");
     let upstream_started = std::time::Instant::now();
-    attempt.admit().await?;
+    attempt.admit()?;
     let response_result = request.send().await;
     state.metrics.observe_upstream(
         &route.driver,
