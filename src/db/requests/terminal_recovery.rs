@@ -1,4 +1,5 @@
 use super::super::*;
+use super::terminal_projection::{TERMINAL_CLAIM_TTL_MILLIS, terminal_claim_eligibility};
 
 #[derive(Clone, Copy, Debug, serde::Serialize)]
 pub struct TerminalRecoveryIdentity {
@@ -132,8 +133,9 @@ impl Database {
             DatabaseBackend::PostgreSql => " FOR UPDATE SKIP LOCKED",
             DatabaseBackend::Sqlite => "",
         };
+        let eligibility = terminal_claim_eligibility(7, 9);
         let statement = format!(
-            "UPDATE terminal_projection_outbox SET lease_owner=$7,lease_expires_at=$8,attempts=attempts+1 WHERE request_id IN (SELECT request_id FROM terminal_projection_outbox WHERE request_id=$1 AND tenant_id=$2 AND key_id=$3 AND account_id=$4 AND reservation_id=$5 AND created_at=$6 AND projected_at IS NULL AND (lease_owner IS NULL OR lease_owner<>$7) AND (lease_expires_at IS NULL OR lease_expires_at<=$9){suffix}) RETURNING request_id"
+            "UPDATE terminal_projection_outbox SET lease_owner=$7,lease_expires_at=$8,attempts=attempts+1 WHERE request_id IN (SELECT request_id FROM terminal_projection_outbox WHERE request_id=$1 AND tenant_id=$2 AND key_id=$3 AND account_id=$4 AND reservation_id=$5 AND created_at=$6 AND {eligibility}{suffix}) RETURNING request_id"
         );
         let claimed = sqlx::query(sqlx::AssertSqlSafe(statement))
             .bind(identity.request_id.to_string())
@@ -143,7 +145,7 @@ impl Database {
             .bind(identity.reservation_id.to_string())
             .bind(identity.created_at)
             .bind(owner.to_string())
-            .bind(now.saturating_add(300_000))
+            .bind(now.saturating_add(TERMINAL_CLAIM_TTL_MILLIS))
             .bind(now)
             .fetch_optional(&mut *tx)
             .await?
