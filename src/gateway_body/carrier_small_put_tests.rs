@@ -101,8 +101,14 @@ async fn real_s3_small_spill_uses_one_put_and_large_boundary_keeps_multipart() {
 async fn real_s3_small_spill_lost_ack_retains_source_and_routes_both_backends() {
     let endpoint = std::env::var("MTC_RUSTFS_TEST_ENDPOINT").unwrap();
     for training in [false, true] {
-        let proxy = RecoveryObjectProxy::start(&endpoint).await;
-        let mut c = config(&proxy).await;
+        let legacy_proxy = RecoveryObjectProxy::start(&endpoint).await;
+        let training_proxy = RecoveryObjectProxy::start(&endpoint).await;
+        let proxy = if training {
+            &training_proxy
+        } else {
+            &legacy_proxy
+        };
+        let mut c = config(&legacy_proxy).await;
         if training {
             c.training_s3 = Some(crate::config::TrainingS3Config {
                 endpoint: proxy.endpoint().into(),
@@ -144,6 +150,13 @@ async fn real_s3_small_spill_lost_ack_retains_source_and_routes_both_backends() 
         proxy.lose_body_put_ack(false);
         assert!(carrier.offload_one().await.unwrap());
         assert_eq!(memory.snapshot().0, 0);
+        if training {
+            assert_eq!(
+                legacy_proxy.counts().get("body_put").copied().unwrap_or(0),
+                0,
+                "qualified staging writes must use the selected backend, not the legacy endpoint"
+            );
+        }
         let reference = match &*carrier.segments[0].lock().unwrap() {
             Segment::Object(r) => r.clone(),
             _ => panic!("confirmed PUT must replace segment"),
@@ -203,6 +216,7 @@ async fn real_s3_small_spill_compares_previous_multipart_at_same_distribution_an
                 async move {
                     let (carrier, memory) = source(&archive, size, upload.clone(), key()).await;
                     let began = std::time::Instant::now();
+                    let hold_us;
                     if previous {
                         // Exact prior offload sequence, same receipt and envelope.
                         let workspace = upload
@@ -228,6 +242,7 @@ async fn real_s3_small_spill_compares_previous_multipart_at_same_distribution_an
                         writer.retain_workspace(workspace);
                         writer.write(bytes.clone()).await.unwrap();
                         let staged = writer.finish_staged().await.unwrap();
+                        hold_us = began.elapsed().as_micros() as u64;
                         assert_eq!(staged.size_bytes, size as u64);
                         assert_eq!(staged.blake3_digest, carrier.digest());
                         assert_eq!(
@@ -241,6 +256,7 @@ async fn real_s3_small_spill_compares_previous_multipart_at_same_distribution_an
                         drop(carrier);
                     } else {
                         assert!(carrier.offload_one().await.unwrap());
+                        hold_us = began.elapsed().as_micros() as u64;
                         let locator = match &*carrier.segments[0].lock().unwrap() {
                             Segment::Object(r) => r.object_locator.clone(),
                             _ => unreachable!(),
@@ -252,7 +268,7 @@ async fn real_s3_small_spill_compares_previous_multipart_at_same_distribution_an
                         drop(carrier);
                     }
                     assert_eq!(memory.snapshot().0, 0);
-                    began.elapsed().as_micros() as u64
+                    hold_us
                 }
             })
             .buffer_unordered(2)
@@ -271,7 +287,7 @@ async fn real_s3_small_spill_compares_previous_multipart_at_same_distribution_an
         }
         assert_eq!(upload.upload_workspace.snapshot().0, 0);
         eprintln!(
-            "synthetic_spill_comparison previous={previous} concurrency=2 objects=16 bytes={total} elapsed_us={} throughput_bytes_s={:.2} lifetime_p50_us={} lifetime_p95_us={} lifetime_p99_us={} operations={counts:?}",
+            "synthetic_spill_comparison previous={previous} concurrency=2 objects=16 bytes={total} elapsed_us={} throughput_bytes_s={:.2} owner_operation_p50_us={} owner_operation_p95_us={} owner_operation_p99_us={} operations={counts:?}",
             elapsed.as_micros(),
             total as f64 / elapsed.as_secs_f64(),
             ordered[7],
