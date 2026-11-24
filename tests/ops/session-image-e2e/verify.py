@@ -64,13 +64,16 @@ print(json.dumps({'request_id':rid,'session_status':status,'usage':d['usage'],'a
 
 # Verify the actual published semantic manifest through its signed cursor chain.
 path='/self/v1/sessions/'+urllib.parse.quote(matched[0],safe='')+'/requests/'+rid+'/semantic-view'
+last_status=None; last_state=None
 for i in range(120):
  try:
-  status,_,raw=request(path,token=k);page=json.loads(raw)
-  if page.get('status')=='published':break
- except urllib.error.HTTPError:pass
+  status,_,raw=request(path,token=k);page=json.loads(raw);last_status=status;last_state=page.get('status')
+  if last_state=='published':break
+ except urllib.error.HTTPError as error:last_status=error.code
  time.sleep(2)
-else:raise RuntimeError('semantic manifest did not publish')
+else:
+ print(json.dumps({'semantic_http':last_status,'semantic_state':last_state,'session_shape':matched[0][:9],'request_id':rid}),flush=True)
+ raise RuntimeError('semantic manifest did not publish')
 instances=[];pages=0
 while True:
  pages+=1;instances.extend(page['instances']);cursor=page.get('next_cursor')
