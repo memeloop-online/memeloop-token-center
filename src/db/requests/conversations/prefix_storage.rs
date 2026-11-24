@@ -112,12 +112,50 @@ pub(crate) fn candidate_hashes(row: &AnyRow, paths: &PrefixPaths) -> Result<Vec<
     )
 }
 
-pub(crate) async fn load_candidate_paths(
-    transaction: &mut Transaction<'_, Any>,
-    tenant_id: &str,
+pub(crate) struct PreparedCandidatePaths {
+    tenant_id: String,
+    roots: std::collections::BTreeSet<String>,
+    paths: PrefixPaths,
+}
+impl PreparedCandidatePaths {
+    pub(crate) async fn load(
+        transaction: &mut Transaction<'_, Any>,
+        tenant_id: String,
+        candidates: &[AnyRow],
+        leaf: Option<&str>,
+    ) -> Result<Self, ConversationContentError> {
+        let roots = candidate_roots(candidates, leaf)?;
+        let paths = load_paths(transaction, &tenant_id, roots.clone()).await?;
+        Ok(Self {
+            tenant_id,
+            roots,
+            paths,
+        })
+    }
+
+    pub(crate) fn for_fresh_candidates(
+        &self,
+        tenant_id: &str,
+        candidates: &[AnyRow],
+        leaf: Option<&str>,
+    ) -> Result<&PrefixPaths, ConversationContentError> {
+        let required = candidate_roots(candidates, leaf)?;
+        if self.tenant_id != tenant_id || !required.is_subset(&self.roots) {
+            return Err(AppError::Conflict(
+                "conversation candidates changed during prefix preparation".into(),
+            )
+            .into());
+        }
+        // Candidate metadata is always the freshly selected, locked-scope row.
+        // Only tenant-scoped content-addressed nodes are reused.
+        Ok(&self.paths)
+    }
+}
+
+fn candidate_roots(
     candidates: &[AnyRow],
     current_leaf: Option<&str>,
-) -> Result<PrefixPaths, ConversationContentError> {
+) -> Result<std::collections::BTreeSet<String>, ConversationContentError> {
     let mut roots = std::collections::BTreeSet::new();
     if let Some(leaf) = current_leaf {
         roots.insert(leaf.to_owned());
@@ -128,6 +166,16 @@ pub(crate) async fn load_candidate_paths(
             roots.insert(head);
         }
     }
+    Ok(roots)
+}
+
+pub(crate) async fn load_candidate_paths(
+    transaction: &mut Transaction<'_, Any>,
+    tenant_id: &str,
+    candidates: &[AnyRow],
+    current_leaf: Option<&str>,
+) -> Result<PrefixPaths, ConversationContentError> {
+    let roots = candidate_roots(candidates, current_leaf)?;
     load_paths(transaction, tenant_id, roots).await
 }
 
