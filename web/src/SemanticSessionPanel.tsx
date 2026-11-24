@@ -16,7 +16,9 @@ function knownRole(value: unknown): value is ConversationMessageListProjection['
 export function SemanticSessionPanel({ detail, loader }: { detail: LogicalSessionDetail; loader: SemanticViewLoader }) {
   const { locale } = useI18n(); const zh = locale.startsWith('zh');
   const requests = detail.requests;
-  const [requestId, setRequestId] = useState(requests.at(-1)?.request_id ?? '');
+  const [selection, setSelection] = useState({ session: detail.session_id, request: requests.at(-1)?.request_id ?? '' });
+  const requestId = selection.session === detail.session_id && requests.some(request => request.request_id === selection.request)
+    ? selection.request : requests.at(-1)?.request_id ?? '';
   const { page: visiblePage, error, loading, refresh, earlier, newer, hasNewer, host } = useSemanticPages(loader, requestId);
   const [exportError, setExportError] = useState<Error | null>(null);
   const exportActive = useRef<AbortController | null>(null);
@@ -42,7 +44,7 @@ export function SemanticSessionPanel({ detail, loader }: { detail: LogicalSessio
   }]; }), [visibleInstances, revision, detail.session_id, requestId, requests]);
   return <div ref={host}><DataSurface aria-label={zh ? '会话记录' : 'Conversation record'}>
     <FormSection title={zh ? '会话记录' : 'Conversation record'}>
-    <Field label={zh ? '请求上下文' : 'Request context'}><Select value={requestId} onChange={event => setRequestId(event.target.value)}>
+    <Field label={zh ? '请求上下文' : 'Request context'}><Select value={requestId} onChange={event => setSelection({ session: detail.session_id, request: event.target.value })}>
       {requests.map(request => <option key={request.request_id} value={request.request_id}>{new Date(request.created_at).toLocaleString(locale)} · {request.model}</option>)}
     </Select></Field>
     <Button appearance="secondary" disabled={loading} onClick={() => void refresh()}>{zh ? '刷新会话记录' : 'Refresh conversation'}</Button>
