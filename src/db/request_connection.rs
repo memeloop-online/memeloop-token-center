@@ -1,5 +1,8 @@
 //! A cancelled read must not wait for SQLx to drain the abandoned query.
-use std::ops::{Deref, DerefMut};
+use std::{
+    ops::{Deref, DerefMut},
+    sync::{Arc, atomic::Ordering},
+};
 
 use sqlx::{Any, AnyConnection, Connection, pool::PoolConnection};
 
@@ -8,16 +11,51 @@ use super::DatabaseBackend;
 pub(crate) struct RequestConnection {
     connection: Option<PoolConnection<Any>>,
     backend: DatabaseBackend,
+    diagnostics: Arc<super::request_pool::PoolDiagnostics>,
+    phase: u8,
 }
 
 impl RequestConnection {
-    pub(super) fn new(connection: PoolConnection<Any>, backend: DatabaseBackend) -> Self {
+    pub(super) fn new(
+        connection: PoolConnection<Any>,
+        backend: DatabaseBackend,
+        diagnostics: Arc<super::request_pool::PoolDiagnostics>,
+    ) -> Self {
+        diagnostics.direct_owned.fetch_add(1, Ordering::Relaxed);
         Self {
             connection: Some(connection),
             backend,
+            diagnostics,
+            phase: 0,
         }
     }
 
+    pub(super) fn query_phase(&mut self, stream: bool) {
+        self.clear_query_phase();
+        self.phase = if stream { 2 } else { 1 };
+        if stream {
+            &self.diagnostics.direct_stream
+        } else {
+            &self.diagnostics.direct_query
+        }
+        .fetch_add(1, Ordering::Relaxed);
+    }
+    fn clear_query_phase(&mut self) {
+        match self.phase {
+            1 => {
+                self.diagnostics
+                    .direct_query
+                    .fetch_sub(1, Ordering::Relaxed);
+            }
+            2 => {
+                self.diagnostics
+                    .direct_stream
+                    .fetch_sub(1, Ordering::Relaxed);
+            }
+            _ => {}
+        }
+        self.phase = 0;
+    }
     pub(super) fn close_on_drop(&mut self) {
         self.connection
             .as_mut()
@@ -28,6 +66,9 @@ impl RequestConnection {
     /// Transfer ownership only to SQLx Transaction::begin, whose open=true
     /// rollback guard covers BEGIN, statements and COMMIT cancellation.
     pub(super) fn into_pool(mut self) -> PoolConnection<Any> {
+        self.diagnostics
+            .transaction_transfers
+            .fetch_add(1, Ordering::Relaxed);
         self.connection.take().expect("request connection present")
     }
 
@@ -49,6 +90,9 @@ impl RequestConnection {
 
     /// Only a completed operation takes the normal SQLx return/reuse path.
     pub(super) fn finish(mut self) {
+        self.diagnostics
+            .return_requested
+            .fetch_add(1, Ordering::Relaxed);
         drop(self.connection.take());
     }
 }
@@ -73,6 +117,10 @@ impl DerefMut for RequestConnection {
 
 impl Drop for RequestConnection {
     fn drop(&mut self) {
+        self.clear_query_phase();
+        self.diagnostics
+            .direct_owned
+            .fetch_sub(1, Ordering::Relaxed);
         if matches!(self.backend, DatabaseBackend::PostgreSql)
             && let Some(connection) = self.connection.take()
         {
@@ -80,6 +128,9 @@ impl Drop for RequestConnection {
             // pool can replace this connection immediately. PostgreSQL's
             // client_connection_check_interval detects this disconnect while
             // executing/waiting; it never authorizes replay of uncertain work.
+            self.diagnostics
+                .cancel_detached
+                .fetch_add(1, Ordering::Relaxed);
             drop(connection.detach());
         }
     }

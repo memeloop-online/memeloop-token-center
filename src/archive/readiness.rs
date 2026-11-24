@@ -318,15 +318,7 @@ impl CanaryFailure {
     }
 
     fn storage(stage: CanaryStage, error: object_store::Error) -> Self {
-        let error_class = match error {
-            object_store::Error::PermissionDenied { .. } => "permission_denied",
-            object_store::Error::Unauthenticated { .. } => "unauthenticated",
-            object_store::Error::NotFound { .. } => "not_found",
-            // Generic includes transport and service failures; do not infer a
-            // DNS/connect/TTFB cause by parsing possibly secret-bearing text.
-            object_store::Error::Generic { .. } => "transport_or_service",
-            _ => "operation_error",
-        };
+        let error_class = crate::error::object_store_error_kind(&error);
         Self {
             stage,
             timed_out: false,

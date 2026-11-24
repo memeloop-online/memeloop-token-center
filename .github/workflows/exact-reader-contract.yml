@@ -10,7 +10,12 @@ on:
         required: true
         type: choice
         options:
+          - request-events-997
+          - request-readmodel-994
           - request-carrier-958
+          - response-carrier-968
+          - orphan-reaper-971
+          - semantic-reader-scope
           - pg-executor-959
           - session-response-956
           - semantic-partial-954
@@ -23,10 +28,214 @@ on:
           - admission-cancel
           - quota-outage
           - conversation-812
+          - projection-scheduler-987
+          - legacy-archive-bound
+          - history-writer-984
+          - history-capture-981
           - release-927-928
 permissions:
   contents: read
 jobs:
+  request-readmodel-web-contract:
+    if: inputs.contract == 'request-readmodel-994'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    steps:
+      - name: Require an exact source commit
+        env:
+          SOURCE_REVISION: ${{ inputs.source_revision }}
+        run: '[[ "$SOURCE_REVISION" =~ ^[0-9a-f]{40}$ ]]'
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+        with:
+          ref: ${{ inputs.source_revision }}
+          persist-credentials: false
+      - run: git rev-parse HEAD
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020
+        with:
+          node-version: 24.18.0
+      - run: npm ci --ignore-scripts
+        working-directory: web
+      - name: Compile production TypeScript and bundle
+        run: npm run build
+        working-directory: web
+      - name: Verify partial deltas and financial receipt revisions
+        run: node --import tsx --test e2e/request-live-fields-contract.test.ts e2e/request-refresh-cadence-contract.test.ts e2e/request-refresh-pause-contract.test.ts
+        working-directory: web
+  request-events-contract:
+    if: inputs.contract == 'request-events-997'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+    services:
+      postgres:
+        image: postgres:16-alpine
+        env:
+          POSTGRES_USER: token_center
+          POSTGRES_PASSWORD: token_center
+          POSTGRES_DB: token_center_test
+        ports: ['5432:5432']
+        options: --health-cmd pg_isready --health-interval 5s --health-timeout 5s --health-retries 10
+    env:
+      MTC_TEST_POSTGRES_URL: postgres://token_center:token_center@127.0.0.1:5432/token_center_test
+    steps:
+      - name: Require an exact source commit
+        env:
+          SOURCE_REVISION: ${{ inputs.source_revision }}
+        run: '[[ "$SOURCE_REVISION" =~ ^[0-9a-f]{40}$ ]]'
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+        with:
+          ref: ${{ inputs.source_revision }}
+          persist-credentials: false
+      - run: git rev-parse HEAD
+      - uses: dtolnay/rust-toolchain@4360b52568e2003a75bf9bc1d59f33a8e3fc893c
+        with:
+          toolchain: 1.95.0
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6
+      - uses: ./.github/actions/checkout-plugin-examples
+      - name: Verify lifecycle publication under archive and financial gates
+        run: |
+          set -o pipefail
+          test -n "$MTC_TEST_POSTGRES_URL"
+          cargo test --locked --lib --no-run
+          for selector in \
+            db::requests::operational_terminal::tests::lifecycle_events::sqlite_lifecycle_events_do_not_wait_for_archive_or_financial_projection \
+            db::requests::operational_terminal::tests::lifecycle_events::postgres_lifecycle_events_do_not_wait_for_archive_or_financial_projection \
+            db::requests::conversations::archive_readiness_tests::sqlite_admission_event_precedes_queued_archive_and_preserves_raw_body \
+            db::requests::conversations::archive_readiness_tests::postgres_admission_event_precedes_queued_archive_and_preserves_raw_body
+          do
+            echo "Contract: $selector"
+            timeout 180s cargo test --locked --lib "$selector" -- --exact 2>&1 | tee /tmp/request-readmodel-contract.log
+            grep -F '1 passed; 0 failed' /tmp/request-readmodel-contract.log
+          done
+  request-readmodel-contract:
+    if: inputs.contract == 'request-readmodel-994'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+    services:
+      postgres:
+        image: postgres:16-alpine
+        env:
+          POSTGRES_USER: token_center
+          POSTGRES_PASSWORD: token_center
+          POSTGRES_DB: token_center_test
+        ports: ['5432:5432']
+        options: --health-cmd pg_isready --health-interval 5s --health-timeout 5s --health-retries 10
+    env:
+      MTC_TEST_POSTGRES_URL: postgres://token_center:token_center@127.0.0.1:5432/token_center_test
+    steps:
+      - name: Require an exact source commit
+        env:
+          SOURCE_REVISION: ${{ inputs.source_revision }}
+        run: '[[ "$SOURCE_REVISION" =~ ^[0-9a-f]{40}$ ]]'
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+        with:
+          ref: ${{ inputs.source_revision }}
+          persist-credentials: false
+      - run: git rev-parse HEAD
+      - uses: dtolnay/rust-toolchain@4360b52568e2003a75bf9bc1d59f33a8e3fc893c
+        with:
+          toolchain: 1.95.0
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6
+      - uses: ./.github/actions/checkout-plugin-examples
+      - name: Verify SQLite and PostgreSQL request snapshot and event parity
+        run: |
+          set -o pipefail
+          test -n "$MTC_TEST_POSTGRES_URL"
+          cargo test --locked --lib --no-run
+          for selector in \
+            db::requests::queries::event_contract_tests::sqlite_event_enrichment_preserves_recorded_fields_and_tenant_ownership \
+            db::requests::queries::event_contract_tests::postgres_event_enrichment_preserves_recorded_fields_and_tenant_ownership
+          do
+            echo "Contract: $selector"
+            timeout 180s cargo test --locked --lib "$selector" -- --exact 2>&1 | tee /tmp/request-readmodel-contract.log
+            grep -F '1 passed; 0 failed' /tmp/request-readmodel-contract.log
+          done
+  orphan-reaper-contract:
+    if: inputs.contract == 'orphan-reaper-971'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+    services:
+      postgres:
+        image: postgres:16-alpine
+        env:
+          POSTGRES_USER: token_center
+          POSTGRES_PASSWORD: token_center
+          POSTGRES_DB: token_center_test
+        ports: ['5432:5432']
+        options: --health-cmd pg_isready --health-interval 5s --health-timeout 5s --health-retries 10
+    env:
+      MTC_TEST_POSTGRES_URL: postgres://token_center:token_center@127.0.0.1:5432/token_center_test
+    steps:
+      - name: Require an exact source commit
+        env:
+          SOURCE_REVISION: ${{ inputs.source_revision }}
+        run: '[[ "$SOURCE_REVISION" =~ ^[0-9a-f]{40}$ ]]'
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+        with:
+          ref: ${{ inputs.source_revision }}
+          persist-credentials: false
+      - run: git rev-parse HEAD
+      - uses: dtolnay/rust-toolchain@4360b52568e2003a75bf9bc1d59f33a8e3fc893c
+        with:
+          toolchain: 1.95.0
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6
+      - uses: ./.github/actions/checkout-plugin-examples
+      - name: Verify SQLite and PostgreSQL orphan scan fairness
+        run: |
+          set -o pipefail
+          test -n "$MTC_TEST_POSTGRES_URL"
+          cargo test --locked --lib --no-run
+          for selector in \
+            db::requests::settlement::orphan_scan_tests::sqlite_orphan_scan_advances_past_ineligible_rows_and_revisits_late_eligibility \
+            db::requests::settlement::orphan_scan_tests::postgres_orphan_scan_advances_past_ineligible_rows_and_revisits_late_eligibility
+          do
+            echo "Contract: $selector"
+            timeout 180s cargo test --locked --lib "$selector" -- --exact 2>&1 | tee /tmp/orphan-reaper-contract.log
+            grep -F '1 passed; 0 failed' /tmp/orphan-reaper-contract.log
+          done
+  response-carrier-contract:
+    if: inputs.contract == 'response-carrier-968'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+    steps:
+      - name: Require an exact source commit
+        env:
+          SOURCE_REVISION: ${{ inputs.source_revision }}
+        run: '[[ "$SOURCE_REVISION" =~ ^[0-9a-f]{40}$ ]]'
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+        with:
+          ref: ${{ inputs.source_revision }}
+          persist-credentials: false
+      - run: git rev-parse HEAD
+      - uses: dtolnay/rust-toolchain@4360b52568e2003a75bf9bc1d59f33a8e3fc893c
+        with:
+          toolchain: 1.95.0
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6
+      - uses: ./.github/actions/checkout-plugin-examples
+      - name: Verify response carrier ownership and archive behavior
+        run: |
+          set -o pipefail
+          cargo test --locked --lib --no-run
+          for selector in \
+            supplier_error::tests::shared_projection_preserves_explanation_and_removes_credentials \
+            supplier_error::tests::credential_echoes_include_authorization_payload_and_decoded_password \
+            supplier_error::tests::credential_projection_handles_url_and_known_secret_echoes \
+            supplier_error::tests::record_details_above_old_inline_limit_preserve_unknown_fields \
+            supplier_error::tests::known_and_unknown_details_survive_http_stream_and_record_projection \
+            api::proxy::tests::codex_streaming_output_then_failure_keeps_unobserved_usage_out_of_actual_cost \
+            error::tests::object_storage_classification_preserves_only_typed_safe_facts \
+            error::tests::dependency_errors_do_not_retain_secret_bearing_driver_messages \
+            response_archive_spool::tests::shared_capture_reaches_eof_while_all_upload_slots_are_held \
+            response_archive_spool::tests::unavailable_local_directory_does_not_gate_complete_original \
+            response_archive_spool::tests::cancelled_unsealed_carrier_releases_owned_capture_without_acknowledging_original \
+            response_archive_spool::tests::empty_shared_carrier_publishes_the_exact_empty_original \
+            response_archive_spool::tests::original_stream_capture_uses_selected_backend_without_legacy_body_copy \
+            api::proxy::tests::persistence_isolation::pending_response_archive_begin_does_not_hold_first_byte_or_eof \
+            api::proxy::tests::sse_delivery::large_source_backed_conversation_stream_releases_raw_bytes_before_terminal_projection
+          do
+            echo "Contract: $selector"
+            timeout 180s cargo test --locked --lib "$selector" -- --exact 2>&1 | tee /tmp/response-carrier-contract.log
+            grep -F '1 passed; 0 failed' /tmp/response-carrier-contract.log
+          done
   reader-contract:
     if: inputs.contract == 'bfa-reader'
     runs-on: ubuntu-24.04
@@ -256,6 +465,159 @@ jobs:
           grep -F '1 passed; 0 failed' /tmp/contract-812-a.log
           cargo test --locked --lib api::operator_inference::tests::control_responses_streams_image_events_and_archives_usage_and_conversation -- --exact 2>&1 | tee /tmp/contract-812-b.log
           grep -F '1 passed; 0 failed' /tmp/contract-812-b.log
+  projection-scheduler-987-contract:
+    if: inputs.contract == 'projection-scheduler-987'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+    env:
+      MTC_TEST_POSTGRES_URL: postgres://token_center:token_center@127.0.0.1:5432/memeloop_token_center_test
+    services:
+      postgres:
+        image: postgres:16-alpine
+        env:
+          POSTGRES_USER: token_center
+          POSTGRES_PASSWORD: token_center
+          POSTGRES_DB: memeloop_token_center_test
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd pg_isready
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 5
+    steps:
+      - name: Require an exact source commit
+        env:
+          SOURCE_REVISION: ${{ inputs.source_revision }}
+        run: '[[ "$SOURCE_REVISION" =~ ^[0-9a-f]{40}$ ]]'
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+        with:
+          ref: ${{ inputs.source_revision }}
+          persist-credentials: false
+      - uses: ./.github/actions/checkout-plugin-examples
+      - uses: dtolnay/rust-toolchain@4360b52568e2003a75bf9bc1d59f33a8e3fc893c
+        with:
+          toolchain: 1.95.0
+      - name: Verify exact release contracts
+        run: |
+          set -o pipefail
+          git rev-parse HEAD
+          cargo test --locked --all-features --lib db::requests::conversations::archive_readiness_tests::postgres_coverage_read_does_not_block_body_worker -- --exact --nocapture 2>&1 | tee /tmp/projection-scheduler.log
+          grep -F '1 passed; 0 failed' /tmp/projection-scheduler.log
+
+  legacy-archive-bound-contract:
+    if: inputs.contract == 'legacy-archive-bound'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+    steps:
+      - name: Require an exact source commit
+        env:
+          SOURCE_REVISION: ${{ inputs.source_revision }}
+        run: '[[ "$SOURCE_REVISION" =~ ^[0-9a-f]{40}$ ]]'
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+        with:
+          ref: ${{ inputs.source_revision }}
+          persist-credentials: false
+      - uses: ./.github/actions/checkout-plugin-examples
+      - uses: dtolnay/rust-toolchain@4360b52568e2003a75bf9bc1d59f33a8e3fc893c
+        with:
+          toolchain: 1.95.0
+      - name: Verify legacy archive resolver and full-byte contracts
+        run: |
+          set -o pipefail
+          git rev-parse HEAD
+          cargo test --locked --all-features --lib api::self_service::requests::tests::legacy_bound_archive_without_raw_root_remains_readable -- --exact --nocapture 2>&1 | tee /tmp/legacy-archive-bound.log
+          grep -F '1 passed; 0 failed' /tmp/legacy-archive-bound.log
+          cargo test --locked --all-features --lib api::self_service::requests::tests::retired_raw_detail_uses_lossless_semantic_identity_without_reading_old_body -- --exact --nocapture 2>&1 | tee /tmp/legacy-retirement.log
+          grep -F '1 passed; 0 failed' /tmp/legacy-retirement.log
+
+  history-writer-984-contract:
+    if: inputs.contract == 'history-writer-984'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+    env:
+      MTC_TEST_POSTGRES_URL: postgres://token_center:token_center@127.0.0.1:5432/memeloop_token_center_test
+    services:
+      postgres:
+        image: postgres:16-alpine
+        env:
+          POSTGRES_USER: token_center
+          POSTGRES_PASSWORD: token_center
+          POSTGRES_DB: memeloop_token_center_test
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd pg_isready
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 5
+    steps:
+      - name: Require an exact source commit
+        env:
+          SOURCE_REVISION: ${{ inputs.source_revision }}
+        run: '[[ "$SOURCE_REVISION" =~ ^[0-9a-f]{40}$ ]]'
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+        with:
+          ref: ${{ inputs.source_revision }}
+          persist-credentials: false
+      - uses: ./.github/actions/checkout-plugin-examples
+      - uses: dtolnay/rust-toolchain@4360b52568e2003a75bf9bc1d59f33a8e3fc893c
+        with:
+          toolchain: 1.95.0
+      - name: Verify exact release contracts
+        run: |
+          set -o pipefail
+          git rev-parse HEAD
+          cargo test --locked --all-features --lib db::tests::terminal_projection::postgres_terminal_writer_does_not_capture_sibling_events -- --ignored --exact --nocapture 2>&1 | tee /tmp/history-writer.log
+          grep -F '1 passed; 0 failed' /tmp/history-writer.log
+
+  history-capture-981-contract:
+    if: inputs.contract == 'history-capture-981'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+    env:
+      MTC_TEST_POSTGRES_URL: postgres://token_center:token_center@127.0.0.1:5432/memeloop_token_center_test
+    services:
+      postgres:
+        image: postgres:16-alpine
+        env:
+          POSTGRES_USER: token_center
+          POSTGRES_PASSWORD: token_center
+          POSTGRES_DB: memeloop_token_center_test
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd pg_isready
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 5
+    steps:
+      - name: Require an exact source commit
+        env:
+          SOURCE_REVISION: ${{ inputs.source_revision }}
+        run: '[[ "$SOURCE_REVISION" =~ ^[0-9a-f]{40}$ ]]'
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+        with:
+          ref: ${{ inputs.source_revision }}
+          persist-credentials: false
+      - uses: ./.github/actions/checkout-plugin-examples
+      - uses: dtolnay/rust-toolchain@4360b52568e2003a75bf9bc1d59f33a8e3fc893c
+        with:
+          toolchain: 1.95.0
+      - name: Verify exact release contracts
+        run: |
+          set -o pipefail
+          git rev-parse HEAD
+          for selector in \
+            db::requests::queries::history_point_contract_tests::history_point_query_binds_partition_and_full_identity \
+            db::history_immutable_outbox::tests::immutable_history_delivery_survives_source_absence_restart_and_stale_ack
+          do
+            cargo test --locked --all-features --lib "$selector" -- --exact 2>&1 | tee /tmp/history-capture.log
+            grep -F '1 passed; 0 failed' /tmp/history-capture.log
+          done
+          cargo test --locked --all-features --lib db::history_immutable_outbox::tests::postgres_history_capture_skips_locked_identity_and_commits_progress -- --ignored --exact --nocapture 2>&1 | tee /tmp/history-capture-pg.log
+          grep -F '1 passed; 0 failed' /tmp/history-capture-pg.log
+
   release-927-928-contract:
     if: inputs.contract == 'release-927-928'
     runs-on: ubuntu-24.04
@@ -456,3 +818,36 @@ jobs:
           git rev-parse HEAD
           cargo test --locked --lib db::request_pool::tests::postgres_paused_returning_stream_retains_transaction_until_drop_but_execute_commits -- --exact --nocapture 2>&1 | tee /tmp/pg-executor.log
           grep -F '1 passed; 0 failed' /tmp/pg-executor.log
+
+  semantic-reader-scope-contract:
+    if: inputs.contract == 'semantic-reader-scope'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    services:
+      postgres:
+        image: postgres:16-alpine
+        env:
+          POSTGRES_USER: token_center
+          POSTGRES_PASSWORD: token_center
+          POSTGRES_DB: token_center_test
+        ports: ['5432:5432']
+        options: --health-cmd pg_isready --health-interval 5s --health-timeout 5s --health-retries 10
+    env:
+      MTC_TEST_POSTGRES_URL: postgres://token_center:token_center@127.0.0.1:5432/token_center_test
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+        with:
+          ref: ${{ inputs.source_revision }}
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@4360b52568e2003a75bf9bc1d59f33a8e3fc893c
+        with:
+          toolchain: 1.95.0
+      - uses: ./.github/actions/checkout-plugin-examples
+      - run: |
+          set -o pipefail
+          git rev-parse HEAD
+          test "$(git rev-parse HEAD)" = "${{ inputs.source_revision }}"
+          for backend in sqlite postgres; do
+            cargo test --locked --lib "db::session_reading::tests::${backend}_semantic_revision_uses_authorized_request_scope" -- --exact --nocapture 2>&1 | tee /tmp/semantic-reader-scope.log
+            grep -F '1 passed; 0 failed' /tmp/semantic-reader-scope.log
+          done

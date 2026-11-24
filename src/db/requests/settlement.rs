@@ -4,7 +4,19 @@ use crate::model::MeteredUsageReservation;
 #[cfg(test)]
 mod optional_limits;
 #[cfg(test)]
+mod orphan_scan_tests;
+#[cfg(test)]
 mod usage_normalization_tests;
+
+/// Scan positions advance over inspected rows, including rows that are not orphans.
+#[derive(Clone, Default)]
+pub(crate) struct OrphanReservationScan {
+    request_after: Option<(String, String)>,
+    reservation_after: Option<(i64, String)>,
+    reservation_cutoff: Option<i64>,
+    settled_request_after: Option<(i64, String, String, String)>,
+    settled_request_cutoff: Option<i64>,
+}
 
 impl Database {
     pub async fn delete_expired_rate_windows(&self, limit: i64) -> Result<u64, AppError> {
@@ -13,7 +25,7 @@ impl Database {
             "DELETE FROM rate_limit_windows WHERE (key_id, window_start) IN (SELECT key_id, window_start FROM rate_limit_windows WHERE window_start < $1 ORDER BY window_start ASC, key_id ASC LIMIT $2)",
         )
         .bind(cutoff)
-        .bind(limit.clamp(1, 100_000))
+        .bind(limit)
         .execute(&self.pool)
         .await?
         .rows_affected();
@@ -23,7 +35,7 @@ impl Database {
     pub async fn delete_expired_budget_rollups(&self, limit: i64) -> Result<u64, AppError> {
         let cutoff_day = unix_millis().saturating_sub(7 * 86_400_000) / 86_400_000;
         let cutoff_at = cutoff_day.saturating_mul(86_400_000);
-        let limit = limit.clamp(1, 100_000);
+        let limit = limit;
         let mut tx = self.begin_write_transaction().await?;
         let events = sqlx::query(
             "DELETE FROM key_budget_usage_events WHERE usage_entry_id IN (SELECT usage_entry_id FROM key_budget_usage_events WHERE settled_at < $1 ORDER BY settled_at ASC, usage_entry_id ASC LIMIT $2)",
@@ -112,6 +124,15 @@ impl Database {
     }
 
     pub async fn release_orphaned_reservations(&self, limit: i64) -> Result<u64, AppError> {
+        self.release_orphaned_reservations_page(limit, &mut OrphanReservationScan::default())
+            .await
+    }
+
+    pub(crate) async fn release_orphaned_reservations_page(
+        &self,
+        limit: i64,
+        scan: &mut OrphanReservationScan,
+    ) -> Result<u64, AppError> {
         let mut connection = self.pool.acquire().await?;
         let now = self.request_owner_now(&mut connection).await?;
         connection.finish();
@@ -120,133 +141,197 @@ impl Database {
         // its unknown result, including requests without an idempotency key.
         // Preserve reservation and archive evidence; never infer no-send from
         // the absence of a terminal response.
-        sqlx::query("UPDATE request_records SET submission_uncertain_at = $1, error_code = 'image_submission_uncertain' WHERE completed_at IS NULL AND submission_started_at IS NOT NULL AND submission_uncertain_at IS NULL AND id IN (SELECT q.id FROM request_records q WHERE q.created_at < $2 AND q.completed_at IS NULL AND q.submission_started_at IS NOT NULL AND q.submission_uncertain_at IS NULL AND NOT EXISTS (SELECT 1 FROM synchronous_image_idempotency s WHERE s.request_id = q.id AND s.key_id = q.key_id AND s.status = 'pending' AND s.lease_expires_at > $1) ORDER BY q.created_at, q.id LIMIT $3)")
-            .bind(now).bind(cutoff).bind(limit.clamp(1, 1000)).execute(&self.pool).await?;
-        let rows = sqlx::query(
-            "SELECT r.id, r.account_id, r.key_id, r.enforcement_mode, r.reserved_micros, r.reserved_tokens, r.reserved_units, r.billing_unit, r.micros_per_unit, r.rate_window_start, q.id AS request_id, q.created_at AS request_created_at, q.tenant_id AS request_tenant_id, q.error_code AS pending_error_code, q.input_tokens AS pending_input_tokens, q.output_tokens AS pending_output_tokens, q.service_tier AS pending_service_tier FROM usage_reservations r LEFT JOIN request_records q ON q.reservation_id = r.id WHERE (r.status = 'reserved' OR (r.status = 'settled' AND q.id IS NOT NULL)) AND r.created_at < $1 AND q.completed_at IS NULL AND q.submission_started_at IS NULL AND (q.proxy_owner_expires_at IS NULL OR q.proxy_owner_expires_at <= $2) AND NOT EXISTS (SELECT 1 FROM pending_proxy_settlements p WHERE p.reservation_id = r.id AND p.state = 'pending') AND NOT EXISTS (SELECT 1 FROM generation_jobs g WHERE g.reservation_id = r.id) AND NOT EXISTS (SELECT 1 FROM synchronous_image_idempotency s WHERE s.reservation_id = r.id AND s.status = 'pending' AND s.lease_expires_at > $2) ORDER BY r.created_at, r.id LIMIT $3",
+        let limit = limit;
+        // Materialize a bounded index page before any correlated eligibility
+        // checks. LIMIT on the old anti-join only bounded its output, not work.
+        let request_page = match &scan.request_after {
+            Some((tenant, id)) => sqlx::query("SELECT id, created_at, tenant_id FROM request_records WHERE submission_started_at IS NOT NULL AND completed_at IS NULL AND (tenant_id, id) > ($1, $2) ORDER BY tenant_id, id LIMIT $3")
+                .bind(tenant).bind(id).bind(limit).fetch_all(&self.pool).await?,
+            None => sqlx::query("SELECT id, created_at, tenant_id FROM request_records WHERE submission_started_at IS NOT NULL AND completed_at IS NULL ORDER BY tenant_id, id LIMIT $1")
+                .bind(limit).fetch_all(&self.pool).await?,
+        };
+        if request_page.is_empty() {
+            scan.request_after = None;
+        }
+        for candidate in request_page {
+            let id: String = candidate.try_get("id")?;
+            let created: i64 = candidate.try_get("created_at")?;
+            sqlx::query("UPDATE request_records SET submission_uncertain_at = $1, error_code = 'image_submission_uncertain' WHERE id = $2 AND created_at = $3 AND created_at < $4 AND completed_at IS NULL AND submission_started_at IS NOT NULL AND submission_uncertain_at IS NULL AND NOT EXISTS (SELECT 1 FROM synchronous_image_idempotency s WHERE s.request_id = request_records.id AND s.key_id = request_records.key_id AND s.status = 'pending' AND s.lease_expires_at > $1)")
+                .bind(now).bind(&id).bind(created).bind(cutoff).execute(&self.pool).await?;
+            scan.request_after = Some((candidate.try_get("tenant_id")?, id));
+        }
+        // Each lane gets an index-bounded page on every tick. Completed settled
+        // history must never consume the reserved lane's candidate budget.
+        let reserved_cutoff = *scan.reservation_cutoff.get_or_insert(cutoff);
+        let reserved_page = match &scan.reservation_after {
+            Some((created, id)) => sqlx::query("SELECT id, created_at FROM usage_reservations WHERE status = 'reserved' AND created_at < $1 AND (created_at, id) > ($2, $3) ORDER BY created_at, id LIMIT $4")
+                .bind(reserved_cutoff).bind(created).bind(id).bind(limit).fetch_all(&self.pool).await?,
+            None => sqlx::query("SELECT id, created_at FROM usage_reservations WHERE status = 'reserved' AND created_at < $1 ORDER BY created_at, id LIMIT $2")
+                .bind(reserved_cutoff).bind(limit).fetch_all(&self.pool).await?,
+        };
+        if reserved_page.is_empty() {
+            scan.reservation_after = None;
+            scan.reservation_cutoff = None;
+        }
+        let mut candidates = Vec::new();
+        for row in reserved_page {
+            let id: String = row.try_get("id")?;
+            let created: i64 = row.try_get("created_at")?;
+            scan.reservation_after = Some((created, id.clone()));
+            candidates.push((id, created));
+        }
+        let settled_cutoff = *scan.settled_request_cutoff.get_or_insert(cutoff);
+        let settled_page = match &scan.settled_request_after {
+            Some((created, tenant, key, id)) => sqlx::query("SELECT created_at, tenant_id, key_id, id, reservation_id FROM request_records WHERE completed_at IS NULL AND submission_started_at IS NULL AND created_at < $1 AND (created_at, tenant_id, key_id, id) > ($2, $3, $4, $5) ORDER BY created_at, tenant_id, key_id, id LIMIT $6")
+                .bind(settled_cutoff).bind(created).bind(tenant).bind(key).bind(id).bind(limit).fetch_all(&self.pool).await?,
+            None => sqlx::query("SELECT created_at, tenant_id, key_id, id, reservation_id FROM request_records WHERE completed_at IS NULL AND submission_started_at IS NULL AND created_at < $1 ORDER BY created_at, tenant_id, key_id, id LIMIT $2")
+                .bind(settled_cutoff).bind(limit).fetch_all(&self.pool).await?,
+        };
+        if settled_page.is_empty() {
+            scan.settled_request_after = None;
+            scan.settled_request_cutoff = None;
+        }
+        for row in settled_page {
+            scan.settled_request_after = Some((
+                row.try_get("created_at")?,
+                row.try_get("tenant_id")?,
+                row.try_get("key_id")?,
+                row.try_get("id")?,
+            ));
+            let reservation_id: String = row.try_get("reservation_id")?;
+            if let Some(reservation) = sqlx::query("SELECT id, created_at FROM usage_reservations WHERE id = $1 AND status = 'settled' AND created_at < $2")
+                .bind(reservation_id).bind(settled_cutoff).fetch_optional(&self.pool).await? {
+                candidates.push((reservation.try_get("id")?, reservation.try_get("created_at")?));
+            }
+        }
+        let mut released = 0_u64;
+        for (candidate_id, candidate_created) in candidates {
+            let rows = sqlx::query(
+            "SELECT r.id, r.account_id, r.key_id, r.enforcement_mode, r.reserved_micros, r.reserved_tokens, r.reserved_units, r.billing_unit, r.micros_per_unit, r.rate_window_start, q.id AS request_id, q.created_at AS request_created_at, q.tenant_id AS request_tenant_id, q.error_code AS pending_error_code, q.input_tokens AS pending_input_tokens, q.output_tokens AS pending_output_tokens, q.service_tier AS pending_service_tier FROM usage_reservations r LEFT JOIN request_records q ON q.reservation_id = r.id WHERE (r.status = 'reserved' OR (r.status = 'settled' AND q.id IS NOT NULL)) AND r.created_at < $1 AND r.id = $3 AND r.created_at = $4 AND q.completed_at IS NULL AND q.submission_started_at IS NULL AND (q.proxy_owner_expires_at IS NULL OR q.proxy_owner_expires_at <= $2) AND NOT EXISTS (SELECT 1 FROM pending_proxy_settlements p WHERE p.reservation_id = r.id AND p.state = 'pending') AND NOT EXISTS (SELECT 1 FROM generation_jobs g WHERE g.reservation_id = r.id) AND NOT EXISTS (SELECT 1 FROM synchronous_image_idempotency s WHERE s.reservation_id = r.id AND s.status = 'pending' AND s.lease_expires_at > $2)",
         )
         .bind(cutoff)
         .bind(now)
-        .bind(limit.clamp(1, 1_000))
+        .bind(&candidate_id)
+        .bind(candidate_created)
         .fetch_all(&self.pool)
         .await?;
-        let mut released = 0_u64;
-        for row in rows {
-            let request_id = row
-                .try_get::<Option<String>, _>("request_id")?
-                .map(parse_uuid)
-                .transpose()?;
-            let request_created_at = row.try_get::<Option<i64>, _>("request_created_at")?;
-            let request_tenant_id = row
-                .try_get::<Option<String>, _>("request_tenant_id")?
-                .map(parse_uuid)
-                .transpose()?;
-            let reservation = UsageReservation {
-                id: parse_uuid(row.try_get("id")?)?,
-                account_id: parse_uuid(row.try_get("account_id")?)?,
-                key_id: parse_uuid(row.try_get("key_id")?)?,
-                enforcement_mode: EnforcementMode::from_storage(
-                    row.try_get::<String, _>("enforcement_mode")?.as_str(),
-                )
-                .ok_or(AppError::internal(
-                    "settlement_release_orphaned_reservations_1",
-                ))?,
-                reserved_micros: row.try_get("reserved_micros")?,
-                input_micros_per_million: 0,
-                output_micros_per_million: 0,
-                price_tiers: Vec::new(),
-                rate_window_start: row.try_get("rate_window_start")?,
-                reserved_tokens: row.try_get("reserved_tokens")?,
-            };
-            let reserved_units: i64 = row.try_get("reserved_units")?;
-            let billing_unit: String = row.try_get("billing_unit")?;
-            let micros_per_unit: i64 = row.try_get("micros_per_unit")?;
-            let metered_reservation = (reserved_units > 0).then(|| MeteredUsageReservation {
-                reservation: reservation.clone(),
-                unit_ceiling: reserved_units,
-                billing_unit,
-                micros_per_unit,
-            });
-            if let Some(request_id) = request_id {
-                let tenant_id = request_tenant_id.ok_or(AppError::internal(
-                    "settlement_release_orphaned_reservations_2",
-                ))?;
-                let response_object = format!("gap://{request_id}/response");
-                let delivery_started = row
-                    .try_get::<Option<String>, _>("pending_error_code")?
-                    .as_deref()
-                    == Some("delivery_started");
-                let input_token_ceiling = if delivery_started {
-                    row.try_get::<Option<i64>, _>("pending_input_tokens")?
-                        .ok_or(AppError::internal(
-                            "settlement_release_orphaned_reservations_3",
-                        ))?
+            for row in rows {
+                let request_id = row
+                    .try_get::<Option<String>, _>("request_id")?
+                    .map(parse_uuid)
+                    .transpose()?;
+                let request_created_at = row.try_get::<Option<i64>, _>("request_created_at")?;
+                let request_tenant_id = row
+                    .try_get::<Option<String>, _>("request_tenant_id")?
+                    .map(parse_uuid)
+                    .transpose()?;
+                let reservation = UsageReservation {
+                    id: parse_uuid(row.try_get("id")?)?,
+                    account_id: parse_uuid(row.try_get("account_id")?)?,
+                    key_id: parse_uuid(row.try_get("key_id")?)?,
+                    enforcement_mode: EnforcementMode::from_storage(
+                        row.try_get::<String, _>("enforcement_mode")?.as_str(),
+                    )
+                    .ok_or(AppError::internal(
+                        "settlement_release_orphaned_reservations_1",
+                    ))?,
+                    reserved_micros: row.try_get("reserved_micros")?,
+                    input_micros_per_million: 0,
+                    output_micros_per_million: 0,
+                    price_tiers: Vec::new(),
+                    rate_window_start: row.try_get("rate_window_start")?,
+                    reserved_tokens: row.try_get("reserved_tokens")?,
+                };
+                let reserved_units: i64 = row.try_get("reserved_units")?;
+                let billing_unit: String = row.try_get("billing_unit")?;
+                let micros_per_unit: i64 = row.try_get("micros_per_unit")?;
+                let metered_reservation = (reserved_units > 0).then(|| MeteredUsageReservation {
+                    reservation: reservation.clone(),
+                    unit_ceiling: reserved_units,
+                    billing_unit,
+                    micros_per_unit,
+                });
+                if let Some(request_id) = request_id {
+                    let tenant_id = request_tenant_id.ok_or(AppError::internal(
+                        "settlement_release_orphaned_reservations_2",
+                    ))?;
+                    let response_object = format!("gap://{request_id}/response");
+                    let delivery_started = row
+                        .try_get::<Option<String>, _>("pending_error_code")?
+                        .as_deref()
+                        == Some("delivery_started");
+                    let input_token_ceiling = if delivery_started {
+                        row.try_get::<Option<i64>, _>("pending_input_tokens")?
+                            .ok_or(AppError::internal(
+                                "settlement_release_orphaned_reservations_3",
+                            ))?
+                    } else {
+                        reservation.reserved_tokens
+                    };
+                    let output_token_ceiling = if delivery_started {
+                        row.try_get::<Option<i64>, _>("pending_output_tokens")?
+                            .ok_or(AppError::internal(
+                                "settlement_release_orphaned_reservations_4",
+                            ))?
+                    } else {
+                        0
+                    };
+                    let requested_service_tier = delivery_started
+                        .then(|| row.try_get::<Option<String>, _>("pending_service_tier"))
+                        .transpose()?
+                        .flatten();
+                    let duration_ms = request_created_at
+                        .map(|created_at| now.saturating_sub(created_at))
+                        .unwrap_or_default();
+                    let result = if let Some(metered_reservation) = metered_reservation.as_ref() {
+                        self.finish_metered_synchronous_request(FinishMeteredSynchronousRequest {
+                            request_id,
+                            tenant_id,
+                            reservation: metered_reservation,
+                            unit_ceiling: metered_reservation.unit_ceiling,
+                            billed_units: 0,
+                            generation_duration_ms: None,
+                            status_code: 504,
+                            duration_ms,
+                            error_code: Some("request_expired"),
+                            response_object: &response_object,
+                        })
+                        .await
+                    } else {
+                        self.finish_orphaned_proxy_request(FinishProxyRequest {
+                            terminal_cause: None,
+                            usage_basis: Some(crate::model::RequestUsageBasis::NotObserved),
+                            first_output_ms: None,
+                            generation_duration_ms: None,
+                            request_id,
+                            tenant_id,
+                            reservation: &reservation,
+                            input_token_ceiling,
+                            output_token_ceiling,
+                            requested_service_tier: requested_service_tier.as_deref(),
+                            status_code: 504,
+                            duration_ms,
+                            usage: TokenUsage::default(),
+                            error_code: Some("request_expired"),
+                            response_object: &response_object,
+                            routing_session_id: None,
+                            routing_terminal_observed_at: None,
+                            conversation: None,
+                        })
+                        .await
+                    };
+                    let result = match result {
+                        Ok(result) => result,
+                        Err(AppError::Conflict(_)) => continue,
+                        Err(error) => return Err(error),
+                    };
+                    if matches!(result, FinishProxyRequestResult::Finished { .. }) {
+                        released = released.saturating_add(1);
+                    }
                 } else {
-                    reservation.reserved_tokens
-                };
-                let output_token_ceiling = if delivery_started {
-                    row.try_get::<Option<i64>, _>("pending_output_tokens")?
-                        .ok_or(AppError::internal(
-                            "settlement_release_orphaned_reservations_4",
-                        ))?
-                } else {
-                    0
-                };
-                let requested_service_tier = delivery_started
-                    .then(|| row.try_get::<Option<String>, _>("pending_service_tier"))
-                    .transpose()?
-                    .flatten();
-                let duration_ms = request_created_at
-                    .map(|created_at| now.saturating_sub(created_at))
-                    .unwrap_or_default();
-                let result = if let Some(metered_reservation) = metered_reservation.as_ref() {
-                    self.finish_metered_synchronous_request(FinishMeteredSynchronousRequest {
-                        request_id,
-                        tenant_id,
-                        reservation: metered_reservation,
-                        unit_ceiling: metered_reservation.unit_ceiling,
-                        billed_units: 0,
-                        generation_duration_ms: None,
-                        status_code: 504,
-                        duration_ms,
-                        error_code: Some("request_expired"),
-                        response_object: &response_object,
-                    })
-                    .await
-                } else {
-                    self.finish_orphaned_proxy_request(FinishProxyRequest {
-                        terminal_cause: None,
-                        usage_basis: Some(crate::model::RequestUsageBasis::NotObserved),
-                        first_output_ms: None,
-                        generation_duration_ms: None,
-                        request_id,
-                        tenant_id,
-                        reservation: &reservation,
-                        input_token_ceiling,
-                        output_token_ceiling,
-                        requested_service_tier: requested_service_tier.as_deref(),
-                        status_code: 504,
-                        duration_ms,
-                        usage: TokenUsage::default(),
-                        error_code: Some("request_expired"),
-                        response_object: &response_object,
-                        routing_session_id: None,
-                        routing_terminal_observed_at: None,
-                        conversation: None,
-                    })
-                    .await
-                };
-                let result = match result {
-                    Ok(result) => result,
-                    Err(AppError::Conflict(_)) => continue,
-                    Err(error) => return Err(error),
-                };
-                if matches!(result, FinishProxyRequestResult::Finished { .. }) {
+                    self.settle_usage(&reservation, 0, 0).await?;
                     released = released.saturating_add(1);
                 }
-            } else {
-                self.settle_usage(&reservation, 0, 0).await?;
-                released = released.saturating_add(1);
             }
         }
         Ok(released)

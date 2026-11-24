@@ -986,6 +986,10 @@ impl RequestSessionContext {
 
 #[derive(Clone, Debug, Deserialize)]
 pub struct RequestEventView {
+    #[serde(default)]
+    pub operational_terminal: Option<RequestOperationalTerminalView>,
+    #[serde(default)]
+    pub egress: Option<RequestEgressObservation>,
     pub usage_basis: Option<RequestUsageBasis>,
     pub compaction: Option<bool>,
     pub first_output_ms: Option<i64>,
@@ -1040,6 +1044,8 @@ impl Serialize for RequestEventView {
 
         let tokens = self.usage.tokens.as_ref();
         let mut state = serializer.serialize_struct("RequestEventView", 36)?;
+        state.serialize_field("operational_terminal", &self.operational_terminal)?;
+        state.serialize_field("egress", &self.egress)?;
         state.serialize_field("usage_basis", &self.usage_basis)?;
         state.serialize_field("compaction", &self.compaction.filter(|value| *value))?;
         state.serialize_field("event_id", &self.event_id)?;
@@ -1094,6 +1100,10 @@ impl Serialize for RequestEventView {
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
 pub struct RequestArchiveRefs {
+    /// Permanent semantic body authority. Raw locators below are legacy
+    /// provenance while their consumers migrate; they are not semantic roots.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub semantic_archive: Option<crate::archive::SemanticArchiveAuthority>,
     pub view: RequestView,
     pub request_object: String,
     pub response_object: Option<String>,
@@ -1115,7 +1125,18 @@ pub struct RequestProvenanceView {
 }
 
 #[derive(Clone, Debug, Serialize)]
+pub struct SemanticArchiveView {
+    /// Hash-derived revisions are decimal strings on the JSON/JavaScript wire.
+    pub manifest_revision: String,
+    pub projection_version: u32,
+    pub semantic_head: crate::archive::SemanticHead,
+    pub coverage: crate::archive::SemanticCoverage,
+}
+
+#[derive(Clone, Debug, Serialize)]
 pub struct RequestDetail {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub semantic_archive: Option<SemanticArchiveView>,
     #[serde(flatten)]
     pub view: RequestView,
     pub request_body: serde_json::Value,

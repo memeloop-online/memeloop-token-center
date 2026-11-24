@@ -522,3 +522,47 @@ fn terminal_barrier_bounds_the_tail_and_preserves_terminal_billing_class() {
         .is_err()
     );
 }
+
+#[tokio::test]
+async fn thirty_two_live_streams_deliver_small_fragmented_events_and_cancel_cleanly() {
+    let budget = std::sync::Arc::new(crate::gateway_body::memory::ProxyMemoryBudget::new(
+        4 * 1024 * 1024,
+    ));
+    let ready = std::sync::Arc::new(tokio::sync::Barrier::new(33));
+    let mut tasks = Vec::new();
+    for _ in 0..32 {
+        let budget = budget.clone();
+        let ready = ready.clone();
+        tasks.push(tokio::spawn(async move {
+            let request = budget.reservation();
+            let allocation = std::sync::Arc::new(crate::gateway_body::memory::SseAllocationBudget::new(
+                request.try_reserve_sse_streaming(0).unwrap(),
+            ));
+            let mut sanitizer = crate::api::sse::ResponsesStreamingSanitizer::default();
+            sanitizer.set_allocation_budget(allocation.clone());
+            let mut capture = ResponsesSseCapture::for_delivery_with_limits(crate::provider::SseFramingLimits::default());
+            capture.set_allocation_budget(allocation.clone());
+            let wire = b"data: {\"type\":\"response.created\",\"response\":{\"id\":\"resp-concurrent\"}}\n\n";
+            assert!(sanitizer.push(&wire[..wire.len()-1]).unwrap().is_empty());
+            let output = sanitizer.push(&wire[wire.len()-1..]).unwrap();
+            let frames = capture.push_delivery_frames(&output).unwrap();
+            let (sender, mut receiver) = tokio::sync::mpsc::channel(8);
+            for frame in frames {
+                sender.send(allocation.retain_output(frame.bytes).unwrap()).await.unwrap();
+            }
+            assert!(allocation.reconcile_retained(sanitizer.retained_capacity() + capture.retained_framing_capacity()));
+            ready.wait().await;
+            let mut delivered = Vec::new();
+            drop(sender);
+            while let Some(bytes) = receiver.recv().await { delivered.extend_from_slice(&bytes); }
+            assert!(std::str::from_utf8(&delivered).unwrap().contains("resp-concurrent"));
+            // Cancellation drops parser/capture state with live protocol identity.
+        }));
+    }
+    ready.wait().await;
+    assert!(budget.snapshot().0 < 4 * 1024 * 1024);
+    for task in tasks {
+        task.await.unwrap();
+    }
+    assert_eq!(budget.snapshot().0, 0);
+}

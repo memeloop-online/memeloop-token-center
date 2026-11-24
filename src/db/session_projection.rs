@@ -203,7 +203,7 @@ pub(crate) async fn merge_request_session_projection_in_transaction(
     if source_session_id == target_session_id {
         return Ok(());
     }
-    sqlx::query(
+    let moved = sqlx::query(
         "UPDATE request_stats_facts SET session_id = $1 WHERE tenant_id = $2 AND key_id = $3 AND session_id = $4",
     )
     .bind(target_session_id)
@@ -212,6 +212,11 @@ pub(crate) async fn merge_request_session_projection_in_transaction(
     .bind(source_session_id)
     .execute(&mut **tx)
     .await?;
+    // No request membership changed. Generation membership is always unlinked
+    // and is not moved by this operation, so neither session needs replacement.
+    if moved.rows_affected() == 0 {
+        return Ok(());
+    }
     rebuild_request_session_projection_in_transaction(tx, tenant_id, key_id, source_session_id)
         .await?;
     rebuild_request_session_projection_in_transaction(tx, tenant_id, key_id, target_session_id)
@@ -223,15 +228,11 @@ async fn remove_request_fact_from_session_projection_in_transaction(
     tx: &mut Transaction<'_, Any>,
     delta: &RequestSessionDelta,
 ) -> Result<(), AppError> {
-    if delta.previous_session_id == format!("unlinked:{}", delta.key_id) {
-        return rebuild_request_session_projection_in_transaction(
-            tx,
-            &delta.tenant_id,
-            &delta.key_id,
-            &delta.previous_session_id,
-        )
-        .await;
-    }
+    // Unlinked sessions contain request and generation contributions. Subtract only
+    // this request's CAS-owned delta; generation rows and buckets remain unchanged.
+    sqlx::query("SAVEPOINT session_usage_delta")
+        .execute(&mut **tx)
+        .await?;
     let error_delta = i64::from(delta.status_class == "failure");
     let totals = sqlx::query(
         r#"UPDATE session_usage_totals SET
@@ -265,8 +266,10 @@ async fn remove_request_fact_from_session_projection_in_transaction(
     .bind(&delta.currency)
     .execute(&mut **tx)
     .await?;
-    let mut rebuild_old = totals.rows_affected() != 1;
-    if !rebuild_old {
+    if totals.rows_affected() != 1 {
+        return rollback_session_delta_and_rebuild(tx, delta).await;
+    }
+    {
         let deleted = sqlx::query(
             "DELETE FROM session_usage_totals WHERE tenant_id = $1 AND key_id = $2 AND session_id = $3 AND currency = $4 AND requests = 0",
         )
@@ -288,7 +291,7 @@ async fn remove_request_fact_from_session_projection_in_transaction(
             .await?;
             if last_activity_at == delta.created_at {
                 let next_activity: Option<i64> = sqlx::query_scalar(
-                    "SELECT MAX(created_at) FROM request_stats_facts WHERE tenant_id = $1 AND key_id = $2 AND session_id = $3 AND currency = $4",
+                    "SELECT MAX(created_at) FROM (SELECT MAX(created_at) AS created_at FROM request_stats_facts WHERE tenant_id = $1 AND key_id = $2 AND session_id = $3 AND currency = $4 UNION ALL SELECT MAX(created_at) AS created_at FROM generation_stats_facts WHERE tenant_id = $1 AND key_id = $2 AND $3 = 'unlinked:' || key_id AND currency = $4) activity",
                 )
                 .bind(&delta.tenant_id)
                 .bind(&delta.key_id)
@@ -297,13 +300,7 @@ async fn remove_request_fact_from_session_projection_in_transaction(
                 .fetch_one(&mut **tx)
                 .await?;
                 let Some(next_activity) = next_activity else {
-                    return rebuild_request_session_projection_in_transaction(
-                        tx,
-                        &delta.tenant_id,
-                        &delta.key_id,
-                        &delta.previous_session_id,
-                    )
-                    .await;
+                    return rollback_session_delta_and_rebuild(tx, delta).await;
                 };
                 sqlx::query(
                     "UPDATE session_usage_totals SET last_activity_at = $1 WHERE tenant_id = $2 AND key_id = $3 AND session_id = $4 AND currency = $5",
@@ -366,8 +363,7 @@ async fn remove_request_fact_from_session_projection_in_transaction(
             .execute(&mut **tx)
             .await?;
         if updated.rows_affected() != 1 {
-            rebuild_old = true;
-            continue;
+            return rollback_session_delta_and_rebuild(tx, delta).await;
         }
         let delete = format!(
             "DELETE FROM {table} WHERE tenant_id = $1 AND key_id = $2 AND session_id = $3 AND {bucket_column} = $4 AND model = $5 AND protocol = $6 AND status_class = $7 AND error_code = $8 AND upstream_account_id = $9 AND model_route_id = $10 AND currency = $11 AND requests = 0"
@@ -387,15 +383,31 @@ async fn remove_request_fact_from_session_projection_in_transaction(
             .execute(&mut **tx)
             .await?;
     }
-    if rebuild_old {
-        rebuild_request_session_projection_in_transaction(
-            tx,
-            &delta.tenant_id,
-            &delta.key_id,
-            &delta.previous_session_id,
-        )
+    sqlx::query("RELEASE SAVEPOINT session_usage_delta")
+        .execute(&mut **tx)
         .await?;
-    }
+    Ok(())
+}
+
+async fn rollback_session_delta_and_rebuild(
+    tx: &mut Transaction<'_, Any>,
+    delta: &RequestSessionDelta,
+) -> Result<(), AppError> {
+    // Keep the earlier membership CAS, but release every aggregate lock and
+    // partial subtraction before restarting at totals.
+    sqlx::query("ROLLBACK TO SAVEPOINT session_usage_delta")
+        .execute(&mut **tx)
+        .await?;
+    rebuild_request_session_projection_in_transaction(
+        tx,
+        &delta.tenant_id,
+        &delta.key_id,
+        &delta.previous_session_id,
+    )
+    .await?;
+    sqlx::query("RELEASE SAVEPOINT session_usage_delta")
+        .execute(&mut **tx)
+        .await?;
     Ok(())
 }
 
@@ -418,20 +430,16 @@ pub(crate) async fn rebuild_request_session_projection_in_transaction(
     session_id: &str,
 ) -> Result<(), AppError> {
     lock_request_stats_projection_writer_in_transaction(tx).await?;
-    for table in [
-        "session_usage_totals",
-        "session_usage_hourly",
-        "session_usage_daily",
-    ] {
-        let statement =
-            format!("DELETE FROM {table} WHERE tenant_id = $1 AND key_id = $2 AND session_id = $3");
-        sqlx::query(sqlx::AssertSqlSafe(statement))
-            .bind(tenant_id)
-            .bind(key_id)
-            .bind(session_id)
-            .execute(&mut **tx)
-            .await?;
-    }
+    // Finish each aggregate table before acquiring locks in the next one.
+    // Deleting all tables first inverts this order when totals are reinserted.
+    sqlx::query(
+        "DELETE FROM session_usage_totals WHERE tenant_id = $1 AND key_id = $2 AND session_id = $3",
+    )
+    .bind(tenant_id)
+    .bind(key_id)
+    .bind(session_id)
+    .execute(&mut **tx)
+    .await?;
 
     sqlx::query(
         r#"INSERT INTO session_usage_totals (
@@ -490,6 +498,14 @@ pub(crate) async fn rebuild_request_session_projection_in_transaction(
         ("session_usage_hourly", "hour_bucket", 3_600_000_i64),
         ("session_usage_daily", "day_bucket", 86_400_000_i64),
     ] {
+        let delete =
+            format!("DELETE FROM {table} WHERE tenant_id = $1 AND key_id = $2 AND session_id = $3");
+        sqlx::query(sqlx::AssertSqlSafe(delete))
+            .bind(tenant_id)
+            .bind(key_id)
+            .bind(session_id)
+            .execute(&mut **tx)
+            .await?;
         let statement = format!(
             r#"INSERT INTO {table} (
                    tenant_id, key_id, session_id, {bucket_column}, model, protocol,
@@ -555,3 +571,6 @@ pub(crate) async fn rebuild_request_session_projection_in_transaction(
     }
     Ok(())
 }
+
+#[cfg(test)]
+mod lock_order_tests;

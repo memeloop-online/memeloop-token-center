@@ -39,7 +39,7 @@ impl Database {
         }
         Ok(OAuthLoginClaim::Pending {
             retry_after_seconds: millis_until(now, row.try_get::<i64, _>("next_poll_at")?)
-                .clamp(1, 5),
+                ,
         })
     }
 
@@ -59,9 +59,9 @@ impl Database {
         limit: i64,
     ) -> Result<Vec<Uuid>, AppError> {
         sqlx::query("UPDATE oauth_login_sessions SET status = 'failed', lease_owner = NULL, lease_expires_at = NULL, updated_at = $1 WHERE id IN (SELECT id FROM oauth_login_sessions WHERE flow_kind = 'openai_codex_device' AND expires_at <= $1 AND (status = 'pending' OR (status = 'polling' AND lease_expires_at <= $1)) ORDER BY expires_at, id LIMIT $2)")
-            .bind(now).bind(limit.clamp(1, 100)).execute(&self.pool).await?;
+            .bind(now).bind(limit).execute(&self.pool).await?;
         let rows = sqlx::query("SELECT id FROM oauth_login_sessions WHERE flow_kind = 'openai_codex_device' AND next_poll_at <= $1 AND ((expires_at > $1 AND (status = 'pending' OR (status = 'polling' AND lease_expires_at <= $1))) OR (expires_at > $2 AND (status = 'ready' OR (status = 'finalizing' AND lease_expires_at <= $1)))) ORDER BY next_poll_at, id LIMIT $3")
-            .bind(now).bind(now.saturating_sub(24 * 60 * 60 * 1000)).bind(limit.clamp(1, 100)).fetch_all(&self.pool).await?;
+            .bind(now).bind(now.saturating_sub(24 * 60 * 60 * 1000)).bind(limit).fetch_all(&self.pool).await?;
         rows.into_iter()
             .map(|row| parse_uuid(row.try_get("id")?))
             .collect()

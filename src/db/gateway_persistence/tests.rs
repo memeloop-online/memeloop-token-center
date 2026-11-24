@@ -1,3 +1,5 @@
+mod source_binding;
+
 use super::*;
 use crate::{
     db::CreateKeyInput,
@@ -202,6 +204,10 @@ impl Fixture {
             directory.path().join("db.sqlite").display()
         );
         let database = Database::connect_with_max(&url, 1).await.unwrap();
+        Self::with_database(database, directory).await
+    }
+
+    async fn with_database(database: Database, directory: tempfile::TempDir) -> Self {
         database.migrate().await.unwrap();
         let issued = database
             .create_key(

@@ -103,7 +103,7 @@ test('Usage virtual credential buckets open scoped requests while real sessions 
     const readyDetail = async () => {
       await page.locator('.session-detail-region .session-detail').waitFor();
       await page.getByRole('button', { name: 'Rename', exact: true }).waitFor();
-      await page.getByRole('button', { name: 'Read message · 1', exact: true }).click();
+      await page.locator('[data-semantic-role=assistant]').first().scrollIntoViewIfNeeded();
       await page.getByText('The checklist is ready for review.', { exact: true }).waitFor();
       assert.equal(await page.locator('.session-title-action').count(), 1, 'one title editor per selected session');
       assert.deepEqual(pageErrors, [], 'session focus must not cause browser render errors');

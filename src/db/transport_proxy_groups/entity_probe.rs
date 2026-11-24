@@ -61,7 +61,7 @@ impl TransportProxyGroups {
             tokio::spawn(async move {
                 let started = std::time::Instant::now();
                 let mut healthy = false;
-                for _ in 0..attempts.clamp(1, 8) {
+                for _ in 0..attempts {
                     if super::probe::proxy_reaches(&http, &proxy, &target).await {
                         healthy = true;
                         break;

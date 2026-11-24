@@ -104,14 +104,20 @@ impl ArchiveStore {
         key.with_backend_identity(Some(&training.identity))
     }
 
-    pub(super) fn new_cas_locator(&self, key: String) -> Result<String, AppError> {
+    pub(super) fn cas_backend_identity(&self) -> Result<Option<&str>, AppError> {
         if !self.training_cas_writes {
-            return Ok(key);
+            return Ok(None);
         }
-        let training = self
-            .training
+        self.training
             .as_ref()
-            .ok_or_else(|| AppError::storage("archive_training_backend_missing"))?;
-        Ok(format!("{PREFIX}{}/{key}", training.identity))
+            .map(|training| Some(training.identity.as_str()))
+            .ok_or_else(|| AppError::storage("archive_training_backend_missing"))
+    }
+
+    pub(super) fn new_cas_locator(&self, key: String) -> Result<String, AppError> {
+        Ok(match self.cas_backend_identity()? {
+            Some(identity) => format!("{PREFIX}{identity}/{key}"),
+            None => key,
+        })
     }
 }

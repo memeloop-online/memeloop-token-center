@@ -396,6 +396,7 @@ async fn default_probe_skips_unusable_cheaper_models_and_explicit_alias_stays_sk
                     Uuid::now_v7(),
                     unix_millis(),
                     crate::db::SupplierQuotaEvidence {
+                        capacity_scope: crate::db::SupplierQuotaScope::Unknown,
                         exhausted,
                         reset_at,
                         reset_source: if reset_at.is_some() {

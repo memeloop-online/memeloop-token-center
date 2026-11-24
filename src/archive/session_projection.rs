@@ -669,7 +669,7 @@ impl Context {
                     },
                 ))?
         };
-        self.runtime.block_on(self.archive.publish_raw_capture(
+        self.runtime.block_on(self.archive.settle_raw_capture(
             self.tenant,
             request,
             side,
@@ -1034,8 +1034,10 @@ impl Context {
         let mut response_valid = true;
         let mut protocol_terminal = false;
         let mut protocol_incomplete = false;
+        let mut parsed_response = None;
         if let Some(locator) = response_locator {
             let raw_response = self.source_object(request, "response", locator)?;
+            parsed_response = Some(raw_response.clone());
             let mut source = BufReader::with_capacity(CHUNK, self.content(&raw_response)?);
             while source
                 .fill_buf()
@@ -1261,18 +1263,9 @@ impl Context {
             && !protocol_incomplete
             && response_valid
             && gaps.is_empty();
-        let backend_identity = atoms
-            .first()
-            .map(|atom| {
-                let reference: ConversationBodyReference =
-                    serde_json::from_value(atom.content.clone()).map_err(|_| invalid())?;
-                Ok::<_, AppError>(
-                    super::routing::split(&reference.conversation_body_v1.object_locator)?
-                        .map(|(identity, _)| identity.to_owned()),
-                )
-            })
-            .transpose()?
-            .flatten();
+        // Metadata is published into the current CAS target. Historical atom
+        // bodies retain their own qualified locators and may live elsewhere.
+        let backend_identity = self.archive.cas_backend_identity()?.map(str::to_owned);
         let mut manifest = super::SemanticManifestV2 {
             format_version: 2,
             projection_version: 2,
@@ -1292,6 +1285,10 @@ impl Context {
                 depth: node.depth as u64,
             }),
             instances_head: None,
+            raw_sources: Some(super::semantic_manifest::SemanticRawSources {
+                request: raw_request,
+                response: parsed_response,
+            }),
             coverage: super::SemanticCoverage {
                 observed_terminal: response_complete && protocol_terminal && !protocol_incomplete,
                 projection_state: if coverage_complete {

@@ -181,6 +181,18 @@ impl AppState {
     }
 
     pub async fn initialize(config: Config) -> Result<Self, InitializationError> {
+        Self::initialize_with_background(config, true).await
+    }
+
+    /// Build the shared archive writer state without starting customer recovery work.
+    pub async fn initialize_for_maintenance(config: Config) -> Result<Self, InitializationError> {
+        Self::initialize_with_background(config, false).await
+    }
+
+    async fn initialize_with_background(
+        config: Config,
+        background: bool,
+    ) -> Result<Self, InitializationError> {
         let transport_proxy_groups = db::TransportProxyGroups::parse(
             &config.transport_proxy_groups,
             config.key_pepper.as_bytes(),
@@ -219,7 +231,9 @@ impl AppState {
         db.refresh_http_settings()
             .await
             .map_err(InitializationError::Database)?;
-        db.start_http_settings_refresh();
+        if background {
+            db.start_http_settings_refresh();
+        }
         let http_clients = db.http_clients.clone();
         // Runs on every process start rather than behind the migration switch:
         // a row that still holds a sealed envelope must be rewritten before the
@@ -228,7 +242,9 @@ impl AppState {
         // process: an outage is worse than a few unreadable historic rows, and
         // the next start retries because the version marker is only written on
         // success.
-        if let Err(error) = db.convert_sealed_state(config.key_pepper.as_bytes()).await {
+        if background
+            && let Err(error) = db.convert_sealed_state(config.key_pepper.as_bytes()).await
+        {
             tracing::error!(%error, "converting sealed gateway state failed; serving existing rows");
         }
         let archive = ArchiveStore::from_config(&config)
@@ -240,7 +256,7 @@ impl AppState {
             .with_upload_memory(persistence.clone());
         let persistence_db = db.independent_persistence_pool_for("raw-persistence");
         let routing_persistence_db = db.independent_persistence_pool_for("routing-persistence");
-        let early_requests = early_request::Journal::new(
+        let early_requests = early_request::Journal::with_background(
             std::path::Path::new(&config.responses_request_spool_path)
                 .join("early-terminals")
                 .join(
@@ -249,8 +265,9 @@ impl AppState {
                         .as_str(),
                 ),
             db.independent_persistence_pool_for("early-terminals"),
+            background,
         );
-        let pending_terminals = proxy_lifecycle::pending_terminal::Journal::with_archive(
+        let pending_terminals = proxy_lifecycle::pending_terminal::Journal::with_background(
             std::path::Path::new(&config.responses_request_spool_path)
                 .join("pending-terminals-v1")
                 .join(
@@ -260,6 +277,7 @@ impl AppState {
                 ),
             db.independent_persistence_pool_for("pending-terminals"),
             archive.clone(),
+            background,
         );
         let plugins = PluginRuntime::load(config.plugin_dir.as_deref(), db.clone())
             .map_err(|_| InitializationError::Plugin)?;
@@ -308,14 +326,16 @@ impl AppState {
 
         let transport_proxy_groups =
             Arc::new(transport_proxy_groups.with_http_clients(http_clients.clone()));
-        transport_proxy_groups
-            .start(
-                &config.database_url,
-                plugins.clone(),
-                #[cfg(feature = "experimental-plugin-revisions")]
-                application_plugins.clone(),
-            )
-            .map_err(|_| InitializationError::TransportProxyGroups)?;
+        if background {
+            transport_proxy_groups
+                .start(
+                    &config.database_url,
+                    plugins.clone(),
+                    #[cfg(feature = "experimental-plugin-revisions")]
+                    application_plugins.clone(),
+                )
+                .map_err(|_| InitializationError::TransportProxyGroups)?;
+        }
         Ok(Self {
             config: Arc::new(config),
             service_auth_role: None,
@@ -568,6 +588,26 @@ mod tests {
         build_codex_http_client_with_proxy, build_explicit_proxy_http_client, build_http_client,
         build_pinned_http_client,
     };
+
+    #[tokio::test]
+    async fn maintenance_initialization_never_starts_customer_recovery_workers() {
+        let directory = tempfile::tempdir().unwrap();
+        let url = format!(
+            "sqlite://{}?mode=rwc",
+            directory.path().join("maintenance.db").display()
+        );
+        let maintenance =
+            super::AppState::initialize_for_maintenance(super::Config::for_test(url.clone()))
+                .await
+                .unwrap();
+        assert!(!maintenance.pending_terminals.background_started_for_test());
+        tokio::task::yield_now().await;
+        assert!(!maintenance.pending_terminals.background_started_for_test());
+        let serve = super::AppState::initialize(super::Config::for_test(url))
+            .await
+            .unwrap();
+        assert!(serve.pending_terminals.background_started_for_test());
+    }
 
     #[tokio::test]
     async fn shared_http_client_does_not_follow_redirects() {

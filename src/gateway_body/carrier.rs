@@ -21,6 +21,7 @@ pub(crate) type CarrierStream = Pin<Box<dyn Stream<Item = Result<Bytes, AppError
 
 pub(crate) struct CarrierCapture {
     memory: Arc<ProxyMemoryBudget>,
+    workspace: Option<Arc<crate::api::proxy::persistence::Persistence>>,
     archive: Option<ArchiveStore>,
     staging: ArchiveStagingKey,
     parent: Option<Arc<BodyCarrier>>,
@@ -34,10 +35,19 @@ impl CarrierCapture {
     ) -> Self {
         Self {
             memory,
+            workspace: None,
             archive,
             staging,
             parent: None,
         }
+    }
+
+    pub(crate) fn with_upload_workspace(
+        mut self,
+        workspace: Arc<crate::api::proxy::persistence::Persistence>,
+    ) -> Self {
+        self.workspace = Some(workspace);
+        self
     }
 
     /// Only pointer ranges owned by this sealed source may share its allocation
@@ -45,6 +55,7 @@ impl CarrierCapture {
     pub(crate) fn derived_from(source: &Arc<BodyCarrier>, staging: ArchiveStagingKey) -> Self {
         Self {
             memory: source.memory.clone(),
+            workspace: source.workspace.clone(),
             archive: source.archive.clone(),
             staging,
             parent: Some(source.clone()),
@@ -74,6 +85,7 @@ enum Segment {
 
 pub(crate) struct BodyCarrier {
     memory: Arc<ProxyMemoryBudget>,
+    workspace: Option<Arc<crate::api::proxy::persistence::Persistence>>,
     archive: Option<ArchiveStore>,
     staging: ArchiveStagingKey,
     segments: Vec<Mutex<Segment>>,
@@ -87,6 +99,16 @@ pub(crate) struct BodyCarrier {
     _external_owner: Option<Arc<dyn Send + Sync>>,
     published: Mutex<Option<Arc<BodyCarrier>>>,
     readers: std::sync::atomic::AtomicUsize,
+}
+
+struct WorkspaceRead {
+    bytes: Vec<u8>,
+    _workspace: Arc<dyn Send + Sync>,
+}
+impl AsRef<[u8]> for WorkspaceRead {
+    fn as_ref(&self) -> &[u8] {
+        &self.bytes
+    }
 }
 
 struct CarrierReadOwner(Arc<BodyCarrier>);
@@ -143,6 +165,7 @@ impl BodyCarrier {
         };
         let replacement = Arc::new(Self {
             memory: self.memory.clone(),
+            workspace: self.workspace.clone(),
             archive: Some(archive),
             staging: self.staging,
             segments: vec![Mutex::new(Segment::Object(staged.clone()))],
@@ -215,6 +238,7 @@ impl BodyCarrier {
         let digest = blake3::hash(&encoded).to_hex().to_string();
         let source = Self {
             memory: capture.memory,
+            workspace: capture.workspace,
             archive: capture.archive,
             staging,
             segments: Vec::new(),
@@ -260,6 +284,7 @@ impl BodyCarrier {
         }
         Ok(Arc::new(Self {
             memory: capture.memory,
+            workspace: capture.workspace,
             archive: capture.archive,
             staging,
             length: reference.size_bytes,
@@ -286,6 +311,19 @@ impl BodyCarrier {
         S: Stream<Item = Result<Bytes, E>> + Send,
         E: Display,
     {
+        Self::capture_owned(input.map(|chunk| chunk.map(|bytes| (bytes, None))), capture).await
+    }
+
+    /// Adopt archival ingress credit with its allocation; never release and
+    /// reacquire the same budget between the ordered tap and the carrier.
+    pub(crate) async fn capture_owned<S, E>(
+        input: S,
+        capture: CarrierCapture,
+    ) -> Result<Arc<Self>, AppError>
+    where
+        S: Stream<Item = Result<(Bytes, Option<OwnedSemaphorePermit>), E>> + Send,
+        E: Display,
+    {
         let parent = capture.parent;
         let staging = match &capture.archive {
             Some(archive) => archive.select_staging_key(capture.staging)?,
@@ -293,6 +331,7 @@ impl BodyCarrier {
         };
         let mut source = Self {
             memory: capture.memory,
+            workspace: capture.workspace,
             archive: capture.archive,
             staging,
             segments: Vec::new(),
@@ -310,7 +349,7 @@ impl BodyCarrier {
         let mut hash = blake3::Hasher::new();
         futures_util::pin_mut!(input);
         while let Some(chunk) = input.next().await {
-            let chunk = chunk.map_err(|_| AppError::storage("carrier_input_failed"))?;
+            let (chunk, credit) = chunk.map_err(|_| AppError::storage("carrier_input_failed"))?;
             if chunk.is_empty() {
                 continue;
             }
@@ -319,6 +358,18 @@ impl BodyCarrier {
                 .checked_add(chunk.len() as u64)
                 .ok_or_else(|| AppError::storage("carrier_length_overflow"))?;
             hash.update(&chunk);
+            if let Some(credit) = credit {
+                let retained = source.memory.try_reserve_carrier_retained(chunk.len());
+                if retained.is_none() {
+                    // This chunk already owns real source credit. A busy or
+                    // unavailable spill must not turn free source RAM into a
+                    // false capture failure; later offers enforce the byte cap.
+                    let _ = source.offload_one().await;
+                }
+                let bytes = source.leased_bytes(chunk, credit, retained);
+                source.segments.push(Mutex::new(Segment::Ram(bytes)));
+                continue;
+            }
             let mut remaining = chunk;
             while !remaining.is_empty() {
                 // Bounded owned allocations prevent a small slice from pinning
@@ -421,6 +472,17 @@ impl BodyCarrier {
         let Segment::Ram(bytes) = self.segments[index].lock().unwrap().clone() else {
             unreachable!()
         };
+        let workspace = self
+            .workspace
+            .as_ref()
+            .map(|owner| {
+                owner
+                    .try_multipart_workspace(
+                        crate::api::proxy::persistence::WorkspaceRole::CarrierSpill,
+                    )
+                    .map_err(|_| AppError::storage("carrier_workspace_unavailable"))
+            })
+            .transpose()?;
         let locator = format!(
             "{}/carrier-{}",
             self.staging.canonical_prefix(),
@@ -435,6 +497,9 @@ impl BodyCarrier {
             .push((owner.clone(), false));
         archive.begin_carrier_object(&owner).await?;
         let mut writer = archive.start_writer(&locator).await?;
+        if let Some(workspace) = workspace {
+            writer.retain_workspace(workspace);
+        }
         if let Err(error) = writer.write(bytes.clone()).await {
             let _ = writer.abort().await;
             return Err(error);
@@ -574,83 +639,124 @@ impl BodyCarrier {
     }
 
     pub(crate) fn open_stream(self: &Arc<Self>) -> CarrierStream {
+        self.open_stream_inner(None)
+    }
+
+    pub(crate) fn open_stream_with_workspace(
+        self: &Arc<Self>,
+        workspace: Arc<dyn Send + Sync>,
+    ) -> CarrierStream {
+        self.open_stream_inner(Some(workspace))
+    }
+
+    fn open_stream_inner(
+        self: &Arc<Self>,
+        workspace: Option<Arc<dyn Send + Sync>>,
+    ) -> CarrierStream {
         let reader = self.read_owner();
         let published = self.published.lock().unwrap().clone();
         if let Some(published) = published {
-            return published.open_stream();
+            return published.open_stream_inner(workspace);
         }
         let source = self.clone();
         Box::pin(stream::unfold(
             (source, 0usize, None::<CarrierStream>, reader),
-            |(source, mut index, mut remote, reader)| async move {
-                loop {
-                    if let Some(stream) = &mut remote {
-                        if let Some(chunk) = stream.next().await {
-                            return Some((chunk, (source, index, remote, reader)));
+            move |(source, mut index, mut remote, reader)| {
+                let workspace = workspace.clone();
+                async move {
+                    loop {
+                        if let Some(stream) = &mut remote {
+                            if let Some(chunk) = stream.next().await {
+                                return Some((chunk, (source, index, remote, reader)));
+                            }
+                            remote = None;
                         }
-                        remote = None;
-                    }
-                    let segment = source.segments.get(index)?.lock().unwrap().clone();
-                    index += 1;
-                    match &segment {
-                        Segment::Ram(bytes) => {
-                            return Some((Ok(bytes.clone()), (source, index, remote, reader)));
-                        }
-                        Segment::Object(reference) => {
-                            let Some(archive) = &source.archive else {
-                                let end = source.segments.len();
-                                return Some((
-                                    Err(AppError::storage("carrier_backend_missing")),
-                                    (source, end, None, reader),
-                                ));
-                            };
-                            let _ = archive;
-                            let reference = reference.clone();
-                            remote = Some(Box::pin(stream::try_unfold(
-                                (source.clone(), reference, 0u64),
-                                |(source, reference, offset)| async move {
-                                    if offset == reference.size_bytes {
-                                        return Ok(None);
-                                    }
-                                    let count =
-                                        (reference.size_bytes - offset).min(64 * 1024) as usize;
-                                    // Reserve application destination before receiving the SDK
-                                    // frame. Each HTTP range is bounded independently; no slow
-                                    // consumer retains the backing of an entire object stream.
-                                    let lease = source.reserve_workspace(count).await?;
-                                    let archive = source.archive.as_ref().ok_or_else(|| {
-                                        AppError::storage("carrier_backend_missing")
-                                    })?;
-                                    let mut download = archive
-                                        .open_stream(
-                                            &reference.object_locator,
-                                            Some(offset..offset + count as u64),
-                                        )
-                                        .await?
-                                        .stream;
-                                    let mut output = Vec::with_capacity(count);
-                                    while let Some(chunk) = download.next().await {
-                                        let chunk = chunk.map_err(|_| {
-                                            AppError::storage("carrier_object_read_failed")
-                                        })?;
-                                        if chunk.len() > count.saturating_sub(output.len()) {
-                                            return Err(AppError::storage(
-                                                "carrier_object_read_failed",
-                                            ));
+                        let segment = source.segments.get(index)?.lock().unwrap().clone();
+                        index += 1;
+                        match &segment {
+                            Segment::Ram(bytes) => {
+                                return Some((Ok(bytes.clone()), (source, index, remote, reader)));
+                            }
+                            Segment::Object(reference) => {
+                                let Some(archive) = &source.archive else {
+                                    let end = source.segments.len();
+                                    return Some((
+                                        Err(AppError::storage("carrier_backend_missing")),
+                                        (source, end, None, reader),
+                                    ));
+                                };
+                                let _ = archive;
+                                let reference = reference.clone();
+                                let workspace = workspace.clone();
+                                remote = Some(Box::pin(stream::try_unfold(
+                                    (source.clone(), reference, 0u64),
+                                    move |(source, reference, offset)| {
+                                        let workspace = workspace.clone();
+                                        async move {
+                                            if offset == reference.size_bytes {
+                                                return Ok(None);
+                                            }
+                                            let count = (reference.size_bytes - offset)
+                                                .min(64 * 1024)
+                                                as usize;
+                                            // Reserve application destination before receiving the SDK
+                                            // frame. Each HTTP range is bounded independently; no slow
+                                            // consumer retains the backing of an entire object stream.
+                                            let lease = if workspace.is_some() {
+                                                None
+                                            } else {
+                                                Some(source.reserve_workspace(count).await?)
+                                            };
+                                            let archive =
+                                                source.archive.as_ref().ok_or_else(|| {
+                                                    AppError::storage("carrier_backend_missing")
+                                                })?;
+                                            let mut download = archive
+                                                .open_stream(
+                                                    &reference.object_locator,
+                                                    Some(offset..offset + count as u64),
+                                                )
+                                                .await?
+                                                .stream;
+                                            let mut output = Vec::with_capacity(count);
+                                            while let Some(chunk) = download.next().await {
+                                                let chunk = chunk.map_err(|_| {
+                                                    AppError::storage("carrier_object_read_failed")
+                                                })?;
+                                                if chunk.len() > count.saturating_sub(output.len())
+                                                {
+                                                    return Err(AppError::storage(
+                                                        "carrier_object_read_failed",
+                                                    ));
+                                                }
+                                                output.extend_from_slice(&chunk);
+                                            }
+                                            if output.len() != count {
+                                                return Err(AppError::storage(
+                                                    "carrier_object_read_failed",
+                                                ));
+                                            }
+                                            drop(download);
+                                            let owned = match lease {
+                                                Some(lease) => source.leased_bytes(
+                                                    Bytes::from(output),
+                                                    lease,
+                                                    None,
+                                                ),
+                                                None => Bytes::from_owner(WorkspaceRead {
+                                                    bytes: output,
+                                                    _workspace: workspace
+                                                        .expect("read workspace owner"),
+                                                }),
+                                            };
+                                            Ok(Some((
+                                                owned,
+                                                (source, reference, offset + count as u64),
+                                            )))
                                         }
-                                        output.extend_from_slice(&chunk);
-                                    }
-                                    if output.len() != count {
-                                        return Err(AppError::storage(
-                                            "carrier_object_read_failed",
-                                        ));
-                                    }
-                                    drop(download);
-                                    let owned =
-                                        source.leased_bytes(Bytes::from(output), lease, None);
-                                    Ok(Some((owned, (source, reference, offset + count as u64))))
-                                },
-                            )));
+                                    },
+                                )));
+                            }
                         }
                     }
                 }
@@ -697,6 +803,7 @@ impl BodyCarrier {
         Ok(self.leased_bytes(Bytes::from(output), lease, None))
     }
 
+    #[cfg(test)]
     pub(crate) async fn read_range(
         self: &Arc<Self>,
         offset: u64,
@@ -721,10 +828,11 @@ impl BodyCarrier {
                 Segment::Ram(bytes) => bytes.len() as u64,
                 Segment::Object(reference) => reference.size_bytes,
             };
-            if offset >= position && end <= position + size {
-                if let Segment::Ram(bytes) = &segment {
-                    return Ok(bytes.slice((offset - position) as usize..(end - position) as usize));
-                }
+            if offset >= position
+                && end <= position + size
+                && let Segment::Ram(bytes) = &segment
+            {
+                return Ok(bytes.slice((offset - position) as usize..(end - position) as usize));
             }
             position += size;
         }

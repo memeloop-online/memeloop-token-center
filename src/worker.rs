@@ -18,6 +18,9 @@ mod background_actions_tests;
 
 const MAINTENANCE_INTERVAL: Duration = Duration::from_secs(6 * 60 * 60);
 const ORPHANED_RESERVATION_REAPER_INTERVAL: Duration = Duration::from_secs(5 * 60);
+// 已投影的会话 outbox 行回收节奏。表里存的是可达数 MB 的请求/语义快照，
+// 必须在后台持续回收，否则会把存储 IO 拖垮。
+const PROJECTION_OUTBOX_CLEANUP_INTERVAL: Duration = Duration::from_secs(5 * 60);
 const GENERATION_INTERVAL: Duration = Duration::from_millis(500);
 const PROJECTION_INTERVAL: Duration = Duration::from_secs(1);
 const OAUTH_REFRESH_INTERVAL: Duration = Duration::from_secs(60);
@@ -184,6 +187,21 @@ pub async fn run_until_shutdown_with_oauth_stop(
     shutdown: watch::Receiver<bool>,
     oauth_shutdown: watch::Receiver<bool>,
 ) {
+    run_until_shutdown_with_reaper_period(
+        state,
+        shutdown,
+        oauth_shutdown,
+        ORPHANED_RESERVATION_REAPER_INTERVAL,
+    )
+    .await;
+}
+
+pub(crate) async fn run_until_shutdown_with_reaper_period(
+    state: AppState,
+    shutdown: watch::Receiver<bool>,
+    oauth_shutdown: watch::Receiver<bool>,
+    reaper_period: Duration,
+) {
     if *shutdown.borrow() {
         return;
     }
@@ -339,11 +357,50 @@ pub async fn run_until_shutdown_with_oauth_stop(
             }
         }
     );
+    let orphan_reservation_scan = Mutex::new(crate::db::OrphanReservationScan::default());
+    let expired_proxy_owner_scan = Mutex::new(crate::db::ExpiredProxyOwnerScan::default());
+    periodic!(
+        "projection_outbox_cleanup",
+        PROJECTION_OUTBOX_CLEANUP_INTERVAL,
+        async |state: &AppState, _shutdown: &watch::Receiver<bool>| {
+            let cleanup_deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+            let mut deleted_total = 0_u64;
+            loop {
+                match state.db.delete_projected_conversation_outbox(2_000).await {
+                    Ok(deleted) => {
+                        deleted_total = deleted_total.saturating_add(deleted);
+                        if deleted < 2_000 || tokio::time::Instant::now() >= cleanup_deadline {
+                            break;
+                        }
+                    }
+                    Err(error) => {
+                        tracing::error!(
+                            %error,
+                            "worker failed to delete projected conversation outbox rows"
+                        );
+                        break;
+                    }
+                }
+            }
+            if deleted_total > 0 {
+                tracing::info!(
+                    deleted = deleted_total,
+                    "worker deleted projected conversation outbox rows"
+                );
+            }
+        }
+    );
     periodic!(
         "orphaned_reservations",
-        ORPHANED_RESERVATION_REAPER_INTERVAL,
+        reaper_period,
         async |state: &AppState, _shutdown: &watch::Receiver<bool>| {
-            match state.db.release_orphaned_reservations(100).await {
+            let mut scan = orphan_reservation_scan.lock().unwrap().clone();
+            let result = state
+                .db
+                .release_orphaned_reservations_page(100, &mut scan)
+                .await;
+            *orphan_reservation_scan.lock().unwrap() = scan;
+            match result {
                 Ok(released) if released > 0 => {
                     tracing::warn!(released, "worker released orphaned usage reservations");
                 }
@@ -352,7 +409,19 @@ pub async fn run_until_shutdown_with_oauth_stop(
                     tracing::error!(%error, "worker failed to release orphaned usage reservations");
                 }
             }
-            match state.db.close_expired_proxy_owners(100).await {
+        }
+    );
+    periodic!(
+        "expired_proxy_owners",
+        reaper_period,
+        async |state: &AppState, _shutdown: &watch::Receiver<bool>| {
+            let mut scan = expired_proxy_owner_scan.lock().unwrap().clone();
+            let result = state
+                .db
+                .close_expired_proxy_owners_page(100, &mut scan)
+                .await;
+            *expired_proxy_owner_scan.lock().unwrap() = scan;
+            match result {
                 Ok(closed) if closed > 0 => {
                     tracing::warn!(
                         closed,
@@ -394,6 +463,9 @@ pub async fn run_until_shutdown_with_oauth_stop(
         PROJECTION_INTERVAL,
         async |state: &AppState, _shutdown: &watch::Receiver<bool>| {
             process_terminal_projection_batch(state, Uuid::now_v7()).await;
+            if let Err(error) = state.db.publish_pending_proxy_started_events().await {
+                tracing::warn!(%error, "worker failed to publish pending request starts");
+            }
         }
     );
     let terminal_recovery_cursor = Mutex::new(None::<String>);
@@ -451,11 +523,39 @@ pub async fn run_until_shutdown_with_oauth_stop(
             }
         }
     );
+    // Recovery obligations have independent serial lanes: historical object IO
+    // must not prevent already eligible body tasks from being claimed.
+    periodic!(
+        "session_body_rebuild_recovery",
+        PROJECTION_INTERVAL,
+        async |state: &AppState, _shutdown: &watch::Receiver<bool>| {
+            process_session_body_rebuild_recovery(state).await;
+        }
+    );
+    periodic!(
+        "semantic_coverage_recovery",
+        PROJECTION_INTERVAL,
+        async |state: &AppState, _shutdown: &watch::Receiver<bool>| {
+            let started = std::time::Instant::now();
+            tracing::debug!(stage = "coverage_start", "conversation recovery stage");
+            if let Err(error) = state.db.recover_semantic_coverage().await {
+                tracing::warn!(
+                    error_category = error.diagnostic_category(),
+                    "semantic coverage confirmation remains pending"
+                );
+            }
+            tracing::debug!(
+                stage = "coverage_done",
+                elapsed_ms = started.elapsed().as_millis() as u64,
+                "conversation recovery stage"
+            );
+        }
+    );
     periodic!(
         "conversation_projection",
         PROJECTION_INTERVAL,
-        async |state: &AppState, _shutdown: &watch::Receiver<bool>| {
-            process_conversation_projection_batch(state, Uuid::now_v7()).await;
+        async |state: &AppState, shutdown: &watch::Receiver<bool>| {
+            run_conversation_projection(state, shutdown.clone()).await;
         }
     );
     periodic!(
@@ -809,7 +909,7 @@ async fn refresh_plugin_service_data(
                 }
             }
             Err(failure) => {
-                let shift = u32::try_from(previous_failures.clamp(0, 6)).unwrap_or(6);
+                let shift = u32::try_from(previous_failures).unwrap_or(6);
                 let backoff_seconds = 5_i64
                     .saturating_mul(1_i64.checked_shl(shift).unwrap_or(64))
                     .min(300);
@@ -1028,6 +1128,10 @@ async fn supervise_roles_with_early_oauth_shutdown(
 }
 
 async fn process_terminal_projection_batch(state: &AppState, lease_owner: Uuid) {
+    let batch_started = std::time::Instant::now();
+    let mut batch = crate::db::TerminalProjectionBatchTimings::default();
+    let started = std::time::Instant::now();
+    tracing::debug!(%lease_owner, stage = "claim_start", "terminal projection stage");
     let tasks = match state
         .db
         .claim_terminal_projection_tasks(lease_owner, PROJECTION_BATCH_LIMIT)
@@ -1035,18 +1139,43 @@ async fn process_terminal_projection_batch(state: &AppState, lease_owner: Uuid) 
     {
         Ok(tasks) => tasks,
         Err(error) => {
-            tracing::error!(%error, "worker failed to claim terminal projections");
+            tracing::error!(%lease_owner, stage = "claim_failed",
+                elapsed_ms = started.elapsed().as_millis() as u64,
+                error_category = error.diagnostic_category(),
+                "worker failed to claim terminal projections");
             return;
         }
     };
+    tracing::debug!(%lease_owner, stage = "claim_done", count = tasks.len(),
+        elapsed_ms = started.elapsed().as_millis() as u64, "terminal projection stage");
+    let claim_ms = started.elapsed().as_millis() as u64;
     for request_id in tasks {
-        if let Err(error) = state
+        let started = std::time::Instant::now();
+        tracing::debug!(%lease_owner, %request_id, stage = "apply_start", "terminal projection stage");
+        let (result, timings) = state
             .db
-            .project_claimed_terminal_projection_task(lease_owner, request_id)
-            .await
-        {
-            tracing::error!(%error, %request_id, "worker failed to apply terminal projection");
+            .project_claimed_terminal_projection_with_timings(lease_owner, request_id)
+            .await;
+        batch.observe(result.as_ref().ok().copied(), &timings);
+        match result {
+            Ok(projected) => tracing::debug!(%lease_owner, %request_id, stage = "apply_done",
+                projected, elapsed_ms = started.elapsed().as_millis() as u64,
+                "terminal projection stage"),
+            Err(error) => tracing::error!(%lease_owner, %request_id, stage = "apply_failed",
+                elapsed_ms = started.elapsed().as_millis() as u64,
+                error_category = error.diagnostic_category(),
+                "worker failed to apply terminal projection"),
         }
+    }
+    // Nonempty batches emit one bounded diagnostic; idle passes stay silent.
+    if batch.attempted > 0 {
+        tracing::info!(claim_ms, claimed = batch.attempted, projected = batch.projected,
+            deferred = batch.deferred, failed = batch.failed,
+            batch_wall_ms = batch_started.elapsed().as_millis() as u64,
+            stage_names = ?crate::db::TERMINAL_PROJECTION_STAGE_NAMES,
+            stage_sum_us = ?batch.stage_sum_us, stage_max_us = ?batch.stage_max_us,
+            stage_failures = ?batch.stage_failures,
+            "terminal projection batch timing");
     }
 }
 
@@ -1089,8 +1218,9 @@ async fn process_metered_usage_projection_batch(state: &AppState, lease_owner: U
     }
 }
 
-async fn process_conversation_projection_batch(state: &AppState, lease_owner: Uuid) {
-    tracing::debug!(%lease_owner, stage = "reopen_start", "conversation projection stage");
+async fn process_session_body_rebuild_recovery(state: &AppState) {
+    let started = std::time::Instant::now();
+    tracing::debug!(stage = "reopen_start", "conversation recovery stage");
     if let Err(error) = state
         .db
         .reopen_session_body_rebuilds(PROJECTION_BATCH_LIMIT / 4)
@@ -1101,55 +1231,120 @@ async fn process_conversation_projection_batch(state: &AppState, lease_owner: Uu
             .observe_background_projection(BackgroundProjectionKind::Conversation, false);
         tracing::error!(%error, "worker 未能把已有原始请求 JSON 和原始返回 JSON 的会话正文重新排队");
     }
-    if let Err(error) = state.db.recover_semantic_coverage().await {
-        tracing::warn!(
-            error_category = error.diagnostic_category(),
-            "semantic coverage confirmation remains pending"
-        );
-    }
-    tracing::debug!(%lease_owner, stage = "claim_start", "conversation projection stage");
-    let tasks = match state
-        .db
-        .claim_conversation_projection_tasks(lease_owner, PROJECTION_BATCH_LIMIT)
-        .await
-    {
-        Ok(tasks) => tasks,
-        Err(error) => {
-            state
-                .metrics
-                .observe_background_projection(BackgroundProjectionKind::Conversation, false);
-            tracing::error!(%error, "worker 未能领取会话正文归档任务");
-            return;
-        }
-    };
-    tracing::debug!(%lease_owner, count = tasks.len(), stage = "claim_done", "conversation projection stage");
-    for task in tasks {
-        tracing::debug!(request_id = %task.request_id, %lease_owner, stage = "archive_start", "conversation projection stage");
-        match archive_session_body(state, lease_owner, task.request_id).await {
-            Ok(true) => state
-                .metrics
-                .observe_background_projection(BackgroundProjectionKind::Conversation, true),
-            Ok(false) => {}
-            Err(error) => {
-                state
-                    .metrics
-                    .observe_background_projection(BackgroundProjectionKind::Conversation, false);
-                tracing::error!(
-                    %error,
-                    request_id = %task.request_id,
-                    "会话正文归档没有写完，客户端请求已经结束"
-                );
+    tracing::debug!(
+        stage = "reopen_done",
+        elapsed_ms = started.elapsed().as_millis() as u64,
+        "conversation recovery stage"
+    );
+}
+
+async fn run_conversation_projection(state: &AppState, mut shutdown: watch::Receiver<bool>) {
+    let mut running = JoinSet::new();
+    let mut claim_turn = 0usize;
+    let mut ticks = tokio::time::interval(PROJECTION_INTERVAL);
+    ticks.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+    loop {
+        tokio::select! {
+            biased;
+            _ = wait_for_shutdown(&mut shutdown) => {
+                running.abort_all();
+                while running.join_next().await.is_some() {}
+                return;
             }
+            Some(result) = running.join_next(), if !running.is_empty() => {
+                if let Err(error) = result { tracing::error!(%error, "conversation archive task stopped"); }
+            }
+            _ = ticks.tick() => {}
+        }
+        let available = PROJECTION_BATCH_LIMIT - running.len() as i64;
+        if available == 0 {
+            continue;
+        }
+        let owner = Uuid::now_v7();
+        match state
+            .db
+            .claim_conversation_projection_tasks_from_turn(owner, available, claim_turn)
+            .await
+        {
+            Ok(tasks) => {
+                claim_turn = claim_turn.wrapping_add(available as usize);
+                for task in tasks {
+                    let state = state.clone();
+                    running.spawn(async move {
+                    match archive_session_body(&state, owner, task.request_id).await {
+                        Ok(true) => state.metrics.observe_background_projection(BackgroundProjectionKind::Conversation, true),
+                        Ok(false) => {},
+                        Err(error) => {
+                            state.metrics.observe_background_projection(BackgroundProjectionKind::Conversation, false);
+                            tracing::error!(%error, request_id = %task.request_id, "conversation archive remains pending");
+                        }
+                    }
+                });
+                }
+            }
+            Err(error) => tracing::error!(%error, "worker could not claim conversation archives"),
         }
     }
 }
 
 /// 读取原始请求/返回，正文写对象存储，CNPG 仅记录引用和投影元数据。
 /// locator 缺失或文档读不出来时记下原因并结束这条队列，不让客户端失败。
-pub(crate) async fn archive_session_body(
+/// Rebuild one already claimed conversation using the normal canonical writer.
+/// The caller must hold its durable projection lease; this does not claim work
+/// or apply financial projections. Missing/incomplete source remains governed
+/// by the same durable outcome and coverage contract as background recovery.
+pub async fn archive_session_body(
     state: &AppState,
     lease_owner: Uuid,
     request_id: Uuid,
+) -> Result<bool, AppError> {
+    archive_session_body_with_lease(state, lease_owner, request_id, false).await
+}
+
+/// Exact repair keeps the same durable retry transition while returning its
+/// underlying failure to the operator instead of collapsing it to `false`.
+pub async fn recover_claimed_session_body(
+    state: &AppState,
+    lease_owner: Uuid,
+    request_id: Uuid,
+) -> Result<bool, AppError> {
+    archive_session_body_with_lease(state, lease_owner, request_id, true).await
+}
+
+async fn archive_session_body_with_lease(
+    state: &AppState,
+    lease_owner: Uuid,
+    request_id: Uuid,
+    report_deferred_error: bool,
+) -> Result<bool, AppError> {
+    if !state
+        .db
+        .renew_session_body_archive(lease_owner, request_id)
+        .await?
+    {
+        return Ok(false);
+    }
+    let archive =
+        archive_session_body_with_result(state, lease_owner, request_id, report_deferred_error);
+    tokio::pin!(archive);
+    let mut heartbeat = tokio::time::interval(Duration::from_secs(30));
+    heartbeat.tick().await;
+    loop {
+        tokio::select! {
+            biased;
+            result = &mut archive => return result,
+            _ = heartbeat.tick() => {
+                if !state.db.renew_session_body_archive(lease_owner, request_id).await? { return Ok(false); }
+            }
+        }
+    }
+}
+
+async fn archive_session_body_with_result(
+    state: &AppState,
+    lease_owner: Uuid,
+    request_id: Uuid,
+    report_deferred_error: bool,
 ) -> Result<bool, AppError> {
     tracing::debug!(%request_id, %lease_owner, stage = "context_start", "conversation projection stage");
     let (tenant_id, hints, response_complete) =
@@ -1163,16 +1358,34 @@ pub(crate) async fn archive_session_body(
         )
         .await;
     };
+    #[cfg(test)]
+    crate::db::Database::wait_raw_projection_gate_for_test(request_id).await;
     tracing::debug!(%request_id, %lease_owner, stage = "raw_response_reference_start", "conversation projection stage");
     if let Some(response) = state
         .archive
         .raw_capture_reference(tenant_id, request_id, "response")
         .await?
     {
-        state
+        if !state
             .db
-            .bind_raw_capture(tenant_id, request_id, "response", &response)
-            .await?;
+            .renew_session_body_archive(lease_owner, request_id)
+            .await?
+        {
+            return Ok(false);
+        }
+        if !state
+            .db
+            .bind_raw_capture_for_projection(
+                tenant_id,
+                request_id,
+                "response",
+                &response,
+                lease_owner,
+            )
+            .await?
+        {
+            return Ok(false);
+        }
         locators.response = Some(response.object_locator);
         locators.pending = false;
     } else if state
@@ -1189,10 +1402,26 @@ pub(crate) async fn archive_session_body(
         .raw_capture_reference(tenant_id, request_id, "request")
         .await?
     {
-        state
+        if !state
             .db
-            .bind_raw_capture(tenant_id, request_id, "request", &request)
-            .await?;
+            .renew_session_body_archive(lease_owner, request_id)
+            .await?
+        {
+            return Ok(false);
+        }
+        if !state
+            .db
+            .bind_raw_capture_for_projection(
+                tenant_id,
+                request_id,
+                "request",
+                &request,
+                lease_owner,
+            )
+            .await?
+        {
+            return Ok(false);
+        }
         locators.request = request.object_locator;
         locators.source_identity = None;
     }
@@ -1223,30 +1452,20 @@ pub(crate) async fn archive_session_body(
         .await;
     }
     tracing::debug!(%request_id, %lease_owner, stage = "source_stream_start", "conversation projection stage");
-    let projection = state.archive.prepare_session_body_streamed(
-        tenant_id,
-        request_id,
-        hints,
-        locators.request.clone(),
-        locators
-            .response
-            .clone()
-            .filter(|locator| !missing_raw_document(locator)),
-        response_complete,
-    );
-    tokio::pin!(projection);
-    let mut heartbeat = tokio::time::interval(Duration::from_secs(30));
-    heartbeat.tick().await;
-    let prepared = loop {
-        tokio::select! {
-            result = &mut projection => break result,
-            _ = heartbeat.tick() => {
-                if !state.db.renew_session_body_archive(lease_owner, request_id).await? {
-                    return Ok(false);
-                }
-            }
-        }
-    };
+    let prepared = state
+        .archive
+        .prepare_session_body_streamed(
+            tenant_id,
+            request_id,
+            hints,
+            locators.request.clone(),
+            locators
+                .response
+                .clone()
+                .filter(|locator| !missing_raw_document(locator)),
+            response_complete,
+        )
+        .await;
     tracing::debug!(%request_id, %lease_owner, succeeded = prepared.is_ok(), stage = "source_stream_done", "conversation projection stage");
     let prepared = match prepared {
         Ok(Some(prepared)) => prepared,
@@ -1282,7 +1501,11 @@ pub(crate) async fn archive_session_body(
                     .db
                     .defer_session_body_archive(lease_owner, request_id)
                     .await?;
-                return Ok(false);
+                return if report_deferred_error {
+                    Err(error)
+                } else {
+                    Ok(false)
+                };
             }
             if locators.source_identity.is_some() {
                 // The writer's lease has been fenced and its actual source is
@@ -1323,10 +1546,13 @@ pub(crate) async fn archive_session_body(
             .raw_capture_reference(tenant_id, request_id, side)
             .await?
         {
-            state
+            if !state
                 .db
-                .bind_raw_capture(tenant_id, request_id, side, &object)
-                .await?;
+                .bind_raw_capture_for_projection(tenant_id, request_id, side, &object, lease_owner)
+                .await?
+            {
+                return Ok(false);
+            }
         }
     }
     let crate::archive::PreparedSessionBody {
@@ -1365,18 +1591,19 @@ pub(crate) async fn archive_session_body(
         // this boundary, without rolling it back or replaying projection.
         crate::db::Database::semantic_coverage_test_boundary("projection_commit_ack")?;
     }
-    if projected && coverage_complete {
-        if let Some(head) = nodes.last() {
-            let binding = state
-                .db
-                .semantic_archive_binding(tenant_id, request_id, &head.node_hash)
-                .await?
-                .ok_or_else(|| AppError::storage("semantic_sql_binding_not_committed"))?;
-            state
-                .archive
-                .confirm_semantic_coverage(&publication, &binding)
-                .await?;
-        }
+    if projected
+        && coverage_complete
+        && let Some(head) = nodes.last()
+    {
+        let binding = state
+            .db
+            .semantic_archive_binding(tenant_id, request_id, &head.node_hash)
+            .await?
+            .ok_or_else(|| AppError::storage("semantic_sql_binding_not_committed"))?;
+        state
+            .archive
+            .confirm_semantic_coverage(&publication, &binding)
+            .await?;
     }
     // Coverage confirmation is a separate durable handoff, not financial ACK
     // and not yet permission to delete raw still held by another retry owner.

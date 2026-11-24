@@ -237,3 +237,171 @@ async fn another_pod_recovers_finance_and_conversation_seed_without_the_original
     pool.close().await;
     upstream.verify().await;
 }
+
+#[tokio::test]
+#[ignore = "requires the CI PostgreSQL service"]
+async fn postgres_slow_supplier_summary_preserves_terminal_and_recoverable_explanation() {
+    let url = std::env::var("MTC_TEST_POSTGRES_URL").expect("CI PostgreSQL required");
+    let admin = sqlx::PgPool::connect(&url).await.unwrap();
+    let schema = format!("summary_{}", Uuid::now_v7().simple());
+    sqlx::query(sqlx::AssertSqlSafe(format!("CREATE SCHEMA {schema}")))
+        .execute(&admin)
+        .await
+        .unwrap();
+    let mut isolated = url::Url::parse(&url).unwrap();
+    isolated
+        .query_pairs_mut()
+        .append_pair("options", &format!("-csearch_path={schema}"));
+    let mut fixture = codex_route_fixture_with_database(
+        "summary-independent",
+        "archive",
+        Some(isolated.to_string()),
+    )
+    .await;
+    fixture.state.pending_terminals.stop_for_test().await;
+    let s3 = MockServer::start().await;
+    Mock::given(method("PUT"))
+        .respond_with(ResponseTemplate::new(503).set_delay(Duration::from_secs(30)))
+        .mount(&s3)
+        .await;
+    let mut config = Config::for_test(fixture.database_url.clone());
+    config.archive_backend = ArchiveBackend::S3;
+    config.s3_bucket = Some("summary-contract".into());
+    config.s3_endpoint = Some(s3.uri());
+    config.s3_access_key = Some("test-access".into());
+    config.s3_secret_key = Some("test-secret".into());
+    config.s3_allow_http = true;
+    let summary_archive = crate::archive::ArchiveStore::from_config(&config)
+        .await
+        .unwrap();
+    fixture.state.db = fixture
+        .state
+        .db
+        .clone()
+        .with_archive(summary_archive.clone());
+    let directory = fixture
+        .state
+        .pending_terminals
+        .directory_for_test()
+        .to_owned();
+    fixture.state.pending_terminals =
+        crate::proxy_lifecycle::pending_terminal::Journal::with_archive(
+            directory.clone(),
+            fixture.state.db.independent_persistence_pool(),
+            fixture.state.archive.clone(),
+        );
+    let upstream = MockServer::start().await;
+    let explanation = json!({"error":{"type":"upstream_error","code":"NoAvailablePlan","message":"complete supplier explanation retained through restart"}});
+    Mock::given(method("POST"))
+        .and(path(codex_transport::RESPONSES_PATH))
+        .respond_with(ResponseTemplate::new(402).set_body_json(&explanation))
+        .expect(1)
+        .mount(&upstream)
+        .await;
+    let response = tokio::time::timeout(
+        Duration::from_secs(5),
+        send_codex_route(
+            &fixture,
+            &upstream,
+            "/v1/responses",
+            json!({"model":fixture.model,"input":"summary contract","stream":false}),
+        ),
+    )
+    .await
+    .expect("client terminal precedes slow S3 publication");
+    assert_eq!(response.status(), StatusCode::PAYMENT_REQUIRED);
+    let body = to_bytes(response.into_body(), MAX_PROXY_RESPONSE_BODY)
+        .await
+        .unwrap();
+    assert!(String::from_utf8_lossy(&body).contains("complete supplier explanation"));
+    let (receipt_id, receipt) = wait_for_receipt(&fixture).await;
+    let request_id = Uuid::parse_str(receipt["request_id"].as_str().unwrap()).unwrap();
+    assert!(
+        receipt["supplier_summary"]
+            .as_str()
+            .unwrap()
+            .contains("complete supplier explanation")
+    );
+    let pool = sqlx::AnyPool::connect(&fixture.database_url).await.unwrap();
+    tokio::time::timeout(Duration::from_secs(5), async {
+        loop {
+            let counts: (i64,i64) = sqlx::query_as("SELECT (SELECT COUNT(*) FROM proxy_operational_terminals WHERE request_id=$1), (SELECT COUNT(*) FROM conversation_projection_outbox WHERE request_id=$1)")
+                .bind(request_id.to_string()).fetch_one(&pool).await.unwrap();
+            if counts == (1,1) { break; }
+            tokio::task::yield_now().await;
+        }
+    }).await.expect("SQL observation and conversation enqueue precede slow summary PUT");
+    tokio::time::timeout(Duration::from_secs(5), async {
+        loop {
+            if s3
+                .received_requests()
+                .await
+                .unwrap()
+                .iter()
+                .any(|request| request.method.as_str() == "PUT")
+            {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("real S3 client reached blocked HTTP endpoint");
+    fixture.state.pending_terminals.stop_for_test().await;
+    // The journal backend is independent of the unavailable summary endpoint.
+    let location = format!(
+        "terminal-receipts/v1/{}/{}.json",
+        directory.file_name().unwrap().to_string_lossy(),
+        receipt_id
+    );
+    let persisted: Value =
+        serde_json::from_slice(&fixture.state.archive.get(&location).await.unwrap()).unwrap();
+    assert_eq!(persisted["supplier_summary"], receipt["supplier_summary"]);
+    s3.reset().await;
+    Mock::given(method("PUT"))
+        .respond_with(ResponseTemplate::new(200).insert_header("etag", "\"summary\""))
+        .mount(&s3)
+        .await;
+    fixture.state.pending_terminals =
+        crate::proxy_lifecycle::pending_terminal::Journal::with_archive(
+            directory,
+            fixture.state.db.independent_persistence_pool(),
+            fixture.state.archive.clone(),
+        );
+    tokio::time::timeout(Duration::from_secs(5), async {
+        loop {
+            if let Some(request) = s3
+                .received_requests()
+                .await
+                .unwrap()
+                .into_iter()
+                .find(|r| r.method.as_str() == "PUT")
+            {
+                assert_eq!(
+                    request.body,
+                    persisted["supplier_summary"].as_str().unwrap().as_bytes()
+                );
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("restarted journal republishes complete explanation");
+    let financial: (i64,i64) = sqlx::query_as("SELECT (SELECT COUNT(*) FROM usage_reservations WHERE id=(SELECT reservation_id FROM request_records WHERE id=$1)), (SELECT COUNT(*) FROM ledger_entries WHERE source=(SELECT reservation_id FROM request_records WHERE id=$1))")
+        .bind(request_id.to_string()).fetch_one(&pool).await.unwrap();
+    assert_eq!(
+        financial,
+        (1, 0),
+        "unknown provider usage retains one reservation and no fabricated charge"
+    );
+    upstream.verify().await;
+    fixture.state.pending_terminals.stop_for_test().await;
+    fixture.state.db.close().await;
+    pool.close().await;
+    sqlx::query(sqlx::AssertSqlSafe(format!("DROP SCHEMA {schema} CASCADE")))
+        .execute(&admin)
+        .await
+        .unwrap();
+    admin.close().await;
+}

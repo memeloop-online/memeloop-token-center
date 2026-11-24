@@ -80,7 +80,7 @@ tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
 url = "2"
 uuid = { version = "1", features = ["serde", "v7"] }
-wasmtime = { version = "48.0.8", default-features = false, features = ["component-model", "cranelift", "runtime", "std"] }
+wasmtime = { version = "48.0.9", default-features = false, features = ["component-model", "cranelift", "runtime", "std"] }
 zstd = "0.14.3"
 
 [target.'cfg(not(target_env = "msvc"))'.dependencies]
@@ -109,6 +109,8 @@ codegen-units = 1
 strip = "debuginfo"
 
 [patch.crates-io]
+# Bound only returned-connection maintenance; preserve borrowed SQL lifetimes.
+sqlx-core = { path = "vendor/sqlx-core" }
 # Upstream 1.42.1 declares an optional, unused rkyv dependency that is still
 # resolved into Cargo.lock and therefore audited even though no application
 # feature can reach it. This source-identical, manifest-only fork removes that

@@ -2,6 +2,8 @@ mod activation;
 mod bootstrap;
 use super::*;
 
+pub(super) const EVENT_SOURCE_PAGE_SQL: &str = "SELECT 'event' AS source,event_id AS request_id,tenant_id,key_id,event_at AS created_at FROM request_events WHERE event_at >= $1 AND (event_at,event_id) > ($1,$2) ORDER BY event_at,event_id LIMIT $3";
+
 const PENDING_COUNT_SQL: &str = "SELECT (SELECT COUNT(*) FROM request_history_export) + (SELECT COUNT(*) FROM request_history_immutable_outbox i WHERE NOT EXISTS (SELECT 1 FROM request_history_export e WHERE e.revision=i.revision))";
 use crate::request_history::{
     HistoryError, HistoryIdentity, HistoryScope, HistorySnapshot, HistoryStatistics,
@@ -170,6 +172,21 @@ impl Database {
     }
 
     fn history_capture_definitions(&self) -> Result<Vec<CaptureDefinition>, HistoryError> {
+        self.history_capture_definitions_with_upstream_projection(true)
+    }
+
+    fn history_capture_definitions_with_upstream_projection(
+        &self,
+        projected_updates_only: bool,
+    ) -> Result<Vec<CaptureDefinition>, HistoryError> {
+        self.history_capture_definitions_with_projection_guards(projected_updates_only, true)
+    }
+
+    fn history_capture_definitions_with_projection_guards(
+        &self,
+        projected_updates_only: bool,
+        terminal_lease_guard: bool,
+    ) -> Result<Vec<CaptureDefinition>, HistoryError> {
         let sources = [
             ("request_events", Some(("event", "event_id", "event_at"))),
             ("request_records", Some(("native", "id", "created_at"))),
@@ -260,7 +277,22 @@ impl Database {
                 if event == "UPDATE" && identity.is_none() {
                     // A correction may move a metadata row between requests.
                     // Both dependencies must get fresh canonical snapshots.
-                    enqueue.push_str(&enqueue.replace("NEW.", "OLD."));
+                    let old = enqueue.replace("NEW.", "OLD.");
+                    if projected_updates_only && table == "upstream_accounts" {
+                        // A rename affects one account. Only an identity move
+                        // needs both the old and new dependency sets.
+                        match self.backend {
+                            DatabaseBackend::PostgreSql => enqueue.push_str(&format!(
+                                "IF OLD.id IS DISTINCT FROM NEW.id THEN {old} END IF;"
+                            )),
+                            DatabaseBackend::Sqlite => enqueue.push_str(&old.replace(
+                                " != 'off' ON CONFLICT",
+                                " != 'off' AND OLD.id IS NOT NEW.id ON CONFLICT",
+                            )),
+                        }
+                    } else {
+                        enqueue.push_str(&old);
+                    }
                 }
                 let identity_guard = if event == "UPDATE" {
                     if let Some((_, id, created_at)) = identity {
@@ -282,8 +314,21 @@ impl Database {
                     String::new()
                 };
                 let name = format!("history_{table}_{}", event.to_lowercase());
+                let upstream_update =
+                    projected_updates_only && table == "upstream_accounts" && event == "UPDATE";
+                let projection_guard = if upstream_update {
+                    "IF OLD.id IS NOT DISTINCT FROM NEW.id AND OLD.name IS NOT DISTINCT FROM NEW.name THEN RETURN NULL; END IF; "
+                } else if terminal_lease_guard
+                    && table == "terminal_projection_outbox"
+                    && event == "UPDATE"
+                    && matches!(self.backend, DatabaseBackend::PostgreSql)
+                {
+                    "IF (to_jsonb(OLD) - ARRAY['lease_owner','lease_expires_at','attempts']) IS NOT DISTINCT FROM (to_jsonb(NEW) - ARRAY['lease_owner','lease_expires_at','attempts']) THEN RETURN NULL; END IF; "
+                } else {
+                    ""
+                };
                 let body = format!(
-                    "BEGIN IF (SELECT mode FROM request_history_state WHERE id=1)='off' THEN RETURN NULL; END IF; PERFORM id FROM request_history_state WHERE id = 1 FOR SHARE; IF (SELECT mode FROM request_history_state WHERE id=1)='off' THEN RETURN NULL; END IF; {identity_guard} {enqueue} RETURN NULL; END"
+                    "BEGIN IF (SELECT mode FROM request_history_state WHERE id=1)='off' THEN RETURN NULL; END IF; {projection_guard}PERFORM id FROM request_history_state WHERE id = 1 FOR SHARE; IF (SELECT mode FROM request_history_state WHERE id=1)='off' THEN RETURN NULL; END IF; {identity_guard} {enqueue} RETURN NULL; END"
                 );
                 let manifest = format!(
                     "mtc-history-bootstrap-v1-{}",
@@ -297,9 +342,16 @@ impl Database {
                          ALTER FUNCTION {name}() RESET ALL;
                          COMMENT ON FUNCTION {name}() IS '{manifest}';"
                     ),
-                    DatabaseBackend::Sqlite => format!(
-                        "DROP TRIGGER IF EXISTS {name}; CREATE TRIGGER {name} AFTER {event} ON {table} BEGIN {identity_guard} {enqueue} END;"
-                    ),
+                    DatabaseBackend::Sqlite => {
+                        let when = if upstream_update {
+                            " WHEN OLD.id IS NOT NEW.id OR OLD.name IS NOT NEW.name"
+                        } else {
+                            ""
+                        };
+                        format!(
+                            "DROP TRIGGER IF EXISTS {name}; CREATE TRIGGER {name} AFTER {event} ON {table}{when} BEGIN {identity_guard} {enqueue} END;"
+                        )
+                    }
                 };
                 definitions.push(CaptureDefinition {
                     table,
@@ -362,7 +414,7 @@ impl Database {
             sqlx::query("UPDATE request_history_activation SET baseline_owner=NULL,baseline_epoch=NULL WHERE id=1")
                 .execute(&mut *tx).await?;
         }
-        sqlx::query("UPDATE request_history_backfill SET after_id = '', done = 0")
+        sqlx::query("UPDATE request_history_backfill SET after_id = '', after_created_at = NULL, legacy_after_id = NULL, done = 0")
             .execute(&mut *tx)
             .await?;
         tx.commit().await?;
@@ -401,8 +453,12 @@ impl Database {
         after_id: Option<Uuid>,
         limit: i64,
     ) -> Result<Vec<HistoryIdentity>, HistoryError> {
-        let rows=sqlx::query("SELECT 'event' AS source, event_id AS request_id, event_at AS created_at, tenant_id, key_id FROM request_events WHERE (event_at > $1 OR (event_at = $1 AND event_id > $2)) ORDER BY event_at, event_id LIMIT $3")
-            .bind(after).bind(after_id.map(|id|id.to_string()).unwrap_or_default()).bind(limit).fetch_all(&self.pool).await?;
+        let rows = sqlx::query(EVENT_SOURCE_PAGE_SQL)
+            .bind(after)
+            .bind(after_id.map(|id| id.to_string()).unwrap_or_default())
+            .bind(limit)
+            .fetch_all(&self.pool)
+            .await?;
         rows.iter().map(history_identity).collect()
     }
 
@@ -414,6 +470,25 @@ impl Database {
     pub(super) async fn history_backfill_page_after_ready(
         &self,
         page_size: i64,
+        ready: impl std::future::Future<Output = Result<(), HistoryError>>,
+    ) -> Result<usize, HistoryError> {
+        self.history_backfill_source_page_after_ready(page_size, None, ready)
+            .await
+    }
+
+    pub async fn history_backfill_source_page(
+        &self,
+        page_size: i64,
+        source: Option<crate::request_history::HistorySource>,
+    ) -> Result<usize, HistoryError> {
+        self.history_backfill_source_page_after_ready(page_size, source, std::future::ready(Ok(())))
+            .await
+    }
+
+    async fn history_backfill_source_page_after_ready(
+        &self,
+        page_size: i64,
+        source: Option<crate::request_history::HistorySource>,
         ready: impl std::future::Future<Output = Result<(), HistoryError>>,
     ) -> Result<usize, HistoryError> {
         if page_size <= 0 || self.history_mode().await? == "off" {
@@ -447,9 +522,10 @@ impl Database {
             ""
         };
         let sql = format!(
-            "SELECT source, after_id FROM request_history_backfill WHERE done = 0 ORDER BY source LIMIT 1{lock}"
+            "SELECT source, after_id, after_created_at, legacy_after_id FROM request_history_backfill WHERE done = 0 AND (CAST($1 AS TEXT) IS NULL OR source=$1) ORDER BY source LIMIT 1{lock}"
         );
         let Some(checkpoint) = sqlx::query(sqlx::AssertSqlSafe(sql))
+            .bind(source.map(crate::request_history::HistorySource::as_str))
             .fetch_optional(&mut *transaction)
             .await?
         else {
@@ -457,26 +533,55 @@ impl Database {
         };
         let source: String = checkpoint.try_get("source")?;
         let after: String = checkpoint.try_get("after_id")?;
-        let sql = format!(
-            "SELECT {COLUMNS} FROM request_history_source_ids WHERE source = $1 AND request_id > $2 ORDER BY request_id LIMIT $3"
-        );
-        let rows = sqlx::query(sqlx::AssertSqlSafe(sql))
-            .bind(&source)
-            .bind(&after)
-            .bind(page_size)
-            .fetch_all(&mut *transaction)
-            .await?;
+        let event_after: Option<i64> = checkpoint.try_get("after_created_at")?;
+        let legacy_after: Option<String> = checkpoint.try_get("legacy_after_id")?;
+        let legacy_scan = source == "event"
+            && (legacy_after.is_some() || (event_after.is_none() && !after.is_empty()));
+        let rows = if source == "event" {
+            // Event IDs need not follow event time. A legacy UUID cursor gets
+            // one complete time-ordered pass; existing durable receipts below
+            // preserve revisions already captured or delivered.
+            sqlx::query(EVENT_SOURCE_PAGE_SQL)
+                .bind(event_after.unwrap_or(i64::MIN))
+                .bind(if event_after.is_some() {
+                    after.as_str()
+                } else {
+                    ""
+                })
+                .bind(page_size)
+                .fetch_all(&mut *transaction)
+                .await?
+        } else {
+            let sql = format!(
+                "SELECT {COLUMNS} FROM request_history_source_ids WHERE source = $1 AND request_id > $2 ORDER BY request_id LIMIT $3"
+            );
+            sqlx::query(sqlx::AssertSqlSafe(sql))
+                .bind(&source)
+                .bind(&after)
+                .bind(page_size)
+                .fetch_all(&mut *transaction)
+                .await?
+        };
         for row in &rows {
-            sqlx::query("INSERT INTO request_history_export (source, request_id, tenant_id, key_id, created_at) VALUES ($1, $2, $3, $4, $5) ON CONFLICT (source, request_id) DO NOTHING")
+            sqlx::query("INSERT INTO request_history_export (source, request_id, tenant_id, key_id, created_at) SELECT $1, $2, $3, $4, $5 WHERE $6 = 0 OR NOT EXISTS (SELECT 1 FROM request_history_identities i WHERE i.source=$1 AND i.request_id=$2 AND i.tenant_id=$3 AND i.key_id=$4 AND i.created_at=$5 AND ((i.acknowledged_revision=i.head_revision AND i.acknowledged_hash IS NOT NULL AND LENGTH(i.acknowledged_hash)=64) OR EXISTS (SELECT 1 FROM request_history_immutable_outbox o WHERE o.revision=i.head_revision AND o.source=i.source AND o.request_id=i.request_id AND o.tenant_id=i.tenant_id AND o.key_id=i.key_id AND o.created_at=i.created_at))) ON CONFLICT (source, request_id) DO NOTHING")
                 .bind(&source).bind(row.try_get::<String, _>("request_id")?)
                 .bind(row.try_get::<String, _>("tenant_id")?).bind(row.try_get::<String, _>("key_id")?)
-                .bind(row.try_get::<i64, _>("created_at")?).execute(&mut *transaction).await?;
+                .bind(row.try_get::<i64, _>("created_at")?).bind(i64::from(legacy_scan)).execute(&mut *transaction).await?;
         }
         let after = rows
             .last()
             .map(|row| row.try_get::<String, _>("request_id"))
             .transpose()?
             .unwrap_or(after);
+        if source == "event" {
+            let time = rows
+                .last()
+                .map(|row| row.try_get::<i64, _>("created_at"))
+                .transpose()?
+                .or(event_after);
+            sqlx::query("UPDATE request_history_backfill SET legacy_after_id=CASE WHEN after_created_at IS NULL AND after_id<>'' THEN after_id ELSE legacy_after_id END,after_created_at=$1 WHERE source='event'")
+                .bind(time).execute(&mut *transaction).await?;
+        }
         sqlx::query(
             "UPDATE request_history_backfill SET after_id = $1, done = $2 WHERE source = $3",
         )
@@ -509,8 +614,19 @@ impl Database {
         page_size: i64,
         ceiling: Option<i64>,
     ) -> Result<Vec<HistorySnapshot>, HistoryError> {
+        let started = std::time::Instant::now();
         self.history_capture_pending(page_size).await?;
+        let capture_ms = started.elapsed().as_millis() as u64;
+        let phase = std::time::Instant::now();
         let immutable = self.history_immutable_pending(page_size, ceiling).await?;
+        if !immutable.is_empty() {
+            tracing::info!(
+                rows = immutable.len(),
+                capture_ms,
+                materialize_ms = phase.elapsed().as_millis() as u64,
+                "request history capture materialization timings"
+            );
+        }
         if !immutable.is_empty() {
             return Ok(immutable);
         }
@@ -540,6 +656,13 @@ impl Database {
         &self,
         snapshots: &[HistorySnapshot],
     ) -> Result<(), HistoryError> {
+        self.history_acknowledge_count(snapshots).await.map(|_| ())
+    }
+
+    pub(crate) async fn history_acknowledge_count(
+        &self,
+        snapshots: &[HistorySnapshot],
+    ) -> Result<usize, HistoryError> {
         let mut transaction = self.pool.begin().await?;
         let mut acknowledged = Vec::new();
         const ACK: &str = "DELETE FROM request_history_export WHERE revision = $1 AND source = $2 AND request_id = $3 AND snapshot = $4";
@@ -605,7 +728,7 @@ impl Database {
         self.allocation_history_acknowledged(&mut transaction, &acknowledged)
             .await?;
         transaction.commit().await?;
-        Ok(())
+        Ok(acknowledged.len())
     }
 
     pub async fn history_pending_count(&self) -> Result<i64, HistoryError> {
@@ -746,7 +869,7 @@ impl Database {
             let mut transaction = self.pool.begin().await?;
             let original = super::history_immutable_outbox::original_event_in_transaction(
                 &mut transaction,
-                identity.request_id,
+                &identity,
             )
             .await?;
             transaction.commit().await?;
@@ -1140,3 +1263,7 @@ fn history_identity(row: &AnyRow) -> Result<HistoryIdentity, HistoryError> {
 #[cfg(test)]
 #[path = "../request_history/persistence_tests.rs"]
 mod tests;
+
+#[cfg(test)]
+#[path = "request_history/event_backfill_tests.rs"]
+mod event_backfill_tests;

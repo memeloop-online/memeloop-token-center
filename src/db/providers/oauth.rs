@@ -1505,7 +1505,7 @@ impl Database {
             "SELECT a.id, a.credential_generation FROM upstream_accounts a JOIN upstream_credentials c ON c.upstream_account_id = a.id AND c.generation = a.credential_generation AND c.revoked_at IS NULL WHERE a.status = 'active' AND a.auth_kind = 'oauth' AND a.oauth_session_id IS NOT NULL AND a.oauth_refresh_url IS NOT NULL AND a.driver <> 'cpa-gemini-oauth-legacy' AND c.expires_at IS NOT NULL AND c.expires_at <= $1 AND NOT EXISTS (SELECT 1 FROM upstream_oauth_refresh_leases l WHERE l.account_id = a.id AND l.credential_generation = a.credential_generation AND l.request_started_at IS NOT NULL AND l.pending_credential_ciphertext IS NULL) ORDER BY c.expires_at, a.id LIMIT $2",
         )
         .bind(refresh_before)
-        .bind(limit.clamp(1, 100))
+        .bind(limit)
         .fetch_all(&self.pool)
         .await?;
         rows.into_iter()

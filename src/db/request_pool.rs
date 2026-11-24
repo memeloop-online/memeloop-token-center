@@ -29,6 +29,16 @@ pub(super) struct PoolDiagnostics {
     initialization_failed: AtomicU64,
     returned: AtomicU64,
     discarded_protocol: AtomicU64,
+    pub(super) direct_owned: AtomicUsize,
+    pub(super) direct_query: AtomicUsize,
+    pub(super) direct_stream: AtomicUsize,
+    pub(super) return_requested: AtomicU64,
+    pub(super) cancel_detached: AtomicU64,
+    pub(super) transaction_transfers: AtomicU64,
+    pub(super) begin_inflight: AtomicUsize,
+    begin_completed: AtomicU64,
+    begin_failed: AtomicU64,
+    begin_cancelled: AtomicU64,
 }
 
 impl PoolDiagnostics {
@@ -51,6 +61,33 @@ impl PoolDiagnostics {
             self.discarded_protocol.fetch_add(1, Ordering::Relaxed);
         }
     }
+    pub(super) fn begin(self: &Arc<Self>) -> BeginGuard {
+        self.begin_inflight.fetch_add(1, Ordering::Relaxed);
+        BeginGuard {
+            diagnostics: self.clone(),
+            completed: false,
+        }
+    }
+    pub(super) fn observe_phases(&self) {
+        tracing::warn!(
+            pool_label = self.label,
+            direct_owned = self.direct_owned.load(Ordering::Relaxed),
+            direct_query = self.direct_query.load(Ordering::Relaxed),
+            direct_stream = self.direct_stream.load(Ordering::Relaxed),
+            begin_inflight = self.begin_inflight.load(Ordering::Relaxed),
+            begin_completed_total = self.begin_completed.load(Ordering::Relaxed),
+            begin_failed_total = self.begin_failed.load(Ordering::Relaxed),
+            begin_cancelled_total = self.begin_cancelled.load(Ordering::Relaxed),
+            return_requested_total = self.return_requested.load(Ordering::Relaxed),
+            cancel_detached_total = self.cancel_detached.load(Ordering::Relaxed),
+            transaction_transfers_total = self.transaction_transfers.load(Ordering::Relaxed),
+            request_id = crate::api::current_proxy_request_id()
+                .map(|id| id.to_string())
+                .as_deref()
+                .unwrap_or("absent"),
+            "database connection ownership phases"
+        );
+    }
     pub(super) fn snapshot(&self) -> (usize, usize, u64, u64, u64, u64) {
         (
             self.waiters.load(Ordering::Relaxed),
@@ -60,6 +97,34 @@ impl PoolDiagnostics {
             self.returned.load(Ordering::Relaxed),
             self.discarded_protocol.load(Ordering::Relaxed),
         )
+    }
+}
+
+pub(super) struct BeginGuard {
+    diagnostics: Arc<PoolDiagnostics>,
+    completed: bool,
+}
+impl BeginGuard {
+    pub(super) fn finish(&mut self, success: bool) {
+        self.completed = true;
+        if success {
+            &self.diagnostics.begin_completed
+        } else {
+            &self.diagnostics.begin_failed
+        }
+        .fetch_add(1, Ordering::Relaxed);
+    }
+}
+impl Drop for BeginGuard {
+    fn drop(&mut self) {
+        self.diagnostics
+            .begin_inflight
+            .fetch_sub(1, Ordering::Relaxed);
+        if !self.completed {
+            self.diagnostics
+                .begin_cancelled
+                .fetch_add(1, Ordering::Relaxed);
+        }
     }
 }
 
@@ -129,7 +194,7 @@ impl RequestPool {
         self.diagnostics = diagnostics;
         self
     }
-    pub(super) fn diagnostics(&self) -> &PoolDiagnostics {
+    pub(super) fn diagnostics(&self) -> &Arc<PoolDiagnostics> {
         &self.diagnostics
     }
     #[cfg(test)]
@@ -140,10 +205,9 @@ impl RequestPool {
     pub(crate) async fn acquire(&self) -> Result<RequestConnection, sqlx::Error> {
         self.diagnostics.waiters.fetch_add(1, Ordering::Relaxed);
         let _waiting = AcquisitionGuard(&self.diagnostics.waiters);
-        self.inner
-            .acquire()
-            .await
-            .map(|connection| RequestConnection::new(connection, self.backend))
+        self.inner.acquire().await.map(|connection| {
+            RequestConnection::new(connection, self.backend, self.diagnostics.clone())
+        })
     }
 
     // Pool timeout means no application SQL was sent. Direct Executor callers
@@ -159,6 +223,12 @@ impl RequestPool {
                 {
                     timeouts += 1;
                     if timeouts == 1 || timeouts.is_multiple_of(6) {
+                        tracing::warn!(
+                            active_pooled_transactions = self.inner.active_transactions(),
+                            pool_label = self.diagnostics.label,
+                            "database pooled transaction ownership"
+                        );
+                        self.diagnostics.observe_phases();
                         let (waiters, initializing, cancelled, failed, returned, discarded) =
                             self.diagnostics.snapshot();
                         tracing::warn!(
@@ -190,18 +260,23 @@ impl RequestPool {
     }
 
     pub(crate) async fn begin(&self) -> Result<Transaction<'static, Any>, sqlx::Error> {
-        Transaction::begin(self.acquire().await?.into_pool(), None).await
+        let connection = self.acquire().await?;
+        let mut phase = self.diagnostics.begin();
+        let result = Transaction::begin(connection.into_pool(), None).await;
+        phase.finish(result.is_ok());
+        result
     }
 
     pub(crate) async fn begin_with(
         &self,
         statement: impl SqlSafeStr,
     ) -> Result<Transaction<'static, Any>, sqlx::Error> {
-        Transaction::begin(
-            self.acquire().await?.into_pool(),
-            Some(statement.into_sql_str()),
-        )
-        .await
+        let connection = self.acquire().await?;
+        let mut phase = self.diagnostics.begin();
+        let result =
+            Transaction::begin(connection.into_pool(), Some(statement.into_sql_str())).await;
+        phase.finish(result.is_ok());
+        result
     }
 
     pub(crate) fn options(&self) -> &AnyPoolOptions {
@@ -210,6 +285,10 @@ impl RequestPool {
     pub(crate) fn connect_options(&self) -> Arc<AnyConnectOptions> {
         self.inner.connect_options()
     }
+    pub(super) fn active_transactions(&self) -> usize {
+        self.inner.active_transactions()
+    }
+
     pub(crate) fn size(&self) -> u32 {
         self.inner.size()
     }
@@ -242,6 +321,7 @@ impl<'pool> Executor<'pool> for &'pool RequestPool {
         let mut producer = Some(Box::pin(async move {
             let result = async {
                 let mut connection = self.acquire_for_executor().await?;
+                connection.query_phase(true);
                 {
                     let mut rows = (&mut *connection).fetch_many(query);
                     while let Some(row) = rows.try_next().await? {
@@ -278,6 +358,7 @@ impl<'pool> Executor<'pool> for &'pool RequestPool {
     {
         Box::pin(async move {
             let mut connection = self.acquire_for_executor().await?;
+            connection.query_phase(false);
             let row = (&mut *connection).fetch_optional(query).await?;
             connection.finish();
             Ok(row)
@@ -294,6 +375,7 @@ impl<'pool> Executor<'pool> for &'pool RequestPool {
     {
         Box::pin(async move {
             let mut connection = self.acquire_for_executor().await?;
+            connection.query_phase(false);
             let statement = (&mut *connection).prepare_with(sql, parameters).await?;
             connection.finish();
             Ok(statement)
@@ -333,6 +415,8 @@ mod tests {
         let key = (uuid::Uuid::now_v7().as_u128() & i64::MAX as u128) as i64;
         let mut rows = sqlx::Executor::fetch_many(&pool, sqlx::query("INSERT INTO executor_consume_probe SELECT $1 FROM generate_series(1,256) RETURNING repeat('x',65536)").bind(key));
         assert!(rows.try_next().await.unwrap().is_some());
+        assert_eq!(pool.diagnostics.direct_owned.load(Ordering::Relaxed), 1);
+        assert_eq!(pool.diagnostics.direct_stream.load(Ordering::Relaxed), 1);
         let held: i64 = sqlx::query_scalar(
             "SELECT COUNT(*) FROM pg_locks WHERE pid=$1 AND locktype='advisory' AND granted",
         )
@@ -345,6 +429,9 @@ mod tests {
             "paused consumer must expose the trigger transaction while its RETURNING output is not drained"
         );
         drop(rows);
+        assert_eq!(pool.diagnostics.direct_owned.load(Ordering::Relaxed), 0);
+        assert_eq!(pool.diagnostics.direct_stream.load(Ordering::Relaxed), 0);
+        assert_eq!(pool.diagnostics.cancel_detached.load(Ordering::Relaxed), 1);
         tokio::time::timeout(Duration::from_secs(10), async {
             loop {
                 let present: i64 =
@@ -395,6 +482,7 @@ mod tests {
         );
         pool.close().await;
         observer.close().await;
+        super::return_health_tests::postgres_return_health_timeout_releases_slot(&url).await;
     }
 
     #[tokio::test]
@@ -570,3 +658,6 @@ mod tests {
         ));
     }
 }
+
+#[cfg(test)]
+mod return_health_tests;

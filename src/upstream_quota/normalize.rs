@@ -224,6 +224,7 @@ mod tests {
 
     fn snapshot() -> QuotaSnapshot {
         QuotaSnapshot {
+            routing_availability: None,
             contract_version: "upstream_quota_v1",
             upstream_account_id: Uuid::nil(),
             tenant_external_id: "test".into(),
@@ -256,6 +257,7 @@ mod tests {
             attempts: Vec::new(),
             cache_hit: false,
             verification_observation: None,
+            read_started_at: None,
         }
     }
 

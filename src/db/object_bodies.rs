@@ -6,10 +6,45 @@ impl Database {
     pub(crate) async fn resolve_raw_archive_roots(
         &self,
         tenant_id: Uuid,
-        mut refs: crate::model::RequestArchiveRefs,
+        refs: crate::model::RequestArchiveRefs,
     ) -> Result<crate::model::RequestArchiveRefs, AppError> {
         let archive = self.body_archive()?;
         let request_id = refs.view.request_id;
+        // This detail/history read is already tenant-authorized. Complete SQL
+        // metadata acquisition before any object-store operation; inference
+        // admission does not depend on semantic archival.
+        let leaf: Option<String> = sqlx::query_scalar("SELECT o.leaf_node_hash FROM conversation_observations o JOIN conversation_clusters c ON c.id=o.cluster_id WHERE c.tenant_id=$1 AND o.request_id=$2")
+            .bind(tenant_id.to_string()).bind(request_id.to_string()).fetch_optional(&self.pool).await?.flatten();
+        let authority = match leaf {
+            Some(leaf) => {
+                archive
+                    .semantic_archive_authority(tenant_id, request_id, &leaf)
+                    .await?
+            }
+            None => None,
+        };
+        self.resolve_raw_archive_roots_with_semantic_authority(tenant_id, refs, authority)
+            .await
+    }
+
+    /// Frozen history snapshots pass their own exact authority. None is
+    /// explicit pending and never triggers a new live-observation SQL lookup.
+    pub(crate) async fn resolve_raw_archive_roots_with_semantic_authority(
+        &self,
+        tenant_id: Uuid,
+        mut refs: crate::model::RequestArchiveRefs,
+        authority: Option<crate::archive::SemanticArchiveAuthority>,
+    ) -> Result<crate::model::RequestArchiveRefs, AppError> {
+        let archive = self.body_archive()?;
+        let request_id = refs.view.request_id;
+        if authority.as_ref().is_some_and(|authority| {
+            authority.publication.tenant_id != tenant_id
+                || authority.publication.request_id != request_id
+        }) {
+            return Err(AppError::storage("semantic_publication_identity_mismatch"));
+        }
+        refs.semantic_archive = authority;
+
         if refs.view.status_code.is_some_and(|status| status >= 400)
             && let Some(summary) = archive.supplier_summary(tenant_id, request_id).await?
         {
@@ -33,19 +68,67 @@ impl Database {
                     crate::model::RequestArchiveState::Bound,
                     None,
                 )
+            } else if archive
+                .raw_capture_is_retired(tenant_id, request_id, side)
+                .await?
+            {
+                if !refs.semantic_archive.as_ref().is_some_and(|authority| {
+                    authority.coverage.projection_state
+                        == crate::archive::SemanticProjectionState::Complete
+                        && authority.coverage.observed_terminal
+                        && authority.coverage.gaps.is_empty()
+                }) {
+                    return Err(AppError::storage("raw_retired_semantic_authority_missing"));
+                }
+                // Preserve the old URI as audit provenance while history
+                // consumers switch to the typed permanent authority. It does
+                // not mean raw bytes remain a permanent archive requirement.
+                let provenance = if side == "request" {
+                    refs.request_object.clone()
+                } else {
+                    refs.response_object.clone().unwrap_or_default()
+                };
+                (
+                    provenance,
+                    crate::model::RequestArchiveState::MetadataOnly,
+                    Some("raw_retired_semantic_archive".into()),
+                )
             } else {
                 let failed = archive
                     .raw_capture_failed(tenant_id, request_id, side)
                     .await?;
-                (
-                    format!("gap://{request_id}/{side}"),
-                    if failed {
-                        crate::model::RequestArchiveState::Gap
-                    } else {
-                        crate::model::RequestArchiveState::Pending
-                    },
-                    failed.then(|| "capture_failed".to_owned()),
-                )
+                let (legacy_locator, legacy_state, legacy_reason) = if side == "request" {
+                    (
+                        Some(refs.request_object.as_str()),
+                        refs.request_archive_state,
+                        refs.request_archive_reason.as_ref(),
+                    )
+                } else {
+                    (
+                        refs.response_object.as_deref(),
+                        refs.response_archive_state,
+                        refs.response_archive_reason.as_ref(),
+                    )
+                };
+                if !failed && legacy_bound_object(legacy_state, legacy_locator) {
+                    // Pre-root captures retain their existing source ownership until
+                    // semantic migration completes. Reading still verifies the object.
+                    (
+                        legacy_locator.unwrap().to_owned(),
+                        legacy_state,
+                        legacy_reason.cloned(),
+                    )
+                } else {
+                    (
+                        format!("gap://{request_id}/{side}"),
+                        if failed {
+                            crate::model::RequestArchiveState::Gap
+                        } else {
+                            crate::model::RequestArchiveState::Pending
+                        },
+                        failed.then(|| "capture_failed".to_owned()),
+                    )
+                }
             };
             if side == "request" {
                 refs.request_object = locator;
@@ -80,6 +163,36 @@ impl Database {
         side: &str,
         object: &crate::archive::CasArchiveObject,
     ) -> Result<bool, AppError> {
+        self.bind_raw_capture_with_projection_owner(tenant_id, request_id, side, object, None)
+            .await
+    }
+
+    pub(crate) async fn bind_raw_capture_for_projection(
+        &self,
+        tenant_id: Uuid,
+        request_id: Uuid,
+        side: &str,
+        object: &crate::archive::CasArchiveObject,
+        owner: Uuid,
+    ) -> Result<bool, AppError> {
+        self.bind_raw_capture_with_projection_owner(
+            tenant_id,
+            request_id,
+            side,
+            object,
+            Some(owner),
+        )
+        .await
+    }
+
+    async fn bind_raw_capture_with_projection_owner(
+        &self,
+        tenant_id: Uuid,
+        request_id: Uuid,
+        side: &str,
+        object: &crate::archive::CasArchiveObject,
+        owner: Option<Uuid>,
+    ) -> Result<bool, AppError> {
         let archive = self.body_archive()?;
         let effective = match archive
             .verified_published_raw_capture(tenant_id, request_id, side, object)
@@ -101,6 +214,15 @@ impl Database {
             _ => return Err(AppError::BadRequest("invalid raw archive side".into())),
         };
         let mut transaction = self.begin_write_transaction().await?;
+        if let Some(owner) = owner {
+            let now = unix_millis();
+            let fenced = sqlx::query("UPDATE conversation_projection_outbox SET attempts=attempts WHERE request_id=$1 AND tenant_id=$2 AND projected_at IS NULL AND COALESCE(terminal_lease_owner,lease_owner)=$3 AND COALESCE(terminal_lease_expires_at,lease_expires_at)>$4")
+                .bind(request_id.to_string()).bind(tenant_id.to_string()).bind(owner.to_string()).bind(now)
+                .execute(&mut *transaction).await?;
+            if fenced.rows_affected() != 1 {
+                return Ok(false);
+            }
+        }
         let changed = sqlx::query(statement)
             .bind(&effective.object_locator)
             .bind(request_id.to_string())
@@ -422,4 +544,23 @@ mod tests {
         );
         assert_eq!(text_slice("甲乙丙丁", 1, 2).unwrap(), ("乙丙".into(), 4));
     }
+}
+
+// CAS and raw-v1 references require their durable publication roots. Only old
+// object paths may use the source locator already authorized by this read.
+fn legacy_bound_object(state: crate::model::RequestArchiveState, locator: Option<&str>) -> bool {
+    state == crate::model::RequestArchiveState::Bound
+        && locator.is_some_and(|path| {
+            !path.is_empty()
+                && !path.starts_with("tenants/")
+                && !path.starts_with("objects/blake3/")
+                && !path.starts_with("stores/training/")
+                && !path.starts_with("stores/staging/")
+                && path.bytes().all(|byte| {
+                    byte.is_ascii_alphanumeric() || matches!(byte, b'/' | b'.' | b'_' | b'-')
+                })
+                && !path
+                    .split('/')
+                    .any(|segment| segment.is_empty() || segment == "." || segment == "..")
+        })
 }

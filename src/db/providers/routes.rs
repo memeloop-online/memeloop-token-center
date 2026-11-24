@@ -70,7 +70,7 @@ impl Database {
         )
         .bind(tenant_external_id.unwrap_or_default())
         .bind(pattern)
-        .bind(limit.clamp(1, 100))
+        .bind(limit)
         .fetch_all(&self.pool)
         .await?;
         Ok(names)
@@ -108,7 +108,7 @@ impl Database {
         .bind(tenant_external_id.unwrap_or_default())
         .bind(before_created_at)
         .bind(before_id)
-        .bind(limit.clamp(1, 100))
+        .bind(limit)
         .fetch_all(&self.pool)
         .await?;
         rows.into_iter().map(model_route_view).collect()

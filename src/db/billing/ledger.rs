@@ -128,7 +128,7 @@ impl Database {
         .bind(account_id.to_string())
         .bind(before_created_at)
         .bind(before_id)
-        .bind(limit.clamp(1, 500))
+        .bind(limit)
         .fetch_all(&self.pool)
         .await?;
         rows.into_iter()

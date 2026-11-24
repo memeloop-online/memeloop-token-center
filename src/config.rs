@@ -449,9 +449,10 @@ impl Config {
                 "MTC_DATABASE_URL",
                 "postgres://postgres:postgres@127.0.0.1:5432/memeloop_token_center",
             ),
-            database_max_connections: env_u32("MTC_DATABASE_MAX_CONNECTIONS", 4)?.clamp(1, 32),
-            database_aux_pool_max_connections: env_u32("MTC_DATABASE_AUX_POOL_MAX_CONNECTIONS", 2)?
-                .clamp(1, 2),
+            // 不再对连接数做上限夹取：容量应由部署规模决定，而不是代码常量。
+            // 只保留下限 1，因为 0 会让 sqlx 连接池无法工作。
+            database_max_connections: env_u32("MTC_DATABASE_MAX_CONNECTIONS", 4)?,
+            database_aux_pool_max_connections: env_u32("MTC_DATABASE_AUX_POOL_MAX_CONNECTIONS", 2)?,
             terminal_projection_enabled: env_bool(
                 "MTC_TERMINAL_PROJECTION_ENABLED",
                 DEFAULT_TERMINAL_PROJECTION_ENABLED,
@@ -484,15 +485,12 @@ impl Config {
             quota_observation_interval_millis: env_u32(
                 "MTC_QUOTA_OBSERVATION_INTERVAL_MILLIS",
                 10_000,
-            )?
-            .clamp(1_000, 60_000),
-            quota_observation_batch_limit: env_u32("MTC_QUOTA_OBSERVATION_BATCH_LIMIT", 4)?
-                .clamp(1, 16),
+            )?,
+            quota_observation_batch_limit: env_u32("MTC_QUOTA_OBSERVATION_BATCH_LIMIT", 4)?,
             quota_observation_timeout_millis: env_u32(
                 "MTC_QUOTA_OBSERVATION_TIMEOUT_MILLIS",
                 10_000,
-            )?
-            .clamp(1_000, 30_000),
+            )?,
             run_migrations_on_start: env_bool("MTC_RUN_MIGRATIONS_ON_START", true),
             key_pepper,
             service_token,
@@ -757,11 +755,11 @@ fn health_millis(name: &'static str, default: i64) -> Result<i64, ConfigError> {
 }
 
 fn gateway_body_read_concurrency(value: u32) -> u32 {
-    value.clamp(1, MAX_GATEWAY_BODY_READ_CONCURRENCY)
+    value
 }
 
 fn responses_body_max_bytes(value: u32) -> u32 {
-    value.clamp(MIN_RESPONSES_BODY_MAX_BYTES, MAX_RESPONSES_BODY_MAX_BYTES)
+    value
 }
 
 fn default_responses_request_spool_path() -> String {
@@ -773,7 +771,7 @@ const fn default_audio_body_max_bytes() -> u32 {
 }
 
 fn responses_body_read_concurrency(value: u32) -> u32 {
-    value.clamp(1, MAX_RESPONSES_BODY_READ_CONCURRENCY)
+    value
 }
 
 #[derive(Debug, thiserror::Error)]

@@ -164,3 +164,71 @@ test('legacy SSE without terminal cause preserves the recorded typed cause', () 
   };
   assert.equal(requestViewFromEvent(terminal, recorded)?.terminal_cause_code, 'upstream_eof_without_terminal');
 });
+
+test('live-only rows receive the same recorded exit as REST and retain newer observations', () => {
+  const egress: NonNullable<RequestView['egress']> = {
+    selected: { kind: 'direct', group_id: null, group_version: null, group_name: null,
+      member_id: null, member_name: null, scheme: null, host: null, port: null },
+    observed_at: 800,
+  };
+  const live = requestViewFromEvent({ ...event, created_at: 100, egress });
+  assert.deepEqual(live?.egress, egress);
+  assert.deepEqual(requestViewFromEvent({ ...event, created_at: 100 }, live)?.egress, egress);
+  assert.deepEqual(requestViewFromEvent({ ...event, egress: { ...egress, observed_at: 700 } }, live)?.egress, egress);
+  const terminal = { ...recorded, operational_terminal: { completed_at: 800, stage: null, financial_state: 'pending' as const } };
+  assert.deepEqual(requestViewFromEvent({ ...event, egress }, terminal)?.egress, egress);
+});
+
+test('authoritative receipt permits settlement and prevents applied receipt regression', () => {
+  const pending: RequestView = { ...recorded, completed_at: null, cost: null,
+    operational_terminal: { completed_at: 800, stage: null, financial_state: 'pending' } };
+  const settled: RequestEvent = { ...event, completed_at: 1000,
+    operational_terminal: { completed_at: 800, stage: null, financial_state: 'applied' },
+    input_tokens: 124319, output_tokens: 156, cost: '2' };
+  const live = requestViewFromEvent(settled, pending)!;
+  assert.equal(live.input_tokens, 124319);
+  assert.equal(live.cost, '2');
+  assert.equal(live.operational_terminal?.financial_state, 'applied');
+  const delayed = { ...event, status_code: null, cost: null, operational_terminal: pending.operational_terminal };
+  assert.deepEqual(requestViewFromEvent(delayed, live), live);
+  assert.deepEqual(requestViewFromEvent(event, live), live);
+  assert.deepEqual(mergeRefreshedRequestPage([live], { requests: [pending], next_cursor: null }), [live]);
+});
+
+test('partial deltas preserve absent values while authoritative null remains explicit', () => {
+  const partial = { ...event, status_code: undefined, duration_ms: undefined, cost: undefined } as unknown as RequestEvent;
+  assert.deepEqual(requestViewFromEvent(partial, recorded), recorded);
+  const active = { ...recorded, status_code: null, cost: null };
+  const authoritative = { ...event, duration_ms: null,
+    operational_terminal: { completed_at: 800, stage: null, financial_state: 'pending' as const } };
+  assert.equal(requestViewFromEvent(authoritative, active)?.duration_ms, null);
+});
+
+test('authoritative explicit null clears optional observations while absent fields retain them', () => {
+  const previous: RequestView = { ...recorded, first_output_ms: 5, generation_duration_ms: 20,
+    supplier_error: { code: 'old', message: 'old' }, failure_diagnostic: { source: 'old', reason: 'old' } };
+  const optional = ['completed_at', 'upstream_account_id', 'route_id', 'currency', 'cached_input_tokens',
+    'cache_write_tokens', 'terminal_cause_code', 'first_output_ms', 'generation_duration_ms',
+    'supplier_error', 'failure_diagnostic', 'credential_identity'] as const;
+  const authoritative = { ...event, operational_terminal: { completed_at: 800, stage: null, financial_state: 'pending' as const } };
+  const missing = requestViewFromEvent(authoritative, previous)!;
+  for (const field of optional) assert.deepEqual(missing[field], previous[field], field);
+  const cleared = requestViewFromEvent({ ...authoritative, ...Object.fromEntries(optional.map(field => [field, null])) }, previous)!;
+  for (const field of optional) assert.equal(cleared[field], null, field);
+});
+
+test('old settlement receipt protects financial fields while new archive observations update across REST and SSE', () => {
+  const applied: RequestView = { ...recorded, archive_state: 'pending',
+    operational_terminal: { completed_at: 800, stage: null, financial_state: 'applied' } };
+  const oldReceipt = { ...event, archive_state: 'bound' as const, cost: null,
+    credential_identity: { ...recorded.credential_identity!, key_alias: 'Updated key' },
+    operational_terminal: { completed_at: 800, stage: null, financial_state: 'pending' as const } };
+  const refreshed = mergeRefreshedRequestPage([applied], { requests: [{ ...applied, ...oldReceipt, created_at: applied.created_at }], next_cursor: null })[0];
+  const streamed = requestViewFromEvent(oldReceipt, applied)!;
+  for (const row of [refreshed, streamed]) {
+    assert.equal(row.cost, applied.cost);
+    assert.equal(row.operational_terminal?.financial_state, 'applied');
+    assert.equal(row.archive_state, 'bound');
+    assert.equal(row.credential_identity?.key_alias, 'Updated key');
+  }
+});

@@ -5,7 +5,7 @@ use uuid::Uuid;
 use super::{AppError, Database};
 
 mod supplier;
-pub(crate) use supplier::SupplierQuotaEvidence;
+pub(crate) use supplier::{SupplierQuotaEvidence, SupplierQuotaScope};
 #[cfg(test)]
 mod tests;
 
