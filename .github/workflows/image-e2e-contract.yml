@@ -1,6 +1,10 @@
 name: image-e2e-contract
 on:
   workflow_dispatch:
+  pull_request:
+    paths:
+      - .github/workflows/image-e2e-contract.yml
+      - tests/ops/image-e2e/**
 permissions:
   contents: read
 jobs:
