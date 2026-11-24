@@ -16,14 +16,22 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use uuid::Uuid;
 
+mod content;
+mod media;
+mod parts;
+mod reader;
+
 #[derive(Deserialize)]
 pub(super) struct SemanticViewQuery {
     tenant_external_id: Option<String>,
     key_id: Option<Uuid>,
     cursor: Option<String>,
     atom_cursor: Option<String>,
+    parts_cursor: Option<String>,
+    content_cursor: Option<String>,
+    media_cursor: Option<String>,
 }
-#[derive(Serialize, Deserialize)]
+#[derive(Clone, Serialize, Deserialize)]
 struct Continuation {
     tenant_id: Uuid,
     key_id: Uuid,
@@ -32,6 +40,8 @@ struct Continuation {
     revision: u64,
     page: Option<CasArchiveObject>,
     instance_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    reader: Option<reader::Position>,
 }
 const DOMAIN: &str = "mtc-semantic-view-v2:";
 fn invalid() -> AppError {
@@ -105,9 +115,28 @@ async fn page(
     scope: SessionContextScope,
     query: SemanticViewQuery,
 ) -> Result<Response, AppError> {
+    if [
+        query.cursor.as_ref(),
+        query.atom_cursor.as_ref(),
+        query.parts_cursor.as_ref(),
+        query.content_cursor.as_ref(),
+        query.media_cursor.as_ref(),
+    ]
+    .into_iter()
+    .flatten()
+    .count()
+        > 1
+    {
+        return Err(invalid());
+    }
     let revision = state.db.published_semantic_revision(&scope).await?;
     let Some(revision) = revision else {
-        if query.cursor.is_some() || query.atom_cursor.is_some() {
+        if query.cursor.is_some()
+            || query.atom_cursor.is_some()
+            || query.parts_cursor.is_some()
+            || query.content_cursor.is_some()
+            || query.media_cursor.is_some()
+        {
             return Err(AppError::Conflict(
                 "semantic publication is no longer bound; refresh this view".into(),
             ));
@@ -126,12 +155,21 @@ async fn page(
     if query.cursor.is_some() && query.atom_cursor.is_some() {
         return Err(invalid());
     }
+    if query.parts_cursor.is_some()
+        || query.content_cursor.is_some()
+        || query.media_cursor.is_some()
+    {
+        return reader::dispatch(state, &scope, revision, &query).await;
+    }
     if let Some(token) = query.atom_cursor.as_deref() {
         let position = decode(token, &scope, state.config.key_pepper.as_bytes())?;
         if position.revision != revision {
             return Err(AppError::Conflict(
                 "semantic manifest revision changed; refresh this view".into(),
             ));
+        }
+        if position.reader.is_some() {
+            return Err(invalid());
         }
         let instance = position.instance_id.as_deref().ok_or_else(invalid)?;
         let download = state
@@ -158,10 +196,9 @@ async fn page(
         .as_deref()
         .map(|value| decode(value, &scope, state.config.key_pepper.as_bytes()))
         .transpose()?;
-    if continuation
-        .as_ref()
-        .is_some_and(|value| value.revision != revision || value.instance_id.is_some())
-    {
+    if continuation.as_ref().is_some_and(|value| {
+        value.revision != revision || value.instance_id.is_some() || value.reader.is_some()
+    }) {
         return Err(AppError::Conflict(
             "semantic manifest revision changed; refresh this view".into(),
         ));
@@ -188,6 +225,7 @@ async fn page(
                     revision,
                     page: Some(previous.clone()),
                     instance_id: None,
+                    reader: None,
                 },
                 state.config.key_pepper.as_bytes(),
             )
@@ -206,6 +244,7 @@ async fn page(
                     revision,
                     page: continuation.as_ref().and_then(|value| value.page.clone()),
                     instance_id: Some(instance.instance_id.clone()),
+                    reader: None,
                 },
                 state.config.key_pepper.as_bytes(),
             )
@@ -299,6 +338,7 @@ mod tests {
             revision: 7,
             page: None,
             instance_id: Some("occurrence-1".into()),
+            reader: None,
         };
         let token = encode(&value, b"test-pepper").unwrap();
         assert_eq!(
@@ -314,3 +354,58 @@ mod tests {
         assert!(decode(&forged, &original, b"test-pepper").is_err());
     }
 }
+
+#[cfg(test)]
+mod reader_cursor_tests {
+    use super::*;
+    fn scope() -> SessionContextScope {
+        SessionContextScope {
+            tenant_id: Uuid::now_v7(),
+            key_id: Uuid::now_v7(),
+            session_id: Uuid::now_v7(),
+            request_id: Uuid::now_v7(),
+            leaf: None,
+        }
+    }
+    #[test]
+    fn typed_cursor_preserves_occurrence_field_offset_and_scope() {
+        let scope = scope();
+        let mut position = Continuation {
+            tenant_id: scope.tenant_id,
+            key_id: scope.key_id,
+            session_id: scope.session_id,
+            request_id: scope.request_id,
+            revision: 9,
+            page: None,
+            instance_id: Some("occurrence-a".into()),
+            reader: Some(reader::Position::Content {
+                ordinal: 2,
+                part_index: 7,
+                field: "arguments".into(),
+                format: "json".into(),
+                offset: 65535,
+            }),
+        };
+        let a = encode(&position, b"test").unwrap();
+        position.instance_id = Some("occurrence-b".into());
+        let b = encode(&position, b"test").unwrap();
+        assert_ne!(a, b);
+        let decoded = decode(&a, &scope, b"test").unwrap();
+        assert_eq!(decoded.instance_id.as_deref(), Some("occurrence-a"));
+        assert!(matches!(
+            decoded.reader,
+            Some(reader::Position::Content {
+                ordinal: 2,
+                part_index: 7,
+                offset: 65535,
+                ..
+            })
+        ));
+        let mut other_scope = scope.clone();
+        other_scope.key_id = Uuid::now_v7();
+        assert!(decode(&a, &other_scope, b"test").is_err());
+    }
+}
+
+#[cfg(test)]
+mod http_contract;

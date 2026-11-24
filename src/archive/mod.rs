@@ -53,6 +53,7 @@ pub(crate) mod scratch_scope;
 mod semantic_manifest;
 mod semantic_publication;
 mod semantic_view;
+pub(crate) mod semantic_reader;
 pub(crate) use semantic_publication::SemanticBindingProof;
 pub use semantic_publication::{SemanticArchiveAuthority, SemanticPublication};
 mod session_projection;
