@@ -120,7 +120,7 @@ async fn shared_capture_reaches_eof_while_all_upload_slots_are_held() {
         .unwrap()
     );
     let sealed = producer.seal().unwrap();
-    assert!(state.proxy_memory_budget.snapshot().0 > baseline);
+    assert!(state.persistence.stream_memory.snapshot().0 > 0);
     assert!(
         state
             .archive
@@ -1346,7 +1346,7 @@ async fn cancelled_unsealed_carrier_releases_owned_capture_without_acknowledging
         result = entering => result.unwrap(),
         _ = &mut append => panic!("capture receipt must remain paused after owning the chunk"),
     }
-    assert!(state.proxy_memory_budget.snapshot().0 > baseline);
+    assert!(state.persistence.stream_memory.snapshot().0 > 0);
     drop(append);
     drop(producer);
     release_writer.send(()).unwrap();

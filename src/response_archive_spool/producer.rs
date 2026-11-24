@@ -504,7 +504,6 @@ struct CaptureChunk {
 }
 
 struct CaptureReceipt {
-    _credit: Option<tokio::sync::OwnedSemaphorePermit>,
     acknowledged: tokio::sync::oneshot::Sender<()>,
     #[cfg(test)]
     pause: Option<(
@@ -557,7 +556,9 @@ impl CarrierCaptureInput {
 
 fn carrier_capture_stream(
     receiver: tokio::sync::mpsc::UnboundedReceiver<CaptureChunk>,
-) -> impl futures_util::Stream<Item = Result<Bytes, AppError>> + Send {
+) -> impl futures_util::Stream<
+    Item = Result<(Bytes, Option<tokio::sync::OwnedSemaphorePermit>), AppError>,
+> + Send {
     futures_util::stream::unfold(
         (receiver, None::<CaptureReceipt>),
         |(mut receiver, previous)| async move {
@@ -571,11 +572,10 @@ fn carrier_capture_stream(
             }
             let chunk = receiver.recv().await?;
             Some((
-                Ok(chunk.bytes),
+                Ok((chunk.bytes, chunk.credit)),
                 (
                     receiver,
                     Some(CaptureReceipt {
-                        _credit: chunk.credit,
                         acknowledged: chunk.acknowledged,
                         #[cfg(test)]
                         pause: chunk.pause,
@@ -806,12 +806,16 @@ impl ResponseArchiveProducer {
                     )?,
                 )?;
                 let capture = crate::gateway_body::carrier::CarrierCapture::new(
-                    capture_state.proxy_memory_budget.clone(),
+                    capture_state
+                        .persistence
+                        .stream_memory
+                        .reservation()
+                        .shared_budget(),
                     Some(capture_state.archive.clone()),
                     key,
                 );
                 tokio::select! {
-                    result = crate::gateway_body::carrier::BodyCarrier::capture(carrier_capture_stream(source_receiver), capture) => result.map(|source| CapturedResponse { source, staging: key }),
+                    result = crate::gateway_body::carrier::BodyCarrier::capture_owned(carrier_capture_stream(source_receiver), capture) => result.map(|source| CapturedResponse { source, staging: key }),
                     () = capture_abandoned(capture_progress, capture_active) => Err(AppError::internal("response_capture_cancelled")),
                 }
             },
