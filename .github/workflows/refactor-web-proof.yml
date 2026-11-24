@@ -1,0 +1,76 @@
+name: MTC browser and OpenAPI evidence
+on:
+  push:
+    branches: [ci/mtc-refactor-proof-1041]
+    paths: [.github/workflows/refactor-web-proof.yml]
+permissions:
+  contents: read
+jobs:
+  web-contracts:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 35
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+        with:
+          ref: 99674582abf039bb63cfcc975584d6b6b39c9f0d
+          persist-credentials: false
+      - name: Verify exact product revision
+        run: test "$(git rev-parse HEAD)" = "99674582abf039bb63cfcc975584d6b6b39c9f0d"
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020
+        with:
+          node-version: 24.18.0
+          cache: npm
+          cache-dependency-path: |
+            package-lock.json
+            web/package-lock.json
+      - name: Install locked root dependencies
+        id: root_dependencies
+        run: npm ci --ignore-scripts --no-audit
+      - name: Run OpenAPI contract fixture tests
+        if: ${{ !cancelled() && steps.root_dependencies.outcome == 'success' }}
+        run: node --test tests/ops/test-openapi-contract.ts
+      - name: Install locked web dependencies
+        id: web_dependencies
+        if: ${{ !cancelled() }}
+        working-directory: web
+        run: npm ci --ignore-scripts --no-audit
+      - name: Typecheck web and browser fixtures
+        if: ${{ !cancelled() && steps.web_dependencies.outcome == 'success' }}
+        working-directory: web
+        run: npm run typecheck
+      - name: Install pinned Playwright Chromium
+        id: chromium
+        if: ${{ !cancelled() && steps.web_dependencies.outcome == 'success' }}
+        working-directory: web
+        timeout-minutes: 15
+        run: ./node_modules/.bin/playwright install --with-deps chromium
+      - name: Run loading, replay and clipboard contracts in Chromium
+        if: ${{ !cancelled() && steps.chromium.outcome == 'success' }}
+        working-directory: web
+        env:
+          MTC_REQUIRE_BROWSER: "1"
+        run: |
+          set -o pipefail
+          node --import tsx --test --test-reporter=spec --test-concurrency=1 \
+            e2e/session-loading-browser-contract.test.ts \
+            e2e/session-replay-browser-contract.test.ts \
+            e2e/request-diagnostics-browser-contract.test.ts \
+            e2e/credential-create-principal-browser-contract.test.ts \
+            e2e/service-credential-copy-browser-contract.test.ts \
+            e2e/operator-degraded-access-browser-contract.test.ts \
+            e2e/operator-overview-browser-contract.test.ts \
+            e2e/shared-request-metrics-browser-contract.test.ts 2>&1 | tee "$RUNNER_TEMP/web-contracts.log"
+          if grep -Eq '^[[:space:]]*[⁻ℹ]*[[:space:]]*skipped [1-9]' "$RUNNER_TEMP/web-contracts.log"; then
+            echo "::error::A browser contract was skipped"
+            exit 1
+          fi
+      - name: Retain browser evidence and test log
+        if: always()
+        uses: actions/upload-artifact@65462800fd760344b1a7b4382951275a0abb4808
+        with:
+          name: test-refactor-browser
+          path: |
+            ${{ runner.temp }}/web-contracts.log
+            web/e2e-artifacts/
+          if-no-files-found: warn
+          retention-days: 14
