@@ -516,8 +516,6 @@ impl Database {
         identity: ArchiveSpoolIdentity,
     ) -> Result<(), AppError> {
         let mut transaction = self.begin_write_transaction().await?;
-        publish_pending_started_in_transaction(&mut transaction, &identity.request_id.to_string())
-            .await?;
         // Source completion may follow the financial terminal. Lock an open
         // owner before allocating the started event and its global locator.
         let row = sqlx::query("UPDATE request_records SET completed_at = completed_at WHERE id = $1 AND tenant_id = $2 AND reservation_id = $3 AND completed_at IS NULL RETURNING *")
@@ -528,10 +526,13 @@ impl Database {
         let Some(row) = row else {
             return Ok(());
         };
+        publish_pending_started_in_transaction(&mut transaction, &identity.request_id.to_string())
+            .await?;
         let published: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM request_events WHERE request_id = $1 AND tenant_id = $2 AND event_kind = 'started'")
             .bind(identity.request_id.to_string()).bind(identity.tenant_id.to_string())
             .fetch_one(&mut *transaction).await?;
         if published != 0 {
+            transaction.commit().await?;
             return Ok(());
         }
         let started = NewRequest {

@@ -256,3 +256,71 @@ async fn lifecycle_events_contract(fixture: Fixture) {
     drop(archive_gate);
     fixture.close().await;
 }
+
+#[tokio::test]
+async fn sqlite_pending_started_rolls_back_and_precedes_fast_terminal() {
+    pending_fast_terminal_contract(Fixture::sqlite().await).await;
+}
+
+#[tokio::test]
+async fn postgres_pending_started_rolls_back_and_precedes_fast_terminal() {
+    if let Some(fixture) = Fixture::postgres().await {
+        pending_fast_terminal_contract(fixture).await;
+    }
+}
+
+async fn pending_fast_terminal_contract(fixture: Fixture) {
+    let id = fixture.claim.request_id.to_string();
+    // Recreate the committed deferred-admission state on the fixture's owned
+    // request, retaining its real reservation and operational fencing identity.
+    let mut tx = fixture.database.begin_write_transaction().await.unwrap();
+    sqlx::query("DELETE FROM request_events WHERE request_id = $1")
+        .bind(&id)
+        .execute(&mut *tx)
+        .await
+        .unwrap();
+    sqlx::query("UPDATE request_records SET started_event_pending = 1 WHERE id = $1")
+        .bind(&id)
+        .execute(&mut *tx)
+        .await
+        .unwrap();
+    tx.commit().await.unwrap();
+    let mut interrupted = fixture.database.begin_write_transaction().await.unwrap();
+    crate::db::requests::lifecycle::publish_pending_started_in_transaction(&mut interrupted, &id)
+        .await
+        .unwrap();
+    interrupted.rollback().await.unwrap();
+    let pending: i64 =
+        sqlx::query_scalar("SELECT started_event_pending FROM request_records WHERE id = $1")
+            .bind(&id)
+            .fetch_one(&fixture.database.pool)
+            .await
+            .unwrap();
+    assert_eq!(
+        pending, 1,
+        "uncommitted publication retains its recovery obligation"
+    );
+    let receipt = Uuid::now_v7();
+    let terminal = fixture.operational(200);
+    fixture.record(receipt, &terminal).await.unwrap();
+    fixture.record(receipt, &terminal).await.unwrap();
+    fixture
+        .database
+        .publish_pending_proxy_started_events()
+        .await
+        .unwrap();
+    let rows = sqlx::query(
+        "SELECT event_kind FROM request_events WHERE request_id = $1 ORDER BY event_at, event_id",
+    )
+    .bind(&id)
+    .fetch_all(&fixture.database.pool)
+    .await
+    .unwrap();
+    let kinds: Vec<String> = rows
+        .iter()
+        .map(|row| row.try_get("event_kind").unwrap())
+        .collect();
+    assert_eq!(kinds, ["started", "finished"]);
+    fixture.assert_unsettled().await;
+    fixture.close().await;
+}
