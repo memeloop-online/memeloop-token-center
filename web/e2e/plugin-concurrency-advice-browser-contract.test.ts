@@ -1,8 +1,8 @@
 import assert from 'node:assert/strict';
-import { existsSync } from 'node:fs';
 import { fileURLToPath } from 'node:url';
 import test from 'node:test';
 import { chromium } from 'playwright';
+import { hasDefaultChromium } from './support/browser-executable.js';
 import { createServer } from 'vite';
 
 const endpoint = '/internal/v1/plugins/mtc-health-intelligence/private-data/concurrency-advice';
@@ -15,11 +15,8 @@ function ready(tenant = 'tenant-a', stale = false, series: unknown[] = [{
     tenant_external_id: tenant, stale, series } };
 }
 
-test('private observations hide absent data and preserve scoped ready, stale and retry flows', { timeout: 90_000 }, async () => {
-  if (!existsSync(chromium.executablePath())) {
-    if (process.env.MTC_REQUIRE_BROWSER === '1') throw new Error('Chromium required');
-    return test.skip('Chromium required');
-  }
+test('private observations hide absent data and preserve scoped ready, stale and retry flows', { timeout: 90_000 }, async (context) => {
+  if (!hasDefaultChromium(context)) return;
   const server = await createServer({ root: fileURLToPath(new URL('..', import.meta.url)), configFile: false,
     logLevel: 'silent', server: { host: '127.0.0.1', port: 0 } });
   await server.listen();

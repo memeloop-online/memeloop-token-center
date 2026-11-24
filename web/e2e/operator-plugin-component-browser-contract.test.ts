@@ -1,15 +1,12 @@
 import assert from 'node:assert/strict';
-import { existsSync } from 'node:fs';
 import { fileURLToPath } from 'node:url';
 import test from 'node:test';
 import { chromium } from 'playwright';
+import { hasDefaultChromium } from './support/browser-executable.js';
 import { createServer } from 'vite';
 
-test('plugin charts load on demand, resize on narrow screens and unmount cleanly', { timeout: 60_000 }, async () => {
-  if (!existsSync(chromium.executablePath())) {
-    if (process.env.MTC_REQUIRE_BROWSER === '1') throw new Error('Chromium is required');
-    return test.skip('Chromium is required');
-  }
+test('plugin charts load on demand, resize on narrow screens and unmount cleanly', { timeout: 60_000 }, async (context) => {
+  if (!hasDefaultChromium(context)) return;
   const server = await createServer({ root: fileURLToPath(new URL('..', import.meta.url)), configFile: false, logLevel: 'silent', server: { host: '127.0.0.1', port: 0 } });
   await server.listen();
   const address = server.httpServer?.address();
@@ -67,11 +64,8 @@ test('plugin charts load on demand, resize on narrow screens and unmount cleanly
   } finally { await browser.close(); await server.close(); }
 });
 
-test('an installed runtime module renders without rebuilding MTC and failures stay local', { timeout: 60_000 }, async () => {
-  if (!existsSync(chromium.executablePath())) {
-    if (process.env.MTC_REQUIRE_BROWSER === '1') throw new Error('Chromium is required');
-    return test.skip('Chromium is required');
-  }
+test('an installed runtime module renders without rebuilding MTC and failures stay local', { timeout: 60_000 }, async (context) => {
+  if (!hasDefaultChromium(context)) return;
   const server = await createServer({ root: fileURLToPath(new URL('..', import.meta.url)), configFile: false, logLevel: 'silent', server: { host: '127.0.0.1', port: 0 } });
   await server.listen();
   const address = server.httpServer?.address();
@@ -136,11 +130,8 @@ test('an installed runtime module renders without rebuilding MTC and failures st
   } finally { await browser.close(); await server.close(); }
 });
 
-test('plugin activation shares the complete React DOM and JSX runtimes with host hooks and portals', { timeout: 60_000 }, async () => {
-  if (!existsSync(chromium.executablePath())) {
-    if (process.env.MTC_REQUIRE_BROWSER === '1') throw new Error('Chromium is required');
-    return test.skip('Chromium is required');
-  }
+test('plugin activation shares the complete React DOM and JSX runtimes with host hooks and portals', { timeout: 60_000 }, async (context) => {
+  if (!hasDefaultChromium(context)) return;
   const server = await createServer({ root: fileURLToPath(new URL('..', import.meta.url)), configFile: false, logLevel: 'silent', server: { host: '127.0.0.1', port: 0 } });
   await server.listen();
   const address = server.httpServer?.address();

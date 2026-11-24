@@ -510,6 +510,7 @@ test('account workspace returns without retained details, shares list tracks and
   const browser = await chromium.launch({ headless: true });
   const artifacts = `${root}/e2e-artifacts/ui-system/account-workspace`;
   await mkdir(artifacts, { recursive: true });
+  let releasePendingRoutes: (() => void) | undefined;
   try {
     for (const locale of ['zh-CN', 'en'] as const) {
       const chinese = locale === 'zh-CN';
@@ -528,6 +529,18 @@ test('account workspace returns without retained details, shares list tracks and
       let releaseSave: (() => void) | undefined;
       let readStarted: (() => void) | undefined;
       let saveStarted: (() => void) | undefined;
+      let holdStatistics: { started: () => void; response: Promise<void> } | undefined;
+      releasePendingRoutes = () => {
+        state = 'normal';
+        deferSave = false;
+        const read = releaseRead;
+        const save = releaseSave;
+        releaseRead = undefined;
+        releaseSave = undefined;
+        read?.();
+        save?.();
+      };
+      let statisticsReads = 0;
       let writes = 0;
       let deferSave = false;
       let failNextListRead = false;
@@ -560,8 +573,18 @@ test('account workspace returns without retained details, shares list tracks and
         ] });
         if (url.pathname.endsWith('/models')) return route.fulfill({ json: { account_id: url.pathname.split('/')[4], credential_generation: 1, status: 'ready', last_attempt_at: null, last_success_at: null, expires_at: null, error_code: null, models: [], disabled_models: [] } });
         if (url.pathname.endsWith('/access')) return route.fulfill({ json: { can_manage: false } });
-        if (url.pathname.includes('monitoring')) return route.fulfill({ json: { top_upstream_models: [] } });
-        if (url.pathname.includes('availability')) return route.fulfill({ json: { tenant_external_id: 'fixture-a', accounts: [] } });
+        if (url.pathname === '/internal/v1/monitoring-snapshot') {
+          statisticsReads++;
+          if (holdStatistics) {
+            holdStatistics.started();
+            await holdStatistics.response;
+          }
+          return route.fulfill({ json: { top_upstream_models: [] } });
+        }
+        if (url.pathname.includes('availability')) {
+          statisticsReads++;
+          return route.fulfill({ json: { tenant_external_id: 'fixture-a', accounts: [] } });
+        }
         return route.fulfill({ json: [] });
       });
       const fixture = `${origin}/e2e/fixtures/authorization-code.html?scope-controls`;
@@ -702,17 +725,36 @@ test('account workspace returns without retained details, shares list tracks and
         await page.getByRole('alert').getByText('Fixture account read denied', { exact: false }).waitFor();
         await page.screenshot({ path: `${artifacts}/denied-${locale}-${width}.png`, fullPage: true });
         state = 'slow';
-        const reading = new Promise<void>(resolve => { readStarted = resolve; });
-        await page.goto(fixture); await reading;
-        await page.getByText(chinese ? '载入中…' : 'Loading…', { exact: true }).waitFor();
-        assert.ok(releaseRead);
-        await page.screenshot({ path: `${artifacts}/slow-${locale}-${width}.png`, fullPage: true });
-        state = 'normal'; releaseRead(); releaseRead = undefined;
-        await rows.nth(2).waitFor();
+        const statisticsBeforeLoading = statisticsReads;
+        const statisticsStarted = Promise.withResolvers<void>();
+        const statisticsResponse = Promise.withResolvers<void>();
+        holdStatistics = { started: statisticsStarted.resolve, response: statisticsResponse.promise };
+        try {
+          const reading = new Promise<void>(resolve => { readStarted = resolve; });
+          await page.goto(fixture); await reading;
+          await page.getByText(chinese ? '载入中…' : 'Loading…', { exact: true }).waitFor();
+          assert.ok(releaseRead);
+          assert.equal(statisticsReads, statisticsBeforeLoading, 'statistics wait for the account directory');
+          assert.equal(await page.evaluate(() => document.body.outerHTML.includes('fixture-token')), false,
+            'the service credential stays out of the loading DOM');
+          await page.screenshot({ path: `${artifacts}/slow-${locale}-${width}.png`, fullPage: true });
+          releasePendingRoutes();
+          await statisticsStarted.promise;
+          await rows.nth(2).waitFor();
+        } finally {
+          releasePendingRoutes();
+          statisticsResponse.resolve();
+          holdStatistics = undefined;
+        }
         assert.equal(await details.count(), 0);
       }
       assert.deepEqual(errors, []);
       await page.close();
+      releasePendingRoutes = undefined;
     }
-  } finally { await browser.close(); await server.close(); }
+  } finally {
+    releasePendingRoutes?.();
+    await browser.close();
+    await server.close();
+  }
 });

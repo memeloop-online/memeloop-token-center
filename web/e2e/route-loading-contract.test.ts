@@ -1,11 +1,9 @@
 import assert from 'node:assert/strict';
-import { existsSync } from 'node:fs';
-import { readdir } from 'node:fs/promises';
-import { join } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import test from 'node:test';
 
 import { chromium } from 'playwright';
+import { localChromiumExecutable } from './support/browser-executable.js';
 import { createIsolatedFixtureServer as createServer } from './support/isolated-vite-server.js';
 
 const webRoot = fileURLToPath(new URL('..', import.meta.url));
@@ -14,24 +12,11 @@ declare global {
   interface Window { routeLoadingFixture: { calls: string[] } }
 }
 
-async function localChromiumExecutable() {
-  const defaultExecutable = chromium.executablePath();
-  if (existsSync(defaultExecutable)) return defaultExecutable;
-  const workspaceUserCache = fileURLToPath(new URL('../../../../.cache/ms-playwright', import.meta.url));
-  const installations = await readdir(workspaceUserCache, { withFileTypes: true }).catch(() => []);
-  for (const installation of installations) {
-    if (!installation.isDirectory() || !installation.name.startsWith('chromium-')) continue;
-    const executable = join(workspaceUserCache, installation.name, 'chrome-linux64', 'chrome');
-    if (existsSync(executable)) return executable;
-  }
-  return undefined;
-}
-
-test('route credentials stay off the list critical path and load inside an opened form', { timeout: 30_000 }, async () => {
+test('route credentials stay off the list critical path and load inside an opened form', { timeout: 30_000 }, async (context) => {
   const executablePath = await localChromiumExecutable();
   if (!executablePath) {
     if (process.env.MTC_REQUIRE_BROWSER === '1') throw new Error('Chromium is required for the route loading CI gate');
-    return test.skip('a local Chromium runtime is required for route loading behavior assertions');
+    return context.skip('a local Chromium runtime is required for route loading behavior assertions');
   }
   const server = await createServer({ root: webRoot, configFile: false, logLevel: 'silent', server: { host: '127.0.0.1', port: 0, strictPort: false } });
   await server.listen();

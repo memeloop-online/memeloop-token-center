@@ -774,39 +774,85 @@ async fn request_above_legacy_plain_limit_archives_the_raw_bytes() {
 
 #[tokio::test]
 async fn request_binding_is_atomic_with_staging_and_preserves_terminal_facts() {
+    assert_staging_binding_contract(BufferedArchivePurpose::Request).await;
+}
+
+async fn assert_staging_binding_contract(purpose: BufferedArchivePurpose) {
     use crate::archive_staging::{
         ArchiveStagingIntentDigest, ArchiveStagingKey, ArchiveStagingLeaseOwner,
         ArchiveStagingState, BeginArchiveStagingInput, BeginArchiveStagingResult,
     };
     let (_dir, db, id) = fixture().await;
-    assert!(
-        db.capture_buffered_archive_spool(
-            id,
-            BufferedArchivePurpose::Request,
-            &[ArchiveSpoolChunk {
-                seq: 0,
-                byte_count: 3,
-                ciphertext: "opaque".into()
-            }]
-        )
-        .await
-        .unwrap()
-    );
-    sqlx::query("UPDATE request_records SET completed_at = 2, request_object = $1, response_object = 'inline-json:{}'").bind(format!("gap://{}/request", id.request_id)).execute(&db.pool).await.unwrap();
-    sqlx::query("UPDATE request_records SET request_object = $1")
-        .bind(format!("gap://{}/request", id.request_id))
-        .execute(&db.pool)
-        .await
-        .unwrap();
-    sqlx::query("UPDATE request_records SET status_code = 200, cost_micros = 123, input_tokens = 45, output_tokens = 67").execute(&db.pool).await.unwrap();
-    let task = db
-        .claim_archive_spool_if(Uuid::new_v4(), BufferedArchivePurpose::Request, || true)
-        .await
-        .unwrap()
-        .unwrap();
+    let side = purpose.as_str();
+    let gap = format!("gap://{}/{side}", id.request_id);
+    let request_id = id.request_id.to_string();
+    let task = match purpose {
+        BufferedArchivePurpose::Request => {
+            assert!(
+                db.capture_buffered_archive_spool(
+                    id,
+                    purpose,
+                    &[ArchiveSpoolChunk {
+                        seq: 0,
+                        byte_count: 3,
+                        ciphertext: "opaque".into(),
+                    }],
+                )
+                .await
+                .unwrap()
+            );
+            sqlx::query(
+                "UPDATE request_records SET completed_at = 2, status_code = 200, request_object = $1,
+                 response_object = 'inline-json:{}' WHERE id = $2",
+            )
+            .bind(&gap)
+            .bind(&request_id)
+            .execute(&db.pool)
+            .await
+            .unwrap();
+            db.claim_archive_spool_if(Uuid::new_v4(), purpose, || true)
+                .await
+                .unwrap()
+                .unwrap()
+        }
+        BufferedArchivePurpose::Response => {
+            assert!(db.begin_response_archive_spool(id).await.unwrap());
+            assert!(
+                db.append_response_archive_spool(id, 0, 3, "opaque")
+                    .await
+                    .unwrap()
+            );
+            assert!(db.seal_response_archive_spool(id, 1, 3).await.unwrap());
+            terminal(&db, id).await;
+            db.claim_response_archive_spool(Uuid::new_v4())
+                .await
+                .unwrap()
+                .unwrap()
+        }
+    };
+    let (column, select_locator, update_locator) = match purpose {
+        BufferedArchivePurpose::Request => (
+            "request_object",
+            "SELECT request_object FROM request_records WHERE id = $1",
+            "UPDATE request_records SET request_object = $1 WHERE id = $2",
+        ),
+        BufferedArchivePurpose::Response => (
+            "response_object",
+            "SELECT response_object FROM request_records WHERE id = $1",
+            "UPDATE request_records SET response_object = $1 WHERE id = $2",
+        ),
+    };
+    sqlx::query(
+        "UPDATE request_records SET cost_micros = 123, input_tokens = 45, output_tokens = 67
+         WHERE id = $1",
+    )
+    .bind(&request_id)
+    .execute(&db.pool)
+    .await
+    .unwrap();
     let key = ArchiveStagingKey::new(
         ArchiveStagingOwner::ProxyRequest(id.request_id),
-        ArchiveStagingPurpose::Request,
+        purpose.staging(),
         Uuid::new_v4(),
     )
     .unwrap();
@@ -823,7 +869,7 @@ async fn request_binding_is_atomic_with_staging_and_preserves_terminal_facts() {
         BeginArchiveStagingResult::Created(lease) => lease,
         _ => panic!("new staging attempt must be created"),
     };
-    let locator = format!("{}/request.json", key.canonical_prefix());
+    let locator = format!("{}/{side}.json", key.canonical_prefix());
     let mut bad_lease = lease.clone();
     bad_lease.token = Uuid::new_v4();
     assert!(
@@ -831,15 +877,17 @@ async fn request_binding_is_atomic_with_staging_and_preserves_terminal_facts() {
             .await
             .unwrap()
     );
-    let current: String =
-        sqlx::query_scalar("SELECT request_object FROM request_records WHERE id = $1")
-            .bind(id.request_id.to_string())
-            .fetch_one(&db.pool)
-            .await
-            .unwrap();
-    assert_eq!(current, format!("gap://{}/request", id.request_id));
-    // An already-replaced request locator cannot be overwritten.
-    sqlx::query("UPDATE request_records SET request_object = 'preserved/request.json'")
+    let current: String = sqlx::query_scalar(select_locator)
+        .bind(&request_id)
+        .fetch_one(&db.pool)
+        .await
+        .unwrap();
+    assert_eq!(current, gap);
+    // An already-replaced locator cannot be overwritten.
+    let preserved = format!("preserved/{side}.json");
+    sqlx::query(update_locator)
+        .bind(&preserved)
+        .bind(&request_id)
         .execute(&db.pool)
         .await
         .unwrap();
@@ -856,12 +904,31 @@ async fn request_binding_is_atomic_with_staging_and_preserves_terminal_facts() {
             .state,
         ArchiveStagingState::Writing
     );
-    sqlx::query("UPDATE request_records SET completed_at = 2, request_object = $1, response_object = 'inline-json:{}'").bind(format!("gap://{}/request", id.request_id)).execute(&db.pool).await.unwrap();
+    let current: String = sqlx::query_scalar(select_locator)
+        .bind(&request_id)
+        .fetch_one(&db.pool)
+        .await
+        .unwrap();
+    assert_eq!(current, preserved);
+    sqlx::query(update_locator)
+        .bind(&gap)
+        .bind(&request_id)
+        .execute(&db.pool)
+        .await
+        .unwrap();
     assert!(
         db.complete_response_archive_spool(&task, &lease, &locator)
             .await
             .unwrap()
     );
+    // Simulate lost completion ACK and worker error handling: neither retry
+    // nor producer failure may release the bound object or change its locator.
+    db.retry_response_archive_spool(&task, "upload_failed")
+        .await
+        .unwrap();
+    db.fail_response_archive_spool(id, "capture_failed")
+        .await
+        .unwrap();
     let events = db.all_request_events_after(0, None, 10).await.unwrap();
     let bound_events = events
         .iter()
@@ -875,38 +942,28 @@ async fn request_binding_is_atomic_with_staging_and_preserves_terminal_facts() {
     assert_eq!(bound_events[0].input_tokens, 45);
     assert_eq!(bound_events[0].output_tokens, 67);
     assert_eq!(bound_events[0].billing.cost.as_deref(), Some("0.000123"));
-    // Simulate lost completion ACK and worker error handling: neither retry
-    // nor producer failure may release the bound object or change its locator.
-    db.retry_response_archive_spool(&task, "upload_failed")
-        .await
-        .unwrap();
-    db.fail_response_archive_spool(id, "capture_failed")
-        .await
-        .unwrap();
     let bound_event_count: i64 = sqlx::query_scalar(
         "SELECT COUNT(*) FROM request_events WHERE request_id = $1 AND event_kind = 'archive_bound'",
     )
-    .bind(id.request_id.to_string())
+    .bind(&request_id)
     .fetch_one(&db.pool)
     .await
     .unwrap();
     assert_eq!(bound_event_count, 1);
-    let row = sqlx::query("SELECT request_object, status_code, cost_micros, input_tokens, output_tokens, completed_at FROM request_records WHERE id = $1")
-        .bind(id.request_id.to_string()).fetch_one(&db.pool).await.unwrap();
-    assert_eq!(row.get::<String, _>("request_object"), locator);
+    let row = sqlx::query(
+        "SELECT request_object, response_object, status_code, cost_micros, input_tokens,
+                output_tokens, completed_at FROM request_records WHERE id = $1",
+    )
+    .bind(&request_id)
+    .fetch_one(&db.pool)
+    .await
+    .unwrap();
+    assert_eq!(row.get::<String, _>(column), locator);
     assert_eq!(row.get::<i64, _>("status_code"), 200);
     assert_eq!(row.get::<i64, _>("cost_micros"), 123);
     assert_eq!(row.get::<i64, _>("input_tokens"), 45);
     assert_eq!(row.get::<i64, _>("output_tokens"), 67);
     assert_eq!(row.get::<i64, _>("completed_at"), 2);
-    assert_eq!(
-        db.archive_staging_attempt(key.attempt_id)
-            .await
-            .unwrap()
-            .unwrap()
-            .state,
-        ArchiveStagingState::Bound
-    );
     let retained = budget(&db).await;
     assert_eq!(db.cleanup_response_archive_spools(32).await.unwrap(), 0);
     assert_eq!(budget(&db).await, retained);
@@ -1875,144 +1932,7 @@ async fn stale_capture_remains_charged_until_verified_migration() {
 
 #[tokio::test]
 async fn binding_is_atomic_with_staging_and_preserves_terminal_facts() {
-    use crate::archive_staging::{
-        ArchiveStagingIntentDigest, ArchiveStagingKey, ArchiveStagingLeaseOwner,
-        ArchiveStagingState, BeginArchiveStagingInput, BeginArchiveStagingResult,
-    };
-    let (_dir, db, id) = fixture().await;
-    assert!(db.begin_response_archive_spool(id).await.unwrap());
-    assert!(
-        db.append_response_archive_spool(id, 0, 3, "opaque")
-            .await
-            .unwrap()
-    );
-    assert!(db.seal_response_archive_spool(id, 1, 3).await.unwrap());
-    terminal(&db, id).await;
-    sqlx::query("UPDATE request_records SET status_code = 200, cost_micros = 123, input_tokens = 45, output_tokens = 67").execute(&db.pool).await.unwrap();
-    let task = db
-        .claim_response_archive_spool(Uuid::new_v4())
-        .await
-        .unwrap()
-        .unwrap();
-    let key = ArchiveStagingKey::new(
-        ArchiveStagingOwner::ProxyRequest(id.request_id),
-        ArchiveStagingPurpose::Response,
-        Uuid::new_v4(),
-    )
-    .unwrap();
-    let lease = match db
-        .begin_archive_staging_attempt(BeginArchiveStagingInput {
-            key,
-            intent_digest: ArchiveStagingIntentDigest::new("a".repeat(64)).unwrap(),
-            lease_token: Uuid::new_v4(),
-            lease_owner: ArchiveStagingLeaseOwner::new("spool-test").unwrap(),
-        })
-        .await
-        .unwrap()
-    {
-        BeginArchiveStagingResult::Created(lease) => lease,
-        _ => panic!("new staging attempt must be created"),
-    };
-    let locator = format!("{}/response.json", key.canonical_prefix());
-    let mut bad_lease = lease.clone();
-    bad_lease.token = Uuid::new_v4();
-    assert!(
-        !db.complete_response_archive_spool(&task, &bad_lease, &locator)
-            .await
-            .unwrap()
-    );
-    let current: String =
-        sqlx::query_scalar("SELECT response_object FROM request_records WHERE id = $1")
-            .bind(id.request_id.to_string())
-            .fetch_one(&db.pool)
-            .await
-            .unwrap();
-    assert_eq!(current, format!("gap://{}/response", id.request_id));
-    // An already-replaced request locator cannot be overwritten.
-    sqlx::query("UPDATE request_records SET response_object = 'preserved/response.json'")
-        .execute(&db.pool)
-        .await
-        .unwrap();
-    assert!(
-        !db.complete_response_archive_spool(&task, &lease, &locator)
-            .await
-            .unwrap()
-    );
-    assert_eq!(
-        db.archive_staging_attempt(key.attempt_id)
-            .await
-            .unwrap()
-            .unwrap()
-            .state,
-        ArchiveStagingState::Writing
-    );
-    terminal(&db, id).await;
-    assert!(
-        db.complete_response_archive_spool(&task, &lease, &locator)
-            .await
-            .unwrap()
-    );
-    let events = db.all_request_events_after(0, None, 10).await.unwrap();
-    let bound_events = events
-        .iter()
-        .filter(|event| event.event_kind == "archive_bound")
-        .collect::<Vec<_>>();
-    assert_eq!(bound_events.len(), 1);
-    assert_eq!(
-        bound_events[0].archive_state,
-        crate::model::RequestArchiveState::Bound
-    );
-    assert_eq!(bound_events[0].input_tokens, 45);
-    assert_eq!(bound_events[0].output_tokens, 67);
-    assert_eq!(bound_events[0].billing.cost.as_deref(), Some("0.000123"));
-    // Simulate lost completion ACK and worker error handling: neither retry
-    // nor producer failure may release the bound object or change its locator.
-    db.retry_response_archive_spool(&task, "upload_failed")
-        .await
-        .unwrap();
-    db.fail_response_archive_spool(id, "capture_failed")
-        .await
-        .unwrap();
-    let bound_event_count: i64 = sqlx::query_scalar(
-        "SELECT COUNT(*) FROM request_events WHERE request_id = $1 AND event_kind = 'archive_bound'",
-    )
-    .bind(id.request_id.to_string())
-    .fetch_one(&db.pool)
-    .await
-    .unwrap();
-    assert_eq!(bound_event_count, 1);
-    let row = sqlx::query("SELECT response_object, status_code, cost_micros, input_tokens, output_tokens, completed_at FROM request_records WHERE id = $1")
-        .bind(id.request_id.to_string()).fetch_one(&db.pool).await.unwrap();
-    assert_eq!(row.get::<String, _>("response_object"), locator);
-    assert_eq!(row.get::<i64, _>("status_code"), 200);
-    assert_eq!(row.get::<i64, _>("cost_micros"), 123);
-    assert_eq!(row.get::<i64, _>("input_tokens"), 45);
-    assert_eq!(row.get::<i64, _>("output_tokens"), 67);
-    assert_eq!(row.get::<i64, _>("completed_at"), 2);
-    assert_eq!(
-        db.archive_staging_attempt(key.attempt_id)
-            .await
-            .unwrap()
-            .unwrap()
-            .state,
-        ArchiveStagingState::Bound
-    );
-    let retained = budget(&db).await;
-    assert_eq!(db.cleanup_response_archive_spools(32).await.unwrap(), 0);
-    assert_eq!(budget(&db).await, retained);
-    assert_eq!(
-        db.archive_staging_attempt(key.attempt_id)
-            .await
-            .unwrap()
-            .unwrap()
-            .state,
-        ArchiveStagingState::Bound
-    );
-    assert!(
-        !db.complete_response_archive_spool(&task, &lease, &locator)
-            .await
-            .unwrap()
-    );
+    assert_staging_binding_contract(BufferedArchivePurpose::Response).await;
 }
 
 #[tokio::test]

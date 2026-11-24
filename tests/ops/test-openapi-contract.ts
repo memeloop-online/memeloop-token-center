@@ -15,6 +15,37 @@ const repository = resolve(dirname(fileURLToPath(import.meta.url)), "../..");
 const originalDocument = parse(readFileSync(`${repository}/openapi/openapi.yaml`, "utf8")) as Obj;
 const cloneDocument = (): Obj => structuredClone(originalDocument) as Obj;
 
+test("route creation publishes the owned idempotency replay contract", () => {
+  const { paths, components } = originalDocument;
+  const create = paths["/internal/v1/model-routes"].post;
+  assert.ok(create.parameters.some((parameter: Obj) =>
+    parameter.$ref === "#/components/parameters/RouteCreateIdempotencyKey"));
+  const key = components.parameters.RouteCreateIdempotencyKey;
+  assert.equal(key.name, "Idempotency-Key");
+  assert.equal(key.in, "header");
+  assert.equal(key.required, false);
+  assert.equal(key.schema.type, "string");
+  assert.equal(key.schema.minLength, 1);
+  assert.equal(key.schema.maxLength, 200);
+
+  for (const [status, component, values] of [
+    ["201", "RouteCreateCreatedDisposition", ["created", "equivalent_unowned"]],
+    ["200", "RouteCreateReusedDisposition", ["reused"]],
+  ] as const) {
+    assert.equal(create.responses[status].headers["X-MTC-Route-Create-Disposition"].$ref,
+      `#/components/headers/${component}`);
+    assert.equal(components.headers[component].schema.type, "string");
+    assert.deepEqual(new Set(components.headers[component].schema.enum), new Set(values));
+  }
+  assert.equal(create.responses["409"].$ref, "#/components/responses/Conflict");
+
+  assert.equal(create.requestBody.content["application/json"].schema.$ref,
+    "#/components/schemas/CreateModelRouteRequest");
+  const enabled = components.schemas.CreateModelRouteRequest.properties.enabled;
+  assert.equal(enabled.type, "boolean");
+  assert.equal(enabled.default, true);
+});
+
 // Evaluate the JSON Schema keywords used by the health payload contract.
 // This validates values (including negative cases), not only document parity.
 function healthPayloadMatches(document: Obj, schema: Obj, value: any): boolean {

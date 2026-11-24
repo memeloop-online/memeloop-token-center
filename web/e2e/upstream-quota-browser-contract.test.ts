@@ -1,19 +1,16 @@
 import assert from 'node:assert/strict';
-import { existsSync } from 'node:fs';
 import { mkdir } from 'node:fs/promises';
 import { join } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import test from 'node:test';
 import { chromium } from 'playwright';
+import { hasDefaultChromium } from './support/browser-executable.js';
 import { createServer } from 'vite';
 
 declare global { interface Window { quotaReads: number; quotaWrites: number; quotaPrepares: number; quotaConfirms: number; quotaStatuses: number; quotaReconciles: number; quotaCurrents: number; releaseQuotaRead?: () => void } }
 
-test('upstream themes and mock-only quota demand, consent and reconciliation contract', { timeout: 90_000 }, async () => {
-  if (!existsSync(chromium.executablePath())) {
-    if (process.env.MTC_REQUIRE_BROWSER === '1') throw new Error('Chromium required');
-    return test.skip('Chromium required');
-  }
+test('upstream themes and mock-only quota demand, consent and reconciliation contract', { timeout: 90_000 }, async (context) => {
+  if (!hasDefaultChromium(context)) return;
   const root = fileURLToPath(new URL('..', import.meta.url));
   const server = await createServer({ root, configFile: false, logLevel: 'silent', server: { host: '127.0.0.1', port: 0 } });
   await server.listen();

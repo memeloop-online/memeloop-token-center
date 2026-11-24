@@ -1,11 +1,9 @@
 import assert from 'node:assert/strict';
-import { existsSync } from 'node:fs';
-import { readdir } from 'node:fs/promises';
-import { join } from 'node:path';
 import { fileURLToPath } from 'node:url';
-import test from 'node:test';
+import test, { type TestContext } from 'node:test';
 
 import { chromium, type Page } from 'playwright';
+import { localChromiumExecutable } from './support/browser-executable.js';
 import { createIsolatedFixtureServer as createServer } from './support/isolated-vite-server.js';
 import { operatorFixturePlugin } from './support/navigation-fixture-server.js';
 
@@ -20,24 +18,11 @@ const credentialA = 'mts_degraded_fixture_alpha';
 const credentialB = 'mts_degraded_fixture_beta';
 const storageKey = 'mtc.operator.service-credential.v1';
 
-async function localChromiumExecutable() {
-  const defaultExecutable = chromium.executablePath();
-  if (existsSync(defaultExecutable)) return defaultExecutable;
-  const workspaceUserCache = fileURLToPath(new URL('../../../../.cache/ms-playwright', import.meta.url));
-  const installations = await readdir(workspaceUserCache, { withFileTypes: true }).catch(() => []);
-  for (const installation of installations) {
-    if (!installation.isDirectory() || !installation.name.startsWith('chromium-')) continue;
-    const executable = join(workspaceUserCache, installation.name, 'chrome-linux64', 'chrome');
-    if (existsSync(executable)) return executable;
-  }
-  return undefined;
-}
-
-async function requireChromium() {
+async function requireChromium(context: TestContext) {
   const executablePath = await localChromiumExecutable();
   if (!executablePath) {
     if (process.env.MTC_REQUIRE_BROWSER === '1') throw new Error('Chromium is required for the degraded-access browser contract');
-    test.skip('a local Chromium runtime is required for degraded-access browser assertions');
+    context.skip('a local Chromium runtime is required for degraded-access browser assertions');
     return undefined;
   }
   return executablePath;
@@ -87,8 +72,8 @@ async function openTenantManager(page: Page, port: number, seeded = true) {
   await page.locator('.tenant-list').waitFor();
 }
 
-test('outage retry revalidates in place and keeps the mounted page and its unsubmitted draft', { timeout: 60_000 }, async () => {
-  const executablePath = await requireChromium();
+test('outage retry revalidates in place and keeps the mounted page and its unsubmitted draft', { timeout: 60_000 }, async (context) => {
+  const executablePath = await requireChromium(context);
   if (!executablePath) return;
   const { server, browser, page, port } = await openFixture(executablePath);
   try {
@@ -113,8 +98,8 @@ test('outage retry revalidates in place and keeps the mounted page and its unsub
   }
 });
 
-test('tenant selection keeps the fault and its retry until a read succeeds', { timeout: 60_000 }, async () => {
-  const executablePath = await requireChromium();
+test('tenant selection keeps the fault and its retry until a read succeeds', { timeout: 60_000 }, async (context) => {
+  const executablePath = await requireChromium(context);
   if (!executablePath) return;
   const { server, browser, page, port } = await openFixture(executablePath);
   try {
@@ -140,8 +125,8 @@ test('tenant selection keeps the fault and its retry until a read succeeds', { t
   }
 });
 
-test('a rejected replacement candidate never disturbs the validated session', { timeout: 60_000 }, async () => {
-  const executablePath = await requireChromium();
+test('a rejected replacement candidate never disturbs the validated session', { timeout: 60_000 }, async (context) => {
+  const executablePath = await requireChromium(context);
   if (!executablePath) return;
   const { server, browser, page, port } = await openFixture(executablePath);
   try {
@@ -162,8 +147,8 @@ test('a rejected replacement candidate never disturbs the validated session', { 
   }
 });
 
-test('a baseline 403 deauthorizes the console while a scoped API 403 stays local', { timeout: 60_000 }, async () => {
-  const executablePath = await requireChromium();
+test('a baseline 403 deauthorizes the console while a scoped API 403 stays local', { timeout: 60_000 }, async (context) => {
+  const executablePath = await requireChromium(context);
   if (!executablePath) return;
   const { server, browser, page, port } = await openFixture(executablePath);
   try {
@@ -205,8 +190,8 @@ test('a baseline 403 deauthorizes the console while a scoped API 403 stays local
   }
 });
 
-test('an unproven candidate is never promoted or stored on a definitive rejection', { timeout: 60_000 }, async () => {
-  const executablePath = await requireChromium();
+test('an unproven candidate is never promoted or stored on a definitive rejection', { timeout: 60_000 }, async (context) => {
+  const executablePath = await requireChromium(context);
   if (!executablePath) return;
   const { server, browser, page, port } = await openFixture(executablePath);
   try {

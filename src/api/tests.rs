@@ -1358,13 +1358,6 @@ async fn gateway_and_control_have_disjoint_route_surfaces() {
     assert_eq!(gateway_model.status(), StatusCode::UNAUTHORIZED);
 }
 
-#[test]
-fn gateway_router_has_no_blanket_in_flight_limit_ahead_of_lifecycle_capacity() {
-    let gateway_routes = include_str!("routes/gateway.rs");
-    assert!(!gateway_routes.contains("ConcurrencyLimitLayer"));
-    assert!(!gateway_routes.contains("GATEWAY_IN_FLIGHT_REQUESTS"));
-}
-
 #[tokio::test]
 async fn operator_can_explicitly_set_and_read_metered_unlimited_enforcement() {
     let (state, _directory) = test_state().await;

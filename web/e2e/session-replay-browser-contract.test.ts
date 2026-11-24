@@ -1,11 +1,11 @@
 import assert from 'node:assert/strict';
-import { existsSync } from 'node:fs';
-import { mkdir, readdir, stat } from 'node:fs/promises';
+import { mkdir, stat } from 'node:fs/promises';
 import { join } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import test from 'node:test';
 
 import { chromium } from 'playwright';
+import { localChromiumExecutable } from './support/browser-executable.js';
 import { createServer } from 'vite';
 
 declare global { interface Window { sessionReplayReads: Record<string, number>; sessionReplayAborts: number; archiveRangeReads: number; contextReads: number; contextContentReads: number } }
@@ -15,11 +15,11 @@ const artifactRoot = join(webRoot, 'e2e-artifacts', 'session-replay');
 const screenshotWidths = [320, 768, 1440] as const;
 const screenshotLocales = ['zh-CN', 'en'] as const;
 
-test('prefix reader never fetches archives or tool bodies before their disclosure is opened', { timeout: 45_000 }, async () => {
+test('prefix reader never fetches archives or tool bodies before their disclosure is opened', { timeout: 45_000 }, async (context) => {
   const executablePath = await localChromiumExecutable();
   if (!executablePath) {
     if (process.env.MTC_REQUIRE_BROWSER === '1') throw new Error('Chromium required');
-    return test.skip('Chromium required');
+    return context.skip('Chromium required');
   }
   const server = await createServer({ root: webRoot, configFile: false, logLevel: 'silent', server: { host: '127.0.0.1', port: 0 } });
   await server.listen();
@@ -49,11 +49,11 @@ test('prefix reader never fetches archives or tool bodies before their disclosur
   } finally { await browser.close(); await server.close(); }
 });
 
-test('conversation history pages request replies across resets without opening archives', { timeout: 45_000 }, async () => {
+test('conversation history pages request replies across resets without opening archives', { timeout: 45_000 }, async (context) => {
   const executablePath = await localChromiumExecutable();
   if (!executablePath) {
     if (process.env.MTC_REQUIRE_BROWSER === '1') throw new Error('Chromium required');
-    return test.skip('Chromium required');
+    return context.skip('Chromium required');
   }
   const server = await createServer({ root: webRoot, configFile: false, logLevel: 'silent', server: { host: '127.0.0.1', port: 0 } });
   await server.listen();
@@ -105,19 +105,6 @@ test('conversation history pages request replies across resets without opening a
   } finally { await browser.close(); await server.close(); }
 });
 
-async function localChromiumExecutable() {
-  const defaultExecutable = chromium.executablePath();
-  if (existsSync(defaultExecutable)) return defaultExecutable;
-  const workspaceUserCache = fileURLToPath(new URL('../../../../.cache/ms-playwright', import.meta.url));
-  const installations = await readdir(workspaceUserCache, { withFileTypes: true }).catch(() => []);
-  for (const installation of installations) {
-    if (!installation.isDirectory() || !installation.name.startsWith('chromium-')) continue;
-    const executable = join(workspaceUserCache, installation.name, 'chrome-linux64', 'chrome');
-    if (existsSync(executable)) return executable;
-  }
-  return undefined;
-}
-
 async function nextPaint(page: import('playwright').Page) {
   await page.evaluate(() => new Promise<void>((resolve) => requestAnimationFrame(() => requestAnimationFrame(() => resolve()))));
 }
@@ -134,11 +121,11 @@ async function expandReplay(page: import('playwright').Page) {
   }
 }
 
-test('large archive content is explicit, paged to its real end, and cleared on version or scope changes', { timeout: 45_000 }, async () => {
+test('large archive content is explicit, paged to its real end, and cleared on version or scope changes', { timeout: 45_000 }, async (context) => {
   const executablePath = await localChromiumExecutable();
   if (!executablePath) {
     if (process.env.MTC_REQUIRE_BROWSER === '1') throw new Error('Chromium required');
-    return test.skip('Chromium required');
+    return context.skip('Chromium required');
   }
   const server = await createServer({ root: webRoot, configFile: false, logLevel: 'silent', server: { host: '127.0.0.1', port: 0 } });
   await server.listen();
@@ -226,11 +213,11 @@ test('large archive content is explicit, paged to its real end, and cleared on v
   } finally { await browser.close(); await server.close(); }
 });
 
-test('slow replay reads survive live metadata refresh, publish incrementally and isolate scopes', { timeout: 30_000 }, async () => {
+test('slow replay reads survive live metadata refresh, publish incrementally and isolate scopes', { timeout: 30_000 }, async (context) => {
   const executablePath = await localChromiumExecutable();
   if (!executablePath) {
     if (process.env.MTC_REQUIRE_BROWSER === '1') throw new Error('Chromium required');
-    return test.skip('Chromium required');
+    return context.skip('Chromium required');
   }
   const server = await createServer({ root: webRoot, configFile: false, logLevel: 'silent', server: { host: '127.0.0.1', port: 0 } });
   await server.listen();
@@ -288,11 +275,11 @@ test('slow replay reads survive live metadata refresh, publish incrementally and
   } finally { await browser.close(); await server.close(); }
 });
 
-test('SessionReplayPanel renders archived content, keeps missing data explicit, and saves responsive theme screenshots', { timeout: 45_000 }, async () => {
+test('SessionReplayPanel renders archived content, keeps missing data explicit, and saves responsive theme screenshots', { timeout: 45_000 }, async (context) => {
   const executablePath = await localChromiumExecutable();
   if (!executablePath) {
     if (process.env.MTC_REQUIRE_BROWSER === '1') throw new Error('Chromium is required for the session replay browser gate');
-    return test.skip('a local Chromium runtime is required for session replay screenshots');
+    return context.skip('a local Chromium runtime is required for session replay screenshots');
   }
   const server = await createServer({ root: webRoot, configFile: false, logLevel: 'silent', server: { host: '127.0.0.1', port: 0, strictPort: false } });
   await server.listen();
@@ -301,7 +288,7 @@ test('SessionReplayPanel renders archived content, keeps missing data explicit, 
   const browser = await chromium.launch({ executablePath, headless: true });
   try {
     const page = await browser.newPage({ viewport: { width: 1440, height: 900 } });
-    await page.goto(`http://127.0.0.1:${address.port}/e2e/fixtures/session-replay.html`);
+    await page.goto(`http://127.0.0.1:${address.port}/e2e/fixtures/session-replay.html?foreign-request=1`);
     await page.locator('.session-replay[data-replay-loading="false"]').waitFor();
     assert.equal(await page.locator('.session-replay-entry.tool-call').count(), 0, 'tool bodies are not mounted by default');
     assert.equal(await page.locator('.session-replay-entry.tool-result').count(), 0, 'tool results are not mounted by default');
@@ -319,6 +306,8 @@ test('SessionReplayPanel renders archived content, keeps missing data explicit, 
     assert.equal(await page.locator('.session-replay-entry.tool-call').count(), 1);
     assert.equal(await page.locator('.session-replay-entry.tool-result').count(), 1);
     assert.equal(await page.locator('.session-replay-entry.unknown').count(), 2, 'one compact unavailable entry is retained for each affected request');
+    assert.equal(await page.getByText('Foreign session message', { exact: true }).count(), 0);
+    assert.equal(await page.getByText('Foreign request message', { exact: true }).count(), 0);
     assert.equal(await page.locator('.session-replay-expand').count(), 1, 'a long message keeps a readable preview before expansion');
     const turn = page.locator('.session-replay-turns button').first();
     assert.match(await turn.getAttribute('title') ?? '', /precipitation probability/);

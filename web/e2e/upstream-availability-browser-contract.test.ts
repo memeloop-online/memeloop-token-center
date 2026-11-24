@@ -1,11 +1,11 @@
 import assert from 'node:assert/strict';
-import { existsSync } from 'node:fs';
-import { mkdir, readdir, stat, writeFile } from 'node:fs/promises';
+import { mkdir, stat, writeFile } from 'node:fs/promises';
 import { join } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import test from 'node:test';
 
 import { chromium } from 'playwright';
+import { localChromiumExecutable } from './support/browser-executable.js';
 import { createServer } from 'vite';
 
 declare global {
@@ -15,19 +15,6 @@ declare global {
 const webRoot = fileURLToPath(new URL('..', import.meta.url));
 const artifactRoot = join(webRoot, 'e2e-artifacts', 'upstream-availability');
 const widths = [320, 390, 768, 1024, 1440, 1920, 2560] as const;
-
-async function localChromiumExecutable() {
-  const defaultExecutable = chromium.executablePath();
-  if (existsSync(defaultExecutable)) return defaultExecutable;
-  const workspaceUserCache = fileURLToPath(new URL('../../../../.cache/ms-playwright', import.meta.url));
-  const installations = await readdir(workspaceUserCache, { withFileTypes: true }).catch(() => []);
-  for (const installation of installations) {
-    if (!installation.isDirectory() || !installation.name.startsWith('chromium-')) continue;
-    const executable = join(workspaceUserCache, installation.name, 'chrome-linux64', 'chrome');
-    if (existsSync(executable)) return executable;
-  }
-  return undefined;
-}
 
 async function nextPaint(page: import('playwright').Page) {
   await page.evaluate(() => new Promise<void>((resolve) => requestAnimationFrame(() => requestAnimationFrame(() => resolve()))));
@@ -62,11 +49,11 @@ async function retainFailureDiagnostics(page: import('playwright').Page) {
   ]);
 }
 
-test('Upstream availability shows complete account facts separately from routing samples and manual probes', { timeout: 90_000 }, async () => {
+test('Upstream availability shows complete account facts separately from routing samples and manual probes', { timeout: 90_000 }, async (context) => {
   const executablePath = await localChromiumExecutable();
   if (!executablePath) {
     if (process.env.MTC_REQUIRE_BROWSER === '1') throw new Error('Chromium is required for the upstream availability browser gate');
-    return test.skip('a local Chromium runtime is required for upstream availability layout assertions');
+    return context.skip('a local Chromium runtime is required for upstream availability layout assertions');
   }
   let server: Awaited<ReturnType<typeof createServer>> | undefined;
   let browser: import('playwright').Browser | undefined;

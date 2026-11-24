@@ -1,33 +1,19 @@
 import assert from 'node:assert/strict';
-import { existsSync } from 'node:fs';
-import { readdir, readFile } from 'node:fs/promises';
-import { join } from 'node:path';
+import { readFile } from 'node:fs/promises';
 import { fileURLToPath } from 'node:url';
 import test from 'node:test';
 
 import { chromium } from 'playwright';
+import { localChromiumExecutable } from './support/browser-executable.js';
 import { createServer } from 'vite';
 
 const appShellStylesPath = fileURLToPath(new URL('../src/app-shell.css', import.meta.url));
 const sharedStylesPath = fileURLToPath(new URL('../src/styles.css', import.meta.url));
 const webRoot = fileURLToPath(new URL('..', import.meta.url));
 
-async function localChromiumExecutable() {
-  const defaultExecutable = chromium.executablePath();
-  if (existsSync(defaultExecutable)) return defaultExecutable;
-  const workspaceUserCache = fileURLToPath(new URL('../../../../.cache/ms-playwright', import.meta.url));
-  const installations = await readdir(workspaceUserCache, { withFileTypes: true }).catch(() => []);
-  for (const installation of installations) {
-    if (!installation.isDirectory() || !installation.name.startsWith('chromium-')) continue;
-    const executable = join(workspaceUserCache, installation.name, 'chrome-linux64', 'chrome');
-    if (existsSync(executable)) return executable;
-  }
-  return undefined;
-}
-
-test('1024px compact sidebar keeps every visually hidden navigation label accessible', { timeout: 30_000 }, async () => {
+test('1024px compact sidebar keeps every visually hidden navigation label accessible', { timeout: 30_000 }, async (context) => {
   const executablePath = await localChromiumExecutable();
-  if (!executablePath) return test.skip('a local Chromium runtime is required for the 1024px sidebar assertion');
+  if (!executablePath) return context.skip('a local Chromium runtime is required for the 1024px sidebar assertion');
   const componentSource = await readFile(new URL('../src/app/AppShell.tsx', import.meta.url), 'utf8');
   assert.match(componentSource, /aria-label=\{item\.label\}/);
   assert.match(componentSource, /title=\{item\.label\}/);
@@ -52,9 +38,9 @@ test('1024px compact sidebar keeps every visually hidden navigation label access
   } finally { await browser.close(); }
 });
 
-test('shell and route content share the exact 899/900/901 responsive boundary without container overflow', { timeout: 30_000 }, async () => {
+test('shell and route content share the exact 899/900/901 responsive boundary without container overflow', { timeout: 30_000 }, async (context) => {
   const executablePath = await localChromiumExecutable();
-  if (!executablePath) return test.skip('a local Chromium runtime is required for boundary overflow assertions');
+  if (!executablePath) return context.skip('a local Chromium runtime is required for boundary overflow assertions');
   const browser = await chromium.launch({ executablePath, headless: true });
   try {
     const page = await browser.newPage();
@@ -91,9 +77,9 @@ test('shell and route content share the exact 899/900/901 responsive boundary wi
   } finally { await browser.close(); }
 });
 
-test('portal and operator primitives remain readable from 320px mobile to 2560px widescreen', { timeout: 30_000 }, async () => {
+test('portal and operator primitives remain readable from 320px mobile to 2560px widescreen', { timeout: 30_000 }, async (context) => {
   const executablePath = await localChromiumExecutable();
-  if (!executablePath) return test.skip('a local Chromium runtime is required for the responsive matrix');
+  if (!executablePath) return context.skip('a local Chromium runtime is required for the responsive matrix');
   const operatorStylesPath = fileURLToPath(new URL('../src/operator/operator.css', import.meta.url));
   const usageStylesPath = fileURLToPath(new URL('../src/operator/usage.css', import.meta.url));
   const browser = await chromium.launch({ executablePath, headless: true });
@@ -135,9 +121,9 @@ test('portal and operator primitives remain readable from 320px mobile to 2560px
   } finally { await browser.close(); }
 });
 
-test('a rejected lazy route reloads its module graph and recovers instead of staying blank', { timeout: 30_000 }, async () => {
+test('a rejected lazy route reloads its module graph and recovers instead of staying blank', { timeout: 30_000 }, async (context) => {
   const executablePath = await localChromiumExecutable();
-  if (!executablePath) return test.skip('a local Chromium runtime is required for lazy rejection assertions');
+  if (!executablePath) return context.skip('a local Chromium runtime is required for lazy rejection assertions');
   const server = await createServer({ root: webRoot, configFile: false, logLevel: 'silent', server: { host: '127.0.0.1', port: 0, strictPort: false } });
   await server.listen();
   const address = server.httpServer?.address();

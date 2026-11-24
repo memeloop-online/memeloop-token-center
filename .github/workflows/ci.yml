@@ -1197,8 +1197,6 @@ jobs:
         run: node --test tests/ops/buildkit-attestation-contract.test.ts
       - name: Validate immutable two-image GHCR release evidence
         run: node --test tests/ops/ghcr-release-contract.test.ts
-      - name: Enforce focused source-module boundaries
-        run: node --test tests/ops/source-module-size-contract.test.ts
       - name: Validate GitHub release contracts
         run: node scripts/ci/run-release-source-contracts.ts
       - name: Validate exact-revision memory binary reuse

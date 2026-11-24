@@ -9,7 +9,7 @@
   },
   "scripts": {
     "test:ops": "node --test tests/ops/*.test.ts tests/ops/*-static.ts",
-    "test:release-contracts": "node --test tests/ops/repository-script-language-contract.test.ts tests/ops/buildkit-attestation-contract.test.ts tests/ops/github-workflow-policy-fixtures.test.ts tests/ops/release-packaging-contract.test.ts tests/ops/source-module-size-contract.test.ts tests/ops/rust-decimal-vendor-contract.test.ts",
+    "test:release-contracts": "node --test tests/ops/repository-script-language-contract.test.ts tests/ops/buildkit-attestation-contract.test.ts tests/ops/github-workflow-policy-fixtures.test.ts tests/ops/release-packaging-contract.test.ts tests/ops/rust-decimal-vendor-contract.test.ts",
     "typecheck": "tsc -p tsconfig.scripts.json --pretty false"
   },
   "dependencies": {

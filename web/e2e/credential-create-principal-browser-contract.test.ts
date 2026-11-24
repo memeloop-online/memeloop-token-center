@@ -1,11 +1,11 @@
 import assert from 'node:assert/strict';
-import { existsSync, mkdirSync } from 'node:fs';
-import { readdir } from 'node:fs/promises';
+import { mkdirSync } from 'node:fs';
 import { join } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import test from 'node:test';
 
 import { chromium } from 'playwright';
+import { localChromiumExecutable } from './support/browser-executable.js';
 import { createIsolatedFixtureServer as createServer } from './support/isolated-vite-server.js';
 
 const webRoot = fileURLToPath(new URL('..', import.meta.url));
@@ -33,24 +33,11 @@ declare global {
   }
 }
 
-async function localChromiumExecutable() {
-  const defaultExecutable = chromium.executablePath();
-  if (existsSync(defaultExecutable)) return defaultExecutable;
-  const workspaceUserCache = fileURLToPath(new URL('../../../../.cache/ms-playwright', import.meta.url));
-  const installations = await readdir(workspaceUserCache, { withFileTypes: true }).catch(() => []);
-  for (const installation of installations) {
-    if (!installation.isDirectory() || !installation.name.startsWith('chromium-')) continue;
-    const executable = join(workspaceUserCache, installation.name, 'chrome-linux64', 'chrome');
-    if (existsSync(executable)) return executable;
-  }
-  return undefined;
-}
-
-test('client credential creation names the principal once and binds existing principals on demand', { timeout: 90_000 }, async () => {
+test('client credential creation names the principal once and binds existing principals on demand', { timeout: 90_000 }, async (context) => {
   const executablePath = await localChromiumExecutable();
   if (!executablePath) {
     if (process.env.MTC_REQUIRE_BROWSER === '1') throw new Error('Chromium is required for the credential creation CI gate');
-    return test.skip('a local Chromium runtime is required for credential creation behavior assertions');
+    return context.skip('a local Chromium runtime is required for credential creation behavior assertions');
   }
   const server = await createServer({ root: webRoot, configFile: false, logLevel: 'silent', server: { host: '127.0.0.1', port: 0, strictPort: false } });
   await server.listen();
@@ -64,7 +51,12 @@ test('client credential creation names the principal once and binds existing pri
     for (const locale of ['zh-CN', 'en'] as const) {
       const english = locale === 'en';
       const page = await browser.newPage();
-      await page.addInitScript(value => localStorage.setItem('mtc-locale', value), locale);
+      await page.addInitScript(value => {
+        localStorage.setItem('mtc-locale', value);
+        Object.defineProperty(navigator, 'clipboard', { value: {
+          writeText: async (text: string) => { document.documentElement.dataset.issuedClipboard = text; },
+        } });
+      }, locale);
       await page.goto(`${origin}/e2e/fixtures/operator-credential-workspace.html?scenario=client-form`);
       await page.getByText(english ? 'Research workspace' : '研发工作区', { exact: true }).waitFor();
       const create = page.locator('.create-journey');
@@ -90,6 +82,10 @@ test('client credential creation names the principal once and binds existing pri
       const createdPosts = () => page.evaluate(() => window.credentialFixture.requests.filter(request => request.method === 'POST' && request.path === '/internal/v1/keys'));
       await create.locator('button[type="submit"]').click();
       await page.locator('.one-time').getByText('mtc_fixture_created', { exact: true }).waitFor();
+      const issuedCopy = page.locator('.one-time').getByRole('button', { name: english ? 'Copy credential' : '复制凭据', exact: true });
+      await issuedCopy.click();
+      await page.waitForFunction(() => document.documentElement.dataset.issuedClipboard === 'mtc_fixture_created');
+      assert.equal(await page.evaluate(() => window.credentialFixture.requests.some(request => request.path === '/internal/v1/keys/key-created/credential')), false, 'copying the issued key does not fetch it again');
       let posts = await createdPosts();
       assert.equal(posts.length, 1);
       let body = JSON.parse(posts[0].body!);

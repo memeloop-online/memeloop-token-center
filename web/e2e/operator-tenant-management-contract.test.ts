@@ -1,11 +1,9 @@
 import assert from 'node:assert/strict';
-import { existsSync } from 'node:fs';
-import { readdir } from 'node:fs/promises';
-import { join } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import test, { after, before, describe, type TestContext } from 'node:test';
 
 import { chromium, type Page } from 'playwright';
+import { localChromiumExecutable } from './support/browser-executable.js';
 import { createIsolatedFixtureServer as createServer } from './support/isolated-vite-server.js';
 import { operatorFixturePlugin } from './support/navigation-fixture-server.js';
 import { captureNavigationIdentity, seedNavigationIdentity } from './support/navigation-identity-artifacts.js';
@@ -18,19 +16,6 @@ declare global {
 
 const webRoot = fileURLToPath(new URL('..', import.meta.url));
 const screenshotWidths = [320, 390, 768, 1024, 1440, 1920, 2560] as const;
-
-async function localChromiumExecutable() {
-  const defaultExecutable = chromium.executablePath();
-  if (existsSync(defaultExecutable)) return defaultExecutable;
-  const workspaceUserCache = fileURLToPath(new URL('../../../../.cache/ms-playwright', import.meta.url));
-  const installations = await readdir(workspaceUserCache, { withFileTypes: true }).catch(() => []);
-  for (const installation of installations) {
-    if (!installation.isDirectory() || !installation.name.startsWith('chromium-')) continue;
-    const executable = join(workspaceUserCache, installation.name, 'chrome-linux64', 'chrome');
-    if (existsSync(executable)) return executable;
-  }
-  return undefined;
-}
 
 function fixture(port: number, scenario: 'default' | 'multiple' | 'denied' | 'empty' | 'slow' | 'management-denied' | 'management-error' | 'background-refresh' | 'services-denied' | 'services-empty', view = 'tenants') {
   return `http://127.0.0.1:${port}/operator?scenario=${scenario}&view=${view}`;
@@ -57,7 +42,7 @@ function recordIdentityProgress(context: TestContext, page: Page) {
 
 test('tenant management has one sidebar route and single-default scope stays implicit through refresh and history', { timeout: 30_000 }, async context => {
   const executablePath = await localChromiumExecutable();
-  if (!executablePath) return test.skip('a local Chromium runtime is required for tenant navigation assertions');
+  if (!executablePath) return context.skip('a local Chromium runtime is required for tenant navigation assertions');
   const server = await createServer({ root: webRoot, configFile: false, logLevel: 'silent', plugins: [operatorFixturePlugin('/e2e/fixtures/tenant-management.html')], server: { host: '127.0.0.1', port: 0, strictPort: false } });
   await server.listen();
   const address = server.httpServer?.address();
@@ -145,9 +130,9 @@ test('tenant management has one sidebar route and single-default scope stays imp
   }
 });
 
-test('multi-tenant scope exposes tenant CRUD, dependency refusal, authorization boundaries, and screenshot widths', { timeout: 30_000 }, async () => {
+test('multi-tenant scope exposes tenant CRUD, dependency refusal, authorization boundaries, and screenshot widths', { timeout: 30_000 }, async (context) => {
   const executablePath = await localChromiumExecutable();
-  if (!executablePath) return test.skip('a local Chromium runtime is required for tenant lifecycle assertions');
+  if (!executablePath) return context.skip('a local Chromium runtime is required for tenant lifecycle assertions');
   const server = await createServer({ root: webRoot, configFile: false, logLevel: 'silent', plugins: [operatorFixturePlugin('/e2e/fixtures/tenant-management.html')], server: { host: '127.0.0.1', port: 0, strictPort: false } });
   await server.listen();
   const address = server.httpServer?.address();

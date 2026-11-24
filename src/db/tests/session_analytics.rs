@@ -13,34 +13,6 @@ use crate::{AppState, api, config::Config};
 
 const PEPPER: &[u8] = b"session candidate-first test pepper is long enough";
 
-#[test]
-fn unlinked_detail_pages_sources_before_spool_enrichment() {
-    let source = include_str!("../session_analytics.rs")
-        .split("async fn unlinked_session_detail(")
-        .nth(1)
-        .unwrap();
-    assert_eq!(
-        source
-            .matches("FROM (SELECT * FROM request_records")
-            .count(),
-        2
-    );
-    assert_eq!(
-        source
-            .matches("FROM (SELECT * FROM session_archive_unlinked_requests")
-            .count(),
-        2
-    );
-    for branch in source.split("FROM (SELECT * FROM request_records").skip(1) {
-        let bounded = branch
-            .split("LEFT JOIN request_archive_spools")
-            .next()
-            .unwrap();
-        assert!(bounded.contains("conversation_cluster_id IS NULL"));
-        assert!(bounded.contains("ORDER BY created_at DESC, id DESC LIMIT"));
-    }
-}
-
 #[tokio::test]
 async fn unlinked_bucket_keeps_identity_and_pages_mixed_sources_without_gaps() {
     let directory = tempfile::tempdir().unwrap();

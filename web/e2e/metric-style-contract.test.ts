@@ -1,29 +1,15 @@
 import assert from 'node:assert/strict';
-import { existsSync } from 'node:fs';
-import { readdir, readFile } from 'node:fs/promises';
-import { join } from 'node:path';
+import { readFile } from 'node:fs/promises';
 import { fileURLToPath } from 'node:url';
 import test from 'node:test';
 
 import { chromium } from 'playwright';
+import { localChromiumExecutable } from './support/browser-executable.js';
 
 const sharedStylesPath = fileURLToPath(new URL('../src/styles.css', import.meta.url));
 const themeStylesPath = fileURLToPath(new URL('../src/theme.css', import.meta.url));
 const metricStylesPath = fileURLToPath(new URL('../src/styles/metrics.css', import.meta.url));
 const viewportWidths = [320, 390, 768, 1024, 1440, 1920, 2560] as const;
-
-async function localChromiumExecutable() {
-  const defaultExecutable = chromium.executablePath();
-  if (existsSync(defaultExecutable)) return defaultExecutable;
-  const workspaceUserCache = fileURLToPath(new URL('../../../../.cache/ms-playwright', import.meta.url));
-  const installations = await readdir(workspaceUserCache, { withFileTypes: true }).catch(() => []);
-  for (const installation of installations) {
-    if (!installation.isDirectory() || !installation.name.startsWith('chromium-')) continue;
-    const executable = join(workspaceUserCache, installation.name, 'chrome-linux64', 'chrome');
-    if (existsSync(executable)) return executable;
-  }
-  return undefined;
-}
 
 test('metric stylesheet owns label and value typography through explicit classes', async () => {
   const css = await readFile(metricStylesPath, 'utf8');
@@ -41,9 +27,9 @@ test('metric stylesheet owns label and value typography through explicit classes
 
 test('metric typography remains readable and overflow-free at supported widths in both themes', {
   timeout: 30_000,
-}, async () => {
+}, async (context) => {
   const executablePath = await localChromiumExecutable();
-  if (!executablePath) return test.skip('a local Chromium runtime is required for computed-style assertions');
+  if (!executablePath) return context.skip('a local Chromium runtime is required for computed-style assertions');
   const browser = await chromium.launch({ executablePath, headless: true });
   try {
     const page = await browser.newPage();
