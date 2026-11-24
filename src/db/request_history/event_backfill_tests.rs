@@ -29,6 +29,11 @@ async fn request_history_real_services_acceptance_event_backfill_time_cursor() {
         .append_pair("options", &format!("-csearch_path={schema}"));
     let database = Database::connect(isolated.as_str()).await.unwrap();
     database.migrate().await.unwrap();
+    assert_selected_source(&database).await;
+    sqlx::query("UPDATE request_history_backfill SET done=0,after_id='' WHERE source='event'")
+        .execute(&database.pool)
+        .await
+        .unwrap();
     assert_event_cursor(&database).await;
     let now = unix_millis();
     sqlx::query("INSERT INTO request_events (event_id,tenant_id,key_id,request_id,event_at,event_kind,protocol,model,input_tokens,output_tokens,cost_micros) SELECT md5(n::text),'plan-tenant','plan-key',md5(n::text),$1-(n%4)*86400000,'finished','openai','plan',0,0,0 FROM generate_series(1,20000) n")
@@ -169,6 +174,63 @@ async fn sqlite_selected_source_page_does_not_wait_for_events() {
         .execute(&database.pool)
         .await
         .unwrap();
+    assert_selected_source(&database).await;
+}
+
+async fn assert_selected_source(database: &Database) {
+    use crate::request_history::HistorySource;
+    let id = Uuid::now_v7();
+    let tenant = Uuid::now_v7();
+    let key = Uuid::now_v7();
+    sqlx::query("INSERT INTO generation_jobs (id,tenant_id,key_id,upstream_account_id,reservation_id,public_model,upstream_model,driver,status,request_object,estimated_units,next_attempt_at,created_at,updated_at) VALUES ($1,$2,$3,$4,$5,'fixture','fixture','http-json','queued','gap://fixture/generation',1,1,1,1)")
+        .bind(id.to_string()).bind(tenant.to_string()).bind(key.to_string()).bind(Uuid::now_v7().to_string()).bind(Uuid::now_v7().to_string()).execute(&database.pool).await.unwrap();
+    sqlx::query("DELETE FROM request_history_export WHERE source='generation' AND request_id=$1")
+        .bind(id.to_string())
+        .execute(&database.pool)
+        .await
+        .unwrap();
+    let before: Vec<(String,String,i64)> = sqlx::query_as("SELECT source,after_id,done FROM request_history_backfill WHERE source<>'generation' ORDER BY source").fetch_all(&database.pool).await.unwrap();
+    assert_eq!(
+        database
+            .history_backfill_source_page(64, Some(HistorySource::Generation))
+            .await
+            .unwrap(),
+        1
+    );
+    let queued = sqlx::query("SELECT tenant_id,key_id,created_at FROM request_history_export WHERE source='generation' AND request_id=$1").bind(id.to_string()).fetch_one(&database.pool).await.unwrap();
+    assert_eq!(
+        queued.try_get::<String, _>("tenant_id").unwrap(),
+        tenant.to_string()
+    );
+    assert_eq!(
+        queued.try_get::<String, _>("key_id").unwrap(),
+        key.to_string()
+    );
+    assert_eq!(queued.try_get::<i64, _>("created_at").unwrap(), 1);
+    let cursor: String = sqlx::query_scalar(
+        "SELECT after_id FROM request_history_backfill WHERE source='generation'",
+    )
+    .fetch_one(&database.pool)
+    .await
+    .unwrap();
+    assert_eq!(cursor, id.to_string());
+    let after: Vec<(String,String,i64)> = sqlx::query_as("SELECT source,after_id,done FROM request_history_backfill WHERE source<>'generation' ORDER BY source").fetch_all(&database.pool).await.unwrap();
+    assert_eq!(before, after);
+    assert_eq!(
+        database
+            .history_backfill_source_page(64, Some(HistorySource::Generation))
+            .await
+            .unwrap(),
+        0
+    );
+    let count: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM request_history_export WHERE source='generation' AND request_id=$1",
+    )
+    .bind(id.to_string())
+    .fetch_one(&database.pool)
+    .await
+    .unwrap();
+    assert_eq!(count, 1);
     // Event remains unfinished while empty native/generation pages are processed.
     assert_eq!(
         database
@@ -196,7 +258,14 @@ async fn sqlite_selected_source_page_does_not_wait_for_events() {
             done,
             i64::from(source == "native" || source == "generation")
         );
-        assert_eq!(row.try_get::<String, _>("after_id").unwrap(), "");
+        assert_eq!(
+            row.try_get::<String, _>("after_id").unwrap(),
+            if source == "generation" {
+                id.to_string()
+            } else {
+                String::new()
+            }
+        );
     }
     assert!(!database.history_backfill_done().await.unwrap());
     assert_eq!(
