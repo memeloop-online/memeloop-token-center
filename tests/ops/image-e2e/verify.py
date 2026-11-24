@@ -17,6 +17,18 @@ if mode!='normal':
  faults=int(urllib.request.urlopen('http://127.0.0.1:19001/__test__/count').read()); assert faults>0, 'fault mode did not encounter an object PUT'
  urllib.request.urlopen('http://127.0.0.1:19001/__test__/normal').read()
  print(json.dumps({'fault_mode':mode,'intercepted_puts':faults}))
+frames=body.decode('utf-8').strip().split('\n\n')
+assert frames[-1]=='data: [DONE]' and sum(frame=='data: [DONE]' for frame in frames)==1
+parsed=[json.loads(frame[6:]) for frame in frames[:-1] if frame.startswith('data: ')]
+assert len(parsed)==len(frames)-1
+finish=[i for i,frame in enumerate(parsed) if any(c.get('finish_reason')=='stop' for c in frame.get('choices',[]))]
+usage=[i for i,frame in enumerate(parsed) if frame.get('usage') is not None]
+assert len(finish)==1 and len(usage)==1 and finish[0]<usage[0]==len(parsed)-1
+assert parsed[usage[0]]['usage']['prompt_tokens']==2 and parsed[usage[0]]['usage']['completion_tokens']==1
+assert any(c.get('delta',{}).get('content') for frame in parsed[:finish[0]] for c in frame.get('choices',[]))
+marker=hashlib.sha256(('synthetic image e2e '+NONCE).encode()).hexdigest()
+with open('/tmp/mtc-image-e2e-mock.jsonl') as evidence: observed=[json.loads(line) for line in evidence]
+assert sum(row['marker_sha256']==marker for row in observed)==1
 print(json.dumps({'request_id':rid,'stream_status':200,'stream_bytes':len(body),'stream_sha256':hashlib.sha256(body).hexdigest(),'terminal':True}))
 for i in range(90):
  try:
