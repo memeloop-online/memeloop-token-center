@@ -358,9 +358,10 @@ impl BodyCarrier {
             if let Some(credit) = credit {
                 let retained = source.memory.try_reserve_carrier_retained(chunk.len());
                 if retained.is_none() {
-                    // This is an incomplete tap, not a sealed sole original.
-                    // Failed spill must fail capture rather than pin delivery.
-                    source.offload_one().await?;
+                    // This chunk already owns real source credit. A busy or
+                    // unavailable spill must not turn free source RAM into a
+                    // false capture failure; later offers enforce the byte cap.
+                    let _ = source.offload_one().await;
                 }
                 let bytes = source.leased_bytes(chunk, credit, retained);
                 source.segments.push(Mutex::new(Segment::Ram(bytes)));

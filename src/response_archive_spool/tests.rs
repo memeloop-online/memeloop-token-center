@@ -1575,35 +1575,45 @@ async fn exhausted_archival_credit_records_failure_without_a_prefix_root() {
 }
 
 #[tokio::test]
-async fn sealed_source_releases_credit_before_retrying_saturated_upload_workspace() {
+async fn source_credit_survives_four_upload_contenders_without_cross_pool_starvation() {
     let (_dir, state, _pool, identity) = fixture().await;
+    let envelope = super::CAPTURE_MEMORY_BYTES * crate::gateway_body::memory::CAPTURE_MEMORY_WEIGHT;
+    assert_eq!(
+        state.persistence.stream_memory.snapshot().1
+            + state.persistence.upload_workspace.snapshot().1,
+        super::RAW_STREAM_MEMORY_BYTES
+    );
+    let contenders = (0..4)
+        .map(|_| state.persistence.upload_workspace.temporary(envelope))
+        .collect::<Vec<_>>();
+    assert_eq!(contenders.iter().filter(|r| r.is_ok()).count(), 2);
+    assert_eq!(
+        state.persistence.upload_workspace.snapshot().0,
+        super::RAW_UPLOAD_WORKSPACE_BYTES
+    );
     let mut producer = ResponseArchiveProducer::begin_original(&state, identity)
         .await
         .unwrap();
-    let expected = Bytes::from(vec![b'w'; 64 * 1024]);
-    assert!(producer.try_offer(expected.clone()));
-    let (used, capacity, _, _) = state.persistence.stream_memory.snapshot();
-    assert!(used >= expected.len());
-    let occupied = state
-        .persistence
-        .stream_memory
-        .temporary(capacity - used)
-        .unwrap();
+    let expected = Bytes::from(vec![b'w'; 512 * 1024]);
+    for chunk in expected.chunks(4096) {
+        assert!(producer.try_offer(Bytes::copy_from_slice(chunk)));
+    }
     let sealed = producer.seal().unwrap();
-    tokio::time::timeout(std::time::Duration::from_secs(5), async {
-        while state.persistence.stream_memory.snapshot().0 != capacity - used {
-            tokio::task::yield_now().await;
-        }
-    })
-    .await
-    .expect("confirmed offload must release the source credit before waiting for upload workspace");
-    let available = state
-        .proxy_archive_stream_permits
-        .clone()
-        .try_acquire_many_owned(crate::PROXY_ARCHIVE_STREAM_CONCURRENCY as u32)
-        .expect("failed workspace attempt must return upload slots");
-    drop(available);
-    drop(occupied);
+    tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+    assert!(
+        state.persistence.stream_memory.snapshot().0 > 0,
+        "complete source remains owned while workspace is busy"
+    );
+    assert_eq!(state.proxy_memory_budget.snapshot().0, 0);
+    assert!(
+        state
+            .archive
+            .raw_capture_reference(identity.tenant_id, identity.request_id, "response")
+            .await
+            .unwrap()
+            .is_none()
+    );
+    drop(contenders);
     tokio::time::timeout(std::time::Duration::from_secs(15), sealed.wait())
         .await
         .unwrap();
@@ -1622,6 +1632,7 @@ async fn sealed_source_releases_credit_before_retrying_saturated_upload_workspac
         expected
     );
     assert_eq!(state.persistence.stream_memory.snapshot().0, 0);
+    assert_eq!(state.persistence.upload_workspace.snapshot().0, 0);
 }
 
 #[tokio::test]
