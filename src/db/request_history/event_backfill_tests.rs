@@ -193,6 +193,9 @@ async fn assert_selected_source(database: &Database) {
         .execute(&database.pool)
         .await
         .unwrap();
+    let event = Uuid::now_v7();
+    sqlx::query("INSERT INTO request_events(event_id,tenant_id,key_id,request_id,event_at,event_kind,protocol,model,input_tokens,output_tokens,cost_micros) VALUES($1,$2,$3,$4,$5,'finished','openai','fixture',0,0,0)")
+        .bind(event.to_string()).bind(tenant.to_string()).bind(key.to_string()).bind(id.to_string()).bind(unix_millis()).execute(&database.pool).await.unwrap();
     let before: Vec<(String,String,i64)> = sqlx::query_as("SELECT source,after_id,done FROM request_history_backfill WHERE source<>'generation' ORDER BY source").fetch_all(&database.pool).await.unwrap();
     assert_eq!(
         database
@@ -285,4 +288,20 @@ async fn assert_selected_source(database: &Database) {
         .await
         .unwrap();
     assert_eq!(mode, "shadow");
+    // Leave the shared PG fixture clean before its independent default-cursor contract.
+    sqlx::query("DELETE FROM request_events WHERE event_id=$1")
+        .bind(event.to_string())
+        .execute(&database.pool)
+        .await
+        .unwrap();
+    sqlx::query("DELETE FROM request_history_export WHERE source='event' AND request_id=$1")
+        .bind(event.to_string())
+        .execute(&database.pool)
+        .await
+        .unwrap();
+    sqlx::query("DELETE FROM request_history_identities WHERE source='event' AND request_id=$1")
+        .bind(event.to_string())
+        .execute(&database.pool)
+        .await
+        .unwrap();
 }
