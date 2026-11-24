@@ -172,7 +172,10 @@ async fn normalized_overflow_waits_only_on_workspace_and_cancels_without_leaking
     );
     assert_eq!(state.persistence.stream_memory.snapshot().0, 0);
     task.abort();
-    assert!(task.await.unwrap_err().is_cancelled());
+    match task.await {
+        Err(error) => assert!(error.is_cancelled()),
+        Ok(_) => panic!("normalizer must be cancelled while workspace is occupied"),
+    }
     assert_eq!(json_memory.snapshot().0, 0);
     assert_eq!(
         state.persistence.upload_workspace.snapshot().0,
