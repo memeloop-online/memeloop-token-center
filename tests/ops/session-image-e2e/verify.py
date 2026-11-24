@@ -92,13 +92,14 @@ for item in instances:
   if media:
    status,_,raw=request(path+'?'+urllib.parse.urlencode({'media_cursor':media}),token=k);assert status==200 and raw==b'synthetic-media';found_media=True
   for field in part.get('fields',[]):
-   cursor=field.get('read_cursor')
+   cursor=field.get('content_cursor')
    if not cursor:continue
    status,_,raw=request(path+'?'+urllib.parse.urlencode({'content_cursor':cursor}),token=k)
    frames=[json.loads(line) for line in raw.splitlines() if line]
    text=''.join(frame.get('text','') for frame in frames)
    if text=='large-body-'+NONCE+'😀'*40000:
     assert frames and frames[-1].get('complete') is True;found_large=True
+print(json.dumps({'media_found':found_media,'large_text_found':found_large}),flush=True)
 assert found_media and found_large
 other=post('/internal/v1/keys',{'tenant_external_id':'other-'+NONCE,'principal_external_id':'other-'+NONCE,'alias':'other tenant','currency':'USD','initial_balance':'100','route_ids':[],'policy':{'requests_per_minute':60,'tokens_per_minute':100000,'max_concurrency':1,'enforcement_mode':'metered_unlimited','daily_budget':None,'weekly_budget':None,'lifetime_budget':None}})['key']
 try:request(path,token=other);raise RuntimeError('cross-tenant semantic read succeeded')
