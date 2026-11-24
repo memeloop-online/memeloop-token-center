@@ -265,6 +265,7 @@ impl Database {
         )
         .await?;
             let draft_cursor = crate::db::RequestEventCursor { event_id: Uuid::nil().to_string(), event_at: terminal.completed_at };
+            super::lifecycle::publish_pending_started_in_transaction(&mut tx, &claim.request_id.to_string()).await?;
             let draft_row = sqlx::query(r#"SELECT CAST($1 AS TEXT) AS event_id, CAST(tenant_id AS TEXT) AS tenant_id, CAST(key_id AS TEXT) AS key_id, CAST(id AS TEXT) AS request_id, CAST($2 AS BIGINT) AS event_at, CAST('finished' AS TEXT) AS event_kind, CAST(protocol AS TEXT) AS protocol, CAST(model AS TEXT) AS model, CAST($3 AS BIGINT) AS status_code, CAST($4 AS BIGINT) AS duration_ms, CAST(0 AS BIGINT) AS input_tokens, CAST(0 AS BIGINT) AS output_tokens, CAST(0 AS BIGINT) AS cost_micros, CAST($5 AS TEXT) AS error_code FROM request_records WHERE id = $6 AND created_at = $7 AND tenant_id = $8 AND key_id = $9"#)
                 .bind(&draft_cursor.event_id).bind(draft_cursor.event_at).bind(terminal.status_code)
                 .bind(terminal.duration_ms).bind(&terminal.error_code)

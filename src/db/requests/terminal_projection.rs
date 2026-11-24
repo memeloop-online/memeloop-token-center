@@ -60,6 +60,18 @@ pub(super) async fn statistics_pruned_in_transaction(
 }
 
 impl Database {
+    pub(crate) async fn publish_pending_proxy_started_events(&self) -> Result<(), AppError> {
+        let rows = sqlx::query("SELECT id FROM request_records WHERE started_event_pending = 1 ORDER BY created_at, id LIMIT 32")
+            .fetch_all(&self.pool).await?;
+        for row in rows {
+            let id: String = row.try_get("id")?;
+            let mut transaction = self.begin_write_transaction().await?;
+            super::lifecycle::publish_pending_started_in_transaction(&mut transaction, &id).await?;
+            transaction.commit().await?;
+        }
+        Ok(())
+    }
+
     pub(crate) async fn recover_unknown_terminal_projections(
         &self,
         after: Option<&str>,
@@ -262,6 +274,7 @@ impl Database {
             &request_id,
         )
         .await?;
+        super::lifecycle::publish_pending_started_in_transaction(&mut transaction, &request_id).await?;
         timings.enter(ProjectionStage::EventPrepare);
         let draft_cursor = crate::db::RequestEventCursor {
             event_id: Uuid::nil().to_string(),

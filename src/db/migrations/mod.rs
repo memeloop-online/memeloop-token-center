@@ -1701,6 +1701,11 @@ pub(crate) const POSTGRES_MIGRATIONS: &[Migration] = &[
         name: "history_event_backfill_cursor",
         sql: include_str!("../../../migrations/common/0163_history_event_backfill_cursor.sql"),
     },
+    Migration {
+        version: 164,
+        name: "proxy_started_obligation",
+        sql: include_str!("../../../migrations/common/0164_proxy_started_obligation.sql"),
+    },
 ];
 
 impl Database {

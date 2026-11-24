@@ -44,6 +44,13 @@ async fn lifecycle_events_contract(fixture: Fixture) {
     .await
     .expect("admission cannot wait for archive permits")
     .unwrap();
+    // The obligation survives admission; the existing projection worker can
+    // advance a long request without waiting for archive or its terminal.
+    fixture
+        .database
+        .publish_pending_proxy_started_events()
+        .await
+        .unwrap();
     let started = fixture
         .database
         .request_events_after("operational-test", 0, None, 500)
@@ -52,7 +59,7 @@ async fn lifecycle_events_contract(fixture: Fixture) {
     let started = started
         .iter()
         .find(|event| event.request_id == request_id)
-        .expect("admission commits its event");
+        .expect("worker publishes the committed admission obligation");
     assert_eq!(started.event_kind, "started");
     assert!(started.status_code.is_none());
     assert!(started.usage.tokens.is_none());

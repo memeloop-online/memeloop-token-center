@@ -463,6 +463,9 @@ pub(crate) async fn run_until_shutdown_with_reaper_period(
         PROJECTION_INTERVAL,
         async |state: &AppState, _shutdown: &watch::Receiver<bool>| {
             process_terminal_projection_batch(state, Uuid::now_v7()).await;
+            if let Err(error) = state.db.publish_pending_proxy_started_events().await {
+                tracing::warn!(%error, "worker failed to publish pending request starts");
+            }
         }
     );
     let terminal_recovery_cursor = Mutex::new(None::<String>);
