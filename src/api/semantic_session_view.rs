@@ -406,3 +406,6 @@ mod reader_cursor_tests {
         assert!(decode(&a, &other_scope, b"test").is_err());
     }
 }
+
+#[cfg(test)]
+mod http_contract;
