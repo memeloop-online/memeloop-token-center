@@ -96,7 +96,7 @@ test("isolated endpoints bind namespace to exact services", () => {
   assert.equal(endpoints.forwarded, false);
   assert.equal(endpoints.gateway.href, "http://mtc-staging-gateway:8080/");
   assert.equal(endpoints.control.href, "http://mtc-staging-control:8080/");
-  assert.equal(endpoints.mock.href, "http://mtc-staging-mock:18080/");
+  assert.equal(endpoints.mock.href, "http://mtc-peak-tool-fixture-20261118-mock:18080/");
   assert.equal(targetEndpoints({ ...env, POD_NAMESPACE: "memeloop-token-center-test" }).gateway.hostname, "memeloop-token-center-test-gateway");
   for (const invalid of [
     { ...env, POD_NAMESPACE: "memeloop-token-center" },
@@ -146,6 +146,6 @@ test("staging manifests require verified isolated access metadata",()=>{
   assert.throws(()=>manifests(...args,"staging"));
   const bundle=manifests(...args,"staging",{secretName:"explicit-stage-only",gatewaySelector:{component:"gateway"},controlSelector:{component:"control"}});
   assert(bundle.items.every(item=>item.metadata.namespace==="memeloop-token-center-staging"));
-  const mock=bundle.items.find(item=>item.kind==="Service");assert.equal(mock?.metadata.name,"mtc-staging-mock");assert.equal((mock as any).spec.ports[0].port,18080);
+  assert.equal(bundle.items.filter(item=>item.kind==="Service").length,0);
   assert(JSON.stringify(bundle).includes("explicit-stage-only"));
 });
