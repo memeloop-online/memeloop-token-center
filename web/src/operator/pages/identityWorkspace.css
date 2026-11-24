@@ -111,6 +111,7 @@
 
 .network-proxy-tabs {
   display: flex;
+  flex-wrap: wrap;
   gap: 6px;
   padding: 6px;
   border: 1px solid var(--colorNeutralStroke1);
@@ -118,7 +119,7 @@
   background: var(--colorNeutralBackground3);
 }
 .network-proxy-tabs [role="tab"] {
-  flex: 1 1 auto;
+  flex: 1 1 9rem;
   min-height: 48px;
   justify-content: center;
   border-radius: 6px;
