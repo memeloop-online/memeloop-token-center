@@ -927,7 +927,12 @@ impl ResponseArchiveProducer {
         if bytes.is_empty() {
             return self.active.load(Ordering::Acquire);
         }
-        let Some(credit) = self.capture.budget.try_reserve_ingress_bytes(bytes.len()) else {
+        // Account channel/receipt/allocation metadata as well as wire bytes.
+        let Some(charged) = bytes.len().checked_add(256) else {
+            self.abandon("capture_byte_budget_unavailable");
+            return false;
+        };
+        let Some(credit) = self.capture.budget.try_reserve_ingress_bytes(charged) else {
             self.abandon("capture_byte_budget_unavailable");
             return false;
         };
@@ -1269,9 +1274,9 @@ async fn stage_captured_response(
     };
     while let Some(chunk) = stream.next().await {
         let chunk = chunk.map_err(|error| error.storage_phase("source_read"))?;
-        let upload = Bytes::copy_from_slice(&chunk);
-        drop(chunk);
-        if let Err(error) = writer.write(upload).await {
+        // Preserve the source allocation owner through SDK consumption rather
+        // than copying an arbitrarily large credited segment into workspace.
+        if let Err(error) = writer.write(chunk).await {
             let _ = writer.abort().await;
             return Err(error.storage_phase("multipart_write"));
         }

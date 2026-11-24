@@ -33,7 +33,7 @@ impl Drop for ArchiveActivity {
 impl Default for Persistence {
     fn default() -> Self {
         Self {
-            stream_memory: crate::gateway_body::memory::ProxyMemoryBudget::new(
+            stream_memory: crate::gateway_body::memory::ProxyMemoryBudget::new_archive_source(
                 crate::response_archive_spool::RAW_SOURCE_MEMORY_BYTES as u64,
             ),
             upload_workspace: crate::gateway_body::memory::ProxyMemoryBudget::new(
