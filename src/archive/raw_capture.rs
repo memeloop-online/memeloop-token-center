@@ -668,6 +668,38 @@ mod retirement_contracts {
             .retire_covered_raw_roots(&prepared.publication, &proof)
             .await
             .unwrap();
+        // A retirement provenance reference must not count as a live body
+        // root. Actual atom/manifest ownership still protects equal content.
+        let raw_marks = archive
+            .trace_semantic_raw_gc_references(
+                &prepared.publication,
+                &[input.clone(), response.clone()],
+            )
+            .await
+            .unwrap();
+        assert!(raw_marks.is_empty());
+        let body: super::super::ConversationBodyReference =
+            serde_json::from_value(prepared.atoms[0].content.clone()).unwrap();
+        let body_marks = archive
+            .trace_semantic_raw_gc_references(
+                &prepared.publication,
+                &[
+                    body.conversation_body_v1,
+                    prepared.publication.manifest.clone(),
+                ],
+            )
+            .await
+            .unwrap();
+        assert!(
+            body_marks
+                .iter()
+                .any(|edge| edge.authority == "semantic_atom")
+        );
+        assert!(
+            body_marks
+                .iter()
+                .any(|edge| edge.authority == "semantic_manifest")
+        );
         let inventory = archive
             .inventory_retired_raw(&prepared.publication)
             .await
