@@ -1640,7 +1640,7 @@ async fn failed_capture_fact_is_retried_after_object_storage_recovers() {
         .respond_with(move |_request: &wiremock::Request| {
             if health.load(Ordering::Acquire) {
                 acknowledgements.fetch_add(1, Ordering::Release);
-                ResponseTemplate::new(200)
+                ResponseTemplate::new(200).insert_header("ETag", "\"synthetic-failure-fact\"")
             } else {
                 ResponseTemplate::new(503)
             }
