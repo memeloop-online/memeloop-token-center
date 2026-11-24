@@ -1507,6 +1507,7 @@ async fn proxy_with_cancellation_guard(
         None,
     );
     let AuthorizedProxyRoutes {
+        refreshed_candidates: _,
         primary,
         remaining_candidates,
         input_token_ceiling: _,
