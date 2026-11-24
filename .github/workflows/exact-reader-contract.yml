@@ -721,7 +721,7 @@ jobs:
           grep -F '1 passed; 0 failed' /tmp/terminal-ack-rollback.log
 
   routing-snapshot-contract:
-    if: inputs.contract == 'quota-outage' || inputs.contract == 'admission-cancel'
+    if: inputs.contract == 'quota-outage' || inputs.contract == 'admission-cancel' || inputs.contract == 'orphan-reaper-971'
     runs-on: ubuntu-24.04
     timeout-minutes: 30
     services:
@@ -768,3 +768,14 @@ jobs:
           done
           cargo test --locked --lib api::proxy::tests::group_routing::stale_refresh_enters_group_policy_with_current_snapshot_and_one_budget -- --exact --nocapture 2>&1 | tee /tmp/group-snapshot-refresh.log
           grep -F '1 passed; 0 failed' /tmp/group-snapshot-refresh.log
+      - name: Verify exact terminal recovery and CLI
+        if: inputs.contract == 'orphan-reaper-971'
+        run: |
+          set -o pipefail
+          for backend in sqlite postgres
+          do
+            cargo test --locked --lib "db::tests::terminal_projection::exact_recovery::${backend}_exact_terminal_recovery_preserves_identity_lease_and_once" -- --exact --nocapture 2>&1 | tee /tmp/terminal-exact.log
+            grep -F '1 passed; 0 failed' /tmp/terminal-exact.log
+          done
+          cargo test --locked --bin memeloop-token-center terminal_recovery_cli_tests::exact_recovery_requires_identity_and_defaults_to_inspection -- --exact --nocapture 2>&1 | tee /tmp/terminal-exact-cli.log
+          grep -F '1 passed; 0 failed' /tmp/terminal-exact-cli.log
