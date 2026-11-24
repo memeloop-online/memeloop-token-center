@@ -78,8 +78,21 @@ jobs:
           exit 1
       - name: Verify in-place migration and replay
         run: |
-          test "$(docker exec -e PGPASSWORD="$E2E_PG_PASSWORD" image-e2e-postgres psql -U token_center -d token_center_test -Atqc 'SELECT max(version) FROM schema_migrations')" = 164
+          test "$(docker exec -e PGPASSWORD="$E2E_PG_PASSWORD" image-e2e-postgres psql -U token_center -d token_center_test -Atqc 'SELECT max(version) FROM schema_migrations')" = 165
+          test "$(docker exec -e PGPASSWORD="$E2E_PG_PASSWORD" image-e2e-postgres psql -U token_center -d token_center_test -Atqc 'SELECT count(*) FROM schema_migrations WHERE version IN (164,165)')" = 2
           docker exec -e PGPASSWORD="$E2E_PG_PASSWORD" image-e2e-postgres psql -U token_center -d token_center_test -Atqc "SELECT 1 FROM information_schema.columns WHERE table_name='request_records' AND column_name='started_event_pending'" | grep -x 1
+      - name: Verify deployed image remains ready after schema upgrade
+        run: |
+          docker run -d --name image-e2e-rollback --network host \
+            -e MTC_LISTEN=127.0.0.1:18084 -e MTC_RUN_MIGRATIONS_ON_START=false \
+            -e MTC_DATABASE_URL=postgres://token_center:$E2E_PG_PASSWORD@127.0.0.1:5432/token_center_test \
+            -e MTC_KEY_PEPPER="$E2E_KEY_PEPPER" -e MTC_SERVICE_TOKEN="$E2E_SERVICE_TOKEN" \
+            -e MTC_ARCHIVE_BACKEND=s3 -e MTC_S3_BUCKET=image-e2e -e MTC_S3_ENDPOINT=http://127.0.0.1:19001 -e MTC_S3_ALLOW_HTTP=true \
+            -e MTC_S3_ACCESS_KEY=rustfs-test-fixture -e MTC_S3_SECRET_KEY="$E2E_S3_PASSWORD" \
+            ghcr.io/memeloop-online/memeloop-token-center@sha256:18db7198ca41a501ca9165881b04bfe97218a144ef607d0c8dba8c4b0530be5d
+          for n in $(seq 1 60); do if curl -fsS http://127.0.0.1:18084/readyz; then docker rm -f image-e2e-rollback; exit 0; fi; sleep 2; done
+          docker logs --tail 20 image-e2e-rollback
+          exit 1
       - name: Verify stream, request, usage, session and both archives
         run: |
           set -o pipefail
