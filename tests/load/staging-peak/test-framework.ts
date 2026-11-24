@@ -139,3 +139,13 @@ test("empty isolated fixture preserves first-time setup",async()=>{
   const request=(async()=>new Response("[]")) as typeof fetch;
   assert.equal(await reuseFixture("http://control","token","staging-peak-run","run","http://mock:18080",["normal"],198,request),null);
 });
+
+test("staging manifests require verified isolated access metadata",()=>{
+  const plan=validatePlan({release_batch:"test-only",window_ms:1000,drain_timeout_ms:1000,baseline:null,arrivals:[{protocol:"chat",at_ms:0,scenario:"normal",session:"unit",stream:false,request_padding_bytes:0,response_fixture_bytes:0,chunk_delay_ms:0,client_read_delay_ms:0,expected_status:200}]});
+  const args=["contract","example.invalid/test@sha256:"+"a".repeat(64),"b".repeat(40),plan] as const;
+  assert.throws(()=>manifests(...args,"staging"));
+  const bundle=manifests(...args,"staging",{secretName:"explicit-stage-only",gatewaySelector:{component:"gateway"},controlSelector:{component:"control"}});
+  assert(bundle.items.every(item=>item.metadata.namespace==="memeloop-token-center-staging"));
+  const mock=bundle.items.find(item=>item.kind==="Service");assert.equal(mock?.metadata.name,"mtc-staging-mock");assert.equal((mock as any).spec.ports[0].port,18080);
+  assert(JSON.stringify(bundle).includes("explicit-stage-only"));
+});
