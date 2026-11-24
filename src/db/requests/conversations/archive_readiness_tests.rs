@@ -1093,12 +1093,39 @@ impl Fixture {
         self.assert_completed_by(owner, assistant).await;
     }
 
+    async fn projected_event_ids(&self) -> Vec<String> {
+        sqlx::query_scalar("SELECT event_id FROM request_events WHERE request_id = $1 AND event_kind = 'projected' ORDER BY event_id")
+            .bind(self.request_id.to_string())
+            .fetch_all(&self.state.db.pool)
+            .await
+            .unwrap()
+    }
+
     async fn assert_completed_by(&self, owner: Uuid, assistant: bool) {
+        // Fixture setup has applied finance. It uses the same event kind as
+        // semantic projection, so distinguish the two at their commit boundary.
+        let financial_outcome: String = sqlx::query_scalar(
+            "SELECT statistics_outcome FROM terminal_projection_outbox WHERE request_id = $1 AND projected_at IS NOT NULL",
+        )
+        .bind(self.request_id.to_string())
+        .fetch_one(&self.state.db.pool)
+        .await
+        .unwrap();
+        assert_eq!(financial_outcome, "applied");
+        let financial_events = self.projected_event_ids().await;
+        assert_eq!(financial_events.len(), 1, "finance must publish once");
         assert!(
             crate::worker::archive_session_body(&self.state, owner, self.request_id)
                 .await
                 .unwrap()
         );
+        let completed_events = self.projected_event_ids().await;
+        assert_eq!(
+            completed_events.len(),
+            financial_events.len() + 1,
+            "semantic projection must publish one new event"
+        );
+        assert!(completed_events.contains(&financial_events[0]));
         assert!(
             !crate::worker::archive_session_body(&self.state, owner, self.request_id)
                 .await
@@ -1129,9 +1156,11 @@ impl Fixture {
             assistant,
             "{encoded}"
         );
-        let events: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM request_events WHERE request_id = $1 AND event_kind = 'projected'")
-            .bind(self.request_id.to_string()).fetch_one(&self.state.db.pool).await.unwrap();
-        assert_eq!(events, 1);
+        assert_eq!(
+            self.projected_event_ids().await,
+            completed_events,
+            "replaying semantic projection must preserve the event identities"
+        );
     }
 }
 

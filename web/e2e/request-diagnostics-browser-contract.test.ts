@@ -134,8 +134,12 @@ test('Request diagnostics remain copyable, session-linked, and contained on narr
       await surface.locator('.request-outcome').focus();
       const causeTooltip = page.getByRole('tooltip').filter({ hasText: cause });
       await causeTooltip.waitFor();
-      assert.equal(await causeTooltip.innerText(), `Recorded cause: ${cause}`);
-      assert.doesNotMatch(await causeTooltip.innerText(), /429|Recorded status|[0-9a-f]{8}(?:-[0-9a-f]{4}){3}-[0-9a-f]{12}/i);
+      assert.equal(await causeTooltip.locator('.request-status-tooltip-reason').innerText(), `Recorded cause: ${cause}`);
+      const technicalGroup = causeTooltip.getByRole('group', { name: 'Technical details', exact: true });
+      assert.deepEqual(await technicalGroup.locator('dt').allTextContents(), ['Recorded status', 'Terminal cause code']);
+      assert.deepEqual(await technicalGroup.locator('dd').allTextContents(), ['429', terminalCode]);
+      const tooltipText = await causeTooltip.innerText();
+      assert.doesNotMatch(tooltipText, /http_429|Authorization:|Bearer\s|(?:api[_ -]?key|secret|password)\s*[:=]|[0-9a-f]{8}(?:-[0-9a-f]{4}){3}-[0-9a-f]{12}/i);
       await page.keyboard.press('Escape');
     }
     assert.match(await recordedRow.locator('.request-status-cause').textContent() ?? '', /The upstream connection was reset/);
