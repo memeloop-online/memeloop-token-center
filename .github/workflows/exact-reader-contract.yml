@@ -220,6 +220,7 @@ jobs:
             api::proxy::upstream_response::tests::archive_tap::slow_or_failed_dual_object_stores_do_not_own_customer_eof \
             response_archive_spool::tests::byte_charged_tap_accepts_mixed_chunks_without_fragment_count_limit \
             response_archive_spool::tests::concurrent_byte_charged_taps_preserve_every_original \
+            response_archive_spool::tests::exhausted_archival_credit_records_failure_without_a_prefix_root \
             response_archive_spool::tests::shared_capture_reaches_eof_while_all_upload_slots_are_held \
             response_archive_spool::tests::unavailable_local_directory_does_not_gate_complete_original
           do

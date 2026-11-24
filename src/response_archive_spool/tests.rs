@@ -1538,3 +1538,38 @@ async fn concurrent_byte_charged_taps_preserve_every_original() {
     .unwrap();
     assert_eq!(state.persistence.stream_memory.snapshot().0, baseline);
 }
+
+#[tokio::test]
+async fn exhausted_archival_credit_records_failure_without_a_prefix_root() {
+    let (_dir, state, _pool, identity) = fixture().await;
+    let capacity = state.persistence.stream_memory.snapshot().1;
+    let occupied = state.persistence.stream_memory.temporary(capacity).unwrap();
+    let mut producer = ResponseArchiveProducer::begin_original(&state, identity)
+        .await
+        .unwrap();
+    assert!(!producer.try_offer(Bytes::from_static(b"not a complete original")));
+    drop(producer);
+    tokio::time::timeout(std::time::Duration::from_secs(5), async {
+        while !state
+            .archive
+            .raw_capture_failed(identity.tenant_id, identity.request_id, "response")
+            .await
+            .unwrap()
+        {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .unwrap();
+    assert!(
+        state
+            .archive
+            .raw_capture_reference(identity.tenant_id, identity.request_id, "response")
+            .await
+            .unwrap()
+            .is_none()
+    );
+    drop(occupied);
+    assert_eq!(state.persistence.stream_memory.snapshot().0, 0);
+    assert_eq!(state.proxy_memory_budget.snapshot().0, 0);
+}

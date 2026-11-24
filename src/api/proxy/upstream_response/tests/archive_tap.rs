@@ -56,7 +56,7 @@ async fn slow_or_failed_dual_object_stores_do_not_own_customer_eof() {
                     .clone()
                     .with_archive(state.archive.clone());
                 // Deliberately small byte budgets exercise spill and truthful overflow.
-                // Queue credit is archival; carrier memory remains separately accounted.
+                // Queue and carrier transfer the same archival credit; delivery is separate.
                 state.proxy_memory_budget = Arc::new(ProxyMemoryBudget::new(64 * 1024));
                 let mut persistence = crate::api::proxy::persistence::Persistence::default();
                 persistence.stream_memory = ProxyMemoryBudget::new(256 * 1024);
@@ -134,6 +134,16 @@ async fn slow_or_failed_dual_object_stores_do_not_own_customer_eof() {
                         "an incomplete prefix cannot publish a raw root"
                     );
                 }
+                assert_eq!(
+                    state.persistence.stream_memory.snapshot().0,
+                    0,
+                    "abandoned input/current receipt must return all archival credit"
+                );
+                assert_eq!(
+                    state.proxy_memory_budget.snapshot().0,
+                    0,
+                    "archive tap must not charge delivery"
+                );
                 release_fence.send(()).unwrap();
             }
         }
