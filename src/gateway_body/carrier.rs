@@ -101,6 +101,18 @@ pub(crate) struct BodyCarrier {
     readers: std::sync::atomic::AtomicUsize,
 }
 
+// The SDK may retain a body clone after a cancelled upload future. Its
+// envelope follows those exact Bytes until the final network owner releases it.
+struct WorkspaceWrite {
+    bytes: Bytes,
+    _workspace: Option<Arc<dyn Send + Sync>>,
+}
+impl AsRef<[u8]> for WorkspaceWrite {
+    fn as_ref(&self) -> &[u8] {
+        &self.bytes
+    }
+}
+
 struct WorkspaceRead {
     bytes: Vec<u8>,
     _workspace: Arc<dyn Send + Sync>,
@@ -496,15 +508,32 @@ impl BodyCarrier {
             .unwrap()
             .push((owner.clone(), false));
         archive.begin_carrier_object(&owner).await?;
-        let mut writer = archive.start_writer(&locator).await?;
-        if let Some(workspace) = workspace {
-            writer.retain_workspace(workspace);
-        }
-        if let Err(error) = writer.write(bytes.clone()).await {
-            let _ = writer.abort().await;
-            return Err(error);
-        }
-        let staged = writer.finish_staged().await?;
+        let staged = if bytes.len() <= crate::archive::ARCHIVE_MULTIPART_PART_BYTES {
+            // One owned segment already fits the existing multipart envelope.
+            // A single PUT retains these exact Bytes until its ACK; uncertain
+            // completion leaves RAM and the active receipt with this carrier.
+            let payload = Bytes::from_owner(WorkspaceWrite {
+                bytes: bytes.clone(),
+                _workspace: workspace.map(|guard| guard as Arc<dyn Send + Sync>),
+            });
+            archive.put(&locator, payload).await?;
+            StagedArchiveObject {
+                object_locator: locator,
+                size_bytes: bytes.len() as u64,
+                blake3_digest: blake3::hash(&bytes).to_hex().to_string(),
+            }
+        } else {
+            let mut writer = archive.start_writer(&locator).await?;
+            if let Some(workspace) = workspace {
+                writer.retain_workspace(workspace);
+            }
+            if let Err(error) = writer.write(bytes.clone()).await {
+                let _ = writer.abort().await;
+                return Err(error);
+            }
+            let staged = writer.finish_staged().await?;
+            staged
+        };
         if staged.size_bytes != bytes.len() as u64
             || staged.blake3_digest != blake3::hash(&bytes).to_hex().as_str()
         {
@@ -1320,3 +1349,7 @@ mod tests {
         assert_eq!(hash.finalize().to_hex().as_str(), source.digest());
     }
 }
+
+#[cfg(test)]
+#[path = "carrier_small_put_tests.rs"]
+mod small_put_tests;
