@@ -29,8 +29,8 @@ impl Database {
         let row = sqlx::query("SELECT t.account_projected_at,t.projected_at,t.lease_owner,t.lease_expires_at,t.cost_micros,
             CAST(CASE WHEN t.usage_basis='provider_reported' AND t.status_code BETWEEN 200 AND 399
               AND t.error_code='' AND r.status_code=t.status_code AND r.input_tokens=t.input_tokens
-              AND r.output_tokens=t.output_tokens AND r.cost_micros=t.cost_micros
-              AND o.status_code=t.status_code AND u.status='settled' AND u.actual_micros=t.cost_micros
+              AND r.output_tokens=t.output_tokens AND r.cost_micros=t.cost_micros AND r.usage_basis=t.usage_basis
+              AND o.status_code=t.status_code AND COALESCE(o.error_code,'')='' AND u.status='settled' AND u.actual_micros=t.cost_micros
               THEN 1 ELSE 0 END AS BIGINT) AS trusted,
             (SELECT COUNT(*) FROM ledger_entries l WHERE l.account_id=t.account_id AND l.key_id=t.key_id AND l.source=t.reservation_id AND l.kind='usage') AS ledger_count,
             (SELECT COALESCE(SUM(l.amount_micros),0) FROM ledger_entries l WHERE l.account_id=t.account_id AND l.key_id=t.key_id AND l.source=t.reservation_id AND l.kind='usage') AS ledger_amount,
@@ -139,7 +139,11 @@ impl Database {
             .is_some();
         tx.commit().await?;
         if !claimed {
-            return self.inspect_terminal_recovery(identity).await;
+            let mut current = self.inspect_terminal_recovery(identity).await?;
+            if current.state == "eligible" {
+                current.state = "not_claimed";
+            }
+            return Ok(current);
         }
         // Recheck current authoritative source after claiming, before the
         // original writer performs any account projection.
