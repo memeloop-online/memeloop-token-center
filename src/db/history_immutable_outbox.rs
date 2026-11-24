@@ -410,12 +410,25 @@ async fn capture_event_envelope_in_transaction(
     identity: &crate::request_history::HistoryIdentity,
     revision: i64,
 ) -> Result<(), AppError> {
-    let request_id = identity.request_id.to_string();
-    let payload = Database::history_original_event_in_transaction(transaction, identity).await?;
-    let archive_identity=sqlx::query("SELECT e.request_id,CASE WHEN EXISTS(SELECT 1 FROM generation_jobs g WHERE g.id=e.request_id AND g.tenant_id=e.tenant_id AND g.key_id=e.key_id) THEN 'generation' ELSE 'native' END AS source FROM request_events e WHERE e.event_id=$1 AND e.tenant_id=$2 AND e.key_id=$3 AND e.event_at=$4")
-        .bind(&request_id).bind(identity.tenant_id.to_string()).bind(identity.key_id.to_string()).bind(identity.created_at).fetch_optional(&mut **transaction).await?;
-    let archive_identity=archive_identity.map(|row| -> Result<Value,AppError> {Ok(serde_json::json!({"tenant_id":identity.tenant_id,"request_id":row.try_get::<String,_>("request_id")?,"source":row.try_get::<String,_>("source")?}))}).transpose()?;
-    let original_event = original_event_in_transaction(transaction, identity).await?;
+    // Read the immutable event once. The same row owns its original fields,
+    // payload draft and archive identity; the helper column is not provenance.
+    let event = sqlx::query("SELECT e.*, CASE WHEN EXISTS(SELECT 1 FROM generation_jobs g WHERE g.id=e.request_id AND g.tenant_id=e.tenant_id AND g.key_id=e.key_id) THEN 'generation' ELSE 'native' END AS capture_archive_source FROM request_events e WHERE e.event_id=$1 AND e.tenant_id=$2 AND e.key_id=$3 AND e.event_at=$4")
+        .bind(identity.request_id.to_string()).bind(identity.tenant_id.to_string())
+        .bind(identity.key_id.to_string()).bind(identity.created_at)
+        .fetch_optional(&mut **transaction).await?;
+    let (payload, archive_identity, original_event) = if let Some(event) = event {
+        let draft = EventDraft::from_row(&event)?;
+        let payload = Database::history_draft_event_in_transaction(transaction, &draft).await?;
+        let archive_identity = serde_json::json!({"tenant_id":identity.tenant_id,"request_id":draft.request_id,"source":event.try_get::<String,_>("capture_archive_source")?});
+        let mut original = original_row(&event)?;
+        original
+            .as_object_mut()
+            .expect("original_row returns an object")
+            .remove("capture_archive_source");
+        (payload, Some(archive_identity), original)
+    } else {
+        (None, None, Value::Null)
+    };
     let envelope = serde_json::json!({"originals":{"event":original_event},"version":1,"source":"event","revision":revision,"request_id":identity.request_id,"tenant_id":identity.tenant_id,"key_id":identity.key_id,"created_at":identity.created_at,"payload":payload,"read_model":null,"statistics":null,"filter_cost_micros":null,"archive_identity":archive_identity});
     insert_envelope_in_transaction(transaction, &identity, revision, &envelope).await?;
     Ok(())
@@ -1306,3 +1319,6 @@ mod tests {
 
 #[cfg(test)]
 mod reuse_tests;
+
+#[cfg(test)]
+mod event_capture_tests;

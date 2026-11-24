@@ -1,0 +1,86 @@
+name: image-e2e-contract
+on:
+  workflow_dispatch:
+    inputs:
+      image:
+        description: Exact candidate image digest
+        required: false
+        default: ghcr.io/memeloop-online/memeloop-token-center@sha256:f49638a10a866087073b06b7a79d2f25da12e19bed1f83032a3f059209560d2a
+  pull_request:
+    paths:
+      - .github/workflows/image-e2e-contract.yml
+      - tests/ops/image-e2e/**
+permissions:
+  contents: read
+jobs:
+  exact-image-e2e:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+        with:
+          persist-credentials: false
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020
+        with:
+          node-version: 24.18.0
+      - name: Generate isolated credentials
+        run: |
+          service_token=$(openssl rand -hex 32)
+          pepper=$(openssl rand -hex 32)
+          pgpass=$(openssl rand -hex 20)
+          s3pass=$(openssl rand -hex 20)
+          echo "::add-mask::$service_token"
+          echo "::add-mask::$pepper"
+          echo "::add-mask::$pgpass"
+          echo "::add-mask::$s3pass"
+          echo "E2E_SERVICE_TOKEN=$service_token" >> "$GITHUB_ENV"
+          echo "E2E_KEY_PEPPER=$pepper" >> "$GITHUB_ENV"
+          echo "E2E_PG_PASSWORD=$pgpass" >> "$GITHUB_ENV"
+          echo "E2E_S3_PASSWORD=$s3pass" >> "$GITHUB_ENV"
+      - name: Start isolated PostgreSQL
+        run: |
+          docker run -d --name image-e2e-postgres -p 127.0.0.1:5432:5432 -e POSTGRES_USER=token_center -e POSTGRES_PASSWORD="$E2E_PG_PASSWORD" -e POSTGRES_DB=token_center_test postgres:16-alpine
+          for n in $(seq 1 60); do docker exec image-e2e-postgres pg_isready -U token_center -d token_center_test && exit 0; sleep 1; done
+          exit 1
+      - name: Start isolated synthetic mock
+        run: |
+          node tests/ops/image-e2e/mock.ts >"$RUNNER_TEMP/mock.log" 2>&1 &
+          for n in $(seq 1 30); do curl -fsS http://127.0.0.1:18082/healthz && exit 0; sleep 1; done
+          exit 1
+      - name: Start isolated object store
+        run: |
+          export RUSTFS_ACCESS_KEY=rustfs-test-fixture RUSTFS_SECRET_KEY="$E2E_S3_PASSWORD"
+          docker run -d --name image-e2e-rustfs -p 127.0.0.1:19000:9000 --memory 1g --env RUSTFS_ACCESS_KEY --env RUSTFS_SECRET_KEY --env RUSTFS_ADDRESS=:9000 --env RUSTFS_CONSOLE_ENABLE=false --env RUSTFS_OBS_LOG_DIRECTORY= --entrypoint /usr/bin/rustfs rustfs/rustfs:1.0.4@sha256:ed9210d6411d77ffceb70d94b964a3cb7d225983368bc25bebe01e995293dcc2 /data
+          for n in $(seq 1 60); do curl -fsS --aws-sigv4 'aws:amz:us-east-1:s3' --user "$RUSTFS_ACCESS_KEY:$RUSTFS_SECRET_KEY" -X PUT http://127.0.0.1:19000/image-e2e && exit 0; sleep 2; done
+          exit 1
+      - name: Start loopback fault proxy
+        run: python3 tests/ops/image-e2e/object_proxy.py >"$RUNNER_TEMP/object-proxy.log" 2>&1 &
+      - name: Start exact candidate
+        env:
+          IMAGE: ${{ inputs.image || 'ghcr.io/memeloop-online/memeloop-token-center@sha256:f49638a10a866087073b06b7a79d2f25da12e19bed1f83032a3f059209560d2a' }}
+        run: |
+          [[ "$IMAGE" =~ ^ghcr\.io/memeloop-online/memeloop-token-center@sha256:[0-9a-f]{64}$ ]]
+          docker run -d --name image-e2e-service --network host \
+            -e MTC_LISTEN=127.0.0.1:18080 -e MTC_ALLOW_OAUTH_LOOPBACK=true \
+            -e MTC_DATABASE_URL=postgres://token_center:$E2E_PG_PASSWORD@127.0.0.1:5432/token_center_test \
+            -e MTC_KEY_PEPPER="$E2E_KEY_PEPPER" \
+            -e MTC_SERVICE_TOKEN="$E2E_SERVICE_TOKEN" \
+            -e MTC_ARCHIVE_BACKEND=s3 -e MTC_S3_BUCKET=image-e2e -e MTC_S3_ENDPOINT=http://127.0.0.1:19001 -e MTC_S3_REGION=us-east-1 -e MTC_S3_ALLOW_HTTP=true \
+            -e MTC_S3_ACCESS_KEY=rustfs-test-fixture -e MTC_S3_SECRET_KEY="$E2E_S3_PASSWORD" \
+            "$IMAGE"
+          for n in $(seq 1 120); do curl -fsS http://127.0.0.1:18080/readyz && exit 0; sleep 2; done
+          docker logs --tail 40 image-e2e-service
+          exit 1
+      - name: Verify stream, request, usage, session and both archives
+        run: python3 tests/ops/image-e2e/verify.py
+      - name: Verify slow object publication preserves complete stream
+        env:
+          E2E_FAULT_MODE: slow
+        run: python3 tests/ops/image-e2e/verify.py
+      - name: Verify unavailable object publication preserves complete stream
+        env:
+          E2E_FAULT_MODE: fail
+        run: python3 tests/ops/image-e2e/verify.py
+      - name: Safe diagnostics
+        if: failure()
+        run: docker ps -a --filter name=image-e2e --format '{{.Names}} {{.Status}}'

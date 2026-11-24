@@ -816,6 +816,13 @@ impl ResponseArchiveProducer {
                         .shared_budget(),
                     Some(capture_state.archive.clone()),
                     key,
+                )
+                .with_workspace_budget(
+                    capture_state
+                        .persistence
+                        .upload_workspace
+                        .reservation()
+                        .shared_budget(),
                 );
                 tokio::select! {
                     result = crate::gateway_body::carrier::BodyCarrier::capture_owned(carrier_capture_stream(source_receiver), capture) => result.map(|source| CapturedResponse { source, staging: key }),
@@ -920,7 +927,12 @@ impl ResponseArchiveProducer {
         if bytes.is_empty() {
             return self.active.load(Ordering::Acquire);
         }
-        let Some(credit) = self.capture.budget.try_reserve_ingress_bytes(bytes.len()) else {
+        // Account channel/receipt/allocation metadata as well as wire bytes.
+        let Some(charged) = bytes.len().checked_add(256) else {
+            self.abandon("capture_byte_budget_unavailable");
+            return false;
+        };
+        let Some(credit) = self.capture.budget.try_reserve_ingress_bytes(charged) else {
             self.abandon("capture_byte_budget_unavailable");
             return false;
         };
@@ -1223,6 +1235,7 @@ async fn stage_captured_response(
     state: &AppState,
     source: &Arc<crate::gateway_body::carrier::BodyCarrier>,
     staging: crate::archive_staging::ArchiveStagingKey,
+    workspace: Option<Arc<CaptureQueueMemory>>,
 ) -> Result<
     (
         crate::archive::StagedArchiveObject,
@@ -1251,13 +1264,19 @@ async fn stage_captured_response(
         .start_writer(&locator)
         .await
         .map_err(|error| error.storage_phase("multipart_begin"))?;
+    if let Some(workspace) = &workspace {
+        writer.retain_workspace(workspace.clone());
+    }
     use futures_util::StreamExt;
-    let mut stream = source.open_stream();
+    let mut stream = match workspace {
+        Some(workspace) => source.open_stream_with_workspace(workspace),
+        None => source.open_stream(),
+    };
     while let Some(chunk) = stream.next().await {
         let chunk = chunk.map_err(|error| error.storage_phase("source_read"))?;
-        let upload = Bytes::copy_from_slice(&chunk);
-        drop(chunk);
-        if let Err(error) = writer.write(upload).await {
+        // Preserve the source allocation owner through SDK consumption rather
+        // than copying an arbitrarily large credited segment into workspace.
+        if let Err(error) = writer.write(chunk).await {
             let _ = writer.abort().await;
             return Err(error.storage_phase("multipart_write"));
         }
@@ -1307,7 +1326,7 @@ async fn run_response_archive_writer(
                     .acquire_owned()
                     .await
                     .map_err(|_| AppError::internal("capture_upload_admission_closed"))?;
-                let reservation = match state.persistence.stream_memory.temporary(
+                let reservation = match state.persistence.upload_workspace.temporary(
                     super::CAPTURE_MEMORY_BYTES
                         * crate::gateway_body::memory::CAPTURE_MEMORY_WEIGHT,
                 ) {
@@ -1321,11 +1340,11 @@ async fn run_response_archive_writer(
                         return Err(AppError::storage("capture_upload_workspace_unavailable"));
                     }
                 };
-                Some(CaptureQueueMemory {
+                Some(Arc::new(CaptureQueueMemory {
                     _local_metrics: None,
                     _archive_permit: Some(permit),
                     reservation: Some(reservation),
-                })
+                }))
             } else {
                 None
             };
@@ -1333,7 +1352,7 @@ async fn run_response_archive_writer(
                 crate::metrics::MemoryComponent::StreamCapture,
                 super::CAPTURE_MEMORY_BYTES,
             );
-            stage_captured_response(&state, &source, captured.staging).await
+            stage_captured_response(&state, &source, captured.staging, _upload_memory).await
         }
         .await;
         match staged_attempt {
