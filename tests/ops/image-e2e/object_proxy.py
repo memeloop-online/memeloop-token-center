@@ -10,7 +10,8 @@ class Handler(http.server.BaseHTTPRequestHandler):
  def handle_request(self):
   if self.path.startswith('/__test__/'):
    mode=self.path.rsplit('/',1)[-1]
-   if mode in ('normal','slow','fail'):state['mode']=mode;self.send_response(204);self.end_headers();return
+   if mode in ('normal','slow','fail'):
+    state['mode']=mode;state['faults']=0;self.send_response(204);self.end_headers();return
    self.send_response(200);self.end_headers();self.wfile.write(str(state['faults']).encode());return
   if self.command=='PUT' and state['mode']!='normal':
    state['faults']+=1
