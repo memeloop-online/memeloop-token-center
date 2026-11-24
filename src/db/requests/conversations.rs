@@ -1062,10 +1062,10 @@ impl Database {
         // committed content-only prefix retryable rather than user-visible.
         let mut prepared_payload = None;
         let mut rebuilt_snapshot = None;
-        let prepared_snapshot = {
+        let (prepared_snapshot, prepared_paths) = {
             let prepare_now = unix_millis();
             let prepare = sqlx::query(
-                "SELECT tenant_id, key_id, principal_id, request_json, observed_at, lease_owner, COALESCE(semantic_payload_snapshot_json, semantic_snapshot_json) AS semantic_snapshot_json, CAST(CASE WHEN semantic_payload_snapshot_json IS NOT NULL THEN 1 ELSE 0 END AS BIGINT) AS payload_required, statistics_outcome FROM conversation_projection_outbox WHERE request_id = $1 AND projected_at IS NULL AND COALESCE(terminal_lease_owner, lease_owner) = $2 AND COALESCE(terminal_lease_expires_at, lease_expires_at) >= $3",
+                "SELECT tenant_id, key_id, principal_id, request_json, hints_json, observed_at, lease_owner, COALESCE(semantic_payload_snapshot_json, semantic_snapshot_json) AS semantic_snapshot_json, CAST(CASE WHEN semantic_payload_snapshot_json IS NOT NULL THEN 1 ELSE 0 END AS BIGINT) AS payload_required, statistics_outcome FROM conversation_projection_outbox WHERE request_id = $1 AND projected_at IS NULL AND COALESCE(terminal_lease_owner, lease_owner) = $2 AND COALESCE(terminal_lease_expires_at, lease_expires_at) >= $3",
             )
             .bind(request_id.to_string())
             .bind(lease_owner.to_string())
@@ -1212,7 +1212,44 @@ impl Database {
                 )
                 .await?;
             }
-            snapshot
+            let tenant: String = prepare.try_get("tenant_id")?;
+            let principal: String = prepare.try_get("principal_id")?;
+            let key: String = prepare.try_get("key_id")?;
+            let hints: ConversationHints =
+                serde_json::from_str(&prepare.try_get::<String, _>("hints_json")?)
+                    .map_err(|_| AppError::internal("conversation_prepare_hints"))?;
+            let leaf = if let Some(semantic) = rebuilt_snapshot.as_ref().or(snapshot.as_ref()) {
+                semantic.leaf.clone()
+            } else {
+                let request: String = prepare.try_get("request_json")?;
+                let request: Value = serde_json::from_str(&request)
+                    .map_err(|_| AppError::internal("conversation_prepare_request"))?;
+                build_prefix(&extract_atoms(&request))
+                    .last()
+                    .map(|node| node.node_hash.clone())
+            };
+            // No request/session/projection gate is held while this potentially
+            // large immutable graph is received from PostgreSQL.
+            let mut read = self.pool.begin().await?;
+            let candidates = fetch_conversation_candidates(
+                &mut read,
+                &tenant,
+                &principal,
+                &key,
+                &hints,
+                prepare.try_get("observed_at")?,
+                &request_id.to_string(),
+            )
+            .await?;
+            let paths = prefix_storage::PreparedCandidatePaths::load(
+                &mut read,
+                tenant,
+                &candidates,
+                leaf.as_deref(),
+            )
+            .await?;
+            read.commit().await?;
+            (snapshot, paths)
         };
 
         let mut transaction = self.begin_write_transaction().await?;
@@ -1387,6 +1424,7 @@ impl Database {
                     content_materialized: true,
                 },
                 snapshot.as_ref(),
+                Some(&prepared_paths),
             )
             .await?;
         }
@@ -1513,9 +1551,14 @@ impl Database {
         transaction: &mut Transaction<'_, Any>,
         input: ConversationObservationInput<'_>,
     ) -> Result<Uuid, AppError> {
-        self.record_conversation_observation_with_snapshot_in_transaction(transaction, input, None)
-            .await
-            .map_err(Into::into)
+        self.record_conversation_observation_with_snapshot_in_transaction(
+            transaction,
+            input,
+            None,
+            None,
+        )
+        .await
+        .map_err(Into::into)
     }
 
     async fn record_conversation_observation_with_snapshot_in_transaction(
@@ -1523,6 +1566,7 @@ impl Database {
         transaction: &mut Transaction<'_, Any>,
         input: ConversationObservationInput<'_>,
         snapshot: Option<&ConversationSemanticSnapshot>,
+        prepared_paths: Option<&prefix_storage::PreparedCandidatePaths>,
     ) -> Result<Uuid, ConversationContentError> {
         let ConversationObservationInput {
             key,
@@ -1654,11 +1698,7 @@ impl Database {
             ],
         )
         .await?;
-        // Every structured match below is decisive: the selection loop stops on
-        // a direct parent, same turn, or explicit session. Fetch only that one
-        // indexed row instead of reading and sorting up to 50 wide fingerprints
-        // through one OR predicate while the explicit-session lock is held.
-        let structured_candidate = fetch_structured_conversation_candidate(
+        let candidates = fetch_conversation_candidates(
             transaction,
             &tenant_id,
             &principal_id,
@@ -1668,34 +1708,21 @@ impl Database {
             &request_id,
         )
         .await?;
-        let candidates = if let Some(candidate) = structured_candidate {
-            vec![candidate]
-        } else if hints.parent_turn_id.is_some() {
-            // A declared parent is authoritative. If it is not committed yet,
-            // keep this observation isolated and durable for reconciliation
-            // instead of attaching it to an unrelated semantic candidate.
-            Vec::new()
-        } else {
-            sqlx::query(
-                "SELECT o.id, o.cluster_id, o.atom_hashes_json, o.leaf_node_hash, o.explicit_session_id, o.turn_id, o.upstream_response_id, o.branch_id, o.client_name, o.created_at FROM conversation_observations o JOIN conversation_clusters c ON c.id = o.cluster_id WHERE c.tenant_id = $1 AND c.principal_id = $2 AND o.key_id = $3 AND o.created_at <= $4 AND o.request_id <> $5 ORDER BY o.created_at DESC LIMIT 50",
-            )
-            .bind(&tenant_id)
-            .bind(&principal_id)
-            .bind(&key_id)
-            .bind(now)
-            .bind(&request_id)
-            .fetch_all(&mut **transaction)
-            .await?
-        };
 
         let fingerprint = prefix_storage::Fingerprint::from_hashes(&atom_hashes);
-        let graph = prefix_storage::load_candidate_paths(
-            transaction,
-            &tenant_id,
-            &candidates,
-            leaf.as_deref(),
-        )
-        .await?;
+        let loaded;
+        let graph = if let Some(prepared) = prepared_paths {
+            prepared.for_fresh_candidates(&tenant_id, &candidates, leaf.as_deref())?
+        } else {
+            loaded = prefix_storage::load_candidate_paths(
+                transaction,
+                &tenant_id,
+                &candidates,
+                leaf.as_deref(),
+            )
+            .await?;
+            &loaded
+        };
         {
             // A reference must never publish before its complete content-addressed
             // path exists, including when an importer claims content_materialized.
@@ -2271,6 +2298,48 @@ impl Database {
             edges_truncated,
         })
     }
+}
+
+async fn fetch_conversation_candidates(
+    transaction: &mut Transaction<'_, Any>,
+    tenant_id: &str,
+    principal_id: &str,
+    key_id: &str,
+    hints: &ConversationHints,
+    observed_at: i64,
+    excluded_request_id: &str,
+) -> Result<Vec<AnyRow>, AppError> {
+    let structured_candidate = fetch_structured_conversation_candidate(
+        transaction,
+        tenant_id,
+        principal_id,
+        key_id,
+        hints,
+        observed_at,
+        excluded_request_id,
+    )
+    .await?;
+    let candidates = if let Some(candidate) = structured_candidate {
+        vec![candidate]
+    } else if hints.parent_turn_id.is_some() {
+        // A declared parent is authoritative. If it is not committed yet,
+        // keep this observation isolated and durable for reconciliation
+        // instead of attaching it to an unrelated semantic candidate.
+        Vec::new()
+    } else {
+        sqlx::query(
+                "SELECT o.id, o.cluster_id, o.atom_hashes_json, o.leaf_node_hash, o.explicit_session_id, o.turn_id, o.upstream_response_id, o.branch_id, o.client_name, o.created_at FROM conversation_observations o JOIN conversation_clusters c ON c.id = o.cluster_id WHERE c.tenant_id = $1 AND c.principal_id = $2 AND o.key_id = $3 AND o.created_at <= $4 AND o.request_id <> $5 ORDER BY o.created_at DESC LIMIT 50",
+            )
+            .bind(tenant_id)
+            .bind(principal_id)
+            .bind(key_id)
+            .bind(observed_at)
+            .bind(excluded_request_id)
+            .fetch_all(&mut **transaction)
+            .await?
+    };
+
+    Ok(candidates)
 }
 
 async fn fetch_structured_conversation_candidate(
