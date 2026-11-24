@@ -27,13 +27,13 @@ jobs:
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
         with:
-          ref: 6b3f43efcdcf0f5302e55dc4ec53478522694697
+          ref: 43891c323558212f067f4723de34f1c5b349869c
           persist-credentials: false
       - name: Verify exact product revision
         run: |
           actual_sha="$(git rev-parse HEAD)"
           echo "Product checkout: $actual_sha"
-          test "$actual_sha" = "6b3f43efcdcf0f5302e55dc4ec53478522694697"
+          test "$actual_sha" = "43891c323558212f067f4723de34f1c5b349869c"
       - uses: ./.github/actions/checkout-plugin-examples
       - uses: dtolnay/rust-toolchain@4360b52568e2003a75bf9bc1d59f33a8e3fc893c
         with:
@@ -108,8 +108,90 @@ jobs:
           select_contract audio client_cancellation_does_not_abandon_the_admitted_audio_lifecycle 1 --lib
           select_contract worker worker::tests::oauth_worker_ 2 --lib
           select_contract worker projection_tick_drains_metered_usage_and_records_a_fixed_metric 1 --lib
+          for name in \
+            streaming_codex_cache_usage_is_settled_at_distinct_prices \
+            ordinary_openai_wire_omits_unsolicited_limits_and_settles_above_4096_once \
+            ordinary_openai_preserves_explicit_wire_limits_and_settles_reported_usage \
+            passthrough_reserves_trusted_bound_and_settles_actual_usage_above_4096 \
+            passthrough_explicit_limit_is_forwarded_while_actual_usage_settles_once \
+            sqlite_source_failed_state_write_retries_and_lost_writer_converges \
+            postgres_source_failed_state_write_retries_and_lost_writer_converges \
+            legacy_raw_versioned_text_and_tenant_cas_remain_readable_together; do
+            select_contract test-refactor "$name" 1 --lib
+          done
+          select_contract test-refactor db::archive_spool::tests::request_binding_is_atomic_with_staging_and_preserves_terminal_facts 1 --lib
+          select_contract test-refactor db::archive_spool::tests::binding_is_atomic_with_staging_and_preserves_terminal_facts 1 --lib
           exit "$failed"
       - name: Check all targets and features without emitting test binaries
         if: always()
         timeout-minutes: 30
         run: cargo check --locked --all-targets --all-features
+
+  web-contracts:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 35
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+        with:
+          ref: 43891c323558212f067f4723de34f1c5b349869c
+          persist-credentials: false
+      - name: Verify exact product revision
+        run: test "$(git rev-parse HEAD)" = "43891c323558212f067f4723de34f1c5b349869c"
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020
+        with:
+          node-version: 24.18.0
+          cache: npm
+          cache-dependency-path: |
+            package-lock.json
+            web/package-lock.json
+      - name: Install locked root dependencies
+        id: root_dependencies
+        run: npm ci --ignore-scripts --no-audit
+      - name: Run OpenAPI contract fixture tests
+        if: ${{ !cancelled() && steps.root_dependencies.outcome == 'success' }}
+        run: node --test tests/ops/test-openapi-contract.ts
+      - name: Install locked web dependencies
+        id: web_dependencies
+        if: ${{ !cancelled() }}
+        working-directory: web
+        run: npm ci --ignore-scripts --no-audit
+      - name: Typecheck web and browser fixtures
+        if: ${{ !cancelled() && steps.web_dependencies.outcome == 'success' }}
+        working-directory: web
+        run: npm run typecheck
+      - name: Install pinned Playwright Chromium
+        id: chromium
+        if: ${{ !cancelled() && steps.web_dependencies.outcome == 'success' }}
+        working-directory: web
+        timeout-minutes: 15
+        run: ./node_modules/.bin/playwright install --with-deps chromium
+      - name: Run loading, replay and clipboard contracts in Chromium
+        if: ${{ !cancelled() && steps.chromium.outcome == 'success' }}
+        working-directory: web
+        env:
+          MTC_REQUIRE_BROWSER: "1"
+        run: |
+          set -o pipefail
+          node --import tsx --test --test-reporter=spec --test-concurrency=1 \
+            e2e/session-loading-browser-contract.test.ts \
+            e2e/session-replay-browser-contract.test.ts \
+            e2e/request-diagnostics-browser-contract.test.ts \
+            e2e/credential-create-principal-browser-contract.test.ts \
+            e2e/service-credential-copy-browser-contract.test.ts \
+            e2e/operator-degraded-access-browser-contract.test.ts \
+            e2e/operator-overview-browser-contract.test.ts \
+            e2e/shared-request-metrics-browser-contract.test.ts 2>&1 | tee "$RUNNER_TEMP/web-contracts.log"
+          if grep -Eq '^[[:space:]]*[⁻ℹ]*[[:space:]]*skipped [1-9]' "$RUNNER_TEMP/web-contracts.log"; then
+            echo "::error::A browser contract was skipped"
+            exit 1
+          fi
+      - name: Retain browser evidence and test log
+        if: always()
+        uses: actions/upload-artifact@65462800fd760344b1a7b4382951275a0abb4808
+        with:
+          name: test-refactor-browser
+          path: |
+            ${{ runner.temp }}/web-contracts.log
+            web/e2e-artifacts/
+          if-no-files-found: warn
+          retention-days: 14
