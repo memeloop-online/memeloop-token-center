@@ -7,22 +7,16 @@ permissions:
   contents: read
 jobs:
   short-reference:
-    name: explicit-pagination short (${{ matrix.variant }})
+    name: explicit-pagination short (exact head, isolated)
     runs-on: ubuntu-24.04
     timeout-minutes: 55
-    strategy:
-      fail-fast: false
-      matrix:
-        include:
-          - variant: base
-            revision: 60e6b72b9747501e96e84e342913d806c75c1e52
-          - variant: pr
-            revision: 8e9617ec4bf7c61b606959d91a57556e3af20e54
+    env:
+      PRODUCT_SHA: d8f06ab8295bb3caea0225739b8ca71b520743a6
     steps:
       - name: Initialize evidence
         env:
-          REVISION: ${{ matrix.revision }}
-          VARIANT: ${{ matrix.variant }}
+          REVISION: ${{ env.PRODUCT_SHA }}
+          VARIANT: head
         run: |
           mkdir -p "$RUNNER_TEMP/mtc-short"
           printf 'revision_requested=%s\nvariant=%s\nrun_id=%s\nrun_attempt=%s\n' "$REVISION" "$VARIANT" "$GITHUB_RUN_ID" "$GITHUB_RUN_ATTEMPT" > "$RUNNER_TEMP/mtc-short/workflow.txt"
@@ -32,11 +26,11 @@ jobs:
           fi
       - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4
         with:
-          ref: ${{ matrix.revision }}
+          ref: ${{ env.PRODUCT_SHA }}
           persist-credentials: false
       - name: Verify checkout
         env:
-          REVISION: ${{ matrix.revision }}
+          REVISION: ${{ env.PRODUCT_SHA }}
         run: |
           test "$(git rev-parse HEAD)" = "$REVISION"
           git status --porcelain=v1 --untracked-files=all > "$RUNNER_TEMP/mtc-short/checkout-status.txt"
@@ -51,7 +45,7 @@ jobs:
       - name: Build release binary at tested revision
         timeout-minutes: 35
         env:
-          MTC_BUILD_GIT_SHA: ${{ matrix.revision }}
+          MTC_BUILD_GIT_SHA: ${{ env.PRODUCT_SHA }}
         shell: bash
         run: |
           export MTC_BUILD_TIMESTAMP="$(git show -s --format=%cI HEAD)"
@@ -97,21 +91,70 @@ jobs:
           sha256sum "$RUNNER_TEMP/explicit-page/tests/load/"*.ts > "$RUNNER_TEMP/mtc-short/harness-explicit-page.sha256"
           diff -u "$RUNNER_TEMP/mtc-short/benchmark-memory-original.ts" "$RUNNER_TEMP/explicit-page/tests/load/benchmark-memory.ts" > "$RUNNER_TEMP/mtc-short/harness.patch" || test "$?" = 1
           printf 'reference=explicit-pagination-short\nharness_sha=%s\nproduct_sha=%s\n' "$HARNESS_SHA" "$(git rev-parse HEAD)" > "$RUNNER_TEMP/mtc-short/reference.txt"
-      - name: Run explicit-pagination short reference
+      - name: Run explicit-pagination short reference in private loopback namespace
         timeout-minutes: 15
+        shell: bash
         run: |
-          set +e
-          node "$RUNNER_TEMP/explicit-page/tests/load/benchmark-memory.ts" --profile short \
-            --binary "$GITHUB_WORKSPACE/target/release/memeloop-token-center" \
-            --output "$RUNNER_TEMP/mtc-short/result.json" > "$RUNNER_TEMP/mtc-short/harness.log" 2>&1
-          status=$?
-          printf '%s\n' "$status" > "$RUNNER_TEMP/mtc-short/exit-code.txt"
-          cat "$RUNNER_TEMP/mtc-short/harness.log"
+          set -euo pipefail
+          evidence="$RUNNER_TEMP/mtc-short"
+          uname -srmo > "$evidence/runner.txt"
+          lscpu >> "$evidence/runner.txt"
+          cat /etc/os-release >> "$evidence/runner.txt"
+          systemd --version >> "$evidence/runner.txt"
+          cat > "$RUNNER_TEMP/run-mtc-short" <<'RUN'
+          #!/bin/bash
+          set -euo pipefail
+          node_bin="$1"
+          harness="$2"
+          binary="$3"
+          evidence="$4"
+          cgroup="$(sed -n 's/^0:://p' /proc/self/cgroup)"
+          test -n "$cgroup"
+          cgroup_dir="/sys/fs/cgroup$cgroup"
+          record_cgroup() {
+            for f in memory.max memory.swap.max memory.current memory.peak memory.events cpu.max cpu.stat; do
+              if test -r "$cgroup_dir/$f"; then
+                cat "$cgroup_dir/$f" > "$evidence/$1.$f" || true
+              fi
+            done
+          }
+          trap 'record_cgroup after' EXIT
+          record_cgroup before
+          test "$(cat "$cgroup_dir/memory.max")" = 2147483648
+          test "$(cat "$cgroup_dir/memory.swap.max")" = 0
+          read -r quota period < "$cgroup_dir/cpu.max"
+          test "$quota" -eq "$((2 * period))"
+          ip -brief link > "$evidence/network.txt"
+          ip route show >> "$evidence/network.txt"
+          test "$(ip -brief link | cut -d ' ' -f 1)" = lo
+          test -z "$(ip route show)"
+          ip -o link show lo | grep -Fq '<LOOPBACK,UP,LOWER_UP>'
+          status=0
+          "$node_bin" "$harness" --profile short --binary "$binary" \
+            --output "$evidence/result.json" > "$evidence/harness.log" 2>&1 || status=$?
+          printf '%s\n' "$status" > "$evidence/exit-code.txt"
+          cat "$evidence/harness.log"
+          exit "$status"
+          RUN
+          chmod 755 "$RUNNER_TEMP/run-mtc-short"
+          status=0
+          # Use the same runner OS as the build. The transient service gets a
+          # loopback-only network namespace and shares one cgroup with descendants.
+          sudo systemd-run --wait --pipe --collect --unit=mtc-short-reference \
+            --property="User=$(id -un)" --property=PrivateNetwork=yes \
+            --property=MemoryMax=2G --property=MemorySwapMax=0 --property=CPUQuota=200% \
+            --property=RuntimeMaxSec=840 --property=TimeoutStopSec=15 \
+            --setenv=PATH=/usr/bin:/bin --setenv=LANG=C.UTF-8 \
+            "$RUNNER_TEMP/run-mtc-short" "$(command -v node)" \
+            "$RUNNER_TEMP/explicit-page/tests/load/benchmark-memory.ts" \
+            "$GITHUB_WORKSPACE/target/release/memeloop-token-center" "$evidence" \
+            2>&1 | tee "$evidence/service.log" || status=$?
+          printf '%s\n' "$status" > "$evidence/service-exit-code.txt"
           exit "$status"
       - name: Document evidence fields and gaps
         if: always()
         env:
-          REVISION: ${{ matrix.revision }}
+          REVISION: ${{ env.PRODUCT_SHA }}
         run: |
           node <<'NODE' > "$RUNNER_TEMP/mtc-short/interpretation.json"
           const fs = require('fs');
@@ -132,7 +175,7 @@ jobs:
             evidence_notes: [
               'soak.successes and soak.failures are observed completed requests; soak.achieved_rps is successes divided by elapsed seconds, target_rps is only a target.',
               'stream.observed_peak_concurrency is mock upstream streams, not TCP connection count.',
-              'connection counts, whole-cgroup RSS, production PostgreSQL/S3 behavior, and long-duration capacity are not measured; missing fields are null, not zero.',
+              'cgroup memory peak includes cache and all harness/role processes; TCP counts, production PostgreSQL/S3 behavior, and long-duration capacity are not measured; missing fields are null, not zero.',
               'Evidence uses the pinned base harness with four first-page limits changed from 1000000 to 100; this is not the unmodified short gate.',
               'short uses one gateway plus separate control and worker processes, loopback mock, isolated SQLite and filesystem archive; fixture creates 100000 rows per control resource.'
             ]
@@ -143,7 +186,7 @@ jobs:
         if: always()
         uses: actions/upload-artifact@65462800fd760344b1a7b4382951275a0abb4808 # v4
         with:
-          name: explicit-pagination-short-${{ matrix.variant }}-${{ github.run_id }}-${{ github.run_attempt }}
+          name: explicit-pagination-short-head-${{ github.run_id }}-${{ github.run_attempt }}
           path: ${{ runner.temp }}/mtc-short/
           if-no-files-found: error
           retention-days: 30
