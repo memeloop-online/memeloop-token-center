@@ -30,8 +30,12 @@ async fn source(
     staging: ArchiveStagingKey,
 ) -> (Arc<BodyCarrier>, Arc<ProxyMemoryBudget>) {
     let memory = Arc::new(ProxyMemoryBudget::new(u64::try_from(size + 65536).unwrap()));
-    let mut carrier = BodyCarrier::capture(
-        stream::iter([Ok::<_, std::io::Error>(Bytes::from(vec![b'x'; size]))]),
+    let credit = memory.try_reserve_ingress_bytes(size).unwrap();
+    let mut carrier = BodyCarrier::capture_owned(
+        stream::iter([Ok::<_, std::io::Error>((
+            Bytes::from(vec![b'x'; size]),
+            Some(credit),
+        ))]),
         CarrierCapture::new(memory.clone(), None, staging),
     )
     .await
