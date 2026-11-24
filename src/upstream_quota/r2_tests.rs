@@ -159,7 +159,7 @@ async fn concurrent_reset(relevant_usage: bool) {
         };
         let before = unix_millis() - 1000;
         let deadline = before + 3_600_000;
-        let evidence = SupplierQuotaEvidence { exhausted: true, reset_at: Some(deadline), reset_source: "retry_after" };
+        let evidence = SupplierQuotaEvidence { capacity_scope: crate::db::SupplierQuotaScope::Unknown, exhausted: true, reset_at: Some(deadline), reset_source: "retry_after" };
         for model in ["exact", "unrelated"] {
             let mut target = route.clone();
             target.upstream_model = model.into();

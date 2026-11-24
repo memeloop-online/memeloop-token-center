@@ -11,6 +11,7 @@ mod session_routing;
 mod settlement;
 mod stats;
 mod terminal_projection;
+pub(crate) mod terminal_timings;
 
 pub use conversations::ConversationProjectionTask;
 pub use conversations::{ConversationDetailFilter, ConversationListFilter};
@@ -24,17 +25,16 @@ pub use lifecycle::{
     StartMeteredSynchronousRequest, StartProxyRequest,
 };
 pub(crate) use lifecycle::{
-    ProxyRequestUpstreamAttribution, RequestArchiveAdmission, StartedProxyRequest,
-    SwitchProxyCandidateInput, allocate_request_event_cursor,
+    ProxyRequestUpstreamAttribution, RequestArchiveAdmission, RequestEventCursor,
+    StartedProxyRequest, SwitchProxyCandidateInput, allocate_request_event_cursor,
+    insert_request_started_record_in_transaction, publish_request_started_in_transaction,
     record_request_finished_in_transaction, record_request_started_in_transaction,
 };
 #[cfg(test)]
-pub(crate) use lifecycle::{
-    RequestEventCursor, claim_request_event_locator, claim_request_record_locator,
-};
+pub(crate) use lifecycle::{claim_request_event_locator, claim_request_record_locator};
 pub use metered_projection::MeteredUsageProjectionTask;
 pub(crate) use operational_terminal::{
-    PendingProxyOperationalTerminal, PendingProxyOperationalTerminalAck,
+    ExpiredProxyOwnerScan, PendingProxyOperationalTerminal, PendingProxyOperationalTerminalAck,
 };
 pub use queries::RequestListFilter;
 pub(crate) use queries::{
@@ -43,8 +43,9 @@ pub(crate) use queries::{
 pub(crate) use session_routing::{SessionRoutingTerminalInput, is_session_avoid_terminal};
 pub use settlement::normalize_proxy_usage;
 pub(crate) use settlement::{
-    normalize_proxy_usage_with_output_limit, price_token_usage, reserve_usage_in_transaction,
-    settle_confirmed_image_charge_in_transaction, settle_token_usage_in_transaction,
+    OrphanReservationScan, normalize_proxy_usage_with_output_limit, price_token_usage,
+    reserve_usage_in_transaction, settle_confirmed_image_charge_in_transaction,
+    settle_token_usage_in_transaction,
 };
 pub use stats::StatsFilter;
 #[cfg(test)]

@@ -2110,6 +2110,7 @@ impl BufferedResponsesParser {
         let batch = self.framer.push(chunk);
         if let Some(rejection) = batch.rejection {
             return Err(match rejection {
+                SseFramerRejection::MemoryCapacity => "upstream_response_memory_capacity",
                 SseFramerRejection::EventLimit => "upstream_response_event_too_large",
                 SseFramerRejection::BatchLimit => "upstream_response_event_batch_too_large",
             });

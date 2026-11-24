@@ -1,0 +1,522 @@
+use super::*;
+use rust_decimal::Decimal;
+
+#[derive(Debug, PartialEq, Eq)]
+struct FinanceSnapshot {
+    status: String,
+    actual: Option<i64>,
+    settled_at: Option<i64>,
+    available: i64,
+    reserved: i64,
+    ledger: Vec<(String, i64)>,
+}
+
+async fn finance_snapshot(database: &Database, reservation: Uuid) -> FinanceSnapshot {
+    let row = sqlx::query("SELECT r.status, r.actual_micros, r.settled_at, a.available_micros, a.reserved_micros FROM usage_reservations r JOIN credit_accounts a ON a.id = r.account_id WHERE r.id = $1")
+        .bind(reservation.to_string()).fetch_one(&database.pool).await.unwrap();
+    let ledger = sqlx::query("SELECT id, amount_micros FROM ledger_entries WHERE kind = 'usage' AND source = $1 ORDER BY id")
+        .bind(reservation.to_string()).fetch_all(&database.pool).await.unwrap()
+        .into_iter().map(|row| (row.get("id"), row.get("amount_micros"))).collect();
+    FinanceSnapshot {
+        status: row.get("status"),
+        actual: row.get("actual_micros"),
+        settled_at: row.get("settled_at"),
+        available: row.get("available_micros"),
+        reserved: row.get("reserved_micros"),
+        ledger,
+    }
+}
+
+async fn settled_history_does_not_starve_reserved_contract(database: &Database) {
+    let pepper = b"orphan independent lanes contract pepper";
+    let issued = database
+        .create_key(
+            CreateKeyInput {
+                tenant_external_id: Uuid::now_v7().to_string(),
+                principal_external_id: "member".into(),
+                alias: "orphan-lanes".into(),
+                currency: "USD".into(),
+                policy: KeyPolicy::default(),
+                initial_balance: Decimal::from(10),
+                idempotency_key: None,
+            },
+            pepper,
+        )
+        .await
+        .unwrap();
+    let key = database
+        .authenticate_key(&issued.key, pepper)
+        .await
+        .unwrap();
+    let price = database
+        .upsert_model_price("orphan-lanes", "USD", Decimal::ZERO, Decimal::ONE)
+        .await
+        .unwrap();
+    let old = unix_millis() - 3_600_000;
+    for offset in 0..120_i64 {
+        let reservation = database.reserve_usage(&key, &price, 0, 1).await.unwrap();
+        database.settle_usage(&reservation, 0, 0).await.unwrap();
+        sqlx::query("UPDATE usage_reservations SET created_at = $1 WHERE id = $2")
+            .bind(old - 1000 + offset)
+            .bind(reservation.id.to_string())
+            .execute(&database.pool)
+            .await
+            .unwrap();
+    }
+    let reserved = database.reserve_usage(&key, &price, 0, 1).await.unwrap();
+    sqlx::query("UPDATE usage_reservations SET created_at = $1 WHERE id = $2")
+        .bind(old)
+        .bind(reserved.id.to_string())
+        .execute(&database.pool)
+        .await
+        .unwrap();
+    let mut scan = OrphanReservationScan::default();
+    assert_eq!(
+        database
+            .release_orphaned_reservations_page(1, &mut scan)
+            .await
+            .unwrap(),
+        1,
+        "completed settled history must not consume the reserved page"
+    );
+    let finance = finance_snapshot(database, reserved.id).await;
+    assert_eq!(
+        database
+            .release_orphaned_reservations_page(1, &mut scan)
+            .await
+            .unwrap(),
+        0
+    );
+    assert_eq!(finance_snapshot(database, reserved.id).await, finance);
+
+    // A legacy split writer can have settled finance without a terminal request.
+    let settled = database.reserve_usage(&key, &price, 0, 1).await.unwrap();
+    let request_id = Uuid::now_v7();
+    database
+        .record_request_started(NewRequest {
+            request_id,
+            key_id: key.key_id,
+            tenant_id: key.tenant_id,
+            protocol: "openai".into(),
+            model: "orphan-lanes".into(),
+            request_object: format!("gap://{request_id}/request"),
+            reservation_id: settled.id,
+            upstream_account_id: None,
+            model_route_id: None,
+        })
+        .await
+        .unwrap();
+    database.settle_usage(&settled, 0, 0).await.unwrap();
+    sqlx::query("UPDATE usage_reservations SET created_at = $1 WHERE id = $2")
+        .bind(old)
+        .bind(settled.id.to_string())
+        .execute(&database.pool)
+        .await
+        .unwrap();
+    sqlx::query("UPDATE request_records SET created_at = $1 WHERE id = $2")
+        .bind(old)
+        .bind(request_id.to_string())
+        .execute(&database.pool)
+        .await
+        .unwrap();
+    sqlx::query("UPDATE request_record_locators SET created_at = $1 WHERE id = $2")
+        .bind(old)
+        .bind(request_id.to_string())
+        .execute(&database.pool)
+        .await
+        .unwrap();
+    let finance = finance_snapshot(database, settled.id).await;
+    assert_eq!(
+        database
+            .release_orphaned_reservations_page(1, &mut scan)
+            .await
+            .unwrap(),
+        1
+    );
+    assert_eq!(finance_snapshot(database, settled.id).await, finance);
+    assert_eq!(
+        database
+            .release_orphaned_reservations_page(1, &mut scan)
+            .await
+            .unwrap(),
+        0
+    );
+    assert_eq!(finance_snapshot(database, settled.id).await, finance);
+}
+
+async fn bounded_scan_contract(database: &Database) {
+    let pepper = b"bounded orphan reservation scan contract pepper";
+    let issued = database
+        .create_key(
+            CreateKeyInput {
+                tenant_external_id: Uuid::now_v7().to_string(),
+                principal_external_id: "member".into(),
+                alias: "bounded-orphans".into(),
+                currency: "USD".into(),
+                policy: KeyPolicy::default(),
+                initial_balance: Decimal::from(10),
+                idempotency_key: None,
+            },
+            pepper,
+        )
+        .await
+        .unwrap();
+    let key = database
+        .authenticate_key(&issued.key, pepper)
+        .await
+        .unwrap();
+    let price = database
+        .upsert_model_price("bounded-orphan", "USD", Decimal::ZERO, Decimal::ONE)
+        .await
+        .unwrap();
+    let old = unix_millis() - 60 * 60 * 1000;
+    let mut reservations = Vec::new();
+    let mut requests = Vec::new();
+    for ordinal in 0..3_i64 {
+        let reservation = database.reserve_usage(&key, &price, 0, 100).await.unwrap();
+        sqlx::query("UPDATE usage_reservations SET created_at = $1 WHERE id = $2")
+            .bind(old + ordinal)
+            .bind(reservation.id.to_string())
+            .execute(&database.pool)
+            .await
+            .unwrap();
+        if ordinal < 2 {
+            let request_id = Uuid::now_v7();
+            database
+                .record_request_started(NewRequest {
+                    request_id,
+                    key_id: key.key_id,
+                    tenant_id: key.tenant_id,
+                    protocol: "openai".into(),
+                    model: "bounded-orphan".into(),
+                    request_object: format!("gap://{request_id}/request"),
+                    reservation_id: reservation.id,
+                    upstream_account_id: None,
+                    model_route_id: None,
+                })
+                .await
+                .unwrap();
+            // Deliberately different timestamps: qualification must use the
+            // reservation link, never an invented equality/time window.
+            if ordinal == 0 {
+                sqlx::query("UPDATE request_records SET completed_at = $1 WHERE id = $2")
+                    .bind(unix_millis())
+                    .bind(request_id.to_string())
+                    .execute(&database.pool)
+                    .await
+                    .unwrap();
+            } else {
+                sqlx::query("UPDATE request_records SET submission_started_at = $1 WHERE id = $2")
+                    .bind(unix_millis())
+                    .bind(request_id.to_string())
+                    .execute(&database.pool)
+                    .await
+                    .unwrap();
+            }
+            requests.push(request_id);
+        }
+        reservations.push(reservation);
+    }
+    // Completed history must never consume the live submission candidate page.
+    for _ in 0..12 {
+        let request_id = Uuid::now_v7();
+        database
+            .record_request_started(NewRequest {
+                request_id,
+                key_id: key.key_id,
+                tenant_id: key.tenant_id,
+                protocol: "openai".into(),
+                model: "completed-history".into(),
+                request_object: format!("gap://{request_id}/request"),
+                reservation_id: reservations[0].id,
+                upstream_account_id: None,
+                model_route_id: None,
+            })
+            .await
+            .unwrap();
+        sqlx::query("UPDATE request_records SET completed_at = $1, submission_started_at = $1 WHERE id = $2")
+            .bind(old).bind(request_id.to_string()).execute(&database.pool).await.unwrap();
+    }
+    sqlx::query("UPDATE request_records SET created_at = $1 WHERE id = $2")
+        .bind(old - 1234)
+        .bind(requests[1].to_string())
+        .execute(&database.pool)
+        .await
+        .unwrap();
+    let mut scan = OrphanReservationScan::default();
+    for (ordinal, reservation) in reservations.iter().enumerate() {
+        let released = database
+            .release_orphaned_reservations_page(1, &mut scan)
+            .await
+            .unwrap();
+        assert_eq!(released, u64::from(ordinal == 2));
+        if ordinal == 0 {
+            assert_eq!(
+                scan.request_after,
+                Some((key.tenant_id.to_string(), requests[1].to_string()))
+            );
+            let row = sqlx::query("SELECT submission_uncertain_at, completed_at FROM request_records WHERE id = $1 AND created_at = $2")
+                .bind(requests[1].to_string()).bind(old - 1234).fetch_one(&database.pool).await.unwrap();
+            assert!(
+                row.try_get::<Option<i64>, _>("submission_uncertain_at")
+                    .unwrap()
+                    .is_some()
+            );
+            assert!(
+                row.try_get::<Option<i64>, _>("completed_at")
+                    .unwrap()
+                    .is_none()
+            );
+        }
+
+        assert_eq!(
+            scan.reservation_after,
+            Some((old + ordinal as i64, reservation.id.to_string()))
+        );
+    }
+    for reservation in &reservations[..2] {
+        let status: String =
+            sqlx::query_scalar("SELECT status FROM usage_reservations WHERE id = $1")
+                .bind(reservation.id.to_string())
+                .fetch_one(&database.pool)
+                .await
+                .unwrap();
+        assert_eq!(status, "reserved");
+    }
+    let actual: i64 =
+        sqlx::query_scalar("SELECT actual_micros FROM usage_reservations WHERE id = $1")
+            .bind(reservations[2].id.to_string())
+            .fetch_one(&database.pool)
+            .await
+            .unwrap();
+    assert_eq!(actual, 0);
+    // A previously ineligible row becomes eligible behind the cursor. A full
+    // pass resets it and rechecks the row without changing any money twice.
+    sqlx::query("UPDATE request_records SET completed_at = NULL WHERE id = $1")
+        .bind(requests[0].to_string())
+        .execute(&database.pool)
+        .await
+        .unwrap();
+    assert_eq!(
+        database
+            .release_orphaned_reservations_page(1, &mut scan)
+            .await
+            .unwrap(),
+        0
+    );
+    assert!(scan.reservation_after.is_none());
+    assert_eq!(
+        database
+            .release_orphaned_reservations_page(1, &mut scan)
+            .await
+            .unwrap(),
+        1
+    );
+    let late_finance = finance_snapshot(database, reservations[0].id).await;
+    for _ in 0..=reservations.len() {
+        assert_eq!(
+            database
+                .release_orphaned_reservations_page(1, &mut scan)
+                .await
+                .unwrap(),
+            0
+        );
+    }
+    assert_eq!(
+        finance_snapshot(database, reservations[0].id).await,
+        late_finance,
+        "late eligibility must not repeat a financial transition or ledger entry"
+    );
+    let ledger_count: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM ledger_entries WHERE kind = 'usage' AND source = $1",
+    )
+    .bind(reservations[2].id.to_string())
+    .fetch_one(&database.pool)
+    .await
+    .unwrap();
+    assert_eq!(ledger_count, 1);
+}
+
+#[tokio::test]
+async fn sqlite_orphan_scan_advances_past_ineligible_rows_and_revisits_late_eligibility() {
+    let directory = tempfile::tempdir().unwrap();
+    let database = Database::connect(&format!(
+        "sqlite://{}?mode=rwc",
+        directory.path().join("orphan.db").display()
+    ))
+    .await
+    .unwrap();
+    database.migrate().await.unwrap();
+    settled_history_does_not_starve_reserved_contract(&database).await;
+    request_candidate_contract(&database).await;
+    bounded_scan_contract(&database).await;
+}
+
+#[tokio::test]
+async fn postgres_orphan_scan_advances_past_ineligible_rows_and_revisits_late_eligibility() {
+    super::super::operational_terminal::tests::expired_owner_page_contract().await;
+    super::super::operational_terminal::tests::expired_owner_wait_does_not_block_orphan_lane_contract().await;
+    let Ok(database_url) = std::env::var("MTC_TEST_POSTGRES_URL") else {
+        assert!(
+            std::env::var_os("CI").is_none(),
+            "PostgreSQL orphan scan contract requires MTC_TEST_POSTGRES_URL"
+        );
+        return;
+    };
+    sqlx::any::install_default_drivers();
+    let admin = sqlx::AnyPool::connect(&database_url).await.unwrap();
+    let schema = format!("orphan_scan_{}", Uuid::new_v4().simple());
+    sqlx::query(sqlx::AssertSqlSafe(format!("CREATE SCHEMA {schema}")))
+        .execute(&admin)
+        .await
+        .unwrap();
+    let mut url = url::Url::parse(&database_url).unwrap();
+    url.query_pairs_mut()
+        .append_pair("options", &format!("-csearch_path={schema}"));
+    let database = Database::connect(url.as_str()).await.unwrap();
+    database.migrate().await.unwrap();
+    settled_history_does_not_starve_reserved_contract(&database).await;
+    request_candidate_contract(&database).await;
+    bounded_scan_contract(&database).await;
+    database.pool.close().await;
+    sqlx::query(sqlx::AssertSqlSafe(format!("DROP SCHEMA {schema} CASCADE")))
+        .execute(&admin)
+        .await
+        .unwrap();
+    admin.close().await;
+}
+
+async fn request_candidate_contract(database: &Database) {
+    let pepper = b"orphan candidate tenant fairness contract pepper";
+    let old = unix_millis() - 60 * 60 * 1000;
+    let mut candidates = Vec::new();
+    let mut reservations = Vec::new();
+    for tenant in 0..2 {
+        let issued = database
+            .create_key(
+                CreateKeyInput {
+                    tenant_external_id: Uuid::now_v7().to_string(),
+                    principal_external_id: "member".into(),
+                    alias: "candidate".into(),
+                    currency: "USD".into(),
+                    policy: KeyPolicy::default(),
+                    initial_balance: Decimal::from(10),
+                    idempotency_key: None,
+                },
+                pepper,
+            )
+            .await
+            .unwrap();
+        let key = database
+            .authenticate_key(&issued.key, pepper)
+            .await
+            .unwrap();
+        let price = database
+            .upsert_model_price("candidate-request", "USD", Decimal::ZERO, Decimal::ONE)
+            .await
+            .unwrap();
+        let reservation = database.reserve_usage(&key, &price, 0, 100).await.unwrap();
+        reservations.push(reservation.id);
+        for ordinal in 0..8 {
+            let request_id = Uuid::now_v7();
+            database
+                .record_request_started(NewRequest {
+                    request_id,
+                    key_id: key.key_id,
+                    tenant_id: key.tenant_id,
+                    protocol: "openai".into(),
+                    model: "candidate-request".into(),
+                    request_object: format!("gap://{request_id}/request"),
+                    reservation_id: reservation.id,
+                    upstream_account_id: None,
+                    model_route_id: None,
+                })
+                .await
+                .unwrap();
+            let pending = ordinal == 0 || (tenant == 0 && ordinal == 1);
+            let young = tenant == 0 && ordinal == 1;
+            sqlx::query("UPDATE request_records SET created_at = $1, submission_started_at = $2, completed_at = $3 WHERE id = $4")
+                .bind(if young { unix_millis() } else { old })
+                .bind(old).bind(if pending { None } else { Some(old) })
+                .bind(request_id.to_string()).execute(&database.pool).await.unwrap();
+            if pending {
+                candidates.push((key.tenant_id.to_string(), request_id.to_string(), young));
+            }
+        }
+    }
+    candidates.sort();
+    let mut scan = OrphanReservationScan::default();
+    for (tenant, request, _) in &candidates {
+        assert_eq!(
+            database
+                .release_orphaned_reservations_page(1, &mut scan)
+                .await
+                .unwrap(),
+            0
+        );
+        assert_eq!(scan.request_after, Some((tenant.clone(), request.clone())));
+    }
+    assert_eq!(
+        database
+            .release_orphaned_reservations_page(1, &mut scan)
+            .await
+            .unwrap(),
+        0
+    );
+    assert!(scan.request_after.is_none());
+    for (_, request, young) in &candidates {
+        let uncertain: Option<i64> =
+            sqlx::query_scalar("SELECT submission_uncertain_at FROM request_records WHERE id = $1")
+                .bind(request)
+                .fetch_one(&database.pool)
+                .await
+                .unwrap();
+        assert_eq!(uncertain.is_none(), *young);
+        if *young {
+            sqlx::query("UPDATE request_records SET created_at = $1 WHERE id = $2")
+                .bind(old)
+                .bind(request)
+                .execute(&database.pool)
+                .await
+                .unwrap();
+        }
+    }
+    for _ in &candidates {
+        assert_eq!(
+            database
+                .release_orphaned_reservations_page(1, &mut scan)
+                .await
+                .unwrap(),
+            0
+        );
+    }
+    for (_, request, _) in candidates {
+        let uncertain: Option<i64> =
+            sqlx::query_scalar("SELECT submission_uncertain_at FROM request_records WHERE id = $1")
+                .bind(&request)
+                .fetch_one(&database.pool)
+                .await
+                .unwrap();
+        assert!(uncertain.is_some());
+        // Retire this test's request metadata before the independent reservation
+        // page contract; finance remains reserved and is asserted below.
+        sqlx::query("UPDATE request_records SET completed_at = $1 WHERE id = $2")
+            .bind(unix_millis())
+            .bind(&request)
+            .execute(&database.pool)
+            .await
+            .unwrap();
+    }
+    for reservation in reservations {
+        let status: String =
+            sqlx::query_scalar("SELECT status FROM usage_reservations WHERE id = $1")
+                .bind(reservation.to_string())
+                .fetch_one(&database.pool)
+                .await
+                .unwrap();
+        assert_eq!(
+            status, "reserved",
+            "submission evidence must not settle finance"
+        );
+    }
+}

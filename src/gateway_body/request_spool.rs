@@ -177,17 +177,13 @@ impl DurableRequestBodies {
                 // Its existing independent upload envelope must own those
                 // copies; retaining the source pool's replay lease here would
                 // wait on the very bytes queued in the multipart writer.
-                let _upload_memory = upload
-                    .stream_memory
-                    .temporary_wait(
-                        crate::archive::ARCHIVE_MULTIPART_PART_BYTES
-                            + 5 * REQUEST_SPOOL_CHUNK_BYTES,
-                        super::memory::CAPTURE_MEMORY_WEIGHT,
-                    )
+                let workspace = upload
+                    .multipart_workspace(crate::api::proxy::persistence::WorkspaceRole::RequestRaw)
                     .await
-                    .ok_or(())?;
+                    .map_err(|_| ())?;
                 let mut writer = archive.start_writer(key).await.map_err(|_| ())?;
-                let mut stream = source.open_stream();
+                writer.retain_workspace(workspace.clone());
+                let mut stream = source.open_stream_with_workspace(workspace);
                 while let Some(chunk) = stream.next().await {
                     let chunk = match chunk {
                         Ok(chunk) => chunk,
@@ -196,9 +192,7 @@ impl DurableRequestBodies {
                             return Err(());
                         }
                     };
-                    let upload_bytes = Bytes::copy_from_slice(&chunk);
-                    drop(chunk);
-                    if writer.write(upload_bytes).await.is_err() {
+                    if writer.write(chunk).await.is_err() {
                         let _ = writer.abort().await;
                         return Err(());
                     }
@@ -1003,6 +997,26 @@ fn verified_body(shared: &SharedBody, body: Bytes) -> Result<Bytes, RequestSpool
     Ok(body)
 }
 
+/// Only a verified published root or semantic retirement may replace RAM.
+/// A rejected handoff leaves both the source and its budget untouched.
+fn handoff_verified_request_source(
+    source: &Arc<SharedBody>,
+    database: &crate::db::Database,
+    object: &crate::archive::CasArchiveObject,
+) -> Result<(), crate::error::AppError> {
+    if object.size_bytes != source.length as u64
+        || object.blake3_digest != blake3::Hash::from_bytes(source.digest).to_hex().as_str()
+    {
+        return Err(crate::error::AppError::storage(
+            "request_source_publication_identity_mismatch",
+        ));
+    }
+    if let Some(carrier) = &source.carrier {
+        carrier.handoff_verified_publication(database.body_archive()?.clone(), object.clone())?;
+    }
+    Ok(())
+}
+
 fn release_resident_memory(shared: &SharedBody) {
     let removed = shared
         .body
@@ -1140,11 +1154,12 @@ fn publish_durable(shared: &Arc<SharedBody>) {
                     }
                     Err(_) => {}
                 }
-                if source.archived.load(Ordering::Acquire) {
-                    release_resident_memory(&source);
+                // Archive-bound originals still require the typed publication
+                // handoff below. A successful staging PUT alone is not that ACK.
+                if !source.archived.load(Ordering::Acquire) {
+                    residency.durable_settled.store(true, Ordering::Release);
+                    residency.release_if_idle();
                 }
-                residency.durable_settled.store(true, Ordering::Release);
-                residency.release_if_idle();
             } else {
                 tracing::warn!("request body stayed in memory; object storage write failed");
             }
@@ -1184,8 +1199,8 @@ fn publish_durable(shared: &Arc<SharedBody>) {
                                 break false;
                             }
                         };
-                        if success {
-                            let object = database
+                        let settlement = if success {
+                            let (object, settlement) = database
                                 .publish_request_source(
                                     identity,
                                     &key,
@@ -1193,30 +1208,50 @@ fn publish_durable(shared: &Arc<SharedBody>) {
                                     source.digest,
                                 )
                                 .await;
-                            // The immutable raw root now durably owns this
-                            // exact object even while SQL binding waits.
-                            if let Some(carrier) = &source.carrier
-                                && let Ok(archive) = database.body_archive()
-                                && carrier
-                                    .handoff_verified_publication(archive.clone(), object)
-                                    .is_err()
-                            {
-                                tracing::error!(
-                                    "request source durable handoff identity mismatch; retaining RAM"
-                                );
+                            // The publication owns these exact bytes before resident
+                            // credit can move to lightweight completion metadata.
+                            let mut attempt = 0_u32;
+                            loop {
+                                match handoff_verified_request_source(&source, &database, &object) {
+                                    Ok(()) => break,
+                                    Err(error) => {
+                                        attempt = attempt.saturating_add(1);
+                                        tracing::error!(request_id = %identity.request_id,
+                                            error_category = error.diagnostic_category(),
+                                            "request source durable handoff retains original owner");
+                                        let delay =
+                                            crate::archive_staging::cleanup_backoff_with_jitter(
+                                                identity.request_id,
+                                                attempt,
+                                            )
+                                            .min(30_000);
+                                        tokio::time::sleep(std::time::Duration::from_millis(
+                                            delay as u64,
+                                        ))
+                                        .await;
+                                    }
+                                }
                             }
-                        }
-                        let permit = if success {
+                            release_resident_memory(&source);
+                            residency.durable_settled.store(true, Ordering::Release);
+                            residency.release_if_idle();
+                            Some(settlement)
+                        } else {
+                            None
+                        };
+                        let permit = if matches!(
+                            settlement.as_ref(),
+                            Some(crate::archive::RawPublicationSettlement::Retired { .. })
+                        ) {
+                            Some(database.request_source_completion().await)
+                        } else if success {
                             database.try_request_source_completion()
                         } else {
                             Some(database.request_source_completion().await)
                         };
-                        release_resident_memory(&source);
-                        residency.durable_settled.store(true, Ordering::Release);
-                        residency.release_if_idle();
-                        permit
+                        (permit, settlement)
                     };
-                    let (wrote, permit) = tokio::join!(lease, handoff);
+                    let (wrote, (permit, settlement)) = tokio::join!(lease, handoff);
                     if let (Some(_permit), Some(wrote)) = (permit, wrote) {
                         if wrote {
                             database
@@ -1225,6 +1260,7 @@ fn publish_durable(shared: &Arc<SharedBody>) {
                                     &key,
                                     source.length,
                                     source.digest,
+                                    settlement.expect("uploaded source has a publication outcome"),
                                 )
                                 .await;
                         } else {
@@ -1827,3 +1863,6 @@ mod tests {
         assert_eq!(file_count(&target), 0);
     }
 }
+
+#[cfg(test)]
+mod workspace_contracts;

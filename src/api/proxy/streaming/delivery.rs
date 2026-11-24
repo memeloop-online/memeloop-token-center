@@ -47,6 +47,7 @@ pub(super) struct TerminalFrames {
     frames: Vec<SseDeliveryFrame>,
     bytes: usize,
     limit_bytes: usize,
+    allocation_budget: Option<std::sync::Arc<crate::gateway_body::memory::SseAllocationBudget>>,
 }
 
 impl TerminalFrames {
@@ -55,7 +56,15 @@ impl TerminalFrames {
             frames: Vec::new(),
             bytes: 0,
             limit_bytes,
+            allocation_budget: None,
         }
+    }
+
+    pub(super) fn set_allocation_budget(
+        &mut self,
+        budget: std::sync::Arc<crate::gateway_body::memory::SseAllocationBudget>,
+    ) {
+        self.allocation_budget = Some(budget);
     }
 
     pub(super) fn is_empty(&self) -> bool {
@@ -69,6 +78,13 @@ impl TerminalFrames {
         if self.bytes > self.limit_bytes {
             return Err(());
         }
+        if self
+            .allocation_budget
+            .as_ref()
+            .is_some_and(|budget| !budget.reserve_vec(&mut self.frames, 1))
+        {
+            return Err(());
+        }
         self.frames.push(frame);
         Ok(None)
     }
@@ -76,6 +92,10 @@ impl TerminalFrames {
     pub(super) fn take(&mut self) -> Vec<SseDeliveryFrame> {
         self.bytes = 0;
         std::mem::take(&mut self.frames)
+    }
+
+    pub(super) fn metadata_capacity(&self) -> usize {
+        self.frames.capacity() * std::mem::size_of::<SseDeliveryFrame>()
     }
 
     pub(super) fn bytes(&self) -> usize {

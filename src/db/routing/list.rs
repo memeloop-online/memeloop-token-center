@@ -123,7 +123,7 @@ impl Database {
                 tenant_external_id,
                 before_created_at,
                 before_id,
-                limit.clamp(1, MAX_ROUTE_PAGE as i64),
+                limit,
             )
             .await?;
         if routes.is_empty() {

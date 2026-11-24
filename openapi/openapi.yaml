@@ -12671,12 +12671,14 @@ components:
           type: [string, 'null']
           enum: [declared, null]
           description: Source of the optional human/execution semantics; never model- or prompt-guessed.
+    SemanticArchiveView: {"type": "object", "additionalProperties": false, "required": ["manifest_revision", "projection_version", "semantic_head", "coverage"], "properties": {"manifest_revision": {"type": "string", "pattern": "^[0-9]+$", "description": "Lossless decimal u64 publication revision."}, "projection_version": {"type": "integer", "minimum": 1}, "semantic_head": {"type": "object", "required": ["node_hash", "depth"], "properties": {"node_hash": {"type": "string", "pattern": "^[0-9a-f]{64}$"}, "depth": {"type": "integer", "minimum": 1}}}, "coverage": {"type": "object", "required": ["observed_terminal", "projection_state", "omissions", "gaps"], "properties": {"observed_terminal": {"type": "boolean"}, "projection_state": {"type": "string", "enum": ["complete", "partial"]}, "omissions": {"type": "array", "items": {"type": "string"}}, "gaps": {"type": "array", "items": {"type": "string"}}}}}}
     RequestDetail:
       allOf:
         - $ref: '#/components/schemas/RequestSummary'
         - type: object
           required: [request_body, response_body, archive_complete, archive]
           properties:
+            semantic_archive: { $ref: '#/components/schemas/SemanticArchiveView' }
             request_body: true
             response_body: true
             archive_complete: { type: boolean }

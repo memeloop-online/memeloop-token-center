@@ -622,7 +622,7 @@ impl Database {
             )
             .bind(snapshot_id)
             .bind(&pattern)
-            .bind(limit.clamp(1, 10_000))
+            .bind(limit)
             .fetch_all(&self.pool)
             .await?
         } else {
@@ -647,7 +647,7 @@ impl Database {
         )
         .bind(account_id.to_string())
         .bind(&pattern)
-        .bind(limit.clamp(1, 10_000))
+        .bind(limit)
         .fetch_all(&self.pool)
         .await?
         .into_iter()
@@ -785,7 +785,7 @@ impl Database {
         let data = sqlx::query(aggregate_sql)
             .bind(account_ids_json)
             .bind(pattern)
-            .bind(limit.clamp(1, 200))
+            .bind(limit)
             .fetch_all(&self.pool)
             .await?
             .into_iter()

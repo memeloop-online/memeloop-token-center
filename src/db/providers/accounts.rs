@@ -942,7 +942,7 @@ impl Database {
         .bind(tenant_external_id.unwrap_or_default())
         .bind(before_created_at)
         .bind(before_id)
-        .bind(limit.clamp(1, 100))
+        .bind(limit)
         .fetch_all(&self.pool)
         .await?;
         rows.into_iter().map(upstream_account_view).collect()
@@ -1017,7 +1017,7 @@ impl Database {
         .bind(tenant_external_id.unwrap_or_default())
         .bind(before_created_at)
         .bind(before_id)
-        .bind(limit.clamp(1, 100))
+        .bind(limit)
         .fetch_all(&self.pool)
         .await?;
         rows.into_iter()

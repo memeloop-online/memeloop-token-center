@@ -445,7 +445,7 @@ impl Entry {
         if let Ok(mut slot) = self.probe_url.lock() {
             *slot = url;
         }
-        let attempts = u8::try_from(attempts).unwrap_or(2).clamp(1, 8);
+        let attempts = u8::try_from(attempts).unwrap_or(2);
         self.probe_attempts.store(attempts, Ordering::Release);
     }
 

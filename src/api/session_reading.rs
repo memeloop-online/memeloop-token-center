@@ -232,7 +232,7 @@ pub(super) async fn self_session_context_content(
     context_content(&state, scope, query).await.map(Json)
 }
 
-/// Cleaned dialogue already stored in CNPG. This read does not open object storage.
+/// Canonical dialogue loaded through the shared tenant-scoped prefix reader.
 #[derive(Serialize)]
 pub(super) struct SessionDialogue {
     contract_version: &'static str,
@@ -258,6 +258,8 @@ pub(super) struct DialoguePart {
     byte_length: Option<i64>,
     call_id: Option<String>,
     tool_call_id: Option<String>,
+    #[serde(flatten)]
+    details: serde_json::Map<String, Value>,
 }
 
 pub(super) async fn internal_session_dialogue(
@@ -286,6 +288,37 @@ pub(super) async fn internal_session_training(
     Query(query): Query<ContextQuery>,
 ) -> Result<axum::response::Response, AppError> {
     let scope = operator_scope(&state, &headers, &query, session_id, request_id).await?;
+    if scope.leaf.as_deref().is_some_and(|leaf| !leaf.is_empty()) {
+        let turns = load_canonical_dialogue(&state, &scope).await?;
+        let count = turns.len();
+        let manifest = serde_json::json!({
+            "record": "manifest", "format_version": 2,
+            "contract_version": "session_training_v2", "representation": "session_body",
+            "turn_order": "ascending", "request_id": scope.request_id,
+            "session_id": scope.session_id, "leaf": scope.leaf,
+        });
+        let lines = std::iter::once(manifest)
+            .chain(turns.into_iter().enumerate().map(|(ordinal, turn)| {
+                serde_json::json!({
+                    "record": "turn", "ordinal": ordinal, "role": turn.role,
+                    "origin": turn.origin, "parts": turn.parts,
+                })
+            }))
+            .chain(std::iter::once(
+                serde_json::json!({"record": "end", "turn_count": count}),
+            ));
+        let stream = futures_util::stream::iter(lines.map(|line| {
+            let mut bytes = serde_json::to_vec(&line)
+                .map_err(|_| AppError::internal("session_training_encode_failed"))?;
+            bytes.push(b'\n');
+            Ok::<_, AppError>(bytes::Bytes::from(bytes))
+        }));
+        return axum::response::Response::builder()
+            .header(axum::http::header::CONTENT_TYPE, "application/x-ndjson")
+            .body(axum::body::Body::from_stream(stream))
+            .map_err(|_| AppError::internal("conversation_export_response"));
+    }
+    // Only sessions without a canonical leaf retain the legacy export contract.
     let reference = state
         .archive
         .request_conversation_reference(scope.tenant_id, scope.request_id)
@@ -328,15 +361,7 @@ async fn session_dialogue(
     state: &AppState,
     scope: SessionContextScope,
 ) -> Result<SessionDialogue, AppError> {
-    let stored = match scope.leaf.as_deref() {
-        Some(leaf) if !leaf.is_empty() => {
-            state
-                .db
-                .export_training_dialogue(scope.tenant_id, leaf)
-                .await?
-        }
-        _ => Vec::new(),
-    };
+    let stored = load_canonical_dialogue(state, &scope).await?;
     Ok(SessionDialogue {
         contract_version: "session_dialogue_v1",
         representation: "session_body",
@@ -344,6 +369,21 @@ async fn session_dialogue(
         session_id: scope.session_id,
         turns: stored.into_iter().map(dialogue_turn).collect(),
     })
+}
+
+async fn load_canonical_dialogue(
+    state: &AppState,
+    scope: &SessionContextScope,
+) -> Result<Vec<crate::conversation::TrainingUtterance>, AppError> {
+    match scope.leaf.as_deref() {
+        Some(leaf) if !leaf.is_empty() => {
+            state
+                .db
+                .export_training_dialogue(scope.tenant_id, leaf)
+                .await
+        }
+        _ => Ok(Vec::new()),
+    }
 }
 
 fn dialogue_turn(turn: crate::conversation::TrainingUtterance) -> DialogueTurn {
@@ -360,7 +400,20 @@ fn dialogue_part(part: Value) -> DialoguePart {
         .get("media_type")
         .and_then(Value::as_str)
         .map(str::to_owned);
+    let mut details = part.as_object().cloned().unwrap_or_default();
+    for key in [
+        "part_index",
+        "kind",
+        "text",
+        "media_type",
+        "byte_length",
+        "call_id",
+        "tool_call_id",
+    ] {
+        details.remove(key);
+    }
     DialoguePart {
+        details,
         part_index: part.get("part_index").and_then(Value::as_i64).unwrap_or(0),
         kind: part
             .get("kind")
@@ -667,6 +720,8 @@ mod tests {
             .await
             .unwrap()
     }
+
+    include!("session_reading_canonical_tests.rs");
 
     #[tokio::test]
     async fn http_context_and_title_routes_enforce_identity_and_execution_authority() {

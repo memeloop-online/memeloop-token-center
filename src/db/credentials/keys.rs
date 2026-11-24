@@ -312,7 +312,7 @@ impl Database {
             .bind(principal_external_id.unwrap_or_default())
             .bind(before_created_at)
             .bind(&before_id)
-            .bind(limit.clamp(1, 500))
+            .bind(limit)
             .bind(&search)
             .bind(status.unwrap_or_default())
             .bind(creation_source.unwrap_or_default())
@@ -326,7 +326,7 @@ impl Database {
             .bind(principal_external_id.unwrap_or_default())
             .bind(before_created_at)
             .bind(&before_id)
-            .bind(limit.clamp(1, 500))
+            .bind(limit)
             .bind(&search)
             .bind(status.unwrap_or_default())
             .bind(creation_source.unwrap_or_default())
@@ -984,7 +984,7 @@ impl Database {
     pub async fn expire_key_provisioning_responses(&self, limit: i64) -> Result<u64, AppError> {
         let cutoff = unix_millis().saturating_sub(24 * 60 * 60 * 1_000);
         let now = unix_millis();
-        let limit = limit.clamp(1, 10_000);
+        let limit = limit;
         let mut transaction = self.pool.begin().await?;
         let provisioning = sqlx::query(
             "UPDATE key_records SET issued_key_ciphertext = NULL WHERE id IN (SELECT id FROM key_records WHERE issued_key_ciphertext IS NOT NULL AND created_at < $1 ORDER BY created_at, id LIMIT $2)",

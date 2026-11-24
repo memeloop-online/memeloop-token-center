@@ -243,19 +243,20 @@ impl Database {
                 now,
             )
             .await?;
-            record_request_started_in_transaction(
+            let started_request = NewRequest {
+                request_id: input.request_id,
+                key_id: input.key.key_id,
+                tenant_id: input.key.tenant_id,
+                protocol: input.protocol.to_owned(),
+                model: input.model.to_owned(),
+                request_object: input.request_object.to_owned(),
+                reservation_id: reservation.id,
+                upstream_account_id: input.upstream_account_id,
+                model_route_id: input.model_route_id,
+            };
+            super::super::requests::insert_request_started_record_in_transaction(
                 &mut transaction,
-                &NewRequest {
-                    request_id: input.request_id,
-                    key_id: input.key.key_id,
-                    tenant_id: input.key.tenant_id,
-                    protocol: input.protocol.to_owned(),
-                    model: input.model.to_owned(),
-                    request_object: input.request_object.to_owned(),
-                    reservation_id: reservation.id,
-                    upstream_account_id: input.upstream_account_id,
-                    model_route_id: input.model_route_id,
-                },
+                &started_request,
                 now,
             )
             .await?;
@@ -266,6 +267,12 @@ impl Database {
             .bind(input.request_id.to_string())
             .bind(input.key.key_id.to_string())
             .execute(&mut *transaction)
+            .await?;
+            super::super::requests::publish_request_started_in_transaction(
+                &mut transaction,
+                &started_request,
+                now,
+            )
             .await?;
             transaction.commit().await?;
             return Ok(StartSynchronousImageResult::Started(reservation));
@@ -420,19 +427,20 @@ impl Database {
             now,
         )
         .await?;
-        record_request_started_in_transaction(
+        let started_request = NewRequest {
+            request_id: input.request_id,
+            key_id: input.key.key_id,
+            tenant_id: input.key.tenant_id,
+            protocol: input.protocol.to_owned(),
+            model: input.model.to_owned(),
+            request_object: input.request_object.to_owned(),
+            reservation_id: reservation.id,
+            upstream_account_id: input.upstream_account_id,
+            model_route_id: input.model_route_id,
+        };
+        super::super::requests::insert_request_started_record_in_transaction(
             &mut transaction,
-            &NewRequest {
-                request_id: input.request_id,
-                key_id: input.key.key_id,
-                tenant_id: input.key.tenant_id,
-                protocol: input.protocol.to_owned(),
-                model: input.model.to_owned(),
-                request_object: input.request_object.to_owned(),
-                reservation_id: reservation.id,
-                upstream_account_id: input.upstream_account_id,
-                model_route_id: input.model_route_id,
-            },
+            &started_request,
             now,
         )
         .await?;
@@ -458,6 +466,12 @@ impl Database {
         .bind(&request_id)
         .bind(&key_id)
         .execute(&mut *transaction)
+        .await?;
+        super::super::requests::publish_request_started_in_transaction(
+            &mut transaction,
+            &started_request,
+            now,
+        )
         .await?;
         transaction.commit().await?;
         Ok(StartSynchronousImageResult::Started(reservation))

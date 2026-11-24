@@ -220,6 +220,7 @@ async fn scoped_evidence_contract(database: &Database) {
     let route: ResolvedUpstream = candidates.into_iter().find(|r| r.account_id == a).unwrap();
     let now = super::super::unix_millis();
     let evidence = SupplierQuotaEvidence {
+        capacity_scope: crate::db::SupplierQuotaScope::Unknown,
         exhausted: true,
         reset_at: None,
         reset_source: "unknown",
@@ -368,6 +369,7 @@ async fn scoped_evidence_contract(database: &Database) {
     assert_eq!(restored.len(), 2);
 
     let known = SupplierQuotaEvidence {
+        capacity_scope: crate::db::SupplierQuotaScope::Unknown,
         exhausted: true,
         reset_at: Some(now + 60_000),
         reset_source: "retry_after",
@@ -396,6 +398,7 @@ async fn scoped_evidence_contract(database: &Database) {
             Uuid::now_v7(),
             now + 8,
             SupplierQuotaEvidence {
+                capacity_scope: crate::db::SupplierQuotaScope::Unknown,
                 exhausted: false,
                 reset_at: None,
                 reset_source: "unknown",

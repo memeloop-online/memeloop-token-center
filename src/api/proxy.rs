@@ -36,6 +36,7 @@ pub(in crate::api) async fn classify_codex_media_rate_limit(
 #[path = "codex_transport.rs"]
 pub(in crate::api) mod codex_transport;
 
+mod buffered_carrier;
 mod buffered_upstream;
 mod independent_probe;
 pub(in crate::api) use independent_probe::IndependentProbeTarget;
@@ -170,6 +171,8 @@ fn requires_strict_openai_chat_usage(
 }
 
 struct AuthorizedProxyRoutes {
+    // One request-owned metadata snapshot; never contains decrypted secrets.
+    refreshed_candidates: Option<Vec<AuthorizedUpstreamCandidate>>,
     primary: PlannedProxyRoute,
     remaining_candidates: std::vec::IntoIter<AuthorizedUpstreamCandidate>,
     input_token_ceiling: i64,
@@ -182,6 +185,8 @@ struct AuthorizedProxyRoutesInput<'a> {
     request: ProxyRequestContext<'a>,
     original_body_length: usize,
     candidates: Vec<AuthorizedUpstreamCandidate>,
+    selection: RouteSelectionOptions,
+    snapshot_refresh_used: &'a mut bool,
 }
 
 impl AuthorizedProxyRoutes {
@@ -197,6 +202,8 @@ async fn prepare_authorized_proxy_routes(
         request,
         original_body_length,
         candidates,
+        selection,
+        snapshot_refresh_used,
     } = input;
     let protocol = request.protocol;
     let candidate_preparation = proxy_diagnostics::Phase::new(
@@ -210,16 +217,63 @@ async fn prepare_authorized_proxy_routes(
     let output_choice_count = openai_chat_choice_count.unwrap_or(1);
     let strict_choice_count_is_incompatible =
         openai_chat_choice_count.is_some_and(|count| count != 1);
+    let authorized_pairs = candidates
+        .iter()
+        .map(|candidate| (candidate.route_id, candidate.account_id))
+        .collect::<Vec<_>>();
     let mut remaining_candidates = candidates.into_iter();
     let mut summary = CandidatePreparationSummary::default();
-    let Some(primary) = next_planned_proxy_candidate(
+    let mut refreshed_candidates = None;
+    let mut primary = next_planned_proxy_candidate(
         request,
         &mut remaining_candidates,
         strict_choice_count_is_incompatible,
         &mut summary,
     )
-    .await?
-    else {
+    .await?;
+    // Only a pre-dispatch stale snapshot can trigger this one fresh pass.
+    // Repeat current authorization, eligibility and quota admission as a whole;
+    // never combine an old route plan with a new credential generation.
+    if primary.is_none() && !*snapshot_refresh_used && !summary.stale_pairs.is_empty() {
+        *snapshot_refresh_used = true;
+        let mut refreshed = request
+            .state
+            .db
+            .refresh_authorized_dispatch_candidates(
+                request.key.key_id,
+                request.key.tenant_id,
+                request.model,
+                request.protocol.name(),
+                selection,
+            )
+            .await?;
+        // Preserve request pins and group-policy narrowing from the first pass.
+        refreshed.retain(|candidate| {
+            summary
+                .stale_pairs
+                .contains(&(candidate.route_id, candidate.account_id))
+        });
+        refreshed.sort_by_key(|candidate| {
+            authorized_pairs
+                .iter()
+                .position(|pair| *pair == (candidate.route_id, candidate.account_id))
+                .unwrap_or(usize::MAX)
+        });
+        refreshed_candidates = Some(refreshed.clone());
+        remaining_candidates = refreshed.into_iter();
+        tracing::info!(
+            stage = "candidate_snapshot_refresh",
+            "revalidated stale authorized candidate snapshots once"
+        );
+        primary = next_planned_proxy_candidate(
+            request,
+            &mut remaining_candidates,
+            strict_choice_count_is_incompatible,
+            &mut summary,
+        )
+        .await?;
+    }
+    let Some(primary) = primary else {
         // The candidate query already widened to any active account on this
         // route. Reaching here means nothing active remains to send. Do not
         // invent a credential that is not an upstream account.
@@ -229,6 +283,7 @@ async fn prepare_authorized_proxy_routes(
     let (input_token_ceiling, output_token_ceiling, output_token_limit) =
         candidate_reservation_bounds(&primary, original_body_length, output_choice_count)?;
     Ok(AuthorizedProxyRoutes {
+        refreshed_candidates,
         primary,
         remaining_candidates,
         input_token_ceiling,
@@ -540,13 +595,12 @@ async fn finish_non_sse_proxy_response(
         proxy_diagnostics::Context::for_request(buffered_request.request_id),
         "buffered_response",
     );
-    let response_body = match read_bounded_upstream(
+    let response_body = match buffered_carrier::read(
         upstream,
         MAX_PROXY_RESPONSE_BODY,
-        &buffered_request.memory,
-        buffered_request.memory_admission_wait,
+        &buffered_request,
+        buffered_request.state,
         false,
-        buffered_request.conversation.as_ref(),
     )
     .await
     {
@@ -1063,6 +1117,14 @@ async fn proxy_with_cancellation_guard(
     );
     let candidate_query =
         proxy_diagnostics::Phase::new(diagnostic_context, "authorized_candidate_query");
+    let route_selection = RouteSelectionOptions {
+        upstream_account_hint: applied.upstream_account_hint,
+        avoid_route_account,
+        // Native weighted rendezvous balances requests, including within
+        // a session. Session affinity is opt-in through a group policy;
+        // its stable seed is still passed to group_routing::prepare.
+        selection_seed: request_id,
+    };
     let mut candidates = state
         .db
         .list_upstream_candidates_for_dispatch(
@@ -1070,14 +1132,7 @@ async fn proxy_with_cancellation_guard(
             key.tenant_id,
             &model,
             protocol.name(),
-            RouteSelectionOptions {
-                upstream_account_hint: applied.upstream_account_hint,
-                avoid_route_account,
-                // Native weighted rendezvous balances requests, including within
-                // a session. Session affinity is opt-in through a group policy;
-                // its stable seed is still passed to group_routing::prepare.
-                selection_seed: request_id,
-            },
+            route_selection,
             pinned_account.is_some(),
         )
         .await?;
@@ -1140,7 +1195,7 @@ async fn proxy_with_cancellation_guard(
         )
         .await?;
     }
-    let strategy_candidates =
+    let mut strategy_candidates =
         crate::group_routing::candidate_snapshot_if_enabled(&state, &candidates);
     let request_context = ProxyRequestContext {
         state: &state,
@@ -1152,12 +1207,20 @@ async fn proxy_with_cancellation_guard(
         request_memory: Some(&memory),
         codex_multi_agent_v2_request,
     };
+    let mut snapshot_refresh_used = false;
     let mut route_plan = prepare_authorized_proxy_routes(AuthorizedProxyRoutesInput {
         request: request_context,
         original_body_length: request_body_length,
         candidates,
+        selection: route_selection,
+        snapshot_refresh_used: &mut snapshot_refresh_used,
     })
     .await?;
+    if strategy_candidates.is_some()
+        && let Some(refreshed) = route_plan.refreshed_candidates.take()
+    {
+        strategy_candidates = Some(refreshed);
+    }
     let primary = route_plan.primary_route();
     // Freeze before reservation and archive work: later candidates/reloads may
     // change account transport settings, never replenish the request budget.
@@ -1201,6 +1264,8 @@ async fn proxy_with_cancellation_guard(
                 },
                 original_body_length: request_body_length,
                 candidates,
+                selection: route_selection,
+                snapshot_refresh_used: &mut snapshot_refresh_used,
             })
             .await?;
         }
@@ -1442,6 +1507,7 @@ async fn proxy_with_cancellation_guard(
         None,
     );
     let AuthorizedProxyRoutes {
+        refreshed_candidates: _,
         primary,
         remaining_candidates,
         input_token_ceiling: _,
@@ -2068,13 +2134,12 @@ async fn proxy_with_cancellation_guard(
                 .and_then(|value| value.to_str().ok())
                 .unwrap_or("application/json")
                 .to_owned();
-            let body = read_bounded_upstream(
+            let body = buffered_carrier::read(
                 upstream,
                 MAX_PROXY_RESPONSE_BODY,
-                &buffered_request.memory,
-                buffered_request.memory_admission_wait,
+                &buffered_request,
+                buffered_request.state,
                 false,
-                buffered_request.conversation.as_ref(),
             )
             .await
             .map(Bytes::from);
@@ -2720,6 +2785,51 @@ impl ProxyConversation {
         }
     }
 
+    async fn reserve_for_buffered_shape(
+        &self,
+        memory: &crate::gateway_body::memory::ProxyMemoryReservation,
+        bytes: usize,
+        nodes: usize,
+        adapter_envelope: usize,
+        deadline: Option<tokio::time::Instant>,
+    ) -> bool {
+        let (projection_bytes, projection_weight) = match &self.request_body {
+            ConversationBody::ProjectedSpool {
+                json_memory_bytes, ..
+            } => (*json_memory_bytes, 1),
+            body => (body.len(), body.projection_weight()),
+        };
+        let permit = if let Some(deadline) = deadline {
+            memory
+                .reserve_buffered_shape_with_projection(
+                    bytes,
+                    nodes,
+                    adapter_envelope,
+                    projection_bytes,
+                    projection_weight,
+                    deadline,
+                )
+                .await
+        } else {
+            memory.try_reserve_buffered_shape_with_projection(
+                bytes,
+                nodes,
+                adapter_envelope,
+                projection_bytes,
+                projection_weight,
+            )
+        };
+        let admission = permit.map_or(
+            ConversationProjectionAdmission::Rejected,
+            ConversationProjectionAdmission::Reserved,
+        );
+        let reserved = matches!(&admission, ConversationProjectionAdmission::Reserved(_));
+        if let Ok(mut current) = self.projection_admission.lock() {
+            *current = admission;
+        }
+        reserved
+    }
+
     fn reserve_for_buffered_response(
         &self,
         memory: &crate::gateway_body::memory::ProxyMemoryReservation,
@@ -3166,13 +3276,12 @@ async fn execute_component_provider(
         return finish_component_provider_failure(&request, None, "provider_configuration").await;
     };
     let has_content_length = upstream.content_length().is_some();
-    let upstream_body = match read_bounded_upstream(
+    let upstream_body = match buffered_carrier::read(
         upstream,
         maximum.min(MAX_PROXY_RESPONSE_BODY),
-        &request.memory,
-        request.memory_admission_wait,
+        &request,
+        request.state,
         true,
-        request.conversation.as_ref(),
     )
     .await
     {

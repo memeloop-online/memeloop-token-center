@@ -292,7 +292,7 @@ impl ClickHouse {
                 .then_with(|| b.key_id.cmp(&a.key_id))
         });
         if identities.is_none() {
-            result.truncate((filter.limit.clamp(1, 100) + 1) as usize);
+            result.truncate((filter.limit + 1) as usize);
         }
         Ok(result)
     }
@@ -313,14 +313,14 @@ impl ClickHouse {
         let mut query = crate::request_history_api::query_from_request_filter(
             scope,
             &RequestListFilter {
-                limit: filter.limit.clamp(1, 200),
+                limit: filter.limit,
                 before_created_at: filter.before_created_at,
                 before_id: filter.before_request_id,
                 ..Default::default()
             },
         )?;
         // Session detail has its established 200-row page contract.
-        query.limit = filter.limit.clamp(1, 200) as usize;
+        query.limit = filter.limit as usize;
         query.predicates.push(HistoryPredicate {
             dimension: Dimension::Source,
             comparison: Comparison::NotEquals,

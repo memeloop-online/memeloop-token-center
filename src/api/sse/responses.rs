@@ -215,6 +215,26 @@ impl Default for ResponsesStreamingSanitizer {
 }
 
 impl ResponsesStreamingSanitizer {
+    pub(in crate::api) fn set_allocation_budget(
+        &mut self,
+        budget: std::sync::Arc<crate::gateway_body::memory::SseAllocationBudget>,
+    ) {
+        self.framer.set_allocation_budget(budget);
+    }
+
+    pub(in crate::api) fn retained_capacity(&self) -> usize {
+        self.identity
+            .response_id
+            .as_ref()
+            .map_or(0, String::capacity)
+            + self.framer.retained_capacity()
+            + match &self.terminal_hold.state {
+                ResponseTerminalHoldState::Idle => 0,
+                ResponseTerminalHoldState::Holding(bytes) => bytes.capacity(),
+            }
+            + self.progress_heartbeat.as_ref().map_or(0, Bytes::len)
+    }
+
     pub(in crate::api) fn with_limits(limits: SseFramingLimits) -> Self {
         Self {
             framer: BoundedSseFramer::with_limits(limits),
@@ -238,6 +258,14 @@ impl ResponsesStreamingSanitizer {
             return Err(rejection.error_code());
         }
         for event in batch.events {
+            if self
+                .framer
+                .allocation_budget()
+                .is_some_and(|budget| !event.reserve_processing(budget))
+            {
+                return Err("upstream_response_memory_capacity");
+            }
+
             if let Err(rejection) = self.sanitize_event(event, &mut output) {
                 self.last_rejection_stage = Some(rejection.stage);
                 self.last_rejection_code = Some(rejection.code);
@@ -273,6 +301,11 @@ impl ResponsesStreamingSanitizer {
         }
         let terminal = self.terminal_hold.release();
         self.progress_heartbeat = None;
+        if let Some(budget) = self.framer.allocation_budget() {
+            return budget
+                .retain_output(terminal)
+                .ok_or("upstream_response_memory_capacity");
+        }
         Ok(terminal)
     }
 
@@ -491,6 +524,16 @@ impl ResponsesStreamingSanitizer {
         event: &BoundedSseEvent,
         output: &mut Vec<u8>,
     ) -> Result<(), SanitizerRejection> {
+        if self
+            .framer
+            .allocation_budget()
+            .is_some_and(|budget| !budget.reserve_allocation(event.bytes.len()))
+        {
+            return Err(SanitizerRejection::new(
+                "upstream_response_memory_capacity",
+                "output",
+            ));
+        }
         self.append_output(output, &safe_sse_fields(event))
             .map_err(|code| SanitizerRejection::new(code, "terminal_hold"))?;
         self.forward_crlf_continuation = event.bytes.last() == Some(&b'\r');
@@ -499,8 +542,24 @@ impl ResponsesStreamingSanitizer {
 
     fn append_output(&mut self, output: &mut Vec<u8>, bytes: &[u8]) -> Result<(), &'static str> {
         if self.terminal_hold.is_active() {
+            if let ResponseTerminalHoldState::Holding(held) = &mut self.terminal_hold.state {
+                if self
+                    .framer
+                    .allocation_budget()
+                    .is_some_and(|budget| !budget.reserve_vec(held, bytes.len()))
+                {
+                    return Err("upstream_response_memory_capacity");
+                }
+            }
             self.terminal_hold.append(bytes)?;
         } else {
+            if self
+                .framer
+                .allocation_budget()
+                .is_some_and(|budget| !budget.reserve_vec(output, bytes.len()))
+            {
+                return Err("upstream_response_memory_capacity");
+            }
             output.extend_from_slice(bytes);
         }
         Ok(())

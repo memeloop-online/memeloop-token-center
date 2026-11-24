@@ -96,8 +96,8 @@ pub(crate) enum UpstreamAttemptAdmission {
 /// same millisecond timestamp.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) struct QuotaRecoveryFence {
-    consecutive_failures: i64,
-    updated_at: i64,
+    pub(crate) consecutive_failures: i64,
+    pub(crate) updated_at: i64,
 }
 
 impl UpstreamAttemptAdmission {
@@ -484,7 +484,13 @@ impl Database {
         .bind(request_id.to_string())
         .fetch_all(&mut **transaction)
         .await?;
-        rows.into_iter()
+        Self::history_transport_from_rows(&rows)
+    }
+
+    pub(crate) fn history_transport_from_rows(
+        rows: &[sqlx::any::AnyRow],
+    ) -> Result<Vec<crate::model::RequestTransportDiagnosticView>, AppError> {
+        rows.iter()
             .map(|row| {
                 Ok(crate::model::RequestTransportDiagnosticView {
                     route_id: Uuid::parse_str(&row.try_get::<String, _>("route_id")?).map_err(

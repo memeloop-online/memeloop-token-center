@@ -125,7 +125,8 @@ mod upstream_account_availability;
 pub(crate) mod upstream_concurrency;
 mod upstream_quota_reset;
 pub(crate) mod upstream_service_probes;
-pub(crate) use upstream_service_probes::SupplierQuotaEvidence;
+pub(crate) use routing::SupplierAvailabilityDecision;
+pub(crate) use upstream_service_probes::{SupplierQuotaEvidence, SupplierQuotaScope};
 mod usage_analysis;
 mod validation;
 
@@ -245,7 +246,6 @@ pub use providers::{
     NativeOAuthImportCohortResult, ReauthorizeUpstreamAccountInput, ReplaceModelCatalogResult,
     UpdateModelRouteInput, UpdateUpstreamAccountInput, UpstreamModelCatalogView, UpstreamModelView,
 };
-pub(crate) use requests::RequestArchiveAdmission;
 pub use requests::{
     AttachProxyArchiveResult, ConversationDetailFilter, ConversationListFilter,
     ConversationProjectionTask, FinishMeteredSynchronousRequest, FinishProxyRequest,
@@ -257,23 +257,22 @@ pub use requests::{
 pub(crate) use requests::{
     ConversationObservationInput, attach_conversation_upstream_response_in_transaction,
 };
+pub(crate) use requests::{ExpiredProxyOwnerScan, OrphanReservationScan, RequestArchiveAdmission};
 #[cfg(test)]
 pub(crate) use requests::{
     FILTERED_ACTIVITY_SOURCE_FACTS, FILTERED_ACTIVITY_SOURCE_PENDING,
     FILTERED_ACTIVITY_SOURCE_ROLLUPS,
 };
 pub(crate) use requests::{
-    MAX_STATS_RANGE_MILLIS, ProxyRequestUpstreamAttribution, SessionRoutingTerminalInput,
-    SwitchProxyCandidateInput, allocate_request_event_cursor, is_session_avoid_terminal,
-    normalize_proxy_usage_with_output_limit, price_token_usage,
+    MAX_STATS_RANGE_MILLIS, ProxyRequestUpstreamAttribution, RequestEventCursor,
+    SessionRoutingTerminalInput, SwitchProxyCandidateInput, allocate_request_event_cursor,
+    is_session_avoid_terminal, normalize_proxy_usage_with_output_limit, price_token_usage,
     record_request_finished_in_transaction, record_request_started_in_transaction,
     reserve_usage_in_transaction, search_prefix, settle_token_usage_in_transaction,
     validate_numeric_range,
 };
 #[cfg(test)]
-pub(crate) use requests::{
-    RequestEventCursor, claim_request_event_locator, claim_request_record_locator,
-};
+pub(crate) use requests::{claim_request_event_locator, claim_request_record_locator};
 pub use routing::{
     CreateRoutedModelRouteInput, CreateRoutedModelRouteResult, CredentialRoutingView,
     ManagedModelRouteSyncResult, ReplaceCredentialRoutingInput, ReplaceRouteRoutingInput,
@@ -568,7 +567,7 @@ impl Database {
             "SELECT external_id FROM tenants WHERE status = 'active' AND external_id > $1 ORDER BY external_id ASC LIMIT $2",
         )
         .bind(after_external_id.unwrap_or_default())
-        .bind(limit.clamp(1, 100))
+        .bind(limit)
         .fetch_all(&self.pool)
         .await?;
         rows.into_iter()
@@ -659,14 +658,22 @@ impl Database {
         } else {
             DatabaseBackend::PostgreSql
         };
+        let diagnostics = request_pool::PoolDiagnostics::new(match profile {
+            ConnectionProfile::Serve => "serve",
+            ConnectionProfile::Migration => "migration",
+        });
+        let initialization_diagnostics = diagnostics.clone();
+        let release_diagnostics = diagnostics.clone();
         let mut pool_options = AnyPoolOptions::new()
             .min_connections(0)
-            .max_connections(maximum_connections.clamp(1, 32))
+            .max_connections(maximum_connections)
             .acquire_timeout(Duration::from_secs(10))
             .idle_timeout(Some(Duration::from_secs(5 * 60)))
             .max_lifetime(Some(Duration::from_secs(30 * 60)))
             .after_release(move |connection, _metadata| {
-                Box::pin(async move { Ok(request_connection::can_reuse(connection, backend)) })
+                let reusable = request_connection::can_reuse(connection, backend);
+                release_diagnostics.released(reusable);
+                Box::pin(async move { Ok(reusable) })
             });
         if matches!(backend, DatabaseBackend::Sqlite) {
             // SQLite is a supported lightweight/test backend and can have a
@@ -689,9 +696,13 @@ impl Database {
             let application_name = postgres_application_name("mtc-serve");
             pool_options = pool_options.after_connect(move |connection, _metadata| {
                 let application_name = application_name.clone();
+                let mut initialization = initialization_diagnostics.initializing();
                 Box::pin(async move {
-                    initialize_postgres_connection(connection, &application_name, profile).await?;
-                    Ok(())
+                    let result =
+                        initialize_postgres_connection(connection, &application_name, profile)
+                            .await;
+                    initialization.finish(result.is_ok());
+                    result
                 })
             });
         }
@@ -699,11 +710,14 @@ impl Database {
         // invalid URL, so the same `sqlite://...` fixtures never open a file.
         let database_url = Self::normalized_sqlite_url(database_url);
         let pool = if matches!(backend, DatabaseBackend::PostgreSql) {
-            let pool: AnyPool = pool_options.connect_lazy(database_url.as_ref())?.into();
+            let pool: AnyPool =
+                request_pool::RequestPool::from(pool_options.connect_lazy(database_url.as_ref())?)
+                    .with_diagnostics(diagnostics.clone());
             wait_for_initial_postgres_connection(&pool).await?;
             pool
         } else {
             AnyPool::from(pool_options.connect(database_url.as_ref()).await?)
+                .with_diagnostics(diagnostics)
         };
         if matches!(backend, DatabaseBackend::Sqlite) {
             // The control, gateway, and worker roles may be separate processes
@@ -792,11 +806,14 @@ impl Database {
             DatabaseBackend::PostgreSql => "BEGIN",
             DatabaseBackend::Sqlite => "BEGIN IMMEDIATE",
         };
-        Box::pin(Transaction::begin(
+        let mut phase = self.pool.diagnostics().begin();
+        let result = Box::pin(Transaction::begin(
             connection.into_pool(),
             Some(sqlx::SqlStr::from_static(statement)),
         ))
-        .await
+        .await;
+        phase.finish(result.is_ok());
+        result
     }
 
     fn observe_pool_timeout(
@@ -809,6 +826,12 @@ impl Database {
             let pool_size = self.pool.size();
             let pool_idle = self.pool.num_idle();
             let diagnostics = self.pool.diagnostics();
+            tracing::warn!(
+                active_pooled_transactions = self.pool.active_transactions(),
+                pool_label = diagnostics.label,
+                "database pooled transaction ownership"
+            );
+            diagnostics.observe_phases();
             let (waiters, initializing, cancelled, failed, returned, discarded) =
                 diagnostics.snapshot();
             tracing::warn!(
@@ -835,7 +858,8 @@ impl Database {
     }
 
     pub(crate) fn with_auxiliary_pool_max_connections(mut self, maximum: u32) -> Self {
-        self.auxiliary_pool_max_connections = maximum.clamp(1, 2);
+        // 调用方显式传入的规模就是最终规模，不再二次夹取上限。
+        self.auxiliary_pool_max_connections = maximum;
         self
     }
 
@@ -934,4 +958,7 @@ pub(crate) mod test_support;
 #[cfg(test)]
 mod tests;
 
+mod raw_gc;
 mod semantic_archive_binding;
+
+pub(crate) use requests::terminal_timings::{TerminalProjectionBatchTimings, STAGE_NAMES as TERMINAL_PROJECTION_STAGE_NAMES};

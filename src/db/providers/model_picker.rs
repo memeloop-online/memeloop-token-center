@@ -144,7 +144,7 @@ impl Database {
             .bind(query)
             .bind(filter.after_sort_label)
             .bind(filter.after_identity)
-            .bind(filter.limit.clamp(1, MODEL_PICKER_ITEM_LIMIT) + 1)
+            .bind(filter.limit + 1)
             .bind(explicit_accounts)
             .bind(included_groups)
             .bind(excluded_groups)

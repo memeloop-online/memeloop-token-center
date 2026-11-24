@@ -619,12 +619,22 @@ async fn codex_route_fixture_with_archive_directory(
     label: &str,
     archive_directory: &str,
 ) -> CodexRouteFixture {
+    codex_route_fixture_with_database(label, archive_directory, None).await
+}
+
+async fn codex_route_fixture_with_database(
+    label: &str,
+    archive_directory: &str,
+    database_url: Option<String>,
+) -> CodexRouteFixture {
     let directory = tempfile::tempdir().unwrap();
     let archive_path = directory.path().join(archive_directory);
-    let database_url = crate::db::Database::sqlite_database_url(&format!(
-        "sqlite://{}?mode=rwc",
-        directory.path().join(format!("codex-{label}.db")).display()
-    ));
+    let database_url = database_url.unwrap_or_else(|| {
+        crate::db::Database::sqlite_database_url(&format!(
+            "sqlite://{}?mode=rwc",
+            directory.path().join(format!("codex-{label}.db")).display()
+        ))
+    });
     let mut config = Config::for_test(database_url.clone());
     config.archive_backend = ArchiveBackend::Filesystem;
     config.archive_path = Some(archive_path.display().to_string());
@@ -5300,7 +5310,7 @@ async fn codex_streaming_output_then_failure_keeps_unobserved_usage_out_of_actua
         "data: {\"type\":\"response.created\",\"response\":{\"id\":\"resp-failed\"}}\n\n",
         "data: {\"type\":\"response.output_text.delta\",\"delta\":\"billable output\"}\n\n",
         "event: response.failed\n",
-        "data: {\"type\":\"response.failed\",\"response\":{\"error\":{\"message\":\"provider-secret\"}}}\n\n",
+        "data: {\"type\":\"response.failed\",\"response\":{\"error\":{\"message\":\"provider explanation\",\"token\":\"credential-fixture\"}}}\n\n",
         "data: [DONE]\n\n"
     );
     Mock::given(method("POST"))
@@ -5324,7 +5334,8 @@ async fn codex_streaming_output_then_failure_keeps_unobserved_usage_out_of_actua
         .unwrap();
     let rendered = String::from_utf8(body.to_vec()).unwrap();
     assert!(rendered.contains("billable output"));
-    assert!(!rendered.contains("provider-secret"));
+    assert!(rendered.contains("provider explanation"));
+    assert!(!rendered.contains("credential-fixture"));
     cancellation::assert_single_unknown_receipt(&fixture, 502, Some("upstream_failed_response"))
         .await;
     let rows = fixture

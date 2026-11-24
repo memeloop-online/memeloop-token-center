@@ -101,11 +101,17 @@ impl Database {
             return Err(HistoryError::Changed);
         }
         Self::history_require_unprepared(&mut transaction).await?;
+        let previous_definitions =
+            self.history_capture_definitions_with_projection_guards(false, false)?;
         for definition in self.history_capture_definitions()? {
             if definition.matches(&mut transaction).await? {
                 continue;
             }
-            let old_body=definition.body.replacen("BEGIN IF (SELECT mode FROM request_history_state WHERE id=1)='off' THEN RETURN NULL; END IF; ","BEGIN ",1);
+            let previous = previous_definitions
+                .iter()
+                .find(|old| old.name == definition.name)
+                .ok_or(HistoryError::Mismatch)?;
+            let old_body=previous.body.replacen("BEGIN IF (SELECT mode FROM request_history_state WHERE id=1)='off' THEN RETURN NULL; END IF; ","BEGIN ",1);
             let old = CaptureDefinition {
                 table: definition.table,
                 event: definition.event,
@@ -122,7 +128,7 @@ impl Database {
                 body: old_body,
                 sql: String::new(),
             };
-            if !old.matches(&mut transaction).await? {
+            if !previous.matches(&mut transaction).await? && !old.matches(&mut transaction).await? {
                 return Err(HistoryError::Verification(
                     "unknown activation function catalog",
                 ));
@@ -140,6 +146,96 @@ impl Database {
         }
         transaction.commit().await?;
         Ok(())
+    }
+
+    /// Replace only the known upstream UPDATE function. This changes no
+    /// projected business value, capture epoch, source trigger or pending work.
+    pub async fn history_upgrade_upstream_capture(&self) -> Result<Value, HistoryError> {
+        if !matches!(self.backend, DatabaseBackend::PostgreSql) {
+            return Err(HistoryError::Invalid(
+                "upstream capture upgrade requires PostgreSQL",
+            ));
+        }
+        let mut tx = self.pool.begin().await?;
+        Self::history_bootstrap_maintenance_lock(&mut tx).await?;
+        let mode: String = sqlx::query_scalar(
+            "SELECT mode FROM request_history_state WHERE id=1 FOR SHARE NOWAIT",
+        )
+        .fetch_one(&mut *tx)
+        .await?;
+        let next = self
+            .history_capture_definitions()?
+            .into_iter()
+            .find(|d| d.table == "upstream_accounts" && d.event == "UPDATE")
+            .ok_or(HistoryError::Mismatch)?;
+        if !next.matches(&mut tx).await? {
+            let old = self
+                .history_capture_definitions_with_upstream_projection(false)?
+                .into_iter()
+                .find(|d| d.name == next.name)
+                .ok_or(HistoryError::Mismatch)?;
+            if !old.matches(&mut tx).await? {
+                return Err(HistoryError::Verification(
+                    "unknown upstream update capture function",
+                ));
+            }
+            sqlx::raw_sql(sqlx::AssertSqlSafe(format!(
+                "CREATE OR REPLACE FUNCTION {}() RETURNS trigger LANGUAGE plpgsql VOLATILE SECURITY INVOKER AS $history${}$history$; COMMENT ON FUNCTION {}() IS '{}';",
+                next.name, next.body, next.name, next.manifest,
+            ))).execute(&mut *tx).await?;
+            if !next.matches(&mut tx).await? {
+                return Err(HistoryError::Verification(
+                    "upstream update capture upgrade",
+                ));
+            }
+        }
+        tx.commit().await?;
+        Ok(serde_json::json!({"mode":mode,"upstream_update_capture_upgraded":true}))
+    }
+
+    /// Replace only the known terminal UPDATE function. This changes no
+    /// projected business value, capture epoch, source trigger or pending work.
+    pub async fn history_upgrade_terminal_capture(&self) -> Result<Value, HistoryError> {
+        if !matches!(self.backend, DatabaseBackend::PostgreSql) {
+            return Err(HistoryError::Invalid(
+                "terminal capture upgrade requires PostgreSQL",
+            ));
+        }
+        let mut tx = self.pool.begin().await?;
+        Self::history_bootstrap_maintenance_lock(&mut tx).await?;
+        let mode: String = sqlx::query_scalar(
+            "SELECT mode FROM request_history_state WHERE id=1 FOR SHARE NOWAIT",
+        )
+        .fetch_one(&mut *tx)
+        .await?;
+        let next = self
+            .history_capture_definitions()?
+            .into_iter()
+            .find(|d| d.table == "terminal_projection_outbox" && d.event == "UPDATE")
+            .ok_or(HistoryError::Mismatch)?;
+        if !next.matches(&mut tx).await? {
+            let old = self
+                .history_capture_definitions_with_projection_guards(true, false)?
+                .into_iter()
+                .find(|d| d.name == next.name)
+                .ok_or(HistoryError::Mismatch)?;
+            if !old.matches(&mut tx).await? {
+                return Err(HistoryError::Verification(
+                    "unknown terminal update capture function",
+                ));
+            }
+            sqlx::raw_sql(sqlx::AssertSqlSafe(format!(
+                "CREATE OR REPLACE FUNCTION {}() RETURNS trigger LANGUAGE plpgsql VOLATILE SECURITY INVOKER AS $history${}$history$; COMMENT ON FUNCTION {}() IS '{}';",
+                next.name, next.body, next.name, next.manifest,
+            ))).execute(&mut *tx).await?;
+            if !next.matches(&mut tx).await? {
+                return Err(HistoryError::Verification(
+                    "terminal update capture upgrade",
+                ));
+            }
+        }
+        tx.commit().await?;
+        Ok(serde_json::json!({"mode":mode,"terminal_update_capture_upgraded":true}))
     }
 
     pub async fn history_activate_capture(&self) -> Result<(), HistoryError> {
@@ -429,6 +525,15 @@ mod tests {
         insert_event(&mut new_writer, new_event).await.unwrap();
         new_writer.commit().await.unwrap();
         assert_eq!(resumed.history_pending_count().await.unwrap(), 1);
+        // Activation requires the committed old-transaction horizon before
+        // backfill may cover pre-activation writes.
+        tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            while !resumed.history_capture_horizon_ready().await.unwrap() {
+                tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .unwrap();
         while !resumed.history_backfill_done().await.unwrap() {
             resumed.history_backfill_page(64).await.unwrap();
         }
@@ -468,3 +573,11 @@ mod tests {
         admin.close().await;
     }
 }
+
+#[cfg(test)]
+#[path = "upstream_projection_tests.rs"]
+mod upstream_projection_tests;
+
+#[cfg(test)]
+#[path = "terminal_projection_guard_tests.rs"]
+mod terminal_projection_guard_tests;

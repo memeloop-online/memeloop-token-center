@@ -7,6 +7,7 @@ pub(crate) struct HistorySourceSnapshot {
     pub(crate) transaction: Transaction<'static, Any>,
     source: usize,
     after: String,
+    after_created_at: Option<i64>,
     pending: Option<HistorySourcePage>,
     owner: Uuid,
     epoch: i64,
@@ -17,9 +18,40 @@ pub(crate) struct HistorySourceSnapshot {
 #[derive(Clone)]
 pub(crate) struct HistorySourcePage {
     pub(crate) token: Uuid,
-    pub(crate) rows: Vec<(HistoryIdentity, i64, Value)>,
+    pub(crate) rows: Vec<(HistoryIdentity, i64, BaselineAuthority)>,
     source: usize,
     after: String,
+    after_created_at: Option<i64>,
+}
+
+#[derive(Clone)]
+pub(crate) enum BaselineAuthority {
+    Captured(Value),
+    Frozen(crate::request_history::HistorySnapshot),
+    Acknowledged(String),
+}
+
+fn baseline_range_cursor(id: &str, created_at: Option<i64>) -> String {
+    match created_at {
+        Some(time) => serde_json::json!({"created_at":time,"id":id}).to_string(),
+        None => id.to_owned(),
+    }
+}
+
+fn acknowledged_baseline_snapshot(
+    identity: &HistoryIdentity,
+    revision: i64,
+    hash: &str,
+    snapshot: Option<crate::request_history::HistorySnapshot>,
+) -> Result<crate::request_history::HistorySnapshot, HistoryError> {
+    let snapshot = snapshot.ok_or(HistoryError::Changed)?;
+    if snapshot.identity != *identity
+        || snapshot.revision != revision
+        || crate::request_history::canonical_hash(&snapshot)? != hash
+    {
+        return Err(HistoryError::Changed);
+    }
+    Ok(snapshot)
 }
 
 impl Database {
@@ -104,6 +136,7 @@ impl Database {
             transaction: source,
             source: 0,
             after: String::new(),
+            after_created_at: None,
             pending: None,
             owner,
             epoch,
@@ -131,16 +164,51 @@ impl HistorySourceSnapshot {
             return Ok(Some(page.clone()));
         }
         while let Some(source) = SOURCES.get(self.source) {
-            let rows=sqlx::query("SELECT s.source,s.request_id,s.tenant_id,s.key_id,s.created_at,GREATEST(COALESCE(e.revision,0),COALESCE(i.head_revision,0)) AS revision FROM request_history_source_ids s LEFT JOIN request_history_export e ON e.source=s.source AND e.request_id=s.request_id LEFT JOIN request_history_identities i ON i.source=s.source AND i.request_id=s.request_id WHERE s.source=$1 AND s.request_id>$2 ORDER BY s.request_id LIMIT $3")
-                .bind(*source).bind(&self.after).bind(page_size).fetch_all(&mut *self.transaction).await?;
+            let source_rows = if *source == "event" {
+                sqlx::query(super::request_history::EVENT_SOURCE_PAGE_SQL)
+                    .bind(self.after_created_at.unwrap_or(i64::MIN))
+                    .bind(&self.after)
+                    .bind(page_size)
+                    .fetch_all(&mut *self.transaction)
+                    .await?
+            } else {
+                sqlx::query("SELECT source,request_id,tenant_id,key_id,created_at FROM request_history_source_ids WHERE source=$1 AND request_id>$2 ORDER BY request_id LIMIT $3")
+                    .bind(*source).bind(&self.after).bind(page_size).fetch_all(&mut *self.transaction).await?
+            };
+            let rows = source_rows;
             if rows.is_empty() {
                 self.source += 1;
                 self.after.clear();
+                self.after_created_at = None;
                 continue;
             }
             let mut envelopes = Vec::with_capacity(rows.len());
             for row in &rows {
-                let revision: i64 = row.try_get("revision")?;
+                let identity = HistoryIdentity {
+                    source: row.try_get("source")?,
+                    request_id: parse_uuid(row.try_get("request_id")?)?,
+                    tenant_id: parse_uuid(row.try_get("tenant_id")?)?,
+                    key_id: parse_uuid(row.try_get("key_id")?)?,
+                    created_at: row.try_get("created_at")?,
+                };
+                let head = sqlx::query("SELECT head_revision,acknowledged_revision,acknowledged_hash FROM request_history_identities WHERE source=$1 AND request_id=$2 AND tenant_id=$3 AND key_id=$4 AND created_at=$5")
+                    .bind(&identity.source).bind(identity.request_id.to_string()).bind(identity.tenant_id.to_string()).bind(identity.key_id.to_string()).bind(identity.created_at)
+                    .fetch_optional(&mut *self.transaction).await?;
+                let pending = sqlx::query("SELECT revision,snapshot FROM request_history_export WHERE source=$1 AND request_id=$2 AND tenant_id=$3 AND key_id=$4 AND created_at=$5")
+                    .bind(&identity.source).bind(identity.request_id.to_string()).bind(identity.tenant_id.to_string()).bind(identity.key_id.to_string()).bind(identity.created_at)
+                    .fetch_optional(&mut *self.transaction).await?;
+                let revision = head
+                    .as_ref()
+                    .map(|r| r.try_get::<i64, _>("head_revision"))
+                    .transpose()?
+                    .unwrap_or(0)
+                    .max(
+                        pending
+                            .as_ref()
+                            .map(|r| r.try_get::<i64, _>("revision"))
+                            .transpose()?
+                            .unwrap_or(0),
+                    );
                 if revision <= 0
                     || revision
                         > self.receipt["ceiling"]
@@ -149,74 +217,60 @@ impl HistorySourceSnapshot {
                 {
                     return Err(HistoryError::Changed);
                 }
-                let request: String = row.try_get("request_id")?;
-                let (identity, envelope) = match *source {
-                    "native" => {
-                        history_immutable_outbox::source_native_envelope_in_transaction(
-                            &mut self.transaction,
-                            &request,
-                            row,
-                        )
-                        .await?
+                let immutable = sqlx::query("SELECT source,request_id,tenant_id,key_id,created_at,snapshot,delivery_snapshot FROM request_history_immutable_outbox WHERE revision=$1")
+                    .bind(revision).fetch_optional(&mut *self.transaction).await?;
+                let authority = if let Some(captured) = immutable {
+                    let stored = HistoryIdentity {
+                        source: captured.try_get("source")?,
+                        request_id: parse_uuid(captured.try_get("request_id")?)?,
+                        tenant_id: parse_uuid(captured.try_get("tenant_id")?)?,
+                        key_id: parse_uuid(captured.try_get("key_id")?)?,
+                        created_at: captured.try_get("created_at")?,
+                    };
+                    if stored != identity {
+                        return Err(HistoryError::Mismatch);
                     }
-                    "generation" => {
-                        history_immutable_outbox::source_generation_envelope_in_transaction(
-                            &mut self.transaction,
-                            &request,
-                            row,
-                        )
-                        .await?
+                    let envelope = history_immutable_outbox::decode_captured_envelope(
+                        &captured.try_get::<String, _>("snapshot")?,
+                        &identity,
+                        revision,
+                    )?;
+                    if let Some(frozen) =
+                        captured.try_get::<Option<String>, _>("delivery_snapshot")?
+                    {
+                        BaselineAuthority::Frozen(serde_json::from_str(&frozen)?)
+                    } else {
+                        BaselineAuthority::Captured(envelope)
                     }
-                    "archive" => {
-                        history_immutable_outbox::source_archive_envelope_in_transaction(
-                            &mut self.transaction,
-                            &request,
-                            row,
-                        )
-                        .await?
+                } else if let Some(frozen) = pending
+                    .as_ref()
+                    .map(|r| r.try_get::<Option<String>, _>("snapshot"))
+                    .transpose()?
+                    .flatten()
+                {
+                    BaselineAuthority::Frozen(serde_json::from_str(&frozen)?)
+                } else if let Some(head) = head {
+                    let acknowledged: Option<i64> = head.try_get("acknowledged_revision")?;
+                    let hash: Option<String> = head.try_get("acknowledged_hash")?;
+                    match (acknowledged, hash) {
+                        (Some(ack), Some(hash)) if ack == revision && hash.len() == 64 => {
+                            BaselineAuthority::Acknowledged(hash)
+                        }
+                        _ => return Err(HistoryError::Changed),
                     }
-                    "event" => {
-                        let identity = HistoryIdentity {
-                            source: "event".into(),
-                            request_id: parse_uuid(request)?,
-                            tenant_id: parse_uuid(row.try_get("tenant_id")?)?,
-                            key_id: parse_uuid(row.try_get("key_id")?)?,
-                            created_at: row.try_get("created_at")?,
-                        };
-                        let payload = Database::history_original_event_in_transaction(
-                            &mut self.transaction,
-                            identity.request_id,
-                        )
-                        .await?;
-                        let original = history_immutable_outbox::original_event_in_transaction(
-                            &mut self.transaction,
-                            identity.request_id,
-                        )
-                        .await?;
-                        let parent: Option<String> = sqlx::query_scalar(
-                            "SELECT request_id FROM request_events WHERE event_id=$1",
-                        )
-                        .bind(identity.request_id.to_string())
-                        .fetch_optional(&mut *self.transaction)
-                        .await?;
-                        let parent_source: Option<String> = if let Some(parent) = &parent {
-                            sqlx::query_scalar("SELECT source FROM request_history_source_ids WHERE request_id=$1 AND tenant_id=$2 AND key_id=$3 AND source IN ('native','generation') ORDER BY source DESC LIMIT 1")
-                                .bind(parent).bind(identity.tenant_id.to_string()).bind(identity.key_id.to_string()).fetch_optional(&mut *self.transaction).await?
-                        } else {
-                            None
-                        };
-                        let envelope = serde_json::json!({"version":1,"source":"event","revision":revision,"request_id":identity.request_id,"tenant_id":identity.tenant_id,"key_id":identity.key_id,"created_at":identity.created_at,"payload":payload,"read_model":null,"statistics":null,"filter_cost_micros":null,"originals":{"event":original},"archive_identity":{"tenant_id":identity.tenant_id,"request_id":parent,"source":parent_source}});
-                        (identity, envelope)
-                    }
-                    _ => unreachable!("fixed source list"),
+                } else {
+                    return Err(HistoryError::Changed);
                 };
-                envelopes.push((identity, revision, envelope));
+                envelopes.push((identity, revision, authority));
             }
             let page = HistorySourcePage {
                 token: Uuid::now_v7(),
                 rows: envelopes,
                 source: self.source,
                 after: rows.last().unwrap().try_get("request_id")?,
+                after_created_at: (*source == "event")
+                    .then(|| rows.last().unwrap().try_get("created_at"))
+                    .transpose()?,
             };
             self.pending = Some(page.clone());
             return Ok(Some(page));
@@ -238,13 +292,36 @@ impl HistorySourceSnapshot {
         let Some(page) = self.next_envelopes(page_size).await? else {
             return Ok(0);
         };
+        let identities = page
+            .rows
+            .iter()
+            .map(|row| row.0.clone())
+            .collect::<Vec<_>>();
+        let existing = reader.baseline_snapshots(&identities).await?;
+        let mut summaries = history_immutable_outbox::SummaryBatch::default();
         let mut expected = Vec::with_capacity(page.rows.len());
         let mut missing = Vec::new();
-        for (identity, revision, envelope) in &page.rows {
-            let row = database
-                .history_materialize_envelope(envelope, identity.clone(), *revision)
-                .await?;
-            match reader.baseline_snapshot(identity).await? {
+        for ((identity, revision, authority), existing) in page.rows.iter().zip(existing) {
+            let row = match authority {
+                BaselineAuthority::Captured(envelope) => {
+                    database
+                        .history_materialize_envelope_with_batch(
+                            envelope,
+                            identity.clone(),
+                            *revision,
+                            &mut summaries,
+                        )
+                        .await?
+                }
+                BaselineAuthority::Frozen(snapshot) => snapshot.clone(),
+                BaselineAuthority::Acknowledged(hash) => {
+                    acknowledged_baseline_snapshot(identity, *revision, hash, existing.clone())?
+                }
+            };
+            if row.identity != *identity || row.revision != *revision {
+                return Err(HistoryError::Mismatch);
+            }
+            match existing {
                 Some(existing) if existing.revision > *revision => {
                     return Err(HistoryError::Changed);
                 }
@@ -258,15 +335,12 @@ impl HistorySourceSnapshot {
             expected.push(row);
         }
         writer.append(&missing).await?;
-        let mut target = Vec::with_capacity(expected.len());
-        for row in &expected {
-            target.push(
-                reader
-                    .baseline_snapshot(&row.identity)
-                    .await?
-                    .ok_or(HistoryError::Mismatch)?,
-            );
-        }
+        let target = reader
+            .baseline_snapshots(&identities)
+            .await?
+            .into_iter()
+            .map(|row| row.ok_or(HistoryError::Mismatch))
+            .collect::<Result<Vec<_>, _>>()?;
         self.acknowledge_page(database, page.token, &expected, &target)
             .await?;
         Ok(expected.len())
@@ -343,7 +417,9 @@ impl HistorySourceSnapshot {
         }
         sqlx::query("INSERT INTO request_history_baseline_chunks (owner,epoch,ordinal,source,after_id,through_id,row_count,source_hash,target_hash) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9) ON CONFLICT (owner,epoch,ordinal) DO NOTHING")
             .bind(self.owner.to_string()).bind(self.epoch).bind(self.ordinal)
-            .bind(&page.rows[0].0.source).bind(&self.after).bind(&page.after)
+            .bind(&page.rows[0].0.source)
+            .bind(baseline_range_cursor(&self.after, self.after_created_at))
+            .bind(baseline_range_cursor(&page.after, page.after_created_at))
             .bind(page.rows.len() as i64).bind(&source_hash).bind(&target_hash)
             .execute(&mut *transaction).await?;
         let hash: String = sqlx::query_scalar("SELECT source_hash FROM request_history_baseline_chunks WHERE owner=$1 AND epoch=$2 AND ordinal=$3")
@@ -354,6 +430,7 @@ impl HistorySourceSnapshot {
         transaction.commit().await?;
         self.source = page.source;
         self.after.clone_from(&page.after);
+        self.after_created_at = page.after_created_at;
         self.pending = None;
         self.ordinal += 1;
         Ok(())
@@ -387,6 +464,118 @@ impl Database {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn request_history_baseline_ack_authority_keeps_exact_frozen_revision() {
+        use crate::request_history::{HistorySnapshot, canonical_hash};
+        let identity = HistoryIdentity {
+            source: "event".into(),
+            request_id: Uuid::now_v7(),
+            tenant_id: Uuid::now_v7(),
+            key_id: Uuid::now_v7(),
+            created_at: 42,
+        };
+        let frozen = HistorySnapshot {
+            identity: identity.clone(),
+            revision: 7,
+            payload: Some(serde_json::json!({"legacy":true})),
+            read_model: Value::Null,
+            statistics: None,
+            filter_cost_micros: None,
+        };
+        let hash = canonical_hash(&frozen).unwrap();
+        assert_eq!(
+            canonical_hash(
+                &acknowledged_baseline_snapshot(&identity, 7, &hash, Some(frozen.clone())).unwrap()
+            )
+            .unwrap(),
+            hash
+        );
+        assert!(acknowledged_baseline_snapshot(&identity, 7, &hash, None).is_err());
+        assert!(acknowledged_baseline_snapshot(&identity, 8, &hash, Some(frozen.clone())).is_err());
+        assert!(
+            acknowledged_baseline_snapshot(&identity, 7, &"0".repeat(64), Some(frozen.clone()))
+                .is_err()
+        );
+        let mut wrong = frozen;
+        wrong.identity.tenant_id = Uuid::now_v7();
+        assert!(acknowledged_baseline_snapshot(&identity, 7, &hash, Some(wrong)).is_err());
+        assert_eq!(
+            baseline_range_cursor("id", Some(42)),
+            r#"{"created_at":42,"id":"id"}"#
+        );
+    }
+
+    #[tokio::test]
+    async fn request_history_baseline_event_cursor_reuses_frozen_authority() {
+        let directory = tempfile::tempdir().unwrap();
+        let database = Database::connect(&format!(
+            "sqlite://{}?mode=rwc",
+            directory.path().join("baseline.sqlite").display()
+        ))
+        .await
+        .unwrap();
+        database.migrate().await.unwrap();
+        database.history_start().await.unwrap();
+        let tenant = Uuid::now_v7();
+        let key = Uuid::now_v7();
+        // UUID order deliberately differs from event time, including an equal-time pair.
+        let ids = [Uuid::from_u128(9), Uuid::from_u128(2), Uuid::from_u128(3)];
+        let times = [42_i64, 43, 43];
+        for (id, time) in ids.into_iter().zip(times) {
+            sqlx::query("INSERT INTO request_events(event_id,tenant_id,key_id,request_id,event_at,event_kind,protocol,model,status_code,input_tokens,output_tokens,cost_micros) VALUES($1,$2,$3,$4,$5,'finished','openai','fixture',200,1,2,0)")
+                .bind(id.to_string()).bind(tenant.to_string()).bind(key.to_string()).bind(Uuid::now_v7().to_string()).bind(time).execute(&database.pool).await.unwrap();
+        }
+        // Capture the existing journal once, then baseline must use those bytes.
+        database.history_capture_pending(64).await.unwrap();
+        let mut snapshot = HistorySourceSnapshot {
+            receipt: serde_json::json!({"ceiling":i64::MAX}),
+            transaction: database.pool.begin().await.unwrap(),
+            source: 3,
+            after: String::new(),
+            after_created_at: None,
+            pending: None,
+            owner: Uuid::now_v7(),
+            epoch: 1,
+            ordinal: 0,
+            activation_epoch: 1,
+        };
+        for (id, time) in ids.into_iter().zip(times) {
+            let page = snapshot.next_envelopes(1).await.unwrap().unwrap();
+            assert_eq!(page.rows[0].0.request_id, id);
+            assert_eq!(page.rows[0].0.created_at, time);
+            assert!(matches!(page.rows[0].2, BaselineAuthority::Captured(_)));
+            assert_eq!(page.after_created_at, Some(time));
+            // Only simulate an already acknowledged cursor; real receipts remain covered by PG/CH test.
+            snapshot.after = page.after;
+            snapshot.after_created_at = page.after_created_at;
+            snapshot.pending = None;
+        }
+        assert!(snapshot.next_envelopes(1).await.unwrap().is_none());
+        snapshot.transaction.rollback().await.unwrap();
+        // An orphaned head cannot be reconstructed with today's DTO under an old revision.
+        sqlx::query("DELETE FROM request_history_immutable_outbox")
+            .execute(&database.pool)
+            .await
+            .unwrap();
+        let mut orphan = HistorySourceSnapshot {
+            receipt: serde_json::json!({"ceiling":i64::MAX}),
+            transaction: database.pool.begin().await.unwrap(),
+            source: 3,
+            after: String::new(),
+            after_created_at: None,
+            pending: None,
+            owner: Uuid::now_v7(),
+            epoch: 1,
+            ordinal: 0,
+            activation_epoch: 1,
+        };
+        assert!(matches!(
+            orphan.next_envelopes(1).await,
+            Err(HistoryError::Changed)
+        ));
+        orphan.transaction.rollback().await.unwrap();
+    }
 
     #[tokio::test]
     #[ignore = "existing CI supplies real PostgreSQL and ClickHouse services"]
@@ -469,6 +658,7 @@ mod tests {
         )
         .unwrap();
         client.initialize().await.unwrap();
+        database.history_capture_pending(64).await.unwrap();
         let owner = Uuid::now_v7();
         let mut snapshot = database
             .history_begin_source_snapshot(&source, owner)

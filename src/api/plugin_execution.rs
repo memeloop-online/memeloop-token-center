@@ -13,7 +13,7 @@ use crate::{
     metrics::{Metrics, plugin_execution::Outcome},
 };
 
-static PERMITS: LazyLock<Arc<Semaphore>> = LazyLock::new(|| Arc::new(Semaphore::new(8)));
+static PERMITS: LazyLock<Arc<Semaphore>> = LazyLock::new(|| Arc::new(Semaphore::new(1024)));
 
 struct Event {
     invocation_id: Uuid,

@@ -53,7 +53,13 @@ pub(crate) async fn lock_request_stats_projection_writer_in_transaction(
     Ok(())
 }
 
-/// Exclusively fences online projection writers for a fact backfill or full rebuild.
+/// Exclusively fences online projection writers for any aggregate replacement.
+///
+/// Take this at the owning transaction entry, before source/fact/session/budget locks.
+/// Conversation identity changes and merges can rebuild even one session; shared mode
+/// cannot protect their DELETE + INSERT snapshot from concurrent incremental writers.
+/// Never upgrade an already shared transaction after it has acquired other locks.
+/// This global gate pauses all projection writers until the replacement commits.
 pub(crate) async fn lock_request_stats_projection_rebuild_in_transaction(
     transaction: &mut Transaction<'_, Any>,
 ) -> Result<(), AppError> {

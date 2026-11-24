@@ -375,3 +375,108 @@ async fn staging_identity_and_typed_segments_are_fail_closed() {
     // Generic finish would publish a bare location on the wrong backend.
     assert!(writer.finish().await.is_err());
 }
+
+#[tokio::test]
+async fn streamed_legacy_body_uses_current_metadata_backend_and_survives_switchback() {
+    let mut archive = memory_store();
+    let tenant = Uuid::now_v7();
+    let request = Uuid::now_v7();
+    let request_bytes = Bytes::from_static(br#"{"input":"legacy question"}"#);
+    let response_bytes = Bytes::from_static(br#"{"object":"response","status":"incomplete","output":[{"type":"message","role":"assistant","content":[{"type":"output_text","text":"partial legacy answer"}]}]}"#);
+    archive
+        .put("legacy/request.json", request_bytes.clone())
+        .await
+        .unwrap();
+    archive
+        .put("legacy/response.json", response_bytes.clone())
+        .await
+        .unwrap();
+    archive.training = Some(TrainingStore {
+        store: Arc::new(InMemory::new()),
+        identity: "c".repeat(64),
+    });
+    archive.training_cas_writes = true;
+    let prepared = archive
+        .prepare_session_body_streamed(
+            tenant,
+            request,
+            crate::conversation::ConversationHints::default(),
+            "legacy/request.json".into(),
+            Some("legacy/response.json".into()),
+            true,
+        )
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(!prepared.coverage_complete);
+    let manifest = archive
+        .get_semantic_manifest_streamed(tenant, &prepared.publication.manifest)
+        .await
+        .unwrap();
+    assert_eq!(
+        manifest.backend_identity.as_deref(),
+        Some("c".repeat(64).as_str())
+    );
+    assert!(
+        prepared
+            .publication
+            .manifest
+            .object_locator
+            .starts_with("stores/training/")
+    );
+    assert!(!manifest.coverage.observed_terminal);
+    let mut documents = Vec::new();
+    for atom in &prepared.atoms {
+        let reference: super::ConversationBodyReference =
+            serde_json::from_value(atom.content.clone()).unwrap();
+        // Streaming promotion preserves the legacy staging source backend.
+        assert!(
+            !reference
+                .conversation_body_v1
+                .object_locator
+                .starts_with("stores/training/")
+        );
+        let bytes = archive
+            .get_tenant_content(tenant, &reference.conversation_body_v1, 4096)
+            .await
+            .unwrap();
+        documents.push(String::from_utf8(bytes.to_vec()).unwrap());
+    }
+    assert!(documents.iter().any(|d| d.contains("legacy question")));
+    assert!(
+        documents
+            .iter()
+            .any(|d| d.contains("partial legacy answer"))
+    );
+    archive.training_cas_writes = false;
+    let existing = archive
+        .get_semantic_manifest_streamed(tenant, &prepared.publication.manifest)
+        .await
+        .unwrap();
+    assert_eq!(existing.backend_identity, manifest.backend_identity);
+    let legacy = archive
+        .prepare_session_body_streamed(
+            tenant,
+            Uuid::now_v7(),
+            crate::conversation::ConversationHints::default(),
+            "legacy/request.json".into(),
+            Some("legacy/response.json".into()),
+            true,
+        )
+        .await
+        .unwrap()
+        .unwrap();
+    let legacy_manifest = archive
+        .get_semantic_manifest_streamed(tenant, &legacy.publication.manifest)
+        .await
+        .unwrap();
+    assert_eq!(legacy_manifest.backend_identity, None);
+    assert_eq!(
+        archive.get("legacy/request.json").await.unwrap(),
+        request_bytes
+    );
+    assert_eq!(
+        archive.get("legacy/response.json").await.unwrap(),
+        response_bytes
+    );
+}

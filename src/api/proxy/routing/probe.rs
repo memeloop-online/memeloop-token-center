@@ -868,18 +868,26 @@ impl UpstreamAttemptGuard {
                 }
             );
         if mandatory {
-            self.finish_delivery_recovery().await;
+            // 持久化永远不允许阻塞请求通行。认证/限流这类必须落库的终态也只给一个
+            // 很小的有界预算；超时就放弃本次同步写入，交给后台队列与后续配额读取
+            // 重新收敛，而不是让请求排在连接池后面。
+            if tokio::time::timeout(
+                std::time::Duration::from_millis(500),
+                self.finish_delivery_recovery(),
+            )
+            .await
+            .is_err()
+            {
+                tracing::warn!(
+                    "delivery recovery persistence exceeded the request budget; continuing"
+                );
+            }
         }
-        let Some(completion) = self.take_completion(terminal, !mandatory) else {
-            return;
-        };
-        if mandatory {
-            completion.await;
-        } else {
+        // 认证/限流终态的持久化一律交给后台队列，请求路径完全不等它。
+        // 落库晚几毫秒只影响熔断/配额收敛的速度，不应该反过来卡住请求本身。
+        if let Some(completion) = self.take_completion(terminal, !mandatory) {
             queue.submit(4096, async move {
-                tokio::time::timeout(std::time::Duration::from_secs(2), completion)
-                    .await
-                    .map_err(|_| AppError::internal("probe_complete_1"))?;
+                let _ = tokio::time::timeout(std::time::Duration::from_secs(2), completion).await;
                 Ok(())
             });
         }

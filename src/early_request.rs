@@ -36,6 +36,14 @@ pub(crate) struct Journal {
 
 impl Journal {
     pub(crate) fn new(directory: PathBuf, database: Database) -> Arc<Self> {
+        Self::with_background(directory, database, true)
+    }
+
+    pub(crate) fn with_background(
+        directory: PathBuf,
+        database: Database,
+        background: bool,
+    ) -> Arc<Self> {
         let journal = Arc::new(Self {
             directory,
             database: database.clone(),
@@ -49,6 +57,9 @@ impl Journal {
             replayed: AtomicU64::new(0),
             failed: AtomicU64::new(0),
         });
+        if !background {
+            return journal;
+        }
         let owner = Arc::downgrade(&journal);
         let wake = journal.wake.clone();
         tokio::spawn(async move {

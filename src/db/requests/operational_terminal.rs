@@ -5,7 +5,7 @@ use super::super::parse_uuid;
 use super::super::*;
 
 #[cfg(test)]
-mod tests;
+pub(crate) mod tests;
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
@@ -28,6 +28,12 @@ pub(crate) struct PendingProxyOperationalTerminalAck {
     pub fence: Uuid,
     pub receipt_id: Uuid,
     pub operational_digest: String,
+}
+
+#[derive(Clone, Default)]
+pub(crate) struct ExpiredProxyOwnerScan {
+    after: Option<(i64, String)>,
+    upper: Option<i64>,
 }
 
 fn conflict() -> AppError {
@@ -78,6 +84,24 @@ impl Database {
         terminal: &PendingProxyOperationalTerminal,
         upstream_attribution: ProxyRequestUpstreamAttribution,
     ) -> Result<PendingProxyOperationalTerminalAck, AppError> {
+        self.record_pending_proxy_operational_terminal_inner(
+            claim,
+            receipt_id,
+            terminal,
+            upstream_attribution,
+            false,
+        )
+        .await
+    }
+
+    async fn record_pending_proxy_operational_terminal_inner(
+        &self,
+        claim: &PendingProxySettlementClaim,
+        receipt_id: Uuid,
+        terminal: &PendingProxyOperationalTerminal,
+        upstream_attribution: ProxyRequestUpstreamAttribution,
+        require_expired: bool,
+    ) -> Result<PendingProxyOperationalTerminalAck, AppError> {
         validate(terminal)?;
         let attribution = match upstream_attribution {
             ProxyRequestUpstreamAttribution::KeepSelected => {
@@ -123,6 +147,15 @@ impl Database {
         .await?;
         if owned.rows_affected() != 1 {
             return Err(conflict());
+        }
+        if require_expired {
+            let now = self.request_owner_now(&mut tx).await?;
+            let eligible = sqlx::query("SELECT 1 FROM request_records q WHERE q.id = $1 AND q.created_at = $2 AND q.tenant_id = $3 AND q.key_id = $4 AND q.reservation_id = $5 AND q.proxy_owner_token = $7 AND q.completed_at IS NULL AND q.proxy_owner_expires_at IS NOT NULL AND q.proxy_owner_expires_at <= $6 AND NOT EXISTS (SELECT 1 FROM proxy_operational_terminals o WHERE o.request_id = q.id)")
+                .bind(claim.request_id.to_string()).bind(created_at).bind(claim.tenant_id.to_string()).bind(claim.key_id.to_string()).bind(claim.reservation_id.to_string()).bind(now).bind(claim.owner_token.to_string())
+                .fetch_optional(&mut *tx).await?;
+            if eligible.is_none() {
+                return Err(conflict());
+            }
         }
         let authority = sqlx::query(
             "SELECT tenant_id,key_id,account_id,reservation_id,owner_token,fence,contract_digest,contract_json,state FROM pending_proxy_settlements WHERE request_id = $1",
@@ -178,6 +211,9 @@ impl Database {
             {
                 return Err(conflict());
             }
+            super::terminal_projection::enqueue_unknown_terminal_projection_in_transaction(
+                &mut tx, &claim.request_id.to_string(),
+            ).await?;
         } else {
             // Use the frozen contract, not a mutable request/candidate lookup,
             // so recovery has identical attribution after financial completion.
@@ -219,12 +255,30 @@ impl Database {
             .bind(unix_millis())
             .execute(&mut *tx)
             .await?;
-        }
+            // Publish the execution receipt atomically, independently of archive
+            // permits and financial projection. Legacy storage requires numeric
+            // placeholders; the shared read model emits unknown usage until the
+            // authoritative financial source is complete.
         super::terminal_projection::enqueue_unknown_terminal_projection_in_transaction(
             &mut tx,
             &claim.request_id.to_string(),
         )
         .await?;
+            let draft_cursor = crate::db::RequestEventCursor { event_id: Uuid::nil().to_string(), event_at: terminal.completed_at };
+            let pending_started = super::lifecycle::prepare_pending_started_in_transaction(&mut tx, &claim.request_id.to_string()).await?;
+            let draft_row = sqlx::query(r#"SELECT CAST($1 AS TEXT) AS event_id, CAST(tenant_id AS TEXT) AS tenant_id, CAST(key_id AS TEXT) AS key_id, CAST(id AS TEXT) AS request_id, CAST($2 AS BIGINT) AS event_at, CAST('finished' AS TEXT) AS event_kind, CAST(protocol AS TEXT) AS protocol, CAST(model AS TEXT) AS model, CAST($3 AS BIGINT) AS status_code, CAST($4 AS BIGINT) AS duration_ms, CAST(0 AS BIGINT) AS input_tokens, CAST(0 AS BIGINT) AS output_tokens, CAST(0 AS BIGINT) AS cost_micros, CAST($5 AS TEXT) AS error_code FROM request_records WHERE id = $6 AND created_at = $7 AND tenant_id = $8 AND key_id = $9"#)
+                .bind(&draft_cursor.event_id).bind(draft_cursor.event_at).bind(terminal.status_code)
+                .bind(terminal.duration_ms).bind(&terminal.error_code)
+                .bind(claim.request_id.to_string()).bind(created_at)
+                .bind(claim.tenant_id.to_string()).bind(claim.key_id.to_string())
+                .fetch_optional(&mut *tx).await?;
+            let prepared = match draft_row.as_ref() {
+                Some(row) => Some(crate::db::history_immutable_outbox::EventDraft::from_row(row)?.prepare(&mut tx).await?),
+                None => None,
+            };
+            crate::db::history_immutable_outbox::PreparedEventCapture::publish(&mut tx, pending_started, terminal.completed_at).await?;
+        crate::db::history_immutable_outbox::PreparedEventCapture::publish(&mut tx, prepared, terminal.completed_at).await?;
+        }
         tx.commit().await?;
         Ok(PendingProxyOperationalTerminalAck {
             request_id: claim.request_id,
@@ -239,19 +293,47 @@ impl Database {
     /// lease. Record that the connection is over so the list does not keep
     /// showing the request as still running. Billing stays unknown.
     pub(crate) async fn close_expired_proxy_owners(&self, limit: i64) -> Result<u64, AppError> {
+        self.close_expired_proxy_owners_page(limit, &mut ExpiredProxyOwnerScan::default())
+            .await
+    }
+
+    pub(crate) async fn close_expired_proxy_owners_page(
+        &self,
+        limit: i64,
+        scan: &mut ExpiredProxyOwnerScan,
+    ) -> Result<u64, AppError> {
         let mut connection = self.pool.acquire().await?;
         let now = self.request_owner_now(&mut connection).await?;
         connection.finish();
-        let rows = sqlx::query(
-            "SELECT p.request_id, p.tenant_id, p.key_id, p.account_id, p.reservation_id, p.owner_token, p.fence, p.contract_digest, p.contract_json, q.created_at FROM pending_proxy_settlements p JOIN request_records q ON q.id = p.request_id AND q.tenant_id = p.tenant_id AND q.key_id = p.key_id AND q.reservation_id = p.reservation_id WHERE p.state = 'pending' AND q.completed_at IS NULL AND q.proxy_owner_expires_at IS NOT NULL AND q.proxy_owner_expires_at <= $1 AND NOT EXISTS (SELECT 1 FROM proxy_operational_terminals o WHERE o.request_id = p.request_id AND o.reservation_id = p.reservation_id) ORDER BY q.proxy_owner_expires_at, p.request_id LIMIT $2",
-        )
-        .bind(now)
-        .bind(limit.clamp(1, 100))
-        .fetch_all(&self.pool)
-        .await?;
+        let upper = *scan.upper.get_or_insert(now);
+        // Bound work before looking up any partition or applying eligibility.
+        let rows = match &scan.after {
+            Some((updated, id)) => sqlx::query("SELECT * FROM pending_proxy_settlements WHERE state = 'pending' AND updated_at <= $1 AND (updated_at, request_id) > ($2, $3) ORDER BY updated_at, request_id LIMIT $4")
+                .bind(upper).bind(updated).bind(id).bind(limit).fetch_all(&self.pool).await?,
+            None => sqlx::query("SELECT * FROM pending_proxy_settlements WHERE state = 'pending' AND updated_at <= $1 ORDER BY updated_at, request_id LIMIT $2")
+                .bind(upper).bind(limit).fetch_all(&self.pool).await?,
+        };
+        if rows.is_empty() {
+            scan.after = None;
+            scan.upper = None;
+        }
         let mut closed = 0_u64;
         for row in rows {
-            let request_id = parse_uuid(row.try_get("request_id")?)?;
+            let request_id_text: String = row.try_get("request_id")?;
+            scan.after = Some((row.try_get("updated_at")?, request_id_text.clone()));
+            let request_id = parse_uuid(request_id_text)?;
+            let tenant: String = row.try_get("tenant_id")?;
+            let key: String = row.try_get("key_id")?;
+            let created_at: Option<i64> = sqlx::query_scalar("SELECT created_at FROM request_record_locators WHERE id = $1 AND tenant_id = $2 AND key_id = $3")
+                .bind(request_id.to_string()).bind(&tenant).bind(&key).fetch_optional(&self.pool).await?;
+            let Some(created_at) = created_at else {
+                continue;
+            };
+            let eligible = sqlx::query("SELECT 1 FROM request_records q WHERE q.id = $1 AND q.created_at = $2 AND q.tenant_id = $3 AND q.key_id = $4 AND q.reservation_id = $5 AND q.completed_at IS NULL AND q.proxy_owner_expires_at IS NOT NULL AND q.proxy_owner_expires_at <= $6 AND NOT EXISTS (SELECT 1 FROM proxy_operational_terminals o WHERE o.request_id = q.id)")
+                .bind(request_id.to_string()).bind(created_at).bind(&tenant).bind(&key).bind(row.try_get::<String,_>("reservation_id")?).bind(now).fetch_optional(&self.pool).await?;
+            if eligible.is_none() {
+                continue;
+            }
             let contract: serde_json::Value = serde_json::from_str(
                 &row.try_get::<String, _>("contract_json")?,
             )
@@ -283,7 +365,6 @@ impl Database {
                     .unwrap_or("default")
                     .to_owned(),
             };
-            let created_at: i64 = row.try_get("created_at")?;
             let terminal = PendingProxyOperationalTerminal {
                 status_code: 502,
                 error_code: Some("gateway_owner_lost".to_owned()),
@@ -297,11 +378,12 @@ impl Database {
             };
             let receipt_id = Uuid::now_v7();
             match self
-                .record_pending_proxy_operational_terminal(
+                .record_pending_proxy_operational_terminal_inner(
                     &claim,
                     receipt_id,
                     &terminal,
                     ProxyRequestUpstreamAttribution::KeepSelected,
+                    true,
                 )
                 .await
             {

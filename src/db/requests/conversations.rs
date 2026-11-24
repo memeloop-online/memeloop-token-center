@@ -476,6 +476,72 @@ impl Database {
         Ok(())
     }
 
+    /// Claim one independently verified historical body without claiming any other work.
+    /// Source locators and the previous acknowledgement are compared atomically.
+    #[allow(clippy::too_many_arguments)]
+    pub async fn claim_exact_session_body_rebuild(
+        &self,
+        tenant_id: Uuid,
+        key_id: Uuid,
+        request_id: Uuid,
+        expected_projected_at: Option<i64>,
+        request_locator: &str,
+        response_locator: &str,
+        lease_owner: Uuid,
+        prepared_snapshot: Option<&str>,
+        previous_lease_owner: Option<Uuid>,
+    ) -> Result<bool, AppError> {
+        let now = unix_millis();
+        let mut transaction = self.begin_write_transaction().await?;
+        if matches!(self.backend, DatabaseBackend::PostgreSql) {
+            sqlx::query("SET LOCAL lock_timeout = '1s'")
+                .execute(&mut *transaction)
+                .await?;
+            sqlx::query("SET LOCAL statement_timeout = '3s'")
+                .execute(&mut *transaction)
+                .await?;
+        }
+        let created_at: Option<i64> = sqlx::query_scalar("SELECT created_at FROM request_record_locators WHERE id = $1 AND tenant_id = $2 AND key_id = $3")
+            .bind(request_id.to_string()).bind(tenant_id.to_string()).bind(key_id.to_string())
+            .fetch_optional(&mut *transaction).await?;
+        let Some(created_at) = created_at else {
+            return Ok(false);
+        };
+        let result = sqlx::query(
+            "UPDATE conversation_projection_outbox SET projected_at = NULL,
+             lease_owner = $1, lease_expires_at = $2,
+             terminal_lease_owner = NULL, terminal_lease_expires_at = NULL,
+             statistics_outcome = 'session_body', attempts = attempts + 1
+             WHERE request_id = $3 AND tenant_id = $4 AND key_id = $5
+               AND (projected_at = $6 OR (projected_at IS NULL AND $6 IS NULL))
+               AND semantic_payload_snapshot_json IS NULL
+               AND (semantic_snapshot_json IS NULL OR
+                    ($10 IS NOT NULL AND semantic_snapshot_json = $10
+                     AND lease_owner = $11 AND projected_at IS NULL))
+               AND (lease_owner IS NULL OR lease_expires_at <= $7)
+               AND (terminal_lease_owner IS NULL OR terminal_lease_expires_at <= $7)
+               AND EXISTS (SELECT 1 FROM request_records r
+                 WHERE r.id = $3 AND r.tenant_id = $4 AND r.key_id = $5 AND r.created_at = $12
+                   AND r.request_object = $8 AND r.response_object = $9)",
+        )
+        .bind(lease_owner.to_string())
+        .bind(now.saturating_add(CONVERSATION_PROJECTION_LEASE_MILLIS))
+        .bind(request_id.to_string())
+        .bind(tenant_id.to_string())
+        .bind(key_id.to_string())
+        .bind(expected_projected_at)
+        .bind(now)
+        .bind(request_locator)
+        .bind(response_locator)
+        .bind(prepared_snapshot)
+        .bind(previous_lease_owner.map(|owner| owner.to_string()))
+        .bind(created_at)
+        .execute(&mut *transaction)
+        .await?;
+        transaction.commit().await?;
+        Ok(result.rows_affected() == 1)
+    }
+
     /// 把已经写过 `projected_at`、并且原始请求 JSON 与原始返回 JSON 的 locator 都还在的行
     /// 收成小批，交给新 worker 重写会话正文。
     ///
@@ -484,7 +550,7 @@ impl Database {
     /// `statistics_outcome = session_body` 留在完成之后，避免同一行被反复重开。
     /// locator 缺一就不重开。不改 `request_object` / `response_object`。
     pub async fn reopen_session_body_rebuilds(&self, limit: i64) -> Result<u64, AppError> {
-        let limit = limit.clamp(1, CONVERSATION_PROJECTION_BATCH_LIMIT);
+        let limit = limit;
         let mut transaction = self.begin_write_transaction().await?;
         // Serialize the count and replenishment across worker transactions.
         // This background operation never waits for a busy replenisher.
@@ -524,10 +590,7 @@ impl Database {
     ///
     /// 只删除 `projected_at` 已落地且早于保留期的行；未投影任务一律保留。
     /// 用 `request_id` 子查询 + `LIMIT` 分批，避免一次性大事务放大 WAL 与 IO。
-    pub async fn delete_projected_conversation_outbox(
-        &self,
-        limit: i64,
-    ) -> Result<u64, AppError> {
+    pub async fn delete_projected_conversation_outbox(&self, limit: i64) -> Result<u64, AppError> {
         let cutoff = unix_millis().saturating_sub(CONVERSATION_PROJECTION_RETENTION_MS);
         let rows = sqlx::query(
             "DELETE FROM conversation_projection_outbox
@@ -540,7 +603,7 @@ impl Database {
              )",
         )
         .bind(cutoff)
-        .bind(limit.clamp(1, 10_000))
+        .bind(limit)
         .execute(&self.pool)
         .await?
         .rows_affected();
@@ -555,9 +618,19 @@ impl Database {
         lease_owner: Uuid,
         limit: i64,
     ) -> Result<Vec<ConversationProjectionTask>, AppError> {
+        self.claim_conversation_projection_tasks_from_turn(lease_owner, limit, 0)
+            .await
+    }
+
+    pub(crate) async fn claim_conversation_projection_tasks_from_turn(
+        &self,
+        lease_owner: Uuid,
+        limit: i64,
+        turn: usize,
+    ) -> Result<Vec<ConversationProjectionTask>, AppError> {
         let now = unix_millis();
         let expires_at = now.saturating_add(CONVERSATION_PROJECTION_LEASE_MILLIS);
-        let limit = limit.clamp(1, CONVERSATION_PROJECTION_BATCH_LIMIT);
+        let limit = limit;
         let mut transaction = self.begin_write_transaction().await?;
         let lock = match self.backend {
             DatabaseBackend::PostgreSql => " FOR UPDATE SKIP LOCKED",
@@ -568,21 +641,29 @@ impl Database {
         // others. Both primary and terminal-snapshot claims share these budgets.
         // Retry order uses the previous deadline so one old failing row cannot
         // repeatedly jump ahead of other eligible work.
-        let rebuild_budget = limit / 4;
-        let retry_budget = limit / 4;
-        let fresh_budget = limit - rebuild_budget - retry_budget;
         let primary = "(lease_owner = 'session-body-rebuild' OR lease_expires_at IS NULL OR lease_expires_at <= $3)";
         let ordinary = "COALESCE(statistics_outcome, '') <> 'session_body' AND COALESCE(lease_owner, '') <> 'session-body-rebuild'";
-        let lanes = [
-            (format!("{ordinary} AND attempts = 0"), fresh_budget),
-            (format!("{ordinary} AND attempts > 0"), retry_budget),
-            (
-                "(statistics_outcome = 'session_body' OR lease_owner = 'session-body-rebuild')"
-                    .to_owned(),
-                rebuild_budget,
-            ),
-            ("1 = 1".to_owned(), limit),
+        let predicates = [
+            format!("{ordinary} AND attempts = 0"),
+            format!("{ordinary} AND attempts > 0"),
+            "(statistics_outcome = 'session_body' OR lease_owner = 'session-body-rebuild')"
+                .to_owned(),
         ];
+        let schedule = [0usize, 0, 1, 2];
+        let mut budgets = [0i64; 3];
+        let mut order = Vec::new();
+        for offset in 0..limit.max(0) as usize {
+            let lane = schedule[(turn.wrapping_add(offset)) % schedule.len()];
+            budgets[lane] += 1;
+            if !order.contains(&lane) {
+                order.push(lane);
+            }
+        }
+        let mut lanes: Vec<(String, i64)> = order
+            .into_iter()
+            .map(|lane| (predicates[lane].clone(), budgets[lane]))
+            .collect();
+        lanes.push(("1 = 1".to_owned(), limit));
         let mut rows = Vec::new();
         for (lane, lane_budget) in lanes {
             let budget = lane_budget.min(limit - rows.len() as i64);
@@ -917,9 +998,7 @@ impl Database {
         tenant_id: Uuid,
         leaf_node_hash: &str,
     ) -> Result<Vec<crate::conversation::TrainingUtterance>, AppError> {
-        use futures_util::TryStreamExt as _;
-
-        let mut rows = sqlx::query(
+        let rows = sqlx::query(
             "WITH RECURSIVE chain AS (
                 SELECT node_hash, parent_hash, atom_hash, depth FROM context_nodes WHERE tenant_id = $1 AND node_hash = $2
                 UNION
@@ -933,10 +1012,12 @@ impl Database {
         )
         .bind(tenant_id.to_string())
         .bind(leaf_node_hash)
-        .fetch(&self.pool);
+        .fetch_all(&self.pool)
+        .await?;
         let mut turns = Vec::new();
         let mut previous = None;
-        while let Some(row) = rows.try_next().await? {
+        // Release the SQL query and its connection before opening body objects.
+        for row in rows {
             let parent: Option<String> = row.try_get("parent_hash")?;
             let depth: i64 = row.try_get("depth")?;
             if depth
@@ -1136,7 +1217,7 @@ impl Database {
 
         let mut transaction = self.begin_write_transaction().await?;
         let result: Result<bool, ConversationContentError> = async {
-        lock_request_stats_projection_writer_in_transaction(&mut transaction).await?;
+        lock_request_stats_projection_rebuild_in_transaction(&mut transaction).await?;
         let now = unix_millis();
         let terminal = sqlx::query(
             "SELECT created_at, projected_at FROM terminal_projection_outbox WHERE request_id = $1",
@@ -1391,7 +1472,22 @@ impl Database {
         hints: &ConversationHints,
         client_name: Option<&str>,
     ) -> Result<Uuid, AppError> {
+        // Object storage must finish before the global replacement gate is held.
+        let atoms = extract_atoms(request_json);
+        let nodes = build_prefix(&atoms);
+        let archived_atoms = self.archive_atom_bodies(key.tenant_id, &atoms).await?;
+        let observed_at = unix_millis();
         let mut transaction = self.begin_write_transaction().await?;
+        // Identity publication can replace session aggregates. Fence before any source lock.
+        lock_request_stats_projection_rebuild_in_transaction(&mut transaction).await?;
+        materialize_conversation_content_in_transaction(
+            &mut transaction,
+            &key.tenant_id.to_string(),
+            &archived_atoms,
+            &nodes,
+            observed_at,
+        )
+        .await?;
         let cluster_id = self
             .record_conversation_observation_in_transaction(
                 &mut transaction,
@@ -1402,9 +1498,9 @@ impl Database {
                     hints,
                     client_name,
                     upstream_response_id: None,
-                    observed_at: unix_millis(),
+                    observed_at,
                     attach_request_record: true,
-                    content_materialized: false,
+                    content_materialized: true,
                 },
             )
             .await?;
@@ -1439,8 +1535,9 @@ impl Database {
             attach_request_record,
             content_materialized,
         } = input;
-        // Join the live projection-writer cohort before request source, explicit-session, or
-        // conversation-reference locks. Full rebuilds take the exclusive form of this advisory.
+        // The owning transaction takes the exclusive projection gate before source locks:
+        // identity publication can reclassify or merge sessions and replace their aggregates.
+        // Re-entering shared mode here never upgrades a writer that already holds source locks.
         lock_request_stats_projection_writer_in_transaction(transaction).await?;
         let atoms = extract_atoms(request_json);
         let nodes = build_prefix(&atoms);
@@ -1771,7 +1868,7 @@ impl Database {
                 candidate_selection = Some(ConversationSelection {
                     observation_id: row.try_get("id")?,
                     relation: RelationKind::Candidate,
-                    confidence: confidence.clamp(1, 699),
+                    confidence: confidence,
                     direct_parent: false,
                     same_turn: false,
                     semantic_prefix: false,
@@ -1983,6 +2080,8 @@ impl Database {
         upstream_response_id: &str,
     ) -> Result<(), AppError> {
         let mut transaction = self.begin_write_transaction().await?;
+        // Resolving response references may merge and replace session aggregates.
+        lock_request_stats_projection_rebuild_in_transaction(&mut transaction).await?;
         attach_conversation_upstream_response_in_transaction(
             &mut transaction,
             self.backend,
@@ -2004,7 +2103,7 @@ impl Database {
         key_id: Uuid,
         filter: ConversationListFilter,
     ) -> Result<Vec<ConversationClusterView>, AppError> {
-        let limit = filter.limit.clamp(1, 100);
+        let limit = filter.limit;
         let key_id = key_id.to_string();
         let rows = if let (Some(before_updated_at), Some(before_cluster_id)) =
             (filter.before_updated_at, filter.before_cluster_id)
@@ -2063,7 +2162,7 @@ impl Database {
             request_count: cluster_row.try_get("request_count")?,
             candidate_edge_count: cluster_row.try_get("candidate_edge_count")?,
         };
-        let limit = filter.limit.clamp(1, 200);
+        let limit = filter.limit;
         // Bound each ordered source before touching archive spools. Applying
         // only the outer LIMIT makes large sessions hash-join the entire spool
         // tables and sort the complete history just to display one page.
@@ -2121,7 +2220,7 @@ impl Database {
             .collect();
         requests.reverse();
 
-        let edge_limit = (limit * 2).clamp(1, 400);
+        let edge_limit = (limit * 2);
         let edge_rows = if page_request_ids.is_empty() {
             Vec::new()
         } else {
@@ -2278,7 +2377,7 @@ fn newest_conversation_candidate(
     }
 }
 
-async fn emit_conversation_projected_event_in_transaction(
+pub(super) async fn emit_conversation_projected_event_in_transaction(
     transaction: &mut Transaction<'_, Any>,
     request_id: Uuid,
     tenant_id: Uuid,
@@ -2291,24 +2390,19 @@ async fn emit_conversation_projected_event_in_transaction(
     let request_id = request_id.to_string();
     let tenant_id = tenant_id.to_string();
     let key_id = key_id.to_string();
-    let event =
-        allocate_request_event_cursor(transaction, unix_millis(), &tenant_id, &key_id, &request_id)
-            .await?;
-    // Semantic completion does not imply financial settlement. An authenticated
-    // operational receipt may finish a request whose usage remains unknown.
-    // Keep the event's accounting fields sourced exclusively from the request;
-    // use the receipt only for runtime outcome and eligibility.
-    let inserted = sqlx::query(
-        r#"INSERT INTO request_events (
-               event_id, tenant_id, key_id, request_id, event_at, event_kind,
-               protocol, model, status_code, duration_ms, input_tokens,
-               output_tokens, cost_micros, error_code)
-           SELECT $1, r.tenant_id, r.key_id, r.id, $2, 'projected',
-                  r.protocol, r.model,
-                  COALESCE(o.status_code, r.status_code),
-                  COALESCE(o.duration_ms, r.duration_ms),
-                  r.input_tokens, r.output_tokens, r.cost_micros,
-                  CASE WHEN o.request_id IS NOT NULL THEN o.error_code ELSE r.error_code END
+    let pending_started =
+        super::lifecycle::prepare_pending_started_in_transaction(transaction, &request_id).await?;
+    super::super::history_immutable_outbox::capture_request_in_transaction(
+        transaction,
+        &request_id,
+    )
+    .await?;
+    let draft_cursor = crate::db::RequestEventCursor {
+        event_id: Uuid::nil().to_string(),
+        event_at: unix_millis(),
+    };
+    let draft_row = sqlx::query(
+        r#"SELECT CAST($1 AS TEXT) AS event_id, CAST(r.tenant_id AS TEXT) AS tenant_id, CAST(r.key_id AS TEXT) AS key_id, CAST(r.id AS TEXT) AS request_id, CAST($2 AS BIGINT) AS event_at, CAST('projected' AS TEXT) AS event_kind, CAST(r.protocol AS TEXT) AS protocol, CAST(r.model AS TEXT) AS model, CAST(COALESCE(o.status_code, r.status_code) AS BIGINT) AS status_code, CAST(COALESCE(o.duration_ms, r.duration_ms) AS BIGINT) AS duration_ms, CAST(r.input_tokens AS BIGINT) AS input_tokens, CAST(r.output_tokens AS BIGINT) AS output_tokens, CAST(r.cost_micros AS BIGINT) AS cost_micros, CAST(CASE WHEN o.request_id IS NOT NULL THEN o.error_code ELSE r.error_code END AS TEXT) AS error_code
              FROM request_records r
              LEFT JOIN proxy_operational_terminals o
                ON o.request_id = r.id AND o.request_created_at = r.created_at
@@ -2316,31 +2410,44 @@ async fn emit_conversation_projected_event_in_transaction(
               AND o.reservation_id = r.reservation_id
             WHERE r.id = $3 AND r.tenant_id = $4 AND r.key_id = $5
               AND (r.completed_at IS NOT NULL OR o.request_id IS NOT NULL)
-           UNION ALL
-           SELECT $1, tenant_id, key_id, request_id, $2, 'projected',
-                  protocol, model, status_code, duration_ms, input_tokens,
-                  output_tokens, cost_micros, NULLIF(error_code, '')
+            UNION ALL SELECT CAST($1 AS TEXT) AS event_id, CAST(tenant_id AS TEXT) AS tenant_id, CAST(key_id AS TEXT) AS key_id, CAST(request_id AS TEXT) AS request_id, CAST($2 AS BIGINT) AS event_at, CAST('projected' AS TEXT) AS event_kind, CAST(protocol AS TEXT) AS protocol, CAST(model AS TEXT) AS model, CAST(status_code AS BIGINT) AS status_code, CAST(duration_ms AS BIGINT) AS duration_ms, CAST(input_tokens AS BIGINT) AS input_tokens, CAST(output_tokens AS BIGINT) AS output_tokens, CAST(cost_micros AS BIGINT) AS cost_micros, CAST(NULLIF(error_code, '') AS TEXT) AS error_code
              FROM terminal_projection_outbox
             WHERE request_id = $3 AND tenant_id = $4 AND key_id = $5
               AND NOT EXISTS (SELECT 1 FROM request_records WHERE id = $3)"#,
     )
-    .bind(event.event_id)
-    .bind(event.event_at)
+    .bind(&draft_cursor.event_id)
+    .bind(draft_cursor.event_at)
     .bind(&request_id)
     .bind(tenant_id)
     .bind(key_id)
-    .execute(&mut **transaction)
+    .fetch_optional(&mut **transaction)
     .await?;
-    if inserted.rows_affected() != 1 {
+    let prepared = match draft_row.as_ref() {
+        Some(row) => Some(
+            crate::db::history_immutable_outbox::EventDraft::from_row(row)?
+                .prepare(transaction)
+                .await?,
+        ),
+        None => None,
+    };
+    crate::db::history_immutable_outbox::PreparedEventCapture::publish(
+        transaction,
+        pending_started,
+        unix_millis(),
+    )
+    .await?;
+    let inserted = crate::db::history_immutable_outbox::PreparedEventCapture::publish(
+        transaction,
+        prepared,
+        unix_millis(),
+    )
+    .await?;
+    if inserted != 1 {
         return Err(AppError::internal(
             "conversations_emit_conversation_projected_event_in_transaction_1",
         ));
     }
-    super::super::history_immutable_outbox::capture_request_in_transaction(
-        transaction,
-        &request_id,
-    )
-    .await?;
+
     Ok(())
 }
 
@@ -2701,8 +2808,8 @@ pub(crate) async fn attach_conversation_upstream_response_in_transaction(
     request_id: Uuid,
     upstream_response_id: &str,
 ) -> Result<(), AppError> {
-    // This path can reconcile clusters and merge their session projections. Acquire the shared
-    // statistics lock before reading or locking conversation state to preserve the global order.
+    // The owning transaction already holds the exclusive statistics gate before source locks.
+    // This helper can reconcile and replace session projections; it must never upgrade shared mode.
     lock_request_stats_projection_writer_in_transaction(transaction).await?;
     let upstream_response_id = upstream_response_id.trim();
     if upstream_response_id.is_empty()

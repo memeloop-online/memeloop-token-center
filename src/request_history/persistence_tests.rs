@@ -1348,12 +1348,20 @@ async fn request_history_real_services_acceptance_event_original_survives_ack_an
     let (key, request_id, _) = seed(&database).await;
     finish(&database, request_id).await;
     let event_id = Uuid::now_v7();
+    let event_at = unix_millis();
     sqlx::query("INSERT INTO request_events (tenant_id,event_id,request_id,event_at,event_kind,key_id,protocol,model,status_code,duration_ms,input_tokens,output_tokens,cost_micros,error_code) SELECT tenant_id,$1,id,$2,'original_fidelity_fixture',key_id,protocol,model,202,3,0,0,7,NULL FROM request_records WHERE id=$3")
-        .bind(event_id.to_string()).bind(unix_millis()).bind(request_id.to_string()).execute(&database.pool).await.unwrap();
+        .bind(event_id.to_string()).bind(event_at).bind(request_id.to_string()).execute(&database.pool).await.unwrap();
+    let event_identity = HistoryIdentity {
+        source: "event".into(),
+        request_id: event_id,
+        tenant_id: key.tenant_id,
+        key_id: key.key_id,
+        created_at: event_at,
+    };
     let mut transaction = database.pool.begin().await.unwrap();
     let original = super::super::history_immutable_outbox::original_event_in_transaction(
         &mut transaction,
-        event_id,
+        &event_identity,
     )
     .await
     .unwrap();

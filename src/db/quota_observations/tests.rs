@@ -252,6 +252,8 @@ async fn verify(config: Config) {
         generation: target.generation,
         config_revision: target.config_revision,
         provider: "kimi-oauth".into(),
+        ordinary_code_allowance: None,
+        started_at: 90,
         observed_at: 100,
         valid_until: 200,
         windows: vec![RoutingQuotaWindow {
@@ -326,12 +328,29 @@ async fn verify(config: Config) {
     db.finish_quota_observation(&target, failure_lease, None, 150)
         .await
         .unwrap();
-    assert!(
+    assert_eq!(
         db.routing_quota_observations(auth.tenant_id, &candidates, 112)
             .await
             .unwrap()
-            .is_empty()
+            .len(),
+        1,
+        "a failed background attempt cannot erase an accepted success"
     );
+    assert!(
+        db.routing_quota_observations(auth.tenant_id, &candidates, 201)
+            .await
+            .unwrap()
+            .is_empty(),
+        "failure does not extend the accepted observation validity"
+    );
+    let retained_valid_until: i64 = sqlx::query_scalar(
+        "SELECT valid_until FROM upstream_quota_observations WHERE upstream_account_id=$1",
+    )
+    .bind(account.id.to_string())
+    .fetch_one(&db.pool)
+    .await
+    .unwrap();
+    assert_eq!(retained_valid_until, value.valid_until);
     let stale_lease = Uuid::now_v7();
     assert!(
         db.claim_quota_observation(&target, stale_lease, 151, 181)
@@ -353,4 +372,345 @@ async fn verify(config: Config) {
         .await
         .unwrap();
     assert!(metadata[0].windows.is_empty());
+    verify_scoped_supplier_usage_recovery(db, &tenant, state.config.key_pepper.as_bytes()).await;
+}
+
+async fn verify_scoped_supplier_usage_recovery(db: &Database, tenant: &str, pepper: &[u8]) {
+    use crate::upstream_quota::observations::OrdinaryCodeAllowance;
+    let account = db
+        .create_upstream_account(
+            CreateUpstreamAccountInput {
+                tenant_external_id: tenant.into(),
+                name: "supplier-only-recovery".into(),
+                driver: "http-json".into(),
+                config: json!({"base_url":"http://127.0.0.1:18083","network_scope":"private"}),
+                credential: UpstreamCredential::None,
+                oauth_session_id: None,
+                oauth_driver: None,
+                oauth_refresh_url: None,
+            },
+            pepper,
+        )
+        .await
+        .unwrap();
+    sqlx::query("UPDATE upstream_accounts SET driver='openai-codex' WHERE id=$1")
+        .bind(account.id.to_string())
+        .execute(&db.pool)
+        .await
+        .unwrap();
+    let now = unix_millis();
+    let started_at = now - 100;
+    for (model, scope, generation, revision, failed_at) in [
+        (
+            "covered",
+            "ordinary_code",
+            account.credential_generation,
+            account.updated_at,
+            started_at - 1,
+        ),
+        (
+            "during-read",
+            "ordinary_code",
+            account.credential_generation,
+            account.updated_at,
+            started_at + 1,
+        ),
+        (
+            "review",
+            "code_review",
+            account.credential_generation,
+            account.updated_at,
+            started_at - 1,
+        ),
+        (
+            "specific",
+            "model_specific",
+            account.credential_generation,
+            account.updated_at,
+            started_at - 1,
+        ),
+        (
+            "old-generation",
+            "ordinary_code",
+            account.credential_generation - 1,
+            account.updated_at,
+            started_at - 1,
+        ),
+        (
+            "old-revision",
+            "ordinary_code",
+            account.credential_generation,
+            account.updated_at - 1,
+            started_at - 1,
+        ),
+    ] {
+        sqlx::query("INSERT INTO upstream_supplier_availability (upstream_account_id,upstream_model,credential_generation,transport_revision,failure_kind,reset_at,reset_source,observed_at,request_id,capacity_scope,hard_observed_at,reset_observed_at) VALUES ($1,$2,$3,$4,'quota_exhausted',$5,'provider_reset',$6,'fixture',$7,$6,$6)")
+            .bind(account.id.to_string()).bind(model).bind(generation).bind(revision)
+            .bind(now + 86_400_000).bind(failed_at).bind(scope).execute(&db.pool).await.unwrap();
+    }
+    // Old writers/migrated rows have no proved capacity scope; the default must
+    // remain unknown rather than becoming account-wide evidence.
+    sqlx::query("INSERT INTO upstream_supplier_availability (upstream_account_id,upstream_model,credential_generation,transport_revision,failure_kind,reset_at,reset_source,observed_at,request_id) VALUES ($1,'unknown',$2,$3,'quota_exhausted',$4,'provider_reset',$5,'legacy-fixture')")
+        .bind(account.id.to_string()).bind(account.credential_generation).bind(account.updated_at)
+        .bind(now + 86_400_000).bind(started_at - 1).execute(&db.pool).await.unwrap();
+    let target = db
+        .quota_observation_targets(&[], &[], now, 100)
+        .await
+        .unwrap()
+        .into_iter()
+        .find(|target| target.account_id == account.id)
+        .unwrap();
+    assert!(
+        target.recovering_quota,
+        "scoped-only failures need independent quota recovery"
+    );
+    let lease = Uuid::now_v7();
+    assert!(
+        db.claim_quota_observation(&target, lease, now, now + 30_000)
+            .await
+            .unwrap()
+    );
+    sqlx::query("INSERT INTO upstream_account_health (upstream_account_id,credential_generation,transport_revision,consecutive_failures,cooldown_until,probe_lease_until,last_failure_kind,updated_at) VALUES ($1,$2,$3,1,$4,0,'quota_exhausted',$5)")
+        .bind(account.id.to_string()).bind(account.credential_generation).bind(account.updated_at)
+        .bind(now+86_400_000).bind(started_at-1).execute(&db.pool).await.unwrap();
+    let route = db
+        .create_model_route(CreateModelRouteInput {
+            tenant_external_id: tenant.into(),
+            public_model: "quota-recovery-contract".into(),
+            upstream_account_id: account.id,
+            upstream_model: "covered".into(),
+            protocol: "openai".into(),
+            priority: 0,
+        })
+        .await
+        .unwrap();
+    let key = db
+        .create_key_with_routing(
+            CreateKeyInput {
+                tenant_external_id: tenant.into(),
+                principal_external_id: "recovery-contract".into(),
+                alias: "recovery-contract".into(),
+                currency: "USD".into(),
+                policy: KeyPolicy::default(),
+                initial_balance: Decimal::TEN,
+                idempotency_key: None,
+            },
+            &[route.id],
+            &[],
+            pepper,
+        )
+        .await
+        .unwrap();
+    let tenant_id = db
+        .authenticate_key(&key.key, pepper)
+        .await
+        .unwrap()
+        .tenant_id;
+    let selection = RouteSelectionOptions {
+        upstream_account_hint: None,
+        avoid_route_account: None,
+        selection_seed: Uuid::now_v7(),
+    };
+    assert!(
+        db.list_authorized_upstream_candidates_with_hint(
+            key.key_id,
+            tenant_id,
+            "quota-recovery-contract",
+            "openai",
+            selection,
+        )
+        .await
+        .unwrap()
+        .is_empty(),
+        "same-source legacy and scoped exhaustion blocks actual dispatch"
+    );
+    let value = RoutingQuotaObservation {
+        account_id: account.id,
+        generation: account.credential_generation,
+        config_revision: account.updated_at,
+        provider: "openai-codex".into(),
+        started_at,
+        observed_at: now - 10,
+        valid_until: now + 30_000,
+        windows: vec![RoutingQuotaWindow {
+            id: "code:primary_window".into(),
+            period_seconds: Some(604800),
+            reset_at: Some(now + 86_400_000),
+            reset_is_estimated: false,
+            remaining_fraction: Some(0.98),
+            exhausted: Some(false),
+        }],
+        ordinary_code_allowance: Some(OrdinaryCodeAllowance {
+            started_at,
+            window_ids: vec!["code:primary_window".into()],
+            legacy_fence: Some((1, started_at - 1)),
+        }),
+    };
+    // Publication and both recovery projections share the caller transaction.
+    // Aborting after every mutation must retain the original lease and blockers.
+    let mut aborted = db.begin_write_transaction().await.unwrap();
+    db.publish_accepted_quota_observation(&mut aborted, &value)
+        .await
+        .unwrap();
+    aborted.rollback().await.unwrap();
+    let unpublished: Option<String> = sqlx::query_scalar(
+        "SELECT observation_json FROM upstream_quota_observations WHERE upstream_account_id=$1",
+    )
+    .bind(account.id.to_string())
+    .fetch_one(&db.pool)
+    .await
+    .unwrap();
+    assert!(
+        unpublished.is_none(),
+        "aborted publication cannot leak a routing observation"
+    );
+    assert!(
+        db.list_authorized_upstream_candidates_with_hint(
+            key.key_id,
+            tenant_id,
+            "quota-recovery-contract",
+            "openai",
+            selection,
+        )
+        .await
+        .unwrap()
+        .is_empty(),
+        "aborted recovery retains the dispatch blockers"
+    );
+    db.finish_quota_observation(&target, lease, Some(&value), now + 10_000)
+        .await
+        .unwrap();
+    let legacy: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM upstream_account_health WHERE upstream_account_id=$1",
+    )
+    .bind(account.id.to_string())
+    .fetch_one(&db.pool)
+    .await
+    .unwrap();
+    assert_eq!(
+        legacy, 0,
+        "same accepted proof clears the fenced legacy blocker atomically"
+    );
+    let dispatched = db
+        .list_authorized_upstream_candidates_with_hint(
+            key.key_id,
+            tenant_id,
+            "quota-recovery-contract",
+            "openai",
+            selection,
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        dispatched.len(),
+        1,
+        "accepted proof restores actual dispatch"
+    );
+    assert_eq!(dispatched[0].account_id, account.id);
+    let mut newer = value.clone();
+    newer.started_at = started_at + 10;
+    newer.observed_at = now;
+    newer.valid_until = now + 40_000;
+    let old_background_lease = Uuid::now_v7();
+    sqlx::query("UPDATE upstream_quota_observations SET lease_id=$2,lease_until=$3 WHERE upstream_account_id=$1")
+        .bind(account.id.to_string()).bind(old_background_lease.to_string()).bind(now+30_000).execute(&db.pool).await.unwrap();
+    db.publish_manual_quota_observation(&newer).await.unwrap();
+    let retained_lease: Option<String> = sqlx::query_scalar(
+        "SELECT lease_id FROM upstream_quota_observations WHERE upstream_account_id=$1",
+    )
+    .bind(account.id.to_string())
+    .fetch_one(&db.pool)
+    .await
+    .unwrap();
+    assert_eq!(
+        retained_lease,
+        Some(old_background_lease.to_string()),
+        "manual publication never steals a background lease"
+    );
+    let mut late_old = value.clone();
+    late_old.observed_at = unix_millis();
+    late_old.windows[0].remaining_fraction = Some(0.01);
+    db.finish_quota_observation(&target, old_background_lease, Some(&late_old), now + 10_000)
+        .await
+        .unwrap();
+    let accepted: i64 = sqlx::query_scalar(
+        "SELECT observed_at FROM upstream_quota_observations WHERE upstream_account_id=$1",
+    )
+    .bind(account.id.to_string())
+    .fetch_one(&db.pool)
+    .await
+    .unwrap();
+    assert_eq!(
+        accepted, now,
+        "older publication cannot replace newer authority"
+    );
+    let accepted_json: String = sqlx::query_scalar(
+        "SELECT observation_json FROM upstream_quota_observations WHERE upstream_account_id=$1",
+    )
+    .bind(account.id.to_string())
+    .fetch_one(&db.pool)
+    .await
+    .unwrap();
+    let accepted_value: RoutingQuotaObservation = serde_json::from_str(&accepted_json).unwrap();
+    assert_eq!(accepted_value.started_at, newer.started_at);
+    assert_eq!(
+        accepted_value.windows[0].remaining_fraction,
+        Some(0.98),
+        "late older supplier read cannot overwrite newer manual windows"
+    );
+    let rows = sqlx::query("SELECT upstream_model,failure_kind,capacity_scope,request_id FROM upstream_supplier_availability WHERE upstream_account_id=$1")
+        .bind(account.id.to_string()).fetch_all(&db.pool).await.unwrap();
+    assert_eq!(rows.len(), 7);
+    for row in rows {
+        let model: String = row.get("upstream_model");
+        assert_eq!(
+            row.get::<String, _>("failure_kind"),
+            if model == "covered" {
+                "available"
+            } else {
+                "quota_exhausted"
+            },
+            "scope/time fence for {model}"
+        );
+        assert_eq!(
+            row.get::<String, _>("request_id"),
+            if model == "unknown" {
+                "legacy-fixture"
+            } else {
+                "fixture"
+            }
+        );
+        if model == "unknown" {
+            assert_eq!(row.get::<String, _>("capacity_scope"), "unknown");
+        }
+    }
+    let decisions = db
+        .supplier_availability_decisions(account.id)
+        .await
+        .unwrap();
+    assert_eq!(
+        decisions.len(),
+        5,
+        "presentation excludes other generation/revision facts"
+    );
+    for decision in decisions {
+        assert_eq!(
+            decision.dispatch_eligible,
+            decision.upstream_model == "covered",
+            "shared scheduling decision for {}",
+            decision.upstream_model
+        );
+    }
+    db.migrate().await.unwrap();
+    assert_eq!(
+        sqlx::query_scalar::<_, i64>(
+            "SELECT COUNT(*) FROM upstream_supplier_availability WHERE upstream_account_id=$1"
+        )
+        .bind(account.id.to_string())
+        .fetch_one(&db.pool)
+        .await
+        .unwrap(),
+        7,
+        "migration replay retains all facts"
+    );
 }
