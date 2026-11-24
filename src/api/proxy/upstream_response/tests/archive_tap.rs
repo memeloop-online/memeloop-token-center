@@ -84,17 +84,20 @@ async fn slow_or_failed_dual_object_stores_do_not_own_customer_eof() {
                     Bytes::from(vec![b'y'; 512 * 1024])
                 };
                 let expected = [first.clone(), rest.clone()].concat();
-                let input =
-                    stream::once(async move { Ok(first) }).chain(stream::once(async move {
-                        tokio::time::timeout(Duration::from_secs(5), async {
-                            while selected.received_requests().await.unwrap().is_empty() {
-                                tokio::task::yield_now().await;
-                            }
-                        })
-                        .await
-                        .expect("actual selected S3 endpoint must receive a spill operation");
-                        Ok(rest)
-                    }));
+                let input = stream::iter(vec![
+                    Ok(first.slice(..64 * 1024)),
+                    Ok(first.slice(64 * 1024..)),
+                ])
+                .chain(stream::once(async move {
+                    tokio::time::timeout(Duration::from_secs(5), async {
+                        while selected.received_requests().await.unwrap().is_empty() {
+                            tokio::task::yield_now().await;
+                        }
+                    })
+                    .await
+                    .expect("actual selected S3 endpoint must receive a spill operation");
+                    Ok(rest)
+                }));
                 let mut customer = CapturedUpstream {
                     upstream: Some(Box::pin(input)),
                     capture: Some(producer),

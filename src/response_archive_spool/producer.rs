@@ -1276,7 +1276,7 @@ async fn run_response_archive_writer(
 ) -> Result<WriterOutcome, AppError> {
     // Upload concurrency and multipart memory belong to this background task,
     // never to admission of the supplier/client stream. Shared carrier capture
-    // runs independently; the handoff channel holds one acknowledged chunk.
+    // runs independently; ordered ingress is bounded by archival byte credit.
     #[cfg(test)]
     pause_begin_for_test(&state).await;
     #[cfg(test)]
@@ -1297,15 +1297,20 @@ async fn run_response_archive_writer(
                     .acquire_owned()
                     .await
                     .map_err(|_| AppError::internal("capture_upload_admission_closed"))?;
-                let reservation = state
-                    .persistence
-                    .stream_memory
-                    .temporary_wait(
-                        super::CAPTURE_MEMORY_BYTES,
-                        crate::gateway_body::memory::CAPTURE_MEMORY_WEIGHT,
-                    )
-                    .await
-                    .ok_or_else(|| AppError::internal("capture_upload_memory_closed"))?;
+                let reservation = match state.persistence.stream_memory.temporary(
+                    super::CAPTURE_MEMORY_BYTES
+                        * crate::gateway_body::memory::CAPTURE_MEMORY_WEIGHT,
+                ) {
+                    Ok(reservation) => reservation,
+                    Err(_) => {
+                        // Complete source bytes already have an owner. Release
+                        // this attempt's slot, then offload that source to make
+                        // workspace available; never wait behind its own credit.
+                        drop(permit);
+                        source.seal_to_objects().await?;
+                        return Err(AppError::storage("capture_upload_workspace_unavailable"));
+                    }
+                };
                 Some(CaptureQueueMemory {
                     _local_metrics: None,
                     _archive_permit: Some(permit),
