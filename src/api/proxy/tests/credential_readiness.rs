@@ -483,7 +483,7 @@ async fn stale_snapshot_refresh_is_request_bounded_and_does_not_restore_revoked_
     let pool = sqlx::AnyPool::connect(&fixture.database_url).await.unwrap();
     let mut rotation = pool.begin().await.unwrap();
     sqlx::query("INSERT INTO upstream_credentials (id,upstream_account_id,generation,credential_ciphertext,expires_at,created_at) SELECT $2,upstream_account_id,generation + 1,credential_ciphertext,expires_at,created_at FROM upstream_credentials WHERE upstream_account_id = $1 AND generation = (SELECT credential_generation FROM upstream_accounts WHERE id = $1)")
-        .bind(fixture.upstream_account_id.to_string()).execute(&mut *rotation).await.unwrap();
+        .bind(fixture.upstream_account_id.to_string()).bind(Uuid::now_v7().to_string()).execute(&mut *rotation).await.unwrap();
     sqlx::query("UPDATE upstream_accounts SET credential_generation = credential_generation + 1, updated_at = updated_at + 1 WHERE id = $1")
         .bind(fixture.upstream_account_id.to_string()).execute(&mut *rotation).await.unwrap();
     rotation.commit().await.unwrap();
