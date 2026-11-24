@@ -70,7 +70,7 @@ test("unknown requires owned semantics exactly once while retaining its receipt,
     ...claim, financial_completed: null, financial_status: null, actual_micros: null,
     receipt_id: null, receipt_digest: null, cost_micros: null, reserved_micros: 123,
     reservation_status: "reserved", state: "pending", unknown_reason: "authoritative_usage_unavailable",
-    ledger_count: 0, event_count: 1, fact_count: 1, observation_count: 1, projected_event_count: 1,
+    ledger_count: 0, event_count: 1, fact_count: 1, observation_count: 1, projected_event_count: 2, projected_event_ids: "event-a,event-b",
     stats_usage_basis: "not_observed", stats_cost_micros: 0, stats_input_tokens: 0,
     stats_output_tokens: 0, stats_cached_input_tokens: 0, stats_cache_write_tokens: 0,
     stats_status_class: "failure", stats_error_code: "upstream_invalid_response",
@@ -80,8 +80,7 @@ test("unknown requires owned semantics exactly once while retaining its receipt,
     observation_id: "observation", observation_request_id: "request", observation_key_id: "key",
     observation_cluster_id: "cluster", cluster_tenant_id: "tenant", cluster_principal_id: "principal",
     projection_tenant_id: "tenant", projection_key_id: "key", projection_principal_id: "principal",
-    projection_completed: 1235, projection_observed_at: 1234, projected_event_id: "projected",
-    projected_event_tenant_id: "tenant", projected_event_key_id: "key",
+    projection_completed: 1235, projection_observed_at: 1234, stats_projected_at: 1236, stats_outcome: "applied", projection_outcome: "session_body",
     operational_status: 502, operational_error: "upstream_invalid_response",
     operational_stage: "buffered_response_ready", operational_completed: 1234,
     operational_receipt_id: "receipt", operational_response_object: responseObject,
@@ -99,16 +98,21 @@ test("unknown requires owned semantics exactly once while retaining its receipt,
   const semantics = assertUnknownSemanticEvidence(row);
   assert.deepEqual(assertUnknownSemanticEvidence({ ...row }, semantics), semantics);
   assert.equal(assertUnknownFinancialEvidence({ ...row }, receipt), 0);
-  for (const count of [0, 2]) {
-    assert.throws(() => assertUnknownSemanticEvidence({ ...row, observation_count: count }), /exactly one conversation observation/u);
-    assert.throws(() => assertUnknownSemanticEvidence({ ...row, projected_event_count: count }), /exactly one semantic projected event/u);
-    assert.throws(() => assertUnknownSemanticEvidence({ ...row, observation_count: count }, semantics), /exactly one conversation observation/u);
-    assert.throws(() => assertUnknownSemanticEvidence({ ...row, projected_event_count: count }, semantics), /exactly one semantic projected event/u);
+  for (const baseline of [undefined, semantics]) {
+    for (const count of [0, 2]) assert.throws(() => assertUnknownSemanticEvidence({ ...row, observation_count: count }, baseline), /exactly one conversation observation/u);
+    for (const count of [0, 1, 3]) assert.throws(() => assertUnknownSemanticEvidence({ ...row, projected_event_count: count }, baseline), /two distinct scoped projected events/u);
+    for (const ids of [null, "event-a", "event-a,event-a"]) {
+      assert.throws(() => assertUnknownSemanticEvidence({ ...row, projected_event_ids: ids }, baseline), /two distinct scoped projected events/u);
+    }
   }
+  assert.throws(() => assertUnknownSemanticEvidence({ ...row, projected_event_ids: "event-a,event-c" }, semantics), /replay must preserve event IDs/u);
+  for (const field of ["stats_outcome", "projection_outcome"]) {
+    assert.throws(() => assertUnknownSemanticEvidence({ ...row, [field]: null }), /separate statistics and semantic projection receipts/u);
+  }
+  assert.throws(() => assertUnknownSemanticEvidence({ ...row, stats_projected_at: null }), /projection must commit/u);
   for (const field of [
     "observation_request_id", "observation_key_id", "cluster_tenant_id", "cluster_principal_id",
     "observation_cluster_id", "projection_tenant_id", "projection_key_id", "projection_principal_id",
-    "projected_event_tenant_id", "projected_event_key_id",
   ]) {
     assert.throws(() => assertUnknownSemanticEvidence({ ...row, [field]: "other-owner" }), /exact ownership/u);
   }
@@ -116,7 +120,7 @@ test("unknown requires owned semantics exactly once while retaining its receipt,
   assert.throws(() => assertUnknownSemanticEvidence({ ...row, projection_observed_at: 999 }, semantics), /operational receipt timestamp/u);
   assert.throws(() => assertUnknownSemanticEvidence({ ...row, projection_completed: 1236 }, semantics), /replay must preserve timestamp/u);
   assert.throws(() => assertUnknownSemanticEvidence({ ...row, operational_completed: 1235, projection_observed_at: 1235 }, semantics), /replay must preserve timestamp/u);
-  for (const field of ["observation_id", "projected_event_id", "operational_receipt_id"]) {
+  for (const field of ["observation_id", "operational_receipt_id"]) {
     assert.throws(() => assertUnknownSemanticEvidence({ ...row, [field]: "" }), /semantic evidence missing/u);
     assert.throws(() => assertUnknownSemanticEvidence({ ...row, [field]: "replacement" }, semantics), /replay must preserve identity/u);
   }

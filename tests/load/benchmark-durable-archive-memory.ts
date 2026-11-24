@@ -113,8 +113,17 @@ export function assertUnknownArchiveEvidence(row: Record<string, unknown>, archi
 
 export function assertUnknownSemanticEvidence(row: Record<string, unknown>, previous?: Record<string, unknown>): Record<string, unknown> {
   assert(row.observation_count === 1, "unknown must project exactly one conversation observation");
-  assert(row.projected_event_count === 1, "unknown must publish exactly one semantic projected event");
-  for (const field of ["projection_completed", "operational_completed"]) {
+  assert(row.stats_outcome === "applied" && row.projection_outcome === "session_body",
+    "unknown must retain separate statistics and semantic projection receipts");
+  // Both outboxes publish the same public event kind; the scoped ID set
+  // proves distinct publications without assuming commit order.
+  const projectedEventIds = typeof row.projected_event_ids === "string" ? row.projected_event_ids.split(",") : [];
+  assert(row.projected_event_count === 2 && projectedEventIds.length === 2
+    && projectedEventIds.every(Boolean) && new Set(projectedEventIds).size === 2,
+    "unknown must publish two distinct scoped projected events (statistics and semantics)");
+  if (previous) assert(JSON.stringify(projectedEventIds) === JSON.stringify(previous.projected_event_ids),
+    "projection replay must preserve event IDs");
+  for (const field of ["stats_projected_at", "projection_completed", "operational_completed"]) {
     assert(typeof row[field] === "number" && row[field] > 0, "semantic projection must commit with operational evidence");
     if (previous) assert(row[field] === previous[field], `semantic replay must preserve timestamp: ${field}`);
   }
@@ -124,19 +133,18 @@ export function assertUnknownSemanticEvidence(row: Record<string, unknown>, prev
     cluster_tenant_id: "tenant_id", cluster_principal_id: "principal_id",
     observation_cluster_id: "request_cluster_id",
     projection_tenant_id: "tenant_id", projection_key_id: "key_id", projection_principal_id: "principal_id",
-    projected_event_tenant_id: "tenant_id", projected_event_key_id: "key_id",
   })) {
     assert(typeof row[owner] === "string" && row[owner] !== "" && row[field] === row[owner], `semantic projection must retain exact ownership: ${field}`);
   }
   const evidence = Object.fromEntries([
     "request_id", "tenant_id", "key_id", "principal_id", "operational_receipt_id",
-    "observation_id", "observation_cluster_id", "projected_event_id",
+    "observation_id", "observation_cluster_id",
   ].map((field) => {
     assert(typeof row[field] === "string" && row[field] !== "", `semantic evidence missing: ${field}`);
     if (previous) assert(row[field] === previous[field], `semantic replay must preserve identity: ${field}`);
     return [field, row[field]];
   }));
-  return { ...evidence, observation_count: 1, projected_event_count: 1, projection_completed: row.projection_completed, operational_completed: row.operational_completed };
+  return { ...evidence, observation_count: 1, projected_event_count: projectedEventIds.length, projected_event_ids: projectedEventIds, stats_projected_at: row.stats_projected_at, projection_completed: row.projection_completed, operational_completed: row.operational_completed };
 }
 
 function pendingReceipt(directory: string, receiptId: string): PendingReceipt | undefined {
@@ -546,6 +554,7 @@ export async function run(binary: string, output: string): Promise<boolean> {
                   (SELECT COUNT(*) FROM request_events WHERE request_id = q.id AND event_kind = 'finished') AS event_count,
                   (SELECT COUNT(*) FROM request_stats_facts WHERE request_id = q.id) AS fact_count,
                   t.projected_at AS stats_projected_at, t.usage_basis AS stats_usage_basis,
+                  t.statistics_outcome AS stats_outcome,
                   f.tenant_id AS stats_tenant_id, f.key_id AS stats_key_id,
                   f.status_class AS stats_status_class, f.error_code AS stats_error_code,
                   f.cost_micros AS stats_cost_micros, f.input_tokens AS stats_input_tokens,
@@ -555,15 +564,16 @@ export async function run(binary: string, output: string): Promise<boolean> {
                   finished.tenant_id AS finished_tenant_id, finished.key_id AS finished_key_id,
                   (SELECT COUNT(*) FROM conversation_observations WHERE request_id = q.id) AS observation_count,
                   (SELECT COUNT(*) FROM request_events WHERE request_id = q.id AND event_kind = 'projected') AS projected_event_count,
+                  (SELECT group_concat(event_id, ',' ORDER BY event_id) FROM request_events
+                    WHERE request_id = q.id AND tenant_id = q.tenant_id AND key_id = q.key_id
+                      AND event_kind = 'projected') AS projected_event_ids,
                   k.principal_id, q.conversation_cluster_id AS request_cluster_id,
                   v.id AS observation_id, v.request_id AS observation_request_id,
                   v.key_id AS observation_key_id, v.cluster_id AS observation_cluster_id,
                   c.tenant_id AS cluster_tenant_id, c.principal_id AS cluster_principal_id,
                   x.tenant_id AS projection_tenant_id, x.key_id AS projection_key_id,
                   x.principal_id AS projection_principal_id, x.projected_at AS projection_completed,
-                  x.observed_at AS projection_observed_at,
-                  e.event_id AS projected_event_id, e.tenant_id AS projected_event_tenant_id,
-                  e.key_id AS projected_event_key_id
+                  x.observed_at AS projection_observed_at, x.statistics_outcome AS projection_outcome
                 FROM request_records q JOIN usage_reservations r ON r.id = q.reservation_id
                 JOIN key_records k ON k.id = q.key_id AND k.tenant_id = q.tenant_id
                 JOIN pending_proxy_settlements p ON p.request_id = q.id AND p.reservation_id = r.id
@@ -579,7 +589,6 @@ export async function run(binary: string, output: string): Promise<boolean> {
                 LEFT JOIN conversation_observations v ON v.request_id = q.id
                 LEFT JOIN conversation_clusters c ON c.id = v.cluster_id
                 LEFT JOIN conversation_projection_outbox x ON x.request_id = q.id
-                LEFT JOIN request_events e ON e.request_id = q.id AND e.event_kind = 'projected'
                 WHERE q.id = ?`).get(unknownRequestId);
               const receipt = typeof unknown?.operational_receipt_id === "string"
                 ? pendingReceipt(join(requestSpool, "pending-terminals-v1"), unknown.operational_receipt_id) : undefined;
