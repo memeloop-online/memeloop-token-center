@@ -535,12 +535,34 @@ async fn insert_envelope_in_transaction(
     capture_identity_in_transaction(transaction, identity, revision).await?;
     let frozen = serde_json::to_string(envelope)
         .map_err(|_| AppError::storage("history_envelope_serialization"))?;
-    let stored:String=sqlx::query_scalar("INSERT INTO request_history_immutable_outbox (revision,source,request_id,tenant_id,key_id,created_at,snapshot) VALUES ($1,$2,$3,$4,$5,$6,$7) ON CONFLICT(revision) DO UPDATE SET snapshot=request_history_immutable_outbox.snapshot RETURNING snapshot")
-        .bind(revision).bind(&identity.source).bind(identity.request_id.to_string()).bind(identity.tenant_id.to_string()).bind(identity.key_id.to_string()).bind(identity.created_at).bind(&frozen).fetch_one(&mut **transaction).await?;
-    if stored != frozen {
+    let statement =
+        immutable_envelope_upsert_sql(transaction.as_mut().backend_name() == "PostgreSQL");
+    let changed = sqlx::query(sqlx::AssertSqlSafe(statement))
+        .bind(revision)
+        .bind(&identity.source)
+        .bind(identity.request_id.to_string())
+        .bind(identity.tenant_id.to_string())
+        .bind(identity.key_id.to_string())
+        .bind(identity.created_at)
+        .bind(&frozen)
+        .execute(&mut **transaction)
+        .await?;
+    if changed.rows_affected() != 1 {
         return Err(AppError::storage("history_envelope_revision_conflict"));
     }
     Ok(())
+}
+
+// Compare the exact stored bytes, matching the former Rust String equality.
+// A successful capture sends only CommandComplete, never the snapshot body.
+fn immutable_envelope_upsert_sql(postgres: bool) -> String {
+    let collation = if postgres { "\"C\"" } else { "BINARY" };
+    let equal = ["source", "request_id", "tenant_id", "key_id", "snapshot"]
+        .map(|field| format!("request_history_immutable_outbox.{field} COLLATE {collation} = excluded.{field} COLLATE {collation}"))
+        .join(" AND ");
+    format!(
+        "INSERT INTO request_history_immutable_outbox (revision,source,request_id,tenant_id,key_id,created_at,snapshot) VALUES ($1,$2,$3,$4,$5,$6,$7) ON CONFLICT(revision) DO UPDATE SET snapshot=request_history_immutable_outbox.snapshot WHERE {equal} AND request_history_immutable_outbox.created_at=excluded.created_at"
+    )
 }
 
 /// Decode the frozen capture without rebuilding its source at a newer schema.
@@ -1322,3 +1344,6 @@ mod reuse_tests;
 
 #[cfg(test)]
 mod event_capture_tests;
+
+#[cfg(test)]
+mod command_only_tests;

@@ -47,7 +47,7 @@ export function targetEndpoints(env: NodeJS.ProcessEnv) {
   if (!runId || !/^[a-z0-9-]{1,40}$/.test(runId)) throw new Error("DNS-safe explicit run identity required");
   const gateway = new URL(env.MTC_TEST_GATEWAY_URL ?? (staging ? "http://mtc-staging-gateway:8080" : "http://memeloop-token-center-test-gateway:8080"));
   const control = new URL(env.MTC_TEST_CONTROL_URL ?? (staging ? "http://mtc-staging-control:8080" : "http://memeloop-token-center-test-control:8080"));
-  const mock = new URL(env.MTC_TEST_MOCK_URL ?? (staging ? "http://mtc-staging-mock:18080" : `http://mtc-peak-${runId}-mock:8080`));
+  const mock = new URL(env.MTC_TEST_MOCK_URL ?? (staging ? `http://mtc-peak-${runId}-mock:18080` : `http://mtc-peak-${runId}-mock:8080`));
   const forwarded = env.MTC_PEAK_OPERATOR_FORWARD === "1";
   const upstreamBase = forwarded ? new URL(env.MTC_PEAK_UPSTREAM_BASE_URL ?? "") : mock;
   if (forwarded && staging) throw new Error("staging requires direct isolated services");
@@ -55,7 +55,7 @@ export function targetEndpoints(env: NodeJS.ProcessEnv) {
     for (const [url, port] of [[gateway,"18090"],[control,"18089"],[mock,"18091"]] as const) if (url.protocol !== "http:" || url.hostname !== "127.0.0.1" || url.port !== port || url.pathname !== "/" || url.username || url.password || url.search || url.hash) throw new Error("invalid operator forward endpoint");
     if (upstreamBase.protocol !== "http:" || upstreamBase.hostname !== env.MTC_PEAK_TEST_GATEWAY_POD_IP || !/^10\.42\.\d{1,3}\.\d{1,3}$/.test(upstreamBase.hostname) || upstreamBase.port !== "18080" || upstreamBase.pathname !== "/" || upstreamBase.username || upstreamBase.password || upstreamBase.search || upstreamBase.hash) throw new Error("invalid TEST sidecar upstream");
   } else {
-    for (const [url, host] of [[gateway,staging ? "mtc-staging-gateway" : "memeloop-token-center-test-gateway"],[control,staging ? "mtc-staging-control" : "memeloop-token-center-test-control"],[mock,staging ? "mtc-staging-mock" : `mtc-peak-${runId}-mock`]] as const) if (url.protocol !== "http:" || url.hostname !== host || url.port !== (staging && url === mock ? "18080" : "8080") || url.pathname !== "/" || url.username || url.password || url.search || url.hash) throw new Error("isolated service identity mismatch");
+    for (const [url, host] of [[gateway,staging ? "mtc-staging-gateway" : "memeloop-token-center-test-gateway"],[control,staging ? "mtc-staging-control" : "memeloop-token-center-test-control"],[mock,`mtc-peak-${runId}-mock`]] as const) if (url.protocol !== "http:" || url.hostname !== host || url.port !== (staging && url === mock ? "18080" : "8080") || url.pathname !== "/" || url.username || url.password || url.search || url.hash) throw new Error("isolated service identity mismatch");
   }
   return { runId, gateway, control, mock, upstreamBase, forwarded };
 }
