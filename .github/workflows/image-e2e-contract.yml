@@ -50,7 +50,10 @@ jobs:
           for n in $(seq 1 60); do curl -fsS --aws-sigv4 'aws:amz:us-east-1:s3' --user "$RUSTFS_ACCESS_KEY:$RUSTFS_SECRET_KEY" -X PUT http://127.0.0.1:19000/image-e2e && exit 0; sleep 2; done
           exit 1
       - name: Start exact candidate
+        env:
+          IMAGE: ${{ inputs.image || 'ghcr.io/memeloop-online/memeloop-token-center@sha256:f49638a10a866087073b06b7a79d2f25da12e19bed1f83032a3f059209560d2a' }}
         run: |
+          [[ "$IMAGE" =~ ^ghcr\.io/memeloop-online/memeloop-token-center@sha256:[0-9a-f]{64}$ ]]
           docker run -d --name image-e2e-service --network host \
             -e MTC_LISTEN=127.0.0.1:18080 -e MTC_ALLOW_OAUTH_LOOPBACK=true \
             -e MTC_DATABASE_URL=postgres://token_center:synthetic-test-only@127.0.0.1:5432/token_center_test \
@@ -58,7 +61,7 @@ jobs:
             -e MTC_SERVICE_TOKEN="$E2E_SERVICE_TOKEN" \
             -e MTC_ARCHIVE_BACKEND=s3 -e MTC_S3_BUCKET=image-e2e -e MTC_S3_ENDPOINT=http://127.0.0.1:19000 -e MTC_S3_REGION=us-east-1 -e MTC_S3_ALLOW_HTTP=true \
             -e MTC_S3_ACCESS_KEY=rustfs-test-fixture -e MTC_S3_SECRET_KEY=synthetic-test-only-secret-707 \
-            ghcr.io/memeloop-online/memeloop-token-center@sha256:f49638a10a866087073b06b7a79d2f25da12e19bed1f83032a3f059209560d2a
+            "$IMAGE"
           for n in $(seq 1 120); do curl -fsS http://127.0.0.1:18080/readyz && exit 0; sleep 2; done
           docker logs --tail 40 image-e2e-service
           exit 1
