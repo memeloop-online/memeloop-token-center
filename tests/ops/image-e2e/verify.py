@@ -28,14 +28,15 @@ for side in ('request','response'):
 assert NONCE.encode() in archives['request']
 assert archives['response']==body
 for i in range(90):
- status,_,raw=request('/self/v1/sessions?limit=100',token=k); listing=json.loads(raw); matched=[x for x in listing['sessions'] if x['session_id']==SESSION]
- if len(matched)==1:
+ status,_,raw=request('/self/v1/sessions?limit=100',token=k); listing=json.loads(raw); matched=[]
+ for entry in listing['sessions']:
   try:
-   status,_,raw=request('/self/v1/sessions/'+urllib.parse.quote(matched[0]['session_id'],safe=''),token=k);session=json.loads(raw)
-   if status==200 and any(x.get('request_id')==rid for x in session['requests']):break
+   status,_,raw=request('/self/v1/sessions/'+urllib.parse.quote(entry['session_id'],safe=''),token=k); session=json.loads(raw)
+   if status==200 and any(x.get('request_id')==rid for x in session['requests']):matched.append(entry['session_id'])
   except urllib.error.HTTPError:pass
+ if len(matched)==1:break
  time.sleep(2)
 else:
- print(json.dumps({'session_list_count':len(listing['sessions']),'matching_external_id':len(matched),'request_id':rid,'worker_role':'all'}),flush=True)
+ print(json.dumps({'session_list_count':len(listing['sessions']),'matching_request_count':len(matched),'request_id':rid,'worker_role':'all'}),flush=True)
  raise RuntimeError('same request did not appear in session projection')
 print(json.dumps({'request_id':rid,'session_status':status,'usage':d['usage'],'archive_complete':True}))
