@@ -9,6 +9,7 @@ use super::*;
 struct TestMultipartUpload {
     aborts: Arc<AtomicUsize>,
     fail_parts: bool,
+    abort_gate: Option<(Arc<tokio::sync::Notify>, Arc<tokio::sync::Notify>)>,
 }
 
 #[async_trait::async_trait]
@@ -38,6 +39,10 @@ impl MultipartUpload for TestMultipartUpload {
 
     async fn abort(&mut self) -> object_store::Result<()> {
         self.aborts.fetch_add(1, Ordering::SeqCst);
+        if let Some((entered, release)) = &self.abort_gate {
+            entered.notify_one();
+            release.notified().await;
+        }
         Ok(())
     }
 }
@@ -56,7 +61,11 @@ pub(super) fn memory_store() -> ArchiveStore {
 }
 
 fn test_writer(aborts: Arc<AtomicUsize>, fail_parts: bool) -> ArchiveWriter {
-    let upload = TestMultipartUpload { aborts, fail_parts };
+    let upload = TestMultipartUpload {
+        aborts,
+        fail_parts,
+        abort_gate: None,
+    };
     ArchiveWriter {
         store: Arc::new(InMemory::new()),
         staging: Path::from("staging/test/response.bin"),
@@ -489,4 +498,41 @@ async fn object_locations_reject_traversal_and_ambiguous_separators() {
         )
         .await
         .expect("safe tenant object location");
+}
+
+#[tokio::test]
+async fn dropped_multipart_retains_workspace_until_abort_finishes() {
+    let memory = crate::gateway_body::memory::ProxyMemoryBudget::new(1024 * 1024);
+    let workspace = memory.temporary(1024 * 1024).unwrap();
+    let entered = Arc::new(tokio::sync::Notify::new());
+    let release = Arc::new(tokio::sync::Notify::new());
+    let aborts = Arc::new(AtomicUsize::new(0));
+    let mut writer = test_writer(aborts.clone(), false);
+    writer.inner = Some(object_store::WriteMultipart::new_with_chunk_size(
+        Box::new(TestMultipartUpload {
+            aborts: aborts.clone(),
+            fail_parts: false,
+            abort_gate: Some((entered.clone(), release.clone())),
+        }),
+        1,
+    ));
+    writer.retain_workspace(workspace);
+    drop(writer);
+    tokio::time::timeout(std::time::Duration::from_secs(2), entered.notified())
+        .await
+        .unwrap();
+    assert_eq!(
+        memory.snapshot().0,
+        1024 * 1024,
+        "detached abort still owns SDK workspace"
+    );
+    release.notify_one();
+    tokio::time::timeout(std::time::Duration::from_secs(2), async {
+        while memory.snapshot().0 != 0 {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .unwrap();
+    assert_eq!(aborts.load(Ordering::SeqCst), 1);
 }
