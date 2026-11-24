@@ -10,6 +10,8 @@ mod online147;
 #[cfg(test)]
 mod online147_tests;
 mod online164;
+#[cfg(test)]
+mod online164_tests;
 mod plaintext_sweep;
 #[cfg(test)]
 mod transport_policy_tests;

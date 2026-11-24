@@ -71,7 +71,12 @@ pub(super) async fn prepare(c: &mut AnyConnection) -> Result<(), sqlx::Error> {
             .execute(&mut *c)
             .await?;
         }
-        sqlx::query(sqlx::AssertSqlSafe(format!("CREATE INDEX CONCURRENTLY {index} ON {table} (created_at,id) WHERE started_event_pending=1"))).execute(&mut *c).await?;
+        sqlx::query(sqlx::AssertSqlSafe(format!(
+            "CREATE INDEX CONCURRENTLY {} ON {table} (created_at,id) WHERE started_event_pending=1",
+            index.rsplit('.').next().ok_or_else(conflict)?
+        )))
+        .execute(&mut *c)
+        .await?;
         if !index_ok(c, &table, &index).await? {
             return Err(conflict());
         }
