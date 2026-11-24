@@ -55,7 +55,7 @@ jobs:
       - name: Verify staging peak harness contracts
         run: |
           set -euo pipefail
-          node --test tests/load/staging-peak/test-framework.ts 2>&1 | tee /tmp/staging-peak-types.log
+          node --test --test-reporter=tap tests/load/staging-peak/test-framework.ts 2>&1 | tee /tmp/staging-peak-types.log
           grep -E '^# pass [1-9][0-9]*$' /tmp/staging-peak-types.log
           grep -Fx '# fail 0' /tmp/staging-peak-types.log
 
