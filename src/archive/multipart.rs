@@ -48,6 +48,8 @@ impl ArchiveStore {
             ));
         }
         let (store, staging) = self.resolve(location)?;
+        #[cfg(test)]
+        super::multipart_test_gate::wait(location).await;
         let upload = store.put_multipart(&staging).await?;
         Ok(ArchiveWriter {
             store: store.clone(),
