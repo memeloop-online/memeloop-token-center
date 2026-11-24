@@ -120,7 +120,7 @@ async fn shared_capture_reaches_eof_while_all_upload_slots_are_held() {
         .unwrap()
     );
     let sealed = producer.seal().unwrap();
-    assert!(state.proxy_memory_budget.snapshot().0 > baseline);
+    assert!(state.persistence.stream_memory.snapshot().0 > 0);
     assert!(
         state
             .archive
@@ -777,7 +777,7 @@ fn encrypted_chunks_bind_every_owner_and_sequence_without_plaintext() {
     );
 }
 
-async fn fixture() -> (
+pub(crate) async fn fixture() -> (
     tempfile::TempDir,
     AppState,
     sqlx::AnyPool,
@@ -1346,7 +1346,7 @@ async fn cancelled_unsealed_carrier_releases_owned_capture_without_acknowledging
         result = entering => result.unwrap(),
         _ = &mut append => panic!("capture receipt must remain paused after owning the chunk"),
     }
-    assert!(state.proxy_memory_budget.snapshot().0 > baseline);
+    assert!(state.persistence.stream_memory.snapshot().0 > 0);
     drop(append);
     drop(producer);
     release_writer.send(()).unwrap();
@@ -1432,4 +1432,264 @@ async fn streaming_writer_batches_four_chunks_without_growing_its_memory_reserva
         row.get::<i64, _>("byte_count"),
         (4 * super::CHUNK_BYTES) as i64
     );
+}
+
+#[tokio::test]
+async fn byte_charged_tap_accepts_mixed_chunks_without_fragment_count_limit() {
+    for empty in [false, true] {
+        let (_dir, state, _pool, identity) = fixture().await;
+        let baseline = state.persistence.stream_memory.snapshot().0;
+        let mut producer = ResponseArchiveProducer::begin_original(&state, identity)
+            .await
+            .unwrap();
+        let mut expected = Vec::new();
+        if !empty {
+            for index in 0..1000 {
+                let bytes = Bytes::from(vec![
+                    b'a' + (index % 26) as u8;
+                    [1, 17, 1024, 8193][index % 4]
+                ]);
+                expected.extend_from_slice(&bytes);
+                assert!(
+                    producer.try_offer(bytes),
+                    "available byte credit must not reject a fragment count"
+                );
+            }
+        }
+        tokio::time::timeout(
+            std::time::Duration::from_secs(10),
+            producer.seal().unwrap().wait(),
+        )
+        .await
+        .unwrap();
+        let reference = state
+            .archive
+            .raw_capture_reference(identity.tenant_id, identity.request_id, "response")
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            state
+                .archive
+                .get_tenant_content(identity.tenant_id, &reference, expected.len())
+                .await
+                .unwrap()
+                .as_ref(),
+            expected.as_slice()
+        );
+        assert_eq!(state.persistence.stream_memory.snapshot().0, baseline);
+    }
+}
+
+#[tokio::test]
+async fn concurrent_byte_charged_taps_preserve_every_original() {
+    let (_dir, state, pool, seed) = fixture().await;
+    let baseline = state.persistence.stream_memory.snapshot().0;
+    let mut identities = vec![seed];
+    for _ in 1..16 {
+        let identity = ArchiveSpoolIdentity {
+            request_id: Uuid::new_v4(),
+            tenant_id: seed.tenant_id,
+            reservation_id: Uuid::new_v4(),
+        };
+        sqlx::query("INSERT INTO request_records (id, tenant_id, key_id, created_at, protocol, model, input_tokens, output_tokens, cost_micros, request_object, reservation_id) VALUES ($1, $2, $3, 1, 'responses', 'test', 0, 0, 0, 'gap://test/request', $4)")
+            .bind(identity.request_id.to_string()).bind(identity.tenant_id.to_string()).bind(Uuid::new_v4().to_string()).bind(identity.reservation_id.to_string()).execute(&pool).await.unwrap();
+        identities.push(identity);
+    }
+    let tasks = identities.into_iter().map(|identity| {
+        let state = state.clone();
+        async move {
+            let mut producer = ResponseArchiveProducer::begin_original(&state, identity)
+                .await
+                .unwrap();
+            let mut expected = Vec::new();
+            for index in 0..100 {
+                let bytes = Bytes::from(vec![
+                    b'a' + (index % 26) as u8;
+                    [1, 31, 4096, 16385][index % 4]
+                ]);
+                expected.extend_from_slice(&bytes);
+                assert!(producer.try_offer(bytes));
+                tokio::task::yield_now().await;
+            }
+            producer.seal().unwrap().wait().await;
+            let reference = state
+                .archive
+                .raw_capture_reference(identity.tenant_id, identity.request_id, "response")
+                .await
+                .unwrap()
+                .unwrap();
+            assert_eq!(
+                state
+                    .archive
+                    .get_tenant_content(identity.tenant_id, &reference, expected.len())
+                    .await
+                    .unwrap()
+                    .as_ref(),
+                expected.as_slice()
+            );
+        }
+    });
+    tokio::time::timeout(
+        std::time::Duration::from_secs(15),
+        futures_util::future::join_all(tasks),
+    )
+    .await
+    .unwrap();
+    assert_eq!(state.persistence.stream_memory.snapshot().0, baseline);
+}
+
+#[tokio::test]
+async fn exhausted_archival_credit_records_failure_without_a_prefix_root() {
+    let (_dir, state, _pool, identity) = fixture().await;
+    let capacity = state.persistence.stream_memory.snapshot().1;
+    let occupied = state.persistence.stream_memory.temporary(capacity).unwrap();
+    let mut producer = ResponseArchiveProducer::begin_original(&state, identity)
+        .await
+        .unwrap();
+    assert!(!producer.try_offer(Bytes::from_static(b"not a complete original")));
+    drop(producer);
+    tokio::time::timeout(std::time::Duration::from_secs(5), async {
+        while !state
+            .archive
+            .raw_capture_failed(identity.tenant_id, identity.request_id, "response")
+            .await
+            .unwrap()
+        {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .unwrap();
+    assert!(
+        state
+            .archive
+            .raw_capture_reference(identity.tenant_id, identity.request_id, "response")
+            .await
+            .unwrap()
+            .is_none()
+    );
+    drop(occupied);
+    assert_eq!(state.persistence.stream_memory.snapshot().0, 0);
+    assert_eq!(state.proxy_memory_budget.snapshot().0, 0);
+}
+
+#[tokio::test]
+async fn sealed_source_releases_credit_before_retrying_saturated_upload_workspace() {
+    let (_dir, state, _pool, identity) = fixture().await;
+    let mut producer = ResponseArchiveProducer::begin_original(&state, identity)
+        .await
+        .unwrap();
+    let expected = Bytes::from(vec![b'w'; 64 * 1024]);
+    assert!(producer.try_offer(expected.clone()));
+    let (used, capacity, _, _) = state.persistence.stream_memory.snapshot();
+    assert!(used >= expected.len());
+    let occupied = state
+        .persistence
+        .stream_memory
+        .temporary(capacity - used)
+        .unwrap();
+    let sealed = producer.seal().unwrap();
+    tokio::time::timeout(std::time::Duration::from_secs(5), async {
+        while state.persistence.stream_memory.snapshot().0 != capacity - used {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("confirmed offload must release the source credit before waiting for upload workspace");
+    let available = state
+        .proxy_archive_stream_permits
+        .clone()
+        .try_acquire_many_owned(crate::PROXY_ARCHIVE_STREAM_CONCURRENCY as u32)
+        .expect("failed workspace attempt must return upload slots");
+    drop(available);
+    drop(occupied);
+    tokio::time::timeout(std::time::Duration::from_secs(15), sealed.wait())
+        .await
+        .unwrap();
+    let reference = state
+        .archive
+        .raw_capture_reference(identity.tenant_id, identity.request_id, "response")
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        state
+            .archive
+            .get_tenant_content(identity.tenant_id, &reference, expected.len())
+            .await
+            .unwrap(),
+        expected
+    );
+    assert_eq!(state.persistence.stream_memory.snapshot().0, 0);
+}
+
+#[tokio::test]
+async fn failed_capture_fact_is_retried_after_object_storage_recovers() {
+    use std::sync::{
+        Arc,
+        atomic::{AtomicBool, AtomicUsize, Ordering},
+    };
+    use wiremock::{Mock, MockServer, ResponseTemplate, matchers::any};
+    let server = MockServer::start().await;
+    let healthy = Arc::new(AtomicBool::new(false));
+    let accepted = Arc::new(AtomicUsize::new(0));
+    let health = healthy.clone();
+    let acknowledgements = accepted.clone();
+    Mock::given(any())
+        .respond_with(move |_request: &wiremock::Request| {
+            if health.load(Ordering::Acquire) {
+                acknowledgements.fetch_add(1, Ordering::Release);
+                ResponseTemplate::new(200).insert_header("ETag", "\"synthetic-failure-fact\"")
+            } else {
+                ResponseTemplate::new(503)
+            }
+        })
+        .mount(&server)
+        .await;
+    let (_dir, mut state, _pool, identity) = fixture().await;
+    let mut config = (*state.config).clone();
+    config.archive_backend = crate::config::ArchiveBackend::S3;
+    config.s3_endpoint = Some(server.uri());
+    config.s3_bucket = Some("failure-fact-contract".into());
+    config.s3_access_key = Some("synthetic".into());
+    config.s3_secret_key = Some("synthetic".into());
+    config.s3_allow_http = true;
+    state.archive = crate::archive::ArchiveStore::from_config(&config)
+        .await
+        .unwrap();
+    assert!(
+        tokio::time::timeout(
+            std::time::Duration::from_secs(20),
+            producer::fence_failed_capture(&state, identity, CaptureTarget::Response)
+        )
+        .await
+        .unwrap()
+        .is_err()
+    );
+    assert!(
+        tokio::time::timeout(
+            std::time::Duration::from_millis(100),
+            state.persistence.drain()
+        )
+        .await
+        .is_err(),
+        "existing background owner must retain the missing failure fact"
+    );
+    healthy.store(true, Ordering::Release);
+    tokio::time::timeout(
+        std::time::Duration::from_secs(20),
+        state.persistence.drain(),
+    )
+    .await
+    .expect("background owner must finish after the failure fact PUT is acknowledged");
+    assert!(accepted.load(Ordering::Acquire) > 0);
+    let requests = server.received_requests().await.unwrap();
+    assert!(
+        requests
+            .iter()
+            .all(|r| r.method.as_str() == "PUT" && r.url.path().ends_with("/response.json.failed")),
+        "only the failure fact may publish; no prefix root or supplier replay"
+    );
+    assert_eq!(state.persistence.stream_memory.snapshot().0, 0);
 }
