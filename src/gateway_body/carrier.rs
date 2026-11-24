@@ -101,6 +101,18 @@ pub(crate) struct BodyCarrier {
     readers: std::sync::atomic::AtomicUsize,
 }
 
+// The SDK may retain a body clone after a cancelled upload future. Its
+// envelope follows those exact Bytes until the final network owner releases it.
+struct WorkspaceWrite {
+    bytes: Bytes,
+    _workspace: Option<Arc<dyn Send + Sync>>,
+}
+impl AsRef<[u8]> for WorkspaceWrite {
+    fn as_ref(&self) -> &[u8] {
+        &self.bytes
+    }
+}
+
 struct WorkspaceRead {
     bytes: Vec<u8>,
     _workspace: Arc<dyn Send + Sync>,
@@ -500,8 +512,11 @@ impl BodyCarrier {
             // One owned segment already fits the existing multipart envelope.
             // A single PUT retains these exact Bytes until its ACK; uncertain
             // completion leaves RAM and the active receipt with this carrier.
-            let _workspace = workspace;
-            archive.put(&locator, bytes.clone()).await?;
+            let payload = Bytes::from_owner(WorkspaceWrite {
+                bytes: bytes.clone(),
+                _workspace: workspace.map(|guard| guard as Arc<dyn Send + Sync>),
+            });
+            archive.put(&locator, payload).await?;
             StagedArchiveObject {
                 object_locator: locator,
                 size_bytes: bytes.len() as u64,
