@@ -1,6 +1,11 @@
 name: image-e2e-contract
 on:
   workflow_dispatch:
+    inputs:
+      image:
+        description: Exact candidate image digest
+        required: false
+        default: ghcr.io/memeloop-online/memeloop-token-center@sha256:f49638a10a866087073b06b7a79d2f25da12e19bed1f83032a3f059209560d2a
   pull_request:
     paths:
       - .github/workflows/image-e2e-contract.yml
@@ -27,6 +32,10 @@ jobs:
       - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020
         with:
           node-version: 24.18.0
+      - name: Generate isolated credentials
+        run: |
+          echo "E2E_SERVICE_TOKEN=$(openssl rand -hex 32)" >> "$GITHUB_ENV"
+          echo "E2E_KEY_PEPPER=$(openssl rand -hex 32)" >> "$GITHUB_ENV"
       - name: Start isolated synthetic mock
         run: |
           MTC_MOCK_PORT=18082 node tests/load/staging-peak/mock.ts >"$RUNNER_TEMP/mock.log" 2>&1 &
@@ -45,11 +54,11 @@ jobs:
           docker run -d --name image-e2e-service --network host \
             -e MTC_LISTEN=127.0.0.1:18080 -e MTC_ALLOW_OAUTH_LOOPBACK=true \
             -e MTC_DATABASE_URL=postgres://token_center:synthetic-test-only@127.0.0.1:5432/token_center_test \
-            -e MTC_KEY_PEPPER=synthetic-pepper-0123456789abcdef \
-            -e MTC_SERVICE_TOKEN=synthetic-service-token-0123456789abcdef \
+            -e MTC_KEY_PEPPER="$E2E_KEY_PEPPER" \
+            -e MTC_SERVICE_TOKEN="$E2E_SERVICE_TOKEN" \
             -e MTC_ARCHIVE_BACKEND=s3 -e MTC_S3_BUCKET=image-e2e -e MTC_S3_ENDPOINT=http://127.0.0.1:19000 -e MTC_S3_REGION=us-east-1 -e MTC_S3_ALLOW_HTTP=true \
             -e MTC_S3_ACCESS_KEY=rustfs-test-fixture -e MTC_S3_SECRET_KEY=synthetic-test-only-secret-707 \
-            ghcr.io/memeloop-online/memeloop-token-center@sha256:ec9959486e6702eff6f1f4c9671fddb3da518ae4feb3db46fe5a5d75cf89aef4
+            ghcr.io/memeloop-online/memeloop-token-center@sha256:f49638a10a866087073b06b7a79d2f25da12e19bed1f83032a3f059209560d2a
           for n in $(seq 1 120); do curl -fsS http://127.0.0.1:18080/readyz && exit 0; sleep 2; done
           docker logs --tail 40 image-e2e-service
           exit 1
