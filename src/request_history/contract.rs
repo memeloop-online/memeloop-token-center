@@ -230,3 +230,22 @@ impl HistoryPage {
         })
     }
 }
+
+/// Existing history sources selectable for one bounded maintenance page.
+#[derive(Clone, Copy, Debug, clap::ValueEnum)]
+pub enum HistorySource {
+    Native,
+    Generation,
+    Archive,
+    Event,
+}
+impl HistorySource {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Native => "native",
+            Self::Generation => "generation",
+            Self::Archive => "archive",
+            Self::Event => "event",
+        }
+    }
+}
