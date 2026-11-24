@@ -331,6 +331,7 @@ async fn export_batch(
     client: &ClickHouse,
     page_size: i64,
 ) -> Result<ExportReport, ExportFailure> {
+    let started = std::time::Instant::now();
     let failure = |stage, error| ExportFailure {
         stage,
         attempted: 0,
@@ -343,10 +344,13 @@ async fn export_batch(
         .history_delivery_lease()
         .await
         .map_err(|error| failure("lease", error))?;
+    let lease_ms = started.elapsed().as_millis() as u64;
+    let phase = std::time::Instant::now();
     let snapshots = database
         .history_pending_through(page_size, ceiling)
         .await
         .map_err(|error| failure("capture_materialize", error))?;
+    let materialize_ms = phase.elapsed().as_millis() as u64;
     let failure = |stage, error| ExportFailure {
         stage,
         attempted: snapshots.len(),
@@ -361,10 +365,13 @@ async fn export_batch(
             .await
             .map_err(|error| failure("lease_validate", error.into()))?;
     }
+    let phase = std::time::Instant::now();
     client
         .append(&snapshots)
         .await
         .map_err(|error| failure("append", error))?;
+    let append_ms = phase.elapsed().as_millis() as u64;
+    let phase = std::time::Instant::now();
     let acked = database
         .history_acknowledge_count(&snapshots)
         .await
@@ -373,12 +380,25 @@ async fn export_batch(
             failure.acked = None;
             failure
         })?;
+    let acknowledge_ms = phase.elapsed().as_millis() as u64;
     if let Some(lease) = lease {
         lease.rollback().await.map_err(|error| {
             let mut failure = failure("lease_release", error.into());
             failure.acked = Some(acked);
             failure
         })?;
+    }
+    if !snapshots.is_empty() {
+        tracing::info!(
+            attempted = snapshots.len(),
+            acked,
+            lease_ms,
+            materialize_ms,
+            append_ms,
+            acknowledge_ms,
+            total_ms = started.elapsed().as_millis() as u64,
+            "request history export phase timings"
+        );
     }
     Ok(ExportReport {
         attempted: snapshots.len(),

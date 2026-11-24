@@ -1243,20 +1243,27 @@ async fn stage_captured_response(
     )?;
     // An unknown receipt acknowledgement must never authorize a body upload.
     state.archive.begin_carrier_object(&owner).await?;
-    let mut writer = state.archive.start_writer(&locator).await?;
+    let mut writer = state
+        .archive
+        .start_writer(&locator)
+        .await
+        .map_err(|error| error.storage_phase("multipart_begin"))?;
     use futures_util::StreamExt;
     let mut stream = source.open_stream();
     while let Some(chunk) = stream.next().await {
-        let chunk = chunk?;
+        let chunk = chunk.map_err(|error| error.storage_phase("source_read"))?;
         let upload = Bytes::copy_from_slice(&chunk);
         drop(chunk);
         if let Err(error) = writer.write(upload).await {
             let _ = writer.abort().await;
-            return Err(error);
+            return Err(error.storage_phase("multipart_write"));
         }
     }
     drop(stream);
-    let staged = writer.finish_staged().await?;
+    let staged = writer
+        .finish_staged()
+        .await
+        .map_err(|error| error.storage_phase("multipart_complete"))?;
     if staged.size_bytes != source.len() || staged.blake3_digest != source.digest() {
         return Err(AppError::storage(
             "response_carrier_stage_identity_mismatch",
@@ -1335,7 +1342,11 @@ async fn run_response_archive_writer(
                     _ => "operation_error",
                 };
                 tracing::warn!(request_id = %identity.request_id, error_category = error.diagnostic_category(),
-                    stage = "carrier_stage", error_kind = kind, attempt = publication_attempt,
+                    stage = "carrier_stage", error_kind = kind,
+                    phase = match &error { AppError::Storage { facts, .. } => facts.phase, _ => None },
+                    storage_status = match &error { AppError::Storage { facts, .. } => facts.status, _ => None },
+                    backend = if captured.staging.backend_identity.is_some() { "training" } else { "legacy" },
+                    attempt = publication_attempt,
                     elapsed_ms = publication_started.elapsed().as_millis() as u64,
                     "complete carrier source awaits object storage publication");
                 let delay = crate::archive_staging::cleanup_backoff_with_jitter(

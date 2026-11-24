@@ -62,6 +62,20 @@ async fn fair_projection_queue_contract(database_url: String) {
         }
     }
     assert_eq!(db.reopen_session_body_rebuilds(8).await.unwrap(), 0);
+    // A continuously refilled single slot must retain the same weighted lanes.
+    for (turn, expected) in [&fresh, &fresh, &retries, &rebuilds]
+        .into_iter()
+        .enumerate()
+    {
+        let claimed = db
+            .claim_conversation_projection_tasks_from_turn(Uuid::now_v7(), 1, turn)
+            .await
+            .unwrap();
+        assert_eq!(claimed.len(), 1);
+        assert!(expected.contains(&claimed[0].request_id));
+        sqlx::query("UPDATE conversation_projection_outbox SET attempts=attempts-1, lease_owner=CASE WHEN statistics_outcome='session_body' THEN 'session-body-rebuild' WHEN terminal_lease_owner IS NULL THEN NULL ELSE lease_owner END, lease_expires_at=CASE WHEN statistics_outcome='session_body' THEN 9223372036854775807 WHEN terminal_lease_owner IS NULL THEN NULL ELSE lease_expires_at END, terminal_lease_owner=NULL, terminal_lease_expires_at=NULL WHERE request_id=$1")
+            .bind(claimed[0].request_id.to_string()).execute(&db.pool).await.unwrap();
+    }
     let owner = Uuid::now_v7();
     let first = db
         .claim_conversation_projection_tasks(owner, 32)
@@ -2371,11 +2385,123 @@ async fn coverage_read_does_not_block_body_worker_contract(database_url: String)
         .unwrap();
 }
 
+async fn raw_read_does_not_block_next_claim_contract(database_url: String) {
+    let historical = Fixture::new(database_url.clone(), true).await;
+    historical.capture().await;
+    assert!(response_archive_spool::process_one_for_test(&historical.state).await);
+    assert!(response_archive_spool::process_one_for_test(&historical.state).await);
+    let gate = Database::gate_coverage_read_for_test(historical.request_id);
+    let (stop, shutdown) = tokio::sync::watch::channel(false);
+    let worker = tokio::spawn(crate::worker::run_until_shutdown(
+        historical.state.clone(),
+        shutdown,
+    ));
+    let _cleanup = CoverageWorkerGuard {
+        request: historical.request_id,
+        gate: gate.clone(),
+        worker: worker.abort_handle(),
+    };
+    tokio::time::timeout(std::time::Duration::from_secs(10), gate.0.notified())
+        .await
+        .unwrap();
+    let mut fresh = Fixture::new(database_url, true).await;
+    fresh.state.archive = historical.state.archive.clone();
+    fresh.state.db = fresh
+        .state
+        .db
+        .clone()
+        .with_archive(fresh.state.archive.clone());
+    fresh.capture().await;
+    let _ = response_archive_spool::process_one_for_test(&fresh.state).await;
+    let _ = response_archive_spool::process_one_for_test(&fresh.state).await;
+    tokio::time::timeout(std::time::Duration::from_secs(10), async {
+        loop {
+            let done: Option<i64> = sqlx::query_scalar(
+                "SELECT projected_at FROM conversation_projection_outbox WHERE request_id=$1",
+            )
+            .bind(fresh.request_id.to_string())
+            .fetch_one(&fresh.state.db.pool)
+            .await
+            .unwrap();
+            if done.is_some() {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+    })
+    .await
+    .expect("blocked raw GET must not stop the next claim");
+    sqlx::query("UPDATE conversation_projection_outbox SET lease_owner='replacement',terminal_lease_owner='replacement' WHERE request_id=$1").bind(historical.request_id.to_string()).execute(&fresh.state.db.pool).await.unwrap();
+    gate.1.notify_one();
+    stop.send(true).unwrap();
+    tokio::time::timeout(std::time::Duration::from_secs(10), worker)
+        .await
+        .unwrap()
+        .unwrap();
+    let ack: Option<i64> = sqlx::query_scalar(
+        "SELECT projected_at FROM conversation_projection_outbox WHERE request_id=$1",
+    )
+    .bind(historical.request_id.to_string())
+    .fetch_one(&fresh.state.db.pool)
+    .await
+    .unwrap();
+    assert!(
+        ack.is_none(),
+        "lost owner must not acknowledge the blocked task"
+    );
+}
+
+async fn raw_read_lost_owner_returns_without_shutdown(database_url: String) {
+    let fixture = Fixture::new(database_url, true).await;
+    fixture.capture().await;
+    assert!(response_archive_spool::process_one_for_test(&fixture.state).await);
+    assert!(response_archive_spool::process_one_for_test(&fixture.state).await);
+    let owner = fixture.claim().await;
+    let before: (Option<String>,Option<String>)=sqlx::query_as("SELECT semantic_snapshot_json,semantic_payload_snapshot_json FROM conversation_projection_outbox WHERE request_id=$1").bind(fixture.request_id.to_string()).fetch_one(&fixture.state.db.pool).await.unwrap();
+    let gate = Database::gate_coverage_read_for_test(fixture.request_id);
+    let state = fixture.state.clone();
+    let request = fixture.request_id;
+    let task =
+        tokio::spawn(
+            async move { crate::worker::archive_session_body(&state, owner, request).await },
+        );
+    let _cleanup = CoverageWorkerGuard {
+        request,
+        gate: gate.clone(),
+        worker: task.abort_handle(),
+    };
+    tokio::time::timeout(std::time::Duration::from_secs(10), gate.0.notified())
+        .await
+        .unwrap();
+    sqlx::query("UPDATE conversation_projection_outbox SET lease_owner='replacement',terminal_lease_owner='replacement' WHERE request_id=$1").bind(request.to_string()).execute(&fixture.state.db.pool).await.unwrap();
+    gate.1.notify_one();
+    assert!(
+        !tokio::time::timeout(std::time::Duration::from_secs(10), task)
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap()
+    );
+    let unchanged: i64=sqlx::query_scalar("SELECT COUNT(*) FROM conversation_projection_outbox WHERE request_id=$1 AND projected_at IS NULL AND terminal_lease_owner='replacement'").bind(request.to_string()).fetch_one(&fixture.state.db.pool).await.unwrap();
+    let after: (Option<String>,Option<String>)=sqlx::query_as("SELECT semantic_snapshot_json,semantic_payload_snapshot_json FROM conversation_projection_outbox WHERE request_id=$1").bind(request.to_string()).fetch_one(&fixture.state.db.pool).await.unwrap();
+    assert_eq!(
+        after, before,
+        "lost owner must preserve the original terminal snapshots"
+    );
+    assert_eq!(
+        unchanged, 1,
+        "lost owner must return naturally without preparing or acknowledging"
+    );
+}
+
 #[tokio::test]
 async fn postgres_coverage_read_does_not_block_body_worker() {
     let url = std::env::var("MTC_TEST_POSTGRES_URL").expect("requires CI PostgreSQL");
     let isolated = PostgresTestDatabase::create(&url).await;
+    fair_projection_queue_contract(isolated.url().to_owned()).await;
     coverage_read_does_not_block_body_worker_contract(isolated.url().to_owned()).await;
+    raw_read_does_not_block_next_claim_contract(isolated.url().to_owned()).await;
+    raw_read_lost_owner_returns_without_shutdown(isolated.url().to_owned()).await;
     isolated.cleanup().await;
 }
 
