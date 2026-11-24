@@ -1573,3 +1573,53 @@ async fn exhausted_archival_credit_records_failure_without_a_prefix_root() {
     assert_eq!(state.persistence.stream_memory.snapshot().0, 0);
     assert_eq!(state.proxy_memory_budget.snapshot().0, 0);
 }
+
+#[tokio::test]
+async fn sealed_source_releases_credit_before_retrying_saturated_upload_workspace() {
+    let (_dir, state, _pool, identity) = fixture().await;
+    let mut producer = ResponseArchiveProducer::begin_original(&state, identity)
+        .await
+        .unwrap();
+    let expected = Bytes::from(vec![b'w'; 64 * 1024]);
+    assert!(producer.try_offer(expected.clone()));
+    let (used, capacity, _, _) = state.persistence.stream_memory.snapshot();
+    assert!(used >= expected.len());
+    let occupied = state
+        .persistence
+        .stream_memory
+        .temporary(capacity - used)
+        .unwrap();
+    let sealed = producer.seal().unwrap();
+    tokio::time::timeout(std::time::Duration::from_secs(5), async {
+        while state.persistence.stream_memory.snapshot().0 != capacity - used {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("confirmed offload must release the source credit before waiting for upload workspace");
+    let available = state
+        .proxy_archive_stream_permits
+        .clone()
+        .try_acquire_many_owned(crate::PROXY_ARCHIVE_STREAM_CONCURRENCY as u32)
+        .expect("failed workspace attempt must return upload slots");
+    drop(available);
+    drop(occupied);
+    tokio::time::timeout(std::time::Duration::from_secs(15), sealed.wait())
+        .await
+        .unwrap();
+    let reference = state
+        .archive
+        .raw_capture_reference(identity.tenant_id, identity.request_id, "response")
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        state
+            .archive
+            .get_tenant_content(identity.tenant_id, &reference, expected.len())
+            .await
+            .unwrap(),
+        expected
+    );
+    assert_eq!(state.persistence.stream_memory.snapshot().0, 0);
+}
