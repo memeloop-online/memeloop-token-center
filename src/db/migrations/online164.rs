@@ -8,6 +8,14 @@ async fn column_ok(c: &mut AnyConnection) -> Result<bool, sqlx::Error> {
     sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM pg_attribute a JOIN pg_attrdef d ON d.adrelid=a.attrelid AND d.adnum=a.attnum WHERE a.attrelid='request_records'::regclass AND a.attname='started_event_pending' AND NOT a.attisdropped AND a.atttypid='bigint'::regtype AND a.attnotnull AND pg_get_expr(d.adbin,d.adrelid) IN ('0','0::bigint'))")
         .fetch_one(c).await
 }
+async fn index_definition_ok(
+    c: &mut AnyConnection,
+    table: &str,
+    name: &str,
+) -> Result<bool, sqlx::Error> {
+    sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM pg_index i JOIN pg_class x ON x.oid=i.indexrelid JOIN pg_am am ON am.oid=x.relam WHERE i.indrelid=to_regclass($1) AND i.indexrelid=to_regclass($2) AND NOT EXISTS(SELECT 1 FROM pg_constraint con WHERE con.conindid=i.indexrelid) AND NOT i.indisunique AND NOT i.indisprimary AND am.amname='btree' AND i.indnkeyatts=2 AND i.indnatts=2 AND i.indexprs IS NULL AND pg_get_indexdef(i.indexrelid,1,true)='created_at' AND pg_get_indexdef(i.indexrelid,2,true)='id' AND pg_get_expr(i.indpred,i.indrelid)='(started_event_pending = 1)')")
+        .bind(table).bind(name).fetch_one(c).await
+}
 async fn index_ok(c: &mut AnyConnection, table: &str, name: &str) -> Result<bool, sqlx::Error> {
     sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM pg_index i JOIN pg_class x ON x.oid=i.indexrelid JOIN pg_am am ON am.oid=x.relam WHERE i.indrelid=to_regclass($1) AND i.indexrelid=to_regclass($2) AND i.indisvalid AND i.indisready AND i.indislive AND NOT i.indisunique AND NOT i.indisprimary AND am.amname='btree' AND i.indnkeyatts=2 AND i.indnatts=2 AND i.indexprs IS NULL AND pg_get_indexdef(i.indexrelid,1,true)='created_at' AND pg_get_indexdef(i.indexrelid,2,true)='id' AND pg_get_expr(i.indpred,i.indrelid)='(started_event_pending = 1)')")
         .bind(table).bind(name).fetch_one(c).await
@@ -30,20 +38,22 @@ pub(super) async fn prepare(c: &mut AnyConnection) -> Result<(), sqlx::Error> {
     if !ready {
         return Ok(());
     }
-    let mut tx = c.begin().await?;
-    // Recursive lock acquisition is nonblocking, including DEFAULT and every
-    // leaf. An occupied leaf never queues an exclusive parent behind readers.
-    sqlx::query("LOCK TABLE request_records IN ACCESS EXCLUSIVE MODE NOWAIT")
-        .execute(&mut *tx)
-        .await?;
-    let exists: bool=sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM pg_attribute WHERE attrelid='request_records'::regclass AND attname='started_event_pending' AND NOT attisdropped)").fetch_one(&mut *tx).await?;
-    if !exists {
-        sqlx::query("ALTER TABLE request_records ADD COLUMN started_event_pending BIGINT NOT NULL DEFAULT 0").execute(&mut *tx).await?;
+    if !column_ok(c).await? {
+        let mut tx = c.begin().await?;
+        // Recursive lock acquisition is nonblocking, including DEFAULT and every
+        // leaf. An occupied leaf never queues an exclusive parent behind readers.
+        sqlx::query("LOCK TABLE request_records IN ACCESS EXCLUSIVE MODE NOWAIT")
+            .execute(&mut *tx)
+            .await?;
+        let exists: bool=sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM pg_attribute WHERE attrelid='request_records'::regclass AND attname='started_event_pending' AND NOT attisdropped)").fetch_one(&mut *tx).await?;
+        if !exists {
+            sqlx::query("ALTER TABLE request_records ADD COLUMN started_event_pending BIGINT NOT NULL DEFAULT 0").execute(&mut *tx).await?;
+        }
+        if !column_ok(&mut tx).await? {
+            return Err(conflict());
+        }
+        tx.commit().await?;
     }
-    if !column_ok(&mut tx).await? {
-        return Err(conflict());
-    }
-    tx.commit().await?;
     let partitioned: bool = sqlx::query_scalar(
         "SELECT relkind='p' FROM pg_class WHERE oid='request_records'::regclass",
     )
@@ -62,7 +72,13 @@ pub(super) async fn prepare(c: &mut AnyConnection) -> Result<(), sqlx::Error> {
             .await?;
         if exists {
             let invalid: bool=sqlx::query_scalar("SELECT NOT indisvalid FROM pg_index WHERE indexrelid=to_regclass($1) AND indrelid=to_regclass($2)").bind(&index).bind(&table).fetch_optional(&mut *c).await?.unwrap_or(false);
-            if !invalid {
+            let detached: bool = sqlx::query_scalar(
+                "SELECT NOT EXISTS(SELECT 1 FROM pg_inherits WHERE inhrelid=to_regclass($1))",
+            )
+            .bind(&index)
+            .fetch_one(&mut *c)
+            .await?;
+            if !invalid || !detached || !index_definition_ok(c, &table, &index).await? {
                 return Err(conflict());
             }
             sqlx::query(sqlx::AssertSqlSafe(format!(
@@ -83,11 +99,18 @@ pub(super) async fn prepare(c: &mut AnyConnection) -> Result<(), sqlx::Error> {
     }
     // Parent creation/attachment is catalog-only; bound every lock wait.
     let mut tx = c.begin().await?;
+    sqlx::query("SET LOCAL statement_timeout='2s'")
+        .execute(&mut *tx)
+        .await?;
+    let attach_started = std::time::Instant::now();
     sqlx::query("SET LOCAL lock_timeout='250ms'")
         .execute(&mut *tx)
         .await?;
     sqlx::query("CREATE INDEX IF NOT EXISTS request_records_started_pending ON ONLY request_records (created_at,id) WHERE started_event_pending=1").execute(&mut *tx).await?;
     for (table, index) in leaves(&mut tx).await? {
+        if attach_started.elapsed() >= std::time::Duration::from_secs(2) {
+            return Err(conflict());
+        }
         if !index_ok(&mut tx, &table, &index).await? {
             return Err(conflict());
         }
