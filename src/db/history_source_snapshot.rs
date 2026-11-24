@@ -608,6 +608,10 @@ mod tests {
             epoch: 1,
             ordinal: 0,
             activation_epoch: 1,
+            manifest: sha2::Digest::new(),
+            parity: parity::BaselineParity::default(),
+            parity_verified: false,
+            target_identity: None,
         };
         for (id, time) in ids.into_iter().zip(times) {
             let page = snapshot.next_envelopes(1).await.unwrap().unwrap();
@@ -638,6 +642,10 @@ mod tests {
             epoch: 1,
             ordinal: 0,
             activation_epoch: 1,
+            manifest: sha2::Digest::new(),
+            parity: parity::BaselineParity::default(),
+            parity_verified: false,
+            target_identity: None,
         };
         assert!(matches!(
             orphan.next_envelopes(1).await,
