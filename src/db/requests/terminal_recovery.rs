@@ -35,6 +35,7 @@ impl Database {
             (SELECT COUNT(*) FROM ledger_entries l WHERE l.account_id=t.account_id AND l.key_id=t.key_id AND l.source=t.reservation_id AND l.kind='usage') AS ledger_count,
             (SELECT CAST(COALESCE(SUM(l.amount_micros),0) AS BIGINT) FROM ledger_entries l WHERE l.account_id=t.account_id AND l.key_id=t.key_id AND l.source=t.reservation_id AND l.kind='usage') AS ledger_amount,
             (SELECT COUNT(*) FROM request_stats_facts f WHERE f.request_id=t.request_id AND f.tenant_id=t.tenant_id AND f.key_id=t.key_id AND f.created_at=t.created_at) AS facts,
+            (SELECT COUNT(*) FROM metered_usage_projection_outbox m WHERE m.reservation_id=t.reservation_id AND m.account_id=t.account_id AND m.key_id=t.key_id AND m.actual_micros=t.cost_micros AND m.projected_at IS NULL AND m.lease_owner='terminal-v118') AS receipts,
             (SELECT COUNT(*) FROM pending_proxy_settlements p WHERE p.request_id=t.request_id AND p.unknown_reason IS NOT NULL) AS unknowns,
             (SELECT COUNT(*) FROM observability_prune_boundaries b WHERE b.scope='global' AND b.before_day > t.created_at / 86400000) AS pruned
           FROM terminal_projection_outbox t
@@ -65,7 +66,13 @@ impl Database {
             .try_get::<Option<i64>, _>("account_projected_at")?
             .is_some();
         let statistics_acknowledged = row.try_get::<Option<i64>, _>("projected_at")?.is_some();
-        let fact_exists = row.try_get::<i64, _>("facts")? == 1;
+        let fact_count = row.try_get::<i64, _>("facts")?;
+        if fact_count > 1 || (!account_acknowledged && row.try_get::<i64, _>("receipts")? != 1) {
+            return Err(AppError::Conflict(
+                "terminal recovery receipt or fact identity conflicts".into(),
+            ));
+        }
+        let fact_exists = fact_count == 1;
         let pruned = row.try_get::<i64, _>("pruned")? != 0;
         let busy = row.try_get::<Option<String>, _>("lease_owner")?.is_some()
             && row
