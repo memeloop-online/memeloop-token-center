@@ -1,0 +1,167 @@
+name: MTC full Rust equivalence evidence
+on:
+  push:
+    branches: [ci/mtc-refactor-proof-1041]
+    paths: [.github/workflows/refactor-full-proof.yml]
+permissions:
+  contents: read
+jobs:
+  rust-comparison:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 90
+    strategy:
+      fail-fast: false
+      max-parallel: 4
+      matrix:
+        revision:
+          - name: base
+            sha: 60e6b72b9747501e96e84e342913d806c75c1e52
+          - name: head
+            sha: 8e9617ec4bf7c61b606959d91a57556e3af20e54
+        shard: [1, 2, 3, 4]
+    env:
+      CARGO_BUILD_JOBS: "2"
+      CARGO_INCREMENTAL: "0"
+      CARGO_PROFILE_DEV_DEBUG: "0"
+      CARGO_PROFILE_TEST_DEBUG: "0"
+      MTC_TEST_POSTGRES_URL: postgres://token_center:token_center@127.0.0.1:5432/memeloop_token_center_test
+      MTC_TEST_S3_ENDPOINT: http://127.0.0.1:9000
+      MTC_TEST_S3_BUCKET: memeloop-token-center-test
+      MTC_TEST_S3_ACCESS_KEY: token-center-test
+      MTC_TEST_S3_SECRET_KEY: token-center-test-secret
+      MTC_TEST_S3_LIST_ONLY_ACCESS_KEY: mtc-list-only
+      MTC_TEST_S3_LIST_ONLY_SECRET_KEY: mtc-list-only-secret
+    services:
+      postgres:
+        image: postgres:16-alpine
+        env:
+          POSTGRES_DB: memeloop_token_center_test
+          POSTGRES_USER: token_center
+          POSTGRES_PASSWORD: token_center
+        ports: ["5432:5432"]
+        options: >-
+          --health-cmd "pg_isready -U token_center -d memeloop_token_center_test"
+          --health-interval 5s --health-timeout 3s --health-retries 20
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          ref: ${{ matrix.revision.sha }}
+          persist-credentials: false
+      - name: Verify exact product revision and initialize evidence
+        env:
+          EXPECTED_SHA: ${{ matrix.revision.sha }}
+        run: |
+          actual_sha="$(git rev-parse HEAD)"
+          test "$actual_sha" = "$EXPECTED_SHA"
+          mkdir -p "$RUNNER_TEMP/suite-evidence"
+          printf '%s\n' "$actual_sha" > "$RUNNER_TEMP/suite-evidence/revision.txt"
+      - uses: ./.github/actions/checkout-plugin-examples
+      - uses: dtolnay/rust-toolchain@4360b52568e2003a75bf9bc1d59f33a8e3fc893c # stable
+        with:
+          toolchain: 1.95.0
+          targets: wasm32-unknown-unknown
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
+        with:
+          shared-key: refactor-proof-1041
+          save-if: false
+      - name: Install PostgreSQL and SQLite migration clients
+        timeout-minutes: 15
+        env:
+          DEBIAN_FRONTEND: noninteractive
+        run: |
+          test -s /etc/apt/sources.list.d/ubuntu.sources
+          apt_sources=(-o Dir::Etc::sourcelist=/etc/apt/sources.list.d/ubuntu.sources -o Dir::Etc::sourceparts=-)
+          sudo apt-get "${apt_sources[@]}" \
+            -o Acquire::Retries=3 \
+            -o DPkg::Lock::Timeout=60 \
+            update
+          sudo apt-get "${apt_sources[@]}" \
+            -o Acquire::Retries=3 \
+            -o DPkg::Lock::Timeout=60 \
+            install --yes --no-install-recommends postgresql-client sqlite3
+      - name: Start MinIO and create integration-test bucket
+        run: |
+          docker run --detach --name mtc-test-minio --publish 9000:9000 \
+            --tmpfs /data:rw,size=2g \
+            --env MINIO_ROOT_USER=token-center-test \
+            --env MINIO_ROOT_PASSWORD=token-center-test-secret \
+            ghcr.io/weftsh/minio@sha256:14cea493d9a34af32f524e538b8346cf79f3321eff8e708c1e2960462bd8936e server /data
+          for attempt in $(seq 1 30); do
+            if curl --fail --silent http://127.0.0.1:9000/minio/health/live >/dev/null; then
+              break
+            fi
+            if [ "$attempt" -eq 30 ]; then
+              docker logs mtc-test-minio
+              exit 1
+            fi
+            sleep 1
+          done
+          mc_dir="$(mktemp -d "$RUNNER_TEMP/mtc-minio-client.XXXXXX")"
+          mc_binary="$mc_dir/mc"
+          curl --fail --location --retry 3 --max-time 120 \
+            https://github.com/minio/mc/releases/download/RELEASE.2025-08-13T08-35-41Z/mc.linux-amd64.RELEASE.2025-08-13T08-35-41Z \
+            --output "$mc_binary"
+          echo "01f866e9c5f9b87c2b09116fa5d7c06695b106242d829a8bb32990c00312e891  $mc_binary" | sha256sum --check --strict
+          chmod 0500 "$mc_binary"
+          export MC_CONFIG_DIR="$mc_dir/config"
+          "$mc_binary" alias set test http://127.0.0.1:9000 token-center-test token-center-test-secret
+          "$mc_binary" mb --ignore-existing test/memeloop-token-center-test
+          "$mc_binary" admin user add test mtc-list-only mtc-list-only-secret
+          "$mc_binary" admin policy create test mtc-list-only "$PWD/tests/fixtures/minio-list-only-policy.json"
+          "$mc_binary" admin policy attach test mtc-list-only --user mtc-list-only
+      - name: Install pinned cargo-nextest
+        run: |
+          curl --fail --location --retry 3 --max-time 120 \
+            --output "$RUNNER_TEMP/cargo-nextest.tar.gz" \
+            https://github.com/nextest-rs/nextest/releases/download/cargo-nextest-0.9.87/cargo-nextest-0.9.87-x86_64-unknown-linux-gnu.tar.gz
+          echo "bde8d231e435099b068e654c591224defe686c784b4920682ee12784b6bfcf9e  $RUNNER_TEMP/cargo-nextest.tar.gz" | sha256sum --check --strict
+          mkdir -p "$RUNNER_TEMP/nextest"
+          tar -xzf "$RUNNER_TEMP/cargo-nextest.tar.gz" -C "$RUNNER_TEMP/nextest"
+          echo "$RUNNER_TEMP/nextest" >> "$GITHUB_PATH"
+      - name: Record inventory and run shard with a per-test timeout
+        env:
+          SHARD: ${{ matrix.shard }}
+        run: |
+          set -euo pipefail
+          evidence="$RUNNER_TEMP/suite-evidence"
+          filter='not binary(cucumber)'
+          partition="hash:$SHARD/4"
+          printf '%s\n' "$partition" > "$evidence/partition.txt"
+          cargo nextest --version | tee "$evidence/nextest-version.txt"
+          cat >> .config/nextest.toml <<'TOML'
+
+          [profile.comparison]
+          retries = 0
+          slow-timeout = { period = "120s", terminate-after = 1, grace-period = "10s" }
+
+          [profile.comparison.junit]
+          path = "junit.xml"
+          TOML
+          cp .config/nextest.toml "$evidence/nextest.toml"
+          # Inventories are the full filter on each commit; the run applies the shard.
+          cargo nextest list --locked --all-targets --all-features -E "$filter" \
+            --message-format json > "$evidence/inventory.json"
+          set +e
+          cargo nextest run --locked --all-targets --all-features --profile comparison \
+            --no-fail-fast --test-threads=4 --partition "$partition" -E "$filter" \
+            --status-level=all --final-status-level=fail 2>&1 | tee "$evidence/nextest.log"
+          statuses=("${PIPESTATUS[@]}")
+          set -e
+          printf 'nextest_exit=%s\ntee_exit=%s\n' "${statuses[@]}" > "$evidence/exit.txt"
+          report=target/nextest/comparison/junit.xml
+          if [[ -s "$report" ]]; then
+            cp "$report" "$evidence/junit.xml"
+          elif [[ "${statuses[0]}" == 0 ]]; then
+            echo "::error::Nextest exited successfully without a JUnit report"
+            exit 1
+          fi
+          if [[ "${statuses[1]}" != 0 ]]; then exit "${statuses[1]}"; fi
+          exit "${statuses[0]}"
+      - name: Upload nextest inventory and evidence
+        if: always()
+        uses: actions/upload-artifact@65462800fd760344b1a7b4382951275a0abb4808 # v4
+        with:
+          name: proof-1041-${{ matrix.revision.name }}-suite-${{ matrix.shard }}
+          path: ${{ runner.temp }}/suite-evidence/
+          if-no-files-found: error
+          retention-days: 14
