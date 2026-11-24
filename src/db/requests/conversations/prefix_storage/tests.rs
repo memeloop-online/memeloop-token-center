@@ -718,6 +718,16 @@ async fn postgres_prefix_preload_releases_projection_scope_before_graph_receive(
     let owner = Uuid::now_v7();
     sqlx::query("INSERT INTO request_records(id,tenant_id,key_id,created_at,completed_at,protocol,model,status_code,input_tokens,output_tokens,cost_micros,request_object,reservation_id) VALUES($1,$2,$3,$4,$4,'openai','preload',200,0,0,0,'gap://preload/request',$5)")
         .bind(request.to_string()).bind(actor.tenant_id.to_string()).bind(actor.key_id.to_string()).bind(now+1).bind(Uuid::now_v7().to_string()).execute(&database.pool).await.unwrap();
+    sqlx::query(
+        "INSERT INTO request_record_locators(id,created_at,tenant_id,key_id) VALUES($1,$2,$3,$4)",
+    )
+    .bind(request.to_string())
+    .bind(now + 1)
+    .bind(actor.tenant_id.to_string())
+    .bind(actor.key_id.to_string())
+    .execute(&database.pool)
+    .await
+    .unwrap();
     let snapshot = serde_json::to_string(&ConversationSemanticSnapshot {
         leaf: Some(leaf),
         atom_hashes: hashes,
