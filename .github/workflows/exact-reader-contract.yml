@@ -656,10 +656,12 @@ jobs:
           set -o pipefail
           git rev-parse HEAD
           cargo check --locked --lib
-          cargo test --locked --lib request_history::tests::baseline_page_reads_use_two_http_calls_and_validate_identity_hash -- --exact --nocapture 2>&1 | tee /tmp/history-batch-final.log
-          grep -F '1 passed; 0 failed' /tmp/history-batch-final.log
-          cargo test --locked --lib db::history_source_snapshot::tests::request_history_real_services_acceptance_source_baseline_receipts_and_abort -- --ignored --exact --nocapture 2>&1 | tee /tmp/history-batch-final.log
-          grep -F '1 passed; 0 failed' /tmp/history-batch-final.log
+          cargo test --locked --lib db::request_history::event_backfill_tests::sqlite_selected_source_page_does_not_wait_for_events -- --exact --nocapture 2>&1 | tee /tmp/source-page.log
+          grep -F '1 passed; 0 failed' /tmp/source-page.log
+          cargo test --locked --lib db::request_history::event_backfill_tests::sqlite_event_backfill_uses_time_cursor_and_reuses_receipts -- --exact --nocapture 2>&1 | tee /tmp/source-page.log
+          grep -F '1 passed; 0 failed' /tmp/source-page.log
+          cargo test --locked --lib db::request_history::event_backfill_tests::request_history_real_services_acceptance_event_backfill_time_cursor -- --ignored --exact --nocapture 2>&1 | tee /tmp/source-page.log
+          grep -F '1 passed; 0 failed' /tmp/source-page.log
 
   semantic-reader-scope-contract:
     if: inputs.contract == 'semantic-reader-scope'
