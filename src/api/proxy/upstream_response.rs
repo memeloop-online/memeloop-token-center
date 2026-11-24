@@ -617,6 +617,7 @@ impl From<reqwest::Response> for UpstreamResponse {
 
 #[cfg(test)]
 mod tests {
+    mod archive_tap;
     use super::*;
 
     #[tokio::test]

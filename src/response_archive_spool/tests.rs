@@ -777,7 +777,7 @@ fn encrypted_chunks_bind_every_owner_and_sequence_without_plaintext() {
     );
 }
 
-async fn fixture() -> (
+pub(crate) async fn fixture() -> (
     tempfile::TempDir,
     AppState,
     sqlx::AnyPool,
@@ -1432,4 +1432,51 @@ async fn streaming_writer_batches_four_chunks_without_growing_its_memory_reserva
         row.get::<i64, _>("byte_count"),
         (4 * super::CHUNK_BYTES) as i64
     );
+}
+
+#[tokio::test]
+async fn byte_charged_tap_accepts_mixed_chunks_without_fragment_count_limit() {
+    for empty in [false, true] {
+        let (_dir, state, _pool, identity) = fixture().await;
+        let baseline = state.persistence.stream_memory.snapshot().0;
+        let mut producer = ResponseArchiveProducer::begin_original(&state, identity)
+            .await
+            .unwrap();
+        let mut expected = Vec::new();
+        if !empty {
+            for index in 0..1000 {
+                let bytes = Bytes::from(vec![
+                    b'a' + (index % 26) as u8;
+                    [1, 17, 1024, 8193][index % 4]
+                ]);
+                expected.extend_from_slice(&bytes);
+                assert!(
+                    producer.try_offer(bytes),
+                    "available byte credit must not reject a fragment count"
+                );
+            }
+        }
+        tokio::time::timeout(
+            std::time::Duration::from_secs(10),
+            producer.seal().unwrap().wait(),
+        )
+        .await
+        .unwrap();
+        let reference = state
+            .archive
+            .raw_capture_reference(identity.tenant_id, identity.request_id, "response")
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            state
+                .archive
+                .get_tenant_content(identity.tenant_id, &reference, expected.len())
+                .await
+                .unwrap()
+                .as_ref(),
+            expected.as_slice()
+        );
+        assert_eq!(state.persistence.stream_memory.snapshot().0, baseline);
+    }
 }

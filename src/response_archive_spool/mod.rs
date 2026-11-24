@@ -209,7 +209,7 @@ pub(crate) async fn process_one_for_test(state: &crate::AppState) -> bool {
 }
 
 #[cfg(test)]
-mod tests;
+pub(crate) mod tests;
 
 #[cfg(test)]
 pub(crate) async fn observed_claim_for_test(

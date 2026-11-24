@@ -861,7 +861,11 @@ impl ResponseArchiveProducer {
             #[cfg(test)]
             state: state.clone(),
             capture: CarrierCaptureInput {
-                budget: state.proxy_memory_budget.clone(),
+                budget: state
+                    .persistence
+                    .stream_memory
+                    .reservation()
+                    .shared_budget(),
                 source: Some(source),
                 progress,
                 length: 0,
