@@ -20,6 +20,7 @@ export interface SemanticContentField {
   name: 'text' | 'arguments' | 'arguments_text' | 'result_content' | 'tool_name' | 'call_id' | 'tool_call_id' | 'completeness' | 'kind' | 'media_type' | 'reasoning_source' | 'arguments_encoding' | 'result_status';
   format: 'text' | 'json';
   content_cursor: string;
+  preview?: { text: string; byte_offset: 0; complete: boolean; next_cursor: string | null };
 }
 export interface SemanticPartDescriptor {
   part_index: number;
@@ -81,7 +82,10 @@ export function createSemanticViewLoader(credential: string, path: (request: str
       if (!Array.isArray(value.parts) || typeof value.instance_id !== 'string' || typeof value.manifest_revision !== 'string'
         || !value.parts.every(part => Number.isSafeInteger(part.part_index) && part.part_index >= 0 && typeof part.kind === 'string'
           && Array.isArray(part.fields) && part.fields.every(field => ['text', 'arguments', 'arguments_text', 'result_content', 'tool_name', 'call_id', 'tool_call_id', 'completeness', 'kind', 'media_type', 'reasoning_source', 'arguments_encoding', 'result_status'].includes(field.name)
-            && ['text', 'json'].includes(field.format) && typeof field.content_cursor === 'string'))
+            && ['text', 'json'].includes(field.format) && typeof field.content_cursor === 'string'
+            && (!field.preview || (typeof field.preview.text === 'string' && field.preview.byte_offset === 0
+              && typeof field.preview.complete === 'boolean' && field.preview.complete === (field.preview.next_cursor === null)
+              && (field.preview.next_cursor === null || typeof field.preview.next_cursor === 'string')))))
         || !(value.next_cursor === null || typeof value.next_cursor === 'string')) throw new Error('Invalid semantic parts');
       return value;
     },

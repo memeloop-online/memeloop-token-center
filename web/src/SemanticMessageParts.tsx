@@ -10,11 +10,14 @@ function ContentField({ loader, request, instance, revision, part, field }: {
   part: SemanticPartDescriptor; field: SemanticContentField;
 }) {
   const { locale } = useI18n(); const zh = locale.startsWith('zh');
-  const [chunks, setChunks] = useState<{ index: number; value: SemanticContentChunk }[]>([]);
+  const [chunks, setChunks] = useState<{ index: number; value: SemanticContentChunk }[]>(() => field.preview ? [{ index: 0, value: {
+    ...field.preview, manifest_revision: revision, instance_id: instance.instance_id, part_index: part.part_index, field: field.name, format: field.format,
+  } }] : []);
   const chunksRef = useRef(chunks); chunksRef.current = chunks;
   const [error, setError] = useState('');
   const [loading, setLoading] = useState(false);
-  const positions = useRef([{ cursor: field.content_cursor, offset: 0 }]);
+  const positions = useRef([{ cursor: field.content_cursor, offset: 0 }, ...(field.preview?.next_cursor
+    ? [{ cursor: field.preview.next_cursor, offset: new TextEncoder().encode(field.preview.text).byteLength }] : [])]);
   const active = useRef<AbortController | null>(null);
   const stream = useRef<{ nextIndex: number; iterator: AsyncIterator<SemanticContentChunk>; controller: AbortController } | null>(null);
   const viewport = useRef<HTMLDivElement>(null);
@@ -71,7 +74,7 @@ function ContentField({ loader, request, instance, revision, part, field }: {
     }
     finally { if (active.current === controller) { active.current = null; setLoading(false); } }
   };
-  useEffect(() => { void move(0); return () => { stream.current?.controller.abort(); void Promise.resolve(stream.current?.iterator.return?.()).catch(() => undefined); active.current?.abort(); }; }, []);
+  useEffect(() => { if (!field.preview) void move(0); return () => { stream.current?.controller.abort(); void Promise.resolve(stream.current?.iterator.return?.()).catch(() => undefined); active.current?.abort(); }; }, []);
   const first = chunks[0]; const last = chunks.at(-1);
   const role = instance.role;
   const richText: ConversationMessageListProjection | undefined = field.name === 'text' && field.format === 'text'
