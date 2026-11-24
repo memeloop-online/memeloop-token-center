@@ -165,13 +165,7 @@ pub(super) fn prepare_forwarded_request(
         crate::api::kimi_transport::repair_responses_messages(dialect, &mut forwarded);
         return Ok((forwarded, Some(context)));
     }
-    if is_kimi_route {
-        crate::api::kimi_transport::prepare(protocol, &route.upstream_model, &mut forwarded)?;
-        return Ok((forwarded, None));
-    }
-    if let Some(model) = forwarded.get_mut("model") {
-        *model = Value::String(route.upstream_model.clone());
-    }
+    crate::api::kimi_transport::prepare(protocol, &route.upstream_model, &mut forwarded)?;
     Ok((forwarded, None))
 }
 
@@ -588,7 +582,7 @@ mod tests {
 
         let plain = route(dialect_driver);
         assert!(
-            prepare_forwarded_request(&plain, Protocol::OpenAiResponses, &request, false, dialect,)
+            prepare_forwarded_request(&plain, Protocol::OpenAiResponses, &request, false, dialect)
                 .is_err()
         );
     }
@@ -701,8 +695,8 @@ mod tests {
         assert_eq!(forwarded["input"][0]["type"], "additional_tools");
     }
 
-    #[test]
-    fn http_json_forwards_codex_responses_envelope_unchanged() {
+    #[tokio::test]
+    async fn native_http_aliases_keep_the_codex_responses_envelope() {
         let request = json!({
             "model": "public-model",
             "store": false,
@@ -722,23 +716,44 @@ mod tests {
                 ]}]}
             ]
         });
-        let (forwarded, chat) = prepare_forwarded_request(
-            &route("http-json"),
-            Protocol::OpenAiResponses,
-            &request,
-            false,
-            None,
-        )
-        .unwrap();
-
-        assert!(chat.is_none());
-        assert!(forwarded.get("messages").is_none());
-        assert_eq!(forwarded["model"], "upstream-model");
-        assert_eq!(forwarded["store"], false);
-        assert_eq!(forwarded["include"], request["include"]);
-        assert_eq!(forwarded["tools"], request["tools"]);
-        assert_eq!(forwarded["input"], request["input"]);
-        assert!(forwarded.get("max_output_tokens").is_none());
+        let (state, _directory) = crate::api::tests::test_state().await;
+        let key = AuthenticatedKey {
+            key_id: Uuid::now_v7(),
+            tenant_id: Uuid::now_v7(),
+            principal_id: Uuid::now_v7(),
+            account_id: Uuid::now_v7(),
+            alias: "native-http-aliases".into(),
+            currency: "USD".into(),
+            credential_generation: 1,
+            policy: Default::default(),
+        };
+        let mut expected = request.clone();
+        expected["model"] = json!("upstream-model");
+        for driver in ["openai-compatible", "one-api"] {
+            let planned = plan_proxy_route(ProxyRoutePlanInput {
+                request: ProxyRequestContext {
+                    state: &state,
+                    key: &key,
+                    model: "public-model",
+                    protocol: Protocol::OpenAiResponses,
+                    request_id: Uuid::now_v7(),
+                    request_json: &request,
+                    request_memory: None,
+                    codex_multi_agent_v2_request: true,
+                },
+                route: route(driver),
+                preparation_now: unix_millis(),
+            })
+            .unwrap();
+            assert_eq!(
+                planned.upstream_path,
+                Protocol::OpenAiResponses.path(),
+                "{driver}"
+            );
+            assert!(planned.responses_chat.is_none(), "{driver}");
+            assert!(planned.responses_anthropic.is_none(), "{driver}");
+            assert_eq!(planned.forwarded_json, expected, "{driver}");
+        }
     }
 
     #[test]
@@ -753,14 +768,7 @@ mod tests {
                 ]}]
             }),
         ] {
-            let (forwarded, _) = prepare_forwarded_request(
-                &route("openai-codex"),
-                Protocol::OpenAiResponses,
-                &request,
-                false,
-                None,
-            )
-            .unwrap();
+            let forwarded = forward_native_request(&route("openai-codex"), &request);
 
             assert_eq!(forwarded["input"], request["input"]);
             assert_eq!(
