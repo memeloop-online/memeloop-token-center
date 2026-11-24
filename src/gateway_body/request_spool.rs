@@ -177,17 +177,10 @@ impl DurableRequestBodies {
                 // Its existing independent upload envelope must own those
                 // copies; retaining the source pool's replay lease here would
                 // wait on the very bytes queued in the multipart writer.
-                let _upload_memory = upload
-                    .stream_memory
-                    .temporary_wait(
-                        crate::archive::ARCHIVE_MULTIPART_PART_BYTES
-                            + 5 * REQUEST_SPOOL_CHUNK_BYTES,
-                        super::memory::CAPTURE_MEMORY_WEIGHT,
-                    )
-                    .await
-                    .ok_or(())?;
+                let workspace = upload.multipart_workspace().await.map_err(|_| ())?;
                 let mut writer = archive.start_writer(key).await.map_err(|_| ())?;
-                let mut stream = source.open_stream();
+                writer.retain_workspace(workspace.clone());
+                let mut stream = source.open_stream_with_workspace(workspace);
                 while let Some(chunk) = stream.next().await {
                     let chunk = match chunk {
                         Ok(chunk) => chunk,
@@ -196,9 +189,7 @@ impl DurableRequestBodies {
                             return Err(());
                         }
                     };
-                    let upload_bytes = Bytes::copy_from_slice(&chunk);
-                    drop(chunk);
-                    if writer.write(upload_bytes).await.is_err() {
+                    if writer.write(chunk).await.is_err() {
                         let _ = writer.abort().await;
                         return Err(());
                     }

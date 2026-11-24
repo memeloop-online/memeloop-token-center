@@ -817,13 +817,7 @@ impl ResponseArchiveProducer {
                     Some(capture_state.archive.clone()),
                     key,
                 )
-                .with_workspace_budget(
-                    capture_state
-                        .persistence
-                        .upload_workspace
-                        .reservation()
-                        .shared_budget(),
-                );
+                .with_upload_workspace(capture_state.persistence.clone());
                 tokio::select! {
                     result = crate::gateway_body::carrier::BodyCarrier::capture_owned(carrier_capture_stream(source_receiver), capture) => result.map(|source| CapturedResponse { source, staging: key }),
                     () = capture_abandoned(capture_progress, capture_active) => Err(AppError::internal("response_capture_cancelled")),
@@ -1326,10 +1320,7 @@ async fn run_response_archive_writer(
                     .acquire_owned()
                     .await
                     .map_err(|_| AppError::internal("capture_upload_admission_closed"))?;
-                let reservation = match state.persistence.upload_workspace.temporary(
-                    super::CAPTURE_MEMORY_BYTES
-                        * crate::gateway_body::memory::CAPTURE_MEMORY_WEIGHT,
-                ) {
+                let reservation = match state.persistence.try_multipart_workspace() {
                     Ok(reservation) => reservation,
                     Err(_) => {
                         // Complete source bytes already have an owner. Release
