@@ -89,7 +89,7 @@ jobs:
           for (const route of ['tenants','service-tokens','upstreams','model-routes']) {
             const before = `/internal/v1/${route}?limit=1000000`;
             const after = `/internal/v1/${route}?limit=100`;
-            if (s.split(before).length !== 2 || s.includes(after)) throw Error(`unexpected fixture: ${route}`);
+            if (s.split(before).length !== 2 || s.includes(JSON.stringify(after))) throw Error(`unexpected fixture: ${route}`);
             s = s.replace(before, after);
           }
           fs.writeFileSync(p, s);
