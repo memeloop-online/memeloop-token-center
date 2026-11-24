@@ -138,6 +138,10 @@ test('semantic viewer reads verified atoms lazily, preserves parts and pages wit
       await previewField.locator(`[data-content-index="${index}"]`).waitFor({ state: 'attached' });
     }
     assert.equal(await previewField.locator('[data-content-index="0"]').textContent(), '😀首窗');
+    for (let index = 3; index <= 5; index++) {
+      await previewField.evaluate(node => { node.scrollTop = node.scrollHeight; node.dispatchEvent(new WheelEvent('wheel', { deltaY: 300, bubbles: true })); });
+      await previewField.locator(`[data-content-index="${index}"]`).waitFor({ state: 'attached' });
+    }
     const resumed = await page.evaluate(() => window.semanticContentCursors);
     assert.ok(resumed.every(cursor => !cursor.endsWith(':text')), 'returning to the shared preview must not request a different chunk at offset zero');
     assert.equal(await page.getByRole('alert').count(), 0);
