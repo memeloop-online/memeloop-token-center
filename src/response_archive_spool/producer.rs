@@ -545,7 +545,9 @@ impl CarrierCaptureInput {
                 .map_err(|_| std::io::Error::other("capture closed"))?;
             // The receiver acknowledges only when capture has taken ownership
             // of the previous chunk, rather than merely queueing its bytes.
-            completion.map_err(|_| std::io::Error::other("capture closed"))?;
+            completion
+                .await
+                .map_err(|_| std::io::Error::other("capture closed"))?;
             self.length += (end - offset) as u64;
             self.progress.send_replace((self.length, false));
         }
