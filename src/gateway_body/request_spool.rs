@@ -1827,3 +1827,6 @@ mod tests {
         assert_eq!(file_count(&target), 0);
     }
 }
+
+#[cfg(test)]
+mod workspace_contracts;
