@@ -209,7 +209,7 @@ async function writeStreamChunk(response: ServerResponse, chunk: Buffer): Promis
   return !response.destroyed;
 }
 
-async function streamChatSse(request: IncomingMessage, response: ServerResponse, state: MockState, total: number, maximumFrameBytes: number, delayMs: number, barrier?: StreamStartBarrier): Promise<void> {
+export async function streamChatSse(request: IncomingMessage, response: ServerResponse, state: MockState, total: number, maximumFrameBytes: number, delayMs: number, barrier?: StreamStartBarrier): Promise<void> {
   const finish = chatSseFrame([{ index: 0, delta: {}, finish_reason: "stop" }]);
   const usage = chatSseFrame([], { prompt_tokens: 2, completion_tokens: 1, total_tokens: 3 });
   const done = Buffer.from("data: [DONE]\n\n");

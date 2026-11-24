@@ -68,10 +68,15 @@ pub(crate) const CAPTURE_INSERT_BATCH_CHUNKS: usize = 16;
 const CAPTURE_QUEUE_CHUNKS: usize = 3;
 #[cfg(test)]
 pub(crate) const CAPTURE_DATABASE_BATCH_CHUNKS: usize = CAPTURE_QUEUE_CHUNKS + 1;
-const CAPTURE_MEMORY_BYTES: usize = CHUNK_BYTES * 5 + crate::archive::ARCHIVE_MULTIPART_PART_BYTES;
+pub(crate) const CAPTURE_MEMORY_BYTES: usize =
+    CHUNK_BYTES * 5 + crate::archive::ARCHIVE_MULTIPART_PART_BYTES;
 pub(crate) const RAW_STREAM_MEMORY_BYTES: usize = CAPTURE_MEMORY_BYTES
     * crate::gateway_body::memory::CAPTURE_MEMORY_WEIGHT
     * crate::PROXY_ARCHIVE_STREAM_CONCURRENCY;
+
+pub(crate) const RAW_UPLOAD_WORKSPACE_BYTES: usize = RAW_STREAM_MEMORY_BYTES / 2;
+pub(crate) const RAW_SOURCE_MEMORY_BYTES: usize =
+    RAW_STREAM_MEMORY_BYTES - RAW_UPLOAD_WORKSPACE_BYTES;
 
 struct OwnedTask<T: Send + 'static> {
     task: Option<tokio::task::JoinHandle<Result<T, AppError>>>,
@@ -209,7 +214,7 @@ pub(crate) async fn process_one_for_test(state: &crate::AppState) -> bool {
 }
 
 #[cfg(test)]
-mod tests;
+pub(crate) mod tests;
 
 #[cfg(test)]
 pub(crate) async fn observed_claim_for_test(

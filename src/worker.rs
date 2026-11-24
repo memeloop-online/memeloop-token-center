@@ -551,8 +551,8 @@ pub(crate) async fn run_until_shutdown_with_reaper_period(
     periodic!(
         "conversation_projection",
         PROJECTION_INTERVAL,
-        async |state: &AppState, _shutdown: &watch::Receiver<bool>| {
-            process_conversation_projection_batch(state, Uuid::now_v7()).await;
+        async |state: &AppState, shutdown: &watch::Receiver<bool>| {
+            run_conversation_projection(state, shutdown.clone()).await;
         }
     );
     periodic!(
@@ -1125,6 +1125,8 @@ async fn supervise_roles_with_early_oauth_shutdown(
 }
 
 async fn process_terminal_projection_batch(state: &AppState, lease_owner: Uuid) {
+    let batch_started = std::time::Instant::now();
+    let mut batch = crate::db::TerminalProjectionBatchTimings::default();
     let started = std::time::Instant::now();
     tracing::debug!(%lease_owner, stage = "claim_start", "terminal projection stage");
     let tasks = match state
@@ -1143,14 +1145,16 @@ async fn process_terminal_projection_batch(state: &AppState, lease_owner: Uuid) 
     };
     tracing::debug!(%lease_owner, stage = "claim_done", count = tasks.len(),
         elapsed_ms = started.elapsed().as_millis() as u64, "terminal projection stage");
+    let claim_ms = started.elapsed().as_millis() as u64;
     for request_id in tasks {
         let started = std::time::Instant::now();
         tracing::debug!(%lease_owner, %request_id, stage = "apply_start", "terminal projection stage");
-        match state
+        let (result, timings) = state
             .db
-            .project_claimed_terminal_projection_task(lease_owner, request_id)
-            .await
-        {
+            .project_claimed_terminal_projection_with_timings(lease_owner, request_id)
+            .await;
+        batch.observe(result.as_ref().ok().copied(), &timings);
+        match result {
             Ok(projected) => tracing::debug!(%lease_owner, %request_id, stage = "apply_done",
                 projected, elapsed_ms = started.elapsed().as_millis() as u64,
                 "terminal projection stage"),
@@ -1159,6 +1163,16 @@ async fn process_terminal_projection_batch(state: &AppState, lease_owner: Uuid) 
                 error_category = error.diagnostic_category(),
                 "worker failed to apply terminal projection"),
         }
+    }
+    // Nonempty batches emit one bounded diagnostic; idle passes stay silent.
+    if batch.attempted > 0 {
+        tracing::info!(claim_ms, claimed = batch.attempted, projected = batch.projected,
+            deferred = batch.deferred, failed = batch.failed,
+            batch_wall_ms = batch_started.elapsed().as_millis() as u64,
+            stage_names = ?crate::db::TERMINAL_PROJECTION_STAGE_NAMES,
+            stage_sum_us = ?batch.stage_sum_us, stage_max_us = ?batch.stage_max_us,
+            stage_failures = ?batch.stage_failures,
+            "terminal projection batch timing");
     }
 }
 
@@ -1221,40 +1235,51 @@ async fn process_session_body_rebuild_recovery(state: &AppState) {
     );
 }
 
-async fn process_conversation_projection_batch(state: &AppState, lease_owner: Uuid) {
-    tracing::debug!(%lease_owner, stage = "claim_start", "conversation projection stage");
-    let tasks = match state
-        .db
-        .claim_conversation_projection_tasks(lease_owner, PROJECTION_BATCH_LIMIT)
-        .await
-    {
-        Ok(tasks) => tasks,
-        Err(error) => {
-            state
-                .metrics
-                .observe_background_projection(BackgroundProjectionKind::Conversation, false);
-            tracing::error!(%error, "worker 未能领取会话正文归档任务");
-            return;
-        }
-    };
-    tracing::debug!(%lease_owner, count = tasks.len(), stage = "claim_done", "conversation projection stage");
-    for task in tasks {
-        tracing::debug!(request_id = %task.request_id, %lease_owner, stage = "archive_start", "conversation projection stage");
-        match archive_session_body(state, lease_owner, task.request_id).await {
-            Ok(true) => state
-                .metrics
-                .observe_background_projection(BackgroundProjectionKind::Conversation, true),
-            Ok(false) => {}
-            Err(error) => {
-                state
-                    .metrics
-                    .observe_background_projection(BackgroundProjectionKind::Conversation, false);
-                tracing::error!(
-                    %error,
-                    request_id = %task.request_id,
-                    "会话正文归档没有写完，客户端请求已经结束"
-                );
+async fn run_conversation_projection(state: &AppState, mut shutdown: watch::Receiver<bool>) {
+    let mut running = JoinSet::new();
+    let mut claim_turn = 0usize;
+    let mut ticks = tokio::time::interval(PROJECTION_INTERVAL);
+    ticks.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+    loop {
+        tokio::select! {
+            biased;
+            _ = wait_for_shutdown(&mut shutdown) => {
+                running.abort_all();
+                while running.join_next().await.is_some() {}
+                return;
             }
+            Some(result) = running.join_next(), if !running.is_empty() => {
+                if let Err(error) = result { tracing::error!(%error, "conversation archive task stopped"); }
+            }
+            _ = ticks.tick() => {}
+        }
+        let available = PROJECTION_BATCH_LIMIT - running.len() as i64;
+        if available == 0 {
+            continue;
+        }
+        let owner = Uuid::now_v7();
+        match state
+            .db
+            .claim_conversation_projection_tasks_from_turn(owner, available, claim_turn)
+            .await
+        {
+            Ok(tasks) => {
+                claim_turn = claim_turn.wrapping_add(available as usize);
+                for task in tasks {
+                    let state = state.clone();
+                    running.spawn(async move {
+                    match archive_session_body(&state, owner, task.request_id).await {
+                        Ok(true) => state.metrics.observe_background_projection(BackgroundProjectionKind::Conversation, true),
+                        Ok(false) => {},
+                        Err(error) => {
+                            state.metrics.observe_background_projection(BackgroundProjectionKind::Conversation, false);
+                            tracing::error!(%error, request_id = %task.request_id, "conversation archive remains pending");
+                        }
+                    }
+                });
+                }
+            }
+            Err(error) => tracing::error!(%error, "worker could not claim conversation archives"),
         }
     }
 }
@@ -1270,7 +1295,7 @@ pub async fn archive_session_body(
     lease_owner: Uuid,
     request_id: Uuid,
 ) -> Result<bool, AppError> {
-    archive_session_body_with_result(state, lease_owner, request_id, false).await
+    archive_session_body_with_lease(state, lease_owner, request_id, false).await
 }
 
 /// Exact repair keeps the same durable retry transition while returning its
@@ -1280,7 +1305,36 @@ pub async fn recover_claimed_session_body(
     lease_owner: Uuid,
     request_id: Uuid,
 ) -> Result<bool, AppError> {
-    archive_session_body_with_result(state, lease_owner, request_id, true).await
+    archive_session_body_with_lease(state, lease_owner, request_id, true).await
+}
+
+async fn archive_session_body_with_lease(
+    state: &AppState,
+    lease_owner: Uuid,
+    request_id: Uuid,
+    report_deferred_error: bool,
+) -> Result<bool, AppError> {
+    if !state
+        .db
+        .renew_session_body_archive(lease_owner, request_id)
+        .await?
+    {
+        return Ok(false);
+    }
+    let archive =
+        archive_session_body_with_result(state, lease_owner, request_id, report_deferred_error);
+    tokio::pin!(archive);
+    let mut heartbeat = tokio::time::interval(Duration::from_secs(30));
+    heartbeat.tick().await;
+    loop {
+        tokio::select! {
+            biased;
+            result = &mut archive => return result,
+            _ = heartbeat.tick() => {
+                if !state.db.renew_session_body_archive(lease_owner, request_id).await? { return Ok(false); }
+            }
+        }
+    }
 }
 
 async fn archive_session_body_with_result(
@@ -1301,16 +1355,34 @@ async fn archive_session_body_with_result(
         )
         .await;
     };
+    #[cfg(test)]
+    crate::db::Database::wait_raw_projection_gate_for_test(request_id).await;
     tracing::debug!(%request_id, %lease_owner, stage = "raw_response_reference_start", "conversation projection stage");
     if let Some(response) = state
         .archive
         .raw_capture_reference(tenant_id, request_id, "response")
         .await?
     {
-        state
+        if !state
             .db
-            .bind_raw_capture(tenant_id, request_id, "response", &response)
-            .await?;
+            .renew_session_body_archive(lease_owner, request_id)
+            .await?
+        {
+            return Ok(false);
+        }
+        if !state
+            .db
+            .bind_raw_capture_for_projection(
+                tenant_id,
+                request_id,
+                "response",
+                &response,
+                lease_owner,
+            )
+            .await?
+        {
+            return Ok(false);
+        }
         locators.response = Some(response.object_locator);
         locators.pending = false;
     } else if state
@@ -1327,10 +1399,26 @@ async fn archive_session_body_with_result(
         .raw_capture_reference(tenant_id, request_id, "request")
         .await?
     {
-        state
+        if !state
             .db
-            .bind_raw_capture(tenant_id, request_id, "request", &request)
-            .await?;
+            .renew_session_body_archive(lease_owner, request_id)
+            .await?
+        {
+            return Ok(false);
+        }
+        if !state
+            .db
+            .bind_raw_capture_for_projection(
+                tenant_id,
+                request_id,
+                "request",
+                &request,
+                lease_owner,
+            )
+            .await?
+        {
+            return Ok(false);
+        }
         locators.request = request.object_locator;
         locators.source_identity = None;
     }
@@ -1361,30 +1449,20 @@ async fn archive_session_body_with_result(
         .await;
     }
     tracing::debug!(%request_id, %lease_owner, stage = "source_stream_start", "conversation projection stage");
-    let projection = state.archive.prepare_session_body_streamed(
-        tenant_id,
-        request_id,
-        hints,
-        locators.request.clone(),
-        locators
-            .response
-            .clone()
-            .filter(|locator| !missing_raw_document(locator)),
-        response_complete,
-    );
-    tokio::pin!(projection);
-    let mut heartbeat = tokio::time::interval(Duration::from_secs(30));
-    heartbeat.tick().await;
-    let prepared = loop {
-        tokio::select! {
-            result = &mut projection => break result,
-            _ = heartbeat.tick() => {
-                if !state.db.renew_session_body_archive(lease_owner, request_id).await? {
-                    return Ok(false);
-                }
-            }
-        }
-    };
+    let prepared = state
+        .archive
+        .prepare_session_body_streamed(
+            tenant_id,
+            request_id,
+            hints,
+            locators.request.clone(),
+            locators
+                .response
+                .clone()
+                .filter(|locator| !missing_raw_document(locator)),
+            response_complete,
+        )
+        .await;
     tracing::debug!(%request_id, %lease_owner, succeeded = prepared.is_ok(), stage = "source_stream_done", "conversation projection stage");
     let prepared = match prepared {
         Ok(Some(prepared)) => prepared,
@@ -1465,10 +1543,13 @@ async fn archive_session_body_with_result(
             .raw_capture_reference(tenant_id, request_id, side)
             .await?
         {
-            state
+            if !state
                 .db
-                .bind_raw_capture(tenant_id, request_id, side, &object)
-                .await?;
+                .bind_raw_capture_for_projection(tenant_id, request_id, side, &object, lease_owner)
+                .await?
+            {
+                return Ok(false);
+            }
         }
     }
     let crate::archive::PreparedSessionBody {
