@@ -50,6 +50,7 @@ jobs:
             log=$(mktemp)
             local harness_args=(--nocapture)
             if [[ "$target" == ignored-pg ]]; then harness_args+=(--ignored); fi
+            if [[ "$target" == *-exact ]]; then harness_args+=(--exact); fi
             local deadline=240s
             if [[ "$target" != master* && "$target" != ignored-pg ]]; then deadline=1200s; fi
             if timeout --kill-after=15s "$deadline" cargo test --locked --all-features "$@" "$pattern" -- "${harness_args[@]}" >"$log" 2>&1; then
@@ -76,7 +77,8 @@ jobs:
           select_contract picker sqlite_projection_preserves_identity_aggregation_and_evidence 1 --test model_picker_projection
           select_contract picker postgres_projection_matches_sqlite_contract 1 --test model_picker_projection
           select_contract master-archive pending_archive_admission_never_blocks_original_chunks_or_empty_eof 1 --lib
-          select_contract master-archive upstream_response::tests::archive_tap 1 --lib
+          select_contract master-archive-exact api::proxy::upstream_response::tests::archive_tap::exhausted_upload_workspace_and_failed_s3_do_not_block_small_original_eof 1 --lib
+          select_contract master-archive-exact api::proxy::upstream_response::tests::archive_tap::slow_or_failed_dual_object_stores_do_not_own_customer_eof 1 --lib
           select_contract master-archive failed_capture_fact_is_retried_after_object_storage_recovers 1 --lib
           select_contract master-facts terminal_projection::fact_read 2 --lib
           select_contract master-backfill request_history::event_backfill_tests::sqlite_ 2 --lib
