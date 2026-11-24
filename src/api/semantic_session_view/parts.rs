@@ -21,7 +21,26 @@ pub(super) async fn read(
             serde_json::to_value(part).map_err(|_| AppError::internal("semantic_parts_encode"))?;
         let mut fields = Vec::new();
         for field in &part.fields {
-            fields.push(serde_json::json!({"name":field.name,"format":field.format,"content_cursor":reader::token(state,position,Position::Content{ordinal:part.ordinal,part_index:part.part_index,field:field.name.clone(),format:field.format.clone(),offset:0})?}));
+            let mut wire = serde_json::json!({"name":field.name,"format":field.format,"content_cursor":reader::token(state,position,Position::Content{ordinal:part.ordinal,part_index:part.part_index,field:field.name.clone(),format:field.format.clone(),offset:0})?});
+            if let Some(preview) = &field.preview {
+                let next = if preview.complete {
+                    None
+                } else {
+                    Some(reader::token(
+                        state,
+                        position,
+                        Position::Content {
+                            ordinal: part.ordinal,
+                            part_index: part.part_index,
+                            field: field.name.clone(),
+                            format: field.format.clone(),
+                            offset: preview.text.len() as u64,
+                        },
+                    )?)
+                };
+                wire["preview"] = serde_json::json!({"text":preview.text,"byte_offset":0,"complete":preview.complete,"next_cursor":next});
+            }
+            fields.push(wire);
         }
         value["fields"] = Value::Array(fields);
         if part.locator.is_some() {

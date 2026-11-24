@@ -8,6 +8,7 @@ fn invalid() -> io::Error {
 struct Scanner<R> {
     input: R,
     capture: Option<Window>,
+    preview_budget: usize,
     output: Option<tokio::sync::mpsc::Sender<std::io::Result<ContentPiece>>>,
 }
 struct Window {
@@ -16,10 +17,12 @@ struct Window {
     bytes: Vec<u8>,
     output: Option<tokio::sync::mpsc::Sender<std::io::Result<ContentPiece>>>,
     emitted: u64,
+    limit: usize,
 }
 impl Window {
     fn push(&mut self, byte: u8) -> Result<()> {
-        if self.count >= self.offset && (self.output.is_some() || self.bytes.len() < CHUNK + 4) {
+        if self.count >= self.offset && (self.output.is_some() || self.bytes.len() < self.limit + 4)
+        {
             self.bytes.push(byte);
         }
         self.count += 1;
@@ -56,9 +59,9 @@ impl Window {
             let text = String::from_utf8(self.bytes).map_err(|_| invalid())?;
             return Ok((text, true));
         }
-        let mut end = self.bytes.len().min(CHUNK);
+        let mut end = self.bytes.len().min(self.limit);
         while std::str::from_utf8(&self.bytes[..end]).is_err() {
-            if end == 0 || CHUNK.saturating_sub(end) > 3 {
+            if end == 0 || self.limit.saturating_sub(end) > 3 {
                 return Err(invalid());
             }
             end -= 1;
@@ -308,6 +311,7 @@ impl<R: BufRead> Scanner<R> {
             bytes: Vec::new(),
             output: None,
             emitted: 0,
+            limit: CHUNK,
         });
         self.value(0)?;
         let window = self.capture.take().ok_or_else(invalid)?;
@@ -372,6 +376,7 @@ impl<R: BufRead> Scanner<R> {
                     part.fields.push(Field {
                         name: name.clone(),
                         format: format.into(),
+                        preview: None,
                     });
                 }
                 if let Selection::Content {
@@ -391,6 +396,7 @@ impl<R: BufRead> Scanner<R> {
                         bytes: Vec::with_capacity(CHUNK + 4),
                         output: self.output.take(),
                         emitted: 0,
+                        limit: CHUNK,
                     };
                     if text_field {
                         self.string(true, |bytes| {
@@ -409,6 +415,36 @@ impl<R: BufRead> Scanner<R> {
                     projection.text = text;
                     projection.complete = complete;
                     projection.format = Some(format.into());
+                } else if matches!(selection, Selection::Parts { .. })
+                    && selected
+                    && self.preview_budget > 0
+                {
+                    let mut window = Window {
+                        offset: 0,
+                        count: 0,
+                        bytes: Vec::new(),
+                        output: None,
+                        emitted: 0,
+                        limit: self.preview_budget,
+                    };
+                    if text_field {
+                        self.string(true, |bytes| {
+                            for byte in bytes {
+                                window.push(*byte)?;
+                            }
+                            Ok(())
+                        })?;
+                    } else {
+                        self.capture = Some(window);
+                        self.value(0)?;
+                        window = self.capture.take().ok_or_else(invalid)?;
+                    }
+                    let (text, complete) = window.finish()?;
+                    self.preview_budget -= text.len();
+                    if !text.is_empty() || complete {
+                        part.fields.last_mut().ok_or_else(invalid)?.preview =
+                            Some(Preview { text, complete });
+                    }
                 } else {
                     self.value(0)?;
                 }
@@ -436,6 +472,7 @@ impl<R: BufRead> Scanner<R> {
                     part.fields.push(Field {
                         name: name.clone(),
                         format: "text".into(),
+                        preview: None,
                     });
                 }
                 match name.as_str() {
@@ -490,6 +527,7 @@ pub(super) fn scan_with_output<R: BufRead>(
     let mut scanner = Scanner {
         input,
         capture: None,
+        preview_budget: CHUNK,
         output,
     };
     let mut projection = Projection {

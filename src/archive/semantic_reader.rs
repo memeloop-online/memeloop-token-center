@@ -51,6 +51,13 @@ pub(crate) struct Part {
 pub(crate) struct Field {
     pub name: String,
     pub format: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub preview: Option<Preview>,
+}
+#[derive(Serialize)]
+pub(crate) struct Preview {
+    pub text: String,
+    pub complete: bool,
 }
 pub(crate) struct Projection {
     pub role: Option<String>,

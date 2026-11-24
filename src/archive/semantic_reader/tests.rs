@@ -330,3 +330,42 @@ async fn mismatched_part_index_cannot_complete_a_stream() {
     );
     assert!(frames.next().await.unwrap().is_err());
 }
+
+#[test]
+fn parts_previews_share_one_page_budget_and_preserve_field_boundaries() {
+    let body = serde_json::to_vec(&json!({"role":"assistant","parts":[
+        {"part_index":0,"kind":"text","text":"short"},
+        {"part_index":1,"kind":"tool_call","arguments":{"input":"文😀".repeat(CHUNK)}},
+        {"part_index":2,"kind":"reasoning","text":"remaining"}
+    ]}))
+    .unwrap();
+    let projection = scan(&body, Selection::Parts { start: 0 });
+    let previews = projection
+        .parts
+        .iter()
+        .flat_map(|part| &part.fields)
+        .filter_map(|field| field.preview.as_ref())
+        .collect::<Vec<_>>();
+    assert!(
+        previews
+            .iter()
+            .map(|preview| preview.text.len())
+            .sum::<usize>()
+            <= CHUNK
+    );
+    assert_eq!(previews[0].text, "short");
+    assert!(previews[0].complete);
+    assert!(!previews[1].complete);
+    let field = &projection.parts[1].fields[0];
+    let preview = field.preview.as_ref().unwrap();
+    let continuation = scan(
+        &body,
+        Selection::Content {
+            part: 1,
+            field: "arguments".into(),
+            offset: preview.text.len() as u64,
+        },
+    );
+    let expected = serde_json::to_string(&json!({"input":"文😀".repeat(CHUNK)})).unwrap();
+    assert!(expected.starts_with(&format!("{}{}", preview.text, continuation.text)));
+}
