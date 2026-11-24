@@ -1,3 +1,4 @@
+import { useState } from 'react';
 import { createRoot } from 'react-dom/client';
 import { I18nProvider } from '../../src/i18n';
 import { MtcFluentProvider } from '../../src/design-system';
@@ -9,6 +10,8 @@ import '../../src/theme.css';
 
 declare global { interface Window { semanticAtomReads: number; semanticPageReads: number } }
 window.semanticAtomReads = 0; window.semanticPageReads = 0;
+declare global { interface Window { semanticPageRequest: string } }
+window.semanticPageRequest = '';
 const detail: LogicalSessionDetail = {
   session_id: 'session-a', cluster_id: null, unlinked: false, edges: [], edges_truncated: false, has_more: false, next_cursor: null,
   requests: [{ request_id: 'request-a', created_at: 1, protocol: 'openai', model: 'fixture', status_code: 200, duration_ms: 1,
@@ -53,7 +56,7 @@ window.fetch = async (input, init) => {
 const contentLoader = createSemanticViewLoader('fixture', () => '/fixture-content');
 const loader: SemanticViewLoader = {
   page: async (_request, cursor) => {
-    window.semanticPageReads++;
+    window.semanticPageReads++; window.semanticPageRequest = _request;
     if (scenario === 'error') throw new Error('Semantic read HTTP 500');
     if (scenario === 'many') return { status: 'published', manifest_revision: revision, coverage: { observed_terminal: true, projection_state: 'complete', gaps: [], omissions: [] },
       instances: Array.from({ length: cursor ? 1 : 32 }, (_, i) => ({ instance_id: `item-${cursor ? 0 : i + 1}`, request_id: 'request-a', branch_id: 'branch-a', ordinal: cursor ? 0 : i + 1, role: 'assistant', atom_hash: 'same', node_hash: 'same', atom_cursor: `item-${cursor ? 0 : i + 1}`, origin: 'return', terminal_state: 'complete' })), next_cursor: cursor ? null : 'older-page' };
@@ -84,4 +87,9 @@ const loader: SemanticViewLoader = {
     ] }));
   },
 };
-createRoot(document.getElementById('root')!).render(<I18nProvider><MtcFluentProvider><SemanticSessionPanel detail={detail} loader={loader} /></MtcFluentProvider></I18nProvider>);
+function SessionFixture() {
+  const [other, setOther] = useState(false);
+  const selected = other ? { ...detail, session_id: 'session-b', requests: detail.requests.map(request => ({ ...request, request_id: 'request-b' })) } : detail;
+  return <>{scenario === 'scope' && <button onClick={() => setOther(true)}>Open another session</button>}<SemanticSessionPanel detail={selected} loader={loader} /></>;
+}
+createRoot(document.getElementById('root')!).render(<I18nProvider><MtcFluentProvider><SessionFixture /></MtcFluentProvider></I18nProvider>);

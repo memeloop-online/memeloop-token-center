@@ -117,6 +117,10 @@ test('semantic viewer reads verified atoms lazily, preserves parts and pages wit
     await page.goto(`http://127.0.0.1:${address.port}/e2e/fixtures/semantic-session.html?scenario=revision`);
     await page.getByText('Error: Semantic content identity or offset changed; refresh the conversation', { exact: true }).waitFor();
     assert.equal(await page.getByText('Stale content', { exact: true }).count(), 0);
+    await page.goto(`http://127.0.0.1:${address.port}/e2e/fixtures/semantic-session.html?scenario=scope`);
+    await page.waitForFunction(() => window.semanticPageRequest === 'request-a');
+    await page.getByRole('button', { name: 'Open another session', exact: true }).click();
+    await page.waitForFunction(() => window.semanticPageRequest === 'request-b');
     await page.goto(`http://127.0.0.1:${address.port}/e2e/fixtures/semantic-session.html?scenario=error`);
     await page.getByText('Semantic read HTTP 500', { exact: true }).waitFor();
     assert.equal(await page.getByText('semantic_publication_pending', { exact: true }).count(), 0);
