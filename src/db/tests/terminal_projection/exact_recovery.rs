@@ -29,7 +29,7 @@ async fn exact_contract(db: &Database) {
     assert_eq!(before.state, "eligible");
     assert!(!before.applied);
     assert!(!before.fact_exists);
-    if db.backend == DatabaseBackend::PostgreSql {
+    if matches!(db.backend, DatabaseBackend::PostgreSql) {
         let role = format!("terminal_inspect_{}", Uuid::now_v7().simple());
         for statement in [
             format!("CREATE ROLE {role} NOLOGIN"),
@@ -57,7 +57,7 @@ async fn exact_contract(db: &Database) {
             .await
             .unwrap();
         let mut readonly = db.clone();
-        readonly.pool = pool;
+        readonly.pool = pool.into();
         assert_eq!(
             readonly
                 .recover_one_terminal_projection(identity, false)
@@ -138,7 +138,7 @@ async fn exact_contract(db: &Database) {
         .await
         .unwrap();
     let ledger_before:i64=sqlx::query_scalar("SELECT CAST(SUM(amount_micros) AS BIGINT) FROM ledger_entries WHERE account_id=$1 AND key_id=$2 AND source=$3 AND kind='usage'").bind(key.account_id.to_string()).bind(key.key_id.to_string()).bind(reservation.id.to_string()).fetch_one(&db.pool).await.unwrap();
-    if db.backend == DatabaseBackend::PostgreSql {
+    if matches!(db.backend, DatabaseBackend::PostgreSql) {
         let mut blocker = db.begin_write_transaction().await.unwrap();
         sqlx::query(
             "SELECT request_id FROM terminal_projection_outbox WHERE request_id=$1 FOR UPDATE",
