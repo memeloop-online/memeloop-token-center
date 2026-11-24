@@ -707,3 +707,5 @@ jobs:
             cargo test --locked --lib "db::session_reading::tests::${backend}_semantic_revision_uses_authorized_request_scope" -- --exact --nocapture 2>&1 | tee /tmp/semantic-reader-scope.log
             grep -F '1 passed; 0 failed' /tmp/semantic-reader-scope.log
           done
+          cargo test --locked --lib api::semantic_session_view::http_contract::canonical_http_fields_match_training_and_keep_occurrence_scope -- --exact --nocapture 2>&1 | tee /tmp/semantic-reader-http.log
+          grep -F '1 passed; 0 failed' /tmp/semantic-reader-http.log
