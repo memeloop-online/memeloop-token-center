@@ -153,3 +153,63 @@ async fn assert_event_cursor(database: &Database) {
         "explicit read-model refresh re-exports all retained events"
     );
 }
+
+#[tokio::test]
+async fn sqlite_selected_source_page_does_not_wait_for_events() {
+    use crate::request_history::HistorySource;
+    let directory = tempfile::tempdir().unwrap();
+    let database = Database::connect(&format!(
+        "sqlite://{}?mode=rwc",
+        directory.path().join("selected.db").display()
+    ))
+    .await
+    .unwrap();
+    database.migrate().await.unwrap();
+    sqlx::query("UPDATE request_history_state SET mode='shadow' WHERE id=1")
+        .execute(&database.pool)
+        .await
+        .unwrap();
+    // Event remains unfinished while empty native/generation pages are processed.
+    assert_eq!(
+        database
+            .history_backfill_source_page(64, Some(HistorySource::Native))
+            .await
+            .unwrap(),
+        0
+    );
+    assert_eq!(
+        database
+            .history_backfill_source_page(64, Some(HistorySource::Generation))
+            .await
+            .unwrap(),
+        0
+    );
+    let rows =
+        sqlx::query("SELECT source,done,after_id FROM request_history_backfill ORDER BY source")
+            .fetch_all(&database.pool)
+            .await
+            .unwrap();
+    for row in rows {
+        let source: String = row.try_get("source").unwrap();
+        let done: i64 = row.try_get("done").unwrap();
+        assert_eq!(
+            done,
+            i64::from(source == "native" || source == "generation")
+        );
+        assert_eq!(row.try_get::<String, _>("after_id").unwrap(), "");
+    }
+    assert!(!database.history_backfill_done().await.unwrap());
+    assert_eq!(
+        database
+            .history_backfill_source_page(64, Some(HistorySource::Native))
+            .await
+            .unwrap(),
+        0
+    );
+    assert!(!database.history_backfill_done().await.unwrap());
+    let mode: String = sqlx::query_scalar("SELECT mode FROM request_history_state WHERE id=1")
+        .fetch_one(&database.pool)
+        .await
+        .unwrap();
+    assert_eq!(mode, "shadow");
+}
