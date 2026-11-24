@@ -339,6 +339,7 @@ jobs:
         run: |
           set -o pipefail
           cargo test --locked --lib --no-run
+          cargo test --locked --lib gateway_body::carrier::small_put_tests::single_put_payload_keeps_workspace_until_last_sdk_clone_is_dropped -- --exact
           for selector in \
             gateway_body::carrier::small_put_tests::real_s3_small_spill_uses_one_put_and_large_boundary_keeps_multipart \
             gateway_body::carrier::small_put_tests::real_s3_small_spill_lost_ack_retains_source_and_routes_both_backends \

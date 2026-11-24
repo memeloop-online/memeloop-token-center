@@ -280,3 +280,32 @@ async fn real_s3_small_spill_compares_previous_multipart_at_same_distribution_an
         );
     }
 }
+
+#[tokio::test]
+async fn single_put_payload_keeps_workspace_until_last_sdk_clone_is_dropped() {
+    let upload = Arc::new(crate::api::proxy::persistence::Persistence::default());
+    let workspace = upload
+        .multipart_workspace(crate::api::proxy::persistence::WorkspaceRole::CarrierSpill)
+        .await
+        .unwrap();
+    let original = Bytes::from(vec![b'x'; 4096]);
+    let pointer = original.as_ptr();
+    let payload = Bytes::from_owner(WorkspaceWrite {
+        bytes: original.clone(),
+        _workspace: Some(workspace),
+    });
+    assert_eq!(
+        payload.as_ptr(),
+        pointer,
+        "payload must retain original allocation"
+    );
+    let sdk_clone = payload.clone();
+    drop(payload);
+    assert!(
+        upload.upload_workspace.snapshot().0 > 0,
+        "cancelled caller cannot release an SDK-owned envelope"
+    );
+    drop(sdk_clone);
+    assert_eq!(upload.upload_workspace.snapshot().0, 0);
+    assert_eq!(original, Bytes::from(vec![b'x'; 4096]));
+}
