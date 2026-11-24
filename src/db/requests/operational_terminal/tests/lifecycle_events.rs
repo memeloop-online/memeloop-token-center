@@ -22,6 +22,18 @@ async fn lifecycle_events_contract(fixture: Fixture) {
         .upsert_model_price("operational-model", "USD", Decimal::ONE, Decimal::ONE)
         .await
         .unwrap();
+    let mut cursor_gate = if fixture.database.backend == DatabaseBackend::PostgreSql {
+        let mut tx = fixture.database.begin_write_transaction().await.unwrap();
+        sqlx::query("SELECT pg_advisory_xact_lock($1, $2)")
+            .bind(0x4d54_4345_i32)
+            .bind(1_i32)
+            .execute(&mut *tx)
+            .await
+            .unwrap();
+        Some(tx)
+    } else {
+        None
+    };
     let request_id = Uuid::now_v7();
     let reservation = tokio::time::timeout(
         std::time::Duration::from_secs(5),
@@ -44,6 +56,28 @@ async fn lifecycle_events_contract(fixture: Fixture) {
     .await
     .expect("admission cannot wait for archive permits")
     .unwrap();
+    let pending: i64 = sqlx::query_scalar(
+        "SELECT started_event_pending FROM request_records WHERE id = $1 AND reservation_id = $2",
+    )
+    .bind(request_id.to_string())
+    .bind(reservation.id.to_string())
+    .fetch_one(&fixture.database.pool)
+    .await
+    .unwrap();
+    assert_eq!(
+        pending, 1,
+        "admission commits its durable publication obligation"
+    );
+    let reserved: String =
+        sqlx::query_scalar("SELECT status FROM usage_reservations WHERE id = $1")
+            .bind(reservation.id.to_string())
+            .fetch_one(&fixture.database.pool)
+            .await
+            .unwrap();
+    assert_eq!(reserved, "reserved");
+    if let Some(tx) = cursor_gate.take() {
+        tx.rollback().await.unwrap();
+    }
     // The obligation survives admission; the existing projection worker can
     // advance a long request without waiting for archive or its terminal.
     fixture
