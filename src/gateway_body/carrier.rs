@@ -685,6 +685,7 @@ impl BodyCarrier {
                                 };
                                 let _ = archive;
                                 let reference = reference.clone();
+                                let workspace = workspace.clone();
                                 remote = Some(Box::pin(stream::try_unfold(
                                     (source.clone(), reference, 0u64),
                                     move |(source, reference, offset)| {
