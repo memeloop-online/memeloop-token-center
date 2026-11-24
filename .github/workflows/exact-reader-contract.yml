@@ -721,7 +721,7 @@ jobs:
           grep -F '1 passed; 0 failed' /tmp/terminal-ack-rollback.log
 
   routing-snapshot-contract:
-    if: inputs.contract == 'quota-outage'
+    if: inputs.contract == 'quota-outage' || inputs.contract == 'admission-cancel'
     runs-on: ubuntu-24.04
     timeout-minutes: 30
     services:
@@ -756,4 +756,13 @@ jobs:
           do
             cargo test --locked --lib "db::providers::oauth_catalog::tests::${backend}_refresh_catalog_interleaving_preserves_only_same_identity_evidence" -- --exact --nocapture 2>&1 | tee /tmp/catalog-snapshot.log
             grep -F '1 passed; 0 failed' /tmp/catalog-snapshot.log
+          done
+      - name: Verify bounded stale snapshot admission
+        if: inputs.contract == 'admission-cancel'
+        run: |
+          set -o pipefail
+          for selector in stale_snapshot_refresh_is_request_bounded_and_does_not_restore_revoked_candidates stale_snapshot_refresh_rechecks_revoked_grants stale_snapshot_refresh_does_not_admit_real_quota_exhaustion
+          do
+            cargo test --locked --lib "api::proxy::tests::credential_readiness::$selector" -- --exact --nocapture 2>&1 | tee /tmp/routing-stale-refresh.log
+            grep -F '1 passed; 0 failed' /tmp/routing-stale-refresh.log
           done
