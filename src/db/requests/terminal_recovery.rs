@@ -30,6 +30,10 @@ impl Database {
             CAST(CASE WHEN t.usage_basis='provider_reported' AND t.status_code BETWEEN 200 AND 399
               AND t.error_code='' AND r.status_code=t.status_code AND r.input_tokens=t.input_tokens
               AND r.output_tokens=t.output_tokens AND r.cost_micros=t.cost_micros AND r.usage_basis=t.usage_basis
+              AND r.cached_input_tokens=t.cached_input_tokens AND r.cache_write_tokens=t.cache_write_tokens
+              AND COALESCE(r.cache_known_read_tokens,-1)=COALESCE(t.cache_known_read_tokens,-1)
+              AND COALESCE(r.cache_known_input_tokens,-1)=COALESCE(t.cache_known_input_tokens,-1)
+              AND r.model=t.model AND r.protocol=t.protocol AND r.currency=t.currency
               AND o.status_code=t.status_code AND COALESCE(o.error_code,'')='' AND u.status='settled' AND u.actual_micros=t.cost_micros
               THEN 1 ELSE 0 END AS BIGINT) AS trusted,
             (SELECT COUNT(*) FROM ledger_entries l WHERE l.account_id=t.account_id AND l.key_id=t.key_id AND l.source=t.reservation_id AND l.kind='usage') AS ledger_count,
