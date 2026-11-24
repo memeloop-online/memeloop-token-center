@@ -193,13 +193,20 @@ pub(crate) fn record_capture_failure_target(
     let background = state.clone();
     state.persistence.archives.fetch_add(1, Ordering::Release);
     tokio::spawn(async move {
+        let mut attempt = 0_u32;
         loop {
             match target.publish_failure(&background.archive, identity).await {
                 Ok(()) => break,
                 Err(error) => {
                     tracing::warn!(request_id = %identity.request_id, error_category = error.diagnostic_category(),
                         "raw response capture admission failure awaits durable evidence");
-                    tokio::time::sleep(Duration::from_millis(250)).await;
+                    attempt = attempt.saturating_add(1);
+                    let delay = crate::archive_staging::cleanup_backoff_with_jitter(
+                        identity.request_id,
+                        attempt,
+                    )
+                    .min(30_000);
+                    tokio::time::sleep(Duration::from_millis(delay as u64)).await;
                 }
             }
         }

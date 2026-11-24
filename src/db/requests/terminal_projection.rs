@@ -182,26 +182,31 @@ impl Database {
         timings.enter(ProjectionStage::FactProjection);
         let created_at: i64 = task.try_get("created_at")?;
         let pruned = statistics_pruned_in_transaction(&mut transaction, created_at).await?;
-        sqlx::query(
-            "UPDATE request_stats_facts SET cost_micros = cost_micros WHERE request_id = $1",
-        )
+        // Lock the existing contribution once without issuing a no-op UPDATE
+        // (which would also run history capture triggers). Preserve the exact
+        // unknown-placeholder replacement predicate while checking existence.
+        let fact_lock = match self.backend {
+            DatabaseBackend::PostgreSql => " FOR UPDATE OF f",
+            DatabaseBackend::Sqlite => "",
+        };
+        let existing_fact = sqlx::query(sqlx::AssertSqlSafe(format!(
+            "SELECT CAST(CASE WHEN f.input_tokens = 0 AND f.output_tokens = 0 AND f.cached_input_tokens = 0 AND f.cache_write_tokens = 0 AND f.cost_micros = 0 AND EXISTS (SELECT 1 FROM pending_proxy_settlements p WHERE p.request_id = f.request_id AND p.tenant_id = f.tenant_id AND p.key_id = f.key_id AND p.unknown_reason IS NOT NULL) THEN 1 ELSE 0 END AS BIGINT) AS replaceable FROM request_stats_facts f WHERE f.request_id = $1{fact_lock}"
+        )))
         .bind(&request_id)
-        .execute(&mut *transaction)
+        .fetch_optional(&mut *transaction)
         .await?;
-        let previous = sqlx::query("SELECT f.tenant_id, f.key_id, f.currency, f.session_id FROM request_stats_facts f JOIN pending_proxy_settlements p ON p.request_id = f.request_id AND p.tenant_id = f.tenant_id AND p.key_id = f.key_id WHERE f.request_id = $1 AND p.unknown_reason IS NOT NULL AND f.input_tokens = 0 AND f.output_tokens = 0 AND f.cached_input_tokens = 0 AND f.cache_write_tokens = 0 AND f.cost_micros = 0")
-            .bind(&request_id).fetch_optional(&mut *transaction).await?;
-        let fact_exists: i64 =
-            sqlx::query_scalar("SELECT COUNT(*) FROM request_stats_facts WHERE request_id = $1")
-                .bind(&request_id)
-                .fetch_one(&mut *transaction)
-                .await?;
-        if fact_exists != i64::from(previous.is_some()) {
+        let replacing_unknown = existing_fact
+            .as_ref()
+            .map(|row| row.try_get::<i64, _>("replaceable"))
+            .transpose()?
+            == Some(1);
+        if existing_fact.is_some() && !replacing_unknown {
             return Err(AppError::Conflict(
                 "unacknowledged terminal projection already has a fact".into(),
             ));
         }
         if !pruned {
-            if previous.is_some() {
+            if replacing_unknown {
                 super::metered_projection::project_metered_request_fact_in_transaction(
                     &mut transaction,
                     &request_id,

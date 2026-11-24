@@ -100,26 +100,21 @@ impl Stream for CapturedUpstream {
             };
             match upstream.as_mut().poll_next(cx) {
                 Poll::Ready(Some(Ok(bytes))) => {
-                    let writer = this.capture.take();
-                    let admission = this.admission.take();
-                    if writer.is_none() && admission.is_none() {
-                        return Poll::Ready(Some(Ok(bytes)));
+                    if this.capture.is_none() {
+                        if let Some(mut admission) = this.admission.take() {
+                            if let Poll::Ready(writer) = admission.as_mut().poll(cx) {
+                                this.capture = writer;
+                            }
+                            // Pending admission cannot own client delivery.
+                            // Dropping it invokes the existing failure fence.
+                        }
                     }
-                    // The bounded queue applies backpressure to this one
-                    // upstream chunk. A fast or large response must never
-                    // turn into a missing archive merely because the upload
-                    // queue temporarily filled.
-                    this.pending = Some(Box::pin(async move {
-                        let writer = match admission {
-                            Some(admission) => admission.await,
-                            None => writer,
-                        };
-                        let Some(mut writer) = writer else {
-                            return (None, Some(bytes));
-                        };
-                        let retained = writer.append_with_backpressure(bytes.clone()).await;
-                        (retained.then_some(writer), Some(bytes))
-                    }));
+                    if let Some(writer) = this.capture.as_mut() {
+                        if !writer.try_offer(bytes.clone()) {
+                            this.capture.take();
+                        }
+                    }
+                    return Poll::Ready(Some(Ok(bytes)));
                 }
                 Poll::Ready(Some(Err(error))) => {
                     this.upstream.take();
@@ -132,17 +127,10 @@ impl Stream for CapturedUpstream {
                     if let Some(writer) = this.capture.take() {
                         drop(writer.seal());
                     }
-                    if let Some(admission) = this.admission.take() {
-                        // A genuinely empty supplier body still has an exact
-                        // immutable original, acquired without holding a large
-                        // upload envelope during header-only silence.
-                        this.pending = Some(Box::pin(async move {
-                            if let Some(writer) = admission.await {
-                                drop(writer.seal());
-                            }
-                            (None, None)
-                        }));
-                        continue;
+                    if let Some(mut admission) = this.admission.take() {
+                        if let Poll::Ready(Some(writer)) = admission.as_mut().poll(cx) {
+                            drop(writer.seal());
+                        }
                     }
                     return Poll::Ready(None);
                 }
@@ -629,7 +617,36 @@ impl From<reqwest::Response> for UpstreamResponse {
 
 #[cfg(test)]
 mod tests {
+    mod archive_tap;
     use super::*;
+
+    #[tokio::test]
+    async fn pending_archive_admission_never_blocks_original_chunks_or_empty_eof() {
+        for chunks in [
+            vec![],
+            vec![
+                Bytes::from_static(b"data: one\n\n"),
+                Bytes::from_static(b"data: [DONE]\n\n"),
+            ],
+        ] {
+            let expected = chunks.clone();
+            let mut captured = CapturedUpstream {
+                upstream: Some(Box::pin(stream::iter(chunks.into_iter().map(Ok)))),
+                capture: None,
+                admission: Some(Box::pin(std::future::pending())),
+                pending: None,
+            };
+            let mut actual = Vec::new();
+            while let Some(chunk) =
+                tokio::time::timeout(std::time::Duration::from_secs(1), captured.next())
+                    .await
+                    .unwrap()
+            {
+                actual.push(chunk.unwrap());
+            }
+            assert_eq!(actual, expected);
+        }
+    }
 
     #[test]
     fn upstream_headers_cannot_assert_validated_compact_provenance() {

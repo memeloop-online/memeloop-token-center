@@ -129,6 +129,17 @@ impl ProxyMemoryBudget {
         }
         Ok(reservation)
     }
+    pub(crate) fn try_reserve_carrier_retained(
+        &self,
+        bytes: usize,
+    ) -> Option<OwnedSemaphorePermit> {
+        let units = u32::try_from(bytes.div_ceil(UNIT_BYTES)).ok()?;
+        self.retained_requests
+            .clone()
+            .try_acquire_many_owned(units)
+            .ok()
+    }
+
     pub(crate) fn try_reserve_carrier_ingress(
         &self,
         bytes: usize,

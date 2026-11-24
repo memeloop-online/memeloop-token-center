@@ -286,6 +286,19 @@ impl BodyCarrier {
         S: Stream<Item = Result<Bytes, E>> + Send,
         E: Display,
     {
+        Self::capture_owned(input.map(|chunk| chunk.map(|bytes| (bytes, None))), capture).await
+    }
+
+    /// Adopt archival ingress credit with its allocation; never release and
+    /// reacquire the same budget between the ordered tap and the carrier.
+    pub(crate) async fn capture_owned<S, E>(
+        input: S,
+        capture: CarrierCapture,
+    ) -> Result<Arc<Self>, AppError>
+    where
+        S: Stream<Item = Result<(Bytes, Option<OwnedSemaphorePermit>), E>> + Send,
+        E: Display,
+    {
         let parent = capture.parent;
         let staging = match &capture.archive {
             Some(archive) => archive.select_staging_key(capture.staging)?,
@@ -310,7 +323,7 @@ impl BodyCarrier {
         let mut hash = blake3::Hasher::new();
         futures_util::pin_mut!(input);
         while let Some(chunk) = input.next().await {
-            let chunk = chunk.map_err(|_| AppError::storage("carrier_input_failed"))?;
+            let (chunk, credit) = chunk.map_err(|_| AppError::storage("carrier_input_failed"))?;
             if chunk.is_empty() {
                 continue;
             }
@@ -319,6 +332,17 @@ impl BodyCarrier {
                 .checked_add(chunk.len() as u64)
                 .ok_or_else(|| AppError::storage("carrier_length_overflow"))?;
             hash.update(&chunk);
+            if let Some(credit) = credit {
+                let retained = source.memory.try_reserve_carrier_retained(chunk.len());
+                if retained.is_none() {
+                    // This is an incomplete tap, not a sealed sole original.
+                    // Failed spill must fail capture rather than pin delivery.
+                    source.offload_one().await?;
+                }
+                let bytes = source.leased_bytes(chunk, credit, retained);
+                source.segments.push(Mutex::new(Segment::Ram(bytes)));
+                continue;
+            }
             let mut remaining = chunk;
             while !remaining.is_empty() {
                 // Bounded owned allocations prevent a small slice from pinning

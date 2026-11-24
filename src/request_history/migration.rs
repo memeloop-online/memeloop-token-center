@@ -62,6 +62,8 @@ pub enum HistoryCommand {
     },
     /// Queue one source page; delivery remains with the asynchronous exporter.
     BackfillPage {
+        #[arg(long, value_enum)]
+        source: Option<super::HistorySource>,
         #[arg(long, default_value_t = 64, value_parser = clap::value_parser!(i64).range(1..=64))]
         page_size: i64,
     },
@@ -104,10 +106,13 @@ pub async fn command(config: &Config, command: HistoryCommand) -> Result<Value, 
         HistoryCommand::UpgradeUpstreamCapture => {
             return database.history_upgrade_upstream_capture().await;
         }
-        HistoryCommand::BackfillPage { page_size } => {
-            let queued = database.history_backfill_page(*page_size).await?;
+        HistoryCommand::BackfillPage { page_size, source } => {
+            let queued = database
+                .history_backfill_source_page(*page_size, *source)
+                .await?;
             return Ok(json!({
                 "queued": queued,
+                "source": source.map(super::HistorySource::as_str),
                 "backfill_done": database.history_backfill_done().await?,
             }));
         }

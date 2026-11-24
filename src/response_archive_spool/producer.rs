@@ -494,6 +494,7 @@ struct CapturedResponse {
 
 struct CaptureChunk {
     bytes: Bytes,
+    credit: Option<tokio::sync::OwnedSemaphorePermit>,
     acknowledged: tokio::sync::oneshot::Sender<()>,
     #[cfg(test)]
     pause: Option<(
@@ -512,7 +513,8 @@ struct CaptureReceipt {
 }
 
 struct CarrierCaptureInput {
-    source: Option<tokio::sync::mpsc::Sender<CaptureChunk>>,
+    budget: Arc<crate::gateway_body::memory::ProxyMemoryBudget>,
+    source: Option<tokio::sync::mpsc::UnboundedSender<CaptureChunk>>,
     progress: tokio::sync::watch::Sender<(u64, bool)>,
     length: u64,
     #[cfg(test)]
@@ -534,11 +536,11 @@ impl CarrierCaptureInput {
                 .ok_or_else(|| std::io::Error::other("capture closed"))?
                 .send(CaptureChunk {
                     bytes: bytes.slice(offset..end),
+                    credit: None,
                     acknowledged,
                     #[cfg(test)]
                     pause: self.write_pause.take(),
                 })
-                .await
                 .map_err(|_| std::io::Error::other("capture closed"))?;
             // The receiver acknowledges only when capture has taken ownership
             // of the previous chunk, rather than merely queueing its bytes.
@@ -553,8 +555,10 @@ impl CarrierCaptureInput {
 }
 
 fn carrier_capture_stream(
-    receiver: tokio::sync::mpsc::Receiver<CaptureChunk>,
-) -> impl futures_util::Stream<Item = Result<Bytes, AppError>> + Send {
+    receiver: tokio::sync::mpsc::UnboundedReceiver<CaptureChunk>,
+) -> impl futures_util::Stream<
+    Item = Result<(Bytes, Option<tokio::sync::OwnedSemaphorePermit>), AppError>,
+> + Send {
     futures_util::stream::unfold(
         (receiver, None::<CaptureReceipt>),
         |(mut receiver, previous)| async move {
@@ -568,7 +572,7 @@ fn carrier_capture_stream(
             }
             let chunk = receiver.recv().await?;
             Some((
-                Ok(chunk.bytes),
+                Ok((chunk.bytes, chunk.credit)),
                 (
                     receiver,
                     Some(CaptureReceipt {
@@ -601,7 +605,7 @@ impl Drop for CaptureQueueMemory {
     }
 }
 
-async fn fence_failed_capture(
+pub(super) async fn fence_failed_capture(
     state: &AppState,
     identity: ArchiveSpoolIdentity,
     target: CaptureTarget,
@@ -610,6 +614,9 @@ async fn fence_failed_capture(
     super::fence_probe::observe(state).await;
     let result = target.publish_failure(&state.archive, identity).await;
     if let Err(error) = &result {
+        // Keep only the failure fact when object storage cannot acknowledge it.
+        // The existing background owner retries it; incomplete bytes never seal.
+        crate::api::proxy::persistence::record_capture_failure_target(state, identity, target);
         tracing::warn!(
             request_id = %identity.request_id,
             stage = "response_spool_failed_ack_fence",
@@ -779,7 +786,7 @@ impl ResponseArchiveProducer {
             reservation: memory,
             _archive_permit: archive_permit,
         });
-        let (source, source_receiver) = tokio::sync::mpsc::channel(1);
+        let (source, source_receiver) = tokio::sync::mpsc::unbounded_channel();
         let (progress, progress_receiver) = tokio::sync::watch::channel((0_u64, false));
         let active = Arc::new(AtomicBool::new(true));
         let writer_active = active.clone();
@@ -802,12 +809,16 @@ impl ResponseArchiveProducer {
                     )?,
                 )?;
                 let capture = crate::gateway_body::carrier::CarrierCapture::new(
-                    capture_state.proxy_memory_budget.clone(),
+                    capture_state
+                        .persistence
+                        .stream_memory
+                        .reservation()
+                        .shared_budget(),
                     Some(capture_state.archive.clone()),
                     key,
                 );
                 tokio::select! {
-                    result = crate::gateway_body::carrier::BodyCarrier::capture(carrier_capture_stream(source_receiver), capture) => result.map(|source| CapturedResponse { source, staging: key }),
+                    result = crate::gateway_body::carrier::BodyCarrier::capture_owned(carrier_capture_stream(source_receiver), capture) => result.map(|source| CapturedResponse { source, staging: key }),
                     () = capture_abandoned(capture_progress, capture_active) => Err(AppError::internal("response_capture_cancelled")),
                 }
             },
@@ -857,6 +868,11 @@ impl ResponseArchiveProducer {
             #[cfg(test)]
             state: state.clone(),
             capture: CarrierCaptureInput {
+                budget: state
+                    .persistence
+                    .stream_memory
+                    .reservation()
+                    .shared_budget(),
                 source: Some(source),
                 progress,
                 length: 0,
@@ -896,6 +912,41 @@ impl ResponseArchiveProducer {
             self.abandon("carrier_capture_unavailable");
             false
         }
+    }
+
+    /// Nonblocking archival offer. Failure fences this incomplete capture;
+    /// accepted chunks remain ordered in the existing single carrier queue.
+    pub(crate) fn try_offer(&mut self, bytes: Bytes) -> bool {
+        if bytes.is_empty() {
+            return self.active.load(Ordering::Acquire);
+        }
+        let Some(credit) = self.capture.budget.try_reserve_ingress_bytes(bytes.len()) else {
+            self.abandon("capture_byte_budget_unavailable");
+            return false;
+        };
+        let (acknowledged, _completion) = tokio::sync::oneshot::channel();
+        let length = bytes.len() as u64;
+        let chunk = CaptureChunk {
+            bytes,
+            credit: Some(credit),
+            acknowledged,
+            #[cfg(test)]
+            pause: self.capture.write_pause.take(),
+        };
+        let accepted = self
+            .capture
+            .source
+            .as_ref()
+            .is_some_and(|source| source.send(chunk).is_ok());
+        if !accepted {
+            self.abandon("capture_queue_unavailable");
+            return false;
+        }
+        self.capture.length = self.capture.length.saturating_add(length);
+        self.capture
+            .progress
+            .send_replace((self.capture.length, false));
+        true
     }
 
     fn abandon(&mut self, reason: &'static str) {
@@ -1235,35 +1286,7 @@ async fn run_response_archive_writer(
 ) -> Result<WriterOutcome, AppError> {
     // Upload concurrency and multipart memory belong to this background task,
     // never to admission of the supplier/client stream. Shared carrier capture
-    // runs independently; the handoff channel holds one acknowledged chunk.
-    let _upload_memory = if memory._archive_permit.is_none() {
-        let permits = state.proxy_archive_stream_permits.clone();
-        let permit = tokio::select! {
-            permit = permits.acquire_owned() => permit
-                .map_err(|_| AppError::internal("capture_upload_admission_closed"))?,
-            () = capture_abandoned(progress.clone(), active.clone()) =>
-                return Ok(writer_interrupted(identity, "abandoned_before_upload")),
-        };
-        let reservation = tokio::select! {
-            reservation = state.persistence.stream_memory.temporary_wait(
-                super::CAPTURE_MEMORY_BYTES,
-                crate::gateway_body::memory::CAPTURE_MEMORY_WEIGHT,
-            ) => reservation.ok_or_else(|| AppError::internal("capture_upload_memory_closed"))?,
-            () = capture_abandoned(progress.clone(), active.clone()) =>
-                return Ok(writer_interrupted(identity, "abandoned_before_upload_memory")),
-        };
-        Some(CaptureQueueMemory {
-            _local_metrics: None,
-            _archive_permit: Some(permit),
-            reservation: Some(reservation),
-        })
-    } else {
-        None
-    };
-    let _upload_metrics = state.metrics.memory_usage(
-        crate::metrics::MemoryComponent::StreamCapture,
-        super::CAPTURE_MEMORY_BYTES,
-    );
+    // runs independently; ordered ingress is bounded by archival byte credit.
     #[cfg(test)]
     pause_begin_for_test(&state).await;
     #[cfg(test)]
@@ -1277,7 +1300,43 @@ async fn run_response_archive_writer(
     let publication_started = std::time::Instant::now();
     let mut publication_attempt = 0_u64;
     let (staged, staging_owner) = loop {
-        match stage_captured_response(&state, &source, captured.staging).await {
+        let staged_attempt = async {
+            let _upload_memory = if memory._archive_permit.is_none() {
+                let permits = state.proxy_archive_stream_permits.clone();
+                let permit = permits
+                    .acquire_owned()
+                    .await
+                    .map_err(|_| AppError::internal("capture_upload_admission_closed"))?;
+                let reservation = match state.persistence.stream_memory.temporary(
+                    super::CAPTURE_MEMORY_BYTES
+                        * crate::gateway_body::memory::CAPTURE_MEMORY_WEIGHT,
+                ) {
+                    Ok(reservation) => reservation,
+                    Err(_) => {
+                        // Complete source bytes already have an owner. Release
+                        // this attempt's slot, then offload that source to make
+                        // workspace available; never wait behind its own credit.
+                        drop(permit);
+                        source.seal_to_objects().await?;
+                        return Err(AppError::storage("capture_upload_workspace_unavailable"));
+                    }
+                };
+                Some(CaptureQueueMemory {
+                    _local_metrics: None,
+                    _archive_permit: Some(permit),
+                    reservation: Some(reservation),
+                })
+            } else {
+                None
+            };
+            let _upload_metrics = state.metrics.memory_usage(
+                crate::metrics::MemoryComponent::StreamCapture,
+                super::CAPTURE_MEMORY_BYTES,
+            );
+            stage_captured_response(&state, &source, captured.staging).await
+        }
+        .await;
+        match staged_attempt {
             Ok(staged) => break staged,
             Err(error @ AppError::Storage { .. }) => {
                 publication_attempt = publication_attempt.saturating_add(1);
