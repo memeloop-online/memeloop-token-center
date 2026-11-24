@@ -721,7 +721,7 @@ jobs:
           grep -F '1 passed; 0 failed' /tmp/terminal-ack-rollback.log
 
   routing-snapshot-contract:
-    if: inputs.contract == 'routing-snapshot'
+    if: inputs.contract == 'quota-outage'
     runs-on: ubuntu-24.04
     timeout-minutes: 30
     services:
