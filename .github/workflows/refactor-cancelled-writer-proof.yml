@@ -1,0 +1,50 @@
+name: MTC final cancelled writer exact proof
+on:
+  push:
+    branches: [ci/mtc-refactor-proof-1041]
+    paths: [.github/workflows/refactor-cancelled-writer-proof.yml]
+permissions:
+  contents: read
+jobs:
+  isolated:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 65
+    env:
+      CARGO_BUILD_JOBS: "2"
+      CARGO_INCREMENTAL: "0"
+      CARGO_PROFILE_TEST_DEBUG: "0"
+      CARGO_PROFILE_DEV_DEBUG: "0"
+      MTC_TEST_POSTGRES_URL: postgres://token_center:token_center@127.0.0.1:5432/memeloop_token_center_test
+    services:
+      postgres:
+        image: postgres:16-alpine
+        env:
+          POSTGRES_DB: memeloop_token_center_test
+          POSTGRES_USER: token_center
+          POSTGRES_PASSWORD: token_center
+        ports: ["5432:5432"]
+        options: --health-cmd pg_isready --health-interval 5s --health-timeout 3s --health-retries 20
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+        with:
+          ref: 3947db8b7a9d63fc8ad74759e908593fa468d5c2
+          persist-credentials: false
+      - name: Verify exact product revision
+        run: |
+          actual_sha="$(git rev-parse HEAD)"
+          echo "Product checkout: $actual_sha"
+          test "$actual_sha" = "3947db8b7a9d63fc8ad74759e908593fa468d5c2"
+      - uses: ./.github/actions/checkout-plugin-examples
+      - uses: dtolnay/rust-toolchain@4360b52568e2003a75bf9bc1d59f33a8e3fc893c
+        with:
+          toolchain: 1.95.0
+          targets: wasm32-unknown-unknown
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6
+      - name: Build Rust library test binary
+        run: cargo test --locked --all-features --lib --no-run
+      - name: Run the exact cancelled writer regression under the original time cap
+        run: |
+          set -euo pipefail
+          test_name=response_archive_spool::tests::cancelled_writer_returns_success_only_when_its_single_fence_succeeds
+          timeout --kill-after=15s 120s cargo test --locked --all-features --lib "$test_name" -- --exact --nocapture | tee cancelled-writer.log
+          grep -E '^test result: ok\. 1 passed;' cancelled-writer.log
