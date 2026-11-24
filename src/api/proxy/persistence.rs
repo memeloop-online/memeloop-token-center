@@ -10,6 +10,7 @@ const BYTES: usize = 4 * 1024 * 1024 * 1024;
 
 pub(crate) struct Persistence {
     pub(crate) stream_memory: crate::gateway_body::memory::ProxyMemoryBudget,
+    pub(crate) upload_workspace: crate::gateway_body::memory::ProxyMemoryBudget,
     jobs: Arc<tokio::sync::Semaphore>,
     bytes: Arc<tokio::sync::Semaphore>,
     accepted: AtomicU64,
@@ -33,7 +34,10 @@ impl Default for Persistence {
     fn default() -> Self {
         Self {
             stream_memory: crate::gateway_body::memory::ProxyMemoryBudget::new(
-                crate::response_archive_spool::RAW_STREAM_MEMORY_BYTES as u64,
+                crate::response_archive_spool::RAW_SOURCE_MEMORY_BYTES as u64,
+            ),
+            upload_workspace: crate::gateway_body::memory::ProxyMemoryBudget::new(
+                crate::response_archive_spool::RAW_UPLOAD_WORKSPACE_BYTES as u64,
             ),
             jobs: Arc::new(tokio::sync::Semaphore::new(JOBS)),
             bytes: Arc::new(tokio::sync::Semaphore::new(BYTES)),
@@ -173,6 +177,8 @@ impl Persistence {
             "# TYPE memeloop_token_center_deferred_stream_memory_bytes gauge\nmemeloop_token_center_deferred_stream_memory_bytes {}\n# TYPE memeloop_token_center_deferred_stream_memory_limit_bytes gauge\nmemeloop_token_center_deferred_stream_memory_limit_bytes {}\n",
             stream_used, stream_limit,
         ));
+        let (workspace_used, workspace_limit, _, _) = self.upload_workspace.snapshot();
+        output.push_str(&format!("# TYPE memeloop_token_center_archive_workspace_memory_bytes gauge\nmemeloop_token_center_archive_workspace_memory_bytes {}\n# TYPE memeloop_token_center_archive_workspace_memory_limit_bytes gauge\nmemeloop_token_center_archive_workspace_memory_limit_bytes {}\n", workspace_used, workspace_limit));
         output
     }
 }

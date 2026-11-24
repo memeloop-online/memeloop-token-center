@@ -25,6 +25,7 @@ pub struct ArchiveWriter {
     pub(super) size_bytes: u64,
     pub(super) compressed: bool,
     pub(super) compressed_pending: BytesMut,
+    pub(super) workspace: Option<Arc<dyn Send + Sync>>,
 }
 
 #[derive(Clone, Debug, serde::Deserialize, serde::Serialize)]
@@ -61,6 +62,7 @@ impl ArchiveStore {
             size_bytes: 0,
             compressed: false,
             compressed_pending: BytesMut::new(),
+            workspace: None,
         })
     }
 
@@ -84,6 +86,10 @@ impl ArchiveStore {
 }
 
 impl ArchiveWriter {
+    pub(crate) fn retain_workspace(&mut self, workspace: Arc<dyn Send + Sync>) {
+        self.workspace = Some(workspace);
+    }
+
     pub async fn write(&mut self, mut bytes: Bytes) -> Result<(), AppError> {
         let next_size = self
             .size_bytes
@@ -240,6 +246,7 @@ impl Drop for ArchiveWriter {
         let Some(inner) = self.inner.take() else {
             return;
         };
+        let workspace = self.workspace.take();
         match tokio::runtime::Handle::try_current() {
             Ok(runtime) => {
                 // Drop cannot await network I/O. Detach a best-effort abort on
@@ -247,6 +254,7 @@ impl Drop for ArchiveWriter {
                 // reclamation (bucket lifecycle or global stale cleanup)
                 // remains mandatory for process crashes and runtime shutdown.
                 drop(runtime.spawn(async move {
+                    let _workspace = workspace;
                     if inner.abort().await.is_err() {
                         tracing::error!("failed to abort dropped archive multipart upload");
                     }

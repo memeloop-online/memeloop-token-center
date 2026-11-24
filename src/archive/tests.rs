@@ -70,6 +70,7 @@ fn test_writer(aborts: Arc<AtomicUsize>, fail_parts: bool) -> ArchiveWriter {
         size_bytes: 0,
         compressed: false,
         compressed_pending: bytes::BytesMut::new(),
+        workspace: None,
     }
 }
 
