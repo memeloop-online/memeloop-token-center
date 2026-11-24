@@ -27,3 +27,36 @@ where
     }
     Ok(Bytes::from(body))
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn collect_bounded_distinguishes_limit_and_transport() {
+        use MediaBodyReadError::{TooLarge, Transport};
+
+        for (chunks, expected) in [
+            (vec![], Ok(Bytes::new())),
+            (
+                vec![Ok(b"ab".as_slice()), Ok(b"cd".as_slice())],
+                Ok(Bytes::from_static(b"abcd")),
+            ),
+            (
+                vec![Ok(b"ab".as_slice()), Ok(b"cde".as_slice())],
+                Err(TooLarge),
+            ),
+            (
+                vec![Ok(b"ab".as_slice()), Err(()), Ok(b"cd".as_slice())],
+                Err(Transport),
+            ),
+        ] {
+            let stream = futures_util::stream::iter(
+                chunks
+                    .into_iter()
+                    .map(|chunk| chunk.map(Bytes::from_static)),
+            );
+            assert_eq!(collect_bounded(stream, 4).await, expected);
+        }
+    }
+}
