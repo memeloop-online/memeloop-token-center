@@ -324,3 +324,43 @@ async fn pending_fast_terminal_contract(fixture: Fixture) {
     fixture.assert_unsettled().await;
     fixture.close().await;
 }
+
+#[tokio::test]
+async fn postgres_started_preparation_wait_never_holds_global_cursor() {
+    let Some(fixture) = Fixture::postgres().await else {
+        return;
+    };
+    let id = fixture.claim.request_id.to_string();
+    sqlx::query("UPDATE request_records SET started_event_pending = 1 WHERE id = $1")
+        .bind(&id)
+        .execute(&fixture.database.pool)
+        .await
+        .unwrap();
+    let mut history_gate = fixture.database.begin_write_transaction().await.unwrap();
+    sqlx::query("SELECT mode FROM request_history_state WHERE id = 1 FOR UPDATE")
+        .execute(&mut *history_gate)
+        .await
+        .unwrap();
+    let worker_db = fixture.database.clone();
+    let worker =
+        tokio::spawn(async move { worker_db.publish_pending_proxy_started_events().await });
+    tokio::time::timeout(std::time::Duration::from_secs(5), async {
+        loop {
+            let waiting: bool = sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM pg_stat_activity WHERE datname = current_database() AND wait_event_type = 'Lock' AND query LIKE 'SELECT mode FROM request_history_state%FOR SHARE%')")
+                .fetch_one(&fixture.database.pool).await.unwrap();
+            if waiting { break; }
+            tokio::task::yield_now().await;
+        }
+    }).await.expect("worker reaches real history preparation lock");
+    let mut unrelated = fixture.database.begin_write_transaction().await.unwrap();
+    assert!(
+        crate::db::requests::lifecycle::try_request_event_cursor(&mut unrelated)
+            .await
+            .unwrap(),
+        "a history-blocked preparer cannot own the global cursor"
+    );
+    unrelated.rollback().await.unwrap();
+    history_gate.rollback().await.unwrap();
+    worker.await.unwrap().unwrap();
+    fixture.close().await;
+}

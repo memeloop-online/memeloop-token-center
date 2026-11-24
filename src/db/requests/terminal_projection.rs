@@ -74,17 +74,20 @@ impl Database {
                 if locked.is_none() {
                     continue;
                 }
-                let cursor_available: bool =
-                    sqlx::query_scalar("SELECT pg_try_advisory_xact_lock($1, $2)")
-                        .bind(0x4d54_4345_i32)
-                        .bind(1_i32)
-                        .fetch_one(&mut *transaction)
-                        .await?;
-                if !cursor_available {
-                    continue;
-                }
             }
-            super::lifecycle::publish_pending_started_in_transaction(&mut transaction, &id).await?;
+            let prepared =
+                super::lifecycle::prepare_pending_started_in_transaction(&mut transaction, &id)
+                    .await?;
+            if !super::lifecycle::try_request_event_cursor(&mut transaction).await? {
+                transaction.rollback().await?;
+                continue;
+            }
+            crate::db::history_immutable_outbox::PreparedEventCapture::publish(
+                &mut transaction,
+                prepared,
+                unix_millis(),
+            )
+            .await?;
             transaction.commit().await?;
         }
         Ok(())
@@ -292,7 +295,7 @@ impl Database {
             &request_id,
         )
         .await?;
-        super::lifecycle::publish_pending_started_in_transaction(&mut transaction, &request_id).await?;
+        let pending_started = super::lifecycle::prepare_pending_started_in_transaction(&mut transaction, &request_id).await?;
         timings.enter(ProjectionStage::EventPrepare);
         let draft_cursor = crate::db::RequestEventCursor {
             event_id: Uuid::nil().to_string(),
@@ -315,6 +318,7 @@ impl Database {
             None => None,
         };
         timings.enter(ProjectionStage::EventPublish);
+        crate::db::history_immutable_outbox::PreparedEventCapture::publish(&mut transaction, pending_started, now).await?;
         crate::db::history_immutable_outbox::PreparedEventCapture::publish(
             &mut transaction,
             prepared,

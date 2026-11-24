@@ -38,4 +38,3 @@ jobs:
           cargo test --locked --all-features --lib db::requests::operational_terminal::tests -- --nocapture --test-threads=1
           cargo test --locked --all-features --lib forwarding_admission_snapshot_commits_and_failures_roll_back_for_both_modes -- --nocapture
           cargo test --locked --all-features --lib postgres_request_admission_lost_commit_ack_never_dispatches_and_orphan_settles_once -- --nocapture
-
