@@ -58,8 +58,9 @@ async fn slow_or_failed_dual_object_stores_do_not_own_customer_eof() {
                 // Deliberately small byte budgets exercise spill and truthful overflow.
                 // Queue credit is archival; carrier memory remains separately accounted.
                 state.proxy_memory_budget = Arc::new(ProxyMemoryBudget::new(64 * 1024));
-                Arc::get_mut(&mut state.persistence).unwrap().stream_memory =
-                    ProxyMemoryBudget::new(256 * 1024);
+                let mut persistence = crate::api::proxy::persistence::Persistence::default();
+                persistence.stream_memory = ProxyMemoryBudget::new(256 * 1024);
+                state.persistence = Arc::new(persistence);
                 let (probe, fenced, release_fence) =
                     crate::response_archive_spool::fence_probe::install(&state);
                 let selected = if training {
