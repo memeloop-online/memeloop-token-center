@@ -10,7 +10,7 @@ use std::collections::BTreeMap;
 pub(super) struct BaselineParity {
     requests: u64,
     events: u64,
-    credentials: BTreeMap<(Uuid, Uuid), u64>,
+    credentials: BTreeMap<(Uuid, Uuid), Vec<[u8; 32]>>,
     daily:
         BTreeMap<crate::request_history::migration::DailyKey, crate::request_history::DailyBucket>,
     statistics: StatisticsAccumulator,
@@ -26,10 +26,10 @@ impl BaselineParity {
                 continue;
             }
             self.requests += 1;
-            *self
-                .credentials
+            self.credentials
                 .entry((row.identity.tenant_id, row.identity.key_id))
-                .or_default() += 1;
+                .or_default()
+                .push(scope_fingerprint(row)?);
             crate::request_history::migration::add_daily(&mut self.daily, &row.row()?)?;
             self.statistics.accumulate(row)?;
         }
@@ -87,26 +87,33 @@ impl BaselineParity {
         if events != self.events {
             return Err(HistoryError::Verification("baseline event inventory"));
         }
-        for ((tenant_id, key_id), expected) in self.credentials {
+        for ((tenant_id, key_id), mut expected) in self.credentials {
             let mut scoped = HistoryQuery {
                 scope: HistoryScope::Key { tenant_id, key_id },
                 ..query.clone()
             };
-            let mut count = 0;
+            let mut actual = Vec::with_capacity(expected.len());
             loop {
                 let mut rows = client.snapshots(&scoped).await?;
                 rows.truncate(scoped.limit);
                 if rows.is_empty() {
                     break;
                 }
-                count += rows.len() as u64;
+                for row in &rows {
+                    if row.identity.tenant_id != tenant_id || row.identity.key_id != key_id {
+                        return Err(HistoryError::Verification("baseline credential membership"));
+                    }
+                    actual.push(scope_fingerprint(row)?);
+                }
                 let last = rows.last().ok_or(HistoryError::Mismatch)?;
                 scoped.cursor = Some(HistoryCursor {
                     before_created_at: last.identity.created_at,
                     before_id: last.identity.request_id,
                 });
             }
-            if count != expected {
+            expected.sort_unstable();
+            actual.sort_unstable();
+            if actual != expected {
                 return Err(HistoryError::Verification("baseline credential scope"));
             }
             if client
@@ -194,5 +201,87 @@ impl BaselineParity {
             return Err(HistoryError::Verification("baseline statistics"));
         }
         Ok(())
+    }
+}
+
+fn scope_fingerprint(snapshot: &HistorySnapshot) -> Result<[u8; 32], HistoryError> {
+    use sha2::Digest;
+    Ok(sha2::Sha256::digest(serde_json::to_vec(&serde_json::to_value(snapshot)?)?).into())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::sync::{
+        Arc,
+        atomic::{AtomicUsize, Ordering},
+    };
+    #[tokio::test]
+    async fn baseline_scope_parity_rejects_equal_count_swapped_key_payload() {
+        let expected = HistorySnapshot {
+            identity: HistoryIdentity {
+                tenant_id: Uuid::now_v7(),
+                key_id: Uuid::now_v7(),
+                request_id: Uuid::now_v7(),
+                source: "native".into(),
+                created_at: 1,
+            },
+            revision: 1,
+            filter_cost_micros: None,
+            payload: Some(serde_json::json!({"model":"fixture","protocol":"openai"})),
+            statistics: None,
+            read_model: Value::Null,
+        };
+        let mut wrong = expected.clone();
+        wrong.identity.key_id = Uuid::now_v7();
+        let response=serde_json::json!({"snapshot":serde_json::to_string(&wrong).unwrap(),"snapshot_hash":crate::request_history::canonical_hash(&wrong).unwrap()}).to_string()+"\n";
+        let calls = Arc::new(AtomicUsize::new(0));
+        let seen = calls.clone();
+        let router = axum::Router::new().route(
+            "/",
+            axum::routing::post(move || {
+                let seen = seen.clone();
+                let response = response.clone();
+                async move {
+                    if matches!(seen.fetch_add(1, Ordering::SeqCst), 1 | 2) {
+                        String::new()
+                    } else {
+                        response
+                    }
+                }
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let endpoint = format!("http://{}", listener.local_addr().unwrap());
+        let server = tokio::spawn(async move {
+            axum::serve(listener, router).await.unwrap();
+        });
+        let root = tempfile::tempdir().unwrap();
+        let db = Database::connect(&format!(
+            "sqlite://{}?mode=rwc",
+            root.path().join("scope.db").display()
+        ))
+        .await
+        .unwrap();
+        let mut tx = db.pool.begin().await.unwrap();
+        let client = ClickHouse::new(
+            db.http_clients
+                .handle(crate::http_settings::HttpPurpose::General),
+            &endpoint,
+            "default".into(),
+            "default".into(),
+            String::new(),
+        )
+        .unwrap();
+        let mut parity = BaselineParity::default();
+        parity.accumulate(&[expected]).unwrap();
+        assert!(parity.verify(&db, &mut tx, &client).await.is_err());
+        assert_eq!(
+            calls.load(Ordering::SeqCst),
+            4,
+            "equal global count must still reach and reject the scoped wrong-key result"
+        );
+        tx.rollback().await.unwrap();
+        server.abort();
     }
 }

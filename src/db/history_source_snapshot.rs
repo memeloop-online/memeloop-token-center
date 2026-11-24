@@ -17,6 +17,7 @@ pub(crate) struct HistorySourceSnapshot {
     manifest: sha2::Sha256,
     parity: parity::BaselineParity,
     parity_verified: bool,
+    target_identity: Option<crate::request_history::HistoryTargetIdentity>,
 }
 
 #[derive(Clone)]
@@ -151,11 +152,33 @@ impl Database {
             manifest: sha2::Digest::new(),
             parity: parity::BaselineParity::default(),
             parity_verified: false,
+            target_identity: None,
         })
     }
 }
 
 impl HistorySourceSnapshot {
+    async fn bind_target(
+        &mut self,
+        database: &Database,
+        writer: &crate::request_history::ClickHouse,
+        reader: &crate::request_history::ClickHouse,
+    ) -> Result<(), HistoryError> {
+        if self.target_identity.is_some() {
+            return Ok(());
+        }
+        let target = writer.target_identity().await?;
+        if target != reader.target_identity().await? {
+            return Err(HistoryError::Mismatch);
+        }
+        let changed=sqlx::query("UPDATE request_history_baseline_runs SET target_identity=$1 WHERE owner=$2 AND epoch=$3 AND status='active' AND target_identity IS NULL")
+            .bind(serde_json::to_string(&target)?).bind(self.owner.to_string()).bind(self.epoch).execute(&database.pool).await?;
+        if changed.rows_affected() != 1 {
+            return Err(HistoryError::Changed);
+        }
+        self.target_identity = Some(target);
+        Ok(())
+    }
     /// Bounded SQL-only source envelopes under one RR snapshot. No archive GET
     /// or CH operation belongs here. Materialization uses the ordinary async
     /// delivery path only after this page's SQL reads have finished.
@@ -298,6 +321,7 @@ impl HistorySourceSnapshot {
         page_size: i64,
     ) -> Result<usize, HistoryError> {
         use crate::request_history::canonical_hash;
+        self.bind_target(database, writer, reader).await?;
         let Some(page) = self.next_envelopes(page_size).await? else {
             return Ok(0);
         };
@@ -363,6 +387,9 @@ impl HistorySourceSnapshot {
         if self.source != 4 || self.pending.is_some() {
             return Err(HistoryError::Changed);
         }
+        if self.target_identity.as_ref() != Some(&reader.target_identity().await?) {
+            return Err(HistoryError::Mismatch);
+        }
         self.parity_verified = false;
         std::mem::take(&mut self.parity)
             .verify(database, &mut self.transaction, reader)
@@ -386,7 +413,7 @@ impl HistorySourceSnapshot {
             return Err(HistoryError::Changed);
         }
         let manifest_hash = format!("{:x}", sha2::Digest::finalize(self.manifest));
-        let parity = self.parity_verified.then(|| serde_json::json!({"read_model_version":crate::request_history::READ_MODEL_VERSION,"activation_epoch":self.activation_epoch,"baseline_owner":self.owner,"baseline_epoch":self.epoch,"ceiling":self.receipt["ceiling"],"manifest_hash":manifest_hash,"surface_parity":true,"query_version":1}).to_string());
+        let parity = self.parity_verified.then(|| serde_json::json!({"read_model_version":crate::request_history::READ_MODEL_VERSION,"activation_epoch":self.activation_epoch,"baseline_owner":self.owner,"baseline_epoch":self.epoch,"ceiling":self.receipt["ceiling"],"manifest_hash":manifest_hash,"surface_parity":true,"query_version":1,"target_identity":self.target_identity}).to_string());
         let updated = sqlx::query("UPDATE request_history_baseline_runs SET status='source_complete',updated_at=$3,chunk_count=$4,manifest_hash=$5,sources_complete=$6,parity_json=$9 WHERE owner=$1 AND epoch=$2 AND status='active' AND read_model_version=$7 AND activation_epoch=$8")
             .bind(self.owner.to_string()).bind(self.epoch).bind(chrono::Utc::now().timestamp_millis())
             .bind(self.ordinal).bind(&manifest_hash)

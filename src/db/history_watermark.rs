@@ -14,76 +14,116 @@ pub(crate) struct HistoryWatermarkProof {
     baseline_ceiling: i64,
     baseline_manifest: String,
     watermark: i64,
+    target_identity: crate::request_history::HistoryTargetIdentity,
 }
 
 impl Database {
+    pub(crate) async fn history_check_export_target(
+        &self,
+        client: &crate::request_history::ClickHouse,
+    ) -> Result<(), HistoryError> {
+        if !matches!(self.backend, DatabaseBackend::PostgreSql) {
+            return Ok(());
+        }
+        let bound:Option<String>=sqlx::query_scalar("SELECT r.target_identity FROM request_history_baseline_runs r JOIN request_history_activation a ON a.id=1 JOIN request_history_delivery_control d ON d.id=1 WHERE r.target_identity IS NOT NULL AND ((r.owner=d.owner AND r.epoch=d.epoch AND r.status='active') OR (r.owner=a.baseline_owner AND r.epoch=a.baseline_epoch AND r.status='source_complete')) ORDER BY CASE WHEN r.owner=d.owner AND r.epoch=d.epoch THEN 0 ELSE 1 END LIMIT 1").fetch_optional(&self.pool).await?.flatten();
+        if let Some(bound) = bound {
+            let expected: crate::request_history::HistoryTargetIdentity =
+                serde_json::from_str(&bound)?;
+            if expected != client.target_identity().await? {
+                return Err(HistoryError::Mismatch);
+            }
+        }
+        Ok(())
+    }
     pub(crate) fn history_uses_watermark_proof(&self) -> bool {
         matches!(self.backend, DatabaseBackend::PostgreSql)
     }
 
     // An unsuccessful proof is NotReady (Changed), never a newly accepted W.
-    pub(crate) async fn history_verify_watermark(&self) -> Result<Value, HistoryError> {
-        let mut tx = self.begin_write_transaction().await?;
-        let prior: Option<String> = sqlx::query_scalar(
-            "SELECT verification_json FROM request_history_state WHERE id=1 FOR UPDATE NOWAIT",
-        )
-        .fetch_one(&mut *tx)
-        .await?;
-        let prior = prior
-            .as_deref()
-            .and_then(|value| serde_json::from_str::<HistoryWatermarkProof>(value).ok());
-        let (proof, ready) = self
-            .history_watermark_proof_in_transaction(&mut tx, prior.as_ref())
+    pub(crate) async fn history_verify_watermark(
+        &self,
+        client: &crate::request_history::ClickHouse,
+    ) -> Result<Value, HistoryError> {
+        let target = client.target_identity().await?;
+        tokio::time::timeout(std::time::Duration::from_secs(3), async {
+            let mut tx = self.begin_write_transaction().await?;
+            let prior: Option<String> = sqlx::query_scalar(
+                "SELECT verification_json FROM request_history_state WHERE id=1 FOR UPDATE NOWAIT",
+            )
+            .fetch_one(&mut *tx)
             .await?;
-        let mut report = serde_json::to_value(&proof)?;
-        report["cutover_ready"] = Value::Bool(ready);
-        sqlx::query(
+            let prior = prior
+                .as_deref()
+                .and_then(|value| serde_json::from_str::<HistoryWatermarkProof>(value).ok());
+            let (proof, ready) = self
+                .history_watermark_proof_in_transaction(&mut tx, prior.as_ref(), &target)
+                .await?;
+            let mut report = serde_json::to_value(&proof)?;
+            report["cutover_ready"] = Value::Bool(ready);
+            sqlx::query(
             "UPDATE request_history_state SET verified_revision=$1,verification_json=$2 WHERE id=1",
         )
         .bind(if ready { Some(proof.watermark) } else { None })
         .bind(serde_json::to_string(&report)?)
         .execute(&mut *tx)
         .await?;
-        tx.commit().await?;
-        Ok(report)
+            tx.commit().await?;
+            Ok(report)
+        })
+        .await
+        .map_err(|_| HistoryError::Changed)?
     }
 
-    pub(crate) async fn history_switch_watermark(&self) -> Result<(), HistoryError> {
-        let mut tx = self.begin_write_transaction().await?;
-        let saved: Option<String> = sqlx::query_scalar(
-            "SELECT verification_json FROM request_history_state WHERE id=1 FOR UPDATE NOWAIT",
-        )
-        .fetch_one(&mut *tx)
-        .await?;
-        let proof: HistoryWatermarkProof =
-            serde_json::from_str(saved.as_deref().ok_or(HistoryError::Changed)?)?;
-        let verified: Option<i64> =
-            sqlx::query_scalar("SELECT verified_revision FROM request_history_state WHERE id=1")
-                .fetch_one(&mut *tx)
+    pub(crate) async fn history_switch_watermark(
+        &self,
+        client: &crate::request_history::ClickHouse,
+    ) -> Result<(), HistoryError> {
+        let target = client.target_identity().await?;
+        tokio::time::timeout(std::time::Duration::from_secs(3), async {
+            let mut tx = self.begin_write_transaction().await?;
+            let saved: Option<String> = sqlx::query_scalar(
+                "SELECT verification_json FROM request_history_state WHERE id=1 FOR UPDATE NOWAIT",
+            )
+            .fetch_one(&mut *tx)
+            .await?;
+            let proof: HistoryWatermarkProof =
+                serde_json::from_str(saved.as_deref().ok_or(HistoryError::Changed)?)?;
+            let verified: Option<i64> = sqlx::query_scalar(
+                "SELECT verified_revision FROM request_history_state WHERE id=1",
+            )
+            .fetch_one(&mut *tx)
+            .await?;
+            let (_, ready) = self
+                .history_watermark_proof_in_transaction(&mut tx, Some(&proof), &target)
                 .await?;
-        let (_, ready) = self
-            .history_watermark_proof_in_transaction(&mut tx, Some(&proof))
-            .await?;
-        if !ready || verified != Some(proof.watermark) {
-            return Err(HistoryError::Changed);
-        }
-        sqlx::query("UPDATE request_history_state SET mode='clickhouse' WHERE id=1")
-            .execute(&mut *tx)
-            .await?;
-        tx.commit().await?;
-        Ok(())
+            if !ready || verified != Some(proof.watermark) {
+                return Err(HistoryError::Changed);
+            }
+            sqlx::query("UPDATE request_history_state SET mode='clickhouse' WHERE id=1")
+                .execute(&mut *tx)
+                .await?;
+            tx.commit().await?;
+            Ok(())
+        })
+        .await
+        .map_err(|_| HistoryError::Changed)?
     }
 
     async fn history_watermark_proof_in_transaction(
         &self,
         tx: &mut Transaction<'_, Any>,
         saved: Option<&HistoryWatermarkProof>,
+        target: &crate::request_history::HistoryTargetIdentity,
     ) -> Result<(HistoryWatermarkProof, bool), HistoryError> {
         if !matches!(self.backend, DatabaseBackend::PostgreSql) {
             return Err(HistoryError::Invalid(
                 "versioned baseline watermarks require PostgreSQL",
             ));
         }
+        // Bound the entire held-lock statement budget, not only acquisition.
+        sqlx::query("SET LOCAL statement_timeout='3s'")
+            .execute(&mut **tx)
+            .await?;
         // Every capture producer/backfill holds this row FOR SHARE before
         // allocating a revision. NOWAIT does not queue behind a request writer.
         let mode: String = sqlx::query_scalar(
@@ -106,7 +146,17 @@ impl Database {
         if unfinished {
             return Err(HistoryError::Changed);
         }
-        let baseline=sqlx::query("SELECT a.epoch AS activation_epoch,a.baseline_owner,a.baseline_epoch,r.ceiling,r.read_model_version,r.activation_epoch AS source_activation_epoch,r.chunk_count,r.manifest_hash,r.sources_complete,r.parity_json FROM request_history_activation a JOIN request_history_baseline_runs r ON r.owner=a.baseline_owner AND r.epoch=a.baseline_epoch WHERE a.id=1 AND a.phase IN ('drained','legacy') AND r.status='source_complete' FOR SHARE OF a,r NOWAIT").fetch_optional(&mut **tx).await?.ok_or(HistoryError::Changed)?;
+        let baseline=sqlx::query("SELECT a.epoch AS activation_epoch,a.baseline_owner,a.baseline_epoch,r.ceiling,r.read_model_version,r.activation_epoch AS source_activation_epoch,r.chunk_count,r.manifest_hash,r.sources_complete,r.parity_json,r.target_identity FROM request_history_activation a JOIN request_history_baseline_runs r ON r.owner=a.baseline_owner AND r.epoch=a.baseline_epoch WHERE a.id=1 AND a.phase IN ('drained','legacy') AND r.status='source_complete' FOR SHARE OF a,r NOWAIT").fetch_optional(&mut **tx).await?.ok_or(HistoryError::Changed)?;
+        let bound_target: Option<String> = baseline.try_get("target_identity")?;
+        if bound_target
+            .as_deref()
+            .map(serde_json::from_str::<crate::request_history::HistoryTargetIdentity>)
+            .transpose()?
+            .as_ref()
+            != Some(target)
+        {
+            return Err(HistoryError::Mismatch);
+        }
         let version: Option<i64> = baseline.try_get("read_model_version")?;
         let activation: i64 = baseline.try_get("activation_epoch")?;
         let source_activation: Option<i64> = baseline.try_get("source_activation_epoch")?;
@@ -146,6 +196,7 @@ impl Database {
             || parity["manifest_hash"].as_str() != manifest.as_deref()
             || parity["surface_parity"].as_bool() != Some(true)
             || parity["query_version"].as_i64() != Some(1)
+            || parity["target_identity"] != serde_json::to_value(target)?
         {
             return Err(HistoryError::Changed);
         }
@@ -170,6 +221,7 @@ impl Database {
             baseline_ceiling: ceiling,
             baseline_manifest: manifest.unwrap(),
             watermark,
+            target_identity: target.clone(),
         };
         if saved.is_some_and(|saved| saved != &proof) {
             return Err(HistoryError::Changed);

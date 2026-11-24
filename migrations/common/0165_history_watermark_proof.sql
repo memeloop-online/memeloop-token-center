@@ -6,3 +6,4 @@ ALTER TABLE request_history_baseline_runs ADD COLUMN chunk_count BIGINT;
 ALTER TABLE request_history_baseline_runs ADD COLUMN manifest_hash TEXT;
 ALTER TABLE request_history_baseline_runs ADD COLUMN sources_complete TEXT;
 ALTER TABLE request_history_baseline_runs ADD COLUMN parity_json TEXT;
+ALTER TABLE request_history_baseline_runs ADD COLUMN target_identity TEXT;
