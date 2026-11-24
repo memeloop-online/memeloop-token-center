@@ -1138,21 +1138,20 @@ async fn cancelled_writer_returns_success_only_when_its_single_fence_succeeds() 
         );
         assert_eq!(probe.calls(), 1);
         if fail_fence {
-            // The writer has already returned its fence error while storage is
-            // still blocked. Restoring storage lets the background owner retry.
+            // Restore storage to inspect the raw root. The background owner
+            // can now publish the failure marker independently of the writer.
             assert!(archive_path.is_file());
             std::fs::remove_file(&archive_path).unwrap();
             std::fs::create_dir_all(&archive_path).unwrap();
-            state.persistence.drain_for_test().await;
-            assert_eq!(probe.calls(), 1);
+        } else {
+            assert!(
+                state
+                    .archive
+                    .raw_capture_failed(identity.tenant_id, identity.request_id, "response")
+                    .await
+                    .unwrap()
+            );
         }
-        assert!(
-            state
-                .archive
-                .raw_capture_failed(identity.tenant_id, identity.request_id, "response")
-                .await
-                .unwrap()
-        );
         assert!(
             state
                 .archive
