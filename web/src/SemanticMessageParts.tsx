@@ -32,23 +32,27 @@ function ContentField({ loader, request, instance, revision, part, field }: {
   const move = async (target: number) => {
     if (active.current || chunksRef.current.some(chunk => chunk.index === target)) return;
     const entry = positions.current[target]; if (!entry) return;
-    if (!stream.current || stream.current.nextIndex !== target) {
+    if (!(target === 0 && field.preview) && (!stream.current || stream.current.nextIndex !== target)) {
       stream.current?.controller.abort();
       void Promise.resolve(stream.current?.iterator.return?.()).catch(() => undefined);
       const controller = new AbortController();
       if (loader.content) stream.current = { nextIndex: target, iterator: loader.content(request, entry.cursor, controller.signal)[Symbol.asyncIterator](), controller };
     }
-    const controller = stream.current?.controller ?? new AbortController(); active.current = controller;
+    const controller = target === 0 && field.preview ? new AbortController() : stream.current?.controller ?? new AbortController(); active.current = controller;
     setLoading(true); setError('');
     try {
-      if (!loader.content) throw new Error(zh ? '当前无法读取消息，请刷新后重试。' : 'Message content is unavailable. Refresh to try again.');
-      const frame = await stream.current!.iterator.next();
-      if (frame.done) throw new Error('Semantic content stream ended before verification');
-      const value = frame.value;
-      stream.current!.nextIndex = target + 1;
-      if (value.complete) {
-        await stream.current!.iterator.return?.();
-        stream.current = null;
+      let value: SemanticContentChunk;
+      if (target === 0 && field.preview) {
+        value = { ...field.preview, manifest_revision: revision, instance_id: instance.instance_id, part_index: part.part_index, field: field.name, format: field.format };
+        stream.current?.controller.abort();
+        void Promise.resolve(stream.current?.iterator.return?.()).catch(() => undefined); stream.current = null;
+      } else {
+        if (!loader.content) throw new Error(zh ? '当前无法读取消息，请刷新后重试。' : 'Message content is unavailable. Refresh to try again.');
+        const frame = await stream.current!.iterator.next();
+        if (frame.done) throw new Error('Semantic content stream ended before verification');
+        value = frame.value;
+        stream.current!.nextIndex = target + 1;
+        if (value.complete) { await stream.current!.iterator.return?.(); stream.current = null; }
       }
       controller.signal.throwIfAborted();
       if (value.manifest_revision !== revision || value.instance_id !== instance.instance_id
