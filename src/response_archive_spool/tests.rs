@@ -1480,3 +1480,61 @@ async fn byte_charged_tap_accepts_mixed_chunks_without_fragment_count_limit() {
         assert_eq!(state.persistence.stream_memory.snapshot().0, baseline);
     }
 }
+
+#[tokio::test]
+async fn concurrent_byte_charged_taps_preserve_every_original() {
+    let (_dir, state, pool, seed) = fixture().await;
+    let baseline = state.persistence.stream_memory.snapshot().0;
+    let mut identities = vec![seed];
+    for _ in 1..16 {
+        let identity = ArchiveSpoolIdentity {
+            request_id: Uuid::new_v4(),
+            tenant_id: seed.tenant_id,
+            reservation_id: Uuid::new_v4(),
+        };
+        sqlx::query("INSERT INTO request_records (id, tenant_id, key_id, created_at, protocol, model, input_tokens, output_tokens, cost_micros, request_object, reservation_id) VALUES ($1, $2, $3, 1, 'responses', 'test', 0, 0, 0, 'gap://test/request', $4)")
+            .bind(identity.request_id.to_string()).bind(identity.tenant_id.to_string()).bind(Uuid::new_v4().to_string()).bind(identity.reservation_id.to_string()).execute(&pool).await.unwrap();
+        identities.push(identity);
+    }
+    let tasks = identities.into_iter().map(|identity| {
+        let state = state.clone();
+        async move {
+            let mut producer = ResponseArchiveProducer::begin_original(&state, identity)
+                .await
+                .unwrap();
+            let mut expected = Vec::new();
+            for index in 0..100 {
+                let bytes = Bytes::from(vec![
+                    b'a' + (index % 26) as u8;
+                    [1, 31, 4096, 16385][index % 4]
+                ]);
+                expected.extend_from_slice(&bytes);
+                assert!(producer.try_offer(bytes));
+                tokio::task::yield_now().await;
+            }
+            producer.seal().unwrap().wait().await;
+            let reference = state
+                .archive
+                .raw_capture_reference(identity.tenant_id, identity.request_id, "response")
+                .await
+                .unwrap()
+                .unwrap();
+            assert_eq!(
+                state
+                    .archive
+                    .get_tenant_content(identity.tenant_id, &reference, expected.len())
+                    .await
+                    .unwrap()
+                    .as_ref(),
+                expected.as_slice()
+            );
+        }
+    });
+    tokio::time::timeout(
+        std::time::Duration::from_secs(15),
+        futures_util::future::join_all(tasks),
+    )
+    .await
+    .unwrap();
+    assert_eq!(state.persistence.stream_memory.snapshot().0, baseline);
+}
