@@ -232,7 +232,12 @@ async fn run() -> Result<(), &'static str> {
                     apply,
                 },
         } => {
-            let state = AppState::initialize_for_maintenance(config)
+            let mut maintenance_config = config;
+            maintenance_config.run_migrations_on_start = false;
+            if apply && !maintenance_config.terminal_projection_enabled {
+                return Err("terminal_projection_disabled");
+            }
+            let state = AppState::initialize_for_maintenance(maintenance_config)
                 .await
                 .map_err(|_| "terminal_recovery_initialization_failed")?;
             let report = state.db.recover_one_terminal_projection(
@@ -774,5 +779,41 @@ mod lifecycle_tests {
         stop.send(true).unwrap();
         task.unwrap().await.unwrap();
         observed.await.unwrap();
+    }
+}
+
+#[cfg(test)]
+mod terminal_recovery_cli_tests {
+    use super::*;
+    #[test]
+    fn exact_recovery_requires_identity_and_defaults_to_inspection() {
+        assert!(
+            Cli::try_parse_from(["mtc", "terminal-projection", "recover-one", "--apply"]).is_err()
+        );
+        let id = "00000000-0000-0000-0000-000000000001";
+        let cli = Cli::try_parse_from([
+            "mtc",
+            "terminal-projection",
+            "recover-one",
+            "--request-id",
+            id,
+            "--tenant-id",
+            id,
+            "--key-id",
+            id,
+            "--account-id",
+            id,
+            "--reservation-id",
+            id,
+            "--created-at",
+            "1",
+        ])
+        .unwrap();
+        assert!(matches!(
+            cli.command,
+            Command::TerminalProjection {
+                command: TerminalProjectionCommand::RecoverOne { apply: false, .. }
+            }
+        ));
     }
 }
