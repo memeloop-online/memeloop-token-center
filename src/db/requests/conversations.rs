@@ -1419,7 +1419,7 @@ impl Database {
             false
         };
         if !rewrote_existing {
-            self.record_conversation_observation_with_snapshot_in_transaction(
+            self.record_conversation_observation_with_prepared_paths_in_transaction(
                 &mut transaction,
                 ConversationObservationInput {
                     key: &projection_key,
@@ -1560,7 +1560,7 @@ impl Database {
         transaction: &mut Transaction<'_, Any>,
         input: ConversationObservationInput<'_>,
     ) -> Result<Uuid, AppError> {
-        self.record_conversation_observation_with_snapshot_in_transaction(
+        self.record_conversation_observation_with_prepared_paths_in_transaction(
             transaction,
             input,
             None,
@@ -1571,6 +1571,21 @@ impl Database {
     }
 
     async fn record_conversation_observation_with_snapshot_in_transaction(
+        &self,
+        transaction: &mut Transaction<'_, Any>,
+        input: ConversationObservationInput<'_>,
+        snapshot: Option<&ConversationSemanticSnapshot>,
+    ) -> Result<Uuid, ConversationContentError> {
+        self.record_conversation_observation_with_prepared_paths_in_transaction(
+            transaction,
+            input,
+            snapshot,
+            None,
+        )
+        .await
+    }
+
+    async fn record_conversation_observation_with_prepared_paths_in_transaction(
         &self,
         transaction: &mut Transaction<'_, Any>,
         input: ConversationObservationInput<'_>,
