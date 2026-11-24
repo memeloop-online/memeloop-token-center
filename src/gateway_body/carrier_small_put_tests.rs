@@ -29,7 +29,7 @@ async fn source(
     upload: Arc<crate::api::proxy::persistence::Persistence>,
     staging: ArchiveStagingKey,
 ) -> (Arc<BodyCarrier>, Arc<ProxyMemoryBudget>) {
-    let memory = Arc::new(ProxyMemoryBudget::new(size + 65536));
+    let memory = Arc::new(ProxyMemoryBudget::new(u64::try_from(size + 65536).unwrap()));
     let mut carrier = BodyCarrier::capture(
         stream::iter([Ok::<_, std::io::Error>(Bytes::from(vec![b'x'; size]))]),
         CarrierCapture::new(memory.clone(), None, staging),
