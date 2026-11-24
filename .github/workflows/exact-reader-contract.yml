@@ -766,3 +766,5 @@ jobs:
             cargo test --locked --lib "api::proxy::tests::credential_readiness::$selector" -- --exact --nocapture 2>&1 | tee /tmp/routing-stale-refresh.log
             grep -F '1 passed; 0 failed' /tmp/routing-stale-refresh.log
           done
+          cargo test --locked --lib api::proxy::tests::group_routing::stale_refresh_enters_group_policy_with_current_snapshot_and_one_budget -- --exact --nocapture 2>&1 | tee /tmp/group-snapshot-refresh.log
+          grep -F '1 passed; 0 failed' /tmp/group-snapshot-refresh.log
