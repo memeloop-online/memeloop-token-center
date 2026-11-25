@@ -78,6 +78,27 @@ mod tests {
     }
 
     #[test]
+    fn optional_legacy_hints_never_block_the_primary_request_surface() {
+        for json in [
+            None,
+            Some("{}"),
+            Some("{broken"),
+            Some("null"),
+            Some(r#"{"session_id":"legacy"}"#),
+        ] {
+            assert!(captured_from_json(json).is_none());
+        }
+        let minimal = r#"{"session_id":"thread","labels":{"mtc_session_identity_source":"header:thread-id"}}"#;
+        assert_eq!(
+            captured_from_json(Some(minimal))
+                .unwrap()
+                .thread_id
+                .as_deref(),
+            Some("thread")
+        );
+    }
+
+    #[test]
     fn legacy_session_context_round_trip_preserves_frozen_payload_shape() {
         let old = serde_json::json!({"session_id":null,"association":"unlinked","session_name":null,"task_kind":null,"agent_id":null,"semantics_source":null});
         let context: crate::model::RequestSessionContext =
@@ -91,14 +112,40 @@ mod tests {
 /// the partition identity; request id alone never authorizes ingress metadata.
 pub(super) const HINTS_SQL: &str = "(SELECT captured.hints_json FROM conversation_projection_outbox captured JOIN request_record_locators captured_locator ON captured_locator.id = captured.request_id AND captured_locator.tenant_id = captured.tenant_id AND captured_locator.key_id = captured.key_id WHERE captured.request_id = r.id AND captured.tenant_id = r.tenant_id AND captured.key_id = r.key_id AND captured_locator.created_at = r.created_at)";
 
-pub(super) fn captured_from_json(
-    json: Option<&str>,
-) -> Result<Option<CapturedRequestSessionIdentity>, crate::error::AppError> {
-    json.map(|json| {
-        serde_json::from_str::<ConversationHints>(json)
-            .map(|hints| captured_identity(&hints))
-            .map_err(|_| crate::error::AppError::internal("request_captured_session_hints_invalid"))
+#[derive(serde::Deserialize)]
+struct PersistedIdentityHints {
+    session_id: Option<String>,
+    #[serde(default)]
+    labels: std::collections::BTreeMap<String, String>,
+}
+
+pub(super) fn captured_from_json(json: Option<&str>) -> Option<CapturedRequestSessionIdentity> {
+    let json = json?;
+    let hints = match serde_json::from_str::<PersistedIdentityHints>(json) {
+        Ok(hints) => hints,
+        Err(_) => {
+            // Optional attribution must not fail the primary request surface.
+            // Fixed-size state and exponentially sampled safe counts expose
+            // invalid legacy metadata without logging client declarations.
+            static INVALID_HINTS: std::sync::atomic::AtomicU64 =
+                std::sync::atomic::AtomicU64::new(0);
+            let count = INVALID_HINTS
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+                .wrapping_add(1);
+            if count.is_power_of_two() {
+                tracing::warn!(
+                    phase = "request_session_attribution",
+                    reason = "invalid_persisted_hints",
+                    occurrences = count,
+                    "optional captured session attribution unavailable"
+                );
+            }
+            return None;
+        }
+    };
+    captured_identity(&ConversationHints {
+        session_id: hints.session_id,
+        labels: hints.labels,
+        ..ConversationHints::default()
     })
-    .transpose()
-    .map(Option::flatten)
 }

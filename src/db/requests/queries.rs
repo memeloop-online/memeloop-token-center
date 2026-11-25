@@ -2082,7 +2082,7 @@ fn request_session_context_from_row(
                 Err(error) => return Err(error.into()),
             }
             .as_deref(),
-        )?,
+        ),
         session_id,
         association,
         session_name: row.try_get("session_name")?,
