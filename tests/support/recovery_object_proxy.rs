@@ -35,6 +35,7 @@ impl ObjectReadGate {
 struct Faults {
     gets: HashMap<String, Arc<ObjectReadGate>>,
     part_gate: Option<Arc<ObjectReadGate>>,
+    body_put_gate: Option<Arc<ObjectReadGate>>,
     abort_gate: Option<Arc<ObjectReadGate>>,
     puts: HashSet<String>,
     put_prefixes: HashSet<String>,
@@ -93,6 +94,11 @@ impl RecoveryObjectProxy {
     }
     pub(crate) fn endpoint(&self) -> &str {
         &self.endpoint
+    }
+    pub(crate) fn gate_body_put(&self) -> Arc<ObjectReadGate> {
+        let gate = Arc::new(ObjectReadGate::default());
+        self.state.faults.lock().unwrap().body_put_gate = Some(gate.clone());
+        gate
     }
     pub(crate) fn gate_multipart_part(&self) -> Arc<ObjectReadGate> {
         let gate = Arc::new(ObjectReadGate::default());
@@ -206,6 +212,8 @@ async fn forward(State(state): State<Arc<ProxyState>>, request: Request) -> Resp
                 faults.part_gate.clone()
             } else if request.method() == axum::http::Method::DELETE && query.contains("uploadId") {
                 faults.abort_gate.clone()
+            } else if class == "body_put" {
+                faults.body_put_gate.clone()
             } else {
                 None
             },

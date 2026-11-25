@@ -136,3 +136,138 @@ async fn cancelled_resource_race_drops_both_fifo_waiters_and_keeps_original() {
     assert_eq!(memory.snapshot().0, 0);
     assert_eq!(workspace.upload_workspace.snapshot().0, 0);
 }
+
+#[tokio::test(start_paused = true)]
+async fn derived_source_can_spill_its_parent_after_workspace_wakes() {
+    let (source, memory, workspace) = fixture().await;
+    let child = BodyCarrier::capture_owned(
+        stream::empty::<Result<(Bytes, Option<OwnedSemaphorePermit>), std::io::Error>>(),
+        CarrierCapture::derived_from(&source, source.staging),
+    )
+    .await
+    .unwrap();
+    let outside = memory.try_reserve_ingress_bytes(128 * 1024).unwrap();
+    let a = workspace
+        .multipart_workspace(WorkspaceRole::RequestRaw)
+        .await
+        .unwrap();
+    let b = workspace
+        .multipart_workspace(WorkspaceRole::RequestRaw)
+        .await
+        .unwrap();
+    let mut waiting = Box::pin(child.reserve_workspace(64 * 1024));
+    assert!(futures_util::poll!(&mut waiting).is_pending());
+    drop(a);
+    let lease = waiting.await.unwrap();
+    assert!(matches!(
+        &*source.segments[0].lock().unwrap(),
+        Segment::Object(_)
+    ));
+    drop(lease);
+    drop(outside);
+    drop(b);
+    drop(child);
+    drop(source);
+    assert_eq!(memory.snapshot().0, 0);
+    assert_eq!(workspace.upload_workspace.snapshot().0, 0);
+}
+
+#[path = "../../tests/support/recovery_object_proxy.rs"]
+mod recovery_proxy;
+
+#[tokio::test]
+#[ignore = "requires isolated RustFS fixture"]
+async fn actual_put_is_not_cancelled_when_ram_wakes_and_lost_ack_keeps_source() {
+    use recovery_proxy::RecoveryObjectProxy;
+    for lose_ack in [false, true] {
+        let proxy =
+            RecoveryObjectProxy::start(&std::env::var("MTC_RUSTFS_TEST_ENDPOINT").unwrap()).await;
+        let mut config = crate::config::Config::for_test("sqlite::memory:".into());
+        config.archive_backend = crate::config::ArchiveBackend::S3;
+        config.s3_endpoint = Some(proxy.endpoint().into());
+        config.s3_bucket = Some(std::env::var("MTC_RUSTFS_TEST_BUCKET").unwrap());
+        config.s3_access_key = Some(std::env::var("MTC_RUSTFS_TEST_ACCESS_KEY").unwrap());
+        config.s3_secret_key = Some(std::env::var("MTC_RUSTFS_TEST_SECRET_KEY").unwrap());
+        config.s3_allow_http = true;
+        let (mut source, memory, workspace) = fixture().await;
+        Arc::get_mut(&mut source).unwrap().archive =
+            Some(ArchiveStore::from_config(&config).await.unwrap());
+        let outside = memory.try_reserve_ingress_bytes(128 * 1024).unwrap();
+        let a = workspace
+            .multipart_workspace(WorkspaceRole::RequestRaw)
+            .await
+            .unwrap();
+        let b = workspace
+            .multipart_workspace(WorkspaceRole::RequestRaw)
+            .await
+            .unwrap();
+        let put = proxy.gate_body_put();
+        proxy.lose_body_put_ack(lose_ack);
+        let waiter = tokio::spawn({
+            let source = source.clone();
+            async move { source.reserve_workspace(64 * 1024).await }
+        });
+        tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            while !workspace
+                .render()
+                .contains("archive_workspace_waiting{operation=\"carrier_spill\"} 1")
+            {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+        drop(a);
+        put.entered().await;
+        drop(outside);
+        tokio::task::yield_now().await;
+        assert!(
+            !waiter.is_finished(),
+            "RAM availability cannot cancel a started PUT"
+        );
+        assert_eq!(proxy.counts().get("body_put"), Some(&1));
+        put.release();
+        let lease = tokio::time::timeout(std::time::Duration::from_secs(30), waiter)
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap();
+        if lose_ack {
+            assert!(matches!(
+                &*source.segments[0].lock().unwrap(),
+                Segment::Ram(_)
+            ));
+            assert!(
+                source
+                    .owned_objects
+                    .lock()
+                    .unwrap()
+                    .iter()
+                    .any(|(_, settled)| !settled)
+            );
+        } else {
+            assert!(matches!(
+                &*source.segments[0].lock().unwrap(),
+                Segment::Object(_)
+            ));
+            assert_eq!(proxy.counts().get("body_put"), Some(&1));
+        }
+        drop(lease);
+        drop(b);
+        proxy.lose_body_put_ack(false);
+        let mut replay = source.open_stream();
+        let mut hash = blake3::Hasher::new();
+        let mut count = 0;
+        while let Some(chunk) = replay.next().await {
+            let chunk = chunk.unwrap();
+            count += chunk.len();
+            hash.update(&chunk);
+        }
+        assert_eq!(count, source.len() as usize);
+        assert_eq!(hash.finalize().to_hex().as_str(), source.digest());
+        drop(replay);
+        drop(source);
+        assert_eq!(memory.snapshot().0, 0);
+        assert_eq!(workspace.upload_workspace.snapshot().0, 0);
+    }
+}
