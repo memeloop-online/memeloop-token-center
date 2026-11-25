@@ -662,19 +662,24 @@ jobs:
         with:
           toolchain: 1.95.0
       - uses: ./.github/actions/checkout-plugin-examples
-      - name: Verify admission locks and rollback
+      - name: Verify wire delivery and real HTTP2 cancellation
         run: |
           set -euo pipefail
+          git rev-parse HEAD
           test "$(git rev-parse HEAD)" = "${{ inputs.source_revision }}"
           cargo check --locked --lib
-          cargo test --locked --lib db::requests::lifecycle::admission_lock_tests::postgres_started_draft_known_partition_limits_relations_while_cursor_waits -- --exact --nocapture 2>&1 | tee /tmp/admission-lock.log
-          grep -F '1 passed; 0 failed' /tmp/admission-lock.log
-          cargo test --locked --lib db::requests::lifecycle::admission_lock_tests::postgres_admission_model_insert_matches_previous_final_record -- --exact --nocapture 2>&1 | tee /tmp/admission-lock.log
-          grep -F '1 passed; 0 failed' /tmp/admission-lock.log
-          cargo test --locked --lib db::requests::lifecycle::admission_lock_tests::postgres_blocked_request_insert_does_not_hold_shared_key_budget -- --exact --nocapture 2>&1 | tee /tmp/admission-lock.log
-          grep -F '1 passed; 0 failed' /tmp/admission-lock.log
-          cargo test --locked --lib db::requests::lifecycle::admission_lock_tests::postgres_rejected_admission_rolls_back_private_request_and_all_budget_changes -- --exact --nocapture 2>&1 | tee /tmp/admission-lock.log
-          grep -F '1 passed; 0 failed' /tmp/admission-lock.log
+          cargo test --locked --lib api::proxy::tests::codex_wire_delivery::confirmed_connect_refusal_uses_original_candidate_and_one_reservation -- --exact --nocapture 2>&1 | tee /tmp/wire-delivery.log
+          grep -F '1 passed; 0 failed' /tmp/wire-delivery.log
+          cargo test --locked --lib api::proxy::tests::codex_wire_delivery::full_post_then_eof_never_replays_or_reserves_twice -- --exact --nocapture 2>&1 | tee /tmp/wire-delivery.log
+          grep -F '1 passed; 0 failed' /tmp/wire-delivery.log
+          cargo test --locked --lib api::proxy::tests::codex_wire_delivery::full_post_then_h2_reset_never_replays_or_reserves_twice -- --exact --nocapture 2>&1 | tee /tmp/wire-delivery.log
+          grep -F '1 passed; 0 failed' /tmp/wire-delivery.log
+          cargo test --locked --lib api::proxy::routing::codex::send_diagnostics::tests::wire_delivery_requires_connect_proof_and_unconsumed_attempt_body -- --exact --nocapture 2>&1 | tee /tmp/wire-delivery.log
+          grep -F '1 passed; 0 failed' /tmp/wire-delivery.log
+          cargo test --locked --lib api::proxy::tests::codex_http2_downstream_cancel::real_http2_downstream_reset_and_tcp_close_cancel_once_and_release_permits -- --exact --nocapture 2>&1 | tee /tmp/wire-delivery.log
+          grep -F '1 passed; 0 failed' /tmp/wire-delivery.log
+          cargo test --locked --lib api::proxy::tests::codex_http2_failure_safety -- --nocapture 2>&1 | tee /tmp/h2-failure-safety.log
+          grep -F '11 passed; 0 failed' /tmp/h2-failure-safety.log
 
   semantic-reader-scope-contract:
     if: inputs.contract == 'semantic-reader-scope'
