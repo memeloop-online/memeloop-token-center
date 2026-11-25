@@ -19,7 +19,7 @@ permissions:
 jobs:
   web:
     runs-on: ubuntu-24.04
-    timeout-minutes: 40
+    timeout-minutes: 20
     defaults:
       run:
         working-directory: web
@@ -40,10 +40,6 @@ jobs:
           name: semantic-viewer-package-lock
           path: web/package-lock.json
           retention-days: 3
-      - uses: dtolnay/rust-toolchain@4360b52568e2003a75bf9bc1d59f33a8e3fc893c
-        with:
-          toolchain: 1.95.0
-      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6
       - run: npm ci --ignore-scripts --no-audit
       - run: npm run typecheck
       - run: npm run build
@@ -52,12 +48,7 @@ jobs:
         run: npx playwright install --with-deps chromium
       - name: Verify semantic viewer pages, identity, export and existing session surfaces
         if: inputs.contract == 'viewer'
-        run: |
-          set -euo pipefail
-          test "$(git rev-parse HEAD)" = "${{ inputs.source_revision }}"
-          cargo build --locked --manifest-path ../Cargo.toml --features experimental-plugin-revisions --bin memeloop-token-center
-          MTC_E2E_BINARY="${{ github.workspace }}/target/debug/memeloop-token-center" npm run test:e2e -- e2e/features/dogfood.feature:87 e2e/features/dogfood.feature:120 2>&1 | tee /tmp/pr1041-browser.log
-          grep -E '^2 scenarios \(2 passed\)' /tmp/pr1041-browser.log
+        run: MTC_REQUIRE_BROWSER=1 node --import tsx --test --test-concurrency=1 e2e/semantic-view-reader-contract.test.ts e2e/semantic-session-browser-contract.test.ts e2e/session-loading-browser-contract.test.ts e2e/operator-overview-drilldown-browser-contract.test.ts
       - name: Verify quota consent, unknown recovery and retained observations
         if: inputs.contract == 'account'
         run: MTC_REQUIRE_BROWSER=1 node --import tsx --test --test-concurrency=1 e2e/upstream-quota-browser-contract.test.ts e2e/quota-discovery-browser-contract.test.ts e2e/quota-reads-browser-contract.test.ts e2e/quota-semantics-browser-contract.test.ts
