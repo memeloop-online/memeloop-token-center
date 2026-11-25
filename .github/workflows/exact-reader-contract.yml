@@ -72,9 +72,13 @@ jobs:
         run: |
           set -euo pipefail
           target_ref="$TARGET_REPO:$TARGET_TAG"
-          if existing_digest=$(timeout 60s crane digest "$target_ref" 2>/dev/null); then
-            test "$existing_digest" = "$SOURCE_DIGEST"
+          if timeout 60s crane digest "$target_ref" > "$RUNNER_TEMP/target-digest.txt" 2> "$RUNNER_TEMP/target-digest-error.txt"; then
+            test "$(cat "$RUNNER_TEMP/target-digest.txt")" = "$SOURCE_DIGEST"
           else
+            precheck_status=$?
+            cat "$RUNNER_TEMP/target-digest-error.txt" >&2
+            test "$precheck_status" != 124
+            grep -Fq 'MANIFEST_UNKNOWN' "$RUNNER_TEMP/target-digest-error.txt"
             timeout --kill-after=10s 18m crane copy --jobs 2 --no-clobber "$SOURCE_REPO@$SOURCE_DIGEST" "$target_ref"
           fi
           test "$(timeout 60s crane digest "$target_ref")" = "$SOURCE_DIGEST"
