@@ -44,9 +44,21 @@ pub(crate) struct Waiting {
 }
 pub(crate) struct WorkspaceGuard {
     _reservation: Arc<ProxyMemoryReservation>,
+    reader: Arc<tokio::sync::Semaphore>,
     roles: Arc<WorkspaceRoles>,
     role: WorkspaceRole,
     start: Instant,
+}
+impl WorkspaceGuard {
+    // A shared upload envelope has one sequential reader scratch region.
+    // Clones cannot create independently uncharged reader allocations.
+    pub(crate) async fn reader(&self) -> tokio::sync::OwnedSemaphorePermit {
+        self.reader
+            .clone()
+            .acquire_owned()
+            .await
+            .expect("workspace reader is never closed")
+    }
 }
 impl WorkspaceRoles {
     pub(super) fn wait(self: &Arc<Self>, role: WorkspaceRole) -> Waiting {
@@ -90,6 +102,7 @@ impl Waiting {
             .fetch_add(1, Ordering::Relaxed);
         Arc::new(WorkspaceGuard {
             _reservation: reservation,
+            reader: Arc::new(tokio::sync::Semaphore::new(1)),
             roles: self.roles.clone(),
             role: self.role,
             start: Instant::now(),
