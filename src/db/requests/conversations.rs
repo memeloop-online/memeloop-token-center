@@ -625,6 +625,7 @@ impl Database {
     /// locator 缺一就不重开。不改 `request_object` / `response_object`。
     pub async fn reopen_session_body_rebuilds(&self, limit: i64) -> Result<u64, AppError> {
         let mut updated = 0_u64;
+        let mut call_remaining: Option<i64> = None;
         let mut cursor: Option<(i64, String)> = None;
         if limit <= 0 {
             return Ok(0);
@@ -658,7 +659,9 @@ impl Database {
                 }
                 let pending: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM conversation_projection_outbox WHERE projected_at IS NULL AND lease_owner=$1")
             .bind(SESSION_BODY_REBUILD_LEASE_OWNER).fetch_one(&mut *transaction).await?;
-                let remaining = limit.saturating_sub(pending).max(0);
+                let available = limit.saturating_sub(pending).max(0);
+                let budget = call_remaining.get_or_insert(available);
+                let remaining = available.min(*budget);
                 if remaining == 0 {
                     transaction.commit().await?;
                     return Ok(updated);
@@ -708,7 +711,10 @@ impl Database {
                 updated += count;
                 // Every candidate releases its one-leaf footprint before the next.
                 transaction.commit().await?;
-                if count > 0 && remaining == count as i64 {
+                *call_remaining
+                    .as_mut()
+                    .expect("candidate capacity initialized") -= count as i64;
+                if call_remaining == Some(0) {
                     return Ok(updated);
                 }
             }

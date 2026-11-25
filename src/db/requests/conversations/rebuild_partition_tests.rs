@@ -59,6 +59,16 @@ async fn postgres_rebuild_partition_locks_and_ineligible_prefix() {
             .append_pair("options", &format!("-c plan_cache_mode={mode}"));
         let fixture = Fixture::new(url.to_string(), true).await;
         let db = &fixture.state.db;
+        let actual: String = sqlx::query_scalar("SHOW plan_cache_mode")
+            .fetch_one(&db.pool)
+            .await
+            .unwrap();
+        assert_eq!(actual, mode);
+        let schema: String = sqlx::query_scalar("SELECT current_schema()")
+            .fetch_one(&db.pool)
+            .await
+            .unwrap();
+        assert_eq!(schema, "public");
         // Add empty historical leaves outside the product's normal current horizon.
         for day in 1..=8_i64 {
             sqlx::query(sqlx::AssertSqlSafe(format!("CREATE TABLE request_records_lock_probe_{day} PARTITION OF request_records FOR VALUES FROM ({}) TO ({})", day*86400000, (day+1)*86400000)))
@@ -71,6 +81,17 @@ async fn postgres_rebuild_partition_locks_and_ineligible_prefix() {
         let original = held_reopen_footprint(db, true).await;
         sqlx::query("UPDATE conversation_projection_outbox SET projected_at=1, statistics_outcome=NULL WHERE request_id=$1")
             .bind(fixture.request_id.to_string()).execute(&db.pool).await.unwrap();
+        // Checked but source-incomplete rows span the old leaves. Their locks
+        // must be released before the real eligible row reaches its UPDATE.
+        for day in 1..=8_i64 {
+            let id = Uuid::now_v7().to_string();
+            sqlx::query("INSERT INTO request_records SELECT (jsonb_populate_record(NULL::request_records,to_jsonb(r)||jsonb_build_object('id',$1::text,'created_at',$2::bigint,'request_object',''))).* FROM request_records r WHERE r.id=$3")
+                .bind(&id).bind(day*86400000+1).bind(fixture.request_id.to_string()).execute(&db.pool).await.unwrap();
+            sqlx::query("INSERT INTO request_record_locators(id,tenant_id,key_id,created_at) SELECT $1,tenant_id,key_id,$2 FROM request_record_locators WHERE id=$3")
+                .bind(&id).bind(day*86400000+1).bind(fixture.request_id.to_string()).execute(&db.pool).await.unwrap();
+            sqlx::query("INSERT INTO conversation_projection_outbox(request_id,tenant_id,key_id,principal_id,request_json,hints_json,observed_at,projected_at) SELECT $1,tenant_id,key_id,principal_id,request_json,hints_json,$2,1 FROM conversation_projection_outbox WHERE request_id=$3")
+                .bind(&id).bind(day).bind(fixture.request_id.to_string()).execute(&db.pool).await.unwrap();
+        }
         let routed = held_reopen_footprint(db, false).await;
         eprintln!(
             "rebuild_partition_locks mode={mode} original={original:?} authoritative={routed:?}"
@@ -96,6 +117,66 @@ async fn postgres_rebuild_partition_locks_and_ineligible_prefix() {
         }
         assert_eq!(db.reopen_session_body_rebuilds(1).await.unwrap(), 1);
         assert_eq!(db.reopen_session_body_rebuilds(1).await.unwrap(), 0);
+        // A locked earlier eligible row must not prevent a later candidate
+        // from filling the remaining capacity, and then returns after unlock.
+        let later = Uuid::now_v7().to_string();
+        sqlx::query("INSERT INTO request_records SELECT (jsonb_populate_record(NULL::request_records,to_jsonb(r)||jsonb_build_object('id',$1::text))).* FROM request_records r WHERE r.id=$2")
+            .bind(&later).bind(fixture.request_id.to_string()).execute(&db.pool).await.unwrap();
+        sqlx::query("INSERT INTO request_record_locators(id,tenant_id,key_id,created_at) SELECT $1,tenant_id,key_id,created_at FROM request_record_locators WHERE id=$2")
+            .bind(&later).bind(fixture.request_id.to_string()).execute(&db.pool).await.unwrap();
+        sqlx::query("INSERT INTO conversation_projection_outbox(request_id,tenant_id,key_id,principal_id,request_json,hints_json,observed_at,projected_at) SELECT $1,tenant_id,key_id,principal_id,request_json,hints_json,observed_at+1,1 FROM conversation_projection_outbox WHERE request_id=$2")
+            .bind(&later).bind(fixture.request_id.to_string()).execute(&db.pool).await.unwrap();
+        sqlx::query("UPDATE conversation_projection_outbox SET projected_at=1,statistics_outcome=NULL,lease_owner=NULL WHERE request_id=$1")
+            .bind(fixture.request_id.to_string()).execute(&db.pool).await.unwrap();
+        let mut held = db.pool.begin().await.unwrap();
+        sqlx::query(
+            "SELECT request_id FROM conversation_projection_outbox WHERE request_id=$1 FOR UPDATE",
+        )
+        .bind(fixture.request_id.to_string())
+        .fetch_one(&mut *held)
+        .await
+        .unwrap();
+        assert_eq!(
+            tokio::time::timeout(
+                std::time::Duration::from_secs(3),
+                db.reopen_session_body_rebuilds(1)
+            )
+            .await
+            .expect("locked head must be skipped")
+            .unwrap(),
+            1
+        );
+        let picked: String = sqlx::query_scalar(
+            "SELECT lease_owner FROM conversation_projection_outbox WHERE request_id=$1",
+        )
+        .bind(&later)
+        .fetch_one(&db.pool)
+        .await
+        .unwrap();
+        assert_eq!(picked, SESSION_BODY_REBUILD_LEASE_OWNER);
+        held.rollback().await.unwrap();
+        assert_eq!(db.reopen_session_body_rebuilds(2).await.unwrap(), 1);
+        // Model a consumer removing newly pending work between candidates.
+        // Replenishment still owes only its initial allowance, not the full scan.
+        let third = Uuid::now_v7().to_string();
+        sqlx::query("INSERT INTO request_records SELECT (jsonb_populate_record(NULL::request_records,to_jsonb(r)||jsonb_build_object('id',$1::text))).* FROM request_records r WHERE r.id=$2")
+            .bind(&third).bind(fixture.request_id.to_string()).execute(&db.pool).await.unwrap();
+        sqlx::query("INSERT INTO request_record_locators(id,tenant_id,key_id,created_at) SELECT $1,tenant_id,key_id,created_at FROM request_record_locators WHERE id=$2")
+            .bind(&third).bind(fixture.request_id.to_string()).execute(&db.pool).await.unwrap();
+        sqlx::query("INSERT INTO conversation_projection_outbox(request_id,tenant_id,key_id,principal_id,request_json,hints_json,observed_at,projected_at) SELECT $1,tenant_id,key_id,principal_id,request_json,hints_json,observed_at+2,1 FROM conversation_projection_outbox WHERE request_id=$2")
+            .bind(&third).bind(fixture.request_id.to_string()).execute(&db.pool).await.unwrap();
+        sqlx::query("UPDATE conversation_projection_outbox SET projected_at=1,statistics_outcome=NULL,lease_owner=NULL WHERE request_id IN ($1,$2)")
+            .bind(fixture.request_id.to_string()).bind(&later).execute(&db.pool).await.unwrap();
+        sqlx::raw_sql("CREATE OR REPLACE FUNCTION rebuild_lock_probe() RETURNS trigger LANGUAGE plpgsql AS $$ BEGIN IF NEW.lease_owner='session-body-rebuild' AND OLD.projected_at IS NOT NULL AND NEW.projected_at IS NULL THEN UPDATE conversation_projection_outbox SET projected_at=1 WHERE request_id<>NEW.request_id AND projected_at IS NULL AND lease_owner='session-body-rebuild'; END IF; RETURN NEW; END $$;")
+            .execute(&db.pool).await.unwrap();
+        assert_eq!(
+            db.reopen_session_body_rebuilds(2).await.unwrap(),
+            2,
+            "a concurrent consumer cannot expand this call's initial allowance"
+        );
+        let untouched: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM conversation_projection_outbox WHERE request_id IN ($1,$2,$3) AND statistics_outcome IS DISTINCT FROM 'session_body'")
+            .bind(fixture.request_id.to_string()).bind(&later).bind(&third).fetch_one(&db.pool).await.unwrap();
+        assert_eq!(untouched, 1);
         drop(fixture);
         isolated.cleanup().await;
     }
