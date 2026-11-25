@@ -119,12 +119,7 @@ impl Database {
         limit: i64,
     ) -> Result<Vec<EnrichedModelRouteView>, AppError> {
         let routes = self
-            .list_model_routes_page(
-                tenant_external_id,
-                before_created_at,
-                before_id,
-                limit,
-            )
+            .list_model_routes_page(tenant_external_id, before_created_at, before_id, limit)
             .await?;
         if routes.is_empty() {
             return Ok(Vec::new());

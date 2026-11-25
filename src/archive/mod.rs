@@ -19,8 +19,6 @@ use futures_util::{Stream, TryStreamExt, stream};
 #[cfg(test)]
 use object_store::{ObjectStoreExt, PutPayload, memory::InMemory, path::Path};
 
-#[cfg(test)]
-mod single_put_test_transport;
 mod backend;
 pub mod cache_command;
 mod carrier_ownership;
@@ -41,6 +39,8 @@ mod quota_reset_receipts;
 mod raw_cache;
 mod raw_capture;
 mod raw_gc;
+#[cfg(test)]
+mod single_put_test_transport;
 pub(crate) use raw_capture::RawPublicationSettlement;
 pub use raw_gc::{RawGcCandidate, RawGcCandidateBatch};
 #[cfg(test)]
@@ -54,8 +54,8 @@ mod rustfs_contract_tests;
 pub(crate) mod scratch_scope;
 mod semantic_manifest;
 mod semantic_publication;
-mod semantic_view;
 pub(crate) mod semantic_reader;
+mod semantic_view;
 pub(crate) use semantic_publication::SemanticBindingProof;
 pub use semantic_publication::{SemanticArchiveAuthority, SemanticPublication};
 mod session_projection;
