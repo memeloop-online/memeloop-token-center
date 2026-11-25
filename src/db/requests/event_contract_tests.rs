@@ -88,6 +88,166 @@ async fn assert_event_enrichment(database: &Database) {
             .bind(Uuid::now_v7().to_string()).bind(event_tenant).bind(&key).bind(&request).bind(now + 50)
             .execute(&database.pool).await.unwrap();
     }
+    let hints = serde_json::json!({
+        "session_id": "captured-thread",
+        "compaction": false,
+        "labels": {
+            "mtc_session_identity_source": "header:thread-id",
+            "mtc_client_session_id": "shared-client-group",
+            "mtc_parent_thread_id": "declared-parent"
+        }
+    });
+    sqlx::query("INSERT INTO conversation_projection_outbox (request_id,tenant_id,key_id,principal_id,request_json,hints_json,observed_at) VALUES ($1,$2,$3,$4,'{}',$5,$6)")
+        .bind(&request).bind(&tenant).bind(&key).bind(&principal).bind(hints.to_string()).bind(now)
+        .execute(&database.pool).await.unwrap();
+    let expected_captured = serde_json::json!({"thread_id":"captured-thread","declared_id":null,"client_session_id":"shared-client-group","parent_thread_id":"declared-parent","source":"header:thread-id"});
+    // Ingress declarations survive before semantic projection; no confirmed
+    // cluster or observation is required, and this read does not publish one.
+    sqlx::query(
+        "UPDATE request_records SET conversation_cluster_id=NULL WHERE id=$1 AND created_at=$2",
+    )
+    .bind(&request)
+    .bind(now)
+    .execute(&database.pool)
+    .await
+    .unwrap();
+    let pending = database
+        .list_requests(Uuid::parse_str(&key).unwrap(), 10)
+        .await
+        .unwrap();
+    let pending_json = serde_json::to_value(&pending[0]).unwrap();
+    assert_eq!(
+        pending_json["session_context"]["captured"],
+        expected_captured
+    );
+    assert_eq!(pending_json["session_context"]["association"], "unlinked");
+    assert!(pending_json["session_context"]["session_id"].is_null());
+    let pending_event = database
+        .request_events_after(&external, now, None, 500)
+        .await
+        .unwrap();
+    assert_eq!(
+        serde_json::to_value(&pending_event[0]).unwrap()["session_context"],
+        pending_json["session_context"]
+    );
+    // Keep a good row in the same bounded page as the optional legacy/bad
+    // row. One unavailable attribution must not prevent either delivery.
+    let good_neighbor = Uuid::now_v7().to_string();
+    sqlx::query(
+        "INSERT INTO request_record_locators(id,created_at,tenant_id,key_id) VALUES($1,$2,$3,$4)",
+    )
+    .bind(&good_neighbor)
+    .bind(now - 1)
+    .bind(&tenant)
+    .bind(&key)
+    .execute(&database.pool)
+    .await
+    .unwrap();
+    sqlx::query("INSERT INTO request_records(id,tenant_id,key_id,created_at,completed_at,protocol,model,status_code,duration_ms,input_tokens,output_tokens,cost_micros,currency,request_object,reservation_id) SELECT $1,tenant_id,key_id,$2,completed_at,protocol,model,status_code,duration_ms,input_tokens,output_tokens,cost_micros,currency,request_object,reservation_id FROM request_records WHERE id=$3 AND created_at=$4")
+        .bind(&good_neighbor).bind(now-1).bind(&request).bind(now).execute(&database.pool).await.unwrap();
+    sqlx::query("INSERT INTO conversation_projection_outbox(request_id,tenant_id,key_id,principal_id,request_json,hints_json,observed_at) SELECT $1,tenant_id,key_id,principal_id,request_json,hints_json,observed_at FROM conversation_projection_outbox WHERE request_id=$2")
+        .bind(&good_neighbor).bind(&request).execute(&database.pool).await.unwrap();
+    let neighbor_event = Uuid::now_v7().to_string();
+    sqlx::query("INSERT INTO request_events(event_id,tenant_id,key_id,request_id,event_at,event_kind,protocol,model,status_code,duration_ms,input_tokens,output_tokens,cost_micros) VALUES($1,$2,$3,$4,$5,'finished','openai','event-model',200,25,100,20,1000000)")
+        .bind(&neighbor_event).bind(&tenant).bind(&key).bind(&good_neighbor).bind(now+51).execute(&database.pool).await.unwrap();
+    for legacy_hints in ["{}", "{malformed"] {
+        sqlx::query("UPDATE conversation_projection_outbox SET hints_json=$1 WHERE request_id=$2")
+            .bind(legacy_hints)
+            .bind(&request)
+            .execute(&database.pool)
+            .await
+            .unwrap();
+        let list = database
+            .list_requests(Uuid::parse_str(&key).unwrap(), 10)
+            .await
+            .unwrap();
+        let events = database
+            .request_events_after(&external, now, None, 500)
+            .await
+            .unwrap();
+        assert_eq!(list.len(), 2);
+        assert_eq!(events.len(), 2);
+        let bad_id = Uuid::parse_str(&request).unwrap();
+        let good_id = Uuid::parse_str(&good_neighbor).unwrap();
+        let bad_list = list.iter().find(|row| row.request_id == bad_id).unwrap();
+        let bad_event = events.iter().find(|row| row.request_id == bad_id).unwrap();
+        for context in [
+            bad_list.session_context.as_ref().unwrap(),
+            bad_event.session_context.as_ref().unwrap(),
+        ] {
+            assert!(context.captured.is_none());
+            assert_eq!(context.association, RequestSessionAssociation::Unlinked);
+        }
+        for context in [
+            list.iter()
+                .find(|row| row.request_id == good_id)
+                .unwrap()
+                .session_context
+                .as_ref()
+                .unwrap(),
+            events
+                .iter()
+                .find(|row| row.request_id == good_id)
+                .unwrap()
+                .session_context
+                .as_ref()
+                .unwrap(),
+        ] {
+            assert_eq!(
+                serde_json::to_value(&context.captured).unwrap(),
+                expected_captured
+            );
+        }
+        assert_eq!(bad_list.status_code, Some(200));
+        assert_eq!(bad_event.status_code, Some(200));
+    }
+    sqlx::query("DELETE FROM request_events WHERE event_id=$1 AND event_at=$2")
+        .bind(neighbor_event)
+        .bind(now + 51)
+        .execute(&database.pool)
+        .await
+        .unwrap();
+    sqlx::query("DELETE FROM conversation_projection_outbox WHERE request_id=$1")
+        .bind(&good_neighbor)
+        .execute(&database.pool)
+        .await
+        .unwrap();
+    sqlx::query("DELETE FROM request_records WHERE id=$1 AND created_at=$2")
+        .bind(&good_neighbor)
+        .bind(now - 1)
+        .execute(&database.pool)
+        .await
+        .unwrap();
+    sqlx::query("DELETE FROM request_record_locators WHERE id=$1")
+        .bind(&good_neighbor)
+        .execute(&database.pool)
+        .await
+        .unwrap();
+    sqlx::query("UPDATE conversation_projection_outbox SET hints_json=$1 WHERE request_id=$2")
+        .bind(hints.to_string())
+        .bind(&request)
+        .execute(&database.pool)
+        .await
+        .unwrap();
+    sqlx::query("UPDATE request_records SET conversation_cluster_id='recorded-session' WHERE id=$1 AND created_at=$2")
+        .bind(&request).bind(now).execute(&database.pool).await.unwrap();
+    let identity = crate::request_history::HistoryIdentity {
+        tenant_id: Uuid::parse_str(&tenant).unwrap(),
+        key_id: Uuid::parse_str(&key).unwrap(),
+        request_id: Uuid::parse_str(&request).unwrap(),
+        created_at: now,
+        source: "native".into(),
+    };
+    let mut capture = database.pool.begin().await.unwrap();
+    let frozen_view = Database::history_original_view_in_transaction(&mut capture, &identity)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        serde_json::to_value(&frozen_view).unwrap()["session_context"]["captured"],
+        expected_captured
+    );
+    capture.rollback().await.unwrap();
     let events = database
         .request_events_after(&external, now, None, 500)
         .await
@@ -109,6 +269,10 @@ async fn assert_event_enrichment(database: &Database) {
     assert_eq!(event.cache_write_tokens, 10);
     let context = event.session_context.as_ref().unwrap();
     assert_eq!(context.session_id.as_deref(), Some("recorded-session"));
+    assert_eq!(
+        serde_json::to_value(&context.captured).unwrap(),
+        expected_captured
+    );
     assert_eq!(context.session_name.as_deref(), Some("recorded-name"));
     let foreign = database
         .request_events_after(&foreign_external, now, None, 500)

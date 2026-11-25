@@ -717,10 +717,11 @@ jobs:
             test "$(sql "SELECT ceiling FROM request_history_baseline_runs
               WHERE owner = 'ci-schema-159' AND epoch = 7 AND status = 'source_complete'
                 AND read_model_version IS NULL AND activation_epoch IS NULL")" = 19
+            sql "UPDATE request_history_activation SET epoch=7, phase='observing', transactions_json='{}', baseline_owner='migration-smoke', baseline_epoch=7 WHERE id=1"
             ledger="$(sql "SELECT version || ':' || name || ':' || applied_at FROM schema_migrations ORDER BY version")"
             cargo run --locked --bin memeloop-token-center -- migrate
             test "$(sql "SELECT version || ':' || name || ':' || applied_at FROM schema_migrations ORDER BY version")" = "$ledger"
-            test "$(sql 'SELECT phase FROM request_history_activation WHERE id = 1 AND epoch = 0')" = legacy
+            test "$(sql "SELECT count(*) FROM request_history_activation WHERE id=1 AND epoch=7 AND phase='observing' AND transactions_json='{}' AND baseline_owner='migration-smoke' AND baseline_epoch=7")" = 1
           done
       - name: Seed 100k-row observability scale fixture
         env:

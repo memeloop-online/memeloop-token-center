@@ -153,6 +153,7 @@ async fn lifecycle_events_contract(fixture: Fixture) {
         fixture.claim.request_id,
         fixture.key.tenant_id,
         fixture.key.key_id,
+        true,
     )
     .await
     .unwrap();

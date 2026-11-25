@@ -957,8 +957,20 @@ pub enum RequestSessionAssociation {
     Unlinked,
 }
 
+/// Client declarations captured at ingress; these do not confirm a logical session.
+#[derive(Clone, Debug, Serialize, PartialEq, Eq, Deserialize)]
+pub struct CapturedRequestSessionIdentity {
+    pub thread_id: Option<String>,
+    pub declared_id: Option<String>,
+    pub client_session_id: Option<String>,
+    pub parent_thread_id: Option<String>,
+    pub source: Option<String>,
+}
+
 #[derive(Clone, Debug, Serialize, PartialEq, Eq, Deserialize)]
 pub struct RequestSessionContext {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub captured: Option<CapturedRequestSessionIdentity>,
     /// Internal logical-session identifier used by the session detail API.
     /// Unlinked request records deliberately keep this null.
     pub session_id: Option<String>,
@@ -976,6 +988,7 @@ impl RequestSessionContext {
         Self {
             session_id,
             association: RequestSessionAssociation::Unlinked,
+            captured: None,
             session_name: None,
             task_kind: None,
             agent_id: None,
