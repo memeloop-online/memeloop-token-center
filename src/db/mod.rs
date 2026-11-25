@@ -1,3 +1,4 @@
+pub mod capability;
 use std::time::Duration;
 
 mod allocation_history;
