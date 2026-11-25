@@ -553,6 +553,30 @@ fn failure_log_occurrences(
 #[cfg(test)]
 mod export_diagnostic_tests {
     use super::*;
+    #[tokio::test]
+    async fn postgres_history_proof_guard_rejects_missing_and_below_floor_catalog() {
+        let url = std::env::var("MTC_TEST_POSTGRES_URL")
+            .expect("history proof contract requires PostgreSQL");
+        let isolated = crate::db::test_support::PostgresTestDatabase::create(&url).await;
+        let database = Database::connect_for_migration(isolated.url(), 2)
+            .await
+            .unwrap();
+        for below_floor in [false, true] {
+            if below_floor {
+                sqlx::raw_sql("CREATE TABLE schema_migrations(version BIGINT PRIMARY KEY,name TEXT NOT NULL); INSERT INTO schema_migrations VALUES(162,'below_floor');")
+                    .execute(&database.pool).await.unwrap();
+            }
+            let report = database
+                .verify_capabilities(crate::db::capability::CapabilityRole::HistoryReader)
+                .await
+                .unwrap();
+            assert!(report.is_none());
+            assert!(require_receipt_capability(isolated.url(), report.as_ref()).is_err());
+        }
+        database.close().await;
+        isolated.cleanup().await;
+    }
+
     #[test]
     fn history_proof_guard_rejects_missing_postgres_capability() {
         // Both a missing ledger and a below-floor ledger return no report.
