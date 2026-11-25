@@ -710,6 +710,104 @@ mod retirement_contracts {
             .retire_covered_raw_roots(&prepared.publication, &proof)
             .await
             .unwrap();
+        let authority = archive
+            .semantic_archive_authority(tenant, request, &proof.node_hash)
+            .await
+            .unwrap()
+            .unwrap();
+        for (side, object) in [("request", input.clone()), ("response", response.clone())] {
+            let classified = archive
+                .raw_reader_authority(
+                    tenant,
+                    request,
+                    side,
+                    Some(&object.object_locator),
+                    Some(&object),
+                    Some(&authority),
+                )
+                .await
+                .unwrap();
+            assert!(
+                matches!(classified, super::super::RawReaderAuthority::Canonical(proof)
+                if proof.source == object && proof.authority.publication.revision == prepared.publication.revision)
+            );
+            assert!(matches!(
+                archive
+                    .raw_reader_authority(
+                        tenant,
+                        request,
+                        side,
+                        Some(&object.object_locator),
+                        Some(&object),
+                        None,
+                    )
+                    .await
+                    .unwrap(),
+                super::super::RawReaderAuthority::Unknown
+            ));
+            assert!(matches!(
+                archive
+                    .raw_reader_authority(
+                        tenant,
+                        request,
+                        side,
+                        Some("wrong-backend-locator"),
+                        Some(&object),
+                        Some(&authority),
+                    )
+                    .await
+                    .unwrap(),
+                super::super::RawReaderAuthority::Unknown
+            ));
+            let mut mismatched = authority.clone();
+            mismatched.publication.revision += 1;
+            assert!(matches!(
+                archive
+                    .raw_reader_authority(
+                        tenant,
+                        request,
+                        side,
+                        Some(&object.object_locator),
+                        Some(&object),
+                        Some(&mismatched),
+                    )
+                    .await
+                    .unwrap(),
+                super::super::RawReaderAuthority::Unknown
+            ));
+            mismatched = authority.clone();
+            mismatched.semantic_head.node_hash = "f".repeat(64);
+            assert!(matches!(
+                archive
+                    .raw_reader_authority(
+                        tenant,
+                        request,
+                        side,
+                        Some(&object.object_locator),
+                        Some(&object),
+                        Some(&mismatched),
+                    )
+                    .await
+                    .unwrap(),
+                super::super::RawReaderAuthority::Unknown
+            ));
+            let mut incomplete = authority.clone();
+            incomplete.coverage.gaps.push("missing content".into());
+            assert!(matches!(
+                archive
+                    .raw_reader_authority(
+                        tenant,
+                        request,
+                        side,
+                        Some(&object.object_locator),
+                        Some(&object),
+                        Some(&incomplete),
+                    )
+                    .await
+                    .unwrap(),
+                super::super::RawReaderAuthority::Unknown
+            ));
+        }
         for (side, object) in [("request", input), ("response", response)] {
             let fence = archive
                 .raw_retirement(tenant, request, side)
