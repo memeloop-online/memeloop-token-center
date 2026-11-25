@@ -647,10 +647,13 @@ async fn prepared_paths_contract(url: &str) {
             .unwrap(),
         full
     );
+    let foreign = prepared
+        .for_fresh_candidates(&Uuid::now_v7().to_string(), &candidates, Some(&leaf))
+        .err()
+        .expect("foreign tenant must reject prepared content");
     assert!(
-        prepared
-            .for_fresh_candidates(&Uuid::now_v7().to_string(), &candidates, Some(&leaf))
-            .is_err()
+        !foreign.retry_after_confirmed_rollback(),
+        "tenant mismatch is not candidate churn"
     );
     assert!(
         prepared
@@ -685,6 +688,11 @@ async fn sqlite_prepared_prefix_reuses_only_verified_tenant_roots() {
 #[tokio::test]
 #[ignore = "requires CI PostgreSQL"]
 async fn postgres_prefix_preload_releases_projection_scope_before_graph_receive() {
+    prefix_preload_contract(false).await;
+    prefix_preload_contract(true).await;
+}
+
+async fn prefix_preload_contract(change_roots: bool) {
     let postgres = std::env::var("MTC_TEST_POSTGRES_URL").unwrap();
     let admin = sqlx::PgPool::connect(&postgres).await.unwrap();
     let schema = format!("prefix_preload_{}", Uuid::now_v7().simple());
@@ -706,6 +714,26 @@ async fn postgres_prefix_preload_releases_projection_scope_before_graph_receive(
     };
     let candidate = Uuid::now_v7();
     let expected_cluster = observe(&database, &actor, &body, &hints, candidate, now, true).await;
+    let changed_candidate = Uuid::now_v7();
+    let changed_cluster = if change_roots {
+        Some(
+            observe(
+                &database,
+                &actor,
+                &json!({"messages":[{"role":"user","content":"a newly committed candidate root"}]}),
+                &ConversationHints {
+                    session_id: Some("not-selected-yet".into()),
+                    ..Default::default()
+                },
+                changed_candidate,
+                now + 2,
+                true,
+            )
+            .await,
+        )
+    } else {
+        None
+    };
     let (_, hashes, _) = load(&database, actor.tenant_id, candidate).await;
     let leaf: String = sqlx::query_scalar(
         "SELECT leaf_node_hash FROM conversation_observations WHERE request_id=$1",
@@ -736,6 +764,11 @@ async fn postgres_prefix_preload_releases_projection_scope_before_graph_receive(
     .unwrap();
     sqlx::query("INSERT INTO conversation_projection_outbox(request_id,tenant_id,key_id,principal_id,request_json,hints_json,observed_at,semantic_snapshot_json,lease_owner,lease_expires_at) VALUES($1,$2,$3,$4,'{}',$5,$6,$7,$8,$9)")
         .bind(request.to_string()).bind(actor.tenant_id.to_string()).bind(actor.key_id.to_string()).bind(actor.principal_id.to_string()).bind(serde_json::to_string(&hints).unwrap()).bind(now+1).bind(&snapshot).bind(owner.to_string()).bind(now+60000).execute(&database.pool).await.unwrap();
+    if change_roots {
+        sqlx::query("UPDATE conversation_projection_outbox SET attempts=1, lease_owner='terminal-v118', lease_expires_at=9223372036854775807, terminal_lease_owner=$2, terminal_lease_expires_at=$3 WHERE request_id=$1")
+            .bind(request.to_string()).bind(owner.to_string()).bind(now+300000)
+            .execute(&database.pool).await.unwrap();
+    }
     // A real recursive SELECT is suspended before its result is received.
     sqlx::raw_sql("CREATE FUNCTION prefix_receive_gate() RETURNS BOOLEAN LANGUAGE plpgsql VOLATILE AS $$ BEGIN IF EXISTS (SELECT 1 FROM pg_locks WHERE pid=pg_backend_pid() AND relation='request_records'::regclass AND mode IN ('RowShareLock','RowExclusiveLock') AND granted) THEN RAISE EXCEPTION 'recursive prefix received under request scope lock'; END IF; PERFORM pg_advisory_xact_lock(91844,1); RETURN TRUE; END $$; ALTER TABLE context_nodes RENAME TO prefix_nodes; CREATE VIEW context_nodes AS SELECT * FROM prefix_nodes WHERE prefix_receive_gate()")
         .execute(&database.pool).await.unwrap();
@@ -782,18 +815,64 @@ async fn postgres_prefix_preload_releases_projection_scope_before_graph_receive(
         .await
         .unwrap();
     let replacement = Uuid::now_v7();
-    sqlx::query("UPDATE conversation_projection_outbox SET lease_owner=$2 WHERE request_id=$1")
-        .bind(request.to_string())
-        .bind(replacement.to_string())
-        .execute(&mut *probe)
-        .await
-        .unwrap();
+    if change_roots {
+        // B commits a different root into A's candidate scope after A selected
+        // its roots, while A is still receiving its immutable prefix graph.
+        sqlx::query("UPDATE conversation_observations SET explicit_session_id=$2, created_at=$3 WHERE request_id=$1")
+            .bind(changed_candidate.to_string()).bind(hints.session_id.as_deref().unwrap())
+            .bind(now+1).execute(&mut *probe).await.unwrap();
+    } else {
+        sqlx::query("UPDATE conversation_projection_outbox SET lease_owner=$2 WHERE request_id=$1")
+            .bind(request.to_string())
+            .bind(replacement.to_string())
+            .execute(&mut *probe)
+            .await
+            .unwrap();
+    }
     probe.commit().await.unwrap();
     blocker.rollback().await.unwrap();
-    assert!(
-        !task.await.unwrap().unwrap(),
-        "a replaced lease cannot publish the prepared graph"
-    );
+    let result = task.await.unwrap();
+    if change_roots {
+        assert!(matches!(result, Err(AppError::Conflict(_))));
+        let row = sqlx::query("SELECT terminal_lease_owner, terminal_lease_expires_at, projected_at FROM conversation_projection_outbox WHERE request_id=$1")
+            .bind(request.to_string()).fetch_one(&database.pool).await.unwrap();
+        assert_eq!(
+            row.get::<Option<String>, _>("terminal_lease_owner"),
+            Some(owner.to_string())
+        );
+        assert!(row.get::<Option<i64>, _>("projected_at").is_none());
+        let expiry = row.get::<i64, _>("terminal_lease_expires_at");
+        assert!(
+            expiry <= unix_millis() + 1000,
+            "changed roots must not retain the five-minute lease"
+        );
+        // Advance only this fixture's retry clock, then use the real claim
+        // path to re-read fresh candidates under a new owner.
+        sqlx::query("UPDATE conversation_projection_outbox SET terminal_lease_expires_at=$2 WHERE request_id=$1")
+            .bind(request.to_string()).bind(unix_millis()-1).execute(&database.pool).await.unwrap();
+        let claims = database
+            .claim_conversation_projection_tasks(replacement, 1)
+            .await
+            .unwrap();
+        assert_eq!(claims.len(), 1);
+        assert_eq!(claims[0].request_id, request);
+        let held: Option<i64> = sqlx::query_scalar("SELECT terminal_lease_expires_at FROM conversation_projection_outbox WHERE request_id=$1")
+            .bind(request.to_string()).fetch_one(&database.pool).await.unwrap();
+        assert!(
+            !database
+                .schedule_rolled_back_conversation_retry(request, owner)
+                .await
+                .unwrap()
+        );
+        let unchanged: Option<i64> = sqlx::query_scalar("SELECT terminal_lease_expires_at FROM conversation_projection_outbox WHERE request_id=$1")
+            .bind(request.to_string()).fetch_one(&database.pool).await.unwrap();
+        assert_eq!(held, unchanged, "old owner cannot shorten the new lease");
+    } else {
+        assert!(
+            !result.unwrap(),
+            "a replaced lease cannot publish the prepared graph"
+        );
+    }
     let count: i64 =
         sqlx::query_scalar("SELECT COUNT(*) FROM conversation_observations WHERE request_id=$1")
             .bind(request.to_string())
@@ -819,7 +898,10 @@ async fn postgres_prefix_preload_releases_projection_scope_before_graph_receive(
             .fetch_one(&database.pool)
             .await
             .unwrap();
-    assert_eq!(cluster, expected_cluster.to_string());
+    assert_eq!(
+        cluster,
+        changed_cluster.unwrap_or(expected_cluster).to_string()
+    );
     sqlx::raw_sql("DROP VIEW context_nodes; ALTER TABLE prefix_nodes RENAME TO context_nodes; DROP FUNCTION prefix_receive_gate()")
         .execute(&database.pool).await.unwrap();
     database.pool.close().await;
