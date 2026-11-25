@@ -662,16 +662,19 @@ jobs:
         with:
           toolchain: 1.95.0
       - uses: ./.github/actions/checkout-plugin-examples
-      - name: Verify url security lock and origin boundaries
+      - name: Verify admission locks and rollback
         run: |
           set -euo pipefail
-          git rev-parse HEAD
           test "$(git rev-parse HEAD)" = "${{ inputs.source_revision }}"
           cargo check --locked --lib
-          for selector in plugin::tests::rejects_non_origin_http_allowlist_entries plugin::tests::component_provider_request_boundaries_reject_origin_and_secret_header_smuggling; do
-            cargo test --locked --lib "$selector" -- --exact --nocapture 2>&1 | tee /tmp/url-security-contract.log
-            grep -F '1 passed; 0 failed' /tmp/url-security-contract.log
-          done
+          cargo test --locked --lib db::requests::lifecycle::admission_lock_tests::postgres_started_draft_known_partition_limits_relations_while_cursor_waits -- --exact --nocapture 2>&1 | tee /tmp/admission-lock.log
+          grep -F '1 passed; 0 failed' /tmp/admission-lock.log
+          cargo test --locked --lib db::requests::lifecycle::admission_lock_tests::postgres_admission_model_insert_matches_previous_final_record -- --exact --nocapture 2>&1 | tee /tmp/admission-lock.log
+          grep -F '1 passed; 0 failed' /tmp/admission-lock.log
+          cargo test --locked --lib db::requests::lifecycle::admission_lock_tests::postgres_blocked_request_insert_does_not_hold_shared_key_budget -- --exact --nocapture 2>&1 | tee /tmp/admission-lock.log
+          grep -F '1 passed; 0 failed' /tmp/admission-lock.log
+          cargo test --locked --lib db::requests::lifecycle::admission_lock_tests::postgres_rejected_admission_rolls_back_private_request_and_all_budget_changes -- --exact --nocapture 2>&1 | tee /tmp/admission-lock.log
+          grep -F '1 passed; 0 failed' /tmp/admission-lock.log
 
   semantic-reader-scope-contract:
     if: inputs.contract == 'semantic-reader-scope'
