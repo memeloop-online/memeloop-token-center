@@ -8151,6 +8151,17 @@ async fn wait_for_projected_conversation_requests(world: &TokenCenterWorld, expe
         loop {
             let rows = sqlx::query(
                 "SELECT o.request_id, o.projected_at, o.statistics_outcome, o.attempts,
+                    o.lease_expires_at, o.terminal_lease_expires_at,
+                    CASE WHEN o.lease_owner = 'terminal-v118' THEN 'terminal'
+                        WHEN o.lease_owner = 'session-body-rebuild' THEN 'rebuild'
+                        WHEN o.lease_owner IS NULL THEN 'none' ELSE 'worker' END AS primary_owner_kind,
+                    CAST(CASE WHEN o.terminal_lease_owner IS NOT NULL THEN 1 ELSE 0 END AS BIGINT) AS terminal_owned,
+                    CAST(CASE WHEN o.semantic_snapshot_json IS NOT NULL THEN 1 ELSE 0 END AS BIGINT) AS has_snapshot,
+                    CAST(CASE WHEN o.semantic_payload_snapshot_json IS NOT NULL THEN 1 ELSE 0 END AS BIGINT) AS has_payload_snapshot,
+                    CAST(CASE WHEN EXISTS (SELECT 1 FROM request_records r
+                        WHERE r.id = o.request_id AND r.tenant_id = o.tenant_id AND r.key_id = o.key_id
+                        AND r.response_object = 'gap://' || r.id || '/response') THEN 1 ELSE 0 END AS BIGINT) AS response_gap,
+                    o.hints_json,
                     request_spool.state AS request_archive_state,
                     response_spool.state AS response_archive_state,
                     CAST(CASE WHEN EXISTS (
@@ -8176,6 +8187,15 @@ async fn wait_for_projected_conversation_requests(world: &TokenCenterWorld, expe
                 "projected_at": row.get::<Option<i64>, _>("projected_at"),
                 "outcome": row.get::<Option<String>, _>("statistics_outcome"),
                 "attempts": row.get::<i64, _>("attempts"),
+                "primary_owner_kind": row.get::<String, _>("primary_owner_kind"),
+                "lease_expires_at": row.get::<Option<i64>, _>("lease_expires_at"),
+                "terminal_lease_expires_at": row.get::<Option<i64>, _>("terminal_lease_expires_at"),
+                "terminal_owned": row.get::<i64, _>("terminal_owned"),
+                "has_snapshot": row.get::<i64, _>("has_snapshot"),
+                "has_payload_snapshot": row.get::<i64, _>("has_payload_snapshot"),
+                "response_gap": row.get::<i64, _>("response_gap"),
+                "has_declared_session": serde_json::from_str::<Value>(&row.get::<String, _>("hints_json"))
+                    .ok().map(|hints| !hints["session_id"].is_null()),
                 "request_archive_state": row.get::<Option<String>, _>("request_archive_state"),
                 "response_archive_state": row.get::<Option<String>, _>("response_archive_state"),
                 "observed": row.get::<i64, _>("observed"),
@@ -8193,6 +8213,31 @@ async fn wait_for_projected_conversation_requests(world: &TokenCenterWorld, expe
         }
     })
     .await;
+    if result.is_err() {
+        for row in &mut snapshot {
+            let request_id = Uuid::parse_str(row["request_id"].as_str().expect("request id"))
+                .expect("request UUID");
+            // Only sealed/failed state is retained; no locator, body, or digest
+            // is added to failure output. These reads do not change readiness.
+            let tenant: String = sqlx::query_scalar(
+                "SELECT tenant_id FROM conversation_projection_outbox WHERE request_id = $1 AND key_id = $2",
+            ).bind(request_id.to_string()).bind(&key_id).fetch_one(&inspection).await
+                .expect("projection diagnostic tenant");
+            let tenant = Uuid::parse_str(&tenant).expect("tenant UUID");
+            for side in ["request", "response"] {
+                let sealed = state
+                    .archive
+                    .raw_capture_reference(tenant, request_id, side)
+                    .await;
+                let failed = state
+                    .archive
+                    .raw_capture_failed(tenant, request_id, side)
+                    .await;
+                row[format!("{side}_raw_sealed")] = json!(sealed.map(|value| value.is_some()).ok());
+                row[format!("{side}_raw_failed")] = json!(failed.ok());
+            }
+        }
+    }
     inspection.close().await;
     assert!(
         result.is_ok(),
