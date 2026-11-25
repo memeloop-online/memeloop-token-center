@@ -692,7 +692,7 @@ jobs:
           test "$(git rev-parse HEAD)" = "${{ inputs.source_revision }}"
           cargo test --locked --lib json_source::carrier_cancel_tests::cancellation_drops_a_pending_object_read_and_releases_the_source -- --exact --nocapture 2>&1 | tee /tmp/pending-object-cancel.log
           grep -F '1 passed; 0 failed' /tmp/pending-object-cancel.log
-          echo 'RUSTFS_PENDING_READ_CANCEL_PASS backend=rustfs successful_response_gate=required range=bytes0-12 tests=1' 
+          echo 'RUSTFS_PENDING_READ_CANCEL_PASS backend=rustfs successful_response_gate=required range=bytes0-12 tests=1'
 
   semantic-reader-scope-contract:
     if: inputs.contract == 'semantic-reader-scope'
