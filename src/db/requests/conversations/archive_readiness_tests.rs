@@ -2907,10 +2907,21 @@ async fn postgres_exact_legacy_body_rebuild_preserves_incomplete_and_financial_r
         .unwrap()
     );
     let owner = resumed_owner;
+    let pending = db
+        .session_body_locators(fixture.request_id)
+        .await
+        .unwrap()
+        .unwrap()
+        .pending;
+    let rebuilt =
+        crate::worker::recover_claimed_session_body(&fixture.state, owner, fixture.request_id)
+            .await;
+    let state: (Option<i64>, Option<String>, Option<i64>, Option<i64>) = sqlx::query_as(
+        "SELECT projected_at, statistics_outcome, lease_expires_at, terminal_lease_expires_at FROM conversation_projection_outbox WHERE request_id=$1",
+    ).bind(fixture.request_id.to_string()).fetch_one(&db.pool).await.unwrap();
     assert!(
-        crate::worker::archive_session_body(&fixture.state, owner, fixture.request_id)
-            .await
-            .unwrap()
+        rebuilt.as_ref().is_ok_and(|done| *done),
+        "exact canonical recovery: {rebuilt:?}; pending={pending}; state={state:?}"
     );
     let snapshot: String = sqlx::query_scalar("SELECT semantic_snapshot_json FROM conversation_projection_outbox WHERE request_id = $1 AND projected_at IS NOT NULL")
         .bind(fixture.request_id.to_string()).fetch_one(&db.pool).await.unwrap();
