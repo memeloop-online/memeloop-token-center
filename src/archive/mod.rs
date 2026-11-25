@@ -19,6 +19,8 @@ use futures_util::{Stream, TryStreamExt, stream};
 #[cfg(test)]
 use object_store::{ObjectStoreExt, PutPayload, memory::InMemory, path::Path};
 
+#[cfg(test)]
+mod single_put_test_transport;
 mod backend;
 pub mod cache_command;
 mod carrier_ownership;
