@@ -1,0 +1,128 @@
+name: MTC OAuth and proxy snapshot exact contracts
+on:
+  push:
+    branches: [ci/mtc-refactor-proof-1041]
+    paths: [.github/workflows/refactor-oauth-proxy-proof.yml]
+permissions:
+  contents: read
+jobs:
+  rust-contracts:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 65
+    env:
+      CARGO_BUILD_JOBS: "2"
+      CARGO_INCREMENTAL: "0"
+      CARGO_PROFILE_TEST_DEBUG: "0"
+      CARGO_PROFILE_DEV_DEBUG: "0"
+      MTC_TEST_POSTGRES_URL: postgres://token_center:token_center@127.0.0.1:5432/memeloop_token_center_test
+    services:
+      postgres:
+        image: postgres:16-alpine
+        env:
+          POSTGRES_DB: memeloop_token_center_test
+          POSTGRES_USER: token_center
+          POSTGRES_PASSWORD: token_center
+        ports: ["5432:5432"]
+        options: --health-cmd pg_isready --health-interval 5s --health-timeout 3s --health-retries 20
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+        with:
+          ref: bec374e3372605eb4d0a6899dbc92ca2c3df7cef
+          persist-credentials: false
+      - name: Verify exact product revision
+        run: |
+          actual_sha="$(git rev-parse HEAD)"
+          echo "Product checkout: $actual_sha"
+          test "$actual_sha" = "bec374e3372605eb4d0a6899dbc92ca2c3df7cef"
+      - uses: ./.github/actions/checkout-plugin-examples
+      - uses: dtolnay/rust-toolchain@4360b52568e2003a75bf9bc1d59f33a8e3fc893c
+        with:
+          toolchain: 1.95.0
+          targets: wasm32-unknown-unknown
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6
+      - name: Run exact Rust contracts
+        run: |
+          set -euo pipefail
+          failures=0
+          run_exact() {
+            local target="$1" name="$2" output
+            output="$(mktemp)"
+            local -a args
+            if [[ "$target" == lib ]]; then args=(--lib); else args=(--test "$target"); fi
+            if ! cargo test --locked --all-features "${args[@]}" "$name" -- --exact --nocapture 2>&1 | tee "$output"; then failures=1; fi
+            if ! grep -Eq '^test result: ok\. 1 passed; 0 failed; 0 ignored;' "$output"; then failures=1; fi
+          }
+          run_exact lib oauth::kimi_device::tests::device_flow_leases_pending_slowdown_and_consumes_one_credential
+          run_exact lib oauth::copilot::tests::account_socks5h_proxy_carries_device_login_and_short_token_remint
+          run_exact lib api::upstreams::oauth_claude::tests::reauthorization_http_start_only_creates_one_session_for_the_scoped_account
+          run_exact lib api::tests::generic_declared_identity_reauthorization_start_preserves_client_and_account
+          run_exact upstream_config_secrets provider_adapter_secret_cycles_are_rejected_before_oauth_start_or_reauthorization
+          run_exact upstream_config_secrets provider_adapter_reauthorization_restores_only_the_current_secret_config
+          run_exact upstream_proxy_settings explicit_proxy_read_preserves_full_url_but_excludes_other_secrets_and_requires_edit_authority
+          exit "$failures"
+  web-contracts:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 35
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+        with:
+          ref: bec374e3372605eb4d0a6899dbc92ca2c3df7cef
+          persist-credentials: false
+      - name: Verify exact product revision
+        run: test "$(git rev-parse HEAD)" = "bec374e3372605eb4d0a6899dbc92ca2c3df7cef"
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020
+        with:
+          node-version: 24.18.0
+          cache: npm
+          cache-dependency-path: |
+            package-lock.json
+            web/package-lock.json
+      - name: Install locked root dependencies
+        id: root_dependencies
+        run: npm ci --ignore-scripts --no-audit
+      - name: Run OpenAPI contract fixture tests
+        if: ${{ !cancelled() && steps.root_dependencies.outcome == 'success' }}
+        run: node --test tests/ops/test-openapi-contract.ts
+      - name: Install locked web dependencies
+        id: web_dependencies
+        if: ${{ !cancelled() }}
+        working-directory: web
+        run: npm ci --ignore-scripts --no-audit
+      - name: Typecheck web and browser fixtures
+        if: ${{ !cancelled() && steps.web_dependencies.outcome == 'success' }}
+        working-directory: web
+        run: npm run typecheck
+      - name: Install pinned Playwright Chromium
+        id: chromium
+        if: ${{ !cancelled() && steps.web_dependencies.outcome == 'success' }}
+        working-directory: web
+        timeout-minutes: 15
+        run: ./node_modules/.bin/playwright install --with-deps chromium
+      - name: Run OAuth and proxy route contracts in Chromium
+        if: ${{ !cancelled() && steps.chromium.outcome == 'success' }}
+        working-directory: web
+        env:
+          MTC_REQUIRE_BROWSER: "1"
+        run: |
+          set -euo pipefail
+          node --import tsx --test --test-reporter=spec --test-concurrency=1 \
+            e2e/kimi-account-workspace-browser-contract.test.ts \
+            e2e/kimi-device-browser-contract.test.ts \
+            e2e/native-oauth-proxy-browser-contract.test.ts \
+            e2e/reauthorization-journey-browser-contract.test.ts \
+            e2e/route-model-entry-browser-contract.test.ts \
+            e2e/transport-proxy-groups-browser-contract.test.ts 2>&1 | tee "$RUNNER_TEMP/web-contracts.log"
+          if grep -Eq '^[[:space:]]*[⁻ℹ]*[[:space:]]*skipped [1-9]' "$RUNNER_TEMP/web-contracts.log"; then
+            echo "::error::A browser contract was skipped"
+            exit 1
+          fi
+      - name: Retain browser evidence and test log
+        if: always()
+        uses: actions/upload-artifact@65462800fd760344b1a7b4382951275a0abb4808
+        with:
+          name: oauth-proxy-browser
+          path: |
+            ${{ runner.temp }}/web-contracts.log
+            web/e2e-artifacts/
+          if-no-files-found: warn
+          retention-days: 14
