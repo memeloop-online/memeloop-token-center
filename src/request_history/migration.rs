@@ -305,6 +305,7 @@ pub async fn command(config: &Config, command: HistoryCommand) -> Result<Value, 
                 )
                 .await
                 {
+                    Ok(report) if exact_scope.is_some() => exact_export_report(&report),
                     Ok(report) => {
                         json!({"status":"completed","attempted":report.attempted,"acked":report.acked,"deferred":report.attempted.saturating_sub(report.acked),"operation_failed":false})
                     }
@@ -880,4 +881,39 @@ fn add_daily(
     bucket.output_known_requests += u64::from(row["output_tokens"].is_i64());
     bucket.cost_known_requests += u64::from(row["cost_micros"].is_i64());
     Ok(())
+}
+
+fn exact_export_report(report: &ExportReport) -> Value {
+    let completed = report.attempted == 1 && report.acked == 1;
+    json!({"status":if completed {"completed"} else {"not_ready"},"proof":if completed {"exact_ack"} else {"unproven"},"attempted":report.attempted,"acked":report.acked,"deferred":report.attempted.saturating_sub(report.acked),"operation_failed":!completed})
+}
+
+#[cfg(test)]
+mod exact_export_report_tests {
+    use super::*;
+    #[test]
+    fn zero_match_or_zero_ack_is_not_completion() {
+        for report in [
+            ExportReport {
+                attempted: 0,
+                acked: 0,
+            },
+            ExportReport {
+                attempted: 1,
+                acked: 0,
+            },
+        ] {
+            let value = exact_export_report(&report);
+            assert_eq!(value["status"], "not_ready");
+            assert_eq!(value["proof"], "unproven");
+            assert_eq!(value["operation_failed"], true);
+        }
+        assert_eq!(
+            exact_export_report(&ExportReport {
+                attempted: 1,
+                acked: 1
+            })["status"],
+            "completed"
+        );
+    }
 }

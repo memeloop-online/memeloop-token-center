@@ -1004,6 +1004,39 @@ mod tests {
                 .unwrap()
                 .is_empty()
         );
+        if matches!(db.backend, DatabaseBackend::PostgreSql) {
+            let mut held = db.pool.begin().await.unwrap();
+            sqlx::query("SELECT revision FROM request_history_export WHERE revision=$1 FOR UPDATE")
+                .bind(revision)
+                .fetch_one(&mut *held)
+                .await
+                .unwrap();
+            let locked = tokio::time::timeout(
+                std::time::Duration::from_secs(2),
+                db.history_pending_scoped(1, None, Some(&scope)),
+            )
+            .await
+            .expect("scoped claim must not fall back to a blocking UPDATE")
+            .unwrap();
+            assert!(locked.is_empty());
+            let frozen: i64 =
+                sqlx::query_scalar("SELECT COUNT(*) FROM request_history_immutable_outbox")
+                    .fetch_one(&db.pool)
+                    .await
+                    .unwrap();
+            assert_eq!(
+                frozen, 0,
+                "held exact claim cannot materialize target or neighbours"
+            );
+            let changed: i64 = sqlx::query_scalar(
+                "SELECT COUNT(*) FROM request_history_export WHERE snapshot IS NOT NULL",
+            )
+            .fetch_one(&db.pool)
+            .await
+            .unwrap();
+            assert_eq!(changed, 0);
+            held.rollback().await.unwrap();
+        }
         let rows = db
             .history_pending_scoped(1, None, Some(&scope))
             .await

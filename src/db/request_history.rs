@@ -611,14 +611,18 @@ impl Database {
         if !immutable.is_empty() {
             return Ok(immutable);
         }
-        let rows = sqlx::query("SELECT revision, source, request_id, tenant_id, key_id, created_at, snapshot FROM request_history_export WHERE revision <= COALESCE($2,9223372036854775807) AND ($3 IS NULL OR (revision=$3 AND source='event' AND request_id=$4 AND tenant_id=$5 AND key_id=$6 AND created_at=$7)) ORDER BY revision LIMIT $1")
+        let rows = sqlx::query("SELECT revision, source, request_id, tenant_id, key_id, created_at, snapshot FROM request_history_export WHERE revision <= COALESCE($2,9223372036854775807) AND ($3 IS NULL OR (revision=$3 AND source='event' AND request_id=$4 AND tenant_id=$5 AND key_id=$6 AND created_at=$7 AND snapshot IS NOT NULL)) ORDER BY revision LIMIT $1")
             .bind(page_size).bind(ceiling).bind(scope.map(|s|s.revision)).bind(scope.map(|s|s.identity.request_id.to_string())).bind(scope.map(|s|s.identity.tenant_id.to_string())).bind(scope.map(|s|s.identity.key_id.to_string())).bind(scope.map(|s|s.identity.created_at)).fetch_all(&self.pool).await?;
         let mut snapshots = Vec::new();
         for row in rows {
             let revision: i64 = row.try_get("revision")?;
             let frozen: Option<String> = row.try_get("snapshot")?;
             if let Some(frozen) = frozen {
-                snapshots.push(serde_json::from_str(&frozen)?);
+                let snapshot: HistorySnapshot = serde_json::from_str(&frozen)?;
+                if scope.is_some_and(|scope| !scope.matches(&snapshot)) {
+                    return Err(HistoryError::Mismatch);
+                }
+                snapshots.push(snapshot);
                 continue;
             }
             let identity = history_identity(&row)?;
