@@ -39,7 +39,7 @@ test('production AppShell typography and actions share Fluent tokens in both the
       if (url.pathname === '/internal/v1/requests') return json(requests);
       if (url.pathname === '/internal/v1/monitoring-snapshot') return json({ contract_version: 'v1', generated_at: start, scope: 'tenant', tenant_external_id: 'default', from_created_at: start - 3_600_000, to_created_at: start, granularity: 'hour', latency_is_approximate: true, latency_method: 'fixed_histogram_upper_bound_capped_60000ms', summary: { requests: 3, successful_requests: 1, failed_requests: 1, avg_duration_ms: 25_000, p95_duration_ms: 30_000, costs: [] }, freshness: { latest_terminal_created_at: start, age_millis: 0 }, health: { version: 'upstream_breaker_v1', status: 'unknown', observed_at: start }, top_upstream_models: [] });
       if (url.pathname === '/internal/v1/usage-analysis/trends') return json({ from_created_at: start - 3_600_000, to_created_at: start, granularity: 'hour', time_zone: 'UTC', p95_is_approximate: true, p95_method: 'fixed_histogram_upper_bound_capped_60000ms', summary: metrics, time_series: [{ ...metrics, bucket_start: start - 3_600_000 }] });
-      if (['/internal/v1/plugins', '/internal/v1/upstreams', '/internal/v1/model-routes', '/internal/v1/provider-groups'].includes(url.pathname)) return json([]);
+      if (['/internal/v1/plugins', '/internal/v1/upstreams', '/internal/v1/model-routes', '/internal/v1/provider-groups', '/internal/v1/generations'].includes(url.pathname)) return json([]);
       unexpected.push(url.pathname); return route.abort();
     });
     await page.addInitScript(() => {
@@ -56,6 +56,13 @@ test('production AppShell typography and actions share Fluent tokens in both the
     await page.goto(`${origin}/operator?view=requests`);
     const heading = page.locator('.request-page-surface .traffic-heading h2');
     await heading.waitFor();
+    const activityTabs = page.getByRole('tablist', { name: '实时活动', exact: true });
+    await activityTabs.getByRole('tab', { name: '生成任务', exact: true }).click();
+    await page.locator('.request-generation-workspace').waitFor();
+    assert.equal(await activityTabs.getByRole('tab', { name: '生成任务', exact: true }).getAttribute('aria-selected'), 'true');
+    await activityTabs.getByRole('tab', { name: '请求', exact: true }).click();
+    await heading.waitFor();
+    assert.equal(await activityTabs.getByRole('tab', { name: '请求', exact: true }).getAttribute('aria-selected'), 'true');
     const totalTokens = page.locator('.request-traffic-metrics .analytics-metric').filter({ has: page.locator('.metric-label', { hasText: '总词元' }) });
     await totalTokens.locator('.metric-value', { hasText: '350' }).waitFor();
     const load = page.locator('.load-more .fui-Button');
