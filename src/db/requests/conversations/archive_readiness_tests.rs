@@ -2213,6 +2213,133 @@ async fn semantic_coverage_committed_recovery_contract(database_url: String) {
             .await
             .unwrap();
         let sources = manifest.raw_sources.unwrap();
+        // Frozen history keeps its exact bytes; its read interpretation uses
+        // the same current canonical handoff as physical GC classification.
+        let mut frozen = db
+            .request_archive_refs(fixture.key.key_id, fixture.request_id)
+            .await
+            .unwrap();
+        frozen.request_object = sources.request.object_locator.clone();
+        frozen.response_object = Some(sources.response.as_ref().unwrap().object_locator.clone());
+        frozen.request_archive_state = crate::model::RequestArchiveState::Bound;
+        frozen.response_archive_state = crate::model::RequestArchiveState::Bound;
+        frozen.request_archive_reason = None;
+        frozen.response_archive_reason = None;
+        frozen.semantic_archive = None;
+        let immutable = serde_json::to_vec(&frozen).unwrap();
+        let resolved = db
+            .resolve_history_raw_archive_roots(
+                fixture.key.tenant_id,
+                fixture.key.key_id,
+                frozen.clone(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            resolved.request_archive_reason.as_deref(),
+            Some("raw_retired_semantic_archive")
+        );
+        assert_eq!(
+            resolved.response_archive_reason.as_deref(),
+            Some("raw_retired_semantic_archive")
+        );
+        assert!(resolved.semantic_archive.is_some());
+        assert_eq!(serde_json::to_vec(&frozen).unwrap(), immutable);
+        let foreign = db
+            .resolve_history_raw_archive_roots(
+                fixture.key.tenant_id,
+                Uuid::now_v7(),
+                frozen.clone(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(serde_json::to_vec(&foreign).unwrap(), immutable);
+        let mut unconfigured_db = db.clone();
+        unconfigured_db.archive = None;
+        let unchanged = unconfigured_db
+            .resolve_history_raw_archive_roots(
+                fixture.key.tenant_id,
+                fixture.key.key_id,
+                frozen.clone(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(serde_json::to_vec(&unchanged).unwrap(), immutable);
+        let unavailable_archive = crate::archive::ArchiveStore::memory_for_test();
+        unavailable_archive
+            .restore_durable_root(
+                &format!(
+                    "tenants/{}/semantic/v2/requests/{}/1.json",
+                    fixture.key.tenant_id, fixture.request_id
+                ),
+                Bytes::from_static(b"unreadable optional publication metadata"),
+            )
+            .await
+            .unwrap();
+        let unavailable_db = db.clone().with_archive(unavailable_archive);
+        let unchanged = unavailable_db
+            .resolve_history_raw_archive_roots(
+                fixture.key.tenant_id,
+                fixture.key.key_id,
+                frozen.clone(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(serde_json::to_vec(&unchanged).unwrap(), immutable);
+        assert!(
+            unavailable_db
+                .resolve_raw_archive_roots(fixture.key.tenant_id, frozen.clone(),)
+                .await
+                .is_err()
+        );
+        let mut pending = frozen.clone();
+        pending.request_archive_state = crate::model::RequestArchiveState::Pending;
+        pending.response_archive_state = crate::model::RequestArchiveState::Bound;
+        pending.request_archive_reason = Some("archive_pending".into());
+        let pending_bytes = serde_json::to_vec(&pending).unwrap();
+        let unresolved = db
+            .resolve_history_raw_archive_roots(
+                fixture.key.tenant_id,
+                Uuid::now_v7(),
+                pending.clone(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(serde_json::to_vec(&unresolved).unwrap(), pending_bytes);
+        pending.response_object = Some("legacy-uncovered-response".into());
+        let mixed_bytes = serde_json::to_vec(&pending).unwrap();
+        let mixed = db
+            .resolve_history_raw_archive_roots(fixture.key.tenant_id, fixture.key.key_id, pending)
+            .await
+            .unwrap();
+        assert_eq!(serde_json::to_vec(&mixed).unwrap(), mixed_bytes);
+        let mut inline_response = frozen.clone();
+        inline_response.response_object = None;
+        inline_response.response_json = Some(serde_json::json!({"legacy": "inline"}));
+        let inline_bytes = serde_json::to_vec(&inline_response).unwrap();
+        let inline_resolved = db
+            .resolve_history_raw_archive_roots(
+                fixture.key.tenant_id,
+                fixture.key.key_id,
+                inline_response,
+            )
+            .await
+            .unwrap();
+        assert_eq!(serde_json::to_vec(&inline_resolved).unwrap(), inline_bytes);
+        let mut other_locator = frozen.clone();
+        other_locator.request_object =
+            format!("{}/different-source", sources.request.object_locator);
+        let unmatched_bytes = serde_json::to_vec(&other_locator).unwrap();
+        let unmatched = db
+            .resolve_history_raw_archive_roots(
+                fixture.key.tenant_id,
+                fixture.key.key_id,
+                other_locator.clone(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(serde_json::to_vec(&unmatched).unwrap(), unmatched_bytes);
+        assert_eq!(serde_json::to_vec(&other_locator).unwrap(), unmatched_bytes);
         for (side, source) in [
             ("request", sources.request),
             ("response", sources.response.unwrap()),
