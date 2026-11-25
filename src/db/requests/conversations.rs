@@ -572,22 +572,69 @@ impl Database {
                 return Ok(0);
             }
         }
-        let (outcome_predicate, lock) = match self.backend {
-            DatabaseBackend::PostgreSql => (
-                "o.statistics_outcome IS DISTINCT FROM 'session_body'",
-                " FOR UPDATE OF o SKIP LOCKED",
-            ),
-            DatabaseBackend::Sqlite => ("o.statistics_outcome IS NOT 'session_body'", ""),
-        };
-        let statement = format!(
-            "UPDATE conversation_projection_outbox SET projected_at = NULL, semantic_snapshot_json = NULL, semantic_payload_snapshot_json = NULL, lease_owner = '{SESSION_BODY_REBUILD_LEASE_OWNER}', lease_expires_at = 9223372036854775807, terminal_lease_owner = NULL, terminal_lease_expires_at = NULL, statistics_outcome = '{SESSION_BODY_REBUILD_OUTCOME}' WHERE request_id IN (SELECT o.request_id FROM conversation_projection_outbox o JOIN request_records r ON r.id = o.request_id WHERE o.projected_at IS NOT NULL AND {outcome_predicate} AND r.request_object <> '' AND r.response_object IS NOT NULL AND r.response_object <> '' ORDER BY o.observed_at ASC, o.request_id ASC LIMIT (SELECT CASE WHEN COUNT(*) >= $1 THEN 0 ELSE $1 - COUNT(*) END FROM conversation_projection_outbox WHERE projected_at IS NULL AND lease_owner = '{SESSION_BODY_REBUILD_LEASE_OWNER}'){lock})"
-        );
-        let updated = sqlx::query(sqlx::AssertSqlSafe(statement))
-            .bind(limit)
-            .execute(&mut *transaction)
-            .await?;
+        let pending: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM conversation_projection_outbox WHERE projected_at IS NULL AND lease_owner=$1")
+            .bind(SESSION_BODY_REBUILD_LEASE_OWNER).fetch_one(&mut *transaction).await?;
+        let mut remaining = limit.saturating_sub(pending).max(0);
+        let mut updated = 0_u64;
+        let mut cursor: Option<(i64, String)> = None;
+        while remaining > 0 {
+            // Page only durable non-partitioned obligations. Ineligible rows
+            // advance this cursor without taking row locks or starving later work.
+            let (after_time, after_id) = cursor.clone().unwrap_or((i64::MIN, String::new()));
+            let rows = sqlx::query("SELECT request_id, tenant_id, key_id, observed_at FROM conversation_projection_outbox WHERE projected_at IS NOT NULL AND COALESCE(statistics_outcome,'') <> 'session_body' AND (observed_at>$1 OR (observed_at=$1 AND request_id>$2)) ORDER BY observed_at,request_id LIMIT 100")
+                .bind(after_time).bind(after_id).fetch_all(&mut *transaction).await?;
+            if rows.is_empty() {
+                break;
+            }
+            for row in rows {
+                let request: String = row.try_get("request_id")?;
+                cursor = Some((row.try_get("observed_at")?, request.clone()));
+                let request_id = parse_uuid(request)?;
+                let tenant: String = row.try_get("tenant_id")?;
+                let tenant_id = parse_uuid(tenant.clone())?;
+                let key: String = row.try_get("key_id")?;
+                let Some(locator) = self
+                    .authoritative_request_locator_in_transaction(
+                        &mut transaction,
+                        request_id,
+                        tenant_id,
+                    )
+                    .await?
+                else {
+                    continue;
+                };
+                if locator.key_id.to_string() != key {
+                    continue;
+                }
+                let created = locator.created_at_predicate(self.backend, "r.created_at", "$4");
+                let lock = if matches!(self.backend, DatabaseBackend::PostgreSql) {
+                    " FOR UPDATE OF o SKIP LOCKED"
+                } else {
+                    ""
+                };
+                let statement = format!(
+                    "UPDATE conversation_projection_outbox SET projected_at=NULL, semantic_snapshot_json=NULL, semantic_payload_snapshot_json=NULL, lease_owner='session-body-rebuild', lease_expires_at=9223372036854775807, terminal_lease_owner=NULL, terminal_lease_expires_at=NULL, statistics_outcome='session_body' WHERE request_id IN (SELECT o.request_id FROM conversation_projection_outbox o WHERE o.request_id=$1 AND o.tenant_id=$2 AND o.key_id=$3 AND o.projected_at IS NOT NULL AND COALESCE(o.statistics_outcome,'') <> 'session_body' AND EXISTS (SELECT 1 FROM request_records r WHERE r.id=o.request_id AND r.tenant_id=o.tenant_id AND r.key_id=o.key_id AND {created} AND r.request_object<>'' AND r.response_object IS NOT NULL AND r.response_object<>''){lock})"
+                );
+                let query = sqlx::query(sqlx::AssertSqlSafe(statement))
+                    .persistent(false)
+                    .bind(request_id.to_string())
+                    .bind(&tenant)
+                    .bind(&key);
+                let query = if matches!(self.backend, DatabaseBackend::Sqlite) {
+                    query.bind(locator.created_at)
+                } else {
+                    query
+                };
+                let count = query.execute(&mut *transaction).await?.rows_affected();
+                updated += count;
+                remaining -= count as i64;
+                if remaining == 0 {
+                    break;
+                }
+            }
+        }
         transaction.commit().await?;
-        Ok(updated.rows_affected())
+        Ok(updated)
     }
 
     /// 回收已经投影完成且超过保留期的会话投影 outbox 行。
