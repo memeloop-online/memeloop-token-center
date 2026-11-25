@@ -104,9 +104,16 @@ try:
             sql(f"INSERT INTO request_events(event_id,tenant_id,key_id,request_id,event_at,event_kind,protocol,model,status_code,input_tokens,output_tokens,cost_micros) VALUES('{event}','{tenant}','{key}','{parent}',42,'finished','openai','synthetic-runtime',200,1,2,0)")
         return tenant, key, target, neighbour
     pages = []
+    native_pages = []
     if CHECKPOINT:
         # Historical synthetic rows exist before source capture is installed.
         tenant, key, target, neighbour = seed_events()
+        native_ids = sorted(str(uuid.uuid4()) for _ in range(2))
+        # Native rows are synthetic pre-capture history, distinct from event IDs.
+        for native_id in reversed(native_ids):
+            reservation = str(uuid.uuid4())
+            sql(f"INSERT INTO request_records(id,tenant_id,key_id,created_at,protocol,model,input_tokens,output_tokens,cost_micros,request_object,reservation_id,currency) VALUES('{native_id}','{tenant}','{key}',43,'openai','synthetic-runtime',0,0,0,'gap://fixture/request','{reservation}','USD')")
+            sql(f"INSERT INTO request_record_locators(id,created_at,tenant_id,key_id) VALUES('{native_id}',43,'{tenant}','{key}')")
     bootstrap = cli('request-history', 'bootstrap')
     assert sql('SELECT mode FROM request_history_state WHERE id=1') == 'off'
     cli('request-history', 'prepare-activation')
@@ -152,6 +159,40 @@ try:
         for source in ['archive','generation','native']:
             assert [x for x in json.loads(stable['cursor']) if x['source']==source] == [x for x in json.loads(before['cursor']) if x['source']==source]
         pages += [end, noop]
+    if CHECKPOINT:
+        def native_cursor():
+            return json.loads(sql("SELECT json_build_object('source',source,'after_id',after_id,'after_created_at',after_created_at,'legacy_after_id',legacy_after_id,'epoch',(SELECT epoch FROM request_history_activation WHERE id=1),'done',done<>0) FROM request_history_backfill WHERE source='native'"))
+        def native_page(expected, expect_changed=False):
+            return cli('request-history', 'backfill-page', '--source', 'native', '--page-size', '1', '--expected-checkpoint', json.dumps(expected), expect_changed=expect_changed)
+        native_initial = native_cursor()
+        native_before = fingerprint()
+        native_page(dict(native_initial, epoch=native_initial['epoch'] + 1), expect_changed=True)
+        assert fingerprint() == native_before
+        previous = native_initial
+        for native_id in native_ids:
+            result = native_page(previous)
+            assert result['before'] == previous and result['visited'] == result['actually_enqueued'] == 1
+            assert result['covered'] == result['conflict'] == 0
+            identity = result['identities'][0]
+            assert identity['source'] == 'native' and identity['request_id'] == native_id
+            assert result['after']['after_id'] == native_id and result['after']['after_created_at'] is None
+            actual_revision = int(sql(f"SELECT revision FROM request_history_export WHERE source='native' AND request_id='{native_id}' AND tenant_id='{tenant}' AND key_id='{key}' AND created_at=43"))
+            assert identity['revision'] == actual_revision
+            stable = fingerprint()
+            native_page(previous, expect_changed=True)
+            assert fingerprint() == stable
+            native_pages.append(result)
+            previous = result['after']
+        end = native_page(previous)
+        assert end['visited'] == 0 and end['after']['done'] is True
+        stable = fingerprint()
+        noop = native_page(end['after'])
+        assert noop['before'] == noop['after'] == end['after']
+        assert noop['visited'] == noop['actually_enqueued'] == noop['covered'] == noop['conflict'] == 0
+        assert fingerprint() == stable
+        for source in ['archive', 'generation', 'event']:
+            assert [x for x in json.loads(stable['cursor']) if x['source'] == source] == [x for x in json.loads(native_before['cursor']) if x['source'] == source]
+        native_pages += [end, noop]
     revision = int(sql(f"SELECT revision FROM request_history_export WHERE source='event' AND request_id='{target}'"))
     if CHECKPOINT:
         assert pages[0]['identities'][0]['revision'] == revision
@@ -189,7 +230,7 @@ try:
     assert fingerprint() == after
     table_uuid = click(f"SELECT toString(uuid) FROM system.tables WHERE database='{run}' AND name='request_history_v1'")
     assert table_uuid and uuid.UUID(table_uuid).int != 0
-    (evidence / 'receipt.json').write_text(json.dumps({'image': IMAGE, 'source': SOURCE, 'database': run, 'table_uuid': table_uuid, 'identity':row, 'wrong_scope':wrong_report,'exact_ack':report,'repeat':repeated,'cursor_unchanged_during_export':True,'neighbour_untouched':True,'checkpoint_pages':pages,'other_source_cursors_unchanged_during_event_pages':CHECKPOINT,'done_event_noop_unchanged':CHECKPOINT,'oci_page_scope':'event' if CHECKPOINT else None}, indent=2))
+    (evidence / 'receipt.json').write_text(json.dumps({'image': IMAGE, 'source': SOURCE, 'database': run, 'table_uuid': table_uuid, 'identity':row, 'wrong_scope':wrong_report,'exact_ack':report,'repeat':repeated,'cursor_unchanged_during_export':True,'neighbour_untouched':True,'checkpoint_pages':pages,'other_source_cursors_unchanged_during_event_pages':CHECKPOINT,'done_event_noop_unchanged':CHECKPOINT,'oci_page_scope':['event','native'] if CHECKPOINT else None,'native_checkpoint_pages':native_pages,'native_ack_verified':False}, indent=2))
     print('isolated immutable CLI checkpoint and exact event: PASS' if CHECKPOINT else 'isolated immutable CLI exact event: PASS')
 finally:
     for container in [pg, ch]:
