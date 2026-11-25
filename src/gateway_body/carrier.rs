@@ -113,6 +113,11 @@ impl AsRef<[u8]> for WorkspaceWrite {
     }
 }
 
+enum ResourceWake {
+    Memory(OwnedSemaphorePermit),
+    Workspace(Arc<crate::api::proxy::persistence::WorkspaceGuard>),
+}
+
 struct MultipartReplayOwner {
     _workspace: Arc<crate::api::proxy::persistence::WorkspaceGuard>,
     _exclusive: OwnedSemaphorePermit,
@@ -378,9 +383,8 @@ impl BodyCarrier {
             if let Some(credit) = credit {
                 let retained = source.memory.try_reserve_carrier_retained(chunk.len());
                 if retained.is_none() {
-                    // This chunk already owns real source credit. A busy or
-                    // unavailable spill must not turn free source RAM into a
-                    // false capture failure; later offers enforce the byte cap.
+                    // Preserve the existing response tap's opportunistic spill:
+                    // credited streams can exceed source RAM over their lifetime.
                     let _ = source.offload_one().await;
                 }
                 let bytes = source.leased_bytes(chunk, credit, retained);
@@ -408,16 +412,13 @@ impl BodyCarrier {
                         Ok(false) => {
                             break (source.reserve_workspace(part.len()).await?, None);
                         }
-                        Err(_) => {
-                            // Remote failure cannot discard the sole source. If
-                            // real RAM is available retain it and continue;
-                            // otherwise stop polling input and retry this owned
-                            // prefix, without a request deadline or fake seal.
-                            if let Some(lease) = source.memory.try_reserve_ingress_bytes(part.len())
+                        Err(error) => {
+                            if let Some(lease) = source
+                                .wait_after_spill(&source, part.len(), retry, &error)
+                                .await?
                             {
                                 break (lease, None);
                             }
-                            tokio::time::sleep(retry).await;
                             retry = (retry * 2).min(std::time::Duration::from_secs(300));
                         }
                     }
@@ -477,7 +478,27 @@ impl BodyCarrier {
     }
 
     async fn offload_one(&self) -> Result<bool, AppError> {
-        let _owner = self.offload.lock().await;
+        self.offload_one_with_workspace(None).await
+    }
+
+    async fn offload_one_with_workspace(
+        &self,
+        mut prepaid: Option<Arc<crate::api::proxy::persistence::WorkspaceGuard>>,
+    ) -> Result<bool, AppError> {
+        let _owner = if prepaid.is_some() {
+            match self.offload.try_lock() {
+                Ok(owner) => owner,
+                Err(_) => {
+                    // Another exact spill owns the target. Return our envelope
+                    // before waiting for it; re-evaluate RAM/segments afterwards.
+                    drop(prepaid.take());
+                    drop(self.offload.lock().await);
+                    return Ok(false);
+                }
+            }
+        } else {
+            self.offload.lock().await
+        };
         let Some(archive) = &self.archive else {
             return Ok(false);
         };
@@ -489,17 +510,20 @@ impl BodyCarrier {
         let Segment::Ram(bytes) = self.segments[index].lock().unwrap().clone() else {
             unreachable!()
         };
-        let workspace = self
-            .workspace
-            .as_ref()
-            .map(|owner| {
-                owner
-                    .try_multipart_workspace(
-                        crate::api::proxy::persistence::WorkspaceRole::CarrierSpill,
-                    )
-                    .map_err(|_| AppError::storage("carrier_workspace_unavailable"))
-            })
-            .transpose()?;
+        let workspace = match prepaid {
+            Some(workspace) => Some(workspace),
+            None => self
+                .workspace
+                .as_ref()
+                .map(|owner| {
+                    owner
+                        .try_multipart_workspace(
+                            crate::api::proxy::persistence::WorkspaceRole::CarrierSpill,
+                        )
+                        .map_err(|_| AppError::storage("carrier_workspace_unavailable"))
+                })
+                .transpose()?,
+        };
         let locator = format!(
             "{}/carrier-{}",
             self.staging.canonical_prefix(),
@@ -585,8 +609,12 @@ impl BodyCarrier {
                                 break;
                             }
                             Ok(false) => parent = source.parent.as_ref(),
-                            Err(_) => {
-                                tokio::time::sleep(retry).await;
+                            Err(error) => {
+                                if let Some(lease) =
+                                    self.wait_after_spill(source, bytes, retry, &error).await?
+                                {
+                                    return Ok(lease);
+                                }
                                 retry = (retry * 2).min(std::time::Duration::from_secs(300));
                                 released = true;
                                 break;
@@ -598,11 +626,70 @@ impl BodyCarrier {
                     }
                     return self.memory.reserve_carrier_bytes(bytes).await;
                 }
-                Err(_) => {
-                    tokio::time::sleep(retry).await;
+                Err(error) => {
+                    if let Some(lease) = self.wait_after_spill(self, bytes, retry, &error).await? {
+                        return Ok(lease);
+                    }
                     retry = (retry * 2).min(std::time::Duration::from_secs(300));
                 }
             }
+        }
+    }
+
+    /// Wait once on actual resource availability. Losing FIFO acquisitions are
+    /// dropped before a winning workspace starts I/O; no PUT is raced/cancelled.
+    async fn wait_after_spill(
+        &self,
+        target: &Self,
+        bytes: usize,
+        retry: std::time::Duration,
+        error: &AppError,
+    ) -> Result<Option<OwnedSemaphorePermit>, AppError> {
+        if matches!(
+            error,
+            AppError::Storage {
+                code: "carrier_workspace_unavailable",
+                ..
+            }
+        ) {
+            if let Some(persistence) = &target.workspace {
+                let winner = {
+                    let memory = self.memory.reserve_carrier_bytes(bytes);
+                    let workspace = persistence.multipart_workspace(
+                        crate::api::proxy::persistence::WorkspaceRole::CarrierSpill,
+                    );
+                    tokio::pin!(memory, workspace);
+                    tokio::select! {
+                        biased;
+                        lease = &mut memory => ResourceWake::Memory(lease?),
+                        workspace = &mut workspace => ResourceWake::Workspace(workspace?),
+                    }
+                };
+                return match winner {
+                    ResourceWake::Memory(lease) => Ok(Some(lease)),
+                    ResourceWake::Workspace(workspace) => {
+                        match target.offload_one_with_workspace(Some(workspace)).await {
+                            Ok(_) => Ok(None),
+                            // The remote attempt has ended. Retain source and
+                            // receipt while real I/O retry remains throttled.
+                            Err(_) => self.memory_or_retry(bytes, retry).await,
+                        }
+                    }
+                };
+            }
+        }
+        self.memory_or_retry(bytes, retry).await
+    }
+
+    async fn memory_or_retry(
+        &self,
+        bytes: usize,
+        retry: std::time::Duration,
+    ) -> Result<Option<OwnedSemaphorePermit>, AppError> {
+        tokio::select! {
+            biased;
+            lease = self.memory.reserve_carrier_bytes(bytes) => lease.map(Some),
+            () = tokio::time::sleep(retry) => Ok(None),
         }
     }
 
@@ -1398,3 +1485,7 @@ mod tests {
 #[cfg(test)]
 #[path = "carrier_small_put_tests.rs"]
 mod small_put_tests;
+
+#[cfg(test)]
+#[path = "carrier_resource_wakeup_tests.rs"]
+mod resource_wakeup_tests;
