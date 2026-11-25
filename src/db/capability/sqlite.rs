@@ -4,17 +4,6 @@ use sqlx::Row;
 
 impl Database {
     pub(in crate::db) async fn verify_sqlite_runtime(&self) -> Result<bool, sqlx::Error> {
-        let result = self.inspect_sqlite_runtime().await;
-        // Initialization intentionally sanitizes database errors. Tests need
-        // this catalog-only cause to identify the rejected schema invariant.
-        #[cfg(test)]
-        if let Err(error) = &result {
-            eprintln!("SQLite runtime catalog verification: {error}");
-        }
-        result
-    }
-
-    async fn inspect_sqlite_runtime(&self) -> Result<bool, sqlx::Error> {
         if !matches!(self.backend, DatabaseBackend::Sqlite) {
             return Ok(false);
         }
