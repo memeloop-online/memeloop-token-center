@@ -2323,16 +2323,10 @@ async fn semantic_coverage_committed_recovery_contract(database_url: String) {
 
 #[tokio::test]
 async fn sqlite_semantic_coverage_recovers_committed_projection_and_failed_put() {
-    let _ = tracing_subscriber::fmt()
-        .with_max_level(tracing::Level::DEBUG)
-        .with_test_writer()
-        .try_init();
     let directory = tempfile::tempdir().unwrap();
-    crate::error::with_fixture_protocol_diagnostic(semantic_coverage_committed_recovery_contract(
-        format!(
-            "sqlite://{}?mode=rwc",
-            directory.path().join("coverage.db").display()
-        ),
+    semantic_coverage_committed_recovery_contract(format!(
+        "sqlite://{}?mode=rwc",
+        directory.path().join("coverage.db").display()
     ))
     .await;
 }
