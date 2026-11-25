@@ -24,6 +24,13 @@ test("external staging mock reuses gateway JSON/SSE contracts and isolates failu
     assert.equal(failure.status, 503); await failure.arrayBuffer();
     const unknown = await fetch(`${url}/v1/chat/completions`, { method: "POST", body: "{}" });
     assert.equal(unknown.status, 404);
+    const evidence = await (await fetch(`${url}/evidence`)).json() as any;
+    assert(evidence.emitted_bytes >= 8192);
+    assert(evidence.emitted_chunks > 0);
+    const streamed = evidence.streams.find((row: any) => row.scenario === "normal" && row.emitted_chunks > 0);
+    assert(streamed?.first_write_at && streamed.last_write_at && streamed.ended_at);
+    assert(Date.parse(streamed.accepted_at) <= Date.parse(streamed.first_write_at));
+    assert(Date.parse(streamed.last_write_at) <= Date.parse(streamed.ended_at));
   } finally { server.closeAllConnections(); await new Promise<void>((resolve) => server.close(() => resolve())); }
 });
 
@@ -54,7 +61,7 @@ test("tool session mock preserves the tool-call identity through its result", as
 test("native Responses SSE exposes completed usage and output",async()=>{
   const {server}=createStagingMock();await new Promise<void>(resolve=>server.listen(0,"127.0.0.1",resolve));
   const address=server.address();assert(address&&typeof address!=="string");
-  try{const response=await fetch(`http://127.0.0.1:${address.port}/scenario/normal/v1/responses`,{method:"POST",body:JSON.stringify({model:"synthetic",input:"test",stream:true,benchmark:{bytes:8192}})});const text=await response.text();assert.match(text,/event: response.completed/);assert.match(text,/"input_tokens":2/);assert.match(text,/"output_text"/);}finally{server.closeAllConnections();await new Promise<void>(resolve=>server.close(()=>resolve()));}
+  try{const response:Response=await fetch(`http://127.0.0.1:${address.port}/scenario/normal/v1/responses`,{method:"POST",body:JSON.stringify({model:"synthetic",input:"test",stream:true,benchmark:{bytes:8192}})});const text=await response.text();assert.match(text,/event: response.completed/);assert.match(text,/"input_tokens":2/);assert.match(text,/"output_text"/);}finally{server.closeAllConnections();await new Promise<void>(resolve=>server.close(()=>resolve()));}
 });
 
 import { referencePlan } from "./reference-plan.ts";
@@ -86,7 +93,7 @@ test("qualifier rejects observations from another image, plan or baseline",()=>{
 
 test("buffered fixture sends actual large JSON and verifies payload size/content",async()=>{
   const {server}=createStagingMock();await new Promise<void>(resolve=>server.listen(0,"127.0.0.1",resolve));const address=server.address();assert(address&&typeof address!=="string");
-  try{for(const protocol of ["chat","responses"] as const){const bytes=256*1024;const response=await fetch(`http://127.0.0.1:${address.port}/scenario/normal/v1/${protocol==="chat"?"chat/completions":"responses"}`,{method:"POST",body:JSON.stringify({model:"synthetic",stream:false,benchmark:{mode:"buffered",bytes}})});const wire=new Uint8Array(await response.arrayBuffer());assert(wire.byteLength>bytes);const verifier=new FixtureVerifier(protocol,false,bytes);verifier.consume(wire);const result=verifier.finish(wire.byteLength);assert.equal(result.verified,true);assert.equal(result.response_payload_bytes,bytes);const wrong=new FixtureVerifier(protocol,false,bytes+1);wrong.consume(wire);assert.equal(wrong.finish(wire.byteLength).verified,false);}}finally{server.closeAllConnections();await new Promise<void>(resolve=>server.close(()=>resolve()));}
+  try{for(const protocol of ["chat","responses"] as const){const bytes=256*1024;const response: Response=await fetch(`http://127.0.0.1:${address.port}/scenario/normal/v1/${protocol==="chat"?"chat/completions":"responses"}`,{method:"POST",body:JSON.stringify({model:"synthetic",stream:false,benchmark:{mode:"buffered",bytes}})});const wire: Uint8Array=new Uint8Array(await response.arrayBuffer());assert(wire.byteLength>bytes);const verifier=new FixtureVerifier(protocol,false,bytes);verifier.consume(wire);const result=verifier.finish(wire.byteLength);assert.equal(result.verified,true);assert.equal(result.response_payload_bytes,bytes);const wrong=new FixtureVerifier(protocol,false,bytes+1);wrong.consume(wire);assert.equal(wrong.finish(wire.byteLength).verified,false);}}finally{server.closeAllConnections();await new Promise<void>(resolve=>server.close(()=>resolve()));}
 });
 
 import { targetEndpoints } from "./run.ts";

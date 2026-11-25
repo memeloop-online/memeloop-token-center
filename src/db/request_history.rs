@@ -773,6 +773,14 @@ impl Database {
     }
 
     pub async fn history_switch(&self, clickhouse: bool) -> Result<(), HistoryError> {
+        if clickhouse && matches!(self.backend, DatabaseBackend::PostgreSql) {
+            let client = crate::request_history::ClickHouse::reader_from_env(
+                self.http_clients
+                    .handle(crate::http_settings::HttpPurpose::General),
+            )?
+            .ok_or(HistoryError::Unavailable)?;
+            return self.history_switch_watermark(&client).await;
+        }
         if clickhouse && !self.history_activation_baseline_proved().await? {
             return Err(HistoryError::Changed);
         }

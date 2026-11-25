@@ -170,6 +170,10 @@ async fn contract(fixture: Fixture) {
         "statistics commit publishes once"
     );
     let statistics_event_id: String = statistics_event[0].get("event_id");
+    let statistics_cursor = (
+        statistics_event[0].get::<i64, _>("event_at"),
+        statistics_event_id.clone(),
+    );
     let (projected_at, usage_basis, stats_outcome): (Option<i64>, String, String) = sqlx::query_as(
         "SELECT projected_at, usage_basis, statistics_outcome FROM terminal_projection_outbox WHERE request_id = $1 AND tenant_id = $2 AND key_id = $3",
     )
@@ -214,6 +218,14 @@ async fn contract(fixture: Fixture) {
         .iter()
         .find(|row| row.get::<String, _>("event_id") != statistics_event_id)
         .unwrap();
+    let semantic_cursor = (
+        semantic_event.get::<i64, _>("event_at"),
+        semantic_event.get::<String, _>("event_id"),
+    );
+    assert!(
+        semantic_cursor > statistics_cursor,
+        "semantic event must be visible after the statistics cursor"
+    );
     assert_eq!(semantic_event.get::<i64, _>("status_code"), 429);
     assert_eq!(
         semantic_event.get::<i64, _>("duration_ms"),
@@ -310,7 +322,7 @@ async fn contract(fixture: Fixture) {
 
 async fn projected_events(fixture: &Fixture, request_id: Uuid) -> Vec<sqlx::any::AnyRow> {
     let events = sqlx::query(
-        "SELECT event_id, tenant_id, key_id, status_code, duration_ms, error_code FROM request_events WHERE request_id = $1 AND event_kind = 'projected' ORDER BY event_id",
+        "SELECT event_id, event_at, tenant_id, key_id, status_code, duration_ms, error_code FROM request_events WHERE request_id = $1 AND event_kind = 'projected' ORDER BY event_id",
     )
     .bind(request_id.to_string())
     .fetch_all(&fixture.database.pool)

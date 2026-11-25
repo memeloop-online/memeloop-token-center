@@ -13,7 +13,7 @@ on:
         description: Bounded browser contract set
         required: true
         type: choice
-        options: [viewer, account]
+        options: [viewer, account, network]
 permissions:
   contents: read
 jobs:
@@ -52,6 +52,9 @@ jobs:
       - name: Verify quota consent, unknown recovery and retained observations
         if: inputs.contract == 'account'
         run: MTC_REQUIRE_BROWSER=1 node --import tsx --test --test-concurrency=1 e2e/upstream-quota-browser-contract.test.ts e2e/quota-discovery-browser-contract.test.ts e2e/quota-reads-browser-contract.test.ts e2e/quota-semantics-browser-contract.test.ts
+      - name: Verify network policies, navigation and successful request reads
+        if: inputs.contract == 'network'
+        run: MTC_REQUIRE_BROWSER=1 node --import tsx --test --test-concurrency=1 e2e/request-egress-contract.test.ts e2e/transport-proxy-groups-browser-contract.test.ts e2e/request-lifecycle-browser-contract.test.ts e2e/operator-overview-drilldown-browser-contract.test.ts
       - name: Retain actual browser evidence
         if: always() && github.event_name == 'workflow_dispatch'
         uses: actions/upload-artifact@65462800fd760344b1a7b4382951275a0abb4808

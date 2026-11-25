@@ -7,6 +7,10 @@ test('egress preserves directional unknown and zero, historical snapshots, names
   for (const locale of ['zh-CN', 'en']) {
     assert.notEqual(egressBytes(null, locale), egressBytes(0, locale));
     assert.equal(egressBytes(0, locale), '0 B');
+    assert.equal(egressBytes(1000, locale), '1 KB');
+    assert.equal(egressBytes(1_000_000, locale), '1 MB');
+    assert.equal(egressBytes(1_000_000_000, locale), '1 GB');
+    assert.equal(egressBytes(-1, locale), egressBytes(null, locale));
     assert.equal(egressAddress(historicalExit, locale), 'socks5h://old.proxy.test:1080');
     assert.equal(egressAddress({ scheme: 'http', host: '2001:db8::1', port: 8080 }, locale), 'http://[2001:db8::1]:8080');
     assert.equal(egressAddress({ scheme: 'https', host: '[2001:db8::1]', port: 443 }, locale), 'https://[2001:db8::1]:443');
