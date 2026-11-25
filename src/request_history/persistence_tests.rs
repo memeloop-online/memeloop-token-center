@@ -930,6 +930,9 @@ async fn request_history_real_services_acceptance() {
     crate::request_history::migration::drain(&database, &client, 500)
         .await
         .unwrap();
+    // The CH read assertions above ran in clickhouse mode. A new watermark
+    // verification is a shadow-mode operation, as in the production workflow.
+    database.history_switch(false).await.unwrap();
     prove_activation_baseline(&database, &client).await;
     crate::request_history::migration::verify(&database, &client)
         .await
