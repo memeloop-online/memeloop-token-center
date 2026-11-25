@@ -2807,7 +2807,7 @@ async fn postgres_exact_legacy_body_rebuild_preserves_incomplete_and_financial_r
         "UPDATE conversation_projection_outbox SET lease_expires_at=-1 WHERE request_id=$1",
         "UPDATE conversation_projection_outbox SET terminal_lease_owner='00000000-0000-0000-0000-000000000001', terminal_lease_expires_at=9223372036854775807 WHERE request_id=$1",
         "UPDATE conversation_projection_outbox SET semantic_payload_snapshot_json='{}' WHERE request_id=$1",
-        "UPDATE request_records SET response_object='gap://changed/response' WHERE id=$1",
+        "UPDATE request_records SET response_object='gap://' || id || '/response' WHERE id=$1",
         "UPDATE request_records SET response_object=NULL WHERE id=$1",
     ] {
         sqlx::query("UPDATE conversation_projection_outbox SET semantic_snapshot_json=$2, semantic_payload_snapshot_json=NULL, lease_owner=$3, lease_expires_at=0, terminal_lease_owner=NULL, terminal_lease_expires_at=NULL WHERE request_id=$1")
