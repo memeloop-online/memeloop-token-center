@@ -1502,7 +1502,7 @@ impl Database {
                     sqlstate = retryable_sqlstate.unwrap_or("unclassified"),
                     "conversation projection transaction failed"
                 );
-                if rollback_confirmed && retryable_sqlstate.is_some() {
+                if rollback_confirmed && error.retry_after_confirmed_rollback() {
                     self.try_schedule_rolled_back_conversation_retry(request_id, lease_owner)
                         .await;
                 }
