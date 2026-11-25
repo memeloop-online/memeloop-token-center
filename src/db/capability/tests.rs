@@ -110,7 +110,7 @@ async fn postgres_capability_reader_permissions_do_not_authorize_gateway_writes(
         .fetch_one(&db.pool)
         .await
         .unwrap();
-    sqlx::query(sqlx::AssertSqlSafe(format!("GRANT USAGE ON SCHEMA {schema} TO {role}; GRANT SELECT ON ALL TABLES IN SCHEMA {schema} TO {role}"))).execute(&db.pool).await.unwrap();
+    sqlx::raw_sql(sqlx::AssertSqlSafe(format!("GRANT USAGE ON SCHEMA {schema} TO {role}; GRANT SELECT ON ALL TABLES IN SCHEMA {schema} TO {role}"))).execute(&db.pool).await.unwrap();
     let mut tx = db.pool.begin().await.unwrap();
     sqlx::query(sqlx::AssertSqlSafe(format!("SET LOCAL ROLE {role}")))
         .execute(&mut *tx)
@@ -127,7 +127,7 @@ async fn postgres_capability_reader_permissions_do_not_authorize_gateway_writes(
             .is_err()
     );
     tx.rollback().await.unwrap();
-    sqlx::query(sqlx::AssertSqlSafe(format!(
+    sqlx::raw_sql(sqlx::AssertSqlSafe(format!(
         "DROP OWNED BY {role}; DROP ROLE {role}"
     )))
     .execute(&db.pool)
