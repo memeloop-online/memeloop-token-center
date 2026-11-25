@@ -1859,3 +1859,7 @@ mod tests {
             .unwrap();
     }
 }
+
+#[cfg(test)]
+#[path = "workspace_fairness_contracts.rs"]
+mod workspace_fairness_contracts;
