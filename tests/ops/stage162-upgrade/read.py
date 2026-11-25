@@ -48,6 +48,16 @@ if retired:
  texts=[]
  while True:
   for item in page['instances']:
+   if os.environ.get('E2E_LEGACY_ATOM')=='1':
+    atom=json.loads(get(path+'?'+urllib.parse.urlencode({'atom_cursor':item['atom_cursor']})))
+    def collect(value):
+     if isinstance(value,str): texts.append(value)
+     elif isinstance(value,dict):
+      for child in value.values(): collect(child)
+     elif isinstance(value,list):
+      for child in value: collect(child)
+    collect(atom)
+    continue
    parts=json.loads(get(path+'?'+urllib.parse.urlencode({'parts_cursor':item['atom_cursor']})))
    for part in parts.get('parts',[]):
     for field in part.get('fields',[]):
