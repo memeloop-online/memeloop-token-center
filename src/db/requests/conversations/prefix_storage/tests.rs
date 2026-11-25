@@ -649,7 +649,8 @@ async fn prepared_paths_contract(url: &str) {
     );
     let foreign = prepared
         .for_fresh_candidates(&Uuid::now_v7().to_string(), &candidates, Some(&leaf))
-        .unwrap_err();
+        .err()
+        .expect("foreign tenant must reject prepared content");
     assert!(
         !foreign.retry_after_confirmed_rollback(),
         "tenant mismatch is not candidate churn"
