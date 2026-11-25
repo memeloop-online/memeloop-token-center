@@ -1,5 +1,5 @@
 use super::*;
-use crate::db::{Database, DatabaseBackend, POSTGRES_MIGRATIONS};
+use crate::db::{Database, DatabaseBackend, migrations::POSTGRES_MIGRATIONS};
 use sqlx::{AnyConnection, Connection, Row};
 
 fn drift(message: &str) -> sqlx::Error {

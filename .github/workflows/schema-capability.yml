@@ -34,6 +34,8 @@ jobs:
           toolchain: 1.95.0
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6
       - uses: ./.github/actions/checkout-plugin-examples
+      - name: Verify production library compilation
+        run: cargo check --locked --all-features --lib
       - name: Verify low-lock partitioned migration with real PostgreSQL
         run: |
           cargo test --locked --all-features --lib postgres_capability_ -- --nocapture
