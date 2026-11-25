@@ -898,6 +898,8 @@ jobs:
             db::history_source_snapshot::tests::request_history_baseline_event_cursor_reuses_frozen_authority \
             request_history::persistence_tests::request_history_real_services_acceptance_event_original_survives_ack_and_source_removal
           do
-            cargo test --locked --all-features --lib "$selector" -- --ignored --exact --nocapture --test-threads=1 2>&1 | tee /tmp/history-event-only.log
+            ignored=--ignored
+            if [[ "$selector" == db::history_source_snapshot::tests::request_history_baseline_event_cursor_reuses_frozen_authority ]]; then ignored=; fi
+            cargo test --locked --all-features --lib "$selector" -- $ignored --exact --nocapture --test-threads=1 2>&1 | tee /tmp/history-event-only.log
             grep -F '1 passed; 0 failed' /tmp/history-event-only.log
           done
