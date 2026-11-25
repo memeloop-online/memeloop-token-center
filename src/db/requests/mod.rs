@@ -11,6 +11,8 @@ mod session_routing;
 mod settlement;
 mod stats;
 mod terminal_projection;
+mod terminal_recovery;
+pub use terminal_recovery::{TerminalRecoveryIdentity, TerminalRecoveryReport};
 pub(crate) mod terminal_timings;
 
 pub use conversations::ConversationProjectionTask;

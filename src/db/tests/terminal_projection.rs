@@ -4,6 +4,7 @@ use std::time::Duration;
 
 mod archive_binding;
 mod cache_coverage;
+mod exact_recovery;
 mod fact_read;
 mod recovery;
 mod semantic_isolation;
