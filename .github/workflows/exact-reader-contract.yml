@@ -338,6 +338,7 @@ jobs:
           MTC_RUSTFS_TEST_SECRET_KEY: synthetic-test-only-secret-707
         run: |
           set -o pipefail
+          cargo test --locked --lib --no-run
           timeout 180s cargo test --locked --lib gateway_body::carrier::small_put_tests::real_s3_workspace_range_round_trip_comparison -- --ignored --exact --nocapture 2>&1 | tee /tmp/range-contract.log
           grep -F '1 passed; 0 failed' /tmp/range-contract.log
 
