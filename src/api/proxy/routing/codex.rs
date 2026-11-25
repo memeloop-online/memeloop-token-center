@@ -535,6 +535,7 @@ async fn send_codex_attempt_once(
         );
         let mut egress = None;
         let mut remote_reset = false;
+        let mut wire_delivery = CodexWireDelivery::Unknown;
         let upstream_result = send_until_request_deadline(deadline.request, async {
         async {
             let mut request = request?;
@@ -557,6 +558,7 @@ async fn send_codex_attempt_once(
         .map_err(|error| {
             remote_reset = upstream_response::codex_http2_error(&error)
                 .is_some_and(|error| error.is_reset() && error.is_remote() && !error.is_library());
+            wire_delivery = codex_wire_delivery(&error, body_consumption.polls(), body_consumption.bytes());
             http2_evidence.observe_error(&error, true);
             tracing::warn!(
                 %request_id,
@@ -610,7 +612,7 @@ async fn send_codex_attempt_once(
                 };
                 return Ok((response, upstream_activity, egress_selection));
             }
-            Err(_) if remote_reset && *h2_recovery_available => {
+            Err(_) if remote_reset && wire_delivery.can_replay() && *h2_recovery_available => {
                 *h2_recovery_available = false;
                 tracing::warn!(
                     %request_id,
@@ -637,6 +639,38 @@ async fn send_codex_attempt_once(
     }
 }
 
+/// Evidence belongs to this attempt before any response headers exist.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum CodexWireDelivery {
+    ConfirmedNotSent,
+    Unknown,
+}
+
+impl CodexWireDelivery {
+    fn can_replay(self) -> bool {
+        self == Self::ConfirmedNotSent
+    }
+}
+
+fn codex_wire_delivery(
+    error: &reqwest::Error,
+    body_polls: u64,
+    body_bytes: u64,
+) -> CodexWireDelivery {
+    // A native connect error establishes failure before HTTP dispatch. Body
+    // observation only disqualifies this proof; zero polls alone proves nothing.
+    if error.is_connect()
+        && body_polls == 0
+        && body_bytes == 0
+        && upstream_response::codex_http2_failure(error).is_none()
+        && !crate::simple_http::classify_transport(error).connection_reset
+    {
+        CodexWireDelivery::ConfirmedNotSent
+    } else {
+        CodexWireDelivery::Unknown
+    }
+}
+
 fn classify_codex_send_error(
     error: reqwest::Error,
     body_polls: u64,
@@ -650,16 +684,8 @@ fn classify_codex_send_error(
         ProxySendError::NonRetryableTransport(kind)
     } else {
         let class = crate::simple_http::classify_transport(&error);
-        if class.pre_delivery() {
+        if codex_wire_delivery(&error, body_polls, body_bytes).can_replay() {
             return ProxySendError::RetryableConnection(class.stage());
-        }
-        // reqwest surfaces a `connect_timeout` expiry as a plain request timeout,
-        // not as a connect error, so `pre_delivery()` cannot see it. With zero
-        // body polls the request body never reached the wire, so the logical
-        // request was provably not delivered; replaying it on another candidate
-        // (or another sticky exit) cannot double-charge the upstream.
-        if class.timeout && body_polls == 0 && body_bytes == 0 {
-            return ProxySendError::RetryableConnection("connect_timeout");
         }
         // A send error after the request leaves the client is ambiguous and is
         // never replayed by this state machine.
