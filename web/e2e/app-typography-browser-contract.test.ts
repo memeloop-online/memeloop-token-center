@@ -86,7 +86,9 @@ test('production AppShell typography and actions share Fluent tokens in both the
       assert.equal(typography.radius, typography.radiusToken);
       assert.equal(typography.overflow, false);
       assert.equal(await load.evaluate(element => element === document.activeElement), true);
-      assert.equal(await page.locator('.segmented .fui-ToggleButton[aria-pressed="true"]').count(), 1);
+      const modes = page.getByRole('tablist', { name: '实时活动', exact: true });
+      assert.equal(await modes.getByRole('tab', { selected: true }).count(), 1);
+      assert.equal(await modes.getByRole('tab', { name: '请求', exact: true }).getAttribute('aria-selected'), 'true');
       // Focus below the fold scrolls the viewport. Return to the top before a
       // full-page capture so fixed shell elements are not painted mid-page.
       await page.evaluate(() => window.scrollTo({ top: 0, behavior: 'instant' }));
