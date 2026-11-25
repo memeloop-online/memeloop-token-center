@@ -422,7 +422,6 @@ impl RequestSpoolAdmission {
         let capture_summary = capture_timing::CaptureSummary::new(body_key);
         let timing = capture_summary.timing();
         let input = timing.input(body.into_data_stream()).map(|chunk| {
-            let scan_started = std::time::Instant::now();
             let chunk = chunk.map_err(|_| {
                 timing.error();
                 RequestSpoolCaptureError::BodyReadRejected
@@ -437,9 +436,11 @@ impl RequestSpoolAdmission {
                 .map_err(|_| RequestSpoolCaptureError::Unavailable)?
                 .record_written(chunk.len());
             length += chunk.len();
+            let scan_started = std::time::Instant::now();
             hasher.update(&chunk);
             scanner.observe(&chunk);
-            timing.scan(scan_started, chunk.len());
+            let scan_elapsed = scan_started.elapsed();
+            timing.scan(scan_elapsed, chunk.len());
             Ok(chunk)
         });
         let (body, carrier) = if let Some(memory) = memory {

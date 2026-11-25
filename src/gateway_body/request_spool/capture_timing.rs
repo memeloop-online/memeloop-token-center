@@ -1,4 +1,4 @@
-//! One capture summary. Input wall includes scheduling after a pending poll;
+//! One stream-stage summary after metadata reservation and declared-size checks. Input wall includes scheduling after a pending poll;
 //! remaining time is deliberately not attributed to storage.
 use futures_util::Stream;
 use std::{
@@ -43,13 +43,13 @@ impl Drop for CaptureSummary {
         let remaining = total
             .saturating_sub(totals.input)
             .saturating_sub(totals.scan);
-        tracing::info!(request_id=?self.request_id, phase="request_body_capture", input_wall_ms=totals.input.as_secs_f64()*1000., hash_scanner_elapsed_ms=totals.scan.as_secs_f64()*1000., remaining_elapsed_ms=remaining.as_secs_f64()*1000., total_elapsed_ms=total.as_secs_f64()*1000., bytes=totals.bytes, chunks=totals.chunks, outcome=if totals.error {"error"} else if totals.eof {"eof"} else {"drop"}, "request body capture summary");
+        tracing::info!(request_id=?self.request_id, phase="request_body_stream_capture", input_wall_ms=totals.input.as_secs_f64()*1000., hash_scanner_elapsed_ms=totals.scan.as_secs_f64()*1000., remaining_elapsed_ms=remaining.as_secs_f64()*1000., total_elapsed_ms=total.as_secs_f64()*1000., bytes=totals.bytes, chunks=totals.chunks, outcome=if totals.error {"error"} else if totals.eof {"eof"} else {"drop"}, "request body stream capture summary");
     }
 }
 impl Timing {
-    pub(super) fn scan(&self, started: Instant, bytes: usize) {
+    pub(super) fn scan(&self, elapsed: Duration, bytes: usize) {
         let mut t = self.0.lock().unwrap();
-        t.scan += started.elapsed();
+        t.scan += elapsed;
         t.bytes += bytes as u64;
         t.chunks += 1;
     }
@@ -115,7 +115,7 @@ mod tests {
         let bytes = input.next().await.unwrap();
         let scan = Instant::now();
         let hash = blake3::hash(&bytes);
-        timing.scan(scan, bytes.len());
+        timing.scan(scan.elapsed(), bytes.len());
         let input_before = timing.0.lock().unwrap().input;
         // A separate consumer-side gate stands for carrier preservation. It
         // must never be counted as awaiting the next incoming frame.
