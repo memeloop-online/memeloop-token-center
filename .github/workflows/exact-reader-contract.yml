@@ -894,6 +894,7 @@ jobs:
         run: |
           set -o pipefail
           for selector in \
+            request_history::migration::exact_export_report_tests::zero_match_or_zero_ack_is_not_completion \
             db::history_immutable_outbox::tests::sqlite_exact_event_export_preserves_scope_ceiling_and_frozen_retry \
             db::history_immutable_outbox::tests::postgres_exact_event_export_preserves_scope_ceiling_and_frozen_retry \
             db::request_history::event_backfill_tests::request_history_real_services_acceptance_event_backfill_time_cursor \
@@ -901,7 +902,7 @@ jobs:
             db::request_history::tests::request_history_real_services_acceptance_event_original_survives_ack_and_source_removal
           do
             ignored=--ignored
-            if [[ "$selector" == db::history_source_snapshot::tests::request_history_baseline_event_cursor_reuses_frozen_authority || "$selector" == db::history_immutable_outbox::tests::sqlite_exact_event_export_preserves_scope_ceiling_and_frozen_retry ]]; then ignored=; fi
+            if [[ "$selector" == db::history_source_snapshot::tests::request_history_baseline_event_cursor_reuses_frozen_authority || "$selector" == request_history::migration::exact_export_report_tests::zero_match_or_zero_ack_is_not_completion || "$selector" == db::history_immutable_outbox::tests::sqlite_exact_event_export_preserves_scope_ceiling_and_frozen_retry ]]; then ignored=; fi
             cargo test --locked --all-features --lib "$selector" -- $ignored --exact --nocapture --test-threads=1 2>&1 | tee /tmp/history-event-only.log
             grep -F '1 passed; 0 failed' /tmp/history-event-only.log
           done
