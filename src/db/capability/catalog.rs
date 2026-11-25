@@ -19,6 +19,7 @@ pub(in crate::db) async fn inspect(
     let rows = sqlx::query("SELECT version,name FROM schema_migrations ORDER BY version")
         .fetch_all(&mut *c)
         .await?;
+    let rows = super::sql_schema_rows(rows)?;
     let versions: Vec<i64> = rows
         .iter()
         .map(|r| r.try_get("version"))
@@ -185,6 +186,11 @@ impl Database {
         role: CapabilityRole,
     ) -> Result<Option<CapabilityReport>, sqlx::Error> {
         if !matches!(self.backend, DatabaseBackend::PostgreSql) {
+            if !self.verify_sqlite_runtime().await? {
+                return Err(drift(
+                    "SQLite runtime requires completed supported migrations",
+                ));
+            }
             return Ok(None);
         }
         let mut c = self.pool.acquire().await?;

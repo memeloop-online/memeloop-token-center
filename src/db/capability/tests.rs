@@ -8,6 +8,22 @@ async fn postgres_capability_163_skips_hot_ddl_and_preserves_true_ledger() {
     let isolated = PostgresTestDatabase::create(&url).await;
     let db = Database::connect_with_max(isolated.url(), 6).await.unwrap();
     db.migrate().await.unwrap();
+    db.convert_sealed_state(b"postgres-runtime-test-pepper")
+        .await
+        .unwrap();
+    db.close().await;
+    let db = Database::connect_with_max(isolated.url(), 6).await.unwrap();
+    let mut receipt_mutation = db.pool.begin().await.unwrap();
+    sqlx::query("UPDATE schema_migrations SET name='unrecognized conversion' WHERE version=142")
+        .execute(&mut *receipt_mutation)
+        .await
+        .unwrap();
+    assert!(
+        super::catalog::inspect(&mut receipt_mutation, CapabilityRole::Gateway)
+            .await
+            .is_err()
+    );
+    receipt_mutation.rollback().await.unwrap();
     let modern = db
         .verify_capabilities(CapabilityRole::Gateway)
         .await

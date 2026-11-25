@@ -35,6 +35,12 @@ pub(crate) struct Migration {
     pub(crate) sql: &'static str,
 }
 
+// Rust data conversions share the historical ledger but are not SQL schema
+// steps. Keep their identity owned by the conversion that writes the receipt.
+pub(crate) fn is_data_conversion_receipt(version: i64, name: &str) -> bool {
+    version == plaintext_sweep::SWEEP_VERSION && name == plaintext_sweep::SWEEP_NAME
+}
+
 pub(crate) const SQLITE_MIGRATIONS: &[Migration] = &[
     Migration {
         version: 1,
@@ -1890,7 +1896,18 @@ impl Database {
             maintain_postgres_partitions(&mut transaction).await?;
         }
         transaction.commit().await?;
-        self.install_schema_track(super::capability::SchemaTrack::Linear165)?;
+        if matches!(self.backend, DatabaseBackend::Sqlite) {
+            // Release the migration connection before validation borrows the
+            // pool, including single-connection in-memory databases.
+            drop(connection);
+            if !self.verify_sqlite_runtime().await? {
+                return Err(sqlx::Error::Protocol(
+                    "SQLite runtime migrations did not establish a supported schema".into(),
+                ));
+            }
+        } else {
+            self.install_schema_track(super::capability::SchemaTrack::Linear165)?;
+        }
         Ok(())
     }
 
