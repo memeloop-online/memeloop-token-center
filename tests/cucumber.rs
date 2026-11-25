@@ -3412,18 +3412,19 @@ async fn mock_oversized_openai_image_generation(world: &mut TokenCenterWorld) {
         .await;
 }
 
-#[given("the mock OpenAI Images upstream rejects with a sensitive error body")]
-async fn mock_sensitive_openai_image_rejection(world: &mut TokenCenterWorld) {
+const IMAGE_REJECTION_BODY: &str = r#"{ "error": {"message":"image provider rejected this prompt", "code":"fixture_image_rejection"} }"#;
+
+#[given("the mock OpenAI Images upstream returns a fixed rejection")]
+async fn mock_openai_image_rejection(world: &mut TokenCenterWorld) {
     Mock::given(method("POST"))
         .and(path("/v1/images/generations"))
         .and(header("authorization", "Bearer image-secret"))
         .and(header_exists("idempotency-key"))
-        .respond_with(ResponseTemplate::new(400).set_body_json(json!({
-            "error": {
-                "message": "provider detail remains available",
-                "signed_url": "https://images.example.invalid/result.png?token=image-credential-must-not-leak"
-            }
-        })))
+        .respond_with(
+            ResponseTemplate::new(400)
+                .insert_header("content-type", "application/json")
+                .set_body_bytes(IMAGE_REJECTION_BODY.as_bytes().to_vec()),
+        )
         .expect(1)
         .mount(world.mock.as_ref().expect("mock server"))
         .await;
@@ -4639,26 +4640,31 @@ async fn oversized_openai_image_is_unbilled(world: &mut TokenCenterWorld) {
     assert_eq!(key["available_balance"], "0.3");
 }
 
-#[then("the upstream image rejection is sanitized archived as a gap and replayed safely")]
-async fn sensitive_openai_image_rejection_is_sanitized(world: &mut TokenCenterWorld) {
-    assert_eq!(world.status, Some(StatusCode::BAD_GATEWAY));
-    let rendered = world.response.to_string();
-    assert!(rendered.contains("provider detail remains available"));
-    assert!(!rendered.contains("image-credential-must-not-leak"));
-    assert!(!rendered.contains("image-secret"));
-    assert_eq!(world.response["error"]["code"], "upstream_http_400");
+#[then(
+    "the client receives the original image error and repeat submission returns only recorded failure"
+)]
+async fn openai_image_rejection_is_forwarded_without_retention(world: &mut TokenCenterWorld) {
+    assert_eq!(world.status, Some(StatusCode::BAD_REQUEST));
+    assert_eq!(
+        world.synchronous_response_body,
+        IMAGE_REJECTION_BODY.as_bytes()
+    );
     let request_id = world
         .synchronous_request_id
         .expect("rejected synchronous image request id");
     let replay = replay_openai_compatible_image(world).await;
     assert_eq!(replay.status(), StatusCode::BAD_GATEWAY);
+    let expected_request_id = request_id.to_string();
     assert_eq!(
         replay
-            .json::<Value>()
-            .await
-            .expect("sanitized rejection replay"),
-        world.response
+            .headers()
+            .get("x-mtc-request-id")
+            .and_then(|value| value.to_str().ok()),
+        Some(expected_request_id.as_str())
     );
+    let recorded: Value = replay.json().await.expect("recorded image failure");
+    assert_eq!(recorded["error"]["code"], "upstream_http_400");
+    assert!(!recorded.to_string().contains("fixture_image_rejection"));
     let state = world.state.clone().expect("test application state");
     let refs = state
         .db
@@ -4688,7 +4694,7 @@ async fn sensitive_openai_image_rejection_is_sanitized(world: &mut TokenCenterWo
     assert_eq!(detail["cost"], "0");
     assert!(detail["response_body"].is_null());
     assert_eq!(detail["archive_complete"], false);
-    assert!(!detail.to_string().contains("must-not-leak"));
+    assert!(!detail.to_string().contains("fixture_image_rejection"));
 }
 
 #[given("the mock Codex Responses upstream returns a generated icon")]
@@ -5082,6 +5088,47 @@ async fn mock_successful_openai(world: &mut TokenCenterWorld) {
         })))
         .mount(world.mock.as_ref().expect("mock server"))
         .await;
+}
+
+const CHAT_REJECTION_BYTES: &[u8] = b"provider rejected this input\r\nsecond line\n";
+
+#[given("the mock OpenAI upstream returns a non-JSON chat rejection")]
+async fn mock_openai_chat_http_rejection(world: &mut TokenCenterWorld) {
+    Mock::given(method("POST"))
+        .and(path("/v1/chat/completions"))
+        .respond_with(
+            ResponseTemplate::new(418)
+                .set_body_raw(CHAT_REJECTION_BYTES.to_vec(), "text/plain")
+                .insert_header("content-language", "en")
+                .insert_header("set-cookie", "private-provider-cookie=fixture"),
+        )
+        .expect(1)
+        .mount(world.mock.as_ref().expect("mock server"))
+        .await;
+}
+
+#[then(expr = "calling chat for model {string} returns the original upstream rejection")]
+async fn original_openai_chat_http_rejection(world: &mut TokenCenterWorld, model: String) {
+    let response = world
+        .client
+        .post(format!("{}/v1/chat/completions", world.service_url))
+        .bearer_auth(&world.current_key)
+        .json(&json!({"model": model, "messages": [{"role": "user", "content": "hi"}]}))
+        .send()
+        .await
+        .expect("chat request");
+    assert_eq!(response.status(), StatusCode::IM_A_TEAPOT);
+    assert_eq!(
+        response.headers()[reqwest::header::CONTENT_TYPE],
+        "text/plain"
+    );
+    assert_eq!(response.headers()[reqwest::header::CONTENT_LANGUAGE], "en");
+    assert!(!response.headers().contains_key(reqwest::header::SET_COOKIE));
+    assert_eq!(
+        response.bytes().await.unwrap().as_ref(),
+        CHAT_REJECTION_BYTES
+    );
+    world.mock.as_ref().unwrap().verify().await;
 }
 
 #[given("the mock OpenAI Responses upstream returns cached priority usage")]

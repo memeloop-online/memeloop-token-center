@@ -44,6 +44,7 @@ async fn discarded_attempts_retain_distinct_originals_without_overwriting_final_
                 &state,
                 identity,
                 crate::archive::RawResponseAttempt {
+                    subattempt: 0,
                     outbound_attempt: ordinal,
                     upstream_account_id: Uuid::now_v7(),
                     model_route_id: Uuid::now_v7(),
@@ -514,7 +515,7 @@ async fn encoded_buffered_upstream_is_rejected_once_without_replay() {
 }
 
 #[tokio::test]
-async fn original_rejection_is_archived_without_leaking_it_into_the_delivered_error() {
+async fn original_http_rejection_is_delivered_and_archived_byte_for_byte() {
     let upstream = MockServer::start().await;
     let original = br#"{ "error": { "message": "private-original-provider-text", "opaque": {"tool_call_id":"call-1"} } }"#;
     Mock::given(method("POST"))
@@ -530,7 +531,7 @@ async fn original_rejection_is_archived_without_leaking_it_into_the_delivered_er
     let delivered = to_bytes(response.into_body(), MAX_PROXY_RESPONSE_BODY)
         .await
         .unwrap();
-    assert!(!String::from_utf8_lossy(&delivered).contains("private-original-provider-text"));
+    assert_eq!(delivered.as_ref(), original.as_slice());
     let pool = sqlx::AnyPool::connect(&fixture.database_url).await.unwrap();
     tokio::time::timeout(Duration::from_secs(5), async {
         loop {
@@ -563,7 +564,7 @@ async fn original_rejection_is_archived_without_leaking_it_into_the_delivered_er
         }
     })
     .await
-    .expect("safe delivery must not replace the original archive");
+    .expect("delivery must not replace the original archive");
     pool.close().await;
     upstream.verify().await;
 }

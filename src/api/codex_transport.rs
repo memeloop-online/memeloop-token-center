@@ -40,7 +40,7 @@ mod chat_tools;
 #[cfg(test)]
 use bad_request::codex_transient_error;
 pub(super) use bad_request::{
-    BadRequestDisposition, BadRequestUnclassifiableReason, classify_bad_request_with_details,
+    BadRequestDisposition, BadRequestUnclassifiableReason, inspect_bad_request_response,
 };
 
 pub(in crate::api) const DRIVER: &str = "openai-codex";

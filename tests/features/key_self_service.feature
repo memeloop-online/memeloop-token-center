@@ -31,6 +31,12 @@ Feature: Stable key identity and read-only self-service statistics
     Then global operator statistics contain both tenant requests
     And tenant filtered operator statistics contain only "first-import"
 
+  Scenario: Chat returns the upstream HTTP rejection without rewriting it
+    Given a token center backed by SQLite and memory object storage
+    And the mock OpenAI upstream returns a non-JSON chat rejection
+    When the service creates a key for principal "text-rejection" allowing model "gpt-test"
+    Then calling chat for model "gpt-test" returns the original upstream rejection
+
   Scenario: Model permission is enforced before proxying
     Given a token center backed by SQLite and memory object storage
     When the service creates a key for principal "bob" allowing model "allowed-model"
@@ -391,13 +397,13 @@ Feature: Stable key identity and read-only self-service statistics
     Then the response status is 409
     And the oversized image is quarantined and reconciled with no partial response archive
 
-  Scenario: OpenAI image provider errors never expose or archive the upstream body
+  Scenario: The original provider rejection is delivered once without retaining its body
     Given a token center backed by SQLite and memory object storage
-    And the mock OpenAI Images upstream rejects with a sensitive error body
+    And the mock OpenAI Images upstream returns a fixed rejection
     When the service creates a metered OpenAI Images route and key
     And the client creates an OpenAI-compatible image
-    Then the response status is 502
-    And the upstream image rejection is sanitized archived as a gap and replayed safely
+    Then the response status is 400
+    And the client receives the original image error and repeat submission returns only recorded failure
 
   Scenario: Codex Responses image tools are exposed as the OpenAI Images API
     Given a token center backed by SQLite and memory object storage

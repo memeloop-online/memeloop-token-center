@@ -166,13 +166,14 @@ impl ImageUpstreamTransport {
         }
     }
 
-    async fn classify_rate_limit(
+    fn rejection_response(
         self,
         response: reqwest::Response,
-    ) -> crate::db::UpstreamFailureKind {
+    ) -> crate::api::proxy::upstream_response::UpstreamResponse {
+        use crate::api::proxy::upstream_response::UpstreamResponse;
         match self {
-            Self::Reqwest => crate::api::classify_media_rate_limit(response).await,
-            Self::Codex => crate::api::proxy::classify_codex_media_rate_limit(response).await,
+            Self::Reqwest => UpstreamResponse::Reqwest(response),
+            Self::Codex => UpstreamResponse::Codex(response),
         }
     }
 }
@@ -280,7 +281,7 @@ fn image_submission_state_unavailable(request_id: Uuid) -> Response {
         .expect("static submission-state headers")
 }
 
-async fn quarantine_image_request(context: &SyncImageRequest<'_>) -> Response {
+async fn quarantine_image_request(context: &SyncImageRequest<'_>) -> (Response, bool) {
     if let Err(error) = context
         .state
         .db
@@ -297,9 +298,15 @@ async fn quarantine_image_request(context: &SyncImageRequest<'_>) -> Response {
         // reconciliation action whose durable publication was not confirmed.
         tracing::warn!(request_id=%context.request_id, error_category=error.diagnostic_category(),
             "image uncertainty publication unavailable; this recovery attempt will not release or resubmit without authoritative verification");
-        return image_submission_state_unavailable(context.request_id);
+        return (
+            image_submission_state_unavailable(context.request_id),
+            false,
+        );
     }
-    uncertain_image_response(context.request_id, Some(true))
+    (
+        uncertain_image_response(context.request_id, Some(true)),
+        true,
+    )
 }
 
 pub(super) async fn execute_synchronous_image_request(
@@ -398,38 +405,39 @@ pub(super) async fn execute_synchronous_image_request(
             .confirmed_rejection
             .store(true, std::sync::atomic::Ordering::Release);
     }
-    if upstream_status == StatusCode::TOO_MANY_REQUESTS {
-        let kind = transport.classify_rate_limit(upstream).await;
-        attempt
-            .complete(crate::generation::group_routing::media_rate_limit_terminal(
-                kind,
-            ))
-            .await;
-        return fail_image_request(context, "upstream_http_429").await;
-    }
-    if let Some(terminal) =
-        crate::generation::group_routing::media_rejection_terminal(upstream_status)
-    {
-        attempt.complete(terminal).await;
-    }
     if !upstream_status.is_success() {
-        let response = crate::api::proxy::upstream_response::UpstreamResponse::from(upstream)
-            .with_original_archive_capture(
-                context.state,
-                crate::db::ArchiveSpoolIdentity {
-                    request_id: context.request_id,
-                    tenant_id: context.tenant_id,
-                    reservation_id: context.reservation.id,
-                },
-            );
-        let rejection = crate::api::proxy::upstream_error::read_rejection(response).await;
-        let error_code = rejection.reason().map_or_else(
-            || format!("upstream_http_{}", upstream_status.as_u16()),
-            |reason| reason.code().to_owned(),
-        );
-        let response = fail_image_request(context, &error_code).await?;
-        return crate::api::proxy::upstream_error::with_media_rejection(response, rejection.body)
-            .await;
+        let headers =
+            crate::api::proxy::upstream_error::forwarded_http_error_headers(upstream.headers());
+        // This route retains metadata only. The quota classifier returns its
+        // prefetched bytes ahead of the unread supplier stream.
+        let mut response = transport.rejection_response(upstream);
+        if upstream_status == StatusCode::TOO_MANY_REQUESTS {
+            let (prefetched, kind) = crate::api::proxy::classify_image_rate_limit(response).await;
+            response = prefetched;
+            attempt
+                .complete(crate::generation::group_routing::media_rate_limit_terminal(
+                    kind,
+                ))
+                .await;
+        } else if let Some(terminal) =
+            crate::generation::group_routing::media_rejection_terminal(upstream_status)
+        {
+            attempt.complete(terminal).await;
+        }
+        let error_code = format!("upstream_http_{}", upstream_status.as_u16());
+        let (terminal, owns_delivery) = finish_image_failure(context, &error_code).await?;
+        if !owns_delivery {
+            return Ok(terminal);
+        }
+        let mut downstream = Response::new(Body::from_stream(response.bytes_stream()));
+        *downstream.status_mut() = upstream_status;
+        *downstream.headers_mut() = headers;
+        if let Some(request_id) = terminal.headers().get(REQUEST_ID_HEADER) {
+            downstream
+                .headers_mut()
+                .insert(REQUEST_ID_HEADER, request_id.clone());
+        }
+        return Ok(downstream);
     }
     let response_bytes = match read_synchronous_image_response_bounded(upstream).await {
         Ok(bytes) => bytes,
@@ -598,14 +606,17 @@ pub(super) async fn fail_image_request(
     context: &SyncImageRequest<'_>,
     error_code: &str,
 ) -> Result<Response, AppError> {
-    fail_image_request_with_staging(context, error_code, None).await
+    finish_image_failure(context, error_code)
+        .await
+        .map(|(response, _)| response)
 }
 
-async fn fail_image_request_with_staging(
+// The boolean grants delivery only when this attempt recorded the failure or
+// confirmed its own quarantine. A replay must keep its full response.
+async fn finish_image_failure(
     context: &SyncImageRequest<'_>,
     error_code: &str,
-    result_lease: Option<&crate::archive_staging::ArchiveStagingWriteLease>,
-) -> Result<Response, AppError> {
+) -> Result<(Response, bool), AppError> {
     if submission_may_have_started(context).await?
         && !context
             .confirmed_rejection
@@ -622,25 +633,12 @@ async fn fail_image_request_with_staging(
                 .invalid_response
                 .store(true, std::sync::atomic::Ordering::Release);
         }
-        // An unusable result never becomes a published asset. Hand its owned
-        // staging attempt to durable cleanup without deleting bytes here or
-        // interpreting this local cleanup as permission to refund/resubmit.
-        if let Some(lease) = result_lease
-            && let Err(error) = context
-                .state
-                .db
-                .abandon_archive_staging_attempt(lease)
-                .await
-        {
-            tracing::warn!(request_id=%context.request_id, error_category=error.diagnostic_category(),
-                "uncertain image result cleanup publication failed; lease expiry retains recovery");
-        }
         return Ok(quarantine_image_request(context).await);
     }
     let state = context.state;
     let request_id = context.request_id;
     let response_object = format!("gap://{request_id}/response");
-    let (response, cleanup_staging) = match commit_synchronous_image_terminal(
+    match commit_synchronous_image_terminal(
         context,
         502,
         0,
@@ -648,23 +646,18 @@ async fn fail_image_request_with_staging(
         Some(error_code),
         &response_object,
         &[],
-        result_lease,
+        None,
     )
     .await?
     {
         FinishSynchronousImageResult::Finished { .. } => {
-            (replayed_image_failure(request_id, error_code), false)
+            Ok((replayed_image_failure(request_id, error_code), true))
         }
-        FinishSynchronousImageResult::Replay(replay) => {
-            let cleanup = matches!(&replay, SynchronousImageIdempotencyClaim::Failed { .. });
-            (
-                image_idempotency_replay_response(state, replay).await?,
-                cleanup,
-            )
-        }
-    };
-    let _ = cleanup_staging;
-    Ok(response)
+        FinishSynchronousImageResult::Replay(replay) => Ok((
+            image_idempotency_replay_response(state, replay).await?,
+            false,
+        )),
+    }
 }
 
 async fn finish_openai_image_response(

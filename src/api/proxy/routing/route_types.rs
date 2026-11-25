@@ -171,9 +171,6 @@ impl TransportFailureKind {
 #[derive(Debug, Eq, PartialEq)]
 pub(in crate::api::proxy) enum ProxySendError {
     RetryableConnection(&'static str),
-    RetryableCodexBadRequest,
-    CodexBadRequest,
-    CodexRejection(bytes::Bytes),
     CandidateUnavailable,
     AmbiguousResponse(&'static str),
     NonRetryableTransport(TransportFailureKind),
@@ -182,6 +179,7 @@ pub(in crate::api::proxy) enum ProxySendError {
 }
 
 pub(in crate::api::proxy) struct ProxyRouteResponse {
+    pub(in crate::api::proxy) codex_transient_bad_request: bool,
     pub(in crate::api::proxy) preoutput_quota: Option<(
         crate::db::UpstreamFailureKind,
         crate::db::SupplierQuotaEvidence,

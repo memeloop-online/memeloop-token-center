@@ -15398,22 +15398,25 @@
             "$ref": "#/components/responses/ProxySuccess"
           },
           "400": {
-            "$ref": "#/components/responses/InvalidRequest"
+            "$ref": "#/components/responses/TextProxyErrorOrUpstreamRejection"
           },
           "401": {
-            "$ref": "#/components/responses/Unauthorized"
+            "$ref": "#/components/responses/TextProxyErrorOrUpstreamRejection"
           },
           "403": {
-            "$ref": "#/components/responses/Forbidden"
+            "$ref": "#/components/responses/TextProxyErrorOrUpstreamRejection"
           },
           "424": {
-            "$ref": "#/components/responses/UnpricedModel"
+            "$ref": "#/components/responses/TextProxyErrorOrUpstreamRejection"
           },
           "429": {
-            "$ref": "#/components/responses/UsageRejected"
+            "$ref": "#/components/responses/TextProxyErrorOrUpstreamRejection"
           },
           "502": {
-            "$ref": "#/components/responses/UpstreamError"
+            "$ref": "#/components/responses/TextProxyErrorOrUpstreamRejection"
+          },
+          "default": {
+            "$ref": "#/components/responses/TextProxyErrorOrUpstreamRejection"
           }
         }
       }
@@ -15471,22 +15474,25 @@
             "$ref": "#/components/responses/ProxySuccess"
           },
           "400": {
-            "$ref": "#/components/responses/InvalidRequest"
+            "$ref": "#/components/responses/TextProxyErrorOrUpstreamRejection"
           },
           "401": {
-            "$ref": "#/components/responses/Unauthorized"
+            "$ref": "#/components/responses/TextProxyErrorOrUpstreamRejection"
           },
           "403": {
-            "$ref": "#/components/responses/Forbidden"
+            "$ref": "#/components/responses/TextProxyErrorOrUpstreamRejection"
           },
           "424": {
-            "$ref": "#/components/responses/UnpricedModel"
+            "$ref": "#/components/responses/TextProxyErrorOrUpstreamRejection"
           },
           "429": {
-            "$ref": "#/components/responses/UsageRejected"
+            "$ref": "#/components/responses/TextProxyErrorOrUpstreamRejection"
           },
           "502": {
-            "$ref": "#/components/responses/UpstreamError"
+            "$ref": "#/components/responses/TextProxyErrorOrUpstreamRejection"
+          },
+          "default": {
+            "$ref": "#/components/responses/TextProxyErrorOrUpstreamRejection"
           }
         }
       }
@@ -15519,22 +15525,25 @@
             "$ref": "#/components/responses/ProxySuccess"
           },
           "400": {
-            "$ref": "#/components/responses/InvalidRequest"
+            "$ref": "#/components/responses/TextProxyErrorOrUpstreamRejection"
           },
           "401": {
-            "$ref": "#/components/responses/Unauthorized"
+            "$ref": "#/components/responses/TextProxyErrorOrUpstreamRejection"
           },
           "403": {
-            "$ref": "#/components/responses/Forbidden"
+            "$ref": "#/components/responses/TextProxyErrorOrUpstreamRejection"
           },
           "424": {
-            "$ref": "#/components/responses/UnpricedModel"
+            "$ref": "#/components/responses/TextProxyErrorOrUpstreamRejection"
           },
           "429": {
-            "$ref": "#/components/responses/UsageRejected"
+            "$ref": "#/components/responses/TextProxyErrorOrUpstreamRejection"
           },
           "502": {
-            "$ref": "#/components/responses/UpstreamError"
+            "$ref": "#/components/responses/TextProxyErrorOrUpstreamRejection"
+          },
+          "default": {
+            "$ref": "#/components/responses/TextProxyErrorOrUpstreamRejection"
           }
         }
       }
@@ -15566,22 +15575,25 @@
             "$ref": "#/components/responses/ProxySuccess"
           },
           "400": {
-            "$ref": "#/components/responses/InvalidRequest"
+            "$ref": "#/components/responses/TextProxyErrorOrUpstreamRejection"
           },
           "401": {
-            "$ref": "#/components/responses/Unauthorized"
+            "$ref": "#/components/responses/TextProxyErrorOrUpstreamRejection"
           },
           "403": {
-            "$ref": "#/components/responses/Forbidden"
+            "$ref": "#/components/responses/TextProxyErrorOrUpstreamRejection"
           },
           "424": {
-            "$ref": "#/components/responses/UnpricedModel"
+            "$ref": "#/components/responses/TextProxyErrorOrUpstreamRejection"
           },
           "429": {
-            "$ref": "#/components/responses/UsageRejected"
+            "$ref": "#/components/responses/TextProxyErrorOrUpstreamRejection"
           },
           "502": {
-            "$ref": "#/components/responses/UpstreamError"
+            "$ref": "#/components/responses/TextProxyErrorOrUpstreamRejection"
+          },
+          "default": {
+            "$ref": "#/components/responses/TextProxyErrorOrUpstreamRejection"
           }
         }
       }
@@ -15613,22 +15625,25 @@
             "$ref": "#/components/responses/ProxySuccess"
           },
           "400": {
-            "$ref": "#/components/responses/InvalidRequest"
+            "$ref": "#/components/responses/TextProxyErrorOrUpstreamRejection"
           },
           "401": {
-            "$ref": "#/components/responses/Unauthorized"
+            "$ref": "#/components/responses/TextProxyErrorOrUpstreamRejection"
           },
           "403": {
-            "$ref": "#/components/responses/Forbidden"
+            "$ref": "#/components/responses/TextProxyErrorOrUpstreamRejection"
           },
           "424": {
-            "$ref": "#/components/responses/UnpricedModel"
+            "$ref": "#/components/responses/TextProxyErrorOrUpstreamRejection"
           },
           "429": {
-            "$ref": "#/components/responses/UsageRejected"
+            "$ref": "#/components/responses/TextProxyErrorOrUpstreamRejection"
           },
           "502": {
-            "$ref": "#/components/responses/UpstreamError"
+            "$ref": "#/components/responses/TextProxyErrorOrUpstreamRejection"
+          },
+          "default": {
+            "$ref": "#/components/responses/TextProxyErrorOrUpstreamRejection"
           }
         }
       }
@@ -15770,22 +15785,25 @@
             "$ref": "#/components/responses/ProxySuccess"
           },
           "400": {
-            "$ref": "#/components/responses/InvalidRequest"
+            "$ref": "#/components/responses/TextProxyErrorOrUpstreamRejection"
           },
           "401": {
-            "$ref": "#/components/responses/Unauthorized"
+            "$ref": "#/components/responses/TextProxyErrorOrUpstreamRejection"
           },
           "403": {
-            "$ref": "#/components/responses/Forbidden"
+            "$ref": "#/components/responses/TextProxyErrorOrUpstreamRejection"
           },
           "424": {
-            "$ref": "#/components/responses/UnpricedModel"
+            "$ref": "#/components/responses/TextProxyErrorOrUpstreamRejection"
           },
           "429": {
-            "$ref": "#/components/responses/UsageRejected"
+            "$ref": "#/components/responses/TextProxyErrorOrUpstreamRejection"
           },
           "502": {
-            "$ref": "#/components/responses/UpstreamError"
+            "$ref": "#/components/responses/TextProxyErrorOrUpstreamRejection"
+          },
+          "default": {
+            "$ref": "#/components/responses/TextProxyErrorOrUpstreamRejection"
           }
         }
       }
@@ -15836,22 +15854,25 @@
             "$ref": "#/components/responses/ProxySuccess"
           },
           "400": {
-            "$ref": "#/components/responses/InvalidRequest"
+            "$ref": "#/components/responses/TextProxyErrorOrUpstreamRejection"
           },
           "401": {
-            "$ref": "#/components/responses/Unauthorized"
+            "$ref": "#/components/responses/TextProxyErrorOrUpstreamRejection"
           },
           "403": {
-            "$ref": "#/components/responses/Forbidden"
+            "$ref": "#/components/responses/TextProxyErrorOrUpstreamRejection"
           },
           "424": {
-            "$ref": "#/components/responses/UnpricedModel"
+            "$ref": "#/components/responses/TextProxyErrorOrUpstreamRejection"
           },
           "429": {
-            "$ref": "#/components/responses/UsageRejected"
+            "$ref": "#/components/responses/TextProxyErrorOrUpstreamRejection"
           },
           "502": {
-            "$ref": "#/components/responses/UpstreamError"
+            "$ref": "#/components/responses/TextProxyErrorOrUpstreamRejection"
+          },
+          "default": {
+            "$ref": "#/components/responses/TextProxyErrorOrUpstreamRejection"
           }
         }
       }
@@ -15975,7 +15996,7 @@
         ],
         "operationId": "createImageGeneration",
         "summary": "Generate an image synchronously or queue a provider-native job",
-        "description": "When the body contains `input`, it uses the asynchronous generation contract and\naccepts optional `Idempotency-Key`: the first submission returns 202, an identical\nreplay returns the same job with 200 without a second reservation, and reuse with\ndifferent `model` or `input` returns 400. Without `input`, this endpoint proxies\nthe synchronous OpenAI Images API or a configured Codex Responses image tool.\n\nSynchronous idempotency is isolated by the authenticated stable `key_id` and uses\nthe canonical post-policy model/request payload. Authentication and traffic-policy\nevaluation precede the replay lookup, while route/price resolution and outbound\nclient validation run only for a newly claimed execution. A completed same-payload\nreplay never resubmits upstream: because media bodies are not retained, it returns\n409 `image_result_not_retained` with the original request ID. It creates no new\nrequest record, makes no upstream call, and consumes no additional quota/billing\nreservation, per-key rate-limit window, or image execution permit. Reusing the key\nwith a different payload returns 400. An identical active request returns 409; an\nexpired pending lease is atomically reclaimed for a fresh execution. For URL-mode\nresults, Token Center retains only a protected provider reference and returns a relative\n`/self/v1/requests/{request_id}/assets/{asset_id}` URL. Authorized downloads stream\nfrom the validated provider origin with server-side credentials; media bytes, provider\nURLs, and internal references are not returned in request history or retained as assets.\n",
+        "description": "When the body contains `input`, it uses the asynchronous generation contract and\naccepts optional `Idempotency-Key`: the first submission returns 202, an identical\nreplay returns the same job with 200 without a second reservation, and reuse with\ndifferent `model` or `input` returns 400. Without `input`, this endpoint proxies\nthe synchronous OpenAI Images API or a configured Codex Responses image tool.\n\nSynchronous idempotency is isolated by the authenticated stable `key_id` and uses\nthe canonical post-policy model/request payload. Authentication and traffic-policy\nevaluation precede the replay lookup, while route/price resolution and outbound\nclient validation run only for a newly claimed execution. A completed same-payload\nreplay never resubmits upstream: because media bodies are not retained, it returns\n409 `image_result_not_retained` with the original request ID. It creates no new\nrequest record, makes no upstream call, and consumes no additional quota/billing\nreservation, per-key rate-limit window, or image execution permit. Reusing the key\nwith a different payload returns 400. An identical active request returns 409; an\nexpired pending lease is atomically reclaimed for a fresh execution. For URL-mode\nresults, Token Center retains only a protected provider reference and returns a relative\n`/self/v1/requests/{request_id}/assets/{asset_id}` URL. Authorized downloads stream\nfrom the validated provider origin with server-side credentials; media bytes, provider\nURLs, and internal references are not returned in request history or retained as assets.\n\nOn a new synchronous submission that receives an upstream HTTP rejection,\nthe client receives that status and the original response body, which may be\nnon-JSON. Token Center does not retain the rejection body. Repeating the same\npayload and key after a recorded definitive rejection returns a local 502\nwith the original request ID and recorded error code, without another upstream\ncall or charge. That response does not reproduce the original upstream body.\n",
         "security": [
           {
             "clientBearer": []
@@ -16037,25 +16058,31 @@
             "$ref": "#/components/responses/GenerationAccepted"
           },
           "400": {
-            "$ref": "#/components/responses/InvalidRequest"
+            "$ref": "#/components/responses/ImageErrorOrUpstreamRejection"
           },
           "401": {
-            "$ref": "#/components/responses/Unauthorized"
+            "$ref": "#/components/responses/ImageErrorOrUpstreamRejection"
           },
           "403": {
-            "$ref": "#/components/responses/Forbidden"
+            "$ref": "#/components/responses/ImageErrorOrUpstreamRejection"
           },
           "409": {
-            "$ref": "#/components/responses/Conflict"
+            "$ref": "#/components/responses/ImageErrorOrUpstreamRejection"
           },
           "424": {
-            "$ref": "#/components/responses/UnpricedModel"
+            "$ref": "#/components/responses/ImageErrorOrUpstreamRejection"
           },
           "429": {
-            "$ref": "#/components/responses/UsageRejected"
+            "$ref": "#/components/responses/ImageErrorOrUpstreamRejection"
           },
           "502": {
-            "$ref": "#/components/responses/UpstreamError"
+            "$ref": "#/components/responses/ImageErrorOrUpstreamRejection"
+          },
+          "default": {
+            "description": "Current synchronous upstream HTTP rejection with the original response body.",
+            "content": {
+              "*/*": {}
+            }
           }
         }
       }
@@ -18414,6 +18441,24 @@
               "$ref": "#/components/schemas/GenerationJob"
             }
           }
+        }
+      },
+        "TextProxyErrorOrUpstreamRejection": {
+          "description": "A gateway-generated JSON error (see ErrorResponse and UsageLimitErrorResponse) or the final upstream HTTP rejection. For a relayed rejection, the provider status and response body are preserved; the body need not be JSON or follow the gateway error schema. This does not describe errors after a successful stream has begun.",
+          "content": {
+            "application/json": {
+              "schema": {}
+            },
+            "*/*": {}
+          }
+        },
+      "ImageErrorOrUpstreamRejection": {
+        "description": "A local API error (ErrorResponse JSON) or the original synchronous upstream rejection body at this status.",
+        "content": {
+          "application/json": {
+            "schema": {}
+          },
+          "*/*": {}
         }
       },
       "ImageSuccessOrGenerationReplay": {

@@ -7621,12 +7621,13 @@ paths:
             schema: { $ref: '#/components/schemas/OpenAIChatRequest' }
       responses:
         '200': { $ref: '#/components/responses/ProxySuccess' }
-        '400': { $ref: '#/components/responses/InvalidRequest' }
-        '401': { $ref: '#/components/responses/Unauthorized' }
-        '403': { $ref: '#/components/responses/Forbidden' }
-        '424': { $ref: '#/components/responses/UnpricedModel' }
-        '429': { $ref: '#/components/responses/UsageRejected' }
-        '502': { $ref: '#/components/responses/UpstreamError' }
+        '400': { $ref: '#/components/responses/TextProxyErrorOrUpstreamRejection' }
+        '401': { $ref: '#/components/responses/TextProxyErrorOrUpstreamRejection' }
+        '403': { $ref: '#/components/responses/TextProxyErrorOrUpstreamRejection' }
+        '424': { $ref: '#/components/responses/TextProxyErrorOrUpstreamRejection' }
+        '429': { $ref: '#/components/responses/TextProxyErrorOrUpstreamRejection' }
+        '502': { $ref: '#/components/responses/TextProxyErrorOrUpstreamRejection' }
+        default: { $ref: '#/components/responses/TextProxyErrorOrUpstreamRejection' }
 
   /v1/responses:
     get:
@@ -7658,12 +7659,13 @@ paths:
             schema: { $ref: '#/components/schemas/OpenAIResponseRequest' }
       responses:
         '200': { $ref: '#/components/responses/ProxySuccess' }
-        '400': { $ref: '#/components/responses/InvalidRequest' }
-        '401': { $ref: '#/components/responses/Unauthorized' }
-        '403': { $ref: '#/components/responses/Forbidden' }
-        '424': { $ref: '#/components/responses/UnpricedModel' }
-        '429': { $ref: '#/components/responses/UsageRejected' }
-        '502': { $ref: '#/components/responses/UpstreamError' }
+        '400': { $ref: '#/components/responses/TextProxyErrorOrUpstreamRejection' }
+        '401': { $ref: '#/components/responses/TextProxyErrorOrUpstreamRejection' }
+        '403': { $ref: '#/components/responses/TextProxyErrorOrUpstreamRejection' }
+        '424': { $ref: '#/components/responses/TextProxyErrorOrUpstreamRejection' }
+        '429': { $ref: '#/components/responses/TextProxyErrorOrUpstreamRejection' }
+        '502': { $ref: '#/components/responses/TextProxyErrorOrUpstreamRejection' }
+        default: { $ref: '#/components/responses/TextProxyErrorOrUpstreamRejection' }
 
   /v1/responses/compact:
     post:
@@ -7682,12 +7684,13 @@ paths:
             schema: { $ref: '#/components/schemas/OpenAIResponseRequest' }
       responses:
         '200': { $ref: '#/components/responses/ProxySuccess' }
-        '400': { $ref: '#/components/responses/InvalidRequest' }
-        '401': { $ref: '#/components/responses/Unauthorized' }
-        '403': { $ref: '#/components/responses/Forbidden' }
-        '424': { $ref: '#/components/responses/UnpricedModel' }
-        '429': { $ref: '#/components/responses/UsageRejected' }
-        '502': { $ref: '#/components/responses/UpstreamError' }
+        '400': { $ref: '#/components/responses/TextProxyErrorOrUpstreamRejection' }
+        '401': { $ref: '#/components/responses/TextProxyErrorOrUpstreamRejection' }
+        '403': { $ref: '#/components/responses/TextProxyErrorOrUpstreamRejection' }
+        '424': { $ref: '#/components/responses/TextProxyErrorOrUpstreamRejection' }
+        '429': { $ref: '#/components/responses/TextProxyErrorOrUpstreamRejection' }
+        '502': { $ref: '#/components/responses/TextProxyErrorOrUpstreamRejection' }
+        default: { $ref: '#/components/responses/TextProxyErrorOrUpstreamRejection' }
 
   /v1/alpha/search:
     post:
@@ -7702,12 +7705,13 @@ paths:
             schema: { $ref: '#/components/schemas/OpenAIAlphaSearchRequest' }
       responses:
         '200': { $ref: '#/components/responses/ProxySuccess' }
-        '400': { $ref: '#/components/responses/InvalidRequest' }
-        '401': { $ref: '#/components/responses/Unauthorized' }
-        '403': { $ref: '#/components/responses/Forbidden' }
-        '424': { $ref: '#/components/responses/UnpricedModel' }
-        '429': { $ref: '#/components/responses/UsageRejected' }
-        '502': { $ref: '#/components/responses/UpstreamError' }
+        '400': { $ref: '#/components/responses/TextProxyErrorOrUpstreamRejection' }
+        '401': { $ref: '#/components/responses/TextProxyErrorOrUpstreamRejection' }
+        '403': { $ref: '#/components/responses/TextProxyErrorOrUpstreamRejection' }
+        '424': { $ref: '#/components/responses/TextProxyErrorOrUpstreamRejection' }
+        '429': { $ref: '#/components/responses/TextProxyErrorOrUpstreamRejection' }
+        '502': { $ref: '#/components/responses/TextProxyErrorOrUpstreamRejection' }
+        default: { $ref: '#/components/responses/TextProxyErrorOrUpstreamRejection' }
 
   /v1/embeddings:
     post:
@@ -7722,12 +7726,13 @@ paths:
             schema: { $ref: '#/components/schemas/OpenAIEmbeddingRequest' }
       responses:
         '200': { $ref: '#/components/responses/ProxySuccess' }
-        '400': { $ref: '#/components/responses/InvalidRequest' }
-        '401': { $ref: '#/components/responses/Unauthorized' }
-        '403': { $ref: '#/components/responses/Forbidden' }
-        '424': { $ref: '#/components/responses/UnpricedModel' }
-        '429': { $ref: '#/components/responses/UsageRejected' }
-        '502': { $ref: '#/components/responses/UpstreamError' }
+        '400': { $ref: '#/components/responses/TextProxyErrorOrUpstreamRejection' }
+        '401': { $ref: '#/components/responses/TextProxyErrorOrUpstreamRejection' }
+        '403': { $ref: '#/components/responses/TextProxyErrorOrUpstreamRejection' }
+        '424': { $ref: '#/components/responses/TextProxyErrorOrUpstreamRejection' }
+        '429': { $ref: '#/components/responses/TextProxyErrorOrUpstreamRejection' }
+        '502': { $ref: '#/components/responses/TextProxyErrorOrUpstreamRejection' }
+        default: { $ref: '#/components/responses/TextProxyErrorOrUpstreamRejection' }
 
   /v1/audio/transcriptions:
     post:
@@ -7808,12 +7813,13 @@ paths:
             schema: { $ref: '#/components/schemas/AnthropicMessageRequest' }
       responses:
         '200': { $ref: '#/components/responses/ProxySuccess' }
-        '400': { $ref: '#/components/responses/InvalidRequest' }
-        '401': { $ref: '#/components/responses/Unauthorized' }
-        '403': { $ref: '#/components/responses/Forbidden' }
-        '424': { $ref: '#/components/responses/UnpricedModel' }
-        '429': { $ref: '#/components/responses/UsageRejected' }
-        '502': { $ref: '#/components/responses/UpstreamError' }
+        '400': { $ref: '#/components/responses/TextProxyErrorOrUpstreamRejection' }
+        '401': { $ref: '#/components/responses/TextProxyErrorOrUpstreamRejection' }
+        '403': { $ref: '#/components/responses/TextProxyErrorOrUpstreamRejection' }
+        '424': { $ref: '#/components/responses/TextProxyErrorOrUpstreamRejection' }
+        '429': { $ref: '#/components/responses/TextProxyErrorOrUpstreamRejection' }
+        '502': { $ref: '#/components/responses/TextProxyErrorOrUpstreamRejection' }
+        default: { $ref: '#/components/responses/TextProxyErrorOrUpstreamRejection' }
 
   /v1/messages/count_tokens:
     post:
@@ -7838,12 +7844,13 @@ paths:
             schema: { $ref: '#/components/schemas/AnthropicMessageRequest' }
       responses:
         '200': { $ref: '#/components/responses/ProxySuccess' }
-        '400': { $ref: '#/components/responses/InvalidRequest' }
-        '401': { $ref: '#/components/responses/Unauthorized' }
-        '403': { $ref: '#/components/responses/Forbidden' }
-        '424': { $ref: '#/components/responses/UnpricedModel' }
-        '429': { $ref: '#/components/responses/UsageRejected' }
-        '502': { $ref: '#/components/responses/UpstreamError' }
+        '400': { $ref: '#/components/responses/TextProxyErrorOrUpstreamRejection' }
+        '401': { $ref: '#/components/responses/TextProxyErrorOrUpstreamRejection' }
+        '403': { $ref: '#/components/responses/TextProxyErrorOrUpstreamRejection' }
+        '424': { $ref: '#/components/responses/TextProxyErrorOrUpstreamRejection' }
+        '429': { $ref: '#/components/responses/TextProxyErrorOrUpstreamRejection' }
+        '502': { $ref: '#/components/responses/TextProxyErrorOrUpstreamRejection' }
+        default: { $ref: '#/components/responses/TextProxyErrorOrUpstreamRejection' }
 
   /v1/generations:
     post:
@@ -7927,6 +7934,13 @@ paths:
         `/self/v1/requests/{request_id}/assets/{asset_id}` URL. Authorized downloads stream
         from the validated provider origin with server-side credentials; media bytes, provider
         URLs, and internal references are not returned in request history or retained as assets.
+
+        On a new synchronous submission that receives an upstream HTTP rejection,
+        the client receives that status and the original response body, which may be
+        non-JSON. Token Center does not retain the rejection body. Repeating the same
+        payload and key after a recorded definitive rejection returns a local 502
+        with the original request ID and recorded error code, without another upstream
+        call or charge. That response does not reproduce the original upstream body.
       security: [{ clientBearer: [] }]
       x-idempotency-contract:
         namespace: stable-key-id
@@ -7962,13 +7976,17 @@ paths:
       responses:
         '200': { $ref: '#/components/responses/ImageSuccessOrGenerationReplay' }
         '202': { $ref: '#/components/responses/GenerationAccepted' }
-        '400': { $ref: '#/components/responses/InvalidRequest' }
-        '401': { $ref: '#/components/responses/Unauthorized' }
-        '403': { $ref: '#/components/responses/Forbidden' }
-        '409': { $ref: '#/components/responses/Conflict' }
-        '424': { $ref: '#/components/responses/UnpricedModel' }
-        '429': { $ref: '#/components/responses/UsageRejected' }
-        '502': { $ref: '#/components/responses/UpstreamError' }
+        '400': { $ref: '#/components/responses/ImageErrorOrUpstreamRejection' }
+        '401': { $ref: '#/components/responses/ImageErrorOrUpstreamRejection' }
+        '403': { $ref: '#/components/responses/ImageErrorOrUpstreamRejection' }
+        '409': { $ref: '#/components/responses/ImageErrorOrUpstreamRejection' }
+        '424': { $ref: '#/components/responses/ImageErrorOrUpstreamRejection' }
+        '429': { $ref: '#/components/responses/ImageErrorOrUpstreamRejection' }
+        '502': { $ref: '#/components/responses/ImageErrorOrUpstreamRejection' }
+        default:
+          description: Current synchronous upstream HTTP rejection with the original response body.
+          content:
+            '*/*': {}
 
   /internal/v1/sessions/{session_id}/requests/{request_id}/semantic-view:
     {"get": {"tags": ["Operator traffic"], "operationId": "getOperatorSessionSemanticView", "summary": "Read a verified semantic manifest page or anchored atom stream", "description": "Ownership is checked on every read. No published root returns explicit pending coverage. Revisions are lossless decimal u64 strings; continuations bind tenant, request, revision and instance. No raw fallback.", "security": [{"serviceBearer": []}], "parameters": [{"$ref": "#/components/parameters/ContextSessionId"}, {"$ref": "#/components/parameters/RequestIdPath"}, {"$ref": "#/components/parameters/TenantFilter"}, {"$ref": "#/components/parameters/ContextKeyId"}, {"name": "cursor", "in": "query", "required": false, "description": "Signed fixed-revision page continuation; mutually exclusive with atom_cursor.", "schema": {"type": "string", "maxLength": 16384}}, {"name": "atom_cursor", "in": "query", "required": false, "description": "Signed manifest-anchored instance capability; returns verified JSON atom stream.", "schema": {"type": "string", "maxLength": 16384}}], "responses": {"200": {"description": "Published or pending semantic page, or verified atom JSON stream selected by atom_cursor.", "content": {"application/json": {"schema": {"type": "object", "additionalProperties": true}}}}, "400": {"$ref": "#/components/responses/InvalidRequest"}, "401": {"$ref": "#/components/responses/Unauthorized"}, "404": {"$ref": "#/components/responses/NotFound"}, "409": {"description": "Publication revision changed or no longer has a bound semantic root."}, "403": {"$ref": "#/components/responses/Forbidden"}}, "x-required-scope": "requests:read"}}
@@ -8576,6 +8594,18 @@ components:
       content:
         application/json:
           schema: { $ref: '#/components/schemas/GenerationJob' }
+    TextProxyErrorOrUpstreamRejection:
+      description: A gateway-generated JSON error (see ErrorResponse and UsageLimitErrorResponse) or the final upstream HTTP rejection. For a relayed rejection, the provider status and response body are preserved; the body need not be JSON or follow the gateway error schema. This does not describe errors after a successful stream has begun.
+      content:
+        application/json:
+          schema: {}
+        '*/*': {}
+    ImageErrorOrUpstreamRejection:
+      description: A local API error (ErrorResponse JSON) or the original synchronous upstream rejection body at this status.
+      content:
+        application/json:
+          schema: {}
+        '*/*': {}
     ImageSuccessOrGenerationReplay:
       description: |
         Sanitized synchronous image response, exact completed synchronous replay, or an

@@ -3,7 +3,7 @@ use super::*;
 mod buffered_usage;
 
 #[tokio::test]
-async fn native_kimi_rejections_preserve_classification_and_original_explanation() {
+async fn kimi_error_envelopes_preserve_original_bytes_and_safe_internal_classification() {
     let canary = "kimi-upstream-token-prompt-canary";
     let cases = [
         (
@@ -68,7 +68,7 @@ async fn native_kimi_rejections_preserve_classification_and_original_explanation
         for (label, content_type, body, expected_reason, slow_body) in &cases {
             let upstream = MockServer::start().await;
             Mock::given(method("POST"))
-                .respond_with(ResponseTemplate::new(403).set_body_raw(body.clone(), content_type))
+                .respond_with(ResponseTemplate::new(403).set_body_raw(body.clone(), *content_type))
                 .expect(1)
                 .mount(&upstream)
                 .await;
@@ -140,60 +140,24 @@ async fn native_kimi_rejections_preserve_classification_and_original_explanation
                     chunk
                 }));
             }
-            let (retained, rejection) = read_safe_proxy_rejection(
-                request
-                    .capture_original_response(UpstreamResponse::Prefetched {
-                        status: parts.status,
-                        headers: parts.headers,
-                        version: parts.version,
-                        content_length: parts.content_length,
-                        stream: parts.stream,
-                    })
-                    .await,
-                protocol,
-                false,
-                crate::oauth::managed::kimi::PROVIDER_DRIVER,
-            )
-            .await;
-            assert!(retained.is_none());
-            let rejection = rejection.expect("native Kimi non-success uses the safe reader");
-            let delivered: Value = serde_json::from_slice(&rejection.body).unwrap();
-            assert!(!String::from_utf8_lossy(&rejection.body).contains(canary));
-            assert_eq!(
-                rejection.terminal_cause,
-                Some(crate::model::RequestTerminalCause::UpstreamHttpStatus)
-            );
-            if let Some(reason) = expected_reason {
-                assert_eq!(delivered["error"]["code"].as_str(), Some(*reason));
-                assert_eq!(
-                    delivered["error"]["mtc_safe_reason"].as_str(),
-                    Some(*reason)
-                );
-            } else {
-                assert_eq!(rejection.body, upstream_error::fallback_body());
-            }
-            let response = finish_buffered_request_with_upstream_attribution_and_response_object(
-                &request,
-                StatusCode::FORBIDDEN,
-                rejection.body,
-                "application/json",
-                (
-                    TokenUsage::default(),
-                    crate::model::RequestUsageBasis::NotObserved,
-                ),
-                Some("http_403".to_owned()),
-                BufferedFinishPolicy {
-                    upstream_attribution: ProxyRequestUpstreamAttribution::KeepSelected,
-                    terminal_cause: rejection.terminal_cause,
-                },
-            )
-            .await
-            .unwrap();
+            let upstream = request
+                .capture_original_response(UpstreamResponse::Prefetched {
+                    status: parts.status,
+                    headers: parts.headers,
+                    version: parts.version,
+                    content_length: parts.content_length,
+                    stream: parts.stream,
+                })
+                .await;
+            let response = finish_upstream_http_error(&request, upstream)
+                .await
+                .unwrap();
             assert_eq!(response.status(), StatusCode::FORBIDDEN);
+            assert_eq!(response.headers()[header::CONTENT_TYPE], *content_type);
             let bytes = to_bytes(response.into_body(), MAX_PROXY_RESPONSE_BODY)
                 .await
                 .unwrap();
-            assert_eq!(serde_json::from_slice::<Value>(&bytes).unwrap(), delivered);
+            assert_eq!(bytes.as_ref(), body.as_bytes(), "{label}");
             wait_for_request_settlement(&fixture, 1).await;
             drain_completed_response_archive(&fixture).await;
             let records = fixture
@@ -272,74 +236,6 @@ async fn native_kimi_rejections_preserve_classification_and_original_explanation
             assert_eq!(record.supplier_error.is_some(), expected_reason.is_some());
             upstream.verify().await;
         }
-    }
-}
-
-#[tokio::test]
-async fn native_kimi_safe_rejection_keeps_other_response_paths_untouched() {
-    for (driver, protocol, anthropic_bridge, status) in [
-        (
-            crate::oauth::managed::kimi::PROVIDER_DRIVER,
-            Protocol::AnthropicMessages,
-            false,
-            StatusCode::FORBIDDEN,
-        ),
-        (
-            crate::oauth::managed::kimi::PROVIDER_DRIVER,
-            Protocol::OpenAiResponses,
-            true,
-            StatusCode::FORBIDDEN,
-        ),
-        (
-            crate::oauth::managed::kimi::PROVIDER_DRIVER,
-            Protocol::OpenAiChat,
-            false,
-            StatusCode::OK,
-        ),
-        (
-            crate::oauth::managed::kimi::PROVIDER_DRIVER,
-            Protocol::OpenAiResponsesCompact,
-            false,
-            StatusCode::FORBIDDEN,
-        ),
-        (
-            "openai-codex",
-            Protocol::OpenAiResponses,
-            false,
-            StatusCode::FORBIDDEN,
-        ),
-    ] {
-        let body = Bytes::from_static(b"unmodified provider response");
-        let (upstream, rejection) = read_safe_proxy_rejection(
-            UpstreamResponse::Prefetched {
-                status,
-                headers: HeaderMap::new(),
-                version: http::Version::HTTP_11,
-                content_length: Some(body.len() as u64),
-                stream: Box::pin(futures_util::stream::once(async move { Ok(body) })),
-            },
-            protocol,
-            anthropic_bridge,
-            driver,
-        )
-        .await;
-        if !status.is_success() && !protocol.is_anthropic() && !anthropic_bridge {
-            assert!(upstream.is_none());
-            let diagnostic = rejection.expect("compatible HTTP errors retain their explanation");
-            assert!(
-                String::from_utf8_lossy(&diagnostic.body).contains("unmodified provider response")
-            );
-            continue;
-        }
-        assert!(rejection.is_none());
-        let upstream = upstream.unwrap();
-        assert_eq!(upstream.status(), status);
-        let chunks = upstream.bytes_stream().collect::<Vec<_>>().await;
-        assert_eq!(chunks.len(), 1);
-        assert_eq!(
-            chunks[0].as_ref().unwrap().as_ref(),
-            b"unmodified provider response"
-        );
     }
 }
 
@@ -1588,7 +1484,10 @@ async fn dispatched_compaction_400_is_not_replayed_to_a_standby() {
     let body = to_bytes(response.into_body(), MAX_PROXY_RESPONSE_BODY)
         .await
         .unwrap();
-    assert!(!String::from_utf8_lossy(&body).contains("provider-rejection-canary"));
+    let original = json!({"error":{
+        "code":"invalid_request_error","message":"provider-rejection-canary"
+    }});
+    assert_eq!(body.as_ref(), serde_json::to_vec(&original).unwrap());
     assert_eq!(preferred.received_requests().await.unwrap().len(), 1);
     assert!(standby.received_requests().await.unwrap().is_empty());
     preferred.verify().await;

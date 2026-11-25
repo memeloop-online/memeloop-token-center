@@ -16,36 +16,35 @@ pub(in crate::api) struct Rejection {
     pub(super) terminal_cause: Option<RequestTerminalCause>,
 }
 
-// The terminal response owns submission/settlement semantics. Attach the
-// diagnostic without replacing an uncertain or replayed terminal response.
-// Only generated media terminal JSON is passed here, never the supplier stream.
-pub(in crate::api) async fn with_media_rejection(
-    response: axum::response::Response,
-    rejection: Bytes,
-) -> Result<axum::response::Response, crate::error::AppError> {
-    // A concurrent terminal replay can already be successful. Do not attach
-    // a later attempt's diagnostic to that authoritative success payload.
-    if response.status().is_success() && response.status() != StatusCode::ACCEPTED {
-        return Ok(response);
+pub(in crate::api) fn forwarded_http_error_headers(upstream: &HeaderMap) -> HeaderMap {
+    let mut selected = HeaderMap::new();
+    for (name, value) in upstream {
+        let name_text = name.as_str();
+        if !matches!(
+            name_text,
+            "content-type"
+                | "content-encoding"
+                | "content-length"
+                | "content-language"
+                | "retry-after"
+                | "retry-after-ms"
+                | "x-should-retry"
+        ) && !name_text.starts_with("anthropic-ratelimit-")
+        {
+            continue;
+        }
+        let connection_scoped = upstream.get_all(header::CONNECTION).iter().any(|value| {
+            value.as_bytes().split(|byte| *byte == b',').any(|token| {
+                token
+                    .trim_ascii()
+                    .eq_ignore_ascii_case(name_text.as_bytes())
+            })
+        });
+        if !connection_scoped {
+            selected.append(name.clone(), value.clone());
+        }
     }
-    let (mut parts, body) = response.into_parts();
-    let original = axum::body::to_bytes(body, usize::MAX)
-        .await
-        .map_err(|_| crate::error::AppError::internal("media_terminal_body"))?;
-    let mut value: Value = serde_json::from_slice(&original)
-        .map_err(|_| crate::error::AppError::internal("media_terminal_json"))?;
-    let diagnostic: Value = serde_json::from_slice(&rejection)
-        .map_err(|_| crate::error::AppError::internal("media_rejection_json"))?;
-    if let Some(object) = value.as_object_mut() {
-        object.insert("provider_error".to_owned(), diagnostic);
-    }
-    let body = serde_json::to_vec(&value)
-        .map_err(|_| crate::error::AppError::internal("media_terminal_encode"))?;
-    parts.headers.remove(header::CONTENT_LENGTH);
-    Ok(axum::response::Response::from_parts(
-        parts,
-        axum::body::Body::from(body),
-    ))
+    selected
 }
 
 pub(super) fn rejection_content_class(headers: &HeaderMap) -> &'static str {
@@ -290,54 +289,6 @@ mod tests {
     use super::*;
     use futures_util::stream;
     use http::{HeaderMap, HeaderValue, Version};
-
-    #[tokio::test]
-    async fn media_diagnostic_does_not_change_successful_terminal_replay() {
-        let response =
-            axum::response::Response::new(axum::body::Body::from("completed image payload"));
-        let response = with_media_rejection(response, safe_error_body(b"later attempt failed"))
-            .await
-            .unwrap();
-        assert_eq!(response.status(), StatusCode::OK);
-        assert_eq!(
-            axum::body::to_bytes(response.into_body(), usize::MAX)
-                .await
-                .unwrap(),
-            "completed image payload"
-        );
-    }
-
-    #[tokio::test]
-    async fn media_diagnostic_keeps_uncertain_terminal_and_provider_fields() {
-        let response = axum::response::Response::builder()
-            .status(StatusCode::ACCEPTED)
-            .header("x-request-id", "media-request")
-            .body(axum::body::Body::from(
-                r#"{"error":{"code":"submission_unknown"},"retryable":false}"#,
-            ))
-            .unwrap();
-        let diagnostic = safe_error_body(br#"{"error":{"code":"vendor_new_code","message":"specific explanation","extra":{"field":7}}}"#);
-        let response = with_media_rejection(response, diagnostic).await.unwrap();
-        assert_eq!(response.status(), StatusCode::ACCEPTED);
-        assert_eq!(response.headers()["x-request-id"], "media-request");
-        let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
-            .await
-            .unwrap();
-        let value: Value = serde_json::from_slice(&bytes).unwrap();
-        assert_eq!(value["error"]["code"], "submission_unknown");
-        assert_eq!(value["retryable"], false);
-        assert!(
-            value["provider_error"]
-                .to_string()
-                .contains("specific explanation")
-        );
-        assert!(
-            value["provider_error"]
-                .to_string()
-                .contains("vendor_new_code")
-        );
-        assert!(value["provider_error"].to_string().contains("field"));
-    }
 
     #[tokio::test]
     async fn delayed_json_rejection_preserves_policy_reason_including_502() {

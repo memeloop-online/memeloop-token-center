@@ -375,6 +375,7 @@ where
                 response
             };
             Ok(ProxyRouteResponse {
+                codex_transient_bad_request: false,
                 preoutput_quota,
                 egress_selection,
                 response,

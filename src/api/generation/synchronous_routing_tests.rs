@@ -8,7 +8,7 @@ use crate::{
     plugin::PluginRuntime,
 };
 use axum::{
-    body::{Body, to_bytes},
+    body::{Body, Bytes, to_bytes},
     http::Request,
 };
 use sqlx::Row;
@@ -878,7 +878,11 @@ async fn explicit_image_auth_rejection_settles_zero_and_never_replays() {
             "definite-auth-rejection",
         )
         .await;
-        assert_eq!(response.status(), StatusCode::BAD_GATEWAY);
+        assert_eq!(response.status().as_u16(), status);
+        assert_eq!(
+            to_bytes(response.into_body(), 64 * 1024).await.unwrap(),
+            "invalid JSON"
+        );
         let pool = sqlx::AnyPool::connect(&fixture.database_url).await.unwrap();
         let row = sqlx::query("SELECT r.status, r.actual_micros, q.cost_micros, q.submission_uncertain_at, i.status AS idempotency_status FROM usage_reservations r JOIN request_records q ON q.reservation_id = r.id JOIN synchronous_image_idempotency i ON i.request_id = q.id WHERE q.key_id = $1")
             .bind(fixture.key_id.to_string()).fetch_one(&pool).await.unwrap();
@@ -909,6 +913,205 @@ async fn explicit_image_auth_rejection_settles_zero_and_never_replays() {
         assert_eq!(replay.status(), StatusCode::BAD_GATEWAY);
         assert_eq!(upstream.received_requests().await.unwrap().len(), 1);
     }
+}
+
+#[tokio::test]
+async fn synchronous_image_rejection_returns_original_response_without_raw_capture() {
+    let upstream = MockServer::start().await;
+    let raw = br#"{"error":{"authorization":"Bearer fixture-rejection-secret","message":"provider explanation fixture-rejection-secret"}}"#;
+    Mock::given(method("POST"))
+        .and(path("/v1/images/generations"))
+        .respond_with(
+            ResponseTemplate::new(403)
+                .set_body_raw(raw.as_slice(), "application/json")
+                .insert_header("set-cookie", "supplier_cookie=private")
+                .insert_header("www-authenticate", "Bearer realm=supplier")
+                .insert_header("connection", "content-language")
+                .insert_header("content-language", "en"),
+        )
+        .expect(1)
+        .mount(&upstream)
+        .await;
+    let fixture = fixture_with_archive(&upstream, crate::config::ArchiveBackend::Filesystem).await;
+    let response = post(
+        fixture.state.clone(),
+        &fixture.credential,
+        "private-image-rejection",
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::FORBIDDEN);
+    assert_eq!(response.headers()[header::CONTENT_TYPE], "application/json");
+    for name in [
+        header::SET_COOKIE,
+        header::WWW_AUTHENTICATE,
+        header::CONNECTION,
+        header::CONTENT_LANGUAGE,
+    ] {
+        assert!(!response.headers().contains_key(name));
+    }
+    let request_id =
+        Uuid::parse_str(response.headers()[REQUEST_ID_HEADER].to_str().unwrap()).unwrap();
+    let body = to_bytes(response.into_body(), 64 * 1024).await.unwrap();
+    assert_eq!(body.as_ref(), raw);
+
+    fixture.state.persistence.drain_for_test().await;
+    for side in ["request", "response"] {
+        assert!(
+            fixture
+                .state
+                .archive
+                .raw_capture_reference(fixture.tenant, request_id, side)
+                .await
+                .unwrap()
+                .is_none()
+        );
+        assert!(
+            !fixture
+                .state
+                .archive
+                .raw_capture_failed(fixture.tenant, request_id, side)
+                .await
+                .unwrap()
+        );
+    }
+    let digest = blake3::hash(raw).to_hex().to_string();
+    let cas_prefix = fixture._directory.path().join("archive").join(format!(
+        "tenants/{}/cas/v1/blake3/{}",
+        fixture.tenant,
+        &digest[..2]
+    ));
+    match fs::read_dir(cas_prefix) {
+        Ok(entries) => assert!(entries.into_iter().all(|entry| {
+            !entry
+                .unwrap()
+                .file_name()
+                .to_string_lossy()
+                .starts_with(digest.as_str())
+        })),
+        Err(error) => assert_eq!(error.kind(), std::io::ErrorKind::NotFound),
+    }
+    let pool = sqlx::AnyPool::connect(&fixture.database_url).await.unwrap();
+    let tasks: i64 = sqlx::query_scalar(
+        "SELECT (SELECT COUNT(*) FROM response_archive_spools WHERE request_id = $1)
+              + (SELECT COUNT(*) FROM archive_staging_attempts WHERE owner_id = $1)",
+    )
+    .bind(request_id.to_string())
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert_eq!(tasks, 0);
+    upstream.verify().await;
+}
+
+#[tokio::test]
+async fn synchronous_image_rejection_keeps_the_winning_failure_and_request_identity() {
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let uri = format!("http://{}", listener.local_addr().unwrap());
+    let (winner_tx, winner_rx) = tokio::sync::oneshot::channel();
+    let fixture = fixture_with_uri(&uri, crate::config::ArchiveBackend::Memory).await;
+    let pool = sqlx::AnyPool::connect(&fixture.database_url).await.unwrap();
+    let key_id = fixture.key_id;
+    let winner_id = Uuid::now_v7();
+    let upstream = tokio::spawn(async move {
+        let app = axum::Router::new().route(
+            "/v1/images/generations",
+            axum::routing::post(move |_body: Bytes| {
+                let pool = pool.clone();
+                async move {
+                    // Model a different owner publishing a definitive failure
+                    // while this attempt's upstream POST is in flight.
+                    let rows = sqlx::query(
+                        "UPDATE synchronous_image_idempotency
+                         SET request_id = $1, status = 'failed', error_code = 'winner_rejected'
+                         WHERE key_id = $2 AND idempotency_key = 'concurrent-image-failure'
+                           AND status = 'pending'",
+                    )
+                    .bind(winner_id.to_string())
+                    .bind(key_id.to_string())
+                    .execute(&pool)
+                    .await
+                    .unwrap();
+                    assert_eq!(rows.rows_affected(), 1);
+                    (StatusCode::BAD_REQUEST, "losing supplier body")
+                }
+            }),
+        );
+        axum::serve(listener, app)
+            .with_graceful_shutdown(async {
+                let _ = winner_rx.await;
+            })
+            .await
+            .unwrap();
+    });
+    let response = post(
+        fixture.state.clone(),
+        &fixture.credential,
+        "concurrent-image-failure",
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::BAD_GATEWAY);
+    assert_eq!(
+        response.headers()[REQUEST_ID_HEADER].to_str().unwrap(),
+        winner_id.to_string()
+    );
+    let body = to_bytes(response.into_body(), 64 * 1024).await.unwrap();
+    let body: Value = serde_json::from_slice(&body).unwrap();
+    assert_eq!(body["error"]["code"], "winner_rejected");
+    assert!(!body.to_string().contains("losing supplier body"));
+
+    let replay = post(
+        fixture.state.clone(),
+        &fixture.credential,
+        "concurrent-image-failure",
+    )
+    .await;
+    assert_eq!(replay.status(), StatusCode::BAD_GATEWAY);
+    assert_eq!(
+        replay.headers()[REQUEST_ID_HEADER].to_str().unwrap(),
+        winner_id.to_string()
+    );
+    drop(replay);
+    winner_tx.send(()).unwrap();
+    upstream.await.unwrap();
+}
+
+#[tokio::test]
+async fn synchronous_image_429_delivers_prefetched_bytes_and_keeps_the_submission_uncertain() {
+    let upstream = MockServer::start().await;
+    // This valid quota envelope exercises the classifier's consumed prefix.
+    let body = br#"{"error":{"type":"usage_limit_reached","message":"original upstream error"}}"#;
+    Mock::given(method("POST"))
+        .and(path("/v1/images/generations"))
+        .respond_with(
+            ResponseTemplate::new(429)
+                .set_body_raw(body.as_slice(), "application/json")
+                .insert_header("retry-after", "5"),
+        )
+        .expect(1)
+        .mount(&upstream)
+        .await;
+    let fixture = fixture(&upstream).await;
+    let response = post(fixture.state.clone(), &fixture.credential, "raw-429").await;
+    assert_eq!(response.status(), StatusCode::TOO_MANY_REQUESTS);
+    assert_eq!(response.headers()[header::RETRY_AFTER], "5");
+    let response_bytes = to_bytes(response.into_body(), 64 * 1024).await.unwrap();
+    assert_eq!(response_bytes.as_ref(), body);
+
+    let replay = post(fixture.state.clone(), &fixture.credential, "raw-429").await;
+    assert_eq!(replay.status(), StatusCode::CONFLICT);
+    let replay = to_bytes(replay.into_body(), 64 * 1024).await.unwrap();
+    let replay: Value = serde_json::from_slice(&replay).unwrap();
+    assert_eq!(replay["error"]["code"], "image_submission_uncertain");
+    let pool = sqlx::AnyPool::connect(&fixture.database_url).await.unwrap();
+    let reservation: String = sqlx::query_scalar(
+        "SELECT r.status FROM usage_reservations r JOIN request_records q ON q.reservation_id = r.id WHERE q.key_id = $1",
+    )
+    .bind(fixture.key_id.to_string())
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert_eq!(reservation, "reserved");
+    upstream.verify().await;
 }
 
 #[tokio::test]

@@ -160,6 +160,54 @@ async fn responses_route_dispatches_anthropic_messages_and_restores_buffered_con
 }
 
 #[tokio::test]
+async fn responses_via_anthropic_delivers_non_json_http_rejection_without_translation() {
+    let upstream = MockServer::start().await;
+    let original = b"unsupported input: provider detail\r\nsecond line\n";
+    Mock::given(method("POST"))
+        .and(path("/v1/messages"))
+        .and(header_matcher("anthropic-version", "2023-06-01"))
+        .respond_with(
+            ResponseTemplate::new(422)
+                .set_body_raw(original.as_slice(), "text/plain")
+                .insert_header("content-language", "en")
+                .insert_header("set-cookie", "provider-cookie=must-not-cross"),
+        )
+        .expect(1)
+        .mount(&upstream)
+        .await;
+
+    let fixture = fixture("responses-anthropic-http-rejection", &upstream).await;
+    let response = send_response_usage_request(
+        &fixture,
+        &json!({"model":fixture.model,"input":"fixture prompt","stream":true,"max_output_tokens":64}),
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::UNPROCESSABLE_ENTITY);
+    assert_eq!(response.headers()[header::CONTENT_TYPE], "text/plain");
+    assert_eq!(response.headers()[header::CONTENT_LANGUAGE], "en");
+    assert!(!response.headers().contains_key(header::SET_COOKIE));
+    let bytes = to_bytes(response.into_body(), MAX_PROXY_RESPONSE_BODY)
+        .await
+        .unwrap();
+    assert_eq!(bytes.as_ref(), original.as_slice());
+    cancellation::assert_single_unknown_receipt(&fixture, 422, Some("http_422")).await;
+    let records = fixture
+        .state
+        .db
+        .list_requests(fixture.key_id, 10)
+        .await
+        .unwrap();
+    assert_eq!(records.len(), 1);
+    assert_eq!(
+        records[0].upstream_account_id,
+        Some(fixture.upstream_account_id)
+    );
+    assert_eq!(records[0].billing.cost, None);
+    cancellation::assert_original_response(&fixture, records[0].request_id, original).await;
+    upstream.verify().await;
+}
+
+#[tokio::test]
 async fn responses_route_translates_anthropic_stream_and_drops_ping() {
     let upstream = MockServer::start().await;
     Mock::given(method("POST"))

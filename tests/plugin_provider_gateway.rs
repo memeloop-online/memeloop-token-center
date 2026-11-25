@@ -531,6 +531,57 @@ async fn real_component_provider_normalizes_non_openai_upstream_and_core_owns_se
 }
 
 #[tokio::test]
+async fn component_provider_forwards_and_archives_the_supplier_http_error() {
+    let mock = MockServer::start().await;
+    let supplier_error = json!({
+        "error": { "code": "insufficient_quota", "message": "Quota exhausted for this account" }
+    });
+    let original = serde_json::to_vec(&supplier_error).unwrap();
+    Mock::given(method("POST"))
+        .and(path("/vendor/infer"))
+        .and(matches_header("x-plugin-shape", "buffered-v1"))
+        .respond_with(ResponseTemplate::new(429).set_body_raw(original.clone(), "application/json"))
+        .expect(1)
+        .mount(&mock)
+        .await;
+    let ComponentProviderFixture {
+        _directory,
+        state,
+        key,
+        account_id,
+    } = component_provider_fixture(&mock.uri(), "component-provider-http-error.db").await;
+    let (status, delivered) = call_component_provider(&state, &key).await;
+    assert_eq!(status, StatusCode::TOO_MANY_REQUESTS);
+    assert_eq!(delivered, supplier_error);
+
+    let identity = state
+        .db
+        .authenticate_key(&key, state.config.key_pepper.as_bytes())
+        .await
+        .unwrap();
+    let requests = state.db.list_requests(identity.key_id, 10).await.unwrap();
+    assert_eq!(requests.len(), 1);
+    let request_id = requests[0].request_id;
+    wait_for_bound_plugin_archives(&state, &[request_id]).await;
+    let refs = state
+        .db
+        .request_archive_refs(identity.key_id, request_id)
+        .await
+        .unwrap();
+    assert_eq!(refs.view.status_code, Some(429));
+    assert_eq!(refs.view.error_code.as_deref(), Some("http_429"));
+    assert_eq!(refs.view.upstream_account_id, Some(account_id));
+    assert!(refs.view.usage.tokens.is_none());
+    assert_eq!(refs.view.billing.cost, None);
+    let archived = state
+        .archive
+        .get_bounded(refs.response_object.as_deref().unwrap(), 1024 * 1024)
+        .await
+        .unwrap();
+    assert_eq!(archived.as_ref(), original.as_slice());
+}
+
+#[tokio::test]
 async fn component_provider_does_not_replay_after_the_server_accepts_the_prepared_request() {
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let base_url = format!("http://{}", listener.local_addr().unwrap());

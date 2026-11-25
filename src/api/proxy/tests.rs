@@ -1710,13 +1710,16 @@ async fn codex_transient_400_is_not_replayed_across_accounts() {
         json!({"model": fixture.model, "input": "retry safely", "stream": true}),
     )
     .await;
-    assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
     let body = to_bytes(response.into_body(), MAX_PROXY_RESPONSE_BODY)
         .await
         .unwrap();
-    let body = String::from_utf8_lossy(&body);
-    assert!(!body.contains("standby after transient rejection"));
-    assert!(!body.contains("transient upstream detail must stay private"));
+    let original = json!({"error": {
+        "type": "temporarily_unavailable",
+        "message": "transient upstream detail must stay private"
+    }});
+    assert_eq!(body.as_ref(), serde_json::to_vec(&original).unwrap());
+    cancellation::assert_single_unknown_receipt(&fixture, 400, Some("http_400")).await;
     fixture.state.routing_persistence.drain_for_test().await;
     let pool = sqlx::AnyPool::connect(&fixture.database_url).await.unwrap();
     let health_rows: i64 = sqlx::query_scalar(
@@ -1737,11 +1740,14 @@ async fn codex_transient_400_is_not_replayed_across_accounts() {
     .unwrap();
     assert_eq!(actual, fixture.upstream_account_id.to_string());
     pool.close().await;
-    sse_delivery::assert_unknown_response_archives_omit(
-        &fixture,
-        "transient upstream detail must stay private",
-    )
-    .await;
+    let rows = fixture
+        .state
+        .db
+        .list_requests(fixture.key_id, 10)
+        .await
+        .unwrap();
+    assert_eq!(rows.len(), 1);
+    cancellation::assert_original_response(&fixture, rows[0].request_id, &body).await;
     upstream.verify().await;
 }
 
@@ -1969,9 +1975,10 @@ async fn codex_definite_ordinary_400_is_not_replayed_with_a_large_body() {
     let body = to_bytes(response.into_body(), MAX_PROXY_RESPONSE_BODY)
         .await
         .unwrap();
-    let body = String::from_utf8_lossy(&body);
-    assert!(body.contains("upstream rejected the request"));
-    assert!(!body.contains("private ordinary rejection"));
+    let expected = json!({"error": {
+        "type": "invalid_request_error", "message": "private ordinary rejection"
+    }});
+    assert_eq!(body.as_ref(), serde_json::to_vec(&expected).unwrap());
     cancellation::assert_single_unknown_receipt(&fixture, 400, Some("http_400")).await;
     let rows = fixture
         .state
@@ -1981,8 +1988,7 @@ async fn codex_definite_ordinary_400_is_not_replayed_with_a_large_body() {
         .unwrap();
     assert_eq!(rows.len(), 1);
     assert_eq!(rows[0].status_code, Some(400));
-    sse_delivery::assert_unknown_response_archives_omit(&fixture, "private ordinary rejection")
-        .await;
+    cancellation::assert_original_response(&fixture, rows[0].request_id, &body).await;
     let requests = upstream.received_requests().await.unwrap();
     assert_eq!(requests.len(), 1);
     assert_codex_wire(&requests[0], &fixture.upstream_model);
@@ -2168,7 +2174,7 @@ async fn codex_retry_buffered_completion_requires_a_single_matching_response_id(
 }
 
 #[tokio::test]
-async fn codex_retryable_then_ordinary_400_returns_fixed_400_without_cooldown_or_failover() {
+async fn codex_retryable_then_ordinary_400_returns_original_400_without_cooldown_or_failover() {
     let fixture = codex_route_fixture("retryable-then-ordinary-400").await;
     let upstream = MockServer::start().await;
     let attempts = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
@@ -2218,10 +2224,10 @@ async fn codex_retryable_then_ordinary_400_returns_fixed_400_without_cooldown_or
     let body = to_bytes(response.into_body(), MAX_PROXY_RESPONSE_BODY)
         .await
         .unwrap();
-    let body = String::from_utf8_lossy(&body);
-    assert!(body.contains("upstream rejected the request"));
-    assert!(!body.contains("private transient rejection"));
-    assert!(!body.contains("private ordinary rejection"));
+    let expected = json!({"error": {
+        "type": "invalid_request_error", "message": "private ordinary rejection"
+    }});
+    assert_eq!(body.as_ref(), serde_json::to_vec(&expected).unwrap());
     cancellation::assert_single_unknown_receipt(&fixture, 400, Some("http_400")).await;
     let rows = fixture
         .state
@@ -2232,10 +2238,7 @@ async fn codex_retryable_then_ordinary_400_returns_fixed_400_without_cooldown_or
     assert_eq!(rows.len(), 1);
     assert_eq!(rows[0].status_code, Some(400));
     assert_eq!(rows[0].error_code.as_deref(), Some("http_400"));
-    sse_delivery::assert_unknown_response_archives_omit(&fixture, "private transient rejection")
-        .await;
-    sse_delivery::assert_unknown_response_archives_omit(&fixture, "private ordinary rejection")
-        .await;
+    cancellation::assert_original_response(&fixture, rows[0].request_id, &body).await;
     let pool = sqlx::AnyPool::connect(&fixture.database_url).await.unwrap();
     let health_rows: i64 = sqlx::query_scalar(
         "SELECT COUNT(*) FROM upstream_account_health
@@ -2377,7 +2380,7 @@ async fn native_codex_ambiguous_transport_after_request_bytes_is_not_replayed() 
 
 #[tokio::test]
 async fn codex_ordinary_json_400_is_returned_once_without_failover_or_cooldown() {
-    for (label, upstream_body, sensitive) in [
+    for (label, upstream_body) in [
         (
             "known",
             json!({
@@ -2386,13 +2389,11 @@ async fn codex_ordinary_json_400_is_returned_once_without_failover_or_cooldown()
                     "message": "private context rejection detail"
                 }
             }),
-            Some("private context rejection detail"),
         ),
-        ("empty", json!({}), None),
+        ("empty-object", json!({})),
         (
             "unknown-shape",
             json!({"unexpected": {"code": "not-a-transient-error"}}),
-            None,
         ),
     ] {
         let fixture_name = format!("ordinary-400-{label}");
@@ -2401,7 +2402,7 @@ async fn codex_ordinary_json_400_is_returned_once_without_failover_or_cooldown()
         Mock::given(method("POST"))
             .and(path(codex_transport::RESPONSES_PATH))
             .and(header_matcher("chatgpt-account-id", "account-123"))
-            .respond_with(ResponseTemplate::new(400).set_body_json(upstream_body))
+            .respond_with(ResponseTemplate::new(400).set_body_json(upstream_body.clone()))
             .expect(1)
             .mount(&upstream)
             .await;
@@ -2425,13 +2426,20 @@ async fn codex_ordinary_json_400_is_returned_once_without_failover_or_cooldown()
         let body = to_bytes(response.into_body(), MAX_PROXY_RESPONSE_BODY)
             .await
             .unwrap();
-        let body = String::from_utf8_lossy(&body);
-        assert!(body.contains("upstream rejected the request"), "{label}");
+        assert_eq!(
+            body.as_ref(),
+            serde_json::to_vec(&upstream_body).unwrap(),
+            "{label}"
+        );
         cancellation::assert_single_unknown_receipt(&fixture, 400, Some("http_400")).await;
-        if let Some(sensitive) = sensitive {
-            assert!(!body.contains(sensitive), "{label}");
-            sse_delivery::assert_unknown_response_archives_omit(&fixture, sensitive).await;
-        }
+        let rows = fixture
+            .state
+            .db
+            .list_requests(fixture.key_id, 10)
+            .await
+            .unwrap();
+        assert_eq!(rows.len(), 1);
+        cancellation::assert_original_response(&fixture, rows[0].request_id, &body).await;
         let pool = sqlx::AnyPool::connect(&fixture.database_url).await.unwrap();
         let health_rows: i64 = sqlx::query_scalar(
             "SELECT COUNT(*) FROM upstream_account_health
@@ -2470,8 +2478,8 @@ async fn codex_ordinary_json_400_is_returned_once_without_failover_or_cooldown()
 }
 
 #[tokio::test]
-async fn codex_unclassifiable_400_bodies_fail_closed_without_leaking() {
-    for (label, body, sensitive, content_type) in [
+async fn codex_unclassifiable_400_bodies_are_exact_and_never_retry() {
+    for (label, body, content_type) in [
         (
             "oversized-400",
             format!(
@@ -2479,26 +2487,22 @@ async fn codex_unclassifiable_400_bodies_fail_closed_without_leaking() {
                 "oversized private upstream detail ".repeat(600),
             )
             .into_bytes(),
-            "oversized private upstream detail",
             "application/json",
         ),
         (
             "malformed-400",
             b"{\"error\": {\"type\": \"temporarily_unavailable\", \"message\": \"malformed private upstream detail\""
                 .to_vec(),
-            "malformed private upstream detail",
             "application/json",
         ),
         (
             "plaintext-transient-400",
             br#"{"error":{"type":"temporarily_unavailable","message":"private diagnostic canary"}}"#.to_vec(),
-            "private diagnostic canary",
             "text/plain",
         ),
         (
             "html-400",
             b"<html>Invalid input private diagnostic canary</html>".to_vec(),
-            "private diagnostic canary",
             "text/html",
         ),
     ] {
@@ -2530,10 +2534,10 @@ async fn codex_unclassifiable_400_bodies_fail_closed_without_leaking() {
         let response_body = to_bytes(response.into_body(), MAX_PROXY_RESPONSE_BODY)
             .await
             .unwrap();
-        assert!(!response_body.is_empty(), "{label} has a diagnostic");
+        assert_eq!(response_body.as_ref(), body.as_slice(), "{label}");
+        cancellation::assert_single_unknown_receipt(&fixture, 400, Some("http_400")).await;
         let rows = fixture.state.db.list_requests(fixture.key_id, 10).await.unwrap();
         cancellation::assert_original_response(&fixture, rows[0].request_id, &body).await;
-        let _ = sensitive;
         let pool = sqlx::AnyPool::connect(&fixture.database_url).await.unwrap();
         let health_rows: i64 = sqlx::query_scalar(
             "SELECT COUNT(*) FROM upstream_account_health
@@ -2545,7 +2549,6 @@ async fn codex_unclassifiable_400_bodies_fail_closed_without_leaking() {
         .unwrap();
         assert_eq!(health_rows, 0, "{label}");
         pool.close().await;
-        sse_delivery::assert_unknown_response_archives_omit(&fixture, sensitive).await;
         upstream.verify().await;
     }
 }

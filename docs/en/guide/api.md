@@ -15,7 +15,7 @@ The public model interfaces follow common OpenAI and Anthropic protocols. Exact 
 ## Versioning and errors
 
 - Responses carry `X-MTC-API-Version: v1` to identify the API version.
-- Errors use JSON and standard HTTP status codes and do not include provider credential material.
+- Gateway-generated errors use JSON and do not include provider credentials. If a public text proxy relays a final provider HTTP rejection, it preserves the provider status and response body. The body can be empty or non-JSON, and provider JSON need not use the gateway error format. This rule does not apply to gateway errors or errors after an SSE stream has begun.
 - New fields and endpoints can be added incrementally within v1; removing existing fields or behavior requires a public deprecation window.
 
 ## Retries and pagination
@@ -33,6 +33,5 @@ MTC serves `POST /v1/messages` and `POST /v1/messages/count_tokens` through the 
 - `anthropic-version`, `anthropic-beta`, other `anthropic-*` headers, and `x-claude-code-*` session and agent identifiers remain available to an Anthropic-format upstream. Request fields stay open so newer tool, thinking, cache, and context-management fields can travel with their matching beta capabilities.
 - Streamed Messages responses are relayed as `text/event-stream`, including Anthropic `event: ping` frames with `{"type":"ping"}` data. Ping frames are transport control events. `retry-after`, `retry-after-ms`, `x-should-retry`, and the `anthropic-ratelimit-*` response-header family remain available for retry and plan-limit handling.
 - `GET /v1/models` supports Anthropic gateway discovery with `limit` from 1 through 1000 and an optional `before_id` or `after_id` cursor. Its response follows the Anthropic list shape and contains models with an active authorized Anthropic route for the current MTC credential.
-- Error responses from an Anthropic-format upstream retain their status, response body, and retry/limit headers for the client. MTC stores the terminal request facts without retaining the upstream error body.
 
 `/v1/messages/count_tokens` is available when the selected route's upstream supports the endpoint. Provider-specific request translation is supplied by the selected provider adapter; the core gateway keeps the Anthropic Messages envelope intact.
