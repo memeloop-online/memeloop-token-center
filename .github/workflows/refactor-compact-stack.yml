@@ -19,12 +19,36 @@ jobs:
           toolchain: 1.95.0
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6
       - uses: ./.github/actions/checkout-plugin-examples
+      - name: Install and verify debugger on the temporary Ubuntu runner
+        run: |
+          set -euo pipefail
+          evidence="$RUNNER_TEMP/compact-evidence"
+          mkdir -p "$evidence"
+          if ! command -v gdb >/dev/null; then
+            if ! (sudo apt-get -q -o Acquire::Retries=3 update &&
+                  sudo env DEBIAN_FRONTEND=noninteractive apt-get -yq --no-install-recommends install gdb); then
+              echo "::warning::GDB installation failed; checking preinstalled LLDB"
+            fi
+          fi
+          if command -v gdb >/dev/null && gdb -nx -q -batch -ex 'python import gdb; print("GDB Python usable")'; then
+            debugger="$(command -v gdb)"
+            kind=gdb
+          else
+            debugger="$(command -v lldb || command -v lldb-18 || command -v lldb-17 || true)"
+            test -x "$debugger" || { echo "::error::No usable GDB or LLDB"; exit 1; }
+            "$debugger" --batch -o 'script import lldb; print("LLDB Python usable")'
+            kind=lldb
+          fi
+          "$debugger" --version | tee "$evidence/debugger-version.txt"
+          printf 'TRACE_DEBUGGER=%s\nTRACE_KIND=%s\n' "$debugger" "$kind" >> "$GITHUB_ENV"
       - name: Build exact compact-carrier defaults with unchanged stack settings
         run: |
           set -euo pipefail
-          test "$(git rev-parse HEAD)" = 27113d1a43a8975fca5a6c7c0a5b3b0ab04dcf5b
-          test -z "${RUST_MIN_STACK+x}"
-          command -v gdb
+          revision="$(git rev-parse HEAD)"
+          echo "Product revision: $revision"
+          test "$revision" = 27113d1a43a8975fca5a6c7c0a5b3b0ab04dcf5b
+          if [[ -v RUST_MIN_STACK ]]; then echo "::error::Unexpected Rust thread stack override"; exit 1; fi
+          echo "No Rust thread stack override"
           cargo test --locked --lib --no-run --message-format=json-render-diagnostics > "$RUNNER_TEMP/compact-artifacts.json"
           exe=$(jq -rs '[.[]|select(.reason=="compiler-artifact" and .profile.test and .executable!=null and (.target.kind|index("lib")))][-1].executable // empty' "$RUNNER_TEMP/compact-artifacts.json")
           test -x "$exe"; printf 'TEST_EXE=%s\n' "$exe" >> "$GITHUB_ENV"
@@ -81,7 +105,32 @@ jobs:
               print(gdb.execute("x/i $pc",to_string=True))
           end
           GDB
-          timeout --kill-after=5s 200s gdb -nx -q -batch -x "$RUNNER_TEMP/capture.gdb" --args "$TEST_EXE" "$test_name" --exact --nocapture > "$evidence/trace.txt" 2>&1
+          if [[ "$TRACE_KIND" == gdb ]]; then
+            timeout --kill-after=5s 200s "$TRACE_DEBUGGER" -nx -q -batch -x "$RUNNER_TEMP/capture.gdb" --args "$TEST_EXE" "$test_name" --exact --nocapture > "$evidence/trace.txt" 2>&1
+          else
+            cat > "$RUNNER_TEMP/compact_lldb.py" <<'PY'
+          import lldb, os
+          def frames(debugger, command, result, internal_dict):
+              p=debugger.GetSelectedTarget().GetProcess()
+              if p.GetState()==lldb.eStateExited:
+                  print("INFERIOR_EXITED_WITHOUT_SIGNAL"); return
+              threads=[t for t in p if t.GetStopReason()==lldb.eStopReasonSignal]
+              for t in threads:
+                  signum=t.GetStopReasonDataAtIndex(0)
+                  print("received signal",p.GetUnixSignals().GetSignalAsCString(signum))
+                  last=None
+                  for i,f in enumerate(t):
+                      if i>=160:break
+                      sp=f.GetSP(); e=f.GetLineEntry()
+                      print("FRAME",i,"delta",0 if last is None else sp-last,"symbol",f.GetFunctionName() or "?","loc",e.GetFileSpec().GetFilename(),e.GetLine())
+                      last=sp
+          PY
+            timeout --kill-after=5s 200s "$TRACE_DEBUGGER" --no-lldbinit --batch \
+              -o "command script import $RUNNER_TEMP/compact_lldb.py" \
+              -o 'command script add -f compact_lldb.frames safe-frames' \
+              -o 'settings set target.disable-aslr false' -o run -o safe-frames \
+              --one-line-on-crash safe-frames -- "$TEST_EXE" "$test_name" --exact --nocapture > "$evidence/trace.txt" 2>&1 || true
+          fi
           grep -E 'received signal|INFERIOR_EXITED_WITHOUT_SIGNAL|^FRAME [0-9]+ |^FAULTING_INSTRUCTION|^near-sp MAP' "$evidence/trace.txt" | cut -c1-500
           grep -Eq 'received signal SIG(SEGV|ABRT)|INFERIOR_EXITED_WITHOUT_SIGNAL' "$evidence/trace.txt"
       - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
