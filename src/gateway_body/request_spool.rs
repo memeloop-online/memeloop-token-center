@@ -1,3 +1,4 @@
+mod capture_timing;
 use super::carrier::{BodyCarrier, CarrierCapture};
 use std::{
     path::PathBuf,
@@ -418,9 +419,15 @@ impl RequestSpoolAdmission {
         let mut hasher = blake3::Hasher::new();
         let mut scanner = super::memory::JsonMemoryScanner::default();
         let mut rejected = None;
-        let input = body.into_data_stream().map(|chunk| {
-            let chunk = chunk.map_err(|_| RequestSpoolCaptureError::BodyReadRejected)?;
+        let capture_summary = capture_timing::CaptureSummary::new(body_key);
+        let timing = capture_summary.timing();
+        let input = timing.input(body.into_data_stream()).map(|chunk| {
+            let chunk = chunk.map_err(|_| {
+                timing.error();
+                RequestSpoolCaptureError::BodyReadRejected
+            })?;
             if chunk.len() > maximum.saturating_sub(length) {
+                timing.error();
                 rejected = Some(RequestSpoolCaptureError::TooLarge);
                 return Err(RequestSpoolCaptureError::TooLarge);
             }
@@ -429,8 +436,11 @@ impl RequestSpoolAdmission {
                 .map_err(|_| RequestSpoolCaptureError::Unavailable)?
                 .record_written(chunk.len());
             length += chunk.len();
+            let scan_started = std::time::Instant::now();
             hasher.update(&chunk);
             scanner.observe(&chunk);
+            let scan_elapsed = scan_started.elapsed();
+            timing.scan(scan_elapsed, chunk.len());
             Ok(chunk)
         });
         let (body, carrier) = if let Some(memory) = memory {
@@ -461,6 +471,7 @@ impl RequestSpoolAdmission {
             let carrier = match result {
                 Ok(carrier) => carrier,
                 Err(_) => {
+                    timing.error();
                     return Err(rejected.unwrap_or(RequestSpoolCaptureError::BodyReadRejected));
                 }
             };
