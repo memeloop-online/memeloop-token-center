@@ -2,6 +2,14 @@ use super::*;
 use crate::archive::{ArchiveStore, ConversationBodyReference};
 use bytes::Bytes;
 
+struct VerifiedLegacyBinding {
+    old_locator: String,
+    key_id: String,
+    created_at: i64,
+    attempt_id: String,
+    updated_at: i64,
+}
+
 impl Database {
     pub(crate) async fn resolve_raw_archive_roots(
         &self,
@@ -204,12 +212,87 @@ impl Database {
                 object.clone()
             }
         };
+        // A projection may discover a CAS root produced from a historical
+        // original. Verify that original outside SQL locks; only the exact
+        // observed pointer and complete request identity may then be replaced.
+        let legacy = if owner.is_some() {
+            let query = match side {
+                "request" => {
+                    "SELECT r.request_object AS old_locator, r.key_id, r.created_at FROM request_record_locators l JOIN request_records r ON r.id=l.id AND r.created_at=l.created_at AND r.tenant_id=l.tenant_id AND r.key_id=l.key_id WHERE l.id=$1 AND l.tenant_id=$2"
+                }
+                "response" => {
+                    "SELECT r.response_object AS old_locator, r.key_id, r.created_at FROM request_record_locators l JOIN request_records r ON r.id=l.id AND r.created_at=l.created_at AND r.tenant_id=l.tenant_id AND r.key_id=l.key_id WHERE l.id=$1 AND l.tenant_id=$2"
+                }
+                _ => return Err(AppError::BadRequest("invalid raw archive side".into())),
+            };
+            let row = sqlx::query(query)
+                .bind(request_id.to_string())
+                .bind(tenant_id.to_string())
+                .fetch_optional(&self.pool)
+                .await?;
+            if let Some(row) = row {
+                let old: Option<String> = row.try_get("old_locator")?;
+                if let Some(old) = old.filter(|old| {
+                    !old.is_empty()
+                        && old != &effective.object_locator
+                        && old != &format!("gap://{request_id}/{side}")
+                        && !(side == "request"
+                            && old
+                                == &format!(
+                                    "staging/proxy/{request_id}/request/{request_id}/body.json"
+                                ))
+                }) {
+                    // Completed typed attempts have a unique writer/key. A
+                    // bound attempt cannot be reopened by begin/replay, and its
+                    // writer finishes object I/O before committing this receipt.
+                    let receipt = sqlx::query("SELECT attempt_id, backend_identity, updated_at FROM archive_staging_attempts WHERE owner_kind='proxy_request' AND owner_id=$1 AND purpose=$2 AND bound_locator=$3 AND state='bound' AND lease_owner IS NULL AND lease_token IS NULL AND lease_expires_at IS NULL")
+                        .bind(request_id.to_string()).bind(side).bind(&old)
+                        .fetch_optional(&self.pool).await?;
+                    let Some(receipt) = receipt else {
+                        return Ok(false);
+                    };
+                    let attempt_id: String = receipt.try_get("attempt_id")?;
+                    let backend: Option<String> = receipt.try_get("backend_identity")?;
+                    let key = crate::archive_staging::ArchiveStagingKey::from_database(
+                        "proxy_request",
+                        &request_id.to_string(),
+                        side,
+                        &attempt_id,
+                    )?
+                    .with_backend_identity(backend.as_deref())?;
+                    if crate::archive_staging::validate_bound_locator(key, &old).is_err() {
+                        return Ok(false);
+                    }
+                    if archive.verified_legacy_source(&old, &effective).await? {
+                        Some(VerifiedLegacyBinding {
+                            old_locator: old,
+                            key_id: row.try_get("key_id")?,
+                            created_at: row.try_get("created_at")?,
+                            attempt_id,
+                            updated_at: receipt.try_get("updated_at")?,
+                        })
+                    } else {
+                        return Ok(false);
+                    }
+                } else {
+                    None
+                }
+            } else {
+                None
+            }
+        } else {
+            None
+        };
+        #[cfg(test)]
+        if legacy.is_some() {
+            Self::wait_raw_projection_gate_for_test(request_id).await;
+        }
         let statement = match side {
             "request" => {
-                "UPDATE request_records SET request_object = $1 WHERE id = $2 AND tenant_id = $3 AND (request_object IS NULL OR request_object = '' OR request_object = $1 OR request_object = 'gap://' || id || '/request' OR request_object = 'staging/proxy/' || id || '/request/' || id || '/body.json')"
+                "UPDATE request_records SET request_object = $1 WHERE id = $2 AND tenant_id = $3 AND (($7 = 0 AND (request_object IS NULL OR request_object = '' OR request_object = $1 OR request_object = 'gap://' || id || '/request' OR request_object = 'staging/proxy/' || id || '/request/' || id || '/body.json')) OR ($7 = 1 AND request_object = $4 AND created_at = $5 AND key_id = $6))"
             }
             "response" => {
-                "UPDATE request_records SET response_object = $1 WHERE id = $2 AND tenant_id = $3 AND (response_object IS NULL OR response_object = '' OR response_object = $1 OR response_object = 'gap://' || id || '/response')"
+                "UPDATE request_records SET response_object = $1 WHERE id = $2 AND tenant_id = $3 AND (($7 = 0 AND (response_object IS NULL OR response_object = '' OR response_object = $1 OR response_object = 'gap://' || id || '/response')) OR ($7 = 1 AND response_object = $4 AND created_at = $5 AND key_id = $6))"
             }
             _ => return Err(AppError::BadRequest("invalid raw archive side".into())),
         };
@@ -223,12 +306,43 @@ impl Database {
                 return Ok(false);
             }
         }
+        if let Some(proof) = legacy.as_ref() {
+            let sql = match self.backend {
+                DatabaseBackend::PostgreSql => {
+                    "SELECT attempt_id FROM archive_staging_attempts WHERE attempt_id=$1 AND owner_kind='proxy_request' AND owner_id=$2 AND purpose=$3 AND bound_locator=$4 AND state='bound' AND updated_at=$5 AND lease_owner IS NULL AND lease_token IS NULL AND lease_expires_at IS NULL FOR UPDATE"
+                }
+                DatabaseBackend::Sqlite => {
+                    "SELECT attempt_id FROM archive_staging_attempts WHERE attempt_id=$1 AND owner_kind='proxy_request' AND owner_id=$2 AND purpose=$3 AND bound_locator=$4 AND state='bound' AND updated_at=$5 AND lease_owner IS NULL AND lease_token IS NULL AND lease_expires_at IS NULL"
+                }
+            };
+            if sqlx::query(sql)
+                .bind(&proof.attempt_id)
+                .bind(request_id.to_string())
+                .bind(side)
+                .bind(&proof.old_locator)
+                .bind(proof.updated_at)
+                .fetch_optional(&mut *transaction)
+                .await?
+                .is_none()
+            {
+                transaction.rollback().await?;
+                return Ok(false);
+            }
+        }
         let changed = sqlx::query(statement)
             .bind(&effective.object_locator)
             .bind(request_id.to_string())
             .bind(tenant_id.to_string())
+            .bind(legacy.as_ref().map(|proof| proof.old_locator.as_str()))
+            .bind(legacy.as_ref().map(|proof| proof.created_at))
+            .bind(legacy.as_ref().map(|proof| proof.key_id.as_str()))
+            .bind(if legacy.is_some() { 1_i64 } else { 0_i64 })
             .execute(&mut *transaction)
             .await?;
+        if changed.rows_affected() == 0 {
+            transaction.rollback().await?;
+            return Ok(false);
+        }
         if changed.rows_affected() == 1 {
             super::requests::conversations::wake_session_body_archive_in_transaction(
                 &mut transaction,

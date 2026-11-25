@@ -499,6 +499,69 @@ impl Database {
         prepared_snapshot: Option<&str>,
         previous_lease_owner: Option<Uuid>,
     ) -> Result<bool, AppError> {
+        // The legacy entry is initial-only. Prepared continuation requires a
+        // reviewed creation identity and exact expired lease in the same CAS.
+        if prepared_snapshot.is_some() || previous_lease_owner.is_some() {
+            return Ok(false);
+        }
+        self.claim_exact_session_body_rebuild_inner(
+            tenant_id,
+            key_id,
+            request_id,
+            expected_projected_at,
+            request_locator,
+            response_locator,
+            lease_owner,
+            prepared_snapshot,
+            previous_lease_owner,
+            None,
+        )
+        .await
+    }
+
+    /// Resume only the non-empty prepared snapshot and expired owner reviewed
+    /// by maintenance inspection. The original request/response remain intact.
+    pub async fn claim_reviewed_session_body_rebuild(
+        &self,
+        tenant_id: Uuid,
+        key_id: Uuid,
+        request_id: Uuid,
+        request_locator: &str,
+        response_locator: &str,
+        lease_owner: Uuid,
+        prepared_snapshot: &str,
+        previous_lease_owner: Uuid,
+        expected_created_at: i64,
+        expected_lease_expires_at: i64,
+    ) -> Result<bool, AppError> {
+        self.claim_exact_session_body_rebuild_inner(
+            tenant_id,
+            key_id,
+            request_id,
+            None,
+            request_locator,
+            response_locator,
+            lease_owner,
+            Some(prepared_snapshot),
+            Some(previous_lease_owner),
+            Some((expected_created_at, expected_lease_expires_at)),
+        )
+        .await
+    }
+
+    async fn claim_exact_session_body_rebuild_inner(
+        &self,
+        tenant_id: Uuid,
+        key_id: Uuid,
+        request_id: Uuid,
+        expected_projected_at: Option<i64>,
+        request_locator: &str,
+        response_locator: &str,
+        lease_owner: Uuid,
+        prepared_snapshot: Option<&str>,
+        previous_lease_owner: Option<Uuid>,
+        reviewed_identity_and_expiry: Option<(i64, i64)>,
+    ) -> Result<bool, AppError> {
         let now = unix_millis();
         let mut transaction = self.begin_write_transaction().await?;
         if matches!(self.backend, DatabaseBackend::PostgreSql) {
@@ -523,9 +586,10 @@ impl Database {
              WHERE request_id = $3 AND tenant_id = $4 AND key_id = $5
                AND (projected_at = $6 OR (projected_at IS NULL AND $6 IS NULL))
                AND semantic_payload_snapshot_json IS NULL
-               AND (semantic_snapshot_json IS NULL OR
-                    ($10 IS NOT NULL AND semantic_snapshot_json = $10
+               AND (($10 IS NULL AND $11 IS NULL AND semantic_snapshot_json IS NULL) OR
+                    ($10 IS NOT NULL AND $11 IS NOT NULL AND semantic_snapshot_json = $10
                      AND lease_owner = $11 AND projected_at IS NULL))
+               AND ($13 IS NULL OR (lease_expires_at = $13 AND $13 <= $7 AND $14 = $12))
                AND (lease_owner IS NULL OR lease_expires_at <= $7)
                AND (terminal_lease_owner IS NULL OR terminal_lease_expires_at <= $7)
                AND EXISTS (SELECT 1 FROM request_records r
@@ -544,6 +608,8 @@ impl Database {
         .bind(prepared_snapshot)
         .bind(previous_lease_owner.map(|owner| owner.to_string()))
         .bind(created_at)
+        .bind(reviewed_identity_and_expiry.map(|(_, expiry)| expiry))
+        .bind(reviewed_identity_and_expiry.map(|(created, _)| created))
         .execute(&mut *transaction)
         .await?;
         transaction.commit().await?;

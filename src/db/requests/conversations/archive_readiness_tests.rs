@@ -2613,6 +2613,10 @@ async fn queued_archive_event_contract(url: String) {
 
 #[tokio::test]
 async fn postgres_exact_legacy_body_rebuild_preserves_incomplete_and_financial_receipt() {
+    let _ = tracing_subscriber::fmt()
+        .with_max_level(tracing::Level::DEBUG)
+        .with_test_writer()
+        .try_init();
     let database_url =
         std::env::var("MTC_TEST_POSTGRES_URL").expect("exact recovery requires PostgreSQL");
     let isolated = PostgresTestDatabase::create(&database_url).await;
@@ -2621,20 +2625,38 @@ async fn postgres_exact_legacy_body_rebuild_preserves_incomplete_and_financial_r
     let request =
         Bytes::from_static(br#"{"model":"fixture","input":"original question","stream":false}"#);
     let response = Bytes::from_static(br#"{"object":"response","status":"incomplete","incomplete_details":{"reason":"max_output_tokens"},"output":[{"type":"reasoning","summary":[{"type":"summary_text","text":"reason"}]},{"type":"message","role":"assistant","content":[{"type":"output_text","text":"partial answer"}]}]}"#);
-    let request_locator = format!("legacy-exact/{}/request.json", fixture.request_id);
-    let response_locator = format!("legacy-exact/{}/response.json", fixture.request_id);
-    fixture
-        .state
-        .archive
-        .put(&request_locator, request.clone())
-        .await
-        .unwrap();
-    fixture
-        .state
-        .archive
-        .put(&response_locator, response.clone())
-        .await
-        .unwrap();
+    let mut originals = Vec::new();
+    for (purpose, bytes) in [
+        (
+            crate::archive_staging::ArchiveStagingPurpose::Request,
+            request.clone(),
+        ),
+        (
+            crate::archive_staging::ArchiveStagingPurpose::Response,
+            response.clone(),
+        ),
+    ] {
+        let attempt =
+            crate::proxy_lifecycle::begin_proxy_archive_attempt(db, fixture.request_id, purpose)
+                .await
+                .unwrap();
+        let mut writer = fixture
+            .state
+            .archive
+            .start_writer(&attempt.object_locator)
+            .await
+            .unwrap();
+        writer.write(bytes).await.unwrap();
+        let original = writer.finish_staged().await.unwrap();
+        assert!(
+            db.bind_archive_staging_attempt(&attempt.lease, &original.object_locator)
+                .await
+                .unwrap()
+        );
+        originals.push(original.object_locator);
+    }
+    let request_locator = originals.remove(0);
+    let response_locator = originals.remove(0);
     sqlx::query(
         "UPDATE request_records SET request_object = $1, response_object = $2 WHERE id = $3",
     )
@@ -2775,6 +2797,106 @@ async fn postgres_exact_legacy_body_rebuild_preserves_incomplete_and_financial_r
     .unwrap();
     sqlx::query("UPDATE conversation_projection_outbox SET lease_expires_at = 0 WHERE request_id = $1 AND lease_owner = $2")
         .bind(fixture.request_id.to_string()).bind(owner.to_string()).execute(&db.pool).await.unwrap();
+    // Prepared inspection is a strict CAS: none of these post-inspection
+    // changes may fall through the initial (NULL snapshot) claim branch.
+    for mutation in [
+        "UPDATE conversation_projection_outbox SET semantic_snapshot_json=NULL WHERE request_id=$1",
+        "UPDATE conversation_projection_outbox SET semantic_snapshot_json='{}' WHERE request_id=$1",
+        "UPDATE conversation_projection_outbox SET lease_owner='00000000-0000-0000-0000-000000000001' WHERE request_id=$1",
+        "UPDATE conversation_projection_outbox SET lease_expires_at=9223372036854775807 WHERE request_id=$1",
+        "UPDATE conversation_projection_outbox SET lease_expires_at=-1 WHERE request_id=$1",
+        "UPDATE conversation_projection_outbox SET terminal_lease_owner='00000000-0000-0000-0000-000000000001', terminal_lease_expires_at=9223372036854775807 WHERE request_id=$1",
+        "UPDATE conversation_projection_outbox SET semantic_payload_snapshot_json='{}' WHERE request_id=$1",
+        "UPDATE request_records SET response_object='gap://' || id || '/response' WHERE id=$1",
+        "UPDATE request_records SET response_object=NULL WHERE id=$1",
+    ] {
+        sqlx::query("UPDATE conversation_projection_outbox SET semantic_snapshot_json=$2, semantic_payload_snapshot_json=NULL, lease_owner=$3, lease_expires_at=0, terminal_lease_owner=NULL, terminal_lease_expires_at=NULL WHERE request_id=$1")
+            .bind(fixture.request_id.to_string()).bind(&prepared_snapshot).bind(owner.to_string())
+            .execute(&db.pool).await.unwrap();
+        sqlx::query("UPDATE request_records SET response_object=$2 WHERE id=$1")
+            .bind(fixture.request_id.to_string())
+            .bind(&response_locator)
+            .execute(&db.pool)
+            .await
+            .unwrap();
+        sqlx::query(mutation)
+            .bind(fixture.request_id.to_string())
+            .execute(&db.pool)
+            .await
+            .unwrap();
+        let before: String = sqlx::query_scalar(
+            "SELECT to_jsonb(o)::TEXT FROM conversation_projection_outbox o WHERE request_id=$1",
+        )
+        .bind(fixture.request_id.to_string())
+        .fetch_one(&db.pool)
+        .await
+        .unwrap();
+        assert!(
+            !db.claim_reviewed_session_body_rebuild(
+                fixture.key.tenant_id,
+                fixture.key.key_id,
+                fixture.request_id,
+                &request_locator,
+                &response_locator,
+                Uuid::now_v7(),
+                &prepared_snapshot,
+                owner,
+                created_at,
+                0,
+            )
+            .await
+            .unwrap(),
+            "changed inspection must not claim: {mutation}"
+        );
+        let after: String = sqlx::query_scalar(
+            "SELECT to_jsonb(o)::TEXT FROM conversation_projection_outbox o WHERE request_id=$1",
+        )
+        .bind(fixture.request_id.to_string())
+        .fetch_one(&db.pool)
+        .await
+        .unwrap();
+        assert_eq!(before, after, "rejection must perform zero outbox writes");
+    }
+    sqlx::query("UPDATE conversation_projection_outbox SET semantic_snapshot_json=$2, semantic_payload_snapshot_json=NULL, lease_owner=$3, lease_expires_at=0, terminal_lease_owner=NULL, terminal_lease_expires_at=NULL WHERE request_id=$1")
+        .bind(fixture.request_id.to_string()).bind(&prepared_snapshot).bind(owner.to_string()).execute(&db.pool).await.unwrap();
+    sqlx::query("UPDATE request_records SET response_object=$2 WHERE id=$1")
+        .bind(fixture.request_id.to_string())
+        .bind(&response_locator)
+        .execute(&db.pool)
+        .await
+        .unwrap();
+    assert!(
+        !db.claim_reviewed_session_body_rebuild(
+            fixture.key.tenant_id,
+            fixture.key.key_id,
+            fixture.request_id,
+            &request_locator,
+            &response_locator,
+            Uuid::now_v7(),
+            &prepared_snapshot,
+            owner,
+            created_at + 1,
+            0,
+        )
+        .await
+        .unwrap()
+    );
+    assert!(
+        !db.claim_exact_session_body_rebuild(
+            fixture.key.tenant_id,
+            fixture.key.key_id,
+            fixture.request_id,
+            None,
+            &request_locator,
+            &response_locator,
+            Uuid::now_v7(),
+            Some(&prepared_snapshot),
+            Some(owner),
+        )
+        .await
+        .unwrap(),
+        "legacy prepared entry cannot bypass reviewed expiry"
+    );
     let resumed_owner = Uuid::now_v7();
     assert!(
         !db.claim_exact_session_body_rebuild(
@@ -2792,25 +2914,202 @@ async fn postgres_exact_legacy_body_rebuild_preserves_incomplete_and_financial_r
         .unwrap()
     );
     assert!(
-        db.claim_exact_session_body_rebuild(
+        db.claim_reviewed_session_body_rebuild(
             fixture.key.tenant_id,
             fixture.key.key_id,
             fixture.request_id,
-            None,
             &request_locator,
             &response_locator,
             resumed_owner,
-            Some(&prepared_snapshot),
-            Some(owner)
+            &prepared_snapshot,
+            owner,
+            created_at,
+            0,
         )
         .await
         .unwrap()
     );
     let owner = resumed_owner;
+    let raw_response = fixture
+        .state
+        .archive
+        .raw_capture_reference(fixture.key.tenant_id, fixture.request_id, "response")
+        .await
+        .unwrap()
+        .unwrap();
+    let before_rejection: String = sqlx::query_scalar(
+        "SELECT to_jsonb(o)::TEXT FROM conversation_projection_outbox o WHERE request_id=$1",
+    )
+    .bind(fixture.request_id.to_string())
+    .fetch_one(&db.pool)
+    .await
+    .unwrap();
     assert!(
-        crate::worker::archive_session_body(&fixture.state, owner, fixture.request_id)
+        !db.bind_raw_capture_for_projection(
+            fixture.key.tenant_id,
+            fixture.request_id,
+            "response",
+            &raw_response,
+            Uuid::now_v7()
+        )
+        .await
+        .unwrap()
+    );
+    let mut different = response.to_vec();
+    different[0] = b'[';
+    fixture
+        .state
+        .archive
+        .put(&response_locator, Bytes::from(different))
+        .await
+        .unwrap();
+    assert!(
+        !db.bind_raw_capture_for_projection(
+            fixture.key.tenant_id,
+            fixture.request_id,
+            "response",
+            &raw_response,
+            owner
+        )
+        .await
+        .unwrap(),
+        "same length with different decoded bytes must not replace the original"
+    );
+    let after_rejection: String = sqlx::query_scalar(
+        "SELECT to_jsonb(o)::TEXT FROM conversation_projection_outbox o WHERE request_id=$1",
+    )
+    .bind(fixture.request_id.to_string())
+    .fetch_one(&db.pool)
+    .await
+    .unwrap();
+    assert_eq!(before_rejection, after_rejection);
+    let unchanged_locator: String = sqlx::query_scalar(
+        "SELECT response_object FROM request_records WHERE id=$1 AND created_at=$2",
+    )
+    .bind(fixture.request_id.to_string())
+    .bind(created_at)
+    .fetch_one(&db.pool)
+    .await
+    .unwrap();
+    assert_eq!(unchanged_locator, response_locator);
+    fixture
+        .state
+        .archive
+        .put(&response_locator, response.clone())
+        .await
+        .unwrap();
+    let unowned = format!("legacy-exact/{}/unowned.json", fixture.request_id);
+    fixture
+        .state
+        .archive
+        .put(&unowned, response.clone())
+        .await
+        .unwrap();
+    sqlx::query("UPDATE request_records SET response_object=$2 WHERE id=$1 AND created_at=$3")
+        .bind(fixture.request_id.to_string())
+        .bind(&unowned)
+        .bind(created_at)
+        .execute(&db.pool)
+        .await
+        .unwrap();
+    assert!(
+        !db.bind_raw_capture_for_projection(
+            fixture.key.tenant_id,
+            fixture.request_id,
+            "response",
+            &raw_response,
+            owner
+        )
+        .await
+        .unwrap(),
+        "a bare legacy object has no immutable writer authority"
+    );
+    sqlx::query("UPDATE request_records SET response_object=$2 WHERE id=$1 AND created_at=$3")
+        .bind(fixture.request_id.to_string())
+        .bind(&response_locator)
+        .bind(created_at)
+        .execute(&db.pool)
+        .await
+        .unwrap();
+    // Pause after immutable-source verification but before the SQL fence.
+    // Changed pointer, owner, or receipt must never be adopted automatically.
+    for mutation in [
+        "UPDATE request_records SET response_object='gap://changed/response' WHERE id=$1",
+        "UPDATE conversation_projection_outbox SET lease_owner='00000000-0000-0000-0000-000000000001' WHERE request_id=$1",
+        "UPDATE archive_staging_attempts SET updated_at=updated_at+1 WHERE owner_id=$1 AND purpose='response'",
+    ] {
+        let gate = Database::gate_coverage_read_for_test(fixture.request_id);
+        let task_db = db.clone();
+        let tenant = fixture.key.tenant_id;
+        let request_id = fixture.request_id;
+        let object = raw_response.clone();
+        let task = tokio::spawn(async move {
+            task_db
+                .bind_raw_capture_for_projection(tenant, request_id, "response", &object, owner)
+                .await
+        });
+        let _guard = CoverageWorkerGuard {
+            request: request_id,
+            gate: gate.clone(),
+            worker: task.abort_handle(),
+        };
+        tokio::time::timeout(std::time::Duration::from_secs(5), gate.0.notified())
             .await
-            .unwrap()
+            .unwrap();
+        sqlx::query(mutation)
+            .bind(request_id.to_string())
+            .execute(&db.pool)
+            .await
+            .unwrap();
+        let before: String = sqlx::query_scalar(
+            "SELECT to_jsonb(o)::TEXT FROM conversation_projection_outbox o WHERE request_id=$1",
+        )
+        .bind(request_id.to_string())
+        .fetch_one(&db.pool)
+        .await
+        .unwrap();
+        gate.1.notify_one();
+        assert!(
+            !task.await.unwrap().unwrap(),
+            "inspection changed: {mutation}"
+        );
+        let after: String = sqlx::query_scalar(
+            "SELECT to_jsonb(o)::TEXT FROM conversation_projection_outbox o WHERE request_id=$1",
+        )
+        .bind(request_id.to_string())
+        .fetch_one(&db.pool)
+        .await
+        .unwrap();
+        assert_eq!(before, after);
+        sqlx::query("UPDATE request_records SET response_object=$2 WHERE id=$1 AND created_at=$3")
+            .bind(request_id.to_string())
+            .bind(&response_locator)
+            .bind(created_at)
+            .execute(&db.pool)
+            .await
+            .unwrap();
+        sqlx::query("UPDATE conversation_projection_outbox SET lease_owner=$2 WHERE request_id=$1")
+            .bind(request_id.to_string())
+            .bind(owner.to_string())
+            .execute(&db.pool)
+            .await
+            .unwrap();
+    }
+    let pending = db
+        .session_body_locators(fixture.request_id)
+        .await
+        .unwrap()
+        .unwrap()
+        .pending;
+    let rebuilt =
+        crate::worker::recover_claimed_session_body(&fixture.state, owner, fixture.request_id)
+            .await;
+    let state: (Option<i64>, Option<String>, Option<i64>, Option<i64>) = sqlx::query_as(
+        "SELECT projected_at, statistics_outcome, lease_expires_at, terminal_lease_expires_at FROM conversation_projection_outbox WHERE request_id=$1",
+    ).bind(fixture.request_id.to_string()).fetch_one(&db.pool).await.unwrap();
+    assert!(
+        rebuilt.as_ref().is_ok_and(|done| *done),
+        "exact canonical recovery: {rebuilt:?}; pending={pending}; state={state:?}"
     );
     let snapshot: String = sqlx::query_scalar("SELECT semantic_snapshot_json FROM conversation_projection_outbox WHERE request_id = $1 AND projected_at IS NOT NULL")
         .bind(fixture.request_id.to_string()).fetch_one(&db.pool).await.unwrap();
