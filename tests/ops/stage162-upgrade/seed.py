@@ -60,6 +60,6 @@ else:
 print(json.dumps({'request_id':rid,'session_status':status,'usage':d['usage'],'archive_complete':True}))
 
 if os.environ.get('E2E_IDENTITY_FILE'):
- data={'request_id':rid,'key':k,'sha256':{side:hashlib.sha256(value).hexdigest() for side,value in archives.items()}}
+ data={'request_id':rid,'key':k,'marker':'synthetic image e2e '+NONCE,'response_text':''.join(c.get('delta',{}).get('content','') or '' for frame in parsed for c in frame.get('choices',[])),'sha256':{side:hashlib.sha256(value).hexdigest() for side,value in archives.items()}}
  fd=os.open(os.environ['E2E_IDENTITY_FILE'],os.O_WRONLY|os.O_CREAT|os.O_EXCL,0o600)
  with os.fdopen(fd,'w') as f: json.dump(data,f)
