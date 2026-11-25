@@ -662,18 +662,20 @@ jobs:
         with:
           toolchain: 1.95.0
       - uses: ./.github/actions/checkout-plugin-examples
-      - name: Verify exact admission owner and rollback contracts
+      - name: Verify schema163 admission partition and owner contracts
         run: |
           set -euo pipefail
           git rev-parse HEAD
           test "$(git rev-parse HEAD)" = "${{ inputs.source_revision }}"
           cargo check --locked --lib
-          cargo test --locked --lib db::tests::proxy_lifecycle::forwarding_admission_snapshot_commits_and_failures_roll_back_for_both_modes -- --exact --nocapture 2>&1 | tee /tmp/admission-owner.log
-          grep -F '1 passed; 0 failed' /tmp/admission-owner.log
-          cargo test --locked --lib db::requests::lifecycle::admission_lock_tests::postgres_admission_model_insert_matches_previous_final_record -- --exact --nocapture 2>&1 | tee /tmp/admission-owner.log
-          grep -F '1 passed; 0 failed' /tmp/admission-owner.log
-          cargo test --locked --lib db::requests::lifecycle::admission_lock_tests::postgres_blocked_request_insert_does_not_hold_shared_key_budget -- --exact --nocapture 2>&1 | tee /tmp/admission-owner.log
-          grep -F '1 passed; 0 failed' /tmp/admission-owner.log
+          cargo test --locked --lib db::requests::lifecycle::admission_lock_tests::postgres_started_draft_known_partition_limits_relations_while_cursor_waits -- --exact --nocapture 2>&1 | tee /tmp/schema163-admission.log
+          grep -F '1 passed; 0 failed' /tmp/schema163-admission.log
+          cargo test --locked --lib db::requests::lifecycle::admission_lock_tests::postgres_admission_model_insert_matches_previous_final_record -- --exact --nocapture 2>&1 | tee /tmp/schema163-admission.log
+          grep -F '1 passed; 0 failed' /tmp/schema163-admission.log
+          cargo test --locked --lib db::requests::lifecycle::admission_lock_tests::postgres_blocked_request_insert_does_not_hold_shared_key_budget -- --exact --nocapture 2>&1 | tee /tmp/schema163-admission.log
+          grep -F '1 passed; 0 failed' /tmp/schema163-admission.log
+          cargo test --locked --lib db::requests::lifecycle::admission_lock_tests::postgres_rejected_admission_rolls_back_private_request_and_all_budget_changes -- --exact --nocapture 2>&1 | tee /tmp/schema163-admission.log
+          grep -F '1 passed; 0 failed' /tmp/schema163-admission.log
 
   semantic-reader-scope-contract:
     if: inputs.contract == 'semantic-reader-scope'
