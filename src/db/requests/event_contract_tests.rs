@@ -88,6 +88,67 @@ async fn assert_event_enrichment(database: &Database) {
             .bind(Uuid::now_v7().to_string()).bind(event_tenant).bind(&key).bind(&request).bind(now + 50)
             .execute(&database.pool).await.unwrap();
     }
+    let hints = serde_json::json!({
+        "session_id": "captured-thread",
+        "compaction": false,
+        "labels": {
+            "mtc_session_identity_source": "header:thread-id",
+            "mtc_client_session_id": "shared-client-group",
+            "mtc_parent_thread_id": "declared-parent"
+        }
+    });
+    sqlx::query("INSERT INTO conversation_projection_outbox (request_id,tenant_id,key_id,principal_id,request_json,hints_json,observed_at) VALUES ($1,$2,$3,$4,'{}',$5,$6)")
+        .bind(&request).bind(&tenant).bind(&key).bind(&principal).bind(hints.to_string()).bind(now)
+        .execute(&database.pool).await.unwrap();
+    let expected_captured = serde_json::json!({"thread_id":"captured-thread","declared_id":null,"client_session_id":"shared-client-group","parent_thread_id":"declared-parent","source":"header:thread-id"});
+    // Ingress declarations survive before semantic projection; no confirmed
+    // cluster or observation is required, and this read does not publish one.
+    sqlx::query(
+        "UPDATE request_records SET conversation_cluster_id=NULL WHERE id=$1 AND created_at=$2",
+    )
+    .bind(&request)
+    .bind(now)
+    .execute(&database.pool)
+    .await
+    .unwrap();
+    let pending = database
+        .list_requests(Uuid::parse_str(&key).unwrap(), 10)
+        .await
+        .unwrap();
+    let pending_json = serde_json::to_value(&pending[0]).unwrap();
+    assert_eq!(
+        pending_json["session_context"]["captured"],
+        expected_captured
+    );
+    assert_eq!(pending_json["session_context"]["association"], "unlinked");
+    assert!(pending_json["session_context"]["session_id"].is_null());
+    let pending_event = database
+        .request_events_after(&external, now, None, 500)
+        .await
+        .unwrap();
+    assert_eq!(
+        serde_json::to_value(&pending_event[0]).unwrap()["session_context"],
+        pending_json["session_context"]
+    );
+    sqlx::query("UPDATE request_records SET conversation_cluster_id='recorded-session' WHERE id=$1 AND created_at=$2")
+        .bind(&request).bind(now).execute(&database.pool).await.unwrap();
+    let identity = crate::request_history::HistoryIdentity {
+        tenant_id: Uuid::parse_str(&tenant).unwrap(),
+        key_id: Uuid::parse_str(&key).unwrap(),
+        request_id: Uuid::parse_str(&request).unwrap(),
+        created_at: now,
+        source: "native".into(),
+    };
+    let mut capture = database.pool.begin().await.unwrap();
+    let frozen_view = Database::history_original_view_in_transaction(&mut capture, &identity)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        serde_json::to_value(&frozen_view).unwrap()["session_context"]["captured"],
+        expected_captured
+    );
+    capture.rollback().await.unwrap();
     let events = database
         .request_events_after(&external, now, None, 500)
         .await
@@ -109,6 +170,10 @@ async fn assert_event_enrichment(database: &Database) {
     assert_eq!(event.cache_write_tokens, 10);
     let context = event.session_context.as_ref().unwrap();
     assert_eq!(context.session_id.as_deref(), Some("recorded-session"));
+    assert_eq!(
+        serde_json::to_value(&context.captured).unwrap(),
+        expected_captured
+    );
     assert_eq!(context.session_name.as_deref(), Some("recorded-name"));
     let foreign = database
         .request_events_after(&foreign_external, now, None, 500)

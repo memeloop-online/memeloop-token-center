@@ -86,3 +86,19 @@ mod tests {
         assert_eq!(serde_json::to_value(context).unwrap(), old);
     }
 }
+
+/// Correlated to an already-authorized native request row. The locator pins
+/// the partition identity; request id alone never authorizes ingress metadata.
+pub(super) const HINTS_SQL: &str = "(SELECT captured.hints_json FROM conversation_projection_outbox captured JOIN request_record_locators captured_locator ON captured_locator.id = captured.request_id AND captured_locator.tenant_id = captured.tenant_id AND captured_locator.key_id = captured.key_id WHERE captured.request_id = r.id AND captured.tenant_id = r.tenant_id AND captured.key_id = r.key_id AND captured_locator.created_at = r.created_at)";
+
+pub(super) fn captured_from_json(
+    json: Option<&str>,
+) -> Result<Option<CapturedRequestSessionIdentity>, crate::error::AppError> {
+    json.map(|json| {
+        serde_json::from_str::<ConversationHints>(json)
+            .map(|hints| captured_identity(&hints))
+            .map_err(|_| crate::error::AppError::internal("request_captured_session_hints_invalid"))
+    })
+    .transpose()
+    .map(Option::flatten)
+}
