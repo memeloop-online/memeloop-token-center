@@ -1398,3 +1398,7 @@ mod tests {
 #[cfg(test)]
 #[path = "carrier_small_put_tests.rs"]
 mod small_put_tests;
+
+#[cfg(test)]
+#[path = "carrier_resource_wakeup_tests.rs"]
+mod resource_wakeup_tests;
