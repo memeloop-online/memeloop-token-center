@@ -4,9 +4,14 @@ use super::*;
 pub(crate) enum ConversationContentError {
     Application(AppError),
     Database(sqlx::Error),
+    CandidatesChanged,
 }
 
 impl ConversationContentError {
+    pub(super) fn retry_after_confirmed_rollback(&self) -> bool {
+        matches!(self, Self::CandidatesChanged) || self.retryable_sqlstate().is_some()
+    }
+
     pub(super) fn retryable_sqlstate(&self) -> Option<&'static str> {
         let Self::Database(sqlx::Error::Database(error)) = self else {
             return None;
@@ -38,6 +43,9 @@ impl From<ConversationContentError> for AppError {
         match error {
             ConversationContentError::Application(error) => error,
             ConversationContentError::Database(error) => error.into(),
+            ConversationContentError::CandidatesChanged => AppError::Conflict(
+                "conversation candidates changed during prefix preparation".into(),
+            ),
         }
     }
 }
