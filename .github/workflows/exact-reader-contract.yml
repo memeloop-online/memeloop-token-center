@@ -330,7 +330,7 @@ jobs:
             sleep 2
           done
           exit 1
-      - name: Verify staging identity, routing and real RustFS
+      - name: Compare exact existing carrier contracts against pre-1070
         env:
           MTC_RUSTFS_TEST_ENDPOINT: http://127.0.0.1:19000
           MTC_RUSTFS_TEST_BUCKET: conversation-contract-test
@@ -338,12 +338,23 @@ jobs:
           MTC_RUSTFS_TEST_SECRET_KEY: synthetic-test-only-secret-707
         run: |
           set -o pipefail
-          cargo test --locked --lib db::archive_staging::backend_tests 2>&1 | tee /tmp/staging-db.log
-          grep -F '2 passed; 0 failed' /tmp/staging-db.log
-          cargo test --locked --lib archive::routing_tests 2>&1 | tee /tmp/staging-routing.log
-          grep -F '6 passed; 0 failed' /tmp/staging-routing.log
-          cargo test --locked --lib training_cas_real_s3_configuration_and_reader -- --ignored 2>&1 | tee /tmp/staging-rustfs.log
-          grep -F '1 passed; 0 failed' /tmp/staging-rustfs.log
+          candidate=$(git rev-parse HEAD)
+          git fetch origin 9a98925f7edb41ba574323401da7f5bc9494ff9a
+          for revision in 9a98925f7edb41ba574323401da7f5bc9494ff9a "$candidate"; do
+            git checkout --detach "$revision"
+            git rev-parse HEAD
+            for selector in offloaded_parent_keeps_live_reader_allocation_provenance object_replay_offloads_other_sealed_ram_before_waiting_for_credit; do
+              set +e
+              cargo test --locked --lib "$selector" -- --nocapture 2>&1 | tee "/tmp/${revision}-${selector}.log"
+              result=${PIPESTATUS[0]}
+              set -e
+              test "$result" -ne 0
+              grep -F '1 failed' "/tmp/${revision}-${selector}.log"
+            done
+          done
+          git checkout --detach "$candidate"
+          cargo test --locked --lib gateway_body::carrier::resource_wakeup_tests -- --ignored 2>&1 | tee /tmp/real-carrier.log
+          grep -F '4 passed; 0 failed' /tmp/real-carrier.log
   next-release-contract:
     if: inputs.contract == 'next-release'
     runs-on: ubuntu-24.04
