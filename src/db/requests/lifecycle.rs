@@ -262,6 +262,7 @@ struct MeteredRequestUsage<'a> {
 
 #[derive(Default)]
 struct TerminalMetadata {
+    started_marker: bool,
     cause: Option<crate::model::RequestTerminalCause>,
     cache_coverage: Option<crate::model::CacheUsageCoverage>,
 }
@@ -532,8 +533,13 @@ impl Database {
         let Some(row) = row else {
             return Ok(());
         };
-        publish_pending_started_in_transaction(&mut transaction, &identity.request_id.to_string())
+        if !self.legacy163.load(std::sync::atomic::Ordering::Acquire) {
+            publish_pending_started_in_transaction(
+                &mut transaction,
+                &identity.request_id.to_string(),
+            )
             .await?;
+        }
         let published: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM request_events WHERE request_id = $1 AND tenant_id = $2 AND event_kind = 'started'")
             .bind(identity.request_id.to_string()).bind(identity.tenant_id.to_string())
             .fetch_one(&mut *transaction).await?;
@@ -2146,6 +2152,7 @@ impl Database {
                     billing_unit: &reservation.billing_unit,
                 }),
             TerminalMetadata {
+                started_marker: !self.legacy163.load(std::sync::atomic::Ordering::Acquire),
                 cause: input.terminal_cause,
                 cache_coverage: usage.cache_coverage.filter(|coverage| {
                     usage_basis == Some(crate::model::RequestUsageBasis::ProviderReported)
@@ -2562,7 +2569,7 @@ pub(super) async fn publish_pending_started_in_transaction(
     transaction: &mut Transaction<'_, Any>,
     request_id: &str,
 ) -> Result<(), AppError> {
-    let prepared = prepare_pending_started_in_transaction(transaction, request_id).await?;
+    let prepared = prepare_pending_started_in_transaction(transaction, request_id, true).await?;
     crate::db::history_immutable_outbox::PreparedEventCapture::publish(
         transaction,
         prepared,
@@ -2590,13 +2597,10 @@ pub(super) async fn try_request_event_cursor(
 pub(super) async fn prepare_pending_started_in_transaction(
     transaction: &mut Transaction<'_, Any>,
     request_id: &str,
+    started_marker: bool,
 ) -> Result<Option<crate::db::history_immutable_outbox::PreparedEventCapture>, AppError> {
-    // Legacy163 keeps synchronous started publication and has no marker column.
-    if transaction.as_mut().backend_name() == "PostgreSQL" {
-        let marker: bool = sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM pg_attribute WHERE attrelid='request_records'::regclass AND attname='started_event_pending' AND NOT attisdropped)").fetch_one(&mut **transaction).await?;
-        if !marker {
-            return Ok(None);
-        }
+    if !started_marker {
+        return Ok(None);
     }
     // The row lock serializes recovery with terminal publishers. Clearing the
     // obligation and publishing the event share a commit, including retries.
@@ -2704,6 +2708,7 @@ pub(super) async fn record_early_terminal_in_transaction(
         Some(crate::model::RequestUsageBasis::NotObserved),
         None,
         TerminalMetadata {
+            started_marker: false,
             cause: Some(crate::model::RequestTerminalCause::GatewayPreAdmission),
             cache_coverage: None,
         },
@@ -2740,6 +2745,7 @@ async fn record_request_finished_with_basis_and_metering_in_transaction(
     metadata: TerminalMetadata,
 ) -> Result<bool, AppError> {
     let TerminalMetadata {
+        started_marker,
         cause: terminal_cause,
         cache_coverage,
     } = metadata;
@@ -3003,7 +3009,8 @@ async fn record_request_finished_with_basis_and_metering_in_transaction(
                 .await?;
         }
     }
-    let pending_started = prepare_pending_started_in_transaction(tx, &request_id).await?;
+    let pending_started =
+        prepare_pending_started_in_transaction(tx, &request_id, started_marker).await?;
     super::super::history_immutable_outbox::capture_native_in_transaction(tx, &request_id).await?;
     let draft_cursor = crate::db::RequestEventCursor {
         event_id: Uuid::nil().to_string(),

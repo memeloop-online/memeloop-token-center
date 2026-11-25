@@ -87,9 +87,12 @@ impl Database {
                     continue;
                 }
             }
-            let prepared =
-                super::lifecycle::prepare_pending_started_in_transaction(&mut transaction, &id)
-                    .await?;
+            let prepared = super::lifecycle::prepare_pending_started_in_transaction(
+                &mut transaction,
+                &id,
+                true,
+            )
+            .await?;
             if !super::lifecycle::try_request_event_cursor(&mut transaction).await? {
                 transaction.rollback().await?;
                 continue;
@@ -308,7 +311,7 @@ impl Database {
             &request_id,
         )
         .await?;
-        let pending_started = super::lifecycle::prepare_pending_started_in_transaction(&mut transaction, &request_id).await?;
+        let pending_started = super::lifecycle::prepare_pending_started_in_transaction(&mut transaction, &request_id, !self.legacy163.load(std::sync::atomic::Ordering::Acquire)).await?;
         timings.enter(ProjectionStage::EventPrepare);
         let draft_cursor = crate::db::RequestEventCursor {
             event_id: Uuid::nil().to_string(),
