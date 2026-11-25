@@ -70,6 +70,19 @@ pub enum HistoryCommand {
         #[arg(long, default_value_t = 64, value_parser = clap::value_parser!(i64).range(1..=500))]
         page_size: i64,
     },
+    /// Deliver only one already-journaled event revision; no source cursor is advanced.
+    ExportExactEvent {
+        #[arg(long)]
+        request_id: uuid::Uuid,
+        #[arg(long)]
+        tenant_id: uuid::Uuid,
+        #[arg(long)]
+        key_id: uuid::Uuid,
+        #[arg(long)]
+        created_at: i64,
+        #[arg(long, value_parser=clap::value_parser!(i64).range(1..))]
+        revision: i64,
+    },
     Drain {
         #[arg(long, default_value_t = 500, value_parser = clap::value_parser!(i64).range(1..))]
         page_size: i64,
@@ -81,6 +94,25 @@ pub enum HistoryCommand {
 }
 
 pub async fn command(config: &Config, command: HistoryCommand) -> Result<Value, HistoryError> {
+    let exact_scope = match &command {
+        HistoryCommand::ExportExactEvent {
+            request_id,
+            tenant_id,
+            key_id,
+            created_at,
+            revision,
+        } => Some(super::ExactEventExport {
+            identity: super::HistoryIdentity {
+                source: "event".into(),
+                request_id: *request_id,
+                tenant_id: *tenant_id,
+                key_id: *key_id,
+                created_at: *created_at,
+            },
+            revision: *revision,
+        }),
+        _ => None,
+    };
     let database =
         Database::connect_for_migration(&config.database_url, config.database_max_connections)
             .await?;
@@ -140,6 +172,7 @@ pub async fn command(config: &Config, command: HistoryCommand) -> Result<Value, 
             | HistoryCommand::BaselineSource { .. }
             | HistoryCommand::Drain { .. }
             | HistoryCommand::ExportPage { .. }
+            | HistoryCommand::ExportExactEvent { .. }
             | HistoryCommand::Verify
             | HistoryCommand::Switch
             | HistoryCommand::Refresh
@@ -252,13 +285,26 @@ pub async fn command(config: &Config, command: HistoryCommand) -> Result<Value, 
             }
             drain(&database, &client, page_size).await?;
         }
-        HistoryCommand::ExportPage { page_size } => {
+        HistoryCommand::ExportPage { .. } | HistoryCommand::ExportExactEvent { .. } => {
+            let page_size = if let HistoryCommand::ExportPage { page_size } = command {
+                page_size
+            } else {
+                1
+            };
             let lease_database = database
                 .clone()
                 .with_auxiliary_pool_max_connections(1)
                 .independent_persistence_pool();
             return Ok(
-                match export_batch(&database, &lease_database, &client, page_size).await {
+                match export_batch_scoped(
+                    &database,
+                    &lease_database,
+                    &client,
+                    page_size,
+                    exact_scope.as_ref(),
+                )
+                .await
+                {
                     Ok(report) => {
                         json!({"status":"completed","attempted":report.attempted,"acked":report.acked,"deferred":report.attempted.saturating_sub(report.acked),"operation_failed":false})
                     }
@@ -331,6 +377,16 @@ async fn export_batch(
     client: &ClickHouse,
     page_size: i64,
 ) -> Result<ExportReport, ExportFailure> {
+    export_batch_scoped(database, lease_database, client, page_size, None).await
+}
+
+async fn export_batch_scoped(
+    database: &Database,
+    lease_database: &Database,
+    client: &ClickHouse,
+    page_size: i64,
+    scope: Option<&super::ExactEventExport>,
+) -> Result<ExportReport, ExportFailure> {
     let failure = |stage, error| ExportFailure {
         stage,
         attempted: 0,
@@ -344,9 +400,12 @@ async fn export_batch(
         .await
         .map_err(|error| failure("lease", error))?;
     let snapshots = database
-        .history_pending_through(page_size, ceiling)
+        .history_pending_scoped(page_size, ceiling, scope)
         .await
         .map_err(|error| failure("capture_materialize", error))?;
+    if scope.is_some_and(|scope| snapshots.iter().any(|row| !scope.matches(row))) {
+        return Err(failure("scope", HistoryError::Mismatch));
+    }
     let failure = |stage, error| ExportFailure {
         stage,
         attempted: snapshots.len(),

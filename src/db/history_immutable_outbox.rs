@@ -685,6 +685,15 @@ impl Database {
     /// existing revision fence. Source triggers cannot commit a newer revision
     /// halfway through this SQL-only capture.
     pub(crate) async fn history_capture_pending(&self, page_size: i64) -> Result<(), AppError> {
+        self.history_capture_pending_scoped(page_size, None, None)
+            .await
+    }
+    pub(crate) async fn history_capture_pending_scoped(
+        &self,
+        page_size: i64,
+        ceiling: Option<i64>,
+        scope: Option<&crate::request_history::ExactEventExport>,
+    ) -> Result<(), AppError> {
         if self.history_mode().await.map_err(AppError::from)? == "off" {
             return Ok(());
         }
@@ -696,8 +705,8 @@ impl Database {
         // Source writers update their source row before their AFTER trigger
         // advances this journal. Hold its revision fence while reading source
         // rows with plain MVCC SELECTs; never reverse it with source FOR UPDATE.
-        let rows=sqlx::query("SELECT revision,source,request_id,tenant_id,key_id,created_at FROM request_history_export WHERE snapshot IS NULL ORDER BY revision LIMIT $1")
-            .bind(page_size).fetch_all(&self.pool).await?;
+        let rows=sqlx::query("SELECT revision,source,request_id,tenant_id,key_id,created_at FROM request_history_export WHERE snapshot IS NULL AND ($2 IS NULL OR (revision=$2 AND source='event' AND request_id=$3 AND tenant_id=$4 AND key_id=$5 AND created_at=$6 AND revision<=COALESCE($7,9223372036854775807))) ORDER BY revision LIMIT $1")
+            .bind(page_size).bind(scope.map(|s|s.revision)).bind(scope.map(|s|s.identity.request_id.to_string())).bind(scope.map(|s|s.identity.tenant_id.to_string())).bind(scope.map(|s|s.identity.key_id.to_string())).bind(scope.map(|s|s.identity.created_at)).bind(ceiling).fetch_all(&self.pool).await?;
         for row in rows {
             let revision: i64 = row.try_get("revision")?;
             let identity = crate::request_history::HistoryIdentity {
@@ -819,9 +828,19 @@ impl Database {
         ceiling: Option<i64>,
     ) -> Result<Vec<crate::request_history::HistorySnapshot>, crate::request_history::HistoryError>
     {
+        self.history_immutable_pending_scoped(page_size, ceiling, None)
+            .await
+    }
+    pub(crate) async fn history_immutable_pending_scoped(
+        &self,
+        page_size: i64,
+        ceiling: Option<i64>,
+        scope: Option<&crate::request_history::ExactEventExport>,
+    ) -> Result<Vec<crate::request_history::HistorySnapshot>, crate::request_history::HistoryError>
+    {
         use crate::request_history::{HistoryError, HistoryIdentity, HistorySnapshot};
-        let rows = sqlx::query("SELECT revision,source,request_id,tenant_id,key_id,created_at,snapshot,delivery_snapshot FROM request_history_immutable_outbox WHERE revision <= COALESCE($2,9223372036854775807) ORDER BY revision LIMIT $1")
-            .bind(page_size).bind(ceiling).fetch_all(&self.pool).await?;
+        let rows = sqlx::query("SELECT revision,source,request_id,tenant_id,key_id,created_at,snapshot,delivery_snapshot FROM request_history_immutable_outbox WHERE revision <= COALESCE($2,9223372036854775807) AND ($3 IS NULL OR (revision=$3 AND source='event' AND request_id=$4 AND tenant_id=$5 AND key_id=$6 AND created_at=$7)) ORDER BY revision LIMIT $1")
+            .bind(page_size).bind(ceiling).bind(scope.map(|s|s.revision)).bind(scope.map(|s|s.identity.request_id.to_string())).bind(scope.map(|s|s.identity.tenant_id.to_string())).bind(scope.map(|s|s.identity.key_id.to_string())).bind(scope.map(|s|s.identity.created_at)).fetch_all(&self.pool).await?;
         let mut snapshots = Vec::with_capacity(rows.len());
         for row in rows {
             let revision: i64 = row.try_get("revision")?;
@@ -857,8 +876,8 @@ impl Database {
                         .await?,
                 )?
             };
-            let stored: Option<String> = sqlx::query_scalar("UPDATE request_history_immutable_outbox SET delivery_snapshot=COALESCE(delivery_snapshot,$1) WHERE revision=$2 AND snapshot=$3 RETURNING delivery_snapshot")
-                .bind(&frozen).bind(revision).bind(&original).fetch_optional(&self.pool).await?;
+            let stored: Option<String> = sqlx::query_scalar("UPDATE request_history_immutable_outbox SET delivery_snapshot=COALESCE(delivery_snapshot,$1) WHERE revision=$2 AND snapshot=$3 AND source=$4 AND request_id=$5 AND tenant_id=$6 AND key_id=$7 AND created_at=$8 RETURNING delivery_snapshot")
+                .bind(&frozen).bind(revision).bind(&original).bind(&stored_identity.source).bind(stored_identity.request_id.to_string()).bind(stored_identity.tenant_id.to_string()).bind(stored_identity.key_id.to_string()).bind(stored_identity.created_at).fetch_optional(&self.pool).await?;
             if let Some(stored) = stored {
                 let snapshot: HistorySnapshot = serde_json::from_str(&stored)?;
                 if snapshot.identity != stored_identity || snapshot.revision != revision {
@@ -942,6 +961,130 @@ mod tests {
                 .unwrap();
             assert!(db.history_capture_pending(64).await.is_err(), "{field}");
         }
+    }
+
+    async fn exact_event_scope_contract(db: &Database) {
+        db.migrate().await.unwrap();
+        db.history_start().await.unwrap();
+        let tenant = Uuid::now_v7();
+        let key = Uuid::now_v7();
+        let ids = [Uuid::now_v7(), Uuid::now_v7()];
+        for id in ids {
+            sqlx::query("INSERT INTO request_events(event_id,tenant_id,key_id,request_id,event_at,event_kind,protocol,model,status_code,input_tokens,output_tokens,cost_micros) VALUES($1,$2,$3,$4,42,'finished','openai','fixture',200,1,2,0)")
+                .bind(id.to_string()).bind(tenant.to_string()).bind(key.to_string()).bind(Uuid::now_v7().to_string()).execute(&db.pool).await.unwrap();
+        }
+        let revision: i64 = sqlx::query_scalar(
+            "SELECT revision FROM request_history_export WHERE source='event' AND request_id=$1",
+        )
+        .bind(ids[1].to_string())
+        .fetch_one(&db.pool)
+        .await
+        .unwrap();
+        let scope = crate::request_history::ExactEventExport {
+            identity: HistoryIdentity {
+                source: "event".into(),
+                request_id: ids[1],
+                tenant_id: tenant,
+                key_id: key,
+                created_at: 42,
+            },
+            revision,
+        };
+        assert!(
+            db.history_pending_scoped(1, Some(revision - 1), Some(&scope))
+                .await
+                .unwrap()
+                .is_empty()
+        );
+        let mut wrong = scope.clone();
+        wrong.identity.key_id = Uuid::now_v7();
+        assert!(
+            db.history_pending_scoped(1, None, Some(&wrong))
+                .await
+                .unwrap()
+                .is_empty()
+        );
+        let rows = db
+            .history_pending_scoped(1, None, Some(&scope))
+            .await
+            .unwrap();
+        assert_eq!(rows.len(), 1);
+        assert!(scope.matches(&rows[0]));
+        let hash = crate::request_history::canonical_hash(&rows[0]).unwrap();
+        let retry = db
+            .history_pending_scoped(1, None, Some(&scope))
+            .await
+            .unwrap();
+        assert_eq!(
+            crate::request_history::canonical_hash(&retry[0]).unwrap(),
+            hash
+        );
+        let untouched: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM request_history_immutable_outbox WHERE request_id=$1",
+        )
+        .bind(ids[0].to_string())
+        .fetch_one(&db.pool)
+        .await
+        .unwrap();
+        assert_eq!(untouched, 0, "scoped capture must not freeze its neighbour");
+        let mut bad = rows[0].clone();
+        bad.read_model = serde_json::json!({"wrong_hash":true});
+        db.history_acknowledge(&[bad]).await.unwrap();
+        assert_eq!(
+            db.history_pending_scoped(1, None, Some(&scope))
+                .await
+                .unwrap()
+                .len(),
+            1
+        );
+        db.history_acknowledge(&rows).await.unwrap();
+        assert!(
+            db.history_pending_scoped(1, None, Some(&scope))
+                .await
+                .unwrap()
+                .is_empty()
+        );
+        let neighbour: i64 =
+            sqlx::query_scalar("SELECT COUNT(*) FROM request_history_export WHERE request_id=$1")
+                .bind(ids[0].to_string())
+                .fetch_one(&db.pool)
+                .await
+                .unwrap();
+        assert_eq!(neighbour, 1, "ACK leaves unrelated journal untouched");
+    }
+
+    #[tokio::test]
+    async fn sqlite_exact_event_export_preserves_scope_ceiling_and_frozen_retry() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = Database::connect(&format!(
+            "sqlite://{}?mode=rwc",
+            dir.path().join("scope.sqlite").display()
+        ))
+        .await
+        .unwrap();
+        exact_event_scope_contract(&db).await;
+    }
+
+    #[tokio::test]
+    #[ignore = "requires existing CI PostgreSQL service"]
+    async fn postgres_exact_event_export_preserves_scope_ceiling_and_frozen_retry() {
+        let pg = std::env::var("MTC_TEST_POSTGRES_URL").unwrap();
+        let admin = sqlx::PgPool::connect(&pg).await.unwrap();
+        let schema = format!("history_exact_{}", Uuid::now_v7().simple());
+        sqlx::query(sqlx::AssertSqlSafe(format!("CREATE SCHEMA {schema}")))
+            .execute(&admin)
+            .await
+            .unwrap();
+        let mut url = url::Url::parse(&pg).unwrap();
+        url.query_pairs_mut()
+            .append_pair("options", &format!("-csearch_path={schema}"));
+        let db = Database::connect(url.as_str()).await.unwrap();
+        exact_event_scope_contract(&db).await;
+        db.close().await;
+        sqlx::query(sqlx::AssertSqlSafe(format!("DROP SCHEMA {schema} CASCADE")))
+            .execute(&admin)
+            .await
+            .unwrap();
     }
 
     async fn compact_identity_receipt_contract(database: &Database) {

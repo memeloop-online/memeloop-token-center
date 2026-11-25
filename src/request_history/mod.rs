@@ -24,3 +24,15 @@ pub const SCHEMA: &str = include_str!("schema.sql");
 mod tests;
 
 pub(crate) use sessions::SessionDirectory;
+
+/// An operator-selected existing event revision; never allocates a revision.
+#[derive(Clone, Debug)]
+pub(crate) struct ExactEventExport {
+    pub identity: HistoryIdentity,
+    pub revision: i64,
+}
+impl ExactEventExport {
+    pub(crate) fn matches(&self, row: &HistorySnapshot) -> bool {
+        row.identity == self.identity && row.revision == self.revision
+    }
+}

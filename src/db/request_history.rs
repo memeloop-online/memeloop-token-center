@@ -594,13 +594,25 @@ impl Database {
         page_size: i64,
         ceiling: Option<i64>,
     ) -> Result<Vec<HistorySnapshot>, HistoryError> {
-        self.history_capture_pending(page_size).await?;
-        let immutable = self.history_immutable_pending(page_size, ceiling).await?;
+        self.history_pending_scoped(page_size, ceiling, None).await
+    }
+
+    pub(crate) async fn history_pending_scoped(
+        &self,
+        page_size: i64,
+        ceiling: Option<i64>,
+        scope: Option<&crate::request_history::ExactEventExport>,
+    ) -> Result<Vec<HistorySnapshot>, HistoryError> {
+        self.history_capture_pending_scoped(page_size, ceiling, scope)
+            .await?;
+        let immutable = self
+            .history_immutable_pending_scoped(page_size, ceiling, scope)
+            .await?;
         if !immutable.is_empty() {
             return Ok(immutable);
         }
-        let rows = sqlx::query("SELECT revision, source, request_id, tenant_id, key_id, created_at, snapshot FROM request_history_export WHERE revision <= COALESCE($2,9223372036854775807) ORDER BY revision LIMIT $1")
-            .bind(page_size).bind(ceiling).fetch_all(&self.pool).await?;
+        let rows = sqlx::query("SELECT revision, source, request_id, tenant_id, key_id, created_at, snapshot FROM request_history_export WHERE revision <= COALESCE($2,9223372036854775807) AND ($3 IS NULL OR (revision=$3 AND source='event' AND request_id=$4 AND tenant_id=$5 AND key_id=$6 AND created_at=$7)) ORDER BY revision LIMIT $1")
+            .bind(page_size).bind(ceiling).bind(scope.map(|s|s.revision)).bind(scope.map(|s|s.identity.request_id.to_string())).bind(scope.map(|s|s.identity.tenant_id.to_string())).bind(scope.map(|s|s.identity.key_id.to_string())).bind(scope.map(|s|s.identity.created_at)).fetch_all(&self.pool).await?;
         let mut snapshots = Vec::new();
         for row in rows {
             let revision: i64 = row.try_get("revision")?;
@@ -611,9 +623,12 @@ impl Database {
             }
             let identity = history_identity(&row)?;
             let snapshot = self.history_snapshot(identity, revision).await?;
+            if scope.is_some_and(|scope| !scope.matches(&snapshot)) {
+                return Err(HistoryError::Mismatch);
+            }
             let frozen = serde_json::to_string(&snapshot)?;
-            let stored: Option<String> = sqlx::query_scalar("UPDATE request_history_export SET snapshot = COALESCE(snapshot, $1) WHERE revision = $2 RETURNING snapshot")
-                .bind(frozen).bind(revision).fetch_optional(&self.pool).await?;
+            let stored: Option<String> = sqlx::query_scalar("UPDATE request_history_export SET snapshot = COALESCE(snapshot, $1) WHERE revision = $2 AND source=$3 AND request_id=$4 AND tenant_id=$5 AND key_id=$6 AND created_at=$7 RETURNING snapshot")
+                .bind(frozen).bind(revision).bind(&snapshot.identity.source).bind(snapshot.identity.request_id.to_string()).bind(snapshot.identity.tenant_id.to_string()).bind(snapshot.identity.key_id.to_string()).bind(snapshot.identity.created_at).fetch_optional(&self.pool).await?;
             if let Some(stored) = stored {
                 snapshots.push(serde_json::from_str(&stored)?);
             }
