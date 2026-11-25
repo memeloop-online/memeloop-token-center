@@ -38,6 +38,15 @@ impl Database {
             return Ok(false);
         }
         if rows.len() != SQLITE_MIGRATIONS.len() {
+            #[cfg(test)]
+            eprintln!(
+                "SQLite runtime ledger actual_count={} expected_count={} actual_versions={:?}",
+                rows.len(),
+                SQLITE_MIGRATIONS.len(),
+                rows.iter()
+                    .map(|row| row.try_get::<i64, _>("version"))
+                    .collect::<Vec<_>>()
+            );
             return Err(sqlx::Error::Protocol(
                 "SQLite runtime migration ledger differs".into(),
             ));
