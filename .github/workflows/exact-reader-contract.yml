@@ -662,37 +662,20 @@ jobs:
         with:
           toolchain: 1.95.0
       - uses: ./.github/actions/checkout-plugin-examples
-      - name: Start isolated RustFS fixture
-        env:
-          RUSTFS_ACCESS_KEY: rustfs-test-fixture
-          RUSTFS_SECRET_KEY: synthetic-test-only-secret-707
-        run: |
-          docker run --detach --name rustfs-contract --publish 127.0.0.1:19000:9000 \
-            --memory 1g --cpus 2 --env RUSTFS_ACCESS_KEY --env RUSTFS_SECRET_KEY \
-            --env RUSTFS_ADDRESS=:9000 --env RUSTFS_CONSOLE_ENABLE=false \
-            --env RUSTFS_OBS_LOG_DIRECTORY= --env RUSTFS_OBS_LOGGER_LEVEL=warn \
-            --entrypoint /usr/bin/rustfs \
-            rustfs/rustfs:1.0.4@sha256:ed9210d6411d77ffceb70d94b964a3cb7d225983368bc25bebe01e995293dcc2 /data
-          for attempt in $(seq 1 60); do
-            if curl --fail --silent --aws-sigv4 'aws:amz:us-east-1:s3' \
-              --user "$RUSTFS_ACCESS_KEY:$RUSTFS_SECRET_KEY" \
-              --request PUT http://127.0.0.1:19000/conversation-contract-test; then exit 0; fi
-            sleep 2
-          done
-          exit 1
-      - name: Verify pending object read cancellation
-        env:
-          MTC_RUSTFS_TEST_ENDPOINT: http://127.0.0.1:19000
-          MTC_RUSTFS_TEST_BUCKET: conversation-contract-test
-          MTC_RUSTFS_TEST_ACCESS_KEY: rustfs-test-fixture
-          MTC_RUSTFS_TEST_SECRET_KEY: synthetic-test-only-secret-707
+      - name: Verify captured request session attribution
         run: |
           set -euo pipefail
           git rev-parse HEAD
           test "$(git rev-parse HEAD)" = "${{ inputs.source_revision }}"
-          cargo test --locked --lib json_source::carrier_cancel_tests::cancellation_drops_a_pending_object_read_and_releases_the_source -- --exact --nocapture 2>&1 | tee /tmp/pending-object-cancel.log
-          grep -F '1 passed; 0 failed' /tmp/pending-object-cancel.log
-          echo 'RUSTFS_PENDING_READ_CANCEL_PASS backend=rustfs successful_response_gate=required range=bytes0-12 tests=1'
+          cargo check --locked --lib
+          cargo test --locked --lib db::requests::session_attribution::tests::captured_identity_preserves_provenance_without_confirming_shared_sessions -- --exact --nocapture 2>&1 | tee /tmp/session-attribution.log
+          grep -F '1 passed; 0 failed' /tmp/session-attribution.log
+          cargo test --locked --lib db::requests::session_attribution::tests::legacy_session_context_round_trip_preserves_frozen_payload_shape -- --exact --nocapture 2>&1 | tee /tmp/session-attribution.log
+          grep -F '1 passed; 0 failed' /tmp/session-attribution.log
+          cargo test --locked --lib db::requests::queries::event_contract_tests::sqlite_event_enrichment_preserves_recorded_fields_and_tenant_ownership -- --exact --nocapture 2>&1 | tee /tmp/session-attribution.log
+          grep -F '1 passed; 0 failed' /tmp/session-attribution.log
+          cargo test --locked --lib db::requests::queries::event_contract_tests::postgres_event_enrichment_preserves_recorded_fields_and_tenant_ownership -- --exact --nocapture 2>&1 | tee /tmp/session-attribution.log
+          grep -F '1 passed; 0 failed' /tmp/session-attribution.log
 
   semantic-reader-scope-contract:
     if: inputs.contract == 'semantic-reader-scope'
