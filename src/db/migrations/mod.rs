@@ -1890,7 +1890,18 @@ impl Database {
             maintain_postgres_partitions(&mut transaction).await?;
         }
         transaction.commit().await?;
-        self.install_schema_track(super::capability::SchemaTrack::Linear165)?;
+        if matches!(self.backend, DatabaseBackend::Sqlite) {
+            // Release the migration connection before validation borrows the
+            // pool, including single-connection in-memory databases.
+            drop(connection);
+            if !self.verify_sqlite_runtime().await? {
+                return Err(sqlx::Error::Protocol(
+                    "SQLite runtime migrations did not establish a supported schema".into(),
+                ));
+            }
+        } else {
+            self.install_schema_track(super::capability::SchemaTrack::Linear165)?;
+        }
         Ok(())
     }
 

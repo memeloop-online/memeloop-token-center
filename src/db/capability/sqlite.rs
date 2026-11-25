@@ -109,6 +109,50 @@ impl Database {
 mod tests {
     use crate::db::Database;
     #[tokio::test]
+    async fn sqlite_upgrade_rejects_missing_preexisting_marker_index() {
+        let directory = tempfile::tempdir().unwrap();
+        let url = format!(
+            "sqlite://{}?mode=rwc",
+            directory.path().join("upgrade.db").display()
+        );
+        let db = Database::connect(&url).await.unwrap();
+        db.migrate().await.unwrap();
+        for column in [
+            "read_model_version",
+            "activation_epoch",
+            "chunk_count",
+            "manifest_hash",
+            "sources_complete",
+            "parity_json",
+            "target_identity",
+        ] {
+            sqlx::query(&format!(
+                "ALTER TABLE request_history_baseline_runs DROP COLUMN {column}"
+            ))
+            .execute(&db.pool)
+            .await
+            .unwrap();
+        }
+        sqlx::query("DELETE FROM schema_migrations WHERE version=165")
+            .execute(&db.pool)
+            .await
+            .unwrap();
+        sqlx::query("DROP INDEX request_records_started_pending")
+            .execute(&db.pool)
+            .await
+            .unwrap();
+        db.close().await;
+        let old = Database::connect(&url).await.unwrap();
+        assert!(old.legacy163_mode().is_err());
+        assert!(
+            old.migrate().await.is_err(),
+            "upgrade cannot authorize drifted prior schema"
+        );
+        assert!(old.legacy163_mode().is_err());
+        old.close().await;
+        assert!(Database::connect(&url).await.is_err());
+    }
+    #[tokio::test]
     async fn sqlite_runtime_reopen_and_independent_pool_verify_same_track() {
         let directory = tempfile::tempdir().unwrap();
         let url = format!(
