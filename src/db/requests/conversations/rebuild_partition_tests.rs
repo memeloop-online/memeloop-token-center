@@ -156,7 +156,7 @@ async fn postgres_rebuild_partition_locks_and_ineligible_prefix() {
         assert_eq!(picked, SESSION_BODY_REBUILD_LEASE_OWNER);
         held.rollback().await.unwrap();
         assert_eq!(db.reopen_session_body_rebuilds(2).await.unwrap(), 1);
-        // Model a consumer removing newly pending work between candidates.
+        // Consume each newly pending row before the next candidate reads capacity.
         // Replenishment still owes only its initial allowance, not the full scan.
         let third = Uuid::now_v7().to_string();
         sqlx::query("INSERT INTO request_records SELECT (jsonb_populate_record(NULL::request_records,to_jsonb(r)||jsonb_build_object('id',$1::text))).* FROM request_records r WHERE r.id=$2")
@@ -167,7 +167,7 @@ async fn postgres_rebuild_partition_locks_and_ineligible_prefix() {
             .bind(&third).bind(fixture.request_id.to_string()).execute(&db.pool).await.unwrap();
         sqlx::query("UPDATE conversation_projection_outbox SET projected_at=1,statistics_outcome=NULL,lease_owner=NULL WHERE request_id IN ($1,$2)")
             .bind(fixture.request_id.to_string()).bind(&later).execute(&db.pool).await.unwrap();
-        sqlx::raw_sql("CREATE OR REPLACE FUNCTION rebuild_lock_probe() RETURNS trigger LANGUAGE plpgsql AS $$ BEGIN IF NEW.lease_owner='session-body-rebuild' AND OLD.projected_at IS NOT NULL AND NEW.projected_at IS NULL THEN UPDATE conversation_projection_outbox SET projected_at=1 WHERE request_id<>NEW.request_id AND projected_at IS NULL AND lease_owner='session-body-rebuild'; END IF; RETURN NEW; END $$;")
+        sqlx::raw_sql("CREATE OR REPLACE FUNCTION rebuild_lock_probe() RETURNS trigger LANGUAGE plpgsql AS $$ BEGIN IF NEW.lease_owner='session-body-rebuild' AND OLD.projected_at IS NOT NULL AND NEW.projected_at IS NULL THEN UPDATE conversation_projection_outbox SET projected_at=1 WHERE projected_at IS NULL AND lease_owner='session-body-rebuild'; END IF; RETURN NEW; END $$;")
             .execute(&db.pool).await.unwrap();
         assert_eq!(
             db.reopen_session_body_rebuilds(2).await.unwrap(),
