@@ -102,19 +102,34 @@ async fn assert_wire_delivery(failure: PeerFailure, label: &str) {
     )
     .await
     .expect("wire failure must terminate through the original candidate state machine");
+    let status = response.status();
+    let request_id = response
+        .headers()
+        .get(REQUEST_ID_HEADER)
+        .and_then(|value| value.to_str().ok())
+        .and_then(|value| Uuid::parse_str(value).ok());
+    let body = to_bytes(response.into_body(), MAX_PROXY_RESPONSE_BODY)
+        .await
+        .unwrap();
+    let safe_code = serde_json::from_slice::<Value>(&body)
+        .ok()
+        .and_then(|value| {
+            value
+                .get("error")
+                .and_then(|error| error.get("code"))
+                .and_then(Value::as_str)
+                .map(str::to_owned)
+        });
     assert_eq!(
-        response.status(),
+        status,
         if retryable {
             StatusCode::OK
         } else {
             StatusCode::BAD_GATEWAY
-        }
+        },
+        "safe error code: {safe_code:?}"
     );
-    let request_id =
-        Uuid::parse_str(response.headers()[REQUEST_ID_HEADER].to_str().unwrap()).unwrap();
-    let _ = to_bytes(response.into_body(), MAX_PROXY_RESPONSE_BODY)
-        .await
-        .unwrap();
+    let request_id = request_id.expect("admitted logical request must expose its identity");
     standby.verify().await;
     assert_eq!(
         received.load(Ordering::SeqCst),
