@@ -6,7 +6,7 @@ fn drift(message: &str) -> sqlx::Error {
     sqlx::Error::Protocol(format!("capability catalog rejected: {message}"))
 }
 
-pub(super) async fn inspect(
+pub(in crate::db) async fn inspect(
     c: &mut AnyConnection,
     role: CapabilityRole,
 ) -> Result<Option<CapabilityReport>, sqlx::Error> {

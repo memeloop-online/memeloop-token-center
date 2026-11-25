@@ -3,6 +3,8 @@
 use serde::{Deserialize, Serialize};
 pub(super) mod catalog;
 mod history;
+#[cfg(test)]
+mod tests;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
