@@ -36,65 +36,28 @@ jobs:
   metadata-refresh-contract:
     if: inputs.contract == 'metadata-refresh'
     runs-on: ubuntu-24.04
-    timeout-minutes: 30
-    permissions:
-      contents: read
-      packages: write
-    env:
-      SOURCE_REPO: docker.io/clickhouse/clickhouse-server
-      SOURCE_DIGEST: sha256:5311f717b7a3ee1e8ed2c198fee498c636ba6c2da3e39dbe45769088ebc858d0
-      TARGET_REPO: ghcr.io/memeloop-online/memeloop-token-center
-      TARGET_TAG: mirror-clickhouse-sha-5311f717b7a3ee1e8ed2c198fee498c636ba6c2da3e39dbe45769088ebc858d0
+    timeout-minutes: 5
     steps:
-      - name: Install the existing checksum-pinned crane
-        run: |
-          set -euo pipefail
-          curl --fail --silent --show-error --location --retry 2 --connect-timeout 15 --max-time 120 https://github.com/google/go-containerregistry/releases/download/v0.21.9/go-containerregistry_Linux_x86_64.tar.gz --output "$RUNNER_TEMP/crane.tar.gz"
-          echo '5c16d8ddb971cb1d5e6ed8b1e743da8224414eeba2c2762d8f1a61b2f095699e  '"$RUNNER_TEMP/crane.tar.gz" | sha256sum --check
-          mkdir -p "$RUNNER_TEMP/crane-bin" "$RUNNER_TEMP/clickhouse-mirror-evidence"
-          tar -xzf "$RUNNER_TEMP/crane.tar.gz" -C "$RUNNER_TEMP/crane-bin" crane
-          echo "$RUNNER_TEMP/crane-bin" >> "$GITHUB_PATH"
-          install -d -m 0700 "$RUNNER_TEMP/clickhouse-mirror-auth"
-          echo "DOCKER_CONFIG=$RUNNER_TEMP/clickhouse-mirror-auth" >> "$GITHUB_ENV"
-      - name: Verify the approved exact source manifest
-        run: |
-          set -euo pipefail
-          source_ref="$SOURCE_REPO@$SOURCE_DIGEST"
-          test "$(timeout 60s crane digest "$source_ref")" = "$SOURCE_DIGEST"
-          timeout 60s crane manifest "$source_ref" > "$RUNNER_TEMP/clickhouse-mirror-evidence/source-manifest.json"
-          printf '%s  %s\n' "${SOURCE_DIGEST#sha256:}" "$RUNNER_TEMP/clickhouse-mirror-evidence/source-manifest.json" | sha256sum --check
-      - uses: docker/login-action@c94ce9fb468520275223c153574b00df6fe4bcc9
+      - name: Require an exact source commit
+        env:
+          SOURCE_REVISION: ${{ inputs.source_revision }}
+        run: '[[ "$SOURCE_REVISION" =~ ^[0-9a-f]{40}$ ]]'
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
         with:
-          registry: ghcr.io
-          username: ${{ github.actor }}
-          password: ${{ secrets.GITHUB_TOKEN }}
-      - name: Copy the complete manifest graph to the isolated existing-package tag
+          ref: ${{ inputs.source_revision }}
+          persist-credentials: false
+      - run: git rev-parse HEAD
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020
+        with:
+          node-version: 24.18.0
+      - run: npm ci --ignore-scripts --no-audit
+      - run: npm run typecheck
+      - name: Verify staging peak harness contracts
         run: |
           set -euo pipefail
-          target_ref="$TARGET_REPO:$TARGET_TAG"
-          if timeout 60s crane digest "$target_ref" > "$RUNNER_TEMP/target-digest.txt" 2> "$RUNNER_TEMP/target-digest-error.txt"; then
-            test "$(cat "$RUNNER_TEMP/target-digest.txt")" = "$SOURCE_DIGEST"
-          else
-            precheck_status=$?
-            cat "$RUNNER_TEMP/target-digest-error.txt" >&2
-            test "$precheck_status" != 124
-            grep -Fq 'MANIFEST_UNKNOWN' "$RUNNER_TEMP/target-digest-error.txt"
-            timeout --kill-after=10s 18m crane copy --jobs 2 --no-clobber "$SOURCE_REPO@$SOURCE_DIGEST" "$target_ref"
-          fi
-          test "$(timeout 60s crane digest "$target_ref")" = "$SOURCE_DIGEST"
-          timeout 60s crane manifest "$TARGET_REPO@$SOURCE_DIGEST" > "$RUNNER_TEMP/clickhouse-mirror-evidence/target-manifest.json"
-          cmp "$RUNNER_TEMP/clickhouse-mirror-evidence/source-manifest.json" "$RUNNER_TEMP/clickhouse-mirror-evidence/target-manifest.json"
-          printf 'CLICKHOUSE_EXACT_MIRROR_PASS source=%s@%s target=%s@%s\n' "$SOURCE_REPO" "$SOURCE_DIGEST" "$TARGET_REPO" "$SOURCE_DIGEST"
-      - name: Preserve source and target manifest evidence
-        if: always()
-        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
-        with:
-          name: clickhouse-5311-mirror-evidence
-          path: ${{ runner.temp }}/clickhouse-mirror-evidence/
-          if-no-files-found: warn
-      - name: Remove temporary registry credentials
-        if: always()
-        run: rm -rf -- "$RUNNER_TEMP/clickhouse-mirror-auth"
+          node --test --test-reporter=tap tests/load/staging-peak/test-framework.ts 2>&1 | tee /tmp/staging-peak-types.log
+          grep -E '^# pass [1-9][0-9]*$' /tmp/staging-peak-types.log
+          grep -Fx '# fail 0' /tmp/staging-peak-types.log
 
   orphan-reaper-contract:
     if: inputs.contract == 'orphan-reaper-971'
