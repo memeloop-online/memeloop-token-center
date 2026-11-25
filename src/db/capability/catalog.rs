@@ -1,0 +1,141 @@
+use super::*;
+use crate::db::{Database, DatabaseBackend, POSTGRES_MIGRATIONS};
+use sqlx::{AnyConnection, Connection, Row};
+
+fn drift(message: &str) -> sqlx::Error {
+    sqlx::Error::Protocol(format!("capability catalog rejected: {message}"))
+}
+
+pub(super) async fn inspect(
+    c: &mut AnyConnection,
+    role: CapabilityRole,
+) -> Result<Option<CapabilityReport>, sqlx::Error> {
+    let ledger: bool = sqlx::query_scalar("SELECT to_regclass('schema_migrations') IS NOT NULL")
+        .fetch_one(&mut *c)
+        .await?;
+    if !ledger {
+        return Ok(None);
+    }
+    let rows = sqlx::query("SELECT version,name FROM schema_migrations ORDER BY version")
+        .fetch_all(&mut *c)
+        .await?;
+    let versions: Vec<i64> = rows
+        .iter()
+        .map(|r| r.try_get("version"))
+        .collect::<Result<_, _>>()?;
+    if versions.last().is_none_or(|v| *v < 163) {
+        return Ok(None);
+    }
+    let last = *versions.last().unwrap();
+    if ![163, 164, 165].contains(&last) {
+        return Err(drift("unsupported migration sequence"));
+    }
+    let expected: Vec<_> = POSTGRES_MIGRATIONS
+        .iter()
+        .filter(|m| m.version <= last)
+        .collect();
+    if rows.len() != expected.len() {
+        return Err(drift("migration ledger gap"));
+    }
+    for (row, migration) in rows.iter().zip(expected) {
+        if row.try_get::<i64, _>("version")? != migration.version
+            || row.try_get::<String, _>("name")? != migration.name
+        {
+            return Err(drift("migration identity differs"));
+        }
+    }
+    let track = match last {
+        163 => SchemaTrack::Legacy163,
+        164 => SchemaTrack::Linear164,
+        _ => SchemaTrack::Linear165,
+    };
+    let mut signatures = Vec::new();
+    // Every role relies on these existing transaction and recovery authorities.
+    for table in [
+        "request_records",
+        "request_record_locators",
+        "usage_reservations",
+        "request_events",
+        "terminal_projection_outbox",
+        "request_history_state",
+        "request_history_baseline_runs",
+    ] {
+        let row=sqlx::query("SELECT c.oid::bigint AS oid,c.relkind::text AS kind,has_table_privilege(c.oid,'SELECT') AS readable FROM pg_class c WHERE c.oid=to_regclass($1)")
+            .bind(table).fetch_optional(&mut *c).await?.ok_or_else(||drift("required relation missing"))?;
+        let kind: String = row.try_get("kind")?;
+        if !["r", "p"].contains(&kind.as_str()) || !row.try_get::<bool, _>("readable")? {
+            return Err(drift("required relation inaccessible or incompatible"));
+        }
+        signatures.push(CatalogSignature {
+            object: table.into(),
+            signature: format!("{}:{kind}", row.try_get::<i64, _>("oid")?),
+        });
+    }
+    let manifest = manifest();
+    for node in manifest.nodes.iter().skip(1) {
+        for column in &node.columns {
+            let row=sqlx::query("SELECT format_type(a.atttypid,a.atttypmod) AS typ,a.attnotnull FROM pg_attribute a WHERE a.attrelid=to_regclass($1) AND a.attname=$2 AND NOT a.attisdropped")
+                .bind(column.table).bind(column.name).fetch_optional(&mut *c).await?;
+            let required = if node.id == "proxy.started_pending.v1" {
+                last >= 164
+            } else {
+                last >= 165
+            };
+            if required {
+                let row = row.ok_or_else(|| drift("required capability column missing"))?;
+                if row.try_get::<String, _>("typ")? != column.postgres_type
+                    || row.try_get::<bool, _>("attnotnull")? == column.nullable
+                {
+                    return Err(drift("column signature differs"));
+                }
+                signatures.push(CatalogSignature {
+                    object: format!("{}.{}", column.table, column.name),
+                    signature: format!("{}:nullable={}", column.postgres_type, column.nullable),
+                });
+            } else if row.is_some() {
+                return Err(drift("unregistered capability column; provenance required"));
+            }
+        }
+    }
+    if last >= 164 {
+        let valid:bool=sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM pg_index WHERE indexrelid=to_regclass('request_records_started_pending') AND indrelid=to_regclass('request_records') AND indisvalid AND indisready AND pg_get_expr(indpred,indrelid)='(started_event_pending = 1)' AND pg_get_indexdef(indexrelid,1,true)='created_at' AND pg_get_indexdef(indexrelid,2,true)='id')").fetch_one(&mut *c).await?;
+        if !valid {
+            return Err(drift("started index invalid"));
+        }
+    }
+    let identity:String=sqlx::query_scalar("SELECT current_database()||':'||(SELECT oid::text FROM pg_database WHERE datname=current_database())||':'||current_schema()").fetch_one(&mut *c).await?;
+    Ok(Some(CapabilityReport {
+        manifest_digest: manifest
+            .digest()
+            .map_err(|_| drift("manifest serialization"))?,
+        database_identity: identity,
+        role,
+        track,
+        object_signatures: signatures,
+        verified_at: crate::db::unix_millis(),
+    }))
+}
+impl Database {
+    pub async fn verify_capabilities(
+        &self,
+        role: CapabilityRole,
+    ) -> Result<Option<CapabilityReport>, sqlx::Error> {
+        if !matches!(self.backend, DatabaseBackend::PostgreSql) {
+            return Ok(None);
+        }
+        let mut c = self.pool.acquire().await?;
+        let mut tx = c.begin().await?;
+        sqlx::query("SET TRANSACTION ISOLATION LEVEL REPEATABLE READ READ ONLY")
+            .execute(&mut *tx)
+            .await?;
+        let report = inspect(&mut tx, role).await?;
+        tx.commit().await?;
+        self.legacy163.store(
+            report
+                .as_ref()
+                .is_some_and(|r| r.track == SchemaTrack::Legacy163),
+            std::sync::atomic::Ordering::Release,
+        );
+        Ok(report)
+    }
+}

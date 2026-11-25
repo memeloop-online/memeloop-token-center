@@ -316,6 +316,7 @@ pub struct Database {
     connection_profile: ConnectionProfile,
     backend: DatabaseBackend,
     terminal_projection_enabled: bool,
+    legacy163: std::sync::Arc<std::sync::atomic::AtomicBool>,
     gateway_persistence: std::sync::Arc<gateway_persistence::GatewayPersistence>,
     #[cfg(test)]
     pub(crate) oauth_refresh_write_phase_seam:
@@ -749,6 +750,7 @@ impl Database {
             },
             backend,
             terminal_projection_enabled: false,
+            legacy163: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
             auxiliary_pool_max_connections: 2,
             connection_profile: profile,
             #[cfg(test)]
@@ -925,6 +927,7 @@ impl Database {
             },
             backend: self.backend,
             terminal_projection_enabled: self.terminal_projection_enabled,
+            legacy163: self.legacy163.clone(),
             auxiliary_pool_max_connections: self.auxiliary_pool_max_connections,
             connection_profile: self.connection_profile,
             #[cfg(test)]

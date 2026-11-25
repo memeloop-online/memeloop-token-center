@@ -1,6 +1,8 @@
 //! Versioned, binary-owned schema capabilities. Reports are observations, never
 //! authorization tokens or substitutes for migration ledger entries.
 use serde::{Deserialize, Serialize};
+pub(super) mod catalog;
+mod history;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -88,17 +90,7 @@ pub fn manifest() -> CapabilityManifest {
                     nullable: false,
                 }],
             },
-            CapabilityNode {
-                id: "history.baseline_receipt.v1",
-                semantic_version: "1.0.0",
-                prerequisites: &["schema.legacy163.v1"],
-                migration_source_digest: blake3::hash(include_bytes!(
-                    "../../migrations/common/0165_history_watermark_proof.sql"
-                ))
-                .to_hex()
-                .to_string(),
-                columns: vec![],
-            },
+            history::baseline_receipt(),
         ],
     }
 }

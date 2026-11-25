@@ -70,6 +70,9 @@ pub(super) async fn statistics_pruned_in_transaction(
 
 impl Database {
     pub(crate) async fn publish_pending_proxy_started_events(&self) -> Result<(), AppError> {
+        if self.legacy163.load(std::sync::atomic::Ordering::Acquire) {
+            return Ok(());
+        }
         let rows = sqlx::query("SELECT id FROM request_records WHERE started_event_pending = 1 ORDER BY created_at, id LIMIT 32")
             .fetch_all(&self.pool).await?;
         for row in rows {

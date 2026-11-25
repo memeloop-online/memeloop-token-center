@@ -228,6 +228,9 @@ impl AppState {
             .map_err(|error| InitializationError::Database(error.into()))?
             .with_terminal_projection_enabled(config.terminal_projection_enabled)
             .with_auxiliary_pool_max_connections(config.database_aux_pool_max_connections);
+        db.verify_capabilities(db::capability::CapabilityRole::Gateway)
+            .await
+            .map_err(|error| InitializationError::Database(error.into()))?;
         db.refresh_http_settings()
             .await
             .map_err(InitializationError::Database)?;

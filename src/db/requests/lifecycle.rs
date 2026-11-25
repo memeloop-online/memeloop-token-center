@@ -498,17 +498,23 @@ impl Database {
         upstream_model: Option<&str>,
         output_token_limit: Option<i64>,
     ) -> Result<UsageReservation, AppError> {
-        self.start_proxy_request_inner(input, None, false, upstream_model, output_token_limit)
-            .await
-            .map(|started| started.reservation)
-            .map_err(|error| match error {
-                error @ (AppError::Storage { .. } | AppError::Internal { .. }) => error
-                    .retarget_capacity(
-                        "request_record_persist_failed",
-                        crate::error::ErrorFacts::new().phase("request_record"),
-                    ),
-                other => other,
-            })
+        self.start_proxy_request_inner(
+            input,
+            None,
+            self.legacy163.load(std::sync::atomic::Ordering::Acquire),
+            upstream_model,
+            output_token_limit,
+        )
+        .await
+        .map(|started| started.reservation)
+        .map_err(|error| match error {
+            error @ (AppError::Storage { .. } | AppError::Internal { .. }) => error
+                .retarget_capacity(
+                    "request_record_persist_failed",
+                    crate::error::ErrorFacts::new().phase("request_record"),
+                ),
+            other => other,
+        })
     }
 
     pub(crate) async fn publish_proxy_started_event(
@@ -2585,6 +2591,13 @@ pub(super) async fn prepare_pending_started_in_transaction(
     transaction: &mut Transaction<'_, Any>,
     request_id: &str,
 ) -> Result<Option<crate::db::history_immutable_outbox::PreparedEventCapture>, AppError> {
+    // Legacy163 keeps synchronous started publication and has no marker column.
+    if transaction.as_mut().backend_name() == "PostgreSQL" {
+        let marker: bool = sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM pg_attribute WHERE attrelid='request_records'::regclass AND attname='started_event_pending' AND NOT attisdropped)").fetch_one(&mut **transaction).await?;
+        if !marker {
+            return Ok(None);
+        }
+    }
     // The row lock serializes recovery with terminal publishers. Clearing the
     // obligation and publishing the event share a commit, including retries.
     let row = sqlx::query("UPDATE request_records SET started_event_pending = started_event_pending WHERE id = $1 AND started_event_pending = 1 RETURNING *")

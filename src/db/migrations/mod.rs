@@ -1736,6 +1736,25 @@ impl Database {
             DatabaseBackend::PostgreSql => POSTGRES_MIGRATIONS,
             DatabaseBackend::Sqlite => SQLITE_MIGRATIONS,
         };
+        if matches!(self.backend, DatabaseBackend::PostgreSql)
+            && self.legacy163.load(std::sync::atomic::Ordering::Acquire)
+        {
+            let report = super::capability::catalog::inspect(
+                connection,
+                super::capability::CapabilityRole::Gateway,
+            )
+            .await?;
+            if report.is_some_and(|r| r.track == super::capability::SchemaTrack::Legacy163) {
+                return Ok(DatabaseSchemaStatus {
+                    required_version: 163,
+                    latest_applied_version: Some(163),
+                    missing_migration_count: 0,
+                });
+            }
+            return Err(sqlx::Error::Protocol(
+                "capability track changed; restart validation required".into(),
+            ));
+        }
         let required_version = migrations
             .last()
             .map(|migration| migration.version)
@@ -1768,6 +1787,19 @@ impl Database {
             sqlx::query("SELECT pg_advisory_lock(734627102948311)")
                 .execute(&mut *connection)
                 .await?;
+            let mut snapshot = connection.begin().await?;
+            sqlx::query("SET TRANSACTION ISOLATION LEVEL REPEATABLE READ READ ONLY")
+                .execute(&mut *snapshot)
+                .await?;
+            let plan = super::capability::catalog::inspect(
+                &mut snapshot,
+                super::capability::CapabilityRole::Maintenance,
+            )
+            .await?;
+            snapshot.commit().await?;
+            if plan.is_some_and(|p| p.track == super::capability::SchemaTrack::Legacy163) {
+                return Ok(());
+            }
             online147::prepare(&mut connection).await?;
             online164::prepare(&mut connection).await?;
         }
