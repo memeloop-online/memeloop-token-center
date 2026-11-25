@@ -508,6 +508,8 @@ jobs:
           grep -F '1 passed; 0 failed' /tmp/projection-roots-retry.log
           cargo test --locked --all-features --lib db::requests::conversations::archive_readiness_tests::postgres_exact_legacy_body_rebuild_preserves_incomplete_and_financial_receipt -- --exact --nocapture 2>&1 | tee /tmp/exact-prepared-resume.log
           grep -F '1 passed; 0 failed' /tmp/exact-prepared-resume.log
+          cargo test --locked --all-features --lib db::requests::conversations::archive_readiness_tests::rebuild_partition_tests::postgres_rebuild_partition_locks_and_ineligible_prefix -- --exact --nocapture 2>&1 | tee /tmp/rebuild-partition-locks.log
+          grep -F '1 passed; 0 failed' /tmp/rebuild-partition-locks.log
 
   legacy-archive-bound-contract:
     if: inputs.contract == 'legacy-archive-bound'
