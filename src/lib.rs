@@ -186,20 +186,30 @@ impl AppState {
 
     /// Build the shared archive writer state without starting customer recovery work.
     pub async fn initialize_for_maintenance(config: Config) -> Result<Self, InitializationError> {
-        Self::initialize_with_background(config, false, None).await
+        Self::initialize_with_background(config, false, None, false).await
     }
 
     pub async fn initialize_for_role(
         config: Config,
         role: config::RuntimeRole,
     ) -> Result<Self, InitializationError> {
-        Self::initialize_with_background(config, true, Some(role)).await
+        Self::initialize_with_background(config, true, Some(role), false).await
+    }
+
+    pub async fn initialize_legacy163_for_role(
+        mut config: Config,
+        role: config::RuntimeRole,
+    ) -> Result<Self, InitializationError> {
+        // Explicit compatibility mode never runs the linear migrator.
+        config.run_migrations_on_start = false;
+        Self::initialize_with_background(config, true, Some(role), true).await
     }
 
     async fn initialize_with_background(
         config: Config,
         background: bool,
         runtime_role: Option<config::RuntimeRole>,
+        legacy163_startup: bool,
     ) -> Result<Self, InitializationError> {
         let transport_proxy_groups = db::TransportProxyGroups::parse(
             &config.transport_proxy_groups,
@@ -248,9 +258,21 @@ impl AppState {
             None => vec![db::capability::CapabilityRole::Maintenance],
         };
         for role in roles {
-            db.verify_capabilities(role)
+            let report = db
+                .verify_capabilities(role)
                 .await
                 .map_err(|error| InitializationError::Database(error.into()))?;
+            let legacy = report
+                .as_ref()
+                .is_some_and(|r| r.track == db::capability::SchemaTrack::Legacy163);
+            if legacy != legacy163_startup {
+                return Err(InitializationError::Database(
+                    sqlx::Error::Protocol(
+                        "schema startup mode differs from validated catalog".into(),
+                    )
+                    .into(),
+                ));
+            }
         }
         db.refresh_http_settings()
             .await

@@ -56,6 +56,9 @@ enum Command {
     Serve {
         #[arg(long, value_enum, default_value_t)]
         role: RuntimeRole,
+        /// Validate and serve exact163 without executing linear migrations.
+        #[arg(long, default_value_t = false)]
+        legacy163: bool,
     },
     /// Inspect or recover one exact terminal projection with the normal writer.
     TerminalProjection {
@@ -377,7 +380,7 @@ async fn run() -> Result<(), &'static str> {
                 .map_err(|_| "failed_request_cost_backfill_report_failed")?;
             println!("{output}");
         }
-        Command::Serve { role } => {
+        Command::Serve { role, legacy163 } => {
             let address: SocketAddr = config
                 .listen
                 .parse()
@@ -397,7 +400,10 @@ async fn run() -> Result<(), &'static str> {
                 loop {
                     let initialized = tokio::select! {
                         _ = receiver.changed() => return,
-                        result = AppState::initialize_for_role(config.clone(), role) => result,
+                        result = async {
+                            if legacy163 { AppState::initialize_legacy163_for_role(config.clone(), role).await }
+                            else { AppState::initialize_for_role(config.clone(), role).await }
+                        } => result,
                     };
                     match initialized {
                         Ok(state) => {
