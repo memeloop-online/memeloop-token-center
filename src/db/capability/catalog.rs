@@ -197,7 +197,12 @@ impl Database {
         sqlx::query("SET TRANSACTION ISOLATION LEVEL REPEATABLE READ READ ONLY")
             .execute(&mut *tx)
             .await?;
-        let report = inspect(&mut tx, role).await?;
+        let result = inspect(&mut tx, role).await;
+        #[cfg(test)]
+        if let Err(error) = &result {
+            eprintln!("PostgreSQL runtime catalog verification: {error}");
+        }
+        let report = result?;
         tx.commit().await?;
         if let Some(report) = &report {
             self.install_schema_track(report.track)?;
