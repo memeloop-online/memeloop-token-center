@@ -10,6 +10,7 @@ on:
         required: true
         type: choice
         options:
+          - history-maintenance-1073
           - history-event-only-proof
           - request-events-997
           - request-readmodel-994
@@ -906,3 +907,83 @@ jobs:
             cargo test --locked --all-features --lib "$selector" -- $ignored --exact --nocapture --test-threads=1 2>&1 | tee /tmp/history-event-only.log
             grep -F '1 passed; 0 failed' /tmp/history-event-only.log
           done
+
+  history-maintenance-1073:
+    if: inputs.contract == 'history-maintenance-1073'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
+    permissions:
+      contents: read
+      packages: write
+      id-token: write
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+        with:
+          ref: ${{ inputs.source_revision }}
+          persist-credentials: false
+      - name: Lock audited maintenance source
+        id: identity
+        env:
+          SOURCE: ${{ inputs.source_revision }}
+        run: |
+          test "$SOURCE" = ff088e3e56ac702efae5765e68f1e452279646db
+          test "$(git rev-parse HEAD)" = "$SOURCE"
+          echo "stamp=$(git show -s --format=%cI HEAD)" >> "$GITHUB_OUTPUT"
+          echo "image=ghcr.io/memeloop-online/memeloop-token-center:maintenance-1073-$SOURCE-${GITHUB_RUN_ID}" >> "$GITHUB_OUTPUT"
+      - uses: docker/setup-buildx-action@8d2750c68a42422c14e847fe6c8ac0403b4cbd6f
+      - name: Export existing Docker-native release input
+        uses: docker/build-push-action@10e90e3645eae34f1e60eeb005ba3a3d33f178e8
+        with:
+          context: .
+          file: Dockerfile
+          target: release-input-export
+          platforms: linux/amd64
+          outputs: type=local,dest=${{ runner.temp }}/history-release-input
+          build-args: |
+            MTC_BUILD_GIT_SHA_INPUT=${{ inputs.source_revision }}
+            MTC_BUILD_TIMESTAMP_INPUT=${{ steps.identity.outputs.stamp }}
+            MTC_BUILD_TARGET_INPUT=linux/amd64
+          cache-from: type=gha,scope=service-release-input
+          cache-to: type=gha,mode=max,scope=history-maintenance-1073
+      - uses: docker/login-action@c94ce9fb468520275223c153574b00df6fe4bcc9
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+      - name: Package and publish maintenance OCI
+        id: package
+        uses: docker/build-push-action@10e90e3645eae34f1e60eeb005ba3a3d33f178e8
+        with:
+          context: .
+          file: Dockerfile.release
+          build-contexts: release-input=${{ runner.temp }}/history-release-input
+          platforms: linux/amd64
+          push: true
+          provenance: mode=max
+          sbom: true
+          tags: ${{ steps.identity.outputs.image }}
+          labels: org.opencontainers.image.revision=${{ inputs.source_revision }}
+      - name: Verify immutable image and exact CLI entry
+        env:
+          IMAGE: ${{ steps.identity.outputs.image }}
+          DIGEST: ${{ steps.package.outputs.digest }}
+          SOURCE: ${{ inputs.source_revision }}
+        run: |
+          set -euo pipefail
+          mkdir -p evidence
+          immutable="$IMAGE@$DIGEST"
+          docker pull "$immutable"
+          test "$(docker inspect --format '{{ index .Config.Labels "org.opencontainers.image.revision" }}' "$immutable")" = "$SOURCE"
+          docker run --rm "$immutable" request-history export-exact-event --help > evidence/exact-help.txt
+          for flag in request-id tenant-id key-id created-at revision; do grep -F -- "--$flag" evidence/exact-help.txt; done
+          printf '%s\n' "$immutable" > evidence/immutable-image.txt
+          printf '%s\n' "$SOURCE" > evidence/source.txt
+          chmod +x "$RUNNER_TEMP/history-release-input/cosign"
+          "$RUNNER_TEMP/history-release-input/cosign" sign --yes "$immutable"
+          "$RUNNER_TEMP/history-release-input/cosign" verify --certificate-oidc-issuer https://token.actions.githubusercontent.com --certificate-identity-regexp '^https://github.com/memeloop-online/memeloop-token-center/.github/workflows/exact-reader-contract.yml@refs/heads/ci/history-event-only-proof-20261125$' "$immutable" > evidence/signature.json
+      - uses: actions/upload-artifact@65462800fd760344b1a7b4382951275a0abb4808
+        with:
+          name: history-maintenance-1073-${{ github.run_id }}
+          path: evidence
+          if-no-files-found: error
+          retention-days: 14
