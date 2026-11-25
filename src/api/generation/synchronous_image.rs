@@ -534,14 +534,7 @@ where
     }
 }
 
-#[cfg(test)]
-pub(in crate::api) async fn read_image_response_bounded(
-    response: reqwest::Response,
-) -> Result<Bytes, ImageResponseReadError> {
-    read_synchronous_image_response_bounded(response).await
-}
-
-async fn read_synchronous_image_response_bounded(
+pub(in crate::api) async fn read_synchronous_image_response_bounded(
     response: reqwest::Response,
 ) -> Result<Bytes, ImageResponseReadError> {
     let stream = response.bytes_stream().inspect_err(|error| {

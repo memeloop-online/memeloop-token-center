@@ -1122,7 +1122,7 @@ async fn image_response_limit_accepts_exactly_16_mib_and_rejects_one_more_byte()
         .mount(&server)
         .await;
     let client = reqwest::Client::new();
-    let exact = read_image_response_bounded(
+    let exact = read_synchronous_image_response_bounded(
         client
             .get(format!("{}/exact", server.uri()))
             .send()
@@ -1132,7 +1132,7 @@ async fn image_response_limit_accepts_exactly_16_mib_and_rejects_one_more_byte()
     .await
     .expect("exact boundary accepted");
     assert_eq!(exact.len(), MAX_IMAGE_RESPONSE);
-    let over = read_image_response_bounded(
+    let over = read_synchronous_image_response_bounded(
         client
             .get(format!("{}/over", server.uri()))
             .send()
