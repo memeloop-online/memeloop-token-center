@@ -1,0 +1,20 @@
+name: maintenance-help-contract
+on:
+  pull_request:
+    paths:
+      - .github/workflows/maintenance-help-contract.yml
+permissions:
+  contents: read
+jobs:
+  help:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    steps:
+      - name: Inspect isolated candidate CLI without network or credentials
+        run: |
+          docker pull ghcr.io/memeloop-online/memeloop-token-center@sha256:539f8d4fc024e0aaddbad5cfbd18e269b60987ccbaef0389dffadaaa497cc341
+          docker run --rm --network none --read-only --cap-drop ALL --security-opt no-new-privileges \
+            ghcr.io/memeloop-online/memeloop-token-center@sha256:539f8d4fc024e0aaddbad5cfbd18e269b60987ccbaef0389dffadaaa497cc341 \
+            terminal-projection recover-one --help | tee "$RUNNER_TEMP/help.txt"
+          grep -F -- '--request-id' "$RUNNER_TEMP/help.txt"
+          grep -F -- '--apply' "$RUNNER_TEMP/help.txt"
