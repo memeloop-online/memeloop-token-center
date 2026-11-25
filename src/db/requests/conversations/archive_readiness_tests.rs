@@ -2625,20 +2625,38 @@ async fn postgres_exact_legacy_body_rebuild_preserves_incomplete_and_financial_r
     let request =
         Bytes::from_static(br#"{"model":"fixture","input":"original question","stream":false}"#);
     let response = Bytes::from_static(br#"{"object":"response","status":"incomplete","incomplete_details":{"reason":"max_output_tokens"},"output":[{"type":"reasoning","summary":[{"type":"summary_text","text":"reason"}]},{"type":"message","role":"assistant","content":[{"type":"output_text","text":"partial answer"}]}]}"#);
-    let request_locator = format!("legacy-exact/{}/request.json", fixture.request_id);
-    let response_locator = format!("legacy-exact/{}/response.json", fixture.request_id);
-    fixture
-        .state
-        .archive
-        .put(&request_locator, request.clone())
-        .await
-        .unwrap();
-    fixture
-        .state
-        .archive
-        .put(&response_locator, response.clone())
-        .await
-        .unwrap();
+    let mut originals = Vec::new();
+    for (purpose, bytes) in [
+        (
+            crate::archive_staging::ArchiveStagingPurpose::Request,
+            request.clone(),
+        ),
+        (
+            crate::archive_staging::ArchiveStagingPurpose::Response,
+            response.clone(),
+        ),
+    ] {
+        let attempt =
+            crate::proxy_lifecycle::begin_proxy_archive_attempt(db, fixture.request_id, purpose)
+                .await
+                .unwrap();
+        let mut writer = fixture
+            .state
+            .archive
+            .start_writer(&attempt.object_locator)
+            .await
+            .unwrap();
+        writer.write(bytes).await.unwrap();
+        let original = writer.finish_staged().await.unwrap();
+        assert!(
+            db.bind_archive_staging_attempt(&attempt.lease, &original.object_locator)
+                .await
+                .unwrap()
+        );
+        originals.push(original.object_locator);
+    }
+    let request_locator = originals.remove(0);
+    let response_locator = originals.remove(0);
     sqlx::query(
         "UPDATE request_records SET request_object = $1, response_object = $2 WHERE id = $3",
     )
@@ -2979,6 +2997,103 @@ async fn postgres_exact_legacy_body_rebuild_preserves_incomplete_and_financial_r
         .put(&response_locator, response.clone())
         .await
         .unwrap();
+    let unowned = format!("legacy-exact/{}/unowned.json", fixture.request_id);
+    fixture
+        .state
+        .archive
+        .put(&unowned, response.clone())
+        .await
+        .unwrap();
+    sqlx::query("UPDATE request_records SET response_object=$2 WHERE id=$1 AND created_at=$3")
+        .bind(fixture.request_id.to_string())
+        .bind(&unowned)
+        .bind(created_at)
+        .execute(&db.pool)
+        .await
+        .unwrap();
+    assert!(
+        !db.bind_raw_capture_for_projection(
+            fixture.key.tenant_id,
+            fixture.request_id,
+            "response",
+            &raw_response,
+            owner
+        )
+        .await
+        .unwrap(),
+        "a bare legacy object has no immutable writer authority"
+    );
+    sqlx::query("UPDATE request_records SET response_object=$2 WHERE id=$1 AND created_at=$3")
+        .bind(fixture.request_id.to_string())
+        .bind(&response_locator)
+        .bind(created_at)
+        .execute(&db.pool)
+        .await
+        .unwrap();
+    // Pause after immutable-source verification but before the SQL fence.
+    // Changed pointer, owner, or receipt must never be adopted automatically.
+    for mutation in [
+        "UPDATE request_records SET response_object='gap://changed/response' WHERE id=$1",
+        "UPDATE conversation_projection_outbox SET lease_owner='00000000-0000-0000-0000-000000000001' WHERE request_id=$1",
+        "UPDATE archive_staging_attempts SET updated_at=updated_at+1 WHERE owner_id=$1 AND purpose='response'",
+    ] {
+        let gate = Database::gate_coverage_read_for_test(fixture.request_id);
+        let task_db = db.clone();
+        let tenant = fixture.key.tenant_id;
+        let request_id = fixture.request_id;
+        let object = raw_response.clone();
+        let task = tokio::spawn(async move {
+            task_db
+                .bind_raw_capture_for_projection(tenant, request_id, "response", &object, owner)
+                .await
+        });
+        let _guard = CoverageWorkerGuard {
+            request: request_id,
+            gate: gate.clone(),
+            worker: task.abort_handle(),
+        };
+        tokio::time::timeout(std::time::Duration::from_secs(5), gate.0.notified())
+            .await
+            .unwrap();
+        sqlx::query(mutation)
+            .bind(request_id.to_string())
+            .execute(&db.pool)
+            .await
+            .unwrap();
+        let before: String = sqlx::query_scalar(
+            "SELECT to_jsonb(o)::TEXT FROM conversation_projection_outbox o WHERE request_id=$1",
+        )
+        .bind(request_id.to_string())
+        .fetch_one(&db.pool)
+        .await
+        .unwrap();
+        gate.1.notify_one();
+        assert!(
+            !task.await.unwrap().unwrap(),
+            "inspection changed: {mutation}"
+        );
+        let after: String = sqlx::query_scalar(
+            "SELECT to_jsonb(o)::TEXT FROM conversation_projection_outbox o WHERE request_id=$1",
+        )
+        .bind(request_id.to_string())
+        .fetch_one(&db.pool)
+        .await
+        .unwrap();
+        assert_eq!(before, after);
+        sqlx::query("UPDATE request_records SET response_object=$2 WHERE id=$1 AND created_at=$3")
+            .bind(request_id.to_string())
+            .bind(&response_locator)
+            .bind(created_at)
+            .execute(&db.pool)
+            .await
+            .unwrap();
+        sqlx::query("UPDATE conversation_projection_outbox SET lease_owner=$2 WHERE request_id=$1")
+            .bind(request_id.to_string())
+            .bind(owner.to_string())
+            .execute(&db.pool)
+            .await
+            .unwrap();
+    }
     let pending = db
         .session_body_locators(fixture.request_id)
         .await

@@ -6,6 +6,8 @@ struct VerifiedLegacyBinding {
     old_locator: String,
     key_id: String,
     created_at: i64,
+    attempt_id: String,
+    updated_at: i64,
 }
 
 impl Database {
@@ -240,11 +242,34 @@ impl Database {
                                     "staging/proxy/{request_id}/request/{request_id}/body.json"
                                 ))
                 }) {
+                    // Completed typed attempts have a unique writer/key. A
+                    // bound attempt cannot be reopened by begin/replay, and its
+                    // writer finishes object I/O before committing this receipt.
+                    let receipt = sqlx::query("SELECT attempt_id, backend_identity, updated_at FROM archive_staging_attempts WHERE owner_kind='proxy_request' AND owner_id=$1 AND purpose=$2 AND bound_locator=$3 AND state='bound' AND lease_owner IS NULL AND lease_token IS NULL AND lease_expires_at IS NULL")
+                        .bind(request_id.to_string()).bind(side).bind(&old)
+                        .fetch_optional(&self.pool).await?;
+                    let Some(receipt) = receipt else {
+                        return Ok(false);
+                    };
+                    let attempt_id: String = receipt.try_get("attempt_id")?;
+                    let backend: Option<String> = receipt.try_get("backend_identity")?;
+                    let key = crate::archive_staging::ArchiveStagingKey::from_database(
+                        "proxy_request",
+                        &request_id.to_string(),
+                        side,
+                        &attempt_id,
+                    )?
+                    .with_backend_identity(backend.as_deref())?;
+                    if crate::archive_staging::validate_bound_locator(key, &old).is_err() {
+                        return Ok(false);
+                    }
                     if archive.verified_legacy_source(&old, &effective).await? {
                         Some(VerifiedLegacyBinding {
                             old_locator: old,
                             key_id: row.try_get("key_id")?,
                             created_at: row.try_get("created_at")?,
+                            attempt_id,
+                            updated_at: receipt.try_get("updated_at")?,
                         })
                     } else {
                         return Ok(false);
@@ -258,6 +283,10 @@ impl Database {
         } else {
             None
         };
+        #[cfg(test)]
+        if legacy.is_some() {
+            Self::wait_raw_projection_gate_for_test(request_id).await;
+        }
         let statement = match side {
             "request" => {
                 "UPDATE request_records SET request_object = $1 WHERE id = $2 AND tenant_id = $3 AND (request_object IS NULL OR request_object = '' OR request_object = $1 OR request_object = 'gap://' || id || '/request' OR request_object = 'staging/proxy/' || id || '/request/' || id || '/body.json' OR (request_object = $4 AND created_at = $5 AND key_id = $6))"
@@ -274,6 +303,29 @@ impl Database {
                 .bind(request_id.to_string()).bind(tenant_id.to_string()).bind(owner.to_string()).bind(now)
                 .execute(&mut *transaction).await?;
             if fenced.rows_affected() != 1 {
+                return Ok(false);
+            }
+        }
+        if let Some(proof) = legacy.as_ref() {
+            let sql = match self.backend {
+                DatabaseBackend::PostgreSql => {
+                    "SELECT attempt_id FROM archive_staging_attempts WHERE attempt_id=$1 AND owner_kind='proxy_request' AND owner_id=$2 AND purpose=$3 AND bound_locator=$4 AND state='bound' AND updated_at=$5 AND lease_owner IS NULL AND lease_token IS NULL AND lease_expires_at IS NULL FOR UPDATE"
+                }
+                DatabaseBackend::Sqlite => {
+                    "SELECT attempt_id FROM archive_staging_attempts WHERE attempt_id=$1 AND owner_kind='proxy_request' AND owner_id=$2 AND purpose=$3 AND bound_locator=$4 AND state='bound' AND updated_at=$5 AND lease_owner IS NULL AND lease_token IS NULL AND lease_expires_at IS NULL"
+                }
+            };
+            if sqlx::query(sql)
+                .bind(&proof.attempt_id)
+                .bind(request_id.to_string())
+                .bind(side)
+                .bind(&proof.old_locator)
+                .bind(proof.updated_at)
+                .fetch_optional(&mut *transaction)
+                .await?
+                .is_none()
+            {
+                transaction.rollback().await?;
                 return Ok(false);
             }
         }
