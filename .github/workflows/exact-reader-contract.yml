@@ -662,18 +662,13 @@ jobs:
         with:
           toolchain: 1.95.0
       - uses: ./.github/actions/checkout-plugin-examples
-      - name: Verify prepared conversation prefix scope
+      - name: Verify pending object read cancellation
         run: |
           set -euo pipefail
           git rev-parse HEAD
           test "$(git rev-parse HEAD)" = "${{ inputs.source_revision }}"
-          cargo check --locked --lib
-          cargo test --locked --lib db::requests::conversations::prefix_storage::tests::sqlite_prepared_prefix_reuses_only_verified_tenant_roots -- --exact --nocapture 2>&1 | tee /tmp/conversation-prefix.log
-          grep -F '1 passed; 0 failed' /tmp/conversation-prefix.log
-          cargo test --locked --lib db::requests::conversations::prefix_storage::tests::postgres_prefix_preload_releases_projection_scope_before_graph_receive -- --ignored --exact --nocapture 2>&1 | tee /tmp/conversation-prefix.log
-          grep -F '1 passed; 0 failed' /tmp/conversation-prefix.log
-          cargo test --locked --lib db::requests::conversations::prefix_storage::tests::postgres_long_prefix_storage_and_lossless_replay -- --exact --nocapture 2>&1 | tee /tmp/conversation-prefix.log
-          grep -F '1 passed; 0 failed' /tmp/conversation-prefix.log
+          cargo test --locked --lib json_source::carrier_cancel_tests::cancellation_drops_a_pending_object_read_and_releases_the_source -- --exact --nocapture 2>&1 | tee /tmp/pending-object-cancel.log
+          grep -F '1 passed; 0 failed' /tmp/pending-object-cancel.log
 
   semantic-reader-scope-contract:
     if: inputs.contract == 'semantic-reader-scope'
