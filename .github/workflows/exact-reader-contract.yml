@@ -10,7 +10,6 @@ on:
         required: true
         type: choice
         options:
-          - history-maintenance-1073
           - history-event-only-proof
           - request-events-997
           - request-readmodel-994
@@ -35,6 +34,7 @@ on:
           - history-writer-984
           - history-capture-981
           - release-927-928
+          - history-maintenance-1073
 permissions:
   contents: read
 jobs:
@@ -926,6 +926,8 @@ jobs:
         env:
           SOURCE: ${{ inputs.source_revision }}
         run: |
+          test "$GITHUB_REPOSITORY" = memeloop-online/memeloop-token-center
+          test "$GITHUB_REF" = refs/heads/ci/history-event-only-proof-20261125
           test "$SOURCE" = ff088e3e56ac702efae5765e68f1e452279646db
           test "$(git rev-parse HEAD)" = "$SOURCE"
           echo "stamp=$(git show -s --format=%cI HEAD)" >> "$GITHUB_OUTPUT"
@@ -980,7 +982,7 @@ jobs:
           printf '%s\n' "$SOURCE" > evidence/source.txt
           chmod +x "$RUNNER_TEMP/history-release-input/cosign"
           "$RUNNER_TEMP/history-release-input/cosign" sign --yes "$immutable"
-          "$RUNNER_TEMP/history-release-input/cosign" verify --certificate-oidc-issuer https://token.actions.githubusercontent.com --certificate-identity-regexp '^https://github.com/memeloop-online/memeloop-token-center/.github/workflows/exact-reader-contract.yml@refs/heads/ci/history-event-only-proof-20261125$' "$immutable" > evidence/signature.json
+          "$RUNNER_TEMP/history-release-input/cosign" verify --certificate-oidc-issuer https://token.actions.githubusercontent.com --certificate-identity 'https://github.com/memeloop-online/memeloop-token-center/.github/workflows/exact-reader-contract.yml@refs/heads/ci/history-event-only-proof-20261125' "$immutable" > evidence/signature.json
       - uses: actions/upload-artifact@65462800fd760344b1a7b4382951275a0abb4808
         with:
           name: history-maintenance-1073-${{ github.run_id }}
