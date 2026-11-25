@@ -1696,8 +1696,29 @@ pub(crate) fn explained_failure_body(
     })
 }
 
+#[cfg(test)]
+tokio::task_local! {
+    static FIXTURE_PROTOCOL_DIAGNOSTIC: bool;
+}
+
+/// Only synthetic fixture scopes opt in; production never emits driver text.
+#[cfg(test)]
+pub(crate) async fn with_fixture_protocol_diagnostic<T>(
+    operation: impl std::future::Future<Output = T>,
+) -> T {
+    FIXTURE_PROTOCOL_DIAGNOSTIC.scope(true, operation).await
+}
+
 impl From<sqlx::Error> for AppError {
     fn from(error: sqlx::Error) -> Self {
+        #[cfg(test)]
+        if FIXTURE_PROTOCOL_DIAGNOSTIC
+            .try_with(|enabled| *enabled)
+            .unwrap_or(false)
+            && let sqlx::Error::Protocol(message) = &error
+        {
+            eprintln!("synthetic fixture SQLx protocol error: {message}");
+        }
         #[cfg(test)]
         if let sqlx::Error::Database(database) = &error
             && let Some(code) = database.code()
