@@ -259,7 +259,7 @@ impl AppState {
         };
         for role in roles {
             let report = db
-                .verify_capabilities(role)
+                .verify_startup_capabilities(role)
                 .await
                 .map_err(|error| InitializationError::Database(error.into()))?;
             let legacy = report

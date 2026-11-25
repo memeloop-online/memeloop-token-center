@@ -149,10 +149,89 @@ async fn postgres_capability_reader_permissions_do_not_authorize_gateway_writes(
             .is_err()
     );
     tx.rollback().await.unwrap();
+    for capability_role in [
+        CapabilityRole::Gateway,
+        CapabilityRole::Worker,
+        CapabilityRole::Control,
+        CapabilityRole::Maintenance,
+    ] {
+        sqlx::query(sqlx::AssertSqlSafe(format!(
+            "REVOKE ALL ON ALL TABLES IN SCHEMA {schema} FROM {role}"
+        )))
+        .execute(&db.pool)
+        .await
+        .unwrap();
+        // Ledger identity is always read, independent of lifecycle operations.
+        sqlx::query(sqlx::AssertSqlSafe(format!(
+            "GRANT SELECT ON schema_migrations TO {role}"
+        )))
+        .execute(&db.pool)
+        .await
+        .unwrap();
+        let requirements = super::permissions::requirements(capability_role);
+        for requirement in &requirements {
+            let operations = requirement.operations.join(",");
+            sqlx::query(sqlx::AssertSqlSafe(format!(
+                "GRANT {operations} ON {} TO {role}",
+                requirement.table
+            )))
+            .execute(&db.pool)
+            .await
+            .unwrap();
+        }
+        let mut tx = db.pool.begin().await.unwrap();
+        sqlx::query(sqlx::AssertSqlSafe(format!("SET LOCAL ROLE {role}")))
+            .execute(&mut *tx)
+            .await
+            .unwrap();
+        super::catalog::inspect(&mut tx, capability_role)
+            .await
+            .unwrap()
+            .unwrap();
+        tx.rollback().await.unwrap();
+        let required = &requirements[0];
+        let operation = required.operations[0];
+        sqlx::query(sqlx::AssertSqlSafe(format!(
+            "REVOKE {operation} ON {} FROM {role}",
+            required.table
+        )))
+        .execute(&db.pool)
+        .await
+        .unwrap();
+        let mut tx = db.pool.begin().await.unwrap();
+        sqlx::query(sqlx::AssertSqlSafe(format!("SET LOCAL ROLE {role}")))
+            .execute(&mut *tx)
+            .await
+            .unwrap();
+        assert!(
+            super::catalog::inspect(&mut tx, capability_role)
+                .await
+                .is_err()
+        );
+        tx.rollback().await.unwrap();
+    }
     sqlx::raw_sql(sqlx::AssertSqlSafe(format!(
         "DROP OWNED BY {role}; DROP ROLE {role}"
     )))
     .execute(&db.pool)
     .await
     .unwrap();
+}
+
+#[tokio::test]
+async fn postgres_capability_startup_rejects_absent_and_below_floor_ledger() {
+    let url = std::env::var("MTC_TEST_POSTGRES_URL").expect("PG contract requires PostgreSQL");
+    let isolated = PostgresTestDatabase::create(&url).await;
+    let db = Database::connect_with_max(isolated.url(), 2).await.unwrap();
+    assert!(
+        db.verify_startup_capabilities(CapabilityRole::Gateway)
+            .await
+            .is_err()
+    );
+    sqlx::raw_sql("CREATE TABLE schema_migrations(version BIGINT PRIMARY KEY,name TEXT,applied_at BIGINT); INSERT INTO schema_migrations VALUES(162,'old',0)").execute(&db.pool).await.unwrap();
+    assert!(
+        db.verify_startup_capabilities(CapabilityRole::Gateway)
+            .await
+            .is_err()
+    );
 }
