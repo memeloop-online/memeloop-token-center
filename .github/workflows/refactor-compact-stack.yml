@@ -1,0 +1,92 @@
+name: MTC compact TLS stack trace
+on:
+  push:
+    branches: [ci/mtc-refactor-proof-1041]
+    paths: [.github/workflows/refactor-compact-stack.yml]
+permissions:
+  contents: read
+jobs:
+  evidence:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+        with:
+          ref: 27113d1a43a8975fca5a6c7c0a5b3b0ab04dcf5b
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@4360b52568e2003a75bf9bc1d59f33a8e3fc893c
+        with:
+          toolchain: 1.95.0
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6
+      - uses: ./.github/actions/checkout-plugin-examples
+      - name: Build exact compact-carrier defaults with unchanged stack settings
+        run: |
+          set -euo pipefail
+          test "$(git rev-parse HEAD)" = 27113d1a43a8975fca5a6c7c0a5b3b0ab04dcf5b
+          test -z "${RUST_MIN_STACK+x}"
+          command -v gdb
+          cargo test --locked --lib --no-run --message-format=json-render-diagnostics > "$RUNNER_TEMP/compact-artifacts.json"
+          exe=$(jq -rs '[.[]|select(.reason=="compiler-artifact" and .profile.test and .executable!=null and (.target.kind|index("lib")))][-1].executable // empty' "$RUNNER_TEMP/compact-artifacts.json")
+          test -x "$exe"; printf 'TEST_EXE=%s\n' "$exe" >> "$GITHUB_ENV"
+      - name: Capture guard fault, program counters, frame stack deltas and source locations
+        run: |
+          set -euo pipefail
+          evidence="$RUNNER_TEMP/compact-evidence"
+          mkdir -p "$evidence"
+          git rev-parse HEAD > "$evidence/revision"
+          test_name=api::proxy::tests::codex_protocol_contract::native_tls_socks_h1_h2_stream_tool_cancel_and_compact_contract
+          "$TEST_EXE" --list | grep -Fx "$test_name: test" > "$evidence/case"
+          # Never dump frame arguments, locals, process environment, or core files.
+          ulimit -c 0
+          cat > "$RUNNER_TEMP/capture.gdb" <<'GDB'
+          set pagination off
+          set confirm off
+          set debuginfod enabled off
+          set auto-load off
+          set print thread-events off
+          set print frame-arguments none
+          handle SIGPIPE nostop noprint pass
+          handle SIGSEGV stop print pass
+          handle SIGABRT stop print pass
+          run
+          python
+          import gdb,os
+          if not gdb.selected_thread():
+              print("INFERIOR_EXITED_WITHOUT_SIGNAL")
+          else:
+              code=gdb.execute("info program",to_string=True)
+              print(code)
+              newest=gdb.newest_frame()
+              frame=newest
+              last=None
+              sp0=int(frame.read_register("sp"))
+              pid=gdb.selected_inferior().pid
+              print("THREAD_STACK_POINTERS")
+              with open("/proc/%d/maps"%pid) as maps:
+                  for row in maps:
+                      cols=row.split()
+                      lo,hi=map(lambda v:int(v,16),cols[0].split("-"))
+                      if lo-8192 <= sp0 <= hi+8192:
+                          print("near-sp MAP",cols[0],cols[1], "size_bytes",hi-lo)
+              print("FRAMES (inner to outer, stack bytes from previous frame)")
+              for ix in range(160):
+                  if not frame:break
+                  try:
+                      sp=int(frame.read_register("sp"));sal=frame.find_sal()
+                      loc=(os.path.basename(sal.symtab.filename)+":"+str(sal.line)) if sal.symtab else "?"
+                      print("FRAME",ix,"delta",sp-last if last is not None else 0,"symbol",frame.name() or "?", "loc",loc)
+                      last=sp;frame=frame.older()
+                  except gdb.error as e:print("UNWIND_ERROR",type(e).__name__);break
+              print("FAULTING_INSTRUCTION")
+              print(gdb.execute("x/i $pc",to_string=True))
+          end
+          GDB
+          timeout --kill-after=5s 200s gdb -nx -q -batch -x "$RUNNER_TEMP/capture.gdb" --args "$TEST_EXE" "$test_name" --exact --nocapture > "$evidence/trace.txt" 2>&1
+          grep -E 'received signal|INFERIOR_EXITED_WITHOUT_SIGNAL|^FRAME [0-9]+ |^FAULTING_INSTRUCTION|^near-sp MAP' "$evidence/trace.txt" | cut -c1-500
+          grep -Eq 'received signal SIG(SEGV|ABRT)|INFERIOR_EXITED_WITHOUT_SIGNAL' "$evidence/trace.txt"
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        if: always()
+        with:
+          name: compact-stack-no-process-data
+          path: ${{ runner.temp }}/compact-evidence/
+          if-no-files-found: warn
