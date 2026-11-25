@@ -89,6 +89,7 @@ async fn postgres_rich_event_parent_preparation_does_not_hold_global_cursor() {
             second_id,
             fixture.key.tenant_id,
             fixture.key.key_id,
+            true,
         )
         .await
         .unwrap();

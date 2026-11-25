@@ -262,6 +262,7 @@ struct MeteredRequestUsage<'a> {
 
 #[derive(Default)]
 struct TerminalMetadata {
+    started_marker: bool,
     cause: Option<crate::model::RequestTerminalCause>,
     cache_coverage: Option<crate::model::CacheUsageCoverage>,
 }
@@ -498,17 +499,23 @@ impl Database {
         upstream_model: Option<&str>,
         output_token_limit: Option<i64>,
     ) -> Result<UsageReservation, AppError> {
-        self.start_proxy_request_inner(input, None, false, upstream_model, output_token_limit)
-            .await
-            .map(|started| started.reservation)
-            .map_err(|error| match error {
-                error @ (AppError::Storage { .. } | AppError::Internal { .. }) => error
-                    .retarget_capacity(
-                        "request_record_persist_failed",
-                        crate::error::ErrorFacts::new().phase("request_record"),
-                    ),
-                other => other,
-            })
+        self.start_proxy_request_inner(
+            input,
+            None,
+            self.legacy163_mode()?,
+            upstream_model,
+            output_token_limit,
+        )
+        .await
+        .map(|started| started.reservation)
+        .map_err(|error| match error {
+            error @ (AppError::Storage { .. } | AppError::Internal { .. }) => error
+                .retarget_capacity(
+                    "request_record_persist_failed",
+                    crate::error::ErrorFacts::new().phase("request_record"),
+                ),
+            other => other,
+        })
     }
 
     pub(crate) async fn publish_proxy_started_event(
@@ -526,8 +533,13 @@ impl Database {
         let Some(row) = row else {
             return Ok(());
         };
-        publish_pending_started_in_transaction(&mut transaction, &identity.request_id.to_string())
+        if !self.legacy163_mode()? {
+            publish_pending_started_in_transaction(
+                &mut transaction,
+                &identity.request_id.to_string(),
+            )
             .await?;
+        }
         let published: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM request_events WHERE request_id = $1 AND tenant_id = $2 AND event_kind = 'started'")
             .bind(identity.request_id.to_string()).bind(identity.tenant_id.to_string())
             .fetch_one(&mut *transaction).await?;
@@ -2140,6 +2152,7 @@ impl Database {
                     billing_unit: &reservation.billing_unit,
                 }),
             TerminalMetadata {
+                started_marker: !self.legacy163_mode()?,
                 cause: input.terminal_cause,
                 cache_coverage: usage.cache_coverage.filter(|coverage| {
                     usage_basis == Some(crate::model::RequestUsageBasis::ProviderReported)
@@ -2556,7 +2569,7 @@ pub(super) async fn publish_pending_started_in_transaction(
     transaction: &mut Transaction<'_, Any>,
     request_id: &str,
 ) -> Result<(), AppError> {
-    let prepared = prepare_pending_started_in_transaction(transaction, request_id).await?;
+    let prepared = prepare_pending_started_in_transaction(transaction, request_id, true).await?;
     crate::db::history_immutable_outbox::PreparedEventCapture::publish(
         transaction,
         prepared,
@@ -2584,7 +2597,11 @@ pub(super) async fn try_request_event_cursor(
 pub(super) async fn prepare_pending_started_in_transaction(
     transaction: &mut Transaction<'_, Any>,
     request_id: &str,
+    started_marker: bool,
 ) -> Result<Option<crate::db::history_immutable_outbox::PreparedEventCapture>, AppError> {
+    if !started_marker {
+        return Ok(None);
+    }
     // The row lock serializes recovery with terminal publishers. Clearing the
     // obligation and publishing the event share a commit, including retries.
     let row = sqlx::query("UPDATE request_records SET started_event_pending = started_event_pending WHERE id = $1 AND started_event_pending = 1 RETURNING *")
@@ -2691,6 +2708,7 @@ pub(super) async fn record_early_terminal_in_transaction(
         Some(crate::model::RequestUsageBasis::NotObserved),
         None,
         TerminalMetadata {
+            started_marker: false,
             cause: Some(crate::model::RequestTerminalCause::GatewayPreAdmission),
             cache_coverage: None,
         },
@@ -2727,6 +2745,7 @@ async fn record_request_finished_with_basis_and_metering_in_transaction(
     metadata: TerminalMetadata,
 ) -> Result<bool, AppError> {
     let TerminalMetadata {
+        started_marker,
         cause: terminal_cause,
         cache_coverage,
     } = metadata;
@@ -2990,7 +3009,8 @@ async fn record_request_finished_with_basis_and_metering_in_transaction(
                 .await?;
         }
     }
-    let pending_started = prepare_pending_started_in_transaction(tx, &request_id).await?;
+    let pending_started =
+        prepare_pending_started_in_transaction(tx, &request_id, started_marker).await?;
     super::super::history_immutable_outbox::capture_native_in_transaction(tx, &request_id).await?;
     let draft_cursor = crate::db::RequestEventCursor {
         event_id: Uuid::nil().to_string(),

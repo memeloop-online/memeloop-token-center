@@ -127,7 +127,7 @@ pub(super) async fn prepare(c: &mut AnyConnection) -> Result<(), sqlx::Error> {
     tx.commit().await?;
     Ok(())
 }
-async fn verify(c: &mut AnyConnection) -> Result<(), sqlx::Error> {
+pub(super) async fn verify(c: &mut AnyConnection) -> Result<(), sqlx::Error> {
     if !column_ok(c).await?
         || !index_ok(c, "request_records", "request_records_started_pending").await?
     {

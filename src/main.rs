@@ -56,6 +56,9 @@ enum Command {
     Serve {
         #[arg(long, value_enum, default_value_t)]
         role: RuntimeRole,
+        /// Validate and serve exact163 without executing linear migrations.
+        #[arg(long, default_value_t = false)]
+        legacy163: bool,
     },
     /// Inspect or recover one exact terminal projection with the normal writer.
     TerminalProjection {
@@ -240,12 +243,27 @@ async fn run() -> Result<(), &'static str> {
             let state = AppState::initialize_for_maintenance(maintenance_config)
                 .await
                 .map_err(|_| "terminal_recovery_initialization_failed")?;
-            let report = state.db.recover_one_terminal_projection(
-                memeloop_token_center::db::TerminalRecoveryIdentity { request_id, tenant_id, key_id, account_id, reservation_id, created_at }, apply
-            ).await.map_err(|_| {
-                tracing::error!(code = "terminal_recovery_failed", "terminal recovery failed");
-                "terminal_recovery_failed"
-            })?;
+            let report = state
+                .db
+                .recover_one_terminal_projection(
+                    memeloop_token_center::db::TerminalRecoveryIdentity {
+                        request_id,
+                        tenant_id,
+                        key_id,
+                        account_id,
+                        reservation_id,
+                        created_at,
+                    },
+                    apply,
+                )
+                .await
+                .map_err(|_| {
+                    tracing::error!(
+                        code = "terminal_recovery_failed",
+                        "terminal recovery failed"
+                    );
+                    "terminal_recovery_failed"
+                })?;
             println!(
                 "{}",
                 serde_json::to_string(&report).map_err(|_| "terminal_recovery_report_failed")?
@@ -362,7 +380,7 @@ async fn run() -> Result<(), &'static str> {
                 .map_err(|_| "failed_request_cost_backfill_report_failed")?;
             println!("{output}");
         }
-        Command::Serve { role } => {
+        Command::Serve { role, legacy163 } => {
             let address: SocketAddr = config
                 .listen
                 .parse()
@@ -382,7 +400,10 @@ async fn run() -> Result<(), &'static str> {
                 loop {
                     let initialized = tokio::select! {
                         _ = receiver.changed() => return,
-                        result = AppState::initialize(config.clone()) => result,
+                        result = async {
+                            if legacy163 { AppState::initialize_legacy163_for_role(config.clone(), role).await }
+                            else { AppState::initialize_for_role(config.clone(), role).await }
+                        } => result,
                     };
                     match initialized {
                         Ok(state) => {

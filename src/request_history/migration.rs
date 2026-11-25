@@ -95,6 +95,24 @@ pub enum HistoryCommand {
     Status,
 }
 
+fn require_receipt_capability(
+    database_url: &str,
+    report: Option<&crate::db::capability::CapabilityReport>,
+) -> Result<(), sqlx::Error> {
+    // Keep the same backend classification as Database::connect. Only SQLite
+    // has the pre-capability proof path; an uninitialized PostgreSQL does not.
+    if database_url.starts_with("sqlite:") {
+        return Ok(());
+    }
+    report
+        .ok_or_else(|| {
+            sqlx::Error::Protocol(
+                "history proof requires a verified PostgreSQL schema at or above 163".into(),
+            )
+        })?
+        .require("history.baseline_receipt.v1")
+}
+
 pub async fn command(config: &Config, command: HistoryCommand) -> Result<Value, HistoryError> {
     let exact_scope = match &command {
         HistoryCommand::ExportExactEvent {
@@ -118,6 +136,18 @@ pub async fn command(config: &Config, command: HistoryCommand) -> Result<Value, 
     let database =
         Database::connect_for_migration(&config.database_url, config.database_max_connections)
             .await?;
+    // Proof and watermark commands require the verified receipt schema before
+    // they acquire a delivery fence or begin a baseline. Legacy queries and
+    // SQLite's existing verification path keep their original requirements.
+    if matches!(
+        &command,
+        HistoryCommand::BaselineSource { .. } | HistoryCommand::Verify | HistoryCommand::Switch
+    ) {
+        let report = database
+            .verify_capabilities(crate::db::capability::CapabilityRole::HistoryReader)
+            .await?;
+        require_receipt_capability(&config.database_url, report.as_ref())?;
+    }
     if matches!(command, HistoryCommand::Rollback) {
         database.history_switch(false).await?;
         return Ok(json!({"mode": "shadow"}));
@@ -583,6 +613,45 @@ fn failure_log_occurrences(
 #[cfg(test)]
 mod export_diagnostic_tests {
     use super::*;
+    #[tokio::test]
+    async fn postgres_history_proof_guard_rejects_missing_and_below_floor_catalog() {
+        let url = std::env::var("MTC_TEST_POSTGRES_URL")
+            .expect("history proof contract requires PostgreSQL");
+        let isolated = crate::db::test_support::PostgresTestDatabase::create(&url).await;
+        let database = Database::connect_for_migration(isolated.url(), 2)
+            .await
+            .unwrap();
+        use sqlx::Connection;
+        let mut connection = sqlx::AnyConnection::connect(isolated.url()).await.unwrap();
+        for below_floor in [false, true] {
+            if below_floor {
+                sqlx::raw_sql("CREATE TABLE schema_migrations(version BIGINT PRIMARY KEY,name TEXT NOT NULL); INSERT INTO schema_migrations VALUES(162,'below_floor');")
+                    .execute(&mut connection).await.unwrap();
+            }
+            let report = database
+                .verify_capabilities(crate::db::capability::CapabilityRole::HistoryReader)
+                .await
+                .unwrap();
+            assert!(report.is_none());
+            assert!(require_receipt_capability(isolated.url(), report.as_ref()).is_err());
+        }
+        connection.close().await.unwrap();
+        database.close().await;
+        isolated.cleanup().await;
+    }
+
+    #[test]
+    fn history_proof_guard_rejects_missing_postgres_capability() {
+        // Both a missing ledger and a below-floor ledger return no report.
+        for url in [
+            "postgres://localhost/missing",
+            "postgresql://localhost/below163",
+        ] {
+            assert!(require_receipt_capability(url, None).is_err());
+        }
+        assert!(require_receipt_capability("sqlite::memory:", None).is_ok());
+    }
+
     #[test]
     fn request_history_export_log_buckets_count_alternating_failures_independently() {
         let mut buckets = BTreeMap::new();
