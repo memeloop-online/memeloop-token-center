@@ -2254,6 +2254,17 @@ async fn semantic_coverage_committed_recovery_contract(database_url: String) {
             .await
             .unwrap();
         assert_eq!(serde_json::to_vec(&foreign).unwrap(), immutable);
+        let mut unconfigured_db = db.clone();
+        unconfigured_db.archive = None;
+        let unchanged = unconfigured_db
+            .resolve_history_raw_archive_roots(
+                fixture.key.tenant_id,
+                fixture.key.key_id,
+                frozen.clone(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(serde_json::to_vec(&unchanged).unwrap(), immutable);
         let unavailable_archive = crate::archive::ArchiveStore::memory_for_test();
         unavailable_archive
             .restore_durable_root(

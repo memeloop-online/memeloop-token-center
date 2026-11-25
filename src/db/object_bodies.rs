@@ -63,7 +63,14 @@ impl Database {
         let Some(leaf) = leaf else {
             return Ok(refs);
         };
-        let archive = self.body_archive()?;
+        let archive = match self.body_archive() {
+            Ok(archive) => archive,
+            Err(AppError::Storage {
+                code: "conversation_archive_not_configured",
+                ..
+            }) => return Ok(refs),
+            Err(error) => return Err(error),
+        };
         let authority = match archive
             .semantic_archive_authority(tenant, request, &leaf)
             .await
