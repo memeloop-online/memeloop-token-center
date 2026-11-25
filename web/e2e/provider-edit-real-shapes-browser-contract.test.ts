@@ -26,11 +26,23 @@ test('real Codex config shapes localize transport controls and preserve advanced
       await editProviderAccount(page);
       const workspace = page.locator('.provider-edit-workspace');
       const original = providerEditShape(shape)!.config;
+      const measureProxy = async (opening: string) => {
+        const control = workspace.getByLabel(/^固定出口\s*\*?$/);
+        await control.waitFor();
+        const position = await control.evaluate(element => {
+          const { top, bottom, left, right } = element.getBoundingClientRect();
+          return { top, bottom, left, right, width: innerWidth, height: innerHeight, scrollY };
+        });
+        console.log('proxy-initial-viewport', JSON.stringify({ shape, opening, ...position }));
+        return position;
+      };
+      await measureProxy('first');
       if (shape === 'retry-only') {
         await workspace.locator('.rjsf > button[type="submit"]').click();
         assert.equal(Object.hasOwn((await page.evaluate(() => window.formJourneyLastProviderWrite))!, 'config'), false,
           'opening and saving without config edits leaves stored config and defaults untouched');
         await editProviderAccount(page);
+        await measureProxy('reopen');
       }
       const advanced = workspace.getByRole('button', { name: '高级网络与用量设置', exact: true });
       assert.equal(await advanced.getAttribute('aria-expanded'), 'false');
