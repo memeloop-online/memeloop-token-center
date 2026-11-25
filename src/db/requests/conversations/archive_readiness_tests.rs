@@ -2254,6 +2254,33 @@ async fn semantic_coverage_committed_recovery_contract(database_url: String) {
             .await
             .unwrap();
         assert_eq!(serde_json::to_vec(&foreign).unwrap(), immutable);
+        let unavailable_archive = crate::archive::ArchiveStore::memory_for_test();
+        unavailable_archive
+            .restore_durable_root(
+                &format!(
+                    "tenants/{}/semantic/v2/requests/{}/1.json",
+                    fixture.key.tenant_id, fixture.request_id
+                ),
+                Bytes::from_static(b"unreadable optional publication metadata"),
+            )
+            .await
+            .unwrap();
+        let unavailable_db = db.clone().with_archive(unavailable_archive);
+        let unchanged = unavailable_db
+            .resolve_history_raw_archive_roots(
+                fixture.key.tenant_id,
+                fixture.key.key_id,
+                frozen.clone(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(serde_json::to_vec(&unchanged).unwrap(), immutable);
+        assert!(
+            unavailable_db
+                .resolve_raw_archive_roots(fixture.key.tenant_id, frozen.clone(),)
+                .await
+                .is_err()
+        );
         let mut pending = frozen.clone();
         pending.request_archive_state = crate::model::RequestArchiveState::Pending;
         pending.response_archive_state = crate::model::RequestArchiveState::Bound;
