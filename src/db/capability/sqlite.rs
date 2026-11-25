@@ -104,3 +104,48 @@ impl Database {
         Ok(true)
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use crate::db::Database;
+    #[tokio::test]
+    async fn sqlite_runtime_reopen_and_independent_pool_verify_same_track() {
+        let directory = tempfile::tempdir().unwrap();
+        let url = format!(
+            "sqlite://{}?mode=rwc",
+            directory.path().join("runtime.db").display()
+        );
+        let db = Database::connect(&url).await.unwrap();
+        assert!(
+            db.legacy163_mode().is_err(),
+            "empty DB cannot authorize runtime"
+        );
+        db.migrate().await.unwrap();
+        assert!(!db.legacy163_mode().unwrap());
+        db.close().await;
+        let reopened = Database::connect(&url).await.unwrap();
+        let independent = Database::connect(&url).await.unwrap();
+        assert!(!reopened.legacy163_mode().unwrap());
+        assert!(!independent.legacy163_mode().unwrap());
+        reopened
+            .publish_pending_proxy_started_events()
+            .await
+            .unwrap();
+        independent
+            .publish_pending_proxy_started_events()
+            .await
+            .unwrap();
+        reopened.close().await;
+        independent.close().await;
+        let corrupt = Database::connect(&url).await.unwrap();
+        sqlx::query("DROP INDEX request_records_started_pending")
+            .execute(&corrupt.pool)
+            .await
+            .unwrap();
+        corrupt.close().await;
+        assert!(
+            Database::connect(&url).await.is_err(),
+            "drifted migrated catalog must fail closed"
+        );
+    }
+}
