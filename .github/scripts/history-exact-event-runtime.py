@@ -114,7 +114,7 @@ try:
     receipt = sql(f"SELECT acknowledged_revision||':'||acknowledged_hash FROM request_history_identities WHERE source='event' AND request_id='{target}' AND tenant_id='{tenant}' AND key_id='{key}' AND created_at=42")
     acknowledged_revision, acknowledged_hash = receipt.split(':')
     assert int(acknowledged_revision) == revision and len(acknowledged_hash) == 64
-    row = json.loads(click(f"SELECT source,toString(request_id) AS request_id,toString(tenant_id) AS tenant_id,toString(key_id) AS key_id,created_at,revision,snapshot_hash FROM request_history_v1 FINAL WHERE request_id=toUUID('{target}') FORMAT JSONEachRow"))
+    row = json.loads(click(f"SELECT source,request_id,tenant_id,key_id,created_at,revision,snapshot_hash FROM request_history_v1 FINAL WHERE request_id=toUUID('{target}') FORMAT JSONEachRow"))
     assert (row['source'],row['request_id'],row['tenant_id'],row['key_id'],int(row['created_at']),int(row['revision']),row['snapshot_hash']) == ('event',target,tenant,key,created,revision,acknowledged_hash)
     assert sql(f"SELECT count(*) FROM request_history_export WHERE request_id='{target}'") == '0'
     assert sql(f"SELECT count(*) FROM request_history_immutable_outbox WHERE request_id='{target}'") == '0'
