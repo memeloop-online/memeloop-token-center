@@ -330,7 +330,7 @@ jobs:
             sleep 2
           done
           exit 1
-      - name: Verify carrier transport fixtures and real RustFS ownership
+      - name: Verify staging identity, routing and real RustFS
         env:
           MTC_RUSTFS_TEST_ENDPOINT: http://127.0.0.1:19000
           MTC_RUSTFS_TEST_BUCKET: conversation-contract-test
@@ -338,12 +338,12 @@ jobs:
           MTC_RUSTFS_TEST_SECRET_KEY: synthetic-test-only-secret-707
         run: |
           set -o pipefail
-          for selector in offloaded_parent_keeps_live_reader_allocation_provenance object_replay_offloads_other_sealed_ram_before_waiting_for_credit; do
-            cargo test --locked --lib "$selector" 2>&1 | tee /tmp/carrier-fixture.log
-            grep -F '1 passed; 0 failed' /tmp/carrier-fixture.log
-          done
-          cargo test --locked --lib gateway_body::carrier::resource_wakeup_tests -- --ignored 2>&1 | tee /tmp/carrier-real.log
-          grep -F '4 passed; 0 failed' /tmp/carrier-real.log
+          cargo test --locked --lib db::archive_staging::backend_tests 2>&1 | tee /tmp/staging-db.log
+          grep -F '2 passed; 0 failed' /tmp/staging-db.log
+          cargo test --locked --lib archive::routing_tests 2>&1 | tee /tmp/staging-routing.log
+          grep -F '6 passed; 0 failed' /tmp/staging-routing.log
+          cargo test --locked --lib training_cas_real_s3_configuration_and_reader -- --ignored 2>&1 | tee /tmp/staging-rustfs.log
+          grep -F '1 passed; 0 failed' /tmp/staging-rustfs.log
   next-release-contract:
     if: inputs.contract == 'next-release'
     runs-on: ubuntu-24.04
