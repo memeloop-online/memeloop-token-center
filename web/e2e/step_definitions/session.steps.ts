@@ -17,6 +17,7 @@ import {
 import { requestEventFixture } from '../support/request-event-fixture.js';
 import type { DogfoodWorld } from '../support/world.js';
 import { appPreferenceControls, openAppRoute } from './app-route.support.js';
+import { clientCredentialInput } from './dogfood.support.js';
 import { defaultRequestRefreshInterval } from '../../src/operator/traffic/requestRefresh.js';
 
 interface SessionObservation {
@@ -467,7 +468,7 @@ Then('实际轮换后的新凭据保留旧会话历史而旧凭据和其他身�
   // End the browser session before rotating its key through the service API.
   // The old-key rejection below remains a separate, explicit HTTP assertion.
   await page.getByRole('button', { name: '清空凭据', exact: true }).click();
-  await visible(page.locator('input[type="password"]'));
+  await visible(clientCredentialInput(page));
   const rotated = await requestJson<{ key: string }>(`/internal/v1/keys/${seed.clientKeyId}/rotate`, {
     method: 'POST',
     credential: seed.serviceCredential,
@@ -496,7 +497,7 @@ Then('实际轮换后的新凭据保留旧会话历史而旧凭据和其他身�
   assert.equal(forbiddenDetail.status, 404);
 
   seed.clientCredential = rotated.key;
-  await page.locator('input[type="password"]').fill(rotated.key);
+  await clientCredentialInput(page).fill(rotated.key);
   await page.getByRole('button', { name: '进入', exact: true }).click();
   await openAppRoute(page, 'portal', 'sessions');
   await visible(page.locator('.self-sessions .session-card').first());

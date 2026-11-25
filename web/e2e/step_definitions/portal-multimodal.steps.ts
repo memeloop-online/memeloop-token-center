@@ -8,7 +8,7 @@ import { emptyRequestFilters, requestsPath, statsPath, type RequestFilters } fro
 import { baseURL, eventually, generationMockCounts, model, requestJson, runtime, tenant } from '../support/runtime.js';
 import type { DogfoodWorld } from '../support/world.js';
 import { appPreferenceControls, openAppRoute } from './app-route.support.js';
-import { addTypedFilterCondition, assertAttribute, assertContains, assertCount, assertExactText, assertGenerationDownload, assertNoCount, assertNoHorizontalOverflow, assertValue, assertVisible, catalogModelSearch, connectOperator, generationTableFor, metric, multimodalObservations, openCatalogModelPicker, openTypedFilterDialog, operatorTrafficPanel, requestEventFixture, realtimeReconnectObservations, requireMultimodalObservation, sseRequestEvent, submitPortalGeneration, uuidPattern, waitForGenerationStatus } from './dogfood.support.js';
+import { addTypedFilterCondition, assertAttribute, assertContains, assertCount, assertExactText, assertGenerationDownload, assertNoCount, assertNoHorizontalOverflow, assertValue, assertVisible, catalogModelSearch, clientCredentialInput, connectOperator, generationTableFor, metric, multimodalObservations, openCatalogModelPicker, openTypedFilterDialog, operatorTrafficPanel, requestEventFixture, realtimeReconnectObservations, requireMultimodalObservation, serviceCredentialInput, sseRequestEvent, submitPortalGeneration, uuidPattern, waitForGenerationStatus } from './dogfood.support.js';
 
 const operatorGenerationCancellations = new WeakMap<DogfoodWorld, { status: number; body: { status: string } }>();
 
@@ -75,7 +75,7 @@ When('下游用户以中文亮色主题在手机视口打开自助门户', async
   const page = this.requirePage();
   const seed = runtime.requireSeed();
   await this.open('/portal', { theme: 'light', locale: 'zh-CN', viewport: { width: 375, height: 812 } });
-  await page.locator('input[type="password"]').fill(seed.clientCredential);
+  await clientCredentialInput(page).fill(seed.clientCredential);
   await page.getByRole('button', { name: '进入', exact: true }).click();
 });
 
@@ -213,7 +213,7 @@ Then('下游凭据不能读取管理资源或选择另一个凭据身份', async
 When('下游用户输入无效凭据并切换英文', async function (this: DogfoodWorld) {
   const page = this.requirePage();
   await page.getByRole('button', { name: '清空凭据', exact: true }).click();
-  await page.locator('input[type="password"]').fill('invalid-browser-test-credential');
+  await clientCredentialInput(page).fill('invalid-browser-test-credential');
   await rejectInvalidSelfCredential(page,
     () => page.getByRole('button', { name: '进入', exact: true }).click());
   await assertContains(page.getByRole('alert'), '凭据无效或已失效');
@@ -648,7 +648,7 @@ When('普通凭据用户通过中文亮色门户创建图片和两种视频任�
     );
   });
   await this.open('/portal', { theme: 'light', locale: 'zh-CN', viewport: { width: 390, height: 844 } });
-  await page.locator('input[type="password"]').fill(observation.clientCredential);
+  await clientCredentialInput(page).fill(observation.clientCredential);
   await page.getByRole('button', { name: '进入', exact: true }).click();
   await openAppRoute(page, 'portal', 'generate');
   await assertVisible(page.getByRole('heading', { name: '创建多模态任务', exact: true }));
@@ -806,7 +806,7 @@ Then('普通凭据在英文暗色主题下仍无法访问管理端', async funct
   await assertVisible(clearRememberedOperatorCredential);
   await clearRememberedOperatorCredential.click();
   await assertNoCount(operatorPage.locator('.tenant-picker'));
-  await operatorPage.locator('input[type="password"]').fill(observation.clientCredential);
+  await serviceCredentialInput(operatorPage.locator('.operator-credential')).fill(observation.clientCredential);
   await operatorPage.getByRole('button', { name: 'Connect', exact: true }).click();
   await eventually(async () => {
     const messages = (await operatorPage.getByRole('alert').allTextContents()).join(' ');
