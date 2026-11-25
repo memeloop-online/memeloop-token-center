@@ -14,7 +14,10 @@ use crate::archive_staging::{
 use crate::model::MeteredUsageReservation;
 use tracing::Instrument;
 
+#[cfg(test)]
 const ADMISSION_UPSTREAM_MODEL_UPDATE: &str = "UPDATE request_records SET upstream_model = $1 WHERE id = $2 AND reservation_id = $3 AND created_at = $4";
+
+const STARTED_EVENT_DRAFT_SQL: &str = r#"SELECT CAST($1 AS TEXT) AS event_id, CAST($2 AS TEXT) AS tenant_id, CAST($3 AS TEXT) AS key_id, CAST($4 AS TEXT) AS request_id, CAST($5 AS BIGINT) AS event_at, CAST('started' AS TEXT) AS event_kind, CAST($6 AS TEXT) AS protocol, CAST($7 AS TEXT) AS model, CAST(NULL AS BIGINT) AS status_code, CAST(NULL AS BIGINT) AS duration_ms, CAST(0 AS BIGINT) AS input_tokens, CAST(0 AS BIGINT) AS output_tokens, CAST(0 AS BIGINT) AS cost_micros, CAST(NULL AS TEXT) AS error_code WHERE EXISTS (SELECT 1 FROM request_records WHERE id = $4 AND tenant_id = $2 AND key_id = $3 AND created_at = $5 AND completed_at IS NULL)"#;
 
 #[cfg(test)]
 mod admission_lock_tests;
@@ -736,25 +739,16 @@ impl Database {
             upstream_account_id: input.upstream_account_id,
             model_route_id: input.model_route_id,
         };
-        if let Err(error) =
-            insert_request_started_record_in_transaction(&mut transaction, &started_request, now)
-                .await
+        if let Err(error) = insert_request_started_record_with_model_in_transaction(
+            &mut transaction,
+            &started_request,
+            now,
+            upstream_model,
+        )
+        .await
         {
             BudgetHold::rollback_optional(transaction, hold).await?;
             return Err(error);
-        }
-        if let Some(upstream_model) = upstream_model {
-            let updated = sqlx::query(ADMISSION_UPSTREAM_MODEL_UPDATE)
-                .bind(upstream_model)
-                .bind(input.request_id.to_string())
-                .bind(reservation_id.to_string())
-                .bind(now)
-                .execute(&mut *transaction)
-                .await?;
-            if updated.rows_affected() != 1 {
-                BudgetHold::rollback_optional(transaction, hold).await?;
-                return Err(AppError::internal("lifecycle_start_proxy_request_inner_1"));
-            }
         }
         if let Some(archive_body) = buffered_archive.as_ref() {
             BudgetHold::set_phase(&mut hold, "archive_capture");
@@ -2512,6 +2506,15 @@ pub(crate) async fn insert_request_started_record_in_transaction(
     request: &NewRequest,
     now: i64,
 ) -> Result<(), AppError> {
+    insert_request_started_record_with_model_in_transaction(transaction, request, now, None).await
+}
+
+async fn insert_request_started_record_with_model_in_transaction(
+    transaction: &mut Transaction<'_, Any>,
+    request: &NewRequest,
+    now: i64,
+    upstream_model: Option<&str>,
+) -> Result<(), AppError> {
     let request_id = request.request_id.to_string();
     let tenant_id = request.tenant_id.to_string();
     let key_id = request.key_id.to_string();
@@ -2526,7 +2529,7 @@ pub(crate) async fn insert_request_started_record_in_transaction(
         ));
     }
     sqlx::query(
-        "INSERT INTO request_records (id, tenant_id, key_id, created_at, protocol, model, request_object, reservation_id, upstream_account_id, model_route_id, currency, input_tokens, output_tokens, cost_micros) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, COALESCE((SELECT account.currency FROM usage_reservations reservation JOIN credit_accounts account ON account.id = reservation.account_id WHERE reservation.id = $8 AND reservation.key_id = $3), (SELECT currency FROM key_records WHERE id = $3), ''), 0, 0, 0)",
+        "INSERT INTO request_records (id, tenant_id, key_id, created_at, protocol, model, request_object, reservation_id, upstream_account_id, model_route_id, upstream_model, currency, input_tokens, output_tokens, cost_micros) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, COALESCE((SELECT account.currency FROM usage_reservations reservation JOIN credit_accounts account ON account.id = reservation.account_id WHERE reservation.id = $8 AND reservation.key_id = $3), (SELECT currency FROM key_records WHERE id = $3), ''), 0, 0, 0)",
     )
     .bind(&request_id)
     .bind(&tenant_id)
@@ -2538,6 +2541,7 @@ pub(crate) async fn insert_request_started_record_in_transaction(
     .bind(&reservation_id)
     .bind(&upstream_account_id)
     .bind(&model_route_id)
+    .bind(upstream_model)
     .execute(&mut **transaction)
     .await?;
     Ok(())
@@ -2555,18 +2559,16 @@ async fn insert_request_started_event_in_transaction(
         event_id: Uuid::nil().to_string(),
         event_at: now,
     };
-    let draft_row = sqlx::query(
-        r#"SELECT CAST($1 AS TEXT) AS event_id, CAST($2 AS TEXT) AS tenant_id, CAST($3 AS TEXT) AS key_id, CAST($4 AS TEXT) AS request_id, CAST($5 AS BIGINT) AS event_at, CAST('started' AS TEXT) AS event_kind, CAST($6 AS TEXT) AS protocol, CAST($7 AS TEXT) AS model, CAST(NULL AS BIGINT) AS status_code, CAST(NULL AS BIGINT) AS duration_ms, CAST(0 AS BIGINT) AS input_tokens, CAST(0 AS BIGINT) AS output_tokens, CAST(0 AS BIGINT) AS cost_micros, CAST(NULL AS TEXT) AS error_code WHERE EXISTS (SELECT 1 FROM request_records WHERE id = $4 AND tenant_id = $2 AND key_id = $3 AND completed_at IS NULL)"#,
-    )
-    .bind(&draft_cursor.event_id)
-    .bind(&tenant_id)
-    .bind(&key_id)
-    .bind(&request_id)
-    .bind(draft_cursor.event_at)
-    .bind(&request.protocol)
-    .bind(&request.model)
-    .fetch_optional(&mut **transaction)
-    .await?;
+    let draft_row = sqlx::query(STARTED_EVENT_DRAFT_SQL)
+        .bind(&draft_cursor.event_id)
+        .bind(&tenant_id)
+        .bind(&key_id)
+        .bind(&request_id)
+        .bind(draft_cursor.event_at)
+        .bind(&request.protocol)
+        .bind(&request.model)
+        .fetch_optional(&mut **transaction)
+        .await?;
     let prepared = match draft_row.as_ref() {
         Some(row) => Some(
             crate::db::history_immutable_outbox::EventDraft::from_row(row)?
