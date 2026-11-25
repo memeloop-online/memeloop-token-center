@@ -339,8 +339,8 @@ jobs:
         run: |
           set -o pipefail
           cargo test --locked --lib --no-run
-          timeout 90s cargo test --locked --lib response_archive_spool::producer::workspace_fairness_contracts::legacy_try_workspace_retries_stay_behind_existing_raw_waiters -- --exact --nocapture 2>&1 | tee /tmp/response-fairness.log
-          grep -F '1 passed; 0 failed' /tmp/response-fairness.log
+          timeout 120s cargo test --locked --lib response_archive_spool::producer::workspace_fairness_contracts -- --nocapture 2>&1 | tee /tmp/response-fairness.log
+          grep -F '3 passed; 0 failed' /tmp/response-fairness.log
 
   next-release-contract:
     if: inputs.contract == 'next-release'

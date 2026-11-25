@@ -1290,6 +1290,45 @@ async fn stage_captured_response(
     Ok((staged, Some(owner)))
 }
 
+/// Join the same FIFO as request uploads. Never hold one scarce resource
+/// while waiting for the other: an unavailable upload slot releases workspace
+/// before waiting for a wakeup, then rejoins the workspace queue.
+async fn response_upload_workspace(state: &AppState) -> Result<Arc<CaptureQueueMemory>, AppError> {
+    loop {
+        let workspace = state
+            .persistence
+            .multipart_workspace(crate::api::proxy::persistence::WorkspaceRole::ResponseStage)
+            .await?;
+        match state
+            .proxy_archive_stream_permits
+            .clone()
+            .try_acquire_owned()
+        {
+            Ok(permit) => {
+                return Ok(Arc::new(CaptureQueueMemory {
+                    _local_metrics: None,
+                    _archive_permit: Some(permit),
+                    reservation: None,
+                    workspace: Some(workspace),
+                }));
+            }
+            Err(tokio::sync::TryAcquireError::Closed) => {
+                return Err(AppError::internal("capture_upload_admission_closed"));
+            }
+            Err(tokio::sync::TryAcquireError::NoPermits) => {
+                drop(workspace);
+                let wakeup = state
+                    .proxy_archive_stream_permits
+                    .clone()
+                    .acquire_owned()
+                    .await
+                    .map_err(|_| AppError::internal("capture_upload_admission_closed"))?;
+                drop(wakeup);
+            }
+        }
+    }
+}
+
 async fn run_response_archive_writer(
     mut state: AppState,
     identity: ArchiveSpoolIdentity,
@@ -1317,30 +1356,7 @@ async fn run_response_archive_writer(
     let (staged, staging_owner) = loop {
         let staged_attempt = async {
             let _upload_memory = if memory._archive_permit.is_none() {
-                let permits = state.proxy_archive_stream_permits.clone();
-                let permit = permits
-                    .acquire_owned()
-                    .await
-                    .map_err(|_| AppError::internal("capture_upload_admission_closed"))?;
-                let reservation = match state.persistence.try_multipart_workspace(
-                    crate::api::proxy::persistence::WorkspaceRole::ResponseStage,
-                ) {
-                    Ok(reservation) => reservation,
-                    Err(_) => {
-                        // Complete source bytes already have an owner. Release
-                        // this attempt's slot, then offload that source to make
-                        // workspace available; never wait behind its own credit.
-                        drop(permit);
-                        source.seal_to_objects().await?;
-                        return Err(AppError::storage("capture_upload_workspace_unavailable"));
-                    }
-                };
-                Some(Arc::new(CaptureQueueMemory {
-                    _local_metrics: None,
-                    _archive_permit: Some(permit),
-                    reservation: None,
-                    workspace: Some(reservation),
-                }))
+                Some(response_upload_workspace(&state).await?)
             } else {
                 None
             };
