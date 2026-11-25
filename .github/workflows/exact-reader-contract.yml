@@ -501,15 +501,17 @@ jobs:
       - name: Verify exact release contracts
         run: |
           set -o pipefail
+          failed=0
           git rev-parse HEAD
-          cargo test --locked --all-features --lib db::requests::conversations::archive_readiness_tests::postgres_coverage_read_does_not_block_body_worker -- --exact --nocapture 2>&1 | tee /tmp/projection-scheduler.log
-          grep -F '1 passed; 0 failed' /tmp/projection-scheduler.log
-          cargo test --locked --all-features --lib db::requests::conversations::prefix_storage::tests::postgres_prefix_preload_releases_projection_scope_before_graph_receive -- --ignored --exact --nocapture 2>&1 | tee /tmp/projection-roots-retry.log
-          grep -F '1 passed; 0 failed' /tmp/projection-roots-retry.log
-          cargo test --locked --all-features --lib db::requests::conversations::archive_readiness_tests::postgres_exact_legacy_body_rebuild_preserves_incomplete_and_financial_receipt -- --exact --nocapture 2>&1 | tee /tmp/exact-prepared-resume.log
-          grep -F '1 passed; 0 failed' /tmp/exact-prepared-resume.log
-          cargo test --locked --all-features --lib db::requests::conversations::archive_readiness_tests::rebuild_partition_tests::postgres_rebuild_partition_locks_and_ineligible_prefix -- --exact --nocapture 2>&1 | tee /tmp/rebuild-partition-locks.log
-          grep -F '1 passed; 0 failed' /tmp/rebuild-partition-locks.log
+          cargo test --locked --all-features --lib db::requests::conversations::archive_readiness_tests::postgres_coverage_read_does_not_block_body_worker -- --exact --nocapture 2>&1 | tee /tmp/projection-scheduler.log || failed=1
+          grep -F '1 passed; 0 failed' /tmp/projection-scheduler.log || failed=1
+          cargo test --locked --all-features --lib db::requests::conversations::prefix_storage::tests::postgres_prefix_preload_releases_projection_scope_before_graph_receive -- --ignored --exact --nocapture 2>&1 | tee /tmp/projection-roots-retry.log || failed=1
+          grep -F '1 passed; 0 failed' /tmp/projection-roots-retry.log || failed=1
+          cargo test --locked --all-features --lib db::requests::conversations::archive_readiness_tests::postgres_exact_legacy_body_rebuild_preserves_incomplete_and_financial_receipt -- --exact --nocapture 2>&1 | tee /tmp/exact-prepared-resume.log || failed=1
+          grep -F '1 passed; 0 failed' /tmp/exact-prepared-resume.log || failed=1
+          cargo test --locked --all-features --lib db::requests::conversations::archive_readiness_tests::rebuild_partition_tests::postgres_rebuild_partition_locks_and_ineligible_prefix -- --exact --nocapture 2>&1 | tee /tmp/rebuild-partition-locks.log || failed=1
+          grep -F '1 passed; 0 failed' /tmp/rebuild-partition-locks.log || failed=1
+          exit "$failed"
 
   legacy-archive-bound-contract:
     if: inputs.contract == 'legacy-archive-bound'
