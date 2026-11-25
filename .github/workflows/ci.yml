@@ -639,11 +639,14 @@ jobs:
           cargo run --locked --bin memeloop-token-center -- migrate
           test "$(sqlite3 "$database" 'SELECT max(version) FROM schema_migrations')" = "$current_version"
           test "$(sqlite3 "$database" 'SELECT count(*) FROM schema_migrations WHERE version = 160')" = 1
+          test "$(sqlite3 "$database" "SELECT count(*) FROM request_history_activation WHERE id=1 AND epoch=0 AND phase='legacy' AND transactions_json IS NULL AND baseline_owner IS NULL AND baseline_epoch IS NULL")" = 1
+          sqlite3 "$database" "UPDATE request_history_activation SET epoch=7, phase='observing', transactions_json='{}', baseline_owner='migration-smoke', baseline_epoch=7 WHERE id=1"
           first_count="$(sqlite3 "$database" 'SELECT count(*) FROM schema_migrations')"
           cargo run --locked --bin memeloop-token-center -- migrate
           second_count="$(sqlite3 "$database" 'SELECT count(*) FROM schema_migrations')"
           test "$first_count" -gt 0
           test "$second_count" = "$first_count"
+          test "$(sqlite3 "$database" "SELECT count(*) FROM request_history_activation WHERE id=1 AND epoch=7 AND phase='observing' AND transactions_json='{}' AND baseline_owner='migration-smoke' AND baseline_epoch=7")" = 1
       - name: PostgreSQL migration and replay smoke test
         env:
           MTC_DATABASE_URL: postgres://token_center:token_center@127.0.0.1:5432/memeloop_token_center_test
@@ -660,6 +663,8 @@ jobs:
           cargo run --locked --bin memeloop-token-center -- migrate
           test "$(psql -X --no-psqlrc -qAt "$MTC_DATABASE_URL" -c 'SELECT max(version) FROM schema_migrations')" = "$current_version"
           test "$(psql -X --no-psqlrc -qAt "$MTC_DATABASE_URL" -c 'SELECT count(*) FROM schema_migrations WHERE version = 160')" = 1
+          test "$(psql -X --no-psqlrc -qAt "$MTC_DATABASE_URL" -c "SELECT count(*) FROM request_history_activation WHERE id=1 AND epoch=0 AND phase='legacy' AND transactions_json IS NULL AND baseline_owner IS NULL AND baseline_epoch IS NULL")" = 1
+          psql -X --no-psqlrc -v ON_ERROR_STOP=1 "$MTC_DATABASE_URL" -c "UPDATE request_history_activation SET epoch=7, phase='observing', transactions_json='{}', baseline_owner='migration-smoke', baseline_epoch=7 WHERE id=1"
           first_count="$(psql -X --no-psqlrc -qAt "$MTC_DATABASE_URL" \
             -c 'SELECT count(*) FROM schema_migrations')"
           cargo run --locked --bin memeloop-token-center -- migrate
@@ -667,6 +672,7 @@ jobs:
             -c 'SELECT count(*) FROM schema_migrations')"
           test "$first_count" -gt 0
           test "$second_count" = "$first_count"
+          test "$(psql -X --no-psqlrc -qAt "$MTC_DATABASE_URL" -c "SELECT count(*) FROM request_history_activation WHERE id=1 AND epoch=7 AND phase='observing' AND transactions_json='{}' AND baseline_owner='migration-smoke' AND baseline_epoch=7")" = 1
       - name: Seed 100k-row observability scale fixture
         env:
           PGHOST: 127.0.0.1
