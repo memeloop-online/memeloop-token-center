@@ -38,6 +38,7 @@ on:
           - history-maintenance-runtime-1073
           - history-expected-checkpoint-1086
           - history-maintenance-1086
+          - history-maintenance-runtime-1086
 permissions:
   contents: read
 jobs:
@@ -1167,5 +1168,54 @@ jobs:
         with:
           name: history-maintenance-1086-${{ github.run_id }}
           path: evidence
+          if-no-files-found: error
+          retention-days: 14
+
+  history-maintenance-runtime-1086:
+    if: inputs.contract == 'history-maintenance-runtime-1086'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    permissions:
+      contents: read
+      packages: read
+      actions: read
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+        with:
+          persist-credentials: false
+      - name: Require fixed audited product source
+        env:
+          SOURCE: ${{ inputs.source_revision }}
+        run: test "$SOURCE" = 3e9b5fb00f343899b24f13a7e2826ce73a64250d
+      - uses: docker/login-action@c94ce9fb468520275223c153574b00df6fe4bcc9
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+      - name: Read the fixed successful maintenance build evidence
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          test "$(gh run view 45679706853 --json conclusion --jq .conclusion)" = success
+          gh run download 45679706853 -n history-maintenance-1086-45679706853 -D "$RUNNER_TEMP/history1086-build"
+      - name: Build independent pinned signature verifier
+        run: |
+          set -euo pipefail
+          docker build --target cosign-builder -t history1073-trusted-cosign:${{ github.run_id }} .
+          tool_container=$(docker create history1073-trusted-cosign:${{ github.run_id }})
+          trap 'docker rm -f "$tool_container"' EXIT
+          docker cp "$tool_container:/tmp/cosign" "$RUNNER_TEMP/history1073-cosign"
+          chmod 0555 "$RUNNER_TEMP/history1073-cosign"
+      - name: Exercise immutable CLI in run-owned PostgreSQL and ClickHouse
+        env:
+          TRUSTED_COSIGN: ${{ runner.temp }}/history1073-cosign
+          HISTORY_RUNTIME_PROFILE: checkpoint1086
+          HISTORY_BUILD_EVIDENCE: ${{ runner.temp }}/history1086-build
+        run: python3 .github/scripts/history-exact-event-runtime.py
+      - uses: actions/upload-artifact@65462800fd760344b1a7b4382951275a0abb4808
+        if: always()
+        with:
+          name: history-maintenance-runtime-1086-${{ github.run_id }}
+          path: runtime-evidence
           if-no-files-found: error
           retention-days: 14
