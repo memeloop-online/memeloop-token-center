@@ -66,10 +66,6 @@ export async function assertOperatorTenantScope(
   return pickerExpectation === 'visible' ? tenantPicker : undefined;
 }
 
-/** A restored credential owns the form until its tenant discovery commits.
- * An explicit connection must begin after that transition, otherwise the
- * successful restoration can correctly clear the matching draft we just filled.
- */
 export function serviceCredentialInput(scope: Page | Locator): Locator {
   return scope.getByRole('textbox', { name: /^(服务凭据|Service credential)$/, exact: true });
 }
@@ -78,6 +74,10 @@ export function clientCredentialInput(scope: Page | Locator): Locator {
   return scope.getByLabel(/^(客户端凭据|Client credential)$/, { exact: true });
 }
 
+/** A restored credential owns the form until its tenant discovery commits.
+ * An explicit connection must begin after that transition, otherwise the
+ * successful restoration can correctly clear the matching draft we just filled.
+ */
 export function operatorCredentialEntryForm(page: Page): Locator {
   return page.locator('form.operator-credential[aria-busy="false"]');
 }
