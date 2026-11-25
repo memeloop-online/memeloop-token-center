@@ -726,7 +726,7 @@ fn normalize_audio_response(
         }
     }
     let duration = match object.get("duration") {
-        Some(value) => finite_non_negative(Some(value), "duration")?,
+        Some(value) => finite_non_negative(Some(value))?,
         None => measured_duration_seconds,
     };
     verbose.insert("duration".to_owned(), json!(duration));
@@ -742,8 +742,8 @@ fn normalize_audio_response(
             ));
         }
         for segment in upstream_segments {
-            let start = finite_non_negative(segment.get("start"), "start")?;
-            let end = finite_non_negative(segment.get("end"), "end")?;
+            let start = finite_non_negative(segment.get("start"))?;
+            let end = finite_non_negative(segment.get("end"))?;
             let text = segment
                 .get("text")
                 .and_then(Value::as_str)
@@ -818,8 +818,8 @@ fn normalize_audio_response(
                 .get("word")
                 .and_then(Value::as_str)
                 .ok_or_else(|| AppError::upstream("audio_upstream_word_text_is_missing"))?;
-            let start = finite_non_negative(word.get("start"), "word start")?;
-            let end = finite_non_negative(word.get("end"), "word end")?;
+            let start = finite_non_negative(word.get("start"))?;
+            let end = finite_non_negative(word.get("end"))?;
             if end < start {
                 return Err(AppError::upstream_with(
                     "upstream_unavailable",
@@ -833,7 +833,7 @@ fn normalize_audio_response(
     Ok(Value::Object(verbose))
 }
 
-fn finite_non_negative(value: Option<&Value>, _field: &str) -> Result<f64, AppError> {
+fn finite_non_negative(value: Option<&Value>) -> Result<f64, AppError> {
     value
         .and_then(Value::as_f64)
         .filter(|value| value.is_finite() && *value >= 0.0)
