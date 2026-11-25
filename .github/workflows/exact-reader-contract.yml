@@ -35,6 +35,7 @@ on:
           - history-capture-981
           - release-927-928
           - history-maintenance-1073
+          - history-maintenance-runtime-1073
 permissions:
   contents: read
 jobs:
@@ -987,5 +988,35 @@ jobs:
         with:
           name: history-maintenance-1073-${{ github.run_id }}
           path: evidence
+          if-no-files-found: error
+          retention-days: 14
+
+  history-maintenance-runtime-1073:
+    if: inputs.contract == 'history-maintenance-runtime-1073'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    permissions:
+      contents: read
+      packages: read
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+        with:
+          persist-credentials: false
+      - name: Require fixed audited product source
+        env:
+          SOURCE: ${{ inputs.source_revision }}
+        run: test "$SOURCE" = ff088e3e56ac702efae5765e68f1e452279646db
+      - uses: docker/login-action@c94ce9fb468520275223c153574b00df6fe4bcc9
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+      - name: Exercise immutable CLI in run-owned PostgreSQL and ClickHouse
+        run: python3 .github/scripts/history-exact-event-runtime.py
+      - uses: actions/upload-artifact@65462800fd760344b1a7b4382951275a0abb4808
+        if: always()
+        with:
+          name: history-maintenance-runtime-1073-${{ github.run_id }}
+          path: runtime-evidence
           if-no-files-found: error
           retention-days: 14
