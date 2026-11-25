@@ -43,6 +43,10 @@ test('real Codex config shapes localize transport controls and preserve advanced
           'opening and saving without config edits leaves stored config and defaults untouched');
         await editProviderAccount(page);
         await measureProxy('reopen');
+        const receipt = workspace.getByRole('status');
+        console.log('proxy-success-receipt', JSON.stringify(await receipt.evaluateAll(elements => elements.map(element => ({ text: element.textContent, height: element.getBoundingClientRect().height })))));
+        await receipt.evaluateAll(elements => elements.forEach(element => element.remove()));
+        await measureProxy('reopen-without-receipt');
       }
       const advanced = workspace.getByRole('button', { name: '高级网络与用量设置', exact: true });
       assert.equal(await advanced.getAttribute('aria-expanded'), 'false');
