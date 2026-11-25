@@ -82,6 +82,24 @@ pub enum HistoryCommand {
     Status,
 }
 
+fn require_receipt_capability(
+    database_url: &str,
+    report: Option<&crate::db::capability::CapabilityReport>,
+) -> Result<(), sqlx::Error> {
+    // Keep the same backend classification as Database::connect. Only SQLite
+    // has the pre-capability proof path; an uninitialized PostgreSQL does not.
+    if database_url.starts_with("sqlite:") {
+        return Ok(());
+    }
+    report
+        .ok_or_else(|| {
+            sqlx::Error::Protocol(
+                "history proof requires a verified PostgreSQL schema at or above 163".into(),
+            )
+        })?
+        .require("history.baseline_receipt.v1")
+}
+
 pub async fn command(config: &Config, command: HistoryCommand) -> Result<Value, HistoryError> {
     let database =
         Database::connect_for_migration(&config.database_url, config.database_max_connections)
@@ -93,12 +111,10 @@ pub async fn command(config: &Config, command: HistoryCommand) -> Result<Value, 
         &command,
         HistoryCommand::BaselineSource { .. } | HistoryCommand::Verify | HistoryCommand::Switch
     ) {
-        if let Some(report) = database
+        let report = database
             .verify_capabilities(crate::db::capability::CapabilityRole::HistoryReader)
-            .await?
-        {
-            report.require("history.baseline_receipt.v1")?;
-        }
+            .await?;
+        require_receipt_capability(&config.database_url, report.as_ref())?;
     }
     if matches!(command, HistoryCommand::Rollback) {
         database.history_switch(false).await?;
@@ -537,6 +553,18 @@ fn failure_log_occurrences(
 #[cfg(test)]
 mod export_diagnostic_tests {
     use super::*;
+    #[test]
+    fn history_proof_guard_rejects_missing_postgres_capability() {
+        // Both a missing ledger and a below-floor ledger return no report.
+        for url in [
+            "postgres://localhost/missing",
+            "postgresql://localhost/below163",
+        ] {
+            assert!(require_receipt_capability(url, None).is_err());
+        }
+        assert!(require_receipt_capability("sqlite::memory:", None).is_ok());
+    }
+
     #[test]
     fn request_history_export_log_buckets_count_alternating_failures_independently() {
         let mut buckets = BTreeMap::new();
