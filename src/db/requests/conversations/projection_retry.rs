@@ -108,6 +108,11 @@ mod tests {
     use super::*;
 
     #[test]
+    fn same_tenant_candidate_churn_is_a_typed_rollback_retry() {
+        assert!(ConversationContentError::CandidatesChanged.retry_after_confirmed_rollback());
+    }
+
+    #[test]
     fn transport_and_application_errors_do_not_authorize_statement_retry() {
         for error in [
             ConversationContentError::Database(sqlx::Error::Io(std::io::Error::from(
@@ -120,6 +125,7 @@ mod tests {
             ConversationContentError::Application(AppError::Conflict("invalid snapshot".into())),
         ] {
             assert_eq!(error.retryable_sqlstate(), None);
+            assert!(!error.retry_after_confirmed_rollback());
         }
     }
 }
