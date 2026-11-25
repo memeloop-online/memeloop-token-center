@@ -4,6 +4,7 @@
 //! buffered compression. No transaction encompasses object I/O.
 use crate::response_archive_spool::BufferedArchivePurpose;
 mod hold_diagnostics;
+mod partition_claim;
 mod reservations;
 pub(crate) use hold_diagnostics::BudgetHold;
 pub(crate) use reservations::ArchiveBudgetReservation;
@@ -838,25 +839,13 @@ impl Database {
     ) -> Result<Option<ArchiveSpoolTask>, AppError> {
         let mut tx = self.archive_state_transaction().await?;
         let hint_now = archive_clock(&mut tx, self.backend).await?;
-        let claim = match self.backend {
+        let row = match self.backend {
             DatabaseBackend::PostgreSql => {
-                "WITH pending AS MATERIALIZED (
-                    SELECT s.* FROM response_archive_spools s
-                    WHERE s.cleaned_at IS NULL AND s.state = 'pending'
-                      AND s.next_attempt_at <= $1 AND s.expires_at > $1
-                      AND EXISTS (SELECT 1 FROM request_records r WHERE r.id = s.request_id AND r.tenant_id = s.tenant_id AND r.reservation_id = s.reservation_id AND (r.response_object = 'gap://' || s.request_id || '/response' OR r.response_object IS NULL OR r.response_object = ''))
-                    ORDER BY s.next_attempt_at, s.request_id LIMIT 1 FOR UPDATE OF s SKIP LOCKED
-                 ), expired_lease AS MATERIALIZED (
-                    SELECT s.* FROM response_archive_spools s
-                    WHERE s.cleaned_at IS NULL AND s.state = 'uploading'
-                      AND s.lease_expires_at <= $1 AND s.expires_at > $1
-                      AND EXISTS (SELECT 1 FROM request_records r WHERE r.id = s.request_id AND r.tenant_id = s.tenant_id AND r.reservation_id = s.reservation_id AND (r.response_object = 'gap://' || s.request_id || '/response' OR r.response_object IS NULL OR r.response_object = ''))
-                    ORDER BY s.lease_expires_at, s.request_id LIMIT 1 FOR UPDATE OF s SKIP LOCKED
-                 ) SELECT * FROM (SELECT * FROM pending UNION ALL SELECT * FROM expired_lease) candidates
-                 ORDER BY CASE WHEN state = 'pending' THEN next_attempt_at ELSE lease_expires_at END, request_id LIMIT 1"
+                self.partitioned_archive_spool_candidate(&mut tx, purpose, hint_now)
+                    .await?
             }
             DatabaseBackend::Sqlite => {
-                "WITH pending AS (
+                let claim = "WITH pending AS (
                     SELECT s.* FROM response_archive_spools s
                     WHERE s.cleaned_at IS NULL AND s.state = 'pending'
                       AND s.next_attempt_at <= $1 AND s.expires_at > $1
@@ -869,13 +858,13 @@ impl Database {
                       AND EXISTS (SELECT 1 FROM request_records r WHERE r.id = s.request_id AND r.tenant_id = s.tenant_id AND r.reservation_id = s.reservation_id AND (r.response_object = 'gap://' || s.request_id || '/response' OR r.response_object IS NULL OR r.response_object = ''))
                     ORDER BY s.lease_expires_at, s.request_id LIMIT 1
                  ) SELECT * FROM (SELECT * FROM pending UNION ALL SELECT * FROM expired_lease) candidates
-                 ORDER BY CASE WHEN state = 'pending' THEN next_attempt_at ELSE lease_expires_at END, request_id LIMIT 1"
+                 ORDER BY CASE WHEN state = 'pending' THEN next_attempt_at ELSE lease_expires_at END, request_id LIMIT 1";
+                sqlx::query(sqlx::AssertSqlSafe(spool_sql(purpose, claim)))
+                    .bind(hint_now)
+                    .fetch_optional(&mut *tx)
+                    .await?
             }
         };
-        let row = sqlx::query(sqlx::AssertSqlSafe(spool_sql(purpose, claim)))
-            .bind(hint_now)
-            .fetch_optional(&mut *tx)
-            .await?;
         let Some(row) = row else {
             tx.commit().await?;
             return Ok(None);
@@ -907,9 +896,13 @@ impl Database {
             return Ok(None);
         }
         let identity = identity_from_row(&row)?;
-        let successful: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM request_records WHERE id = $1 AND tenant_id = $2 AND reservation_id = $3 AND completed_at IS NOT NULL AND status_code BETWEEN 200 AND 399 AND COALESCE(error_code, '') = ''")
+        let successful: i64 = if matches!(self.backend, DatabaseBackend::PostgreSql) {
+            row.try_get("successful_terminal")?
+        } else {
+            sqlx::query_scalar("SELECT COUNT(*) FROM request_records WHERE id = $1 AND tenant_id = $2 AND reservation_id = $3 AND completed_at IS NOT NULL AND status_code BETWEEN 200 AND 399 AND COALESCE(error_code, '') = ''")
             .bind(identity.request_id.to_string()).bind(identity.tenant_id.to_string())
-            .bind(identity.reservation_id.to_string()).fetch_one(&mut *tx).await?;
+            .bind(identity.reservation_id.to_string()).fetch_one(&mut *tx).await?
+        };
         let lease_token = Uuid::new_v4();
         sqlx::query(sqlx::AssertSqlSafe(spool_sql(purpose, "UPDATE response_archive_spools SET state = 'uploading', lease_owner = $1, lease_token = $2, lease_expires_at = $3, attempts = attempts + 1, updated_at = $4 WHERE request_id = $5")))
             .bind(lease_owner.to_string()).bind(lease_token.to_string()).bind(now + LEASE_TTL).bind(now).bind(identity.request_id.to_string()).execute(&mut *tx).await?;
