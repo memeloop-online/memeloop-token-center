@@ -1474,6 +1474,7 @@ impl Database {
             request_id,
             tenant_id,
             key_id,
+            !self.legacy163_mode()?,
         )
         .await?;
         Ok(true)
@@ -2475,6 +2476,7 @@ pub(super) async fn emit_conversation_projected_event_in_transaction(
     request_id: Uuid,
     tenant_id: Uuid,
     key_id: Uuid,
+    started_marker: bool,
 ) -> Result<(), AppError> {
     // Take the cursor timestamp only after semantic materialization and the
     // outbox acknowledgement have succeeded. Reusing the projector's lease
@@ -2483,8 +2485,12 @@ pub(super) async fn emit_conversation_projected_event_in_transaction(
     let request_id = request_id.to_string();
     let tenant_id = tenant_id.to_string();
     let key_id = key_id.to_string();
-    let pending_started =
-        super::lifecycle::prepare_pending_started_in_transaction(transaction, &request_id).await?;
+    let pending_started = super::lifecycle::prepare_pending_started_in_transaction(
+        transaction,
+        &request_id,
+        started_marker,
+    )
+    .await?;
     super::super::history_immutable_outbox::capture_request_in_transaction(
         transaction,
         &request_id,

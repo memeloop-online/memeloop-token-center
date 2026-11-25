@@ -70,6 +70,9 @@ pub(super) async fn statistics_pruned_in_transaction(
 
 impl Database {
     pub(crate) async fn publish_pending_proxy_started_events(&self) -> Result<(), AppError> {
+        if self.legacy163_mode()? {
+            return Ok(());
+        }
         let rows = sqlx::query("SELECT id FROM request_records WHERE started_event_pending = 1 ORDER BY created_at, id LIMIT 32")
             .fetch_all(&self.pool).await?;
         for row in rows {
@@ -84,9 +87,12 @@ impl Database {
                     continue;
                 }
             }
-            let prepared =
-                super::lifecycle::prepare_pending_started_in_transaction(&mut transaction, &id)
-                    .await?;
+            let prepared = super::lifecycle::prepare_pending_started_in_transaction(
+                &mut transaction,
+                &id,
+                true,
+            )
+            .await?;
             if !super::lifecycle::try_request_event_cursor(&mut transaction).await? {
                 transaction.rollback().await?;
                 continue;
@@ -305,7 +311,7 @@ impl Database {
             &request_id,
         )
         .await?;
-        let pending_started = super::lifecycle::prepare_pending_started_in_transaction(&mut transaction, &request_id).await?;
+        let pending_started = super::lifecycle::prepare_pending_started_in_transaction(&mut transaction, &request_id, !self.legacy163_mode()?).await?;
         timings.enter(ProjectionStage::EventPrepare);
         let draft_cursor = crate::db::RequestEventCursor {
             event_id: Uuid::nil().to_string(),

@@ -1,3 +1,4 @@
+pub mod capability;
 use std::time::Duration;
 
 mod allocation_history;
@@ -315,6 +316,7 @@ pub struct Database {
     connection_profile: ConnectionProfile,
     backend: DatabaseBackend,
     terminal_projection_enabled: bool,
+    schema_track: std::sync::Arc<std::sync::OnceLock<capability::SchemaTrack>>,
     gateway_persistence: std::sync::Arc<gateway_persistence::GatewayPersistence>,
     #[cfg(test)]
     pub(crate) oauth_refresh_write_phase_seam:
@@ -748,6 +750,7 @@ impl Database {
             },
             backend,
             terminal_projection_enabled: false,
+            schema_track: std::sync::Arc::new(std::sync::OnceLock::new()),
             auxiliary_pool_max_connections: 2,
             connection_profile: profile,
             #[cfg(test)]
@@ -924,6 +927,7 @@ impl Database {
             },
             backend: self.backend,
             terminal_projection_enabled: self.terminal_projection_enabled,
+            schema_track: self.schema_track.clone(),
             auxiliary_pool_max_connections: self.auxiliary_pool_max_connections,
             connection_profile: self.connection_profile,
             #[cfg(test)]
