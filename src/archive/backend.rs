@@ -18,6 +18,15 @@ impl ArchiveStore {
         super::tests::memory_store()
     }
 
+    /// Single-PUT fixture transport: remote storage cannot retain caller credit.
+    #[cfg(test)]
+    pub(crate) fn single_put_memory_transport_for_test() -> Self {
+        let mut archive = super::tests::memory_store();
+        archive.inner =
+            Arc::new(super::single_put_test_transport::SinglePutMemoryTransport::default());
+        archive
+    }
+
     #[cfg(test)]
     pub(crate) fn training_memory_for_test() -> Self {
         let mut archive = super::tests::memory_store();

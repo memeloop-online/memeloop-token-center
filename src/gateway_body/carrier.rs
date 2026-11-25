@@ -1341,6 +1341,13 @@ mod tests {
     }
 
     async fn full_ram_source(memory: Arc<ProxyMemoryBudget>) -> Arc<BodyCarrier> {
+        full_ram_source_with_archive(memory, ArchiveStore::memory_for_test()).await
+    }
+
+    async fn full_ram_source_with_archive(
+        memory: Arc<ProxyMemoryBudget>,
+        archive: ArchiveStore,
+    ) -> Arc<BodyCarrier> {
         let mut source = BodyCarrier::capture(
             stream::iter([
                 Ok::<_, std::io::Error>(Bytes::from(vec![b'a'; 65536])),
@@ -1350,7 +1357,7 @@ mod tests {
         )
         .await
         .unwrap();
-        Arc::get_mut(&mut source).unwrap().archive = Some(ArchiveStore::memory_for_test());
+        Arc::get_mut(&mut source).unwrap().archive = Some(archive);
         source
     }
 
@@ -1370,7 +1377,11 @@ mod tests {
     #[tokio::test]
     async fn offloaded_parent_keeps_live_reader_allocation_provenance() {
         let memory = Arc::new(ProxyMemoryBudget::new(128 * 1024));
-        let source = full_ram_source(memory.clone()).await;
+        let source = full_ram_source_with_archive(
+            memory.clone(),
+            ArchiveStore::single_put_memory_transport_for_test(),
+        )
+        .await;
         let reader = source.read_range(0, 65536).await.unwrap();
         assert!(source.offload_one().await.unwrap());
         // The segment is now remote, but this old reader still owns its RAM.
@@ -1417,7 +1428,11 @@ mod tests {
     #[tokio::test]
     async fn object_replay_offloads_other_sealed_ram_before_waiting_for_credit() {
         let memory = Arc::new(ProxyMemoryBudget::new(128 * 1024));
-        let source = full_ram_source(memory.clone()).await;
+        let source = full_ram_source_with_archive(
+            memory.clone(),
+            ArchiveStore::single_put_memory_transport_for_test(),
+        )
+        .await;
         assert!(source.offload_one().await.unwrap());
         let external = memory.try_reserve_ingress_bytes(65536).unwrap();
         assert_eq!(memory.snapshot().0, 128 * 1024);
