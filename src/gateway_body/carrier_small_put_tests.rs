@@ -339,3 +339,84 @@ async fn single_put_payload_keeps_workspace_until_last_sdk_clone_is_dropped() {
     assert_eq!(upload.upload_workspace.snapshot().0, 0);
     assert_eq!(original, Bytes::from(vec![b'x'; 4096]));
 }
+
+/// Isolate HTTP range round-trip cost before changing the production reader.
+/// Each concurrent reader owns a separate existing workspace envelope.
+#[tokio::test]
+#[ignore = "requires isolated RustFS fixture"]
+async fn real_s3_workspace_range_round_trip_comparison() {
+    let endpoint = std::env::var("MTC_RUSTFS_TEST_ENDPOINT").unwrap();
+    let proxy = RecoveryObjectProxy::start(&endpoint).await;
+    let archive = ArchiveStore::from_config(&config(&proxy).await)
+        .await
+        .unwrap();
+    let upload = Arc::new(crate::api::proxy::persistence::Persistence::default());
+    let size = 8 * 1024 * 1024 + 17;
+    let (carrier, memory) = source(&archive, size, upload.clone(), key()).await;
+    assert!(carrier.offload_one().await.unwrap());
+    assert_eq!(memory.snapshot().0, 0);
+    let reference = match &*carrier.segments[0].lock().unwrap() {
+        Segment::Object(reference) => reference.clone(),
+        Segment::Ram(_) => panic!("fixture was not offloaded"),
+    };
+    for window in [64 * 1024, 256 * 1024, 256 * 1024, 64 * 1024] {
+        let before = proxy.counts();
+        let began = std::time::Instant::now();
+        let readers = stream::iter(0..2)
+            .map(|_| {
+                let archive = archive.clone();
+                let upload = upload.clone();
+                let reference = reference.clone();
+                async move {
+                    let guard = upload
+                        .multipart_workspace(
+                            crate::api::proxy::persistence::WorkspaceRole::RequestRaw,
+                        )
+                        .await
+                        .unwrap();
+                    let holding = std::time::Instant::now();
+                    let mut offset = 0;
+                    let mut hasher = blake3::Hasher::new();
+                    let mut peak_output = 0;
+                    while offset < reference.size_bytes {
+                        let end = (offset + window as u64).min(reference.size_bytes);
+                        let mut download = archive
+                            .open_stream(&reference.object_locator, Some(offset..end))
+                            .await
+                            .unwrap()
+                            .stream;
+                        let mut output = Vec::with_capacity((end - offset) as usize);
+                        while let Some(chunk) = download.next().await {
+                            let chunk = chunk.unwrap();
+                            assert!(chunk.len() <= (end - offset) as usize - output.len());
+                            output.extend_from_slice(&chunk);
+                        }
+                        assert_eq!(output.len(), (end - offset) as usize);
+                        peak_output = peak_output.max(output.capacity());
+                        hasher.update(&output);
+                        offset = end;
+                    }
+                    assert_eq!(offset, reference.size_bytes);
+                    assert_eq!(hasher.finalize().to_hex().as_str(), reference.blake3_digest);
+                    let held_us = holding.elapsed().as_micros();
+                    drop(guard);
+                    (offset, held_us, peak_output)
+                }
+            })
+            .buffer_unordered(2)
+            .collect::<Vec<_>>()
+            .await;
+        let elapsed_us = began.elapsed().as_micros();
+        let after = proxy.counts();
+        let gets = after.get("range_get").copied().unwrap_or(0)
+            - before.get("range_get").copied().unwrap_or(0);
+        assert_eq!(gets, size.div_ceil(window) * 2);
+        assert_eq!(upload.upload_workspace.snapshot().0, 0);
+        assert_eq!(memory.snapshot().0, 0);
+        eprintln!(
+            "synthetic_range_comparison window={window} concurrency=2 bytes={} range_gets={gets} elapsed_us={elapsed_us} reader_results={readers:?}",
+            size * 2
+        );
+    }
+    drop(carrier);
+}

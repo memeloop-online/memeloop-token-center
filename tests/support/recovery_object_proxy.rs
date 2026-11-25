@@ -171,6 +171,10 @@ async fn forward(State(state): State<Arc<ProxyState>>, request: Request) -> Resp
         "multipart_part"
     } else if request.method() == axum::http::Method::PUT {
         "body_put"
+    } else if request.method() == axum::http::Method::GET
+        && request.headers().contains_key(axum::http::header::RANGE)
+    {
+        "range_get"
     } else {
         "other"
     };
