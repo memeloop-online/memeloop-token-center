@@ -1726,6 +1726,12 @@ pub(crate) const POSTGRES_MIGRATIONS: &[Migration] = &[
     },
 ];
 
+pub(super) async fn validate_started_capability(
+    connection: &mut AnyConnection,
+) -> Result<(), sqlx::Error> {
+    online164::verify(connection).await
+}
+
 impl Database {
     pub(super) async fn schema_status(
         &self,
@@ -1737,11 +1743,16 @@ impl Database {
             DatabaseBackend::Sqlite => SQLITE_MIGRATIONS,
         };
         if matches!(self.backend, DatabaseBackend::PostgreSql) && self.legacy163_mode()? {
+            let mut snapshot = connection.begin().await?;
+            sqlx::query("SET TRANSACTION ISOLATION LEVEL REPEATABLE READ READ ONLY")
+                .execute(&mut *snapshot)
+                .await?;
             let report = super::capability::catalog::inspect(
-                connection,
+                &mut snapshot,
                 super::capability::CapabilityRole::Gateway,
             )
             .await?;
+            snapshot.commit().await?;
             if report.is_some_and(|r| r.track == super::capability::SchemaTrack::Legacy163) {
                 return Ok(DatabaseSchemaStatus {
                     required_version: 163,

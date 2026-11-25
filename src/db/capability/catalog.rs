@@ -105,6 +105,7 @@ pub(in crate::db) async fn inspect(
         }
     }
     if last >= 164 {
+        crate::db::migrations::validate_started_capability(c).await?;
         let valid:bool=sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM pg_index WHERE indexrelid=to_regclass('request_records_started_pending') AND indrelid=to_regclass('request_records') AND indisvalid AND indisready AND pg_get_expr(indpred,indrelid)='(started_event_pending = 1)' AND pg_get_indexdef(indexrelid,1,true)='created_at' AND pg_get_indexdef(indexrelid,2,true)='id')").fetch_one(&mut *c).await?;
         if !valid {
             return Err(drift("started index invalid"));
