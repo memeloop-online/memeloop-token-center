@@ -252,7 +252,7 @@ pub use requests::{
     ConversationProjectionTask, FinishMeteredSynchronousRequest, FinishProxyRequest,
     FinishProxyRequestResult, FinishRequest, MeteredUsageProjectionTask, NewRequest,
     ProxyConversationInput, RequestListFilter, StartMeteredSynchronousRequest, StartProxyRequest,
-    StatsFilter, normalize_proxy_usage,
+    StatsFilter, TerminalRecoveryIdentity, TerminalRecoveryReport, normalize_proxy_usage,
 };
 #[cfg_attr(not(test), allow(unused_imports))]
 pub(crate) use requests::{
@@ -962,4 +962,6 @@ mod tests;
 mod raw_gc;
 mod semantic_archive_binding;
 
-pub(crate) use requests::terminal_timings::{TerminalProjectionBatchTimings, STAGE_NAMES as TERMINAL_PROJECTION_STAGE_NAMES};
+pub(crate) use requests::terminal_timings::{
+    STAGE_NAMES as TERMINAL_PROJECTION_STAGE_NAMES, TerminalProjectionBatchTimings,
+};

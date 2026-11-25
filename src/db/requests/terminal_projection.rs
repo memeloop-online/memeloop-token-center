@@ -1,6 +1,15 @@
 use super::super::*;
 use super::terminal_timings::{ProjectionStage, TerminalProjectionTimings};
 
+pub(super) const TERMINAL_CLAIM_TTL_MILLIS: i64 = 300_000;
+
+// Bind positions are selected by the two in-process callers, never input SQL.
+pub(super) fn terminal_claim_eligibility(owner_parameter: usize, now_parameter: usize) -> String {
+    format!(
+        "projected_at IS NULL AND (lease_owner IS NULL OR lease_owner <> ${owner_parameter}) AND (lease_expires_at IS NULL OR lease_expires_at <= ${now_parameter})"
+    )
+}
+
 pub(super) async fn enqueue_unknown_terminal_projection_in_transaction(
     transaction: &mut Transaction<'_, Any>,
     request_id: &str,
@@ -141,12 +150,13 @@ impl Database {
             DatabaseBackend::PostgreSql => " FOR UPDATE SKIP LOCKED",
             DatabaseBackend::Sqlite => "",
         };
+        let eligibility = terminal_claim_eligibility(1, 3);
         let statement = format!(
-            "UPDATE terminal_projection_outbox SET lease_owner = $1, lease_expires_at = $2, attempts = attempts + 1 WHERE request_id IN (SELECT request_id FROM terminal_projection_outbox WHERE projected_at IS NULL AND (lease_owner IS NULL OR lease_owner <> $1) AND (lease_expires_at IS NULL OR lease_expires_at <= $3) ORDER BY completed_at, request_id LIMIT $4{suffix}) RETURNING request_id"
+            "UPDATE terminal_projection_outbox SET lease_owner = $1, lease_expires_at = $2, attempts = attempts + 1 WHERE request_id IN (SELECT request_id FROM terminal_projection_outbox WHERE {eligibility} ORDER BY completed_at, request_id LIMIT $4{suffix}) RETURNING request_id"
         );
         let rows = sqlx::query(sqlx::AssertSqlSafe(statement))
             .bind(lease_owner.to_string())
-            .bind(now.saturating_add(300_000))
+            .bind(now.saturating_add(TERMINAL_CLAIM_TTL_MILLIS))
             .bind(now)
             .bind(limit)
             .fetch_all(&mut *transaction)
