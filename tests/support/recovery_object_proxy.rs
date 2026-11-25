@@ -34,6 +34,7 @@ impl ObjectReadGate {
 #[derive(Default)]
 struct Faults {
     gets: HashMap<String, Arc<ObjectReadGate>>,
+    response_get: Option<(String, Arc<ObjectReadGate>)>,
     part_gate: Option<Arc<ObjectReadGate>>,
     abort_gate: Option<Arc<ObjectReadGate>>,
     puts: HashSet<String>,
@@ -102,6 +103,11 @@ impl RecoveryObjectProxy {
     pub(crate) fn gate_multipart_abort(&self) -> Arc<ObjectReadGate> {
         let gate = Arc::new(ObjectReadGate::default());
         self.state.faults.lock().unwrap().abort_gate = Some(gate.clone());
+        gate
+    }
+    pub(crate) fn gate_get_response_prefix(&self, prefix: &str) -> Arc<ObjectReadGate> {
+        let gate = Arc::new(ObjectReadGate::default());
+        self.state.faults.lock().unwrap().response_get = Some((prefix.to_owned(), gate.clone()));
         gate
     }
     pub(crate) fn gate_get(&self, path: &str) -> Arc<ObjectReadGate> {
@@ -237,6 +243,14 @@ async fn forward(State(state): State<Arc<ProxyState>>, request: Request) -> Resp
             .body(Body::from("temporarily unavailable"))
             .unwrap();
     }
+    let response_gate = {
+        let faults = state.faults.lock().unwrap();
+        faults.response_get.as_ref().filter(|(prefix, _)| request.method() == axum::http::Method::GET && request.uri().path().starts_with(prefix))
+            .map(|(_, gate)| {
+                assert_eq!(request.headers().get(axum::http::header::RANGE).unwrap(), "bytes=0-12");
+                gate.clone()
+            })
+    };
     let (parts, body) = request.into_parts();
     let url = format!(
         "{}{}",
@@ -273,6 +287,14 @@ async fn forward(State(state): State<Arc<ProxyState>>, request: Request) -> Resp
     {
         // Upstream has persisted the bytes, but the caller receives no ACK.
         return Response::builder().status(503).body(Body::empty()).unwrap();
+    }
+    if let Some(gate) = response_gate {
+        assert!(response.status().is_success());
+        let release = gate.release.notified();
+        tokio::pin!(release);
+        release.as_mut().enable();
+        gate.entered.notify_one();
+        if !gate.released.load(Ordering::SeqCst) { release.await; }
     }
     let mut output = Response::builder().status(response.status());
     *output.headers_mut().unwrap() = response.headers().clone();
