@@ -40,6 +40,13 @@ impl Fixture {
         url.query_pairs_mut()
             .append_pair("application_name", &contender_name);
         let contender = Database::connect_with_max(url.as_str(), 4).await.unwrap();
+        for runtime in [&database, &contender] {
+            runtime
+                .verify_capabilities(crate::db::capability::CapabilityRole::Gateway)
+                .await
+                .unwrap()
+                .expect("migrated admission runtime must have verified capabilities");
+        }
         let pepper = b"admission lock financial regression pepper";
         let issued = database
             .create_key(
