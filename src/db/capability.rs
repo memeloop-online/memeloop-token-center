@@ -4,6 +4,7 @@ use serde::{Deserialize, Serialize};
 pub(super) mod catalog;
 mod history;
 pub mod permissions;
+mod sqlite;
 #[cfg(test)]
 mod tests;
 

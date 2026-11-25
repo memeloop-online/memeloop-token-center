@@ -185,6 +185,11 @@ impl Database {
         role: CapabilityRole,
     ) -> Result<Option<CapabilityReport>, sqlx::Error> {
         if !matches!(self.backend, DatabaseBackend::PostgreSql) {
+            if !self.verify_sqlite_runtime().await? {
+                return Err(drift(
+                    "SQLite runtime requires completed supported migrations",
+                ));
+            }
             return Ok(None);
         }
         let mut c = self.pool.acquire().await?;
