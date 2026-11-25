@@ -472,8 +472,9 @@ impl Database {
         page_size: i64,
         ready: impl std::future::Future<Output = Result<(), HistoryError>>,
     ) -> Result<usize, HistoryError> {
-        self.history_backfill_source_page_after_ready(page_size, None, ready)
+        self.history_backfill_source_page_after_ready(page_size, None, None, ready)
             .await
+            .map(|report| report.visited)
     }
 
     pub async fn history_backfill_source_page(
@@ -481,117 +482,338 @@ impl Database {
         page_size: i64,
         source: Option<crate::request_history::HistorySource>,
     ) -> Result<usize, HistoryError> {
-        self.history_backfill_source_page_after_ready(page_size, source, std::future::ready(Ok(())))
-            .await
+        self.history_backfill_source_page_after_ready(
+            page_size,
+            source,
+            None,
+            std::future::ready(Ok(())),
+        )
+        .await
+        .map(|report| report.visited)
+    }
+
+    pub async fn history_backfill_expected_page(
+        &self,
+        page_size: i64,
+        expected: &crate::request_history::HistoryBackfillCheckpoint,
+    ) -> Result<crate::request_history::HistoryBackfillPageReport, HistoryError> {
+        let source = match expected.source.as_str() {
+            "native" => crate::request_history::HistorySource::Native,
+            "event" => crate::request_history::HistorySource::Event,
+            _ => {
+                return Err(HistoryError::Invalid(
+                    "expected checkpoint requires native or event",
+                ));
+            }
+        };
+        if !(1..=64).contains(&page_size) {
+            return Err(HistoryError::Invalid(
+                "expected checkpoint page size must be 1..64",
+            ));
+        }
+        self.history_backfill_source_page_after_ready(
+            page_size,
+            Some(source),
+            Some(expected),
+            std::future::ready(Ok(())),
+        )
+        .await
     }
 
     async fn history_backfill_source_page_after_ready(
         &self,
         page_size: i64,
         source: Option<crate::request_history::HistorySource>,
+        expected: Option<&crate::request_history::HistoryBackfillCheckpoint>,
         ready: impl std::future::Future<Output = Result<(), HistoryError>>,
-    ) -> Result<usize, HistoryError> {
+    ) -> Result<crate::request_history::HistoryBackfillPageReport, HistoryError> {
+        if expected.is_some() && self.history_mode().await? != "shadow" {
+            return Err(HistoryError::Changed);
+        }
         if page_size <= 0 || self.history_mode().await? == "off" {
             return Err(HistoryError::Invalid(
                 "start history capture before backfill; page_size must be positive",
             ));
         }
-        if !self.history_capture_horizon_ready().await? {
+        if expected.is_none() && !self.history_capture_horizon_ready().await? {
             return Err(HistoryError::Changed);
         }
         ready.await?;
         let mut transaction = self.pool.begin().await?;
-        if matches!(self.backend, DatabaseBackend::PostgreSql) {
-            // Backfill also allocates global revisions and must participate in
-            // the same commit barrier as source triggers.
-            sqlx::query("SELECT id FROM request_history_state WHERE id=1 FOR SHARE")
+        let work = async {
+            if matches!(self.backend, DatabaseBackend::PostgreSql) {
+                if expected.is_some() {
+                    // Maintenance-only limits: rollback this page on contention;
+                    // never change request/worker pool defaults or retry here.
+                    sqlx::query("SET LOCAL lock_timeout='100ms'")
+                        .execute(&mut *transaction)
+                        .await?;
+                    sqlx::query("SET LOCAL statement_timeout='5s'")
+                        .execute(&mut *transaction)
+                        .await?;
+                }
+                // Backfill also allocates global revisions and must participate in
+                // the same commit barrier as source triggers.
+                sqlx::query(if expected.is_some() {
+                    "SELECT id FROM request_history_state WHERE id=1 FOR SHARE NOWAIT"
+                } else {
+                    "SELECT id FROM request_history_state WHERE id=1 FOR SHARE"
+                })
                 .execute(&mut *transaction)
                 .await?;
-            let covered: bool = sqlx::query_scalar(
+                let covered: bool = sqlx::query_scalar(
                 "SELECT phase IN ('drained','legacy') FROM request_history_activation WHERE id=1",
             )
             .fetch_one(&mut *transaction)
             .await?;
-            if !covered {
+                if !covered {
+                    return Err(HistoryError::Changed);
+                }
+            }
+            let mode: String =
+                sqlx::query_scalar("SELECT mode FROM request_history_state WHERE id=1")
+                    .fetch_one(&mut *transaction)
+                    .await?;
+            if expected.is_some() && mode != "shadow" {
                 return Err(HistoryError::Changed);
             }
-        }
-        let lock = if matches!(self.backend, DatabaseBackend::PostgreSql) {
-            " FOR UPDATE"
-        } else {
-            ""
-        };
-        let sql = format!(
-            "SELECT source, after_id, after_created_at, legacy_after_id FROM request_history_backfill WHERE done = 0 AND (CAST($1 AS TEXT) IS NULL OR source=$1) ORDER BY source LIMIT 1{lock}"
-        );
-        let Some(checkpoint) = sqlx::query(sqlx::AssertSqlSafe(sql))
-            .bind(source.map(crate::request_history::HistorySource::as_str))
-            .fetch_optional(&mut *transaction)
-            .await?
-        else {
-            return Ok(0);
-        };
-        let source: String = checkpoint.try_get("source")?;
-        let after: String = checkpoint.try_get("after_id")?;
-        let event_after: Option<i64> = checkpoint.try_get("after_created_at")?;
-        let legacy_after: Option<String> = checkpoint.try_get("legacy_after_id")?;
-        let legacy_scan = source == "event"
-            && (legacy_after.is_some() || (event_after.is_none() && !after.is_empty()));
-        let rows = if source == "event" {
-            // Event IDs need not follow event time. A legacy UUID cursor gets
-            // one complete time-ordered pass; existing durable receipts below
-            // preserve revisions already captured or delivered.
-            sqlx::query(EVENT_SOURCE_PAGE_SQL)
-                .bind(event_after.unwrap_or(i64::MIN))
-                .bind(if event_after.is_some() {
-                    after.as_str()
+            let epoch: i64 =
+                sqlx::query_scalar("SELECT epoch FROM request_history_activation WHERE id=1")
+                    .fetch_one(&mut *transaction)
+                    .await?;
+            let lock = if matches!(self.backend, DatabaseBackend::PostgreSql) {
+                if expected.is_some() {
+                    " FOR UPDATE NOWAIT"
                 } else {
-                    ""
-                })
-                .bind(page_size)
-                .fetch_all(&mut *transaction)
-                .await?
-        } else {
+                    " FOR UPDATE"
+                }
+            } else {
+                ""
+            };
             let sql = format!(
-                "SELECT {COLUMNS} FROM request_history_source_ids WHERE source = $1 AND request_id > $2 ORDER BY request_id LIMIT $3"
+                "SELECT source, after_id, after_created_at, legacy_after_id, done FROM request_history_backfill WHERE (CAST($1 AS TEXT) IS NULL OR source=$1) AND (done=0 OR $2=1) ORDER BY source LIMIT 1{lock}"
             );
-            sqlx::query(sqlx::AssertSqlSafe(sql))
-                .bind(&source)
-                .bind(&after)
-                .bind(page_size)
-                .fetch_all(&mut *transaction)
+            let Some(checkpoint) = sqlx::query(sqlx::AssertSqlSafe(sql))
+                .bind(source.map(crate::request_history::HistorySource::as_str))
+                .bind(i64::from(expected.is_some()))
+                .fetch_optional(&mut *transaction)
                 .await?
-        };
-        for row in &rows {
-            sqlx::query("INSERT INTO request_history_export (source, request_id, tenant_id, key_id, created_at) SELECT $1, $2, $3, $4, $5 WHERE $6 = 0 OR NOT EXISTS (SELECT 1 FROM request_history_identities i WHERE i.source=$1 AND i.request_id=$2 AND i.tenant_id=$3 AND i.key_id=$4 AND i.created_at=$5 AND ((i.acknowledged_revision=i.head_revision AND i.acknowledged_hash IS NOT NULL AND LENGTH(i.acknowledged_hash)=64) OR EXISTS (SELECT 1 FROM request_history_immutable_outbox o WHERE o.revision=i.head_revision AND o.source=i.source AND o.request_id=i.request_id AND o.tenant_id=i.tenant_id AND o.key_id=i.key_id AND o.created_at=i.created_at))) ON CONFLICT (source, request_id) DO NOTHING")
+            else {
+                if expected.is_some() {
+                    return Err(HistoryError::Changed);
+                }
+                return Ok(crate::request_history::HistoryBackfillPageReport {
+                    before: None,
+                    after: None,
+                    visited: 0,
+                    actually_enqueued: 0,
+                    covered: 0,
+                    conflict: 0,
+                    identities: Vec::new(),
+                });
+            };
+            let source: String = checkpoint.try_get("source")?;
+            let after: String = checkpoint.try_get("after_id")?;
+            let event_after: Option<i64> = checkpoint.try_get("after_created_at")?;
+            let legacy_after: Option<String> = checkpoint.try_get("legacy_after_id")?;
+            let before = crate::request_history::HistoryBackfillCheckpoint {
+                source: source.clone(),
+                after_id: after.clone(),
+                after_created_at: event_after,
+                legacy_after_id: legacy_after.clone(),
+                epoch,
+                done: checkpoint.try_get::<i64, _>("done")? != 0,
+            };
+            if expected.is_some_and(|expected| expected != &before) {
+                return Err(HistoryError::Changed);
+            }
+            let mut report = crate::request_history::HistoryBackfillPageReport {
+                before: Some(before.clone()),
+                after: Some(before),
+                visited: 0,
+                actually_enqueued: 0,
+                covered: 0,
+                conflict: 0,
+                identities: Vec::new(),
+            };
+            if expected.is_some()
+                && report
+                    .before
+                    .as_ref()
+                    .is_some_and(|checkpoint| checkpoint.done)
+            {
+                return Ok(report);
+            }
+            let legacy_scan = source == "event"
+                && (legacy_after.is_some() || (event_after.is_none() && !after.is_empty()));
+            let rows = if source == "event" {
+                // Event IDs need not follow event time. A legacy UUID cursor gets
+                // one complete time-ordered pass; existing durable receipts below
+                // preserve revisions already captured or delivered.
+                sqlx::query(EVENT_SOURCE_PAGE_SQL)
+                    .bind(event_after.unwrap_or(i64::MIN))
+                    .bind(if event_after.is_some() {
+                        after.as_str()
+                    } else {
+                        ""
+                    })
+                    .bind(page_size)
+                    .fetch_all(&mut *transaction)
+                    .await?
+            } else {
+                let sql = format!(
+                    "SELECT {COLUMNS} FROM request_history_source_ids WHERE source = $1 AND request_id > $2 ORDER BY request_id LIMIT $3"
+                );
+                sqlx::query(sqlx::AssertSqlSafe(sql))
+                    .bind(&source)
+                    .bind(&after)
+                    .bind(page_size)
+                    .fetch_all(&mut *transaction)
+                    .await?
+            };
+            for row in &rows {
+                let inserted = sqlx::query("INSERT INTO request_history_export (source, request_id, tenant_id, key_id, created_at) SELECT $1, $2, $3, $4, $5 WHERE $6 = 0 OR NOT EXISTS (SELECT 1 FROM request_history_identities i WHERE i.source=$1 AND i.request_id=$2 AND i.tenant_id=$3 AND i.key_id=$4 AND i.created_at=$5 AND ((i.acknowledged_revision=i.head_revision AND i.acknowledged_hash IS NOT NULL AND LENGTH(i.acknowledged_hash)=64) OR EXISTS (SELECT 1 FROM request_history_immutable_outbox o WHERE o.revision=i.head_revision AND o.source=i.source AND o.request_id=i.request_id AND o.tenant_id=i.tenant_id AND o.key_id=i.key_id AND o.created_at=i.created_at))) ON CONFLICT (source, request_id) DO NOTHING")
                 .bind(&source).bind(row.try_get::<String, _>("request_id")?)
                 .bind(row.try_get::<String, _>("tenant_id")?).bind(row.try_get::<String, _>("key_id")?)
                 .bind(row.try_get::<i64, _>("created_at")?).bind(i64::from(legacy_scan)).execute(&mut *transaction).await?;
-        }
-        let after = rows
-            .last()
-            .map(|row| row.try_get::<String, _>("request_id"))
-            .transpose()?
-            .unwrap_or(after);
-        if source == "event" {
-            let time = rows
+                if expected.is_none() {
+                    continue;
+                }
+                let id: String = row.try_get("request_id")?;
+                let tenant: String = row.try_get("tenant_id")?;
+                let key: String = row.try_get("key_id")?;
+                let created: i64 = row.try_get("created_at")?;
+                let journal = sqlx::query("SELECT revision,tenant_id,key_id,created_at FROM request_history_export WHERE source=$1 AND request_id=$2")
+                .bind(&source).bind(&id).fetch_optional(&mut *transaction).await?;
+                let receipt = sqlx::query("SELECT head_revision,acknowledged_revision,acknowledged_hash FROM request_history_identities WHERE source=$1 AND request_id=$2 AND tenant_id=$3 AND key_id=$4 AND created_at=$5")
+                .bind(&source).bind(&id).bind(&tenant).bind(&key).bind(created).fetch_optional(&mut *transaction).await?;
+                let journal_exists = journal.is_some();
+                let mut revision = None;
+                let mut acknowledged_revision = None;
+                let mut acknowledged_hash = None;
+                let mut immutable_present = false;
+                if let Some(journal) = journal {
+                    if journal.try_get::<String, _>("tenant_id")? != tenant
+                        || journal.try_get::<String, _>("key_id")? != key
+                        || journal.try_get::<i64, _>("created_at")? != created
+                    {
+                        return Err(HistoryError::Changed);
+                    }
+                    revision = Some(journal.try_get::<i64, _>("revision")?);
+                }
+                if let Some(receipt) = receipt {
+                    let head: i64 = receipt.try_get("head_revision")?;
+                    let ack: Option<i64> = receipt.try_get("acknowledged_revision")?;
+                    let hash: Option<String> = receipt.try_get("acknowledged_hash")?;
+                    if let (Some(ack), Some(hash)) = (ack, hash) {
+                        if hash.len() == 64 && hash.bytes().all(|byte| byte.is_ascii_hexdigit()) {
+                            acknowledged_revision = Some(ack);
+                            acknowledged_hash = Some(hash);
+                        }
+                    }
+                    if !journal_exists {
+                        if acknowledged_revision == Some(head) {
+                            revision = Some(head);
+                        } else {
+                            immutable_present=sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM request_history_immutable_outbox WHERE revision=$1 AND source=$2 AND request_id=$3 AND tenant_id=$4 AND key_id=$5 AND created_at=$6)")
+                            .bind(head).bind(&source).bind(&id).bind(&tenant).bind(&key).bind(created).fetch_one(&mut *transaction).await?;
+                            if immutable_present {
+                                revision = Some(head);
+                            }
+                        }
+                    }
+                }
+                // A source key collision is not coverage. Never advance past an
+                // identity unless this transaction sees its exact durable duty.
+                let revision = revision.ok_or(HistoryError::Changed)?;
+                let acknowledged = acknowledged_revision == Some(revision);
+                if inserted.rows_affected() == 1 {
+                    report.actually_enqueued += 1;
+                } else if acknowledged && !journal_exists {
+                    report.covered += 1;
+                } else {
+                    report.conflict += 1;
+                }
+                let proof = if inserted.rows_affected() == 1 {
+                    "enqueued"
+                } else if acknowledged && !journal_exists {
+                    "acknowledged"
+                } else if journal_exists {
+                    "journal_pending"
+                } else if immutable_present {
+                    "immutable_pending"
+                } else {
+                    return Err(HistoryError::Changed);
+                };
+                report.identities.push(serde_json::json!({"source":source,"request_id":id,"tenant_id":tenant,"key_id":key,"created_at":created,"revision":revision,"acknowledged_revision":acknowledged_revision,"acknowledged_hash":acknowledged_hash,"revision_acknowledged":acknowledged,"proof":proof}));
+            }
+            let after = rows
                 .last()
-                .map(|row| row.try_get::<i64, _>("created_at"))
+                .map(|row| row.try_get::<String, _>("request_id"))
                 .transpose()?
-                .or(event_after);
-            sqlx::query("UPDATE request_history_backfill SET legacy_after_id=CASE WHEN after_created_at IS NULL AND after_id<>'' THEN after_id ELSE legacy_after_id END,after_created_at=$1 WHERE source='event'")
+                .unwrap_or(after.clone());
+            if source == "event" {
+                let time = rows
+                    .last()
+                    .map(|row| row.try_get::<i64, _>("created_at"))
+                    .transpose()?
+                    .or(event_after);
+                sqlx::query("UPDATE request_history_backfill SET legacy_after_id=CASE WHEN after_created_at IS NULL AND after_id<>'' THEN after_id ELSE legacy_after_id END,after_created_at=$1 WHERE source='event'")
                 .bind(time).execute(&mut *transaction).await?;
+            }
+            sqlx::query(
+                "UPDATE request_history_backfill SET after_id = $1, done = $2 WHERE source = $3",
+            )
+            .bind(&after)
+            .bind(i64::from(rows.len() < page_size as usize))
+            .bind(&source)
+            .execute(&mut *transaction)
+            .await?;
+            report.visited = rows.len();
+            report.after = Some(crate::request_history::HistoryBackfillCheckpoint {
+                source: source.clone(),
+                after_id: after,
+                after_created_at: if source == "event" {
+                    rows.last()
+                        .map(|row| row.try_get::<i64, _>("created_at"))
+                        .transpose()?
+                        .or(event_after)
+                } else {
+                    event_after
+                },
+                legacy_after_id: if source == "event"
+                    && event_after.is_none()
+                    && !report.before.as_ref().unwrap().after_id.is_empty()
+                {
+                    Some(report.before.as_ref().unwrap().after_id.clone())
+                } else {
+                    legacy_after
+                },
+                epoch,
+                done: rows.len() < page_size as usize,
+            });
+            Ok::<_, HistoryError>(report)
+        };
+        let report = if expected.is_some() {
+            // Dropping only pre-COMMIT SQL work rolls back the open page.
+            tokio::time::timeout(std::time::Duration::from_secs(8), work)
+                .await
+                .map_err(|_| HistoryError::Changed)??
+        } else {
+            work.await?
+        };
+        // Do not cancel a COMMIT after sending it. A connection error can have
+        // an unknown result; operators must read the exact persisted cursor.
+        if let Err(error) = transaction.commit().await {
+            if expected.is_some() {
+                tracing::warn!(diagnostic=%HistoryError::Sql(error).safe_diagnostic(),"history backfill commit outcome unknown");
+                return Err(HistoryError::Verification(
+                    "backfill commit outcome unknown; read exact checkpoint before retry",
+                ));
+            }
+            return Err(error.into());
         }
-        sqlx::query(
-            "UPDATE request_history_backfill SET after_id = $1, done = $2 WHERE source = $3",
-        )
-        .bind(after)
-        .bind(i64::from(rows.len() < page_size as usize))
-        .bind(source)
-        .execute(&mut *transaction)
-        .await?;
-        transaction.commit().await?;
-        Ok(rows.len())
+        Ok(report)
     }
 
     pub async fn history_backfill_done(&self) -> Result<bool, HistoryError> {
@@ -1192,3 +1414,6 @@ mod tests;
 #[cfg(test)]
 #[path = "request_history/event_backfill_tests.rs"]
 mod event_backfill_tests;
+
+#[cfg(test)]
+mod checkpoint_tests;

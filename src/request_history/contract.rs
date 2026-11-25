@@ -249,3 +249,26 @@ impl HistorySource {
         }
     }
 }
+
+/// Exact persisted source cursor and activation generation for maintenance CAS.
+#[derive(Clone, Debug, serde::Serialize, serde::Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct HistoryBackfillCheckpoint {
+    pub source: String,
+    pub after_id: String,
+    pub after_created_at: Option<i64>,
+    pub legacy_after_id: Option<String>,
+    pub epoch: i64,
+    pub done: bool,
+}
+
+#[derive(Clone, Debug, serde::Serialize)]
+pub struct HistoryBackfillPageReport {
+    pub before: Option<HistoryBackfillCheckpoint>,
+    pub after: Option<HistoryBackfillCheckpoint>,
+    pub visited: usize,
+    pub actually_enqueued: usize,
+    pub covered: usize,
+    pub conflict: usize,
+    pub identities: Vec<serde_json::Value>,
+}
