@@ -65,9 +65,11 @@ try:
     command('docker', 'pull', IMAGE)
     revision = command('docker', 'inspect', '--format', '{{ index .Config.Labels "org.opencontainers.image.revision" }}', IMAGE).stdout.strip()
     assert revision == SOURCE
-    signature = command('docker', 'run', '--rm', '--entrypoint', '/usr/local/bin/cosign', IMAGE,
-                        'verify', '--certificate-oidc-issuer', 'https://token.actions.githubusercontent.com',
+    signature = command(os.environ['TRUSTED_COSIGN'], 'verify', '--certificate-oidc-issuer', 'https://token.actions.githubusercontent.com',
                         '--certificate-identity', IDENTITY, IMAGE).stdout
+    verified = json.loads(signature)
+    assert isinstance(verified, list) and verified
+    assert all(item['critical']['image']['docker-manifest-digest'] == IMAGE.split('@')[1] for item in verified)
     (evidence / 'signature.json').write_text(signature)
     command('docker', 'network', 'create', network)
     command('docker', 'run', '-d', '--name', pg, '--network', network,
@@ -97,11 +99,15 @@ try:
     revision = int(sql(f"SELECT revision FROM request_history_export WHERE source='event' AND request_id='{target}'"))
     scope = ['request-history', 'export-exact-event', '--request-id', target,
              '--tenant-id', tenant, '--key-id', key, '--created-at', str(created), '--revision', str(revision)]
+    def neighbour_state():
+        return {table: sql(f"SELECT COALESCE(json_agg(t ORDER BY request_id)::text,'[]') FROM {table} t WHERE request_id='{neighbour}'") for table in ['request_history_export', 'request_history_immutable_outbox', 'request_history_identities']}
+    neighbour_before = neighbour_state()
     before = fingerprint()
     wrong = scope.copy()
     wrong[wrong.index('--key-id') + 1] = str(uuid.uuid4())
     wrong_report = cli(*wrong)
     assert wrong_report['status'] == 'not_ready' and wrong_report['proof'] == 'unproven' and wrong_report['operation_failed'] is True
+    assert wrong_report['attempted'] == wrong_report['acked'] == 0
     assert fingerprint() == before
     report = cli(*scope)
     assert report['status'] == 'completed' and report['proof'] == 'exact_ack' and report['attempted'] == report['acked'] == 1
@@ -114,12 +120,15 @@ try:
     assert sql(f"SELECT count(*) FROM request_history_immutable_outbox WHERE request_id='{target}'") == '0'
     assert sql(f"SELECT count(*) FROM request_history_export WHERE request_id='{neighbour}' AND snapshot IS NULL") == '1'
     assert click(f"SELECT count() FROM request_history_v1 FINAL WHERE request_id=toUUID('{neighbour}')") == '0'
+    assert neighbour_state() == neighbour_before
     after = fingerprint()
     assert after['cursor'] == before['cursor']
     repeated = cli(*scope)
     assert repeated['status'] == 'not_ready' and repeated['proof'] == 'unproven' and repeated['operation_failed'] is True
+    assert repeated['attempted'] == repeated['acked'] == 0
     assert fingerprint() == after
     table_uuid = click(f"SELECT toString(uuid) FROM system.tables WHERE database='{run}' AND name='request_history_v1'")
+    assert table_uuid and uuid.UUID(table_uuid).int != 0
     (evidence / 'receipt.json').write_text(json.dumps({'image': IMAGE, 'source': SOURCE, 'database': run, 'table_uuid': table_uuid, 'identity':row, 'wrong_scope':wrong_report,'exact_ack':report,'repeat':repeated,'cursor_unchanged':True,'neighbour_untouched':True}, indent=2))
     print('isolated immutable CLI exact event: PASS')
 finally:

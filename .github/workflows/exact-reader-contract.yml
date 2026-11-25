@@ -1011,7 +1011,17 @@ jobs:
           registry: ghcr.io
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
+      - name: Build independent pinned signature verifier
+        run: |
+          set -euo pipefail
+          docker build --target cosign-builder -t history1073-trusted-cosign:${{ github.run_id }} .
+          tool_container=$(docker create history1073-trusted-cosign:${{ github.run_id }})
+          trap 'docker rm -f "$tool_container"' EXIT
+          docker cp "$tool_container:/tmp/cosign" "$RUNNER_TEMP/history1073-cosign"
+          chmod 0555 "$RUNNER_TEMP/history1073-cosign"
       - name: Exercise immutable CLI in run-owned PostgreSQL and ClickHouse
+        env:
+          TRUSTED_COSIGN: ${{ runner.temp }}/history1073-cosign
         run: python3 .github/scripts/history-exact-event-runtime.py
       - uses: actions/upload-artifact@65462800fd760344b1a7b4382951275a0abb4808
         if: always()
