@@ -72,4 +72,65 @@ async fn postgres_capability_163_skips_hot_ddl_and_preserves_true_ledger() {
         .await
         .unwrap();
     assert!(rows.is_empty());
+    sqlx::query("ALTER TABLE request_records DROP COLUMN started_event_pending")
+        .execute(&db.pool)
+        .await
+        .unwrap();
+    // Genuine interrupted online164 state: column committed, no ledger164.
+    sqlx::query(
+        "ALTER TABLE request_records ADD COLUMN started_event_pending BIGINT NOT NULL DEFAULT 0",
+    )
+    .execute(&db.pool)
+    .await
+    .unwrap();
+    db.migrate().await.unwrap();
+    assert_eq!(
+        db.verify_capabilities(CapabilityRole::Worker)
+            .await
+            .unwrap()
+            .unwrap()
+            .track,
+        SchemaTrack::Linear165
+    );
+}
+
+#[tokio::test]
+async fn postgres_capability_reader_permissions_do_not_authorize_gateway_writes() {
+    let url =
+        std::env::var("MTC_TEST_POSTGRES_URL").expect("PG capability contract requires PostgreSQL");
+    let isolated = PostgresTestDatabase::create(&url).await;
+    let db = Database::connect_with_max(isolated.url(), 6).await.unwrap();
+    db.migrate().await.unwrap();
+    let role = format!("capability_reader_{}", uuid::Uuid::now_v7().simple());
+    sqlx::query(sqlx::AssertSqlSafe(format!("CREATE ROLE {role}")))
+        .execute(&db.pool)
+        .await
+        .unwrap();
+    let schema: String = sqlx::query_scalar("SELECT current_schema()")
+        .fetch_one(&db.pool)
+        .await
+        .unwrap();
+    sqlx::query(sqlx::AssertSqlSafe(format!("GRANT USAGE ON SCHEMA {schema} TO {role}; GRANT SELECT ON ALL TABLES IN SCHEMA {schema} TO {role}"))).execute(&db.pool).await.unwrap();
+    let mut tx = db.pool.begin().await.unwrap();
+    sqlx::query(sqlx::AssertSqlSafe(format!("SET LOCAL ROLE {role}")))
+        .execute(&mut *tx)
+        .await
+        .unwrap();
+    let reader = super::catalog::inspect(&mut tx, CapabilityRole::HistoryReader)
+        .await
+        .unwrap()
+        .unwrap();
+    reader.require("history.baseline_receipt.v1").unwrap();
+    assert!(
+        super::catalog::inspect(&mut tx, CapabilityRole::Gateway)
+            .await
+            .is_err()
+    );
+    tx.rollback().await.unwrap();
+    sqlx::query(sqlx::AssertSqlSafe(format!(
+        "DROP OWNED BY {role}; DROP ROLE {role}"
+    )))
+    .execute(&db.pool)
+    .await
+    .unwrap();
 }
