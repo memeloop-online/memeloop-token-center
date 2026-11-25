@@ -38,8 +38,7 @@ impl Database {
             return Err(AppError::BadRequest("OAuth login expired or failed".into()));
         }
         Ok(OAuthLoginClaim::Pending {
-            retry_after_seconds: millis_until(now, row.try_get::<i64, _>("next_poll_at")?)
-                ,
+            retry_after_seconds: millis_until(now, row.try_get::<i64, _>("next_poll_at")?),
         })
     }
 

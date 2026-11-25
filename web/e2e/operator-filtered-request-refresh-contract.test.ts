@@ -15,6 +15,7 @@ function request(request_id: string, created_at: number, status_code: number | n
   return {
     request_id, created_at, status_code, protocol: 'openai', model: 'example', duration_ms: null,
     input_tokens: 0, output_tokens: 0, cost: '0', error_code: null,
+    archive_state: 'pending',
   };
 }
 

@@ -71,7 +71,7 @@ window.fetch = async (input, init) => {
   const path = url.pathname;
   const method = init?.method ?? (input instanceof Request ? input.method : 'GET');
   if (path === '/internal/v1/transport-proxy-groups/access' && method === 'GET' && !url.search) return Response.json({ can_manage: false });
-  if (path.startsWith('/internal/v1/transport-prox') || path.endsWith('/transport-proxy-selection')) {
+  if (path.startsWith('/internal/v1/transport-prox') || path === '/internal/v1/upstreams/account-native/transport-proxy-selection' || (method === 'GET' && path === '/internal/v1/upstreams/account-native/transport-proxy')) {
     if (method !== 'GET') window.formJourneyWrites++;
     if (account.can_update_transport_proxy !== true) return new Response(JSON.stringify({ error: { code: 'forbidden' } }), { status: 403 });
     if (method === 'GET') {
@@ -81,7 +81,17 @@ window.fetch = async (input, init) => {
       if (path === '/internal/v1/transport-proxies') return Response.json({ items: networkProxies });
       if (path === '/internal/v1/transport-proxy-groups') return Response.json({ items: [] });
       if (path === '/internal/v1/transport-proxy-strategies') return Response.json({ items: [{ id: 'manual', version: '1', schema: { type: 'object', properties: {} }, default: {} }] });
-      if (path === '/internal/v1/upstreams/account-native/transport-proxy-selection') return Response.json(proxySelection());
+      if (path === '/internal/v1/upstreams/account-native/transport-proxy') {
+        const selection = proxySelection();
+        const snapshot = { account_id: selection.account_id, proxy_url: proxyUrl, supported: true, proxy_network_scope: 'private', source: 'manual', configuration_state: 'applied', selected_member_id: selection.desired.proxy_id, updated_at: selection.account_updated_at, credential_generation: selection.credential_generation, selection };
+        const response = () => Response.json(snapshot, { headers: { 'Cache-Control': 'private, no-store' } });
+        if (window.deferNextFormProxyRead) {
+          window.deferNextFormProxyRead = false;
+          // Ignore AbortSignal: this must return the original snapshot even after a save.
+          return new Promise<Response>(resolve => { releaseProxy = () => resolve(response()); });
+        }
+        return response();
+      }
       throw new Error('Unexpected proxy policy read');
     }
     if (method !== 'PUT' || path !== '/internal/v1/upstreams/account-native/transport-proxy-selection' || !workflows || !new URLSearchParams(location.search).has('proxy-workflow')) throw new Error('Mutation outside proxy policy workflow');
@@ -165,17 +175,6 @@ window.fetch = async (input, init) => {
     return new Response(JSON.stringify({ ...existingRoute, ...data }));
   }
   window.formJourneyReads.push(path);
-  if (path === '/internal/v1/upstreams/account-native/transport-proxy') {
-    if (init?.cache !== 'no-store') throw new Error('Proxy reads must not be cached');
-    const snapshot = JSON.stringify({ account_id: account.id, proxy_url: proxyUrl, supported: true, proxy_network_scope: 'private', source: 'manual', configuration_state: 'applied', selected_member_id: selectedProxy, updated_at: account.updated_at, credential_generation: account.credential_generation });
-    if (window.deferNextFormProxyRead) {
-      window.deferNextFormProxyRead = false;
-      // Ignore AbortSignal to prove a late response cannot re-publish a prior
-      // credential generation's original URL after a successful save.
-      return new Promise<Response>(resolve => { releaseProxy = () => resolve(new Response(snapshot)); });
-    }
-    return new Response(snapshot, { headers: { 'Cache-Control': 'private, no-store' } });
-  }
   if (/^\/internal\/v1\/upstreams\/[^/]+\/quota$/.test(path)) {
     const knownAccounts = [account, ...(createdProvider ? [createdProvider] : [])];
     const value = knownAccounts.find(value => path === '/internal/v1/upstreams/' + value.id + '/quota' && value.tenant_external_id === url.searchParams.get('tenant_external_id') && value.status === 'active');

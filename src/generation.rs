@@ -959,8 +959,7 @@ async fn poll_siliconflow_video(
 }
 
 fn siliconflow_poll_delay_millis(attempt_count: i64) -> i64 {
-    let exponent =
-        u32::try_from(attempt_count.saturating_sub(1).div_euclid(5)).unwrap_or(4);
+    let exponent = u32::try_from(attempt_count.saturating_sub(1).div_euclid(5)).unwrap_or(4);
     2_000_i64.saturating_mul(2_i64.saturating_pow(exponent))
 }
 

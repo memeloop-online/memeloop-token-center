@@ -293,9 +293,6 @@ test('Helm chart packaging, security, ingress, and schema contracts', () => {
     const sqlite = Math.max(...migrationVersions('common'), ...migrationVersions('sqlite'));
     const postgres = Math.max(...migrationVersions('common'), ...migrationVersions('postgres'));
     assert.equal(sqlite, postgres);
-    assert.equal(Number(/^  schemaVersion: ([0-9]+)$/m.exec(read('charts/memeloop-token-center/values.yaml'))?.[1]), sqlite);
-    const valuesSchema = JSON.parse(read('charts/memeloop-token-center/values.schema.json'));
-    assert.equal(valuesSchema.properties.migration.properties.schemaVersion.const, sqlite);
     has('default', `memeloop.io/schema-generation: "v${sqlite}"`);
     count('default', 'image: "ghcr.io/memeloop-online/memeloop-token-center:v0.1.3"', 4);
     count('digest', `image: "ghcr.io/memeloop-online/memeloop-token-center@${reviewed}"`, 4); lacks('digest', 'must-not-render');
@@ -404,7 +401,7 @@ test('Helm chart packaging, security, ingress, and schema contracts', () => {
       assert.notEqual(result.status, 0, `chart accepted config.${key}=${value}`);
       assert.ok(result.stderr.includes(key), `expected validation error for config.${key}: ${result.stderr}`);
     }
-    const oldSchema = spawnSync(helm, ['template', 'invalid-old-schema', chart, '--set', 'migration.schemaVersion=58'], { cwd: repository, encoding: 'utf8', shell: false });
+    const oldSchema = spawnSync(helm, ['template', 'invalid-old-schema', chart, '--set', `migration.schemaVersion=${sqlite - 1}`], { cwd: repository, encoding: 'utf8', shell: false });
     for (const values of [
       ['roles.gateway.resources.limits.memory=1Gi'],
       ['roles.gateway.resources.limits.memory=2303Mi'],
@@ -415,7 +412,10 @@ test('Helm chart packaging, security, ingress, and schema contracts', () => {
       assert.notEqual(result.status, 0, `memory cross-field gate accepted ${values.join(',')}`);
       assert.match(result.stderr, /memory must cover config.proxyMemoryBudgetBytes plus 256Mi/);
     }
-    assert.notEqual(oldSchema.status, 0, 'release values schema accepted migration.schemaVersion=58');
+    assert.notEqual(oldSchema.status, 0, 'chart accepted a schema override from the previous migration');
+    assert.match(oldSchema.stderr, /migration.schemaVersion must match chart schema generation/);
+    const matchingSchema = run(helm, ['template', 'matching-schema', chart, '--set', `migration.schemaVersion=${sqlite}`]);
+    assert.ok(matchingSchema.includes(`memeloop.io/schema-generation: "v${sqlite}"`));
     for (const budget of ['268435456', '805306368']) {
       const result = spawnSync(helm, ['template', 'body-memory-budget', chart,
         '--set', 'config.responsesBodyMaxBytes=67108864',

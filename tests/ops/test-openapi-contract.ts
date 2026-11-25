@@ -564,8 +564,9 @@ test("both quarantine APIs enforce shared tenant authority and keep separate ide
   const image = readFileSync(`${repository}/src/api/image_generation_quarantine.rs`, "utf8");
   const functionBody = (source: string, name: string) => {
     const match = source.match(new RegExp(`^pub\\(super\\) (?:async )?fn ${name}\\([\\s\\S]*?\\{\\n([\\s\\S]*?)^}`, "m"));
-    assert.ok(match, `missing function ${name}`);
-    return match[1];
+    const body = match?.[1];
+    assert.ok(body !== undefined, `missing function ${name}`);
+    return body;
   };
   const actor = functionBody(generation, "actor");
   assert.match(actor, /require_service\(headers,\s*state,\s*scope\)\.await\?/);

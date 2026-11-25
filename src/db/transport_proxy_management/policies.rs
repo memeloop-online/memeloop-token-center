@@ -70,22 +70,18 @@ impl UpdateProxySelection {
     }
 }
 
-impl Database {
-    pub(crate) async fn get_network_proxy_selection(
-        &self,
-        account: Uuid,
-        external: &str,
-    ) -> Result<Value, AppError> {
-        let row = sqlx::query("SELECT a.id, a.config_json AS account_config_json, a.credential_generation, a.updated_at AS account_updated_at, COALESCE(b.version, 0) AS binding_version, p.version, CASE WHEN p.mode IS NULL AND b.group_id IS NOT NULL THEN 'auto' ELSE p.mode END AS mode, p.proxy_id, COALESCE(p.group_id, b.group_id) AS group_id, p.plugin_id, p.plugin_version, p.config_json AS policy_config_json FROM upstream_accounts a JOIN tenants t ON t.id = a.tenant_id LEFT JOIN transport_proxy_bindings b ON b.account_id = a.id LEFT JOIN network_proxy_selection_policies p ON p.account_id = a.id WHERE a.id = $1 AND t.external_id = $2")
-            .bind(account.to_string()).bind(external).fetch_optional(&self.pool).await?.ok_or(AppError::NotFound)?;
-        let config: Value = serde_json::from_str(&row.try_get::<String, _>("account_config_json")?)
-            .map_err(|_| invalid())?;
-        let configuration_revision = config
-            .get(CONFIG_KEY)
-            .and_then(|stamp| stamp.get("selection_version"))
-            .and_then(Value::as_i64);
-        Ok(
-            serde_json::json!({"configuration_revision": configuration_revision, "account_id": account, "tenant_external_id": external,
+fn selection_from_row(
+    row: &AnyRow,
+    config: &Value,
+    account: Uuid,
+    external: &str,
+) -> Result<Value, AppError> {
+    let configuration_revision = config
+        .get(CONFIG_KEY)
+        .and_then(|stamp| stamp.get("selection_version"))
+        .and_then(Value::as_i64);
+    Ok(
+        serde_json::json!({"configuration_revision": configuration_revision, "account_id": account, "tenant_external_id": external,
             "selection_version": row.try_get::<Option<i64>, _>("version")?.unwrap_or(0),
             "binding_version": row.try_get::<i64, _>("binding_version")?,
             "credential_generation": row.try_get::<i64, _>("credential_generation")?,
@@ -94,7 +90,75 @@ impl Database {
                 "proxy_id": row.try_get::<Option<String>, _>("proxy_id")?, "group_id": row.try_get::<Option<String>, _>("group_id")?,
                 "plugin_id": row.try_get::<Option<String>, _>("plugin_id")?, "plugin_version": row.try_get::<Option<String>, _>("plugin_version")?,
                 "config": serde_json::from_str::<Value>(&row.try_get::<Option<String>, _>("policy_config_json")?.unwrap_or_else(|| "{}".into())).map_err(|_| invalid())?}}),
-        )
+    )
+}
+
+impl Database {
+    async fn network_proxy_selection_row(
+        &self,
+        account: Uuid,
+        external: &str,
+        with_credential: bool,
+    ) -> Result<Option<AnyRow>, AppError> {
+        let (credential_columns, credential_join) = if with_credential {
+            (
+                ", c.credential_ciphertext",
+                " LEFT JOIN upstream_credentials c ON c.upstream_account_id = a.id AND c.generation = a.credential_generation",
+            )
+        } else {
+            ("", "")
+        };
+        let sql = format!(
+            "SELECT a.config_json AS account_config_json, a.credential_generation, a.updated_at AS account_updated_at, COALESCE(b.version, 0) AS binding_version, p.version, CASE WHEN p.mode IS NULL AND b.group_id IS NOT NULL THEN 'auto' ELSE p.mode END AS mode, p.proxy_id, COALESCE(p.group_id, b.group_id) AS group_id, p.plugin_id, p.plugin_version, p.config_json AS policy_config_json{credential_columns} FROM upstream_accounts a JOIN tenants t ON t.id = a.tenant_id LEFT JOIN transport_proxy_bindings b ON b.account_id = a.id LEFT JOIN network_proxy_selection_policies p ON p.account_id = a.id{credential_join} WHERE a.id = $1 AND t.external_id = $2"
+        );
+        Ok(sqlx::query(sqlx::AssertSqlSafe(sql))
+            .bind(account.to_string())
+            .bind(external)
+            .fetch_optional(&self.pool)
+            .await?)
+    }
+
+    pub(crate) async fn get_network_proxy_selection(
+        &self,
+        account: Uuid,
+        external: &str,
+    ) -> Result<Value, AppError> {
+        let row = self
+            .network_proxy_selection_row(account, external, false)
+            .await?
+            .ok_or(AppError::NotFound)?;
+        let config = serde_json::from_str(&row.try_get::<String, _>("account_config_json")?)
+            .map_err(|_| invalid())?;
+        selection_from_row(&row, &config, account, external)
+    }
+
+    /// One scoped statement binds the desired selection and credential generation
+    /// to the same database snapshot. Retained revoked credentials remain readable.
+    pub(crate) async fn network_proxy_settings_snapshot(
+        &self,
+        account: Uuid,
+        external: &str,
+        key: &[u8],
+    ) -> Result<(Value, Value, UpstreamCredential, i64, i64), AppError> {
+        let row = self
+            .network_proxy_selection_row(account, external, true)
+            .await?
+            .ok_or(AppError::Forbidden)?;
+        let ciphertext = row
+            .try_get::<Option<String>, _>("credential_ciphertext")?
+            .ok_or(AppError::NotFound)?;
+        let credential = open_credential(&ciphertext, key)?;
+        let config = serde_json::from_str(&row.try_get::<String, _>("account_config_json")?)
+            .map_err(|_| invalid())?;
+        let selection = selection_from_row(&row, &config, account, external)?;
+        let config = credential.hydrate_provider_adapter_config(config)?;
+        Ok((
+            selection,
+            config,
+            credential,
+            row.try_get("credential_generation")?,
+            row.try_get("account_updated_at")?,
+        ))
     }
 
     pub(crate) async fn update_network_proxy_selection(

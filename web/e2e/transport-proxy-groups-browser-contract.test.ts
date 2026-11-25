@@ -18,6 +18,12 @@ interface ProxyGroupFixture {
   binding: TransportProxyBinding;
   reads: number;
   accessReads: number;
+  policyReads: string[];
+  holdPolicyDirectory?: boolean;
+  holdPolicyAccount?: boolean;
+  denyPolicyAfterSave?: boolean;
+  releasePolicyAccount?: () => void;
+  releasePolicyDirectory?: () => void;
   accessFailure?: boolean;
   writes: Array<{ path: string; method: string; body: Record<string, any> }>;
   failure?: { status: number; code: string };
@@ -48,7 +54,7 @@ async function installFixture(page: Page, allowed = true, locale = 'zh-CN', tab:
   await page.evaluate(({ allowed, secret, proxy, selection, strategies, concurrency, observations }) => {
     const previousFetch = window.fetch;
     const state: ProxyGroupFixture = window.proxyGroupFixture = {
-      allowed, groups: [], reads: 0, accessReads: 0, writes: [], holdNext: false, policies: [],
+      allowed, groups: [], reads: 0, accessReads: 0, policyReads: [], writes: [], holdNext: false, policies: [],
       proxies: [proxy], selection,
       binding: {
         account_id: 'account-native', tenant_external_id: 'fixture', binding_version: 0,
@@ -62,6 +68,7 @@ async function installFixture(page: Page, allowed = true, locale = 'zh-CN', tab:
       const entityApi = url.pathname === '/internal/v1/transport-proxies' || url.pathname.startsWith('/internal/v1/transport-proxies/')
         || url.pathname === '/internal/v1/transport-proxy-strategies' || url.pathname === '/internal/v1/upstream-concurrency'
         || url.pathname.endsWith('/transport-proxy-selection');
+      if (method === 'GET' && ['/internal/v1/transport-proxies', '/internal/v1/transport-proxy-groups', '/internal/v1/transport-proxy-strategies'].includes(url.pathname)) state.policyReads.push(url.pathname);
       if (entityApi) {
         state.policies.push(init?.cache === 'no-store' && init?.credentials === 'omit' && init?.referrerPolicy === 'no-referrer');
         if (!state.allowed) return new Response(JSON.stringify({ error: { code: 'forbidden', message: secret } }), { status: 403 });
@@ -69,11 +76,16 @@ async function installFixture(page: Page, allowed = true, locale = 'zh-CN', tab:
           if (url.searchParams.get('tenant_external_id') !== 'fixture') throw new Error('missing entity read tenant');
           state.reads += 1;
           if (url.pathname === '/internal/v1/transport-proxies') {
-            return new Response(JSON.stringify({ items: state.proxies.map(proxy => {
+            const response = new Response(JSON.stringify({ items: state.proxies.map(proxy => {
               const item: NetworkProxy = { ...proxy };
               delete item.group_ids; delete item.bound_account_count;
               return item;
             }) }));
+            if (state.holdPolicyDirectory) {
+              state.holdPolicyDirectory = false;
+              await new Promise<void>(resolve => { state.releasePolicyDirectory = resolve; });
+            }
+            return response;
           }
           if (url.pathname.endsWith('/observations')) {
             const id = url.pathname.split('/')[4];
@@ -82,7 +94,7 @@ async function installFixture(page: Page, allowed = true, locale = 'zh-CN', tab:
           }
           if (url.pathname === '/internal/v1/transport-proxy-strategies') return new Response(JSON.stringify({ items: strategies }));
           if (url.pathname === '/internal/v1/upstream-concurrency') return new Response(JSON.stringify(concurrency));
-          if (url.pathname.endsWith('/transport-proxy-selection')) return new Response(JSON.stringify(state.selection));
+          throw new Error(`Unexpected entity read: ${url.pathname}`);
         }
         const body = JSON.parse(String(init?.body ?? '{}'));
         state.writes.push({ path: `${url.pathname}${url.search}`, method, body });
@@ -130,15 +142,27 @@ async function installFixture(page: Page, allowed = true, locale = 'zh-CN', tab:
         return new Response(JSON.stringify(saved), { status: method === 'POST' ? 201 : 200 });
       }
       if (url.pathname.endsWith('/transport-proxy') && method === 'GET') {
+        state.policyReads.push(url.pathname);
+        state.policies.push(init?.cache === 'no-store' && init?.credentials === 'omit' && init?.referrerPolicy === 'no-referrer');
+        if (!state.allowed || (state.denyPolicyAfterSave && state.writes.some(write => write.method === 'PUT' && write.path.endsWith('/transport-proxy-selection')))) {
+          return new Response(JSON.stringify({ error: { code: 'forbidden', message: secret } }), { status: 403 });
+        }
         const selection = state.selection;
-        return new Response(JSON.stringify({ account_id: selection.account_id,
+        if (url.pathname !== `/internal/v1/upstreams/${selection.account_id}/transport-proxy`
+          || url.searchParams.get('tenant_external_id') !== selection.tenant_external_id) throw new Error('invalid account snapshot scope');
+        const response = new Response(JSON.stringify({ account_id: selection.account_id,
           updated_at: selection.account_updated_at, credential_generation: selection.credential_generation,
           source: ['manual', 'auto', 'plugin'].includes(selection.desired.mode) ? selection.desired.mode : 'credential',
           proxy_id: selection.desired.proxy_id, group_id: selection.desired.group_id, selected_member_id: null,
           configuration_state: selection.desired.mode === 'credential' ? 'credential' : 'pending',
           proxy_url: 'socks5h://10.20.30.40:1080',
-          ...state.effective,
+          ...state.effective, selection,
         }));
+        if (state.holdPolicyAccount) {
+          state.holdPolicyAccount = false;
+          await new Promise<void>(resolve => { state.releasePolicyAccount = resolve; });
+        }
+        return response;
       }
       if (!url.pathname.includes('transport-proxy-group')) return previousFetch(input, init);
       state.policies.push(init?.cache === 'no-store' && init?.credentials === 'omit' && init?.referrerPolicy === 'no-referrer');
@@ -479,6 +503,32 @@ test('transport proxy groups: CRUD, policies, validation, CAS, secrets, permissi
       await page.close();
     });
 
+    await context.test('a denied policy readback clears private state after the write was accepted', async () => {
+      const page = await prepare(true, 'zh-CN', 'policies');
+      const copy = networkProxyCopy('zh-CN');
+      const workspace = page.locator('.network-proxy-policy-workspace');
+      await workspace.getByRole('button', { name: '研发订阅', exact: true }).click();
+      await workspace.getByLabel(fieldLabel(copy.targetProxy)).selectOption(csilProxy.id);
+      const save = workspace.getByRole('button', { name: copy.savePolicy, exact: true });
+      const before = await page.evaluate(() => window.proxyGroupFixture.policyReads.length);
+      await page.evaluate(() => { window.proxyGroupFixture.denyPolicyAfterSave = true; });
+      await save.click();
+      await workspace.getByRole('alert').getByText(copy.errors.denied, { exact: true }).waitFor();
+      await workspace.getByText(copy.policySaved, { exact: true }).waitFor();
+      assert.equal(await workspace.locator('.network-proxy-policy-summary').count(), 0);
+      assert.equal(await workspace.getByLabel(fieldLabel(copy.targetProxy)).count(), 0);
+      assert.equal(await save.count(), 0);
+      await assertSecretsAbsent(page);
+      const { writes, reads } = await page.evaluate(before => ({
+        writes: window.proxyGroupFixture.writes,
+        reads: window.proxyGroupFixture.policyReads.slice(before),
+      }), before);
+      assert.equal(writes.length, 1);
+      assert.equal(writes[0].method, 'PUT');
+      assert.deepEqual(reads, ['/internal/v1/upstreams/account-native/transport-proxy']);
+      await page.close();
+    });
+
     await context.test('English group workspace explains the feature instead of reporting permission status', async () => {
       const page = await prepare(true, 'en');
       const workspace = page.locator('.transport-proxy-workspace');
@@ -682,16 +732,63 @@ test('transport proxy groups: CRUD, policies, validation, CAS, secrets, permissi
         state.effective = { source: 'manual', configuration_state: 'applied', proxy_id: state.proxies[0].id, selected_member_id: 'selected-backup', proxy_url: 'socks5h://10.20.30.41:1080' };
       });
       const policies = page.locator('.network-proxy-policy-workspace');
-      await policies.getByRole('button', { name: copy.refresh, exact: true }).click();
-      await policies.getByRole('button', { name: '研发订阅', exact: true }).click();
+      const account = policies.getByRole('button', { name: '研发订阅', exact: true });
+      const refresh = policies.getByRole('button', { name: copy.refresh, exact: true });
+      const catalogPaths = ['/internal/v1/transport-proxies', '/internal/v1/transport-proxy-groups', '/internal/v1/transport-proxy-strategies'];
+      const accountPath = '/internal/v1/upstreams/account-native/transport-proxy';
+      const reads = () => page.evaluate(() => [...window.proxyGroupFixture.policyReads].sort());
+      const resetReads = () => page.evaluate(() => { window.proxyGroupFixture.policyReads = []; });
+      await account.waitFor();
+      await resetReads();
+      await refresh.click();
+      await account.waitFor();
+      await page.waitForFunction(() => !document.querySelector<HTMLButtonElement>('.network-proxy-account-list button')?.disabled);
+      assert.deepEqual(await reads(), [...catalogPaths].sort(), 'refresh with no account only reads the three catalogs');
+      await resetReads();
+      await account.click();
       const exit = policies.getByText(copy.effectiveExit, { exact: true }).locator('..').locator('dd');
       await exit.getByText('实际备用出口', { exact: true }).waitFor();
       assert.equal(await exit.textContent(), '实际备用出口');
-      await page.evaluate(() => { window.proxyGroupFixture.effective = { source: 'manual', configuration_state: 'pending', proxy_id: window.proxyGroupFixture.proxies[0].id, selected_member_id: null, proxy_url: null }; });
-      await policies.getByRole('button', { name: copy.refresh, exact: true }).click();
+      assert.deepEqual(await reads(), [accountPath], 'account switching makes one scoped read');
+      await resetReads();
+      await page.evaluate(() => {
+        const state = window.proxyGroupFixture;
+        state.holdPolicyDirectory = true;
+        state.effective = { source: 'manual', configuration_state: 'pending', proxy_id: state.proxies[0].id, selected_member_id: null, proxy_url: null };
+      });
+      try {
+        await refresh.click();
+        await page.waitForFunction(path => Boolean(window.proxyGroupFixture.releasePolicyDirectory) && window.proxyGroupFixture.policyReads.includes(path), accountPath);
+        assert.deepEqual(await reads(), [...catalogPaths, accountPath].sort(), 'all four reads start before the directory resolves');
+        assert.equal(await exit.count(), 0, 'unresolved refresh does not render a partial snapshot');
+      } finally {
+        await page.evaluate(() => { window.proxyGroupFixture.releasePolicyDirectory?.(); window.proxyGroupFixture.releasePolicyDirectory = undefined; });
+      }
       await exit.getByText(copy.appliedPending, { exact: true }).waitFor();
       assert.equal(await exit.textContent(), copy.appliedPending);
       assert.notEqual(await exit.textContent(), copy.directExit);
+      await page.evaluate(() => {
+        const state = window.proxyGroupFixture;
+        state.holdPolicyAccount = true;
+        state.effective = { ...state.effective, configuration_state: 'applied', selected_member_id: 'selected-backup' };
+      });
+      try {
+        await refresh.click();
+        await page.waitForFunction(() => Boolean(window.proxyGroupFixture.releasePolicyAccount));
+        await page.evaluate(() => {
+          const state = window.proxyGroupFixture;
+          state.effective = { ...state.effective, configuration_state: 'pending', selected_member_id: null };
+        });
+        await page.getByRole('tab', { name: transportProxyGroupCopy('zh-CN').title, exact: true }).click();
+        await policies.waitFor({ state: 'detached' });
+        await page.getByRole('tab', { name: copy.policiesTab, exact: true }).click();
+        await account.click();
+        await exit.getByText(copy.appliedPending, { exact: true }).waitFor();
+      } finally {
+        await page.evaluate(() => { window.proxyGroupFixture.releasePolicyAccount?.(); window.proxyGroupFixture.releasePolicyAccount = undefined; });
+      }
+      await page.evaluate(() => new Promise<void>(resolve => requestAnimationFrame(() => requestAnimationFrame(() => resolve()))));
+      assert.equal(await exit.textContent(), copy.appliedPending, 'a response from the abandoned policy workspace cannot change the reopened account');
       await page.close();
     });
 

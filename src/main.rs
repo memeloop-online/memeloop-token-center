@@ -241,12 +241,27 @@ async fn run() -> Result<(), &'static str> {
             let state = AppState::initialize_for_maintenance(maintenance_config)
                 .await
                 .map_err(|_| "terminal_recovery_initialization_failed")?;
-            let report = state.db.recover_one_terminal_projection(
-                memeloop_token_center::db::TerminalRecoveryIdentity { request_id, tenant_id, key_id, account_id, reservation_id, created_at }, apply
-            ).await.map_err(|_| {
-                tracing::error!(code = "terminal_recovery_failed", "terminal recovery failed");
-                "terminal_recovery_failed"
-            })?;
+            let report = state
+                .db
+                .recover_one_terminal_projection(
+                    memeloop_token_center::db::TerminalRecoveryIdentity {
+                        request_id,
+                        tenant_id,
+                        key_id,
+                        account_id,
+                        reservation_id,
+                        created_at,
+                    },
+                    apply,
+                )
+                .await
+                .map_err(|_| {
+                    tracing::error!(
+                        code = "terminal_recovery_failed",
+                        "terminal recovery failed"
+                    );
+                    "terminal_recovery_failed"
+                })?;
             println!(
                 "{}",
                 serde_json::to_string(&report).map_err(|_| "terminal_recovery_report_failed")?

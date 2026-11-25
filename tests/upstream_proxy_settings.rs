@@ -28,7 +28,12 @@ async fn get(state: &AppState, path: &str, token: &str) -> (StatusCode, Option<S
         .get(header::CACHE_CONTROL)
         .map(|value| value.to_str().unwrap().to_owned());
     let bytes = to_bytes(response.into_body(), 1024 * 1024).await.unwrap();
-    (status, cache, serde_json::from_slice(&bytes).unwrap())
+    (
+        status,
+        cache,
+        serde_json::from_slice(&bytes)
+            .unwrap_or_else(|_| Value::String(String::from_utf8_lossy(&bytes).into_owned())),
+    )
 }
 
 async fn put(
@@ -143,6 +148,14 @@ async fn explicit_proxy_read_preserves_full_url_but_excludes_other_secrets_and_r
             "/internal/v1/upstreams/{}/transport-proxy?tenant_external_id=proxy-tenant",
             account.id
         );
+        for invalid_path in [
+            path.split('?').next().unwrap().to_owned(),
+            path.replace(&account.id.to_string(), "invalid-account-id"),
+        ] {
+            let (status, cache, _) = get(&state, &invalid_path, &tokens[0]).await;
+            assert_eq!(status, StatusCode::BAD_REQUEST);
+            assert_eq!(cache.as_deref(), Some("private, no-store"));
+        }
         let (status, cache, body) = get(&state, &path, &tokens[0]).await;
         assert_eq!(status, StatusCode::OK);
         assert_eq!(cache.as_deref(), Some("private, no-store"));
@@ -166,6 +179,7 @@ async fn explicit_proxy_read_preserves_full_url_but_excludes_other_secrets_and_r
                 "group_id",
                 "selected_member_id",
                 "configuration_state",
+                "selection",
             ])
         );
         assert_eq!(body["source"], "credential");
@@ -177,6 +191,14 @@ async fn explicit_proxy_read_preserves_full_url_but_excludes_other_secrets_and_r
         assert_eq!(body["account_id"], account.id.to_string());
         assert_eq!(body["updated_at"], account.updated_at);
         assert_eq!(body["credential_generation"], account.credential_generation);
+        assert_eq!(body["selection"]["account_id"], body["account_id"]);
+        assert_eq!(
+            body["selection"]["credential_generation"],
+            body["credential_generation"]
+        );
+        assert_eq!(body["selection"]["account_updated_at"], body["updated_at"]);
+        assert_eq!(body["selection"]["desired"]["mode"], body["source"]);
+
         assert_eq!(
             body["proxy_url"],
             if configured {
@@ -202,7 +224,9 @@ async fn explicit_proxy_read_preserves_full_url_but_excludes_other_secrets_and_r
             assert!(!body.to_string().contains(secret));
         }
         for token in &tokens[1..] {
-            assert_eq!(get(&state, &path, token).await.0, StatusCode::FORBIDDEN);
+            let (status, cache, _) = get(&state, &path, token).await;
+            assert_eq!(status, StatusCode::FORBIDDEN);
+            assert_eq!(cache.as_deref(), Some("private, no-store"));
         }
         assert_eq!(
             get(
@@ -284,10 +308,19 @@ async fn explicit_proxy_read_preserves_full_url_but_excludes_other_secrets_and_r
             stored_account.credential_generation,
             account.credential_generation + 1
         );
+        let (status, cache, current) = get(&state, &path, &tokens[0]).await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(cache.as_deref(), Some("private, no-store"));
+        assert_eq!(current["proxy_url"], replacement);
         assert_eq!(
-            get(&state, &path, &tokens[0]).await.2["proxy_url"],
-            replacement
+            current["selection"]["credential_generation"],
+            stored_account.credential_generation
         );
+        assert_eq!(
+            current["selection"]["account_updated_at"],
+            stored_account.updated_at
+        );
+        assert_eq!(current["selection"]["desired"]["mode"], current["source"]);
         let replay = put(&state, edit_path, &tokens[0], &edit_key, &update).await;
         assert_eq!(replay.0, StatusCode::OK);
         assert_eq!(

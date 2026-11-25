@@ -37,9 +37,8 @@ fullnameOverride: ""
 
 migration:
   enabled: true
-  # Must equal the greatest migration registered by the release binary.
-  # The packaging contract rejects drift between this value and migrations/.
-  schemaVersion: 161
+  # The chart records the release schema generation; legacy overlays may
+  # specify schemaVersion only if it matches that generation.
   # The hook is the only component that applies schema migrations. Application
   # Deployments always set MTC_RUN_MIGRATIONS_ON_START=false.
   backoffLimit: 4

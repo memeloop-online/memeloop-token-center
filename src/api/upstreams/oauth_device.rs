@@ -1,9 +1,7 @@
 use super::super::*;
 use super::{
-    accounts::{
-        validate_provider_config_schema, validate_provider_schema, validate_upstream_destination,
-    },
-    oauth::reauthorization_target,
+    accounts::{validate_provider_schema, validate_upstream_destination},
+    oauth::fixed_oauth_start_config,
 };
 use crate::oauth::{copilot, kimi_device, managed::kimi};
 
@@ -61,27 +59,17 @@ impl DeviceProvider {
         }
 
         let (driver, oauth_driver) = self.drivers();
-        let config = if let Some(account_id) = request.upstream_account_id {
-            state
-                .db
-                .upstream_account_for_reauthorization(account_id, &request.tenant_external_id)
-                .await?
-                .config
-        } else {
-            match self {
-                Self::Kimi => kimi::native_import_config(),
-                Self::Copilot => json!({"base_url": copilot::BASE_URL, "network_scope": "public"}),
-            }
-        };
-        validate_provider_config_schema(state, driver, &config)?;
-        let target = reauthorization_target(
+        let (config, target) = fixed_oauth_start_config(
             state,
             request.upstream_account_id,
             &request.tenant_external_id,
             &request.account_name,
             driver,
-            &config,
             oauth_driver,
+            || match self {
+                Self::Kimi => kimi::native_import_config(),
+                Self::Copilot => json!({"base_url": copilot::BASE_URL, "network_scope": "public"}),
+            },
         )
         .await?;
         let proxy_url = if let Some(target) = &target {

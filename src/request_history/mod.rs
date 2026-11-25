@@ -11,8 +11,8 @@ mod session_tasks;
 mod sessions;
 mod statistics;
 mod target;
-pub(crate) use target::HistoryTargetIdentity;
 pub(crate) use statistics::StatisticsAccumulator;
+pub(crate) use target::HistoryTargetIdentity;
 mod usage;
 
 pub use clickhouse::ClickHouse;

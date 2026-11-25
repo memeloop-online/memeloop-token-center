@@ -187,6 +187,7 @@ export function networkProxyError(reason: unknown, locale = 'zh-CN', operation: 
 }
 
 export interface AccountProxyConnection {
+  selection: NetworkProxySelection;
   account_id: string;
   credential_generation: number;
   updated_at: number;

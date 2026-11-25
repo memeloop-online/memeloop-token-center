@@ -19,6 +19,7 @@ struct ProxySettings {
     proxy_id: Option<Uuid>,
     group_id: Option<Uuid>,
     selected_member_id: Option<Uuid>,
+    selection: serde_json::Value,
     configuration_state: &'static str,
 }
 
@@ -28,24 +29,17 @@ pub(in crate::api) async fn get_upstream_proxy_settings(
     Path(account_id): Path<Uuid>,
     Query(query): Query<ProxySettingsQuery>,
 ) -> Result<impl IntoResponse, AppError> {
+    let tenant = &query.tenant_external_id;
     // Same authority as changing private transport proxies. Check both the
     // selected tenant and its account before opening the encrypted credential.
     let service = require_service(&headers, &state, "providers:write").await?;
-    require_service_tenant(&service, &query.tenant_external_id)?;
+    require_service_tenant(&service, tenant)?;
     require_global_service(&service)?;
-    state
+    let (mut policy, config, credential, credential_generation, updated_at) = state
         .db
-        .require_upstream_tenant(account_id, &query.tenant_external_id)
-        .await?;
-    let (account, credential, _, _) = state
-        .db
-        .upstream_account_with_current_credential(account_id, state.config.key_pepper.as_bytes())
+        .network_proxy_settings_snapshot(account_id, tenant, state.config.key_pepper.as_bytes())
         .await?;
     // Build a dedicated projection; never serialize the credential or account.
-    let mut policy = state
-        .db
-        .get_network_proxy_selection(account_id, &query.tenant_external_id)
-        .await?;
     state
         .transport_proxy_groups
         .describe_network_proxy_selection(account_id, &mut policy);
@@ -55,9 +49,9 @@ pub(in crate::api) async fn get_upstream_proxy_settings(
         .to_owned();
     let selected = state.transport_proxy_groups.select_config(
         account_id,
-        account.credential_generation,
+        credential_generation,
         &credential,
-        &account.config,
+        &config,
     );
     let configuration_state = if selected.is_err() {
         "pending"
@@ -77,8 +71,8 @@ pub(in crate::api) async fn get_upstream_proxy_settings(
         account_id,
         proxy_url: proxy.map(|(url, _)| url.to_owned()),
         proxy_network_scope: proxy.map(|(_, scope)| scope),
-        updated_at: account.updated_at,
-        credential_generation: account.credential_generation,
+        updated_at,
+        credential_generation,
         supported: credential.supports_transport_proxy(),
         source,
         proxy_id: identity(&policy["desired"]["proxy_id"]),
@@ -88,7 +82,8 @@ pub(in crate::api) async fn get_upstream_proxy_settings(
             .ok()
             .and_then(|selection| selection.egress_snapshot())
             .and_then(|egress| egress.member_id),
+        selection: policy,
         configuration_state,
     };
-    Ok(([(header::CACHE_CONTROL, "private, no-store")], Json(body)))
+    Ok(Json(body))
 }

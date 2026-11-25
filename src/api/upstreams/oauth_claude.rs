@@ -1,10 +1,7 @@
 use super::super::*;
 use super::{
-    accounts::{
-        validate_provider_config_schema, validate_provider_schema,
-        validate_upstream_destination_with_proxy,
-    },
-    oauth::reauthorization_target,
+    accounts::{validate_provider_schema, validate_upstream_destination_with_proxy},
+    oauth::fixed_oauth_start_config,
 };
 use crate::oauth::claude;
 
@@ -47,24 +44,14 @@ pub(in crate::api) async fn start_claude_oauth(
             state.config.allow_oauth_loopback,
         )?;
     }
-    let provider_config = if let Some(account_id) = body.upstream_account_id {
-        state
-            .db
-            .upstream_account_for_reauthorization(account_id, &body.tenant_external_id)
-            .await?
-            .config
-    } else {
-        json!({"base_url": "https://api.anthropic.com", "network_scope": "public"})
-    };
-    validate_provider_config_schema(&state, claude::PROVIDER_DRIVER, &provider_config)?;
-    let reauthorize = reauthorization_target(
+    let (provider_config, reauthorize) = fixed_oauth_start_config(
         &state,
         body.upstream_account_id,
         &body.tenant_external_id,
         &body.account_name,
         claude::PROVIDER_DRIVER,
-        &provider_config,
         claude::OAUTH_DRIVER,
+        || json!({"base_url": "https://api.anthropic.com", "network_scope": "public"}),
     )
     .await?;
     let session_proxy_url = match (reauthorize.as_ref(), body.proxy_url) {
@@ -478,6 +465,55 @@ mod tests {
         clearing["proxy_url"] = Value::Null;
         let result = start(&state, &scoped, clearing).await;
         assert!(matches!(result, Err(AppError::Forbidden)));
+    }
+
+    #[tokio::test]
+    async fn reauthorization_http_start_only_creates_one_session_for_the_scoped_account() {
+        use tower::ServiceExt;
+
+        let (_directory, state, account_id) = world().await;
+        let scoped = service_token(&state, Some(TENANT)).await;
+        let global = service_token(&state, None).await;
+        let control =
+            crate::api::router_for_role(state.clone(), crate::config::RuntimeRole::Control);
+        let send = |token: &str, body: Value| {
+            control.clone().oneshot(
+                axum::http::Request::post("/internal/v1/oauth/claude/start")
+                    .header(axum::http::header::AUTHORIZATION, format!("Bearer {token}"))
+                    .header(axum::http::header::CONTENT_TYPE, "application/json")
+                    .body(axum::body::Body::from(body.to_string()))
+                    .unwrap(),
+            )
+        };
+
+        let mut other_tenant = reauthorization_body(account_id);
+        other_tenant["tenant_external_id"] = json!("other-tenant");
+        for token in [&scoped, &global] {
+            let response = send(token, other_tenant.clone()).await.unwrap();
+            assert_eq!(response.status(), StatusCode::FORBIDDEN);
+        }
+        let mut wrong_name = reauthorization_body(account_id);
+        wrong_name["account_name"] = json!("other-account");
+        assert_eq!(
+            send(&scoped, wrong_name).await.unwrap().status(),
+            StatusCode::CONFLICT
+        );
+
+        let response = send(&scoped, reauthorization_body(account_id))
+            .await
+            .unwrap();
+        assert_eq!(
+            started_session_proxy(&state, response).await.as_deref(),
+            Some(EXISTING_PROXY)
+        );
+        let pool = sqlx::AnyPool::connect(&state.config.database_url)
+            .await
+            .unwrap();
+        let session_count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM oauth_login_sessions")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        assert_eq!(session_count, 1);
     }
 
     #[tokio::test]

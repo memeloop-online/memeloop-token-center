@@ -285,6 +285,13 @@ async fn provider_adapter_reauthorization_restores_only_the_current_secret_confi
         "label": "unchanged",
         "client_secret": "synthetic-current-secret"
     });
+    use base64::{Engine, engine::general_purpose::URL_SAFE_NO_PAD};
+    let public_config = json!({"base_url":"https://provider.example/api","label":"unchanged"});
+    // Use the persisted split-account shape written by provider adapter completion.
+    let encrypted_credential_patch = URL_SAFE_NO_PAD.encode(
+        serde_json::to_vec(&json!([{"path":["client_secret"],"value":config["client_secret"]}]))
+            .unwrap(),
+    );
     let account = state
         .db
         .create_upstream_account(
@@ -292,14 +299,16 @@ async fn provider_adapter_reauthorization_restores_only_the_current_secret_confi
                 tenant_external_id: tenant.into(),
                 name: "reauthorize-me".into(),
                 driver: "oauth-static-secret".into(),
-                config: config.clone(),
+                config: public_config.clone(),
                 credential: UpstreamCredential::OAuth {
                     access_token: "synthetic-access".into(),
                     refresh_token: Some("synthetic-refresh".into()),
                     expires_at: Some(memeloop_token_center::db::unix_millis() + 3_600_000),
                     header: "authorization".into(),
                     prefix: "Bearer ".into(),
-                    adapter_state: None,
+                    adapter_state: Some(json!({
+                        "__mtc_provider_config_secret_patch_v1": encrypted_credential_patch
+                    })),
                     proxy_url: Some("socks5h://127.0.0.1:1080".into()),
                     proxy_network_scope: Some(
                         memeloop_token_center::network::OutboundScope::Private,
@@ -321,8 +330,17 @@ async fn provider_adapter_reauthorization_restores_only_the_current_secret_confi
     )
     .await;
     assert_eq!(status, StatusCode::OK);
-    let public_config = json!({"base_url":"https://provider.example/api","label":"unchanged"});
     assert_eq!(listed[0]["config"], public_config);
+    let persisted_config: String =
+        sqlx::query_scalar("SELECT config_json FROM upstream_accounts WHERE id = $1")
+            .bind(account.id.to_string())
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+    assert_eq!(
+        serde_json::from_str::<Value>(&persisted_config).unwrap(),
+        public_config
+    );
     assert!(!listed.to_string().contains("synthetic-current-secret"));
 
     let start = |provider_config: Value| {
