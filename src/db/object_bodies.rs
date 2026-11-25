@@ -100,6 +100,15 @@ impl Database {
                 .await
             {
                 Ok(crate::archive::RawReaderAuthority::Canonical(_)) => {}
+                Err(
+                    error @ AppError::Storage {
+                        code:
+                            "raw_retirement_invalid"
+                            | "raw_retirement_coverage_invalid"
+                            | "archive_cas_reference_invalid",
+                        ..
+                    },
+                ) => return Err(error),
                 Ok(_) | Err(AppError::Storage { .. }) => return Ok(refs),
                 Err(error) => return Err(error),
             }
