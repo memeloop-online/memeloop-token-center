@@ -2613,6 +2613,10 @@ async fn queued_archive_event_contract(url: String) {
 
 #[tokio::test]
 async fn postgres_exact_legacy_body_rebuild_preserves_incomplete_and_financial_receipt() {
+    let _ = tracing_subscriber::fmt()
+        .with_max_level(tracing::Level::DEBUG)
+        .with_test_writer()
+        .try_init();
     let database_url =
         std::env::var("MTC_TEST_POSTGRES_URL").expect("exact recovery requires PostgreSQL");
     let isolated = PostgresTestDatabase::create(&database_url).await;
