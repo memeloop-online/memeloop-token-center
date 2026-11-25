@@ -152,6 +152,16 @@ async fn postgres_blocked_request_insert_does_not_hold_shared_key_budget() {
     let Some(fixture) = Fixture::postgres().await else {
         return;
     };
+    // The selected upstream model must be in the INSERT, not a second UPDATE.
+    for statement in [
+        "CREATE FUNCTION reject_model_rewrite() RETURNS trigger LANGUAGE plpgsql AS $$ BEGIN RAISE EXCEPTION 'unexpected admission model rewrite'; END $$",
+        "CREATE TRIGGER reject_model_rewrite BEFORE UPDATE OF upstream_model ON request_records FOR EACH ROW EXECUTE FUNCTION reject_model_rewrite()",
+    ] {
+        sqlx::query(statement)
+            .execute(&fixture.database.pool)
+            .await
+            .unwrap();
+    }
     let mut blocker = fixture.admin.begin().await.unwrap();
     let blocker_pid: i32 = sqlx::query_scalar("SELECT pg_backend_pid()")
         .fetch_one(&mut *blocker)
@@ -353,5 +363,151 @@ async fn postgres_resize_waits_for_key_without_blocking_once_only_settlement() {
         8
     );
     assert_eq!(fixture.amounts().await, (999_992, 0, 8, 0));
+    fixture.close().await;
+}
+
+#[tokio::test]
+async fn postgres_started_draft_known_partition_limits_relations_while_cursor_waits() {
+    let Ok(database_url) = std::env::var("MTC_TEST_POSTGRES_URL") else {
+        assert!(std::env::var_os("CI").is_none());
+        return;
+    };
+    let pool = sqlx::PgPool::connect(&database_url).await.unwrap();
+    let mut blocker = pool.begin().await.unwrap();
+    sqlx::query("SELECT pg_advisory_xact_lock($1,$2)")
+        .bind(REQUEST_EVENT_CURSOR_LOCK_NAMESPACE)
+        .bind(REQUEST_EVENT_CURSOR_LOCK_KEY)
+        .execute(&mut *blocker)
+        .await
+        .unwrap();
+    let mut counts = Vec::new();
+    for bounded in [false, true] {
+        let mut tx = pool.begin().await.unwrap();
+        let pid: i32 = sqlx::query_scalar("SELECT pg_backend_pid()")
+            .fetch_one(&mut *tx)
+            .await
+            .unwrap();
+        for statement in [
+            "CREATE TEMP TABLE request_records(id TEXT, tenant_id TEXT, key_id TEXT, created_at BIGINT) PARTITION BY RANGE(created_at)",
+            "CREATE TEMP TABLE draft_old PARTITION OF request_records FOR VALUES FROM(0) TO(1000)",
+            "CREATE TEMP TABLE draft_current PARTITION OF request_records FOR VALUES FROM(1000) TO(2000)",
+            "CREATE TEMP TABLE draft_new PARTITION OF request_records FOR VALUES FROM(2000) TO(3000)",
+            "CREATE INDEX ON request_records(id)",
+            "INSERT INTO request_records VALUES('request','tenant','key',1500)",
+        ] {
+            sqlx::query(statement).execute(&mut *tx).await.unwrap();
+        }
+        let sql = if bounded {
+            STARTED_EVENT_DRAFT_SQL.to_owned()
+        } else {
+            STARTED_EVENT_DRAFT_SQL.replace(" AND created_at = $5", "")
+        };
+        let row = sqlx::query(sqlx::AssertSqlSafe(sql))
+            .bind("event")
+            .bind("tenant")
+            .bind("key")
+            .bind("request")
+            .bind(1500_i64)
+            .bind("openai")
+            .bind("model")
+            .fetch_one(&mut *tx)
+            .await
+            .unwrap();
+        assert_eq!(row.try_get::<String, _>("request_id").unwrap(), "request");
+        let pending = tokio::spawn(async move {
+            sqlx::query("SELECT pg_advisory_xact_lock($1,$2)")
+                .bind(REQUEST_EVENT_CURSOR_LOCK_NAMESPACE)
+                .bind(REQUEST_EVENT_CURSOR_LOCK_KEY)
+                .execute(&mut *tx)
+                .await
+                .unwrap();
+            tx.rollback().await.unwrap();
+        });
+        tokio::time::timeout(Duration::from_secs(5), async {
+            loop {
+                let waiting: bool = sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM pg_stat_activity WHERE pid=$1 AND wait_event='advisory')")
+                    .bind(pid).fetch_one(&pool).await.unwrap();
+                if waiting { break; }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        }).await.unwrap();
+        let relations: Vec<String> = sqlx::query_scalar("SELECT DISTINCT c.relname FROM pg_locks l JOIN pg_class c ON c.oid=l.relation WHERE l.pid=$1 AND l.granted AND l.mode='AccessShareLock' AND c.relname LIKE 'draft_%' ORDER BY c.relname")
+            .bind(pid).fetch_all(&pool).await.unwrap();
+        assert!(relations.iter().any(|name| name == "draft_current"));
+        if bounded {
+            assert!(
+                !relations
+                    .iter()
+                    .any(|name| name.starts_with("draft_old") || name.starts_with("draft_new")),
+                "{relations:?}"
+            );
+        } else {
+            assert!(relations.iter().any(|name| name == "draft_old"));
+            assert!(relations.iter().any(|name| name == "draft_new"));
+        }
+        counts.push(relations.len());
+        pending.abort();
+        let _ = pending.await;
+        // The dropped contender rolls back; the global cursor blocker remains held.
+    }
+    assert!(counts[1] < counts[0], "{counts:?}");
+    blocker.rollback().await.unwrap();
+    pool.close().await;
+}
+
+#[tokio::test]
+async fn postgres_admission_model_insert_matches_previous_final_record() {
+    let Some(fixture) = Fixture::postgres().await else {
+        return;
+    };
+    let request = NewRequest {
+        request_id: Uuid::now_v7(),
+        tenant_id: fixture.key.tenant_id,
+        key_id: fixture.key.key_id,
+        reservation_id: Uuid::now_v7(),
+        protocol: "openai".into(),
+        model: "admission-model".into(),
+        request_object: "gap://fixture/request".into(),
+        upstream_account_id: None,
+        model_route_id: None,
+    };
+    let now = unix_millis();
+    let mut values = Vec::new();
+    for combined in [false, true] {
+        let mut tx = fixture.database.begin_write_transaction().await.unwrap();
+        if combined {
+            insert_request_started_record_with_model_in_transaction(
+                &mut tx,
+                &request,
+                now,
+                Some("selected-model"),
+            )
+            .await
+            .unwrap();
+        } else {
+            insert_request_started_record_in_transaction(&mut tx, &request, now)
+                .await
+                .unwrap();
+            sqlx::query(ADMISSION_UPSTREAM_MODEL_UPDATE)
+                .bind("selected-model")
+                .bind(request.request_id.to_string())
+                .bind(request.reservation_id.to_string())
+                .bind(now)
+                .execute(&mut *tx)
+                .await
+                .unwrap();
+        }
+        let record: String = sqlx::query_scalar(
+            "SELECT CAST(to_jsonb(r) AS TEXT) FROM request_records r WHERE id=$1 AND created_at=$2",
+        )
+        .bind(request.request_id.to_string())
+        .bind(now)
+        .fetch_one(&mut *tx)
+        .await
+        .unwrap();
+        values.push(serde_json::from_str::<Value>(&record).unwrap());
+        tx.rollback().await.unwrap();
+    }
+    assert_eq!(values[0], values[1]);
     fixture.close().await;
 }
