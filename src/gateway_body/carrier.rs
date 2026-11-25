@@ -382,8 +382,11 @@ impl BodyCarrier {
             hash.update(&chunk);
             if let Some(credit) = credit {
                 let retained = source.memory.try_reserve_carrier_retained(chunk.len());
-                // Already credited Bytes transfer directly, without awaiting
-                // an optional remote spill or reacquiring their allocation.
+                if retained.is_none() {
+                    // Preserve the existing response tap's opportunistic spill:
+                    // credited streams can exceed source RAM over their lifetime.
+                    let _ = source.offload_one().await;
+                }
                 let bytes = source.leased_bytes(chunk, credit, retained);
                 source.segments.push(Mutex::new(Segment::Ram(bytes)));
                 continue;

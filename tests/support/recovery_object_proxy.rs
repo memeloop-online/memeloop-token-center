@@ -161,6 +161,16 @@ impl RecoveryObjectProxy {
             gate.release();
         }
         faults.gets.clear();
+        for gate in [
+            faults.part_gate.take(),
+            faults.abort_gate.take(),
+            faults.body_put_gate.take(),
+        ]
+        .into_iter()
+        .flatten()
+        {
+            gate.release();
+        }
     }
     pub(crate) fn failed_puts(&self) -> usize {
         self.state.failed_puts.load(Ordering::SeqCst)
@@ -168,9 +178,7 @@ impl RecoveryObjectProxy {
 }
 impl Drop for RecoveryObjectProxy {
     fn drop(&mut self) {
-        for gate in self.state.faults.lock().unwrap().gets.values() {
-            gate.release();
-        }
+        self.clear_faults();
         self.task.abort();
     }
 }
