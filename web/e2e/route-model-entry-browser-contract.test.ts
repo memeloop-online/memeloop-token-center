@@ -97,17 +97,18 @@ test('real route forms submit explicit model intent, preserve edit policies and 
 
     for (const confirmed of [false, true]) {
       const page = await open(`existing=1&catalog=failed&confirmed=${confirmed}&driver=openai-codex`, 'en', 1440);
-      await page.getByRole('button', { name: 'Edit', exact: true }).click();
-      const editor = page.getByRole('dialog', { name: 'Edit saved-route', exact: true });
+      const savedRoute = page.getByRole('row').filter({ has: page.getByText('saved-route', { exact: true }) });
+      await savedRoute.getByRole('button', { name: 'Edit', exact: true }).click();
+      const editor = page.getByRole('region', { name: 'Edit saved-route', exact: true });
       await editor.waitFor();
-      await page.locator('.catalog-status').getByRole('button', { name: 'Retry', exact: true }).waitFor();
-      await page.getByLabel(/Public model/).fill('renamed-route');
-      await page.getByRole('button', { name: 'Routing priority', exact: true }).click();
+      await editor.locator('.catalog-status').getByRole('button', { name: 'Retry', exact: true }).waitFor();
+      await editor.getByLabel(/Public model/).fill('renamed-route');
+      await editor.getByRole('button', { name: 'Routing priority', exact: true }).click();
       const priority = editor.getByRole('spinbutton', { name: 'Priority', exact: true });
       await priority.fill('7.5');
       assert.equal(await editor.getByRole('button', { name: 'Save', exact: true }).isDisabled(), true);
       await priority.fill('7');
-      assert.match(await page.locator('.model-combobox').innerText(), /trusted model metadata or a verified reservation bound/);
+      assert.match(await editor.locator('.model-combobox').innerText(), /trusted model metadata or a verified reservation bound/);
       const save = editor.getByRole('button', { name: 'Save', exact: true });
       assert.equal(await save.isEnabled(), true);
       if (confirmed) await capture(page, 'codex-unchanged-en-1440');

@@ -673,8 +673,16 @@ jobs:
             expected_versions="$(find migrations/common "migrations/$backend" -maxdepth 1 -name '[0-9][0-9][0-9][0-9]_*.sql' -printf '%f\n' |
               awk -F_ '{print $1 + 0}' | sort -nu)"
             test -n "$expected_versions"
+            check_migration_ledger() {
+              # v142 is a Rust data conversion recorded by the migrate CLI
+              # separately from the SQL migrations; require both.
+              diff -u --label "$backend expected SQL versions" --label "$backend applied SQL versions" \
+                <(printf '%s\n' "$expected_versions") \
+                <(sql 'SELECT version FROM schema_migrations WHERE version <> 142 ORDER BY version')
+              test "$(sql 'SELECT name FROM schema_migrations WHERE version = 142')" = 'plaintext state instead of sealed envelopes'
+            }
             cargo run --locked --bin memeloop-token-center -- migrate
-            test "$(sql 'SELECT version FROM schema_migrations ORDER BY version')" = "$expected_versions"
+            check_migration_ledger
 
             # Restore the schema-159 activation fixture by undoing all known later
             # changes, on an empty smoke database. Keep the boundary fixed so the
@@ -704,7 +712,7 @@ jobs:
               VALUES ('ci-schema-159',7,19,'ci-snapshot','source_complete',1,2)"
 
             cargo run --locked --bin memeloop-token-center -- migrate
-            test "$(sql 'SELECT version FROM schema_migrations ORDER BY version')" = "$expected_versions"
+            check_migration_ledger
             test "$(sql 'SELECT phase FROM request_history_activation WHERE id = 1 AND epoch = 0')" = legacy
             test "$(sql "SELECT ceiling FROM request_history_baseline_runs
               WHERE owner = 'ci-schema-159' AND epoch = 7 AND status = 'source_complete'

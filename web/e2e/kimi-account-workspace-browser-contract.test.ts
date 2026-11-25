@@ -98,10 +98,16 @@ test('account recovery uses the production shell and workspace with contained Fl
         assert.match(await badge.innerText(), reason);
         assert.equal(await workspace.getByRole('button', { name: '重新登录', exact: true }).isVisible(), true);
         await badge.focus();
-        await page.getByRole('tooltip').filter({ hasText: reason }).waitFor();
-        assert.match(await page.getByRole('tooltip').innerText(), /自动续期已暂停/);
-        await badge.press('Tab');
-        await page.getByRole('tooltip').waitFor({ state: 'hidden' });
+        const renewalTooltip = page.getByRole('tooltip').filter({ hasText: reason });
+        await renewalTooltip.waitFor({ state: 'visible' });
+        const tooltipId = await renewalTooltip.getAttribute('id');
+        assert.ok(tooltipId && (await badge.getAttribute('aria-describedby'))?.split(/\s+/).includes(tooltipId),
+          'the renewal badge describes its own tooltip');
+        assert.match(await renewalTooltip.innerText(), /自动续期已暂停/);
+        await page.keyboard.press('Escape');
+        await page.locator(`[role="tooltip"][id=${JSON.stringify(tooltipId)}]`).waitFor({ state: 'hidden' });
+        assert.equal(await badge.evaluate(element => document.activeElement === element), true,
+          'dismissing the tooltip leaves focus on its badge');
         await page.screenshot({ path: join(artifacts, `kimi-workspace-${accountId}-${theme}-${width}.png`), fullPage: true });
       }
       const workspace = await manageProviderAccount(page, 'codex-recovery');
