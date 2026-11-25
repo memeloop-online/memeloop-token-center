@@ -109,7 +109,7 @@ async fn postgres_capability_reader_permissions_do_not_authorize_gateway_writes(
         .execute(&db.pool)
         .await
         .unwrap();
-    let schema: String = sqlx::query_scalar("SELECT current_schema()")
+    let schema: String = sqlx::query_scalar("SELECT current_schema()::text")
         .fetch_one(&db.pool)
         .await
         .unwrap();
