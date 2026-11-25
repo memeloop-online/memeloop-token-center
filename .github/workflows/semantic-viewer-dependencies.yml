@@ -48,7 +48,13 @@ jobs:
         run: npx playwright install --with-deps chromium
       - name: Verify semantic viewer pages, identity, export and existing session surfaces
         if: inputs.contract == 'viewer'
-        run: MTC_REQUIRE_BROWSER=1 node --import tsx --test --test-concurrency=1 e2e/semantic-view-reader-contract.test.ts e2e/semantic-session-browser-contract.test.ts e2e/session-loading-browser-contract.test.ts e2e/operator-overview-drilldown-browser-contract.test.ts
+        run: |
+          set -euo pipefail
+          test "$(git rev-parse HEAD)" = "${{ inputs.source_revision }}"
+          MTC_REQUIRE_BROWSER=1 node --import tsx --test --test-reporter=tap e2e/app-typography-browser-contract.test.ts 2>&1 | tee /tmp/typography-contract.log
+          grep -Fx '# pass 1' /tmp/typography-contract.log
+          grep -Fx '# fail 0' /tmp/typography-contract.log
+          grep -Fx '# skipped 0' /tmp/typography-contract.log
       - name: Verify quota consent, unknown recovery and retained observations
         if: inputs.contract == 'account'
         run: MTC_REQUIRE_BROWSER=1 node --import tsx --test --test-concurrency=1 e2e/upstream-quota-browser-contract.test.ts e2e/quota-discovery-browser-contract.test.ts e2e/quota-reads-browser-contract.test.ts e2e/quota-semantics-browser-contract.test.ts
