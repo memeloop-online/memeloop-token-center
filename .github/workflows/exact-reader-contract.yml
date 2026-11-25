@@ -504,6 +504,8 @@ jobs:
           git rev-parse HEAD
           cargo test --locked --all-features --lib db::requests::conversations::archive_readiness_tests::postgres_coverage_read_does_not_block_body_worker -- --exact --nocapture 2>&1 | tee /tmp/projection-scheduler.log
           grep -F '1 passed; 0 failed' /tmp/projection-scheduler.log
+          cargo test --locked --all-features --lib db::requests::conversations::prefix_storage::tests::postgres_prefix_preload_releases_projection_scope_before_graph_receive -- --ignored --exact --nocapture 2>&1 | tee /tmp/projection-roots-retry.log
+          grep -F '1 passed; 0 failed' /tmp/projection-roots-retry.log
 
   legacy-archive-bound-contract:
     if: inputs.contract == 'legacy-archive-bound'
