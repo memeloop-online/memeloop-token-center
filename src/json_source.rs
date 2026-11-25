@@ -656,10 +656,12 @@ mod carrier_cancel_tests {
             config.s3_secret_key = Some(std::env::var("MTC_RUSTFS_TEST_SECRET_KEY").unwrap());
             config.s3_allow_http = true;
         }
-        let (archive, store) = ArchiveStore::from_config(&config)
-            .await
-            .unwrap()
-            .with_read_delay_for_test();
+        let archive = if proxy.is_some() {
+            ArchiveStore::from_config(&config).await.unwrap()
+        } else {
+            ArchiveStore::single_put_memory_transport_for_test()
+        };
+        let (archive, store) = archive.with_read_delay_for_test();
         let memory = Arc::new(ProxyMemoryBudget::new(256 * 1024));
         let id = uuid::Uuid::new_v4();
         let key = ArchiveStagingKey::new(
@@ -677,25 +679,6 @@ mod carrier_cancel_tests {
         .await
         .unwrap();
         body.seal_to_objects().await.unwrap();
-        if proxy.is_none() {
-            // Model the remote transport copy: the in-process backend must not
-            // keep the uploaded allocation (and its ingress lease) alive.
-            use futures_util::TryStreamExt;
-            use object_store::{ObjectStore, ObjectStoreExt};
-            let objects: Vec<_> = store.list(None).try_collect().await.unwrap();
-            for object in objects {
-                let bytes = store
-                    .get(&object.location)
-                    .await
-                    .unwrap()
-                    .bytes()
-                    .await
-                    .unwrap();
-                let copied = bytes::Bytes::copy_from_slice(&bytes);
-                drop(bytes);
-                store.put(&object.location, copied.into()).await.unwrap();
-            }
-        }
         assert_eq!(memory.snapshot().0, 0);
         let source = Arc::downgrade(&body);
         let get_gate = proxy.as_ref().map(|proxy| {
