@@ -668,6 +668,8 @@ jobs:
           git rev-parse HEAD
           test "$(git rev-parse HEAD)" = "${{ inputs.source_revision }}"
           cargo check --locked --lib
+          cargo test --locked --lib db::requests::session_attribution::tests::optional_legacy_hints_never_block_the_primary_request_surface -- --exact --nocapture 2>&1 | tee /tmp/session-attribution.log
+          grep -F '1 passed; 0 failed' /tmp/session-attribution.log
           cargo test --locked --lib db::requests::session_attribution::tests::captured_identity_preserves_provenance_without_confirming_shared_sessions -- --exact --nocapture 2>&1 | tee /tmp/session-attribution.log
           grep -F '1 passed; 0 failed' /tmp/session-attribution.log
           cargo test --locked --lib db::requests::session_attribution::tests::legacy_session_context_round_trip_preserves_frozen_payload_shape -- --exact --nocapture 2>&1 | tee /tmp/session-attribution.log
