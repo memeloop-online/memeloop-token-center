@@ -1,9 +1,9 @@
 //! Observe actual relation locks held by the production candidate transaction.
 use super::*;
 
-async fn locked_request_children(fixture: &PgFixture, pid: i32) -> Vec<String> {
-    sqlx::query_scalar("SELECT DISTINCT c.relname FROM pg_locks l JOIN pg_class c ON c.oid=l.relation JOIN pg_namespace n ON n.oid=c.relnamespace WHERE l.pid=$1 AND l.granted AND n.nspname=$2 AND c.oid IN (SELECT relid FROM pg_partition_tree('request_records'::regclass) WHERE isleaf) ORDER BY c.relname")
-        .bind(pid).bind(&fixture.schema).fetch_all(&fixture.db.pool).await.unwrap()
+async fn locked_request_children(fixture: &PgFixture, pid: i32, indexes: bool) -> Vec<String> {
+    sqlx::query_scalar("SELECT DISTINCT c.relname FROM pg_locks l JOIN pg_class c ON c.oid=l.relation JOIN pg_namespace n ON n.oid=c.relnamespace WHERE l.pid=$1 AND l.granted AND n.nspname=$2 AND c.oid IN (SELECT relid FROM pg_partition_tree('request_records'::regclass) WHERE isleaf AND NOT $3 UNION ALL SELECT i.indexrelid FROM pg_index i JOIN pg_partition_tree('request_records'::regclass) p ON p.relid=i.indrelid WHERE p.isleaf AND $3) ORDER BY c.relname")
+        .bind(pid).bind(&fixture.schema).bind(indexes).fetch_all(&fixture.db.pool).await.unwrap()
 }
 
 #[tokio::test]
@@ -47,7 +47,7 @@ async fn verify_partition_claim(purpose: BufferedArchivePurpose) {
         .unwrap();
     sqlx::query(sqlx::AssertSqlSafe(spool_sql(purpose, "SELECT s.request_id FROM response_archive_spools s JOIN request_records r ON r.id=s.request_id AND r.tenant_id=s.tenant_id AND r.reservation_id=s.reservation_id WHERE s.request_id=$1 FOR UPDATE OF s")))
         .bind(fixture.id.request_id.to_string()).fetch_one(&mut *old).await.unwrap();
-    let old_locks = locked_request_children(&fixture, old_pid).await;
+    let old_locks = locked_request_children(&fixture, old_pid, false).await;
     assert!(
         old_locks
             .iter()
@@ -58,6 +58,7 @@ async fn verify_partition_claim(purpose: BufferedArchivePurpose) {
             .iter()
             .any(|name| name == "request_records_unrelated_late")
     );
+    let old_indexes = locked_request_children(&fixture, old_pid, true).await;
     old.rollback().await.unwrap();
     let (mut tx, row) = fixture
         .db
@@ -73,7 +74,7 @@ async fn verify_partition_claim(purpose: BufferedArchivePurpose) {
         .fetch_one(&mut *tx)
         .await
         .unwrap();
-    let locks = locked_request_children(&fixture, pid).await;
+    let locks = locked_request_children(&fixture, pid, false).await;
     assert!(!locks.is_empty());
     assert!(
         !locks
@@ -81,10 +82,19 @@ async fn verify_partition_claim(purpose: BufferedArchivePurpose) {
             .any(|name| name.starts_with("request_records_unrelated_")),
         "{locks:?}"
     );
+    let indexes = locked_request_children(&fixture, pid, true).await;
+    assert!(
+        !indexes
+            .iter()
+            .any(|name| name.starts_with("request_records_unrelated_")),
+        "{indexes:?}"
+    );
     eprintln!(
-        "SPOOL_PARTITION_LOCKS old={} new={}",
+        "SPOOL_PARTITION_LOCKS tables_old={} tables_new={} indexes_old={} indexes_new={}",
         old_locks.len(),
-        locks.len()
+        locks.len(),
+        old_indexes.len(),
+        indexes.len()
     );
     assert!(
         fixture
@@ -147,5 +157,39 @@ async fn verify_partition_claim(purpose: BufferedArchivePurpose) {
             .is_none(),
         "future task remains ineligible"
     );
+    // More than one traversal page of journal-only identities must not hide
+    // the later authoritative request or accumulate request partition locks.
+    sqlx::query(sqlx::AssertSqlSafe(spool_sql(
+        purpose,
+        "UPDATE response_archive_spools SET next_attempt_at=$1 WHERE request_id=$2",
+    )))
+    .bind(now)
+    .bind(fixture.id.request_id.to_string())
+    .execute(&fixture.db.pool)
+    .await
+    .unwrap();
+    sqlx::query(sqlx::AssertSqlSafe(spool_sql(purpose, "INSERT INTO response_archive_spools(request_id,tenant_id,reservation_id,state,next_attempt_at,created_at,updated_at,expires_at) SELECT md5('missing-locator-' || n::text)::uuid::text,$1,$2,'pending',$3-1,$3,$3,$3+60000 FROM generate_series(1,65) n")))
+        .bind(fixture.id.tenant_id.to_string()).bind(fixture.id.reservation_id.to_string()).bind(now).execute(&fixture.db.pool).await.unwrap();
+    let (mut tx, row) = fixture
+        .db
+        .partitioned_archive_spool_candidate(purpose, now)
+        .await
+        .unwrap()
+        .expect("eligible task after 65 missing locators");
+    assert_eq!(
+        row.try_get::<String, _>("request_id").unwrap(),
+        fixture.id.request_id.to_string()
+    );
+    let pid: i32 = sqlx::query_scalar("SELECT pg_backend_pid()")
+        .fetch_one(&mut *tx)
+        .await
+        .unwrap();
+    assert!(
+        !locked_request_children(&fixture, pid, false)
+            .await
+            .iter()
+            .any(|name| name.starts_with("request_records_unrelated_"))
+    );
+    tx.rollback().await.unwrap();
     fixture.finish().await;
 }
