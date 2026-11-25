@@ -159,7 +159,7 @@ async fn forwarding_admission_snapshot_commits_and_failures_roll_back_for_both_m
             assert_admission_snapshot_fault_schema(&database, mode, name, true).await;
             let mut probe = database.begin_write_transaction().await.unwrap();
             let fired = sqlx::query(
-                "INSERT INTO request_records (id, tenant_id, key_id, created_at, protocol, model, request_object, reservation_id, upstream_model) SELECT $1, tenant_id, key_id, created_at, protocol, model, request_object, reservation_id, $2 FROM request_records WHERE id = $3 AND created_at = $4",
+                "INSERT INTO request_records (id, tenant_id, key_id, created_at, protocol, model, request_object, reservation_id, upstream_model, input_tokens, output_tokens, cost_micros) SELECT $1, tenant_id, key_id, created_at, protocol, model, request_object, reservation_id, $2, input_tokens, output_tokens, cost_micros FROM request_records WHERE id = $3 AND created_at = $4",
             )
             .bind(Uuid::now_v7().to_string())
             .bind(fault_model)
@@ -209,7 +209,7 @@ async fn forwarding_admission_snapshot_commits_and_failures_roll_back_for_both_m
         let mut healthy_probe = database.begin_write_transaction().await.unwrap();
         let healthy_id = Uuid::now_v7();
         let healthy = sqlx::query(
-            "INSERT INTO request_records (id, tenant_id, key_id, created_at, protocol, model, request_object, reservation_id, upstream_model) SELECT $1, tenant_id, key_id, created_at, protocol, model, request_object, reservation_id, $2 FROM request_records WHERE id = $3 AND created_at = $4",
+            "INSERT INTO request_records (id, tenant_id, key_id, created_at, protocol, model, request_object, reservation_id, upstream_model, input_tokens, output_tokens, cost_micros) SELECT $1, tenant_id, key_id, created_at, protocol, model, request_object, reservation_id, $2, input_tokens, output_tokens, cost_micros FROM request_records WHERE id = $3 AND created_at = $4",
         )
         .bind(healthy_id.to_string())
         .bind(&snapshot.0)
