@@ -107,25 +107,28 @@ async fn exercise(db: &Database, client: Option<&crate::request_history::ClickHo
         // Interrupt after the first INSERT but while the second unique key is
         // held elsewhere. The whole page, including its cursor, must roll back.
         let mut held = db.pool.begin().await.unwrap();
-        let holder: i64 = sqlx::query_scalar("SELECT pg_backend_pid()::BIGINT")
+        sqlx::query("INSERT INTO request_history_export(source,request_id,tenant_id,key_id,created_at) VALUES('event',$1,$2,$3,100)")
+            .bind(ids[0]).bind(key.tenant_id.to_string()).bind(key.key_id.to_string()).execute(&mut *held).await.unwrap();
+        let timed_out = db
+            .history_backfill_expected_page(2, &expected)
+            .await
+            .unwrap_err();
+        match timed_out {
+            HistoryError::Sql(error) => assert_eq!(
+                error
+                    .as_database_error()
+                    .and_then(|error| error.code())
+                    .as_deref(),
+                Some("55P03")
+            ),
+            other => panic!("expected maintenance lock budget failure: {other:?}"),
+        }
+        // The unrelated writer was not cancelled by maintenance timeout.
+        let alive: i64 = sqlx::query_scalar("SELECT 1::BIGINT")
             .fetch_one(&mut *held)
             .await
             .unwrap();
-        sqlx::query("INSERT INTO request_history_export(source,request_id,tenant_id,key_id,created_at) VALUES('event',$1,$2,$3,100)")
-            .bind(ids[0]).bind(key.tenant_id.to_string()).bind(key.key_id.to_string()).execute(&mut *held).await.unwrap();
-        let worker = db.clone();
-        let resume = expected.clone();
-        let task =
-            tokio::spawn(async move { worker.history_backfill_expected_page(2, &resume).await });
-        tokio::time::timeout(std::time::Duration::from_secs(10),async {
-            loop {
-                let blocked:bool=sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM pg_stat_activity a WHERE $1=ANY(pg_blocking_pids(a.pid)::BIGINT[]))").bind(holder).fetch_one(&db.pool).await.unwrap();
-                if blocked {break;}
-                tokio::time::sleep(std::time::Duration::from_millis(20)).await;
-            }
-        }).await.expect("page must reach the held second key");
-        task.abort();
-        assert!(task.await.unwrap_err().is_cancelled());
+        assert_eq!(alive, 1);
         held.rollback().await.unwrap();
         // Waiting for the rolled-back checkpoint row proves the dropped SQLx
         // transaction released its connection before checking partial inserts.
@@ -137,6 +140,20 @@ async fn exercise(db: &Database, client: Option<&crate::request_history::ClickHo
         check.rollback().await.unwrap();
         assert_eq!(fingerprint(db).await, before);
     }
+    // A source key with another tenant is not a delivered/pending obligation.
+    sqlx::query("INSERT INTO request_history_export(source,request_id,tenant_id,key_id,created_at) VALUES('event',$1,$2,$3,100)")
+        .bind(ids[1]).bind(Uuid::now_v7().to_string()).bind(key.key_id.to_string()).execute(&db.pool).await.unwrap();
+    let collision = fingerprint(db).await;
+    assert!(matches!(
+        db.history_backfill_expected_page(1, &expected).await,
+        Err(HistoryError::Changed)
+    ));
+    assert_eq!(fingerprint(db).await, collision);
+    sqlx::query("DELETE FROM request_history_export WHERE source='event' AND request_id=$1")
+        .bind(ids[1])
+        .execute(&db.pool)
+        .await
+        .unwrap();
     let first = db
         .history_backfill_expected_page(1, &expected)
         .await
@@ -168,6 +185,15 @@ async fn exercise(db: &Database, client: Option<&crate::request_history::ClickHo
     // A pre-existing journal row is pending conflict, never covered or ACK.
     sqlx::query("INSERT INTO request_history_export(source,request_id,tenant_id,key_id,created_at) VALUES('event',$1,$2,$3,100)")
         .bind(ids[0]).bind(key.tenant_id.to_string()).bind(key.key_id.to_string()).execute(&db.pool).await.unwrap();
+    let pending_revision: i64 = sqlx::query_scalar(
+        "SELECT revision FROM request_history_export WHERE source='event' AND request_id=$1",
+    )
+    .bind(ids[0])
+    .fetch_one(&db.pool)
+    .await
+    .unwrap();
+    sqlx::query("INSERT INTO request_history_identities(source,request_id,tenant_id,key_id,created_at,head_revision,acknowledged_revision,acknowledged_hash) VALUES('event',$1,$2,$3,100,$4,$4,$5)")
+        .bind(ids[0]).bind(key.tenant_id.to_string()).bind(key.key_id.to_string()).bind(pending_revision-1).bind("a".repeat(64)).execute(&db.pool).await.unwrap();
     let second = db
         .clone()
         .history_backfill_expected_page(1, &second_expected)
@@ -184,6 +210,12 @@ async fn exercise(db: &Database, client: Option<&crate::request_history::ClickHo
         (1, 0, 0, 1)
     );
     assert_eq!(second.identities[0]["proof"], "journal_pending");
+    assert_eq!(second.identities[0]["revision"], pending_revision);
+    assert_eq!(
+        second.identities[0]["acknowledged_revision"],
+        pending_revision - 1
+    );
+    assert_eq!(second.identities[0]["revision_acknowledged"], false);
     let final_page = db
         .history_backfill_expected_page(1, &second.after.unwrap())
         .await

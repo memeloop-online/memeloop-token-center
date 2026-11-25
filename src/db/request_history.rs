@@ -511,13 +511,17 @@ impl Database {
                 "expected checkpoint page size must be 1..64",
             ));
         }
-        self.history_backfill_source_page_after_ready(
-            page_size,
-            Some(source),
-            Some(expected),
-            std::future::ready(Ok(())),
+        tokio::time::timeout(
+            std::time::Duration::from_secs(8),
+            self.history_backfill_source_page_after_ready(
+                page_size,
+                Some(source),
+                Some(expected),
+                std::future::ready(Ok(())),
+            ),
         )
         .await
+        .map_err(|_| HistoryError::Changed)?
     }
 
     async fn history_backfill_source_page_after_ready(
@@ -541,6 +545,16 @@ impl Database {
         ready.await?;
         let mut transaction = self.pool.begin().await?;
         if matches!(self.backend, DatabaseBackend::PostgreSql) {
+            if expected.is_some() {
+                // Maintenance-only limits: rollback this page on contention;
+                // never change request/worker pool defaults or retry here.
+                sqlx::query("SET LOCAL lock_timeout='100ms'")
+                    .execute(&mut *transaction)
+                    .await?;
+                sqlx::query("SET LOCAL statement_timeout='5s'")
+                    .execute(&mut *transaction)
+                    .await?;
+            }
             // Backfill also allocates global revisions and must participate in
             // the same commit barrier as source triggers.
             sqlx::query(if expected.is_some() {
@@ -579,7 +593,7 @@ impl Database {
             ""
         };
         let sql = format!(
-            "SELECT source, after_id, after_created_at, legacy_after_id, done FROM request_history_backfill WHERE (done=0 OR $2=1) AND (CAST($1 AS TEXT) IS NULL OR source=$1) ORDER BY source LIMIT 1{lock}"
+            "SELECT source, after_id, after_created_at, legacy_after_id, done FROM request_history_backfill WHERE (CAST($1 AS TEXT) IS NULL OR source=$1) AND (done=0 OR $2=1) ORDER BY source LIMIT 1{lock}"
         );
         let Some(checkpoint) = sqlx::query(sqlx::AssertSqlSafe(sql))
             .bind(source.map(crate::request_history::HistorySource::as_str))
@@ -678,38 +692,44 @@ impl Database {
                 .bind(&source).bind(&id).bind(&tenant).bind(&key).bind(created).fetch_optional(&mut *transaction).await?;
             let journal_exists = journal.is_some();
             let mut revision = None;
-            let mut acknowledged = false;
-            let mut acknowledged_hash: Option<String> = None;
+            let mut acknowledged_revision = None;
+            let mut acknowledged_hash = None;
             let mut immutable_present = false;
             if let Some(journal) = journal {
-                if journal.try_get::<String, _>("tenant_id")? == tenant
-                    && journal.try_get::<String, _>("key_id")? == key
-                    && journal.try_get::<i64, _>("created_at")? == created
+                if journal.try_get::<String, _>("tenant_id")? != tenant
+                    || journal.try_get::<String, _>("key_id")? != key
+                    || journal.try_get::<i64, _>("created_at")? != created
                 {
-                    revision = Some(journal.try_get::<i64, _>("revision")?);
+                    return Err(HistoryError::Changed);
                 }
+                revision = Some(journal.try_get::<i64, _>("revision")?);
             }
             if let Some(receipt) = receipt {
                 let head: i64 = receipt.try_get("head_revision")?;
                 let ack: Option<i64> = receipt.try_get("acknowledged_revision")?;
                 let hash: Option<String> = receipt.try_get("acknowledged_hash")?;
-                acknowledged = ack == Some(head)
-                    && hash.as_ref().is_some_and(|hash| {
-                        hash.len() == 64 && hash.bytes().all(|byte| byte.is_ascii_hexdigit())
-                    });
-                if acknowledged {
-                    acknowledged_hash = hash;
+                if let (Some(ack), Some(hash)) = (ack, hash) {
+                    if hash.len() == 64 && hash.bytes().all(|byte| byte.is_ascii_hexdigit()) {
+                        acknowledged_revision = Some(ack);
+                        acknowledged_hash = Some(hash);
+                    }
                 }
-                if revision.is_none() && acknowledged {
-                    revision = Some(head);
-                } else if revision.is_none() {
-                    immutable_present=sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM request_history_immutable_outbox WHERE revision=$1 AND source=$2 AND request_id=$3 AND tenant_id=$4 AND key_id=$5 AND created_at=$6)")
-                        .bind(head).bind(&source).bind(&id).bind(&tenant).bind(&key).bind(created).fetch_one(&mut *transaction).await?;
-                    if immutable_present {
+                if !journal_exists {
+                    if acknowledged_revision == Some(head) {
                         revision = Some(head);
+                    } else {
+                        immutable_present=sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM request_history_immutable_outbox WHERE revision=$1 AND source=$2 AND request_id=$3 AND tenant_id=$4 AND key_id=$5 AND created_at=$6)")
+                            .bind(head).bind(&source).bind(&id).bind(&tenant).bind(&key).bind(created).fetch_one(&mut *transaction).await?;
+                        if immutable_present {
+                            revision = Some(head);
+                        }
                     }
                 }
             }
+            // A source key collision is not coverage. Never advance past an
+            // identity unless this transaction sees its exact durable duty.
+            let revision = revision.ok_or(HistoryError::Changed)?;
+            let acknowledged = acknowledged_revision == Some(revision);
             if inserted.rows_affected() == 1 {
                 report.actually_enqueued += 1;
             } else if acknowledged && !journal_exists {
@@ -721,14 +741,14 @@ impl Database {
                 "enqueued"
             } else if acknowledged && !journal_exists {
                 "acknowledged"
-            } else if journal_exists && revision.is_some() {
+            } else if journal_exists {
                 "journal_pending"
             } else if immutable_present {
                 "immutable_pending"
             } else {
-                "unproven"
+                return Err(HistoryError::Changed);
             };
-            report.identities.push(serde_json::json!({"source":source,"request_id":id,"tenant_id":tenant,"key_id":key,"created_at":created,"revision":revision,"acknowledged_hash":acknowledged_hash,"proof":proof}));
+            report.identities.push(serde_json::json!({"source":source,"request_id":id,"tenant_id":tenant,"key_id":key,"created_at":created,"revision":revision,"acknowledged_revision":acknowledged_revision,"acknowledged_hash":acknowledged_hash,"revision_acknowledged":acknowledged,"proof":proof}));
         }
         let after = rows
             .last()
