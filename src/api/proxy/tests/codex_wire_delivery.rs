@@ -96,8 +96,8 @@ async fn assert_wire_delivery(failure: PeerFailure, label: &str) {
         send_codex_route_to_endpoint(
             &fixture,
             endpoint,
-            "/v1/responses",
-            json!({"model": fixture.model,"input":"wire proof","stream":false}),
+            "/v1/chat/completions",
+            json!({"model": fixture.model,"messages":[{"role":"user","content":"wire proof"}],"stream":false}),
         ),
     )
     .await
