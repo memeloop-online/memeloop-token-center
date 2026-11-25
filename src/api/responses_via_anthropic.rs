@@ -1370,22 +1370,6 @@ impl Stream {
     }
 }
 
-pub(in crate::api) fn error_body(value: &Value) -> Result<Value, &'static str> {
-    let error = value
-        .get("error")
-        .and_then(Value::as_object)
-        .ok_or("anthropic_error_invalid")?;
-    let message = error
-        .get("message")
-        .and_then(Value::as_str)
-        .ok_or("anthropic_error_invalid")?;
-    let kind = error
-        .get("type")
-        .and_then(Value::as_str)
-        .unwrap_or("upstream_error");
-    Ok(json!({"error":{"message":message,"type":kind,"code":kind}}))
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
