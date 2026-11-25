@@ -713,7 +713,7 @@ jobs:
 
             cargo run --locked --bin memeloop-token-center -- migrate
             check_migration_ledger
-            test "$(sql 'SELECT phase FROM request_history_activation WHERE id = 1 AND epoch = 0')" = legacy
+            test "$(sql "SELECT count(*) FROM request_history_activation WHERE id=1 AND epoch=0 AND phase='legacy' AND transactions_json IS NULL AND baseline_owner IS NULL AND baseline_epoch IS NULL")" = 1
             test "$(sql "SELECT ceiling FROM request_history_baseline_runs
               WHERE owner = 'ci-schema-159' AND epoch = 7 AND status = 'source_complete'
                 AND read_model_version IS NULL AND activation_epoch IS NULL")" = 19
