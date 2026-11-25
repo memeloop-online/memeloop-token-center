@@ -16,6 +16,7 @@ async fn postgres_capability_163_skips_hot_ddl_and_preserves_true_ledger() {
     assert_eq!(modern.track, SchemaTrack::Linear165);
     sqlx::raw_sql("ALTER TABLE request_history_baseline_runs DROP COLUMN read_model_version,DROP COLUMN activation_epoch,DROP COLUMN chunk_count,DROP COLUMN manifest_hash,DROP COLUMN sources_complete,DROP COLUMN parity_json,DROP COLUMN target_identity; DELETE FROM schema_migrations WHERE version=165;")
         .execute(&db.pool).await.unwrap();
+    let db = Database::connect_with_max(isolated.url(), 6).await.unwrap();
     assert_eq!(
         db.verify_capabilities(CapabilityRole::Worker)
             .await
@@ -26,6 +27,7 @@ async fn postgres_capability_163_skips_hot_ddl_and_preserves_true_ledger() {
     );
     sqlx::raw_sql("DROP INDEX request_records_started_pending; ALTER TABLE request_records DROP COLUMN started_event_pending; DELETE FROM schema_migrations WHERE version=164;")
         .execute(&db.pool).await.unwrap();
+    let db = Database::connect_with_max(isolated.url(), 6).await.unwrap();
     let report = db
         .verify_capabilities(CapabilityRole::Gateway)
         .await
@@ -83,6 +85,7 @@ async fn postgres_capability_163_skips_hot_ddl_and_preserves_true_ledger() {
     .execute(&db.pool)
     .await
     .unwrap();
+    let db = Database::connect_with_max(isolated.url(), 6).await.unwrap();
     db.migrate().await.unwrap();
     assert_eq!(
         db.verify_capabilities(CapabilityRole::Worker)

@@ -502,7 +502,7 @@ impl Database {
         self.start_proxy_request_inner(
             input,
             None,
-            self.legacy163.load(std::sync::atomic::Ordering::Acquire),
+            self.legacy163_mode()?,
             upstream_model,
             output_token_limit,
         )
@@ -533,7 +533,7 @@ impl Database {
         let Some(row) = row else {
             return Ok(());
         };
-        if !self.legacy163.load(std::sync::atomic::Ordering::Acquire) {
+        if !self.legacy163_mode()? {
             publish_pending_started_in_transaction(
                 &mut transaction,
                 &identity.request_id.to_string(),
@@ -2152,7 +2152,7 @@ impl Database {
                     billing_unit: &reservation.billing_unit,
                 }),
             TerminalMetadata {
-                started_marker: !self.legacy163.load(std::sync::atomic::Ordering::Acquire),
+                started_marker: !self.legacy163_mode()?,
                 cause: input.terminal_cause,
                 cache_coverage: usage.cache_coverage.filter(|coverage| {
                     usage_basis == Some(crate::model::RequestUsageBasis::ProviderReported)

@@ -133,6 +133,25 @@ pub(in crate::db) async fn inspect(
     }))
 }
 impl Database {
+    pub(crate) fn install_schema_track(&self, track: SchemaTrack) -> Result<(), sqlx::Error> {
+        if let Some(existing) = self.schema_track.get() {
+            if *existing != track {
+                return Err(drift("verified track changed; new runtime required"));
+            }
+            return Ok(());
+        }
+        self.schema_track
+            .set(track)
+            .map_err(|_| drift("concurrent schema verification; retry initialization"))
+    }
+
+    pub(crate) fn legacy163_mode(&self) -> Result<bool, sqlx::Error> {
+        self.schema_track
+            .get()
+            .map(|track| *track == SchemaTrack::Legacy163)
+            .ok_or_else(|| drift("runtime schema capability has not been verified"))
+    }
+
     /// Explicit compatibility startup. This never substitutes for `migrate`:
     /// operators requesting a linear upgrade retain the original resume path.
     pub async fn validate_legacy163_startup(
@@ -163,12 +182,9 @@ impl Database {
             .await?;
         let report = inspect(&mut tx, role).await?;
         tx.commit().await?;
-        self.legacy163.store(
-            report
-                .as_ref()
-                .is_some_and(|r| r.track == SchemaTrack::Legacy163),
-            std::sync::atomic::Ordering::Release,
-        );
+        if let Some(report) = &report {
+            self.install_schema_track(report.track)?;
+        }
         Ok(report)
     }
 }

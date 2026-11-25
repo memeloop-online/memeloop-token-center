@@ -1474,7 +1474,7 @@ impl Database {
             request_id,
             tenant_id,
             key_id,
-            !self.legacy163.load(std::sync::atomic::Ordering::Acquire),
+            !self.legacy163_mode()?,
         )
         .await?;
         Ok(true)

@@ -1736,9 +1736,7 @@ impl Database {
             DatabaseBackend::PostgreSql => POSTGRES_MIGRATIONS,
             DatabaseBackend::Sqlite => SQLITE_MIGRATIONS,
         };
-        if matches!(self.backend, DatabaseBackend::PostgreSql)
-            && self.legacy163.load(std::sync::atomic::Ordering::Acquire)
-        {
+        if matches!(self.backend, DatabaseBackend::PostgreSql) && self.legacy163_mode()? {
             let report = super::capability::catalog::inspect(
                 connection,
                 super::capability::CapabilityRole::Gateway,
@@ -1881,6 +1879,7 @@ impl Database {
             maintain_postgres_partitions(&mut transaction).await?;
         }
         transaction.commit().await?;
+        self.install_schema_track(super::capability::SchemaTrack::Linear165)?;
         Ok(())
     }
 
