@@ -38,7 +38,9 @@ export function SemanticConversationViewer({ adapter, revision, readOnlyMessage,
       executionTargets: undefined, activeExecutionTarget: undefined, setExecutionTarget: undefined };
   }, [adapter, readOnlyMessage]);
   return <div data-semantic-theme={mode}><ThemeProvider theme={theme}><MemeLoopRuntimeProvider key={JSON.stringify([adapter.conversationId, revision])} adapter={readonlyAdapter}>
-    {(coverage.projection_state !== 'complete' || !coverage.observed_terminal || coverage.gaps.length > 0 || coverage.omissions.length > 0) && <MessageBar intent="warning"><MessageBarBody>{incompleteMessage}<ul>{[...coverage.gaps, ...coverage.omissions].map((reason, index) => <li key={index}>{reason}</li>)}</ul></MessageBarBody></MessageBar>}
+    {(coverage.projection_state !== 'complete' || !coverage.observed_terminal || coverage.gaps.length > 0 || coverage.omissions.length > 0) && <MessageBar intent="warning" layout="multiline">
+      <MessageBarBody style={{ minWidth: 0, overflowWrap: 'anywhere' }}>{incompleteMessage}<ul>{[...coverage.gaps, ...coverage.omissions].map((reason, index) => <li key={index}>{reason}</li>)}</ul></MessageBarBody>
+    </MessageBar>}
     <MemeLoopThread {...threadProps} composerComponent={EmptyComposer} renderTurnActions={NoTurnActions}
       attachmentRevision={revision} showTimeline />
   </MemeLoopRuntimeProvider></ThemeProvider></div>;
