@@ -420,3 +420,96 @@ async fn real_s3_workspace_range_round_trip_comparison() {
     }
     drop(carrier);
 }
+
+#[tokio::test]
+#[ignore = "requires isolated RustFS fixture"]
+async fn real_s3_multipart_workspace_reader_serializes_clones_and_writes_exact_bytes() {
+    use futures_util::FutureExt;
+    let proxy =
+        RecoveryObjectProxy::start(&std::env::var("MTC_RUSTFS_TEST_ENDPOINT").unwrap()).await;
+    let archive = ArchiveStore::from_config(&config(&proxy).await)
+        .await
+        .unwrap();
+    let upload = Arc::new(crate::api::proxy::persistence::Persistence::default());
+    let size = 8 * 1024 * 1024 + 17;
+    let (carrier, memory) = source(&archive, size, upload.clone(), key()).await;
+    carrier.offload_one().await.unwrap();
+    let guard = upload
+        .multipart_workspace(crate::api::proxy::persistence::WorkspaceRole::RequestRaw)
+        .await
+        .unwrap();
+    let mut first = carrier.open_stream_with_multipart_workspace(guard.clone());
+    let held = first.next().await.unwrap().unwrap();
+    assert_eq!(held.len(), 256 * 1024);
+    let mut second = carrier.open_stream_with_multipart_workspace(guard.clone());
+    assert!(second.next().now_or_never().is_none());
+    drop(first);
+    let next = second.next().await.unwrap().unwrap();
+    assert_eq!(next, held);
+    drop(second);
+    drop(guard);
+    assert!(upload.upload_workspace.snapshot().0 > 0);
+    drop(held);
+    drop(next);
+    assert_eq!(upload.upload_workspace.snapshot().0, 0);
+    for widened in [false, true, true, false] {
+        let before = proxy.counts();
+        let started = std::time::Instant::now();
+        let results = stream::iter(0..2)
+            .map(|_| {
+                let carrier = carrier.clone();
+                let archive = archive.clone();
+                let upload = upload.clone();
+                async move {
+                    let workspace = upload
+                        .multipart_workspace(
+                            crate::api::proxy::persistence::WorkspaceRole::RequestRaw,
+                        )
+                        .await
+                        .unwrap();
+                    let holding = std::time::Instant::now();
+                    let location = format!(
+                        "{}/range-writer-{}",
+                        key().canonical_prefix(),
+                        uuid::Uuid::now_v7()
+                    );
+                    let mut writer = archive.start_writer(&location).await.unwrap();
+                    writer.retain_workspace(workspace.clone());
+                    let mut input = if widened {
+                        carrier.open_stream_with_multipart_workspace(workspace)
+                    } else {
+                        carrier.open_stream_with_workspace(workspace)
+                    };
+                    let mut count = 0;
+                    while let Some(chunk) = input.next().await {
+                        let chunk = chunk.unwrap();
+                        assert!(chunk.len() <= if widened { 256 * 1024 } else { 64 * 1024 });
+                        count += chunk.len();
+                        writer.write(chunk).await.unwrap();
+                    }
+                    drop(input);
+                    let written = writer.finish_staged().await.unwrap();
+                    assert_eq!(count, size);
+                    assert_eq!(written.size_bytes, carrier.len());
+                    assert_eq!(written.blake3_digest, carrier.digest());
+                    holding.elapsed().as_micros()
+                }
+            })
+            .buffer_unordered(2)
+            .collect::<Vec<_>>()
+            .await;
+        let gets = proxy.counts().get("range_get").copied().unwrap_or(0)
+            - before.get("range_get").copied().unwrap_or(0);
+        assert_eq!(
+            gets,
+            size.div_ceil(if widened { 256 * 1024 } else { 64 * 1024 }) * 2
+        );
+        assert_eq!(upload.upload_workspace.snapshot().0, 0);
+        assert_eq!(memory.snapshot().0, 0);
+        eprintln!(
+            "synthetic_range_writer_comparison widened={widened} concurrency=2 bytes={} range_gets={gets} elapsed_us={} hold_us={results:?}",
+            size * 2,
+            started.elapsed().as_micros()
+        );
+    }
+}

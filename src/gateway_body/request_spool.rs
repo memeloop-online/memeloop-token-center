@@ -183,7 +183,7 @@ impl DurableRequestBodies {
                     .map_err(|_| ())?;
                 let mut writer = archive.start_writer(key).await.map_err(|_| ())?;
                 writer.retain_workspace(workspace.clone());
-                let mut stream = source.open_stream_with_workspace(workspace);
+                let mut stream = source.open_stream_with_multipart_workspace(workspace);
                 while let Some(chunk) = stream.next().await {
                     let chunk = match chunk {
                         Ok(chunk) => chunk,

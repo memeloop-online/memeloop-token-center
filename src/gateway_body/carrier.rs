@@ -668,24 +668,47 @@ impl BodyCarrier {
     }
 
     pub(crate) fn open_stream(self: &Arc<Self>) -> CarrierStream {
-        self.open_stream_inner(None)
+        self.open_stream_inner(None, 64 * 1024)
     }
 
     pub(crate) fn open_stream_with_workspace(
         self: &Arc<Self>,
         workspace: Arc<dyn Send + Sync>,
     ) -> CarrierStream {
-        self.open_stream_inner(Some(workspace))
+        self.open_stream_inner(Some(workspace), 64 * 1024)
+    }
+
+    /// One read scratch owner per prepaid multipart envelope. Ordinary readers
+    /// retain their existing independently charged 64 KiB range contract.
+    pub(crate) fn open_stream_with_multipart_workspace(
+        self: &Arc<Self>,
+        workspace: Arc<crate::api::proxy::persistence::WorkspaceGuard>,
+    ) -> CarrierStream {
+        let source = self.clone();
+        Box::pin(
+            stream::once(async move {
+                let reader = workspace.reader().await;
+                let input = source.open_stream_inner(Some(workspace), 256 * 1024);
+                Box::pin(stream::unfold(
+                    (input, reader),
+                    |(mut input, reader)| async move {
+                        input.next().await.map(|item| (item, (input, reader)))
+                    },
+                )) as CarrierStream
+            })
+            .flatten(),
+        )
     }
 
     fn open_stream_inner(
         self: &Arc<Self>,
         workspace: Option<Arc<dyn Send + Sync>>,
+        range_bytes: usize,
     ) -> CarrierStream {
         let reader = self.read_owner();
         let published = self.published.lock().unwrap().clone();
         if let Some(published) = published {
-            return published.open_stream_inner(workspace);
+            return published.open_stream_inner(workspace, range_bytes);
         }
         let source = self.clone();
         Box::pin(stream::unfold(
@@ -726,7 +749,7 @@ impl BodyCarrier {
                                                 return Ok(None);
                                             }
                                             let count = (reference.size_bytes - offset)
-                                                .min(64 * 1024)
+                                                .min(range_bytes as u64)
                                                 as usize;
                                             // Reserve application destination before receiving the SDK
                                             // frame. Each HTTP range is bounded independently; no slow
