@@ -113,6 +113,11 @@ impl AsRef<[u8]> for WorkspaceWrite {
     }
 }
 
+struct MultipartReplayOwner {
+    _workspace: Arc<crate::api::proxy::persistence::WorkspaceGuard>,
+    _exclusive: OwnedSemaphorePermit,
+}
+
 struct WorkspaceRead {
     bytes: Vec<u8>,
     _workspace: Arc<dyn Send + Sync>,
@@ -678,26 +683,43 @@ impl BodyCarrier {
         self.open_stream_inner(Some(workspace), 64 * 1024)
     }
 
-    /// One read scratch owner per prepaid multipart envelope. Ordinary readers
-    /// retain their existing independently charged 64 KiB range contract.
-    pub(crate) fn open_stream_with_multipart_workspace(
+    /// The larger scratch window never escapes as a general byte stream.
+    /// The same exclusive owner follows both the sequential sink and any SDK
+    /// body clones through completion or asynchronous cancellation/abort.
+    pub(crate) async fn pump_to_staged(
         self: &Arc<Self>,
+        archive: &ArchiveStore,
+        location: &str,
         workspace: Arc<crate::api::proxy::persistence::WorkspaceGuard>,
-    ) -> CarrierStream {
-        let source = self.clone();
-        Box::pin(
-            stream::once(async move {
-                let reader = workspace.reader().await;
-                let input = source.open_stream_inner(Some(workspace), 256 * 1024);
-                Box::pin(stream::unfold(
-                    (input, reader),
-                    |(mut input, reader)| async move {
-                        input.next().await.map(|item| (item, (input, reader)))
-                    },
-                )) as CarrierStream
-            })
-            .flatten(),
-        )
+    ) -> Result<StagedArchiveObject, AppError> {
+        let exclusive = workspace.reader().await;
+        let ownership: Arc<dyn Send + Sync> = Arc::new(MultipartReplayOwner {
+            _workspace: workspace,
+            _exclusive: exclusive,
+        });
+        let mut writer = archive.start_writer(location).await?;
+        writer.retain_workspace(ownership.clone());
+        let mut input = self.open_stream_inner(Some(ownership), 256 * 1024);
+        while let Some(chunk) = input.next().await {
+            match chunk {
+                Ok(chunk) => {
+                    if let Err(error) = writer.write(chunk).await {
+                        let _ = writer.abort().await;
+                        return Err(error);
+                    }
+                }
+                Err(error) => {
+                    let _ = writer.abort().await;
+                    return Err(error);
+                }
+            }
+        }
+        drop(input);
+        let staged = writer.finish_staged().await?;
+        if staged.size_bytes != self.len() || staged.blake3_digest != self.digest() {
+            return Err(AppError::storage("carrier_replay_identity_mismatch"));
+        }
+        Ok(staged)
     }
 
     fn open_stream_inner(

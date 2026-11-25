@@ -438,19 +438,37 @@ async fn real_s3_multipart_workspace_reader_serializes_clones_and_writes_exact_b
         .multipart_workspace(crate::api::proxy::persistence::WorkspaceRole::RequestRaw)
         .await
         .unwrap();
-    let mut first = carrier.open_stream_with_multipart_workspace(guard.clone());
-    let held = first.next().await.unwrap().unwrap();
-    assert_eq!(held.len(), 256 * 1024);
-    let mut second = carrier.open_stream_with_multipart_workspace(guard.clone());
-    assert!(second.next().now_or_never().is_none());
-    drop(first);
-    let next = second.next().await.unwrap().unwrap();
-    assert_eq!(next, held);
-    drop(second);
-    drop(guard);
+    let part_gate = proxy.gate_multipart_part();
+    let abort_gate = proxy.gate_multipart_abort();
+    let first = tokio::spawn({
+        let carrier = carrier.clone();
+        let archive = archive.clone();
+        let guard = guard.clone();
+        async move {
+            carrier
+                .pump_to_staged(&archive, "staging/proxy/replay-contract/first", guard)
+                .await
+        }
+    });
+    part_gate.entered().await;
+    let mut second = Box::pin(carrier.pump_to_staged(
+        &archive,
+        "staging/proxy/replay-contract/second",
+        guard.clone(),
+    ));
+    assert!(second.as_mut().now_or_never().is_none());
+    first.abort();
+    assert!(first.await.unwrap_err().is_cancelled());
+    abort_gate.entered().await;
+    // A cancelled writer still owns its previous part until abort finishes.
+    assert!(second.as_mut().now_or_never().is_none());
     assert!(upload.upload_workspace.snapshot().0 > 0);
-    drop(held);
-    drop(next);
+    part_gate.release();
+    abort_gate.release();
+    let recovered = second.await.unwrap();
+    assert_eq!(recovered.size_bytes, carrier.len());
+    assert_eq!(recovered.blake3_digest, carrier.digest());
+    drop(guard);
     assert_eq!(upload.upload_workspace.snapshot().0, 0);
     for widened in [false, true, true, false] {
         let before = proxy.counts();
@@ -473,23 +491,23 @@ async fn real_s3_multipart_workspace_reader_serializes_clones_and_writes_exact_b
                         key().canonical_prefix(),
                         uuid::Uuid::now_v7()
                     );
-                    let mut writer = archive.start_writer(&location).await.unwrap();
-                    writer.retain_workspace(workspace.clone());
-                    let mut input = if widened {
-                        carrier.open_stream_with_multipart_workspace(workspace)
+                    let written = if widened {
+                        carrier
+                            .pump_to_staged(&archive, &location, workspace)
+                            .await
+                            .unwrap()
                     } else {
-                        carrier.open_stream_with_workspace(workspace)
+                        let mut writer = archive.start_writer(&location).await.unwrap();
+                        writer.retain_workspace(workspace.clone());
+                        let mut input = carrier.open_stream_with_workspace(workspace);
+                        while let Some(chunk) = input.next().await {
+                            let chunk = chunk.unwrap();
+                            assert!(chunk.len() <= 64 * 1024);
+                            writer.write(chunk).await.unwrap();
+                        }
+                        drop(input);
+                        writer.finish_staged().await.unwrap()
                     };
-                    let mut count = 0;
-                    while let Some(chunk) = input.next().await {
-                        let chunk = chunk.unwrap();
-                        assert!(chunk.len() <= if widened { 256 * 1024 } else { 64 * 1024 });
-                        count += chunk.len();
-                        writer.write(chunk).await.unwrap();
-                    }
-                    drop(input);
-                    let written = writer.finish_staged().await.unwrap();
-                    assert_eq!(count, size);
                     assert_eq!(written.size_bytes, carrier.len());
                     assert_eq!(written.blake3_digest, carrier.digest());
                     holding.elapsed().as_micros()
