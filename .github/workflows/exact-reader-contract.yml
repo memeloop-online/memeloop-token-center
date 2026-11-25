@@ -10,6 +10,7 @@ on:
         required: true
         type: choice
         options:
+          - history-event-only-proof
           - request-events-997
           - request-readmodel-994
           - request-carrier-958
@@ -850,4 +851,53 @@ jobs:
           for backend in sqlite postgres; do
             cargo test --locked --lib "db::session_reading::tests::${backend}_semantic_revision_uses_authorized_request_scope" -- --exact --nocapture 2>&1 | tee /tmp/semantic-reader-scope.log
             grep -F '1 passed; 0 failed' /tmp/semantic-reader-scope.log
+          done
+
+  history-event-only-proof:
+    if: inputs.contract == 'history-event-only-proof'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+    services:
+      postgres:
+        image: postgres:16-alpine
+        env:
+          POSTGRES_USER: token_center
+          POSTGRES_PASSWORD: token_center
+          POSTGRES_DB: history_test
+        ports: ['5432:5432']
+        options: --health-cmd pg_isready --health-interval 5s --health-timeout 5s --health-retries 10
+      clickhouse:
+        image: clickhouse/clickhouse-server:25.4.2
+        env:
+          CLICKHOUSE_SKIP_USER_SETUP: '1'
+        ports: ['8123:8123']
+    env:
+      MTC_TEST_POSTGRES_URL: postgres://token_center:token_center@127.0.0.1:5432/history_test
+      MTC_TEST_CLICKHOUSE_URL: http://127.0.0.1:8123
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+        with:
+          ref: ${{ inputs.source_revision }}
+          persist-credentials: false
+      - name: Require exact source
+        env:
+          SOURCE: ${{ inputs.source_revision }}
+        run: |
+          [[ "$SOURCE" =~ ^[0-9a-f]{40}$ ]]
+          test "$(git rev-parse HEAD)" = "$SOURCE"
+      - uses: dtolnay/rust-toolchain@4360b52568e2003a75bf9bc1d59f33a8e3fc893c
+        with:
+          toolchain: 1.95.0
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6
+      - uses: ./.github/actions/checkout-plugin-examples
+      - name: Verify event-only cursor frozen authority and exact ACK
+        run: |
+          set -o pipefail
+          for selector in \
+            db::request_history::event_backfill_tests::request_history_real_services_acceptance_event_backfill_time_cursor \
+            db::history_source_snapshot::tests::request_history_baseline_event_cursor_reuses_frozen_authority \
+            request_history::persistence_tests::request_history_real_services_acceptance_event_original_survives_ack_and_source_removal
+          do
+            cargo test --locked --all-features --lib "$selector" -- --ignored --exact --nocapture --test-threads=1 2>&1 | tee /tmp/history-event-only.log
+            grep -F '1 passed; 0 failed' /tmp/history-event-only.log
           done
