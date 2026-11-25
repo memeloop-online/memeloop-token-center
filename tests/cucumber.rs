@@ -8215,28 +8215,33 @@ async fn wait_for_projected_conversation_requests(world: &TokenCenterWorld, expe
     .await;
     if result.is_err() {
         for row in &mut snapshot {
-            let request_id = Uuid::parse_str(row["request_id"].as_str().expect("request id"))
-                .expect("request UUID");
-            // Only sealed/failed state is retained; no locator, body, or digest
-            // is added to failure output. These reads do not change readiness.
-            let tenant: String = sqlx::query_scalar(
-                "SELECT tenant_id FROM conversation_projection_outbox WHERE request_id = $1 AND key_id = $2",
-            ).bind(request_id.to_string()).bind(&key_id).fetch_one(&inspection).await
-                .expect("projection diagnostic tenant");
-            let tenant = Uuid::parse_str(&tenant).expect("tenant UUID");
             for side in ["request", "response"] {
-                let sealed = state
-                    .archive
-                    .raw_capture_reference(tenant, request_id, side)
-                    .await;
-                let failed = state
-                    .archive
-                    .raw_capture_failed(tenant, request_id, side)
-                    .await;
-                row[format!("{side}_raw_sealed")] = json!(sealed.map(|value| value.is_some()).ok());
-                row[format!("{side}_raw_failed")] = json!(failed.ok());
+                row[format!("{side}_raw_sealed")] = Value::Null;
+                row[format!("{side}_raw_failed")] = Value::Null;
             }
         }
+        // One shared budget bounds all best-effort failure enrichment. Null
+        // remains unknown on lookup failure or cancellation; the original
+        // readiness result and snapshot always reach the assertion below.
+        let _ = tokio::time::timeout(Duration::from_secs(1), async {
+            for row in &mut snapshot {
+                let Some(request_id) = row["request_id"].as_str()
+                    .and_then(|value| Uuid::parse_str(value).ok()) else { continue; };
+                let tenant: Option<String> = sqlx::query_scalar(
+                    "SELECT tenant_id FROM conversation_projection_outbox WHERE request_id = $1 AND key_id = $2",
+                ).bind(request_id.to_string()).bind(&key_id)
+                    .fetch_optional(&inspection).await.ok().flatten();
+                let Some(tenant) = tenant.and_then(|value| Uuid::parse_str(&value).ok()) else { continue; };
+                // Only state booleans survive; no body, locator, or digest.
+                for side in ["request", "response"] {
+                    row[format!("{side}_raw_sealed")] = json!(state.archive
+                        .raw_capture_reference(tenant, request_id, side).await
+                        .map(|value| value.is_some()).ok());
+                    row[format!("{side}_raw_failed")] = json!(state.archive
+                        .raw_capture_failed(tenant, request_id, side).await.ok());
+                }
+            }
+        }).await;
     }
     inspection.close().await;
     assert!(
