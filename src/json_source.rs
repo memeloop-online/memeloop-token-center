@@ -642,11 +642,12 @@ mod carrier_cancel_tests {
     async fn cancellation_drops_a_pending_object_read_and_releases_the_source() {
         // InMemory retains uploaded Bytes and their ingress credit. Use an
         // independent object-store allocation so this tests reader cancellation.
-        let directory = tempfile::tempdir().unwrap();
         let mut config = crate::config::Config::for_test("sqlite::memory:".into());
         let proxy = if let Ok(endpoint) = std::env::var("MTC_RUSTFS_TEST_ENDPOINT") {
             Some(recovery_proxy::RecoveryObjectProxy::start(&endpoint).await)
-        } else { None };
+        } else {
+            None
+        };
         if let Some(proxy) = &proxy {
             config.archive_backend = crate::config::ArchiveBackend::S3;
             config.s3_endpoint = Some(proxy.endpoint().to_owned());
@@ -654,9 +655,6 @@ mod carrier_cancel_tests {
             config.s3_access_key = Some(std::env::var("MTC_RUSTFS_TEST_ACCESS_KEY").unwrap());
             config.s3_secret_key = Some(std::env::var("MTC_RUSTFS_TEST_SECRET_KEY").unwrap());
             config.s3_allow_http = true;
-        } else {
-            config.archive_backend = crate::config::ArchiveBackend::Filesystem;
-            config.archive_path = Some(directory.path().to_str().unwrap().to_owned());
         }
         let (archive, store) = ArchiveStore::from_config(&config)
             .await
@@ -679,11 +677,37 @@ mod carrier_cancel_tests {
         .await
         .unwrap();
         body.seal_to_objects().await.unwrap();
+        if proxy.is_none() {
+            // Model the remote transport copy: the in-process backend must not
+            // keep the uploaded allocation (and its ingress lease) alive.
+            use futures_util::TryStreamExt;
+            use object_store::{ObjectStore, ObjectStoreExt};
+            let objects: Vec<_> = store.list(None).try_collect().await.unwrap();
+            for object in objects {
+                let bytes = store
+                    .get(&object.location)
+                    .await
+                    .unwrap()
+                    .bytes()
+                    .await
+                    .unwrap();
+                let copied = bytes::Bytes::copy_from_slice(&bytes);
+                drop(bytes);
+                store.put(&object.location, copied.into()).await.unwrap();
+            }
+        }
         assert_eq!(memory.snapshot().0, 0);
         let source = Arc::downgrade(&body);
-        let get_gate = proxy.as_ref().map(|proxy| proxy.gate_get_response_prefix(&format!("/{}/{}/carrier-", config.s3_bucket.as_ref().unwrap(), key.canonical_prefix())));
+        let get_gate = proxy.as_ref().map(|proxy| {
+            proxy.gate_get_response_prefix(&format!(
+                "/{}/{}/carrier-",
+                config.s3_bucket.as_ref().unwrap(),
+                key.canonical_prefix()
+            ))
+        });
         if proxy.is_none() {
-            store.config_mut(|config| config.wait_get_per_call = std::time::Duration::from_secs(60));
+            store
+                .config_mut(|config| config.wait_get_per_call = std::time::Duration::from_secs(60));
         }
         let cancelled = Arc::new(AtomicBool::new(false));
         let wake = Arc::new(tokio::sync::Notify::new());
@@ -702,7 +726,9 @@ mod carrier_cancel_tests {
             scanner.peek()
         });
         if let Some(gate) = &get_gate {
-            tokio::time::timeout(std::time::Duration::from_secs(10), gate.entered()).await.unwrap();
+            tokio::time::timeout(std::time::Duration::from_secs(10), gate.entered())
+                .await
+                .unwrap();
         }
         // The genuine object GET is delayed; no provider bytes have arrived.
         assert!(
@@ -719,7 +745,9 @@ mod carrier_cancel_tests {
                 .unwrap()
                 .is_err()
         );
-        if let Some(gate) = get_gate { gate.release(); }
+        if let Some(gate) = get_gate {
+            gate.release();
+        }
         assert!(source.upgrade().is_none());
         assert_eq!(memory.snapshot().0, 0);
         store.config_mut(|config| config.wait_get_per_call = std::time::Duration::ZERO);

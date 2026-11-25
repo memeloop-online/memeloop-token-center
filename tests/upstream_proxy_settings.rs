@@ -160,14 +160,27 @@ async fn explicit_proxy_read_preserves_full_url_but_excludes_other_secrets_and_r
         assert_eq!(status, StatusCode::OK);
         assert_eq!(cache.as_deref(), Some("private, no-store"));
         let selection_path = path.replace("/transport-proxy?", "/transport-proxy-selection?");
-        let (selection_status, selection_cache, selection) = get(&state, &selection_path, &tokens[0]).await;
+        let (selection_status, selection_cache, selection) =
+            get(&state, &selection_path, &tokens[0]).await;
         assert_eq!(selection_status, StatusCode::OK);
         assert_eq!(selection_cache.as_deref(), Some("private, no-store"));
         assert_eq!(selection, body["selection"]);
         for token in &tokens[1..] {
-            assert_eq!(get(&state, &selection_path, token).await.0, StatusCode::FORBIDDEN);
+            assert_eq!(
+                get(&state, &selection_path, token).await.0,
+                StatusCode::FORBIDDEN
+            );
         }
-        assert_eq!(get(&state, &selection_path.replace("proxy-tenant", "other-tenant"), &tokens[0]).await.0, StatusCode::NOT_FOUND);
+        assert_eq!(
+            get(
+                &state,
+                &selection_path.replace("proxy-tenant", "other-tenant"),
+                &tokens[0]
+            )
+            .await
+            .0,
+            StatusCode::NOT_FOUND
+        );
         let keys = body
             .as_object()
             .unwrap()

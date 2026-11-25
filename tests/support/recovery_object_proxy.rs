@@ -261,9 +261,18 @@ async fn forward(State(state): State<Arc<ProxyState>>, request: Request) -> Resp
     }
     let response_gate = {
         let faults = state.faults.lock().unwrap();
-        faults.response_get.as_ref().filter(|(prefix, _)| request.method() == axum::http::Method::GET && request.uri().path().starts_with(prefix))
+        faults
+            .response_get
+            .as_ref()
+            .filter(|(prefix, _)| {
+                request.method() == axum::http::Method::GET
+                    && request.uri().path().starts_with(prefix)
+            })
             .map(|(_, gate)| {
-                assert_eq!(request.headers().get(axum::http::header::RANGE).unwrap(), "bytes=0-12");
+                assert_eq!(
+                    request.headers().get(axum::http::header::RANGE).unwrap(),
+                    "bytes=0-12"
+                );
                 gate.clone()
             })
     };
@@ -310,7 +319,9 @@ async fn forward(State(state): State<Arc<ProxyState>>, request: Request) -> Resp
         tokio::pin!(release);
         release.as_mut().enable();
         gate.entered.notify_one();
-        if !gate.released.load(Ordering::SeqCst) { release.await; }
+        if !gate.released.load(Ordering::SeqCst) {
+            release.await;
+        }
     }
     let mut output = Response::builder().status(response.status());
     *output.headers_mut().unwrap() = response.headers().clone();
