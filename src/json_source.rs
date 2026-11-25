@@ -635,7 +635,25 @@ mod carrier_cancel_tests {
 
     #[tokio::test]
     async fn cancellation_drops_a_pending_object_read_and_releases_the_source() {
-        let (archive, store) = ArchiveStore::memory_for_test().with_read_delay_for_test();
+        // InMemory retains uploaded Bytes and their ingress credit. Use an
+        // independent object-store allocation so this tests reader cancellation.
+        let directory = tempfile::tempdir().unwrap();
+        let mut config = crate::config::Config::for_test("sqlite::memory:".into());
+        if let Ok(endpoint) = std::env::var("MTC_RUSTFS_TEST_ENDPOINT") {
+            config.archive_backend = crate::config::ArchiveBackend::S3;
+            config.s3_endpoint = Some(endpoint);
+            config.s3_bucket = Some(std::env::var("MTC_RUSTFS_TEST_BUCKET").unwrap());
+            config.s3_access_key = Some(std::env::var("MTC_RUSTFS_TEST_ACCESS_KEY").unwrap());
+            config.s3_secret_key = Some(std::env::var("MTC_RUSTFS_TEST_SECRET_KEY").unwrap());
+            config.s3_allow_http = true;
+        } else {
+            config.archive_backend = crate::config::ArchiveBackend::Filesystem;
+            config.archive_path = Some(directory.path().to_str().unwrap().to_owned());
+        }
+        let (archive, store) = ArchiveStore::from_config(&config)
+            .await
+            .unwrap()
+            .with_read_delay_for_test();
         let memory = Arc::new(ProxyMemoryBudget::new(256 * 1024));
         let id = uuid::Uuid::new_v4();
         let key = ArchiveStagingKey::new(
