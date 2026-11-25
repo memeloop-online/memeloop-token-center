@@ -2254,6 +2254,27 @@ async fn semantic_coverage_committed_recovery_contract(database_url: String) {
             .await
             .unwrap();
         assert_eq!(serde_json::to_vec(&foreign).unwrap(), immutable);
+        let mut pending = frozen.clone();
+        pending.request_archive_state = crate::model::RequestArchiveState::Pending;
+        pending.response_archive_state = crate::model::RequestArchiveState::Bound;
+        pending.request_archive_reason = Some("archive_pending".into());
+        let pending_bytes = serde_json::to_vec(&pending).unwrap();
+        let unresolved = db
+            .resolve_history_raw_archive_roots(
+                fixture.key.tenant_id,
+                Uuid::now_v7(),
+                pending.clone(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(serde_json::to_vec(&unresolved).unwrap(), pending_bytes);
+        pending.response_object = Some("legacy-uncovered-response".into());
+        let mixed_bytes = serde_json::to_vec(&pending).unwrap();
+        let mixed = db
+            .resolve_history_raw_archive_roots(fixture.key.tenant_id, fixture.key.key_id, pending)
+            .await
+            .unwrap();
+        assert_eq!(serde_json::to_vec(&mixed).unwrap(), mixed_bytes);
         let mut inline_response = frozen.clone();
         inline_response.response_object = None;
         inline_response.response_json = Some(serde_json::json!({"legacy": "inline"}));

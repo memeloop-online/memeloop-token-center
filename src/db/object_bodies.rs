@@ -58,56 +58,60 @@ impl Database {
         .fetch_optional(&self.pool)
         .await?
         .flatten();
-        // The SQL query and its connection finish before object-store reads.
-        let authority = match leaf {
-            Some(leaf) => {
-                self.body_archive()?
-                    .semantic_archive_authority(tenant, request, &leaf)
-                    .await?
-            }
-            None => None,
-        };
-        // A frozen Bound locator is its own reader obligation. A retirement
-        // for another physical locator cannot replace it, even on this request.
-        let archive = self.body_archive()?;
-        let mut all_bound_sources_covered = true;
-        for (side, state, locator) in [
-            (
-                "request",
-                refs.request_archive_state,
-                Some(refs.request_object.as_str()),
-            ),
-            (
-                "response",
-                refs.response_archive_state,
-                refs.response_object.as_deref(),
-            ),
-        ] {
-            if state == crate::model::RequestArchiveState::Bound
-                && (locator.is_none()
-                    || !matches!(
-                        archive
-                            .raw_reader_authority(
-                                tenant,
-                                request,
-                                side,
-                                locator,
-                                None,
-                                authority.as_ref(),
-                            )
-                            .await?,
-                        crate::archive::RawReaderAuthority::Canonical(_)
-                    ))
-            {
-                all_bound_sources_covered = false;
-                break;
-            }
-        }
-        if !all_bound_sources_covered {
+        // Optional current authority can enrich a frozen read, but unavailable
+        // archival metadata cannot erase that already-authorized snapshot.
+        let Some(leaf) = leaf else {
             return Ok(refs);
-        }
-        self.resolve_raw_archive_roots_with_semantic_authority(tenant, refs, authority)
+        };
+        let archive = self.body_archive()?;
+        let authority = match archive
+            .semantic_archive_authority(tenant, request, &leaf)
             .await
+        {
+            Ok(Some(authority)) => authority,
+            Ok(None) => return Ok(refs),
+            Err(
+                error @ AppError::Storage {
+                    code: "semantic_publication_identity_mismatch",
+                    ..
+                },
+            ) => return Err(error),
+            Err(AppError::Storage { .. }) => return Ok(refs),
+            Err(error) => return Err(error),
+        };
+        for (side, locator) in [
+            ("request", Some(refs.request_object.clone())),
+            ("response", refs.response_object.clone()),
+        ] {
+            // No locator, a different source, or unknown retirement leaves the
+            // whole frozen snapshot intact, including mixed-side states.
+            let Some(locator) = locator else {
+                return Ok(refs);
+            };
+            match archive
+                .raw_reader_authority(
+                    tenant,
+                    request,
+                    side,
+                    Some(&locator),
+                    None,
+                    Some(&authority),
+                )
+                .await
+            {
+                Ok(crate::archive::RawReaderAuthority::Canonical(_)) => {}
+                Ok(_) | Err(AppError::Storage { .. }) => return Ok(refs),
+                Err(error) => return Err(error),
+            }
+        }
+        let mut refs = refs;
+        refs.semantic_archive = Some(authority);
+        refs.request_archive_state = crate::model::RequestArchiveState::MetadataOnly;
+        refs.response_archive_state = crate::model::RequestArchiveState::MetadataOnly;
+        refs.request_archive_reason = Some("raw_retired_semantic_archive".into());
+        refs.response_archive_reason = Some("raw_retired_semantic_archive".into());
+        refs.response_json = None;
+        Ok(refs)
     }
 
     /// Frozen history snapshots pass their own exact authority. None is
