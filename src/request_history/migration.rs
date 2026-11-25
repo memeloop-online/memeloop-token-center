@@ -561,10 +561,12 @@ mod export_diagnostic_tests {
         let database = Database::connect_for_migration(isolated.url(), 2)
             .await
             .unwrap();
+        use sqlx::Connection;
+        let mut connection = sqlx::AnyConnection::connect(isolated.url()).await.unwrap();
         for below_floor in [false, true] {
             if below_floor {
                 sqlx::raw_sql("CREATE TABLE schema_migrations(version BIGINT PRIMARY KEY,name TEXT NOT NULL); INSERT INTO schema_migrations VALUES(162,'below_floor');")
-                    .execute(&database.pool).await.unwrap();
+                    .execute(&mut connection).await.unwrap();
             }
             let report = database
                 .verify_capabilities(crate::db::capability::CapabilityRole::HistoryReader)
@@ -573,6 +575,7 @@ mod export_diagnostic_tests {
             assert!(report.is_none());
             assert!(require_receipt_capability(isolated.url(), report.as_ref()).is_err());
         }
+        connection.close().await.unwrap();
         database.close().await;
         isolated.cleanup().await;
     }
