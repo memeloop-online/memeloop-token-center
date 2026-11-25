@@ -1787,19 +1787,6 @@ impl Database {
             sqlx::query("SELECT pg_advisory_lock(734627102948311)")
                 .execute(&mut *connection)
                 .await?;
-            let mut snapshot = connection.begin().await?;
-            sqlx::query("SET TRANSACTION ISOLATION LEVEL REPEATABLE READ READ ONLY")
-                .execute(&mut *snapshot)
-                .await?;
-            let plan = super::capability::catalog::inspect(
-                &mut snapshot,
-                super::capability::CapabilityRole::Maintenance,
-            )
-            .await?;
-            snapshot.commit().await?;
-            if plan.is_some_and(|p| p.track == super::capability::SchemaTrack::Legacy163) {
-                return Ok(());
-            }
             online147::prepare(&mut connection).await?;
             online164::prepare(&mut connection).await?;
         }

@@ -116,6 +116,22 @@ pub(in crate::db) async fn inspect(
     }))
 }
 impl Database {
+    /// Explicit compatibility startup. This never substitutes for `migrate`:
+    /// operators requesting a linear upgrade retain the original resume path.
+    pub async fn validate_legacy163_startup(
+        &self,
+        role: CapabilityRole,
+    ) -> Result<CapabilityReport, sqlx::Error> {
+        let report = self
+            .verify_capabilities(role)
+            .await?
+            .ok_or_else(|| drift("legacy startup requires an existing verified database"))?;
+        if report.track != SchemaTrack::Legacy163 {
+            return Err(drift("legacy startup requires exact163"));
+        }
+        Ok(report)
+    }
+
     pub async fn verify_capabilities(
         &self,
         role: CapabilityRole,

@@ -40,10 +40,13 @@ async fn postgres_capability_163_skips_hot_ddl_and_preserves_true_ledger() {
     .execute(&mut *holder)
     .await
     .unwrap();
-    tokio::time::timeout(std::time::Duration::from_secs(5), db.migrate())
-        .await
-        .expect("legacy planner must never attempt recursive exclusive DDL")
-        .unwrap();
+    tokio::time::timeout(
+        std::time::Duration::from_secs(5),
+        db.validate_legacy163_startup(CapabilityRole::Gateway),
+    )
+    .await
+    .expect("legacy planner must never attempt recursive exclusive DDL")
+    .unwrap();
     let versions: Vec<i64> =
         sqlx::query_scalar("SELECT version FROM schema_migrations ORDER BY version")
             .fetch_all(&db.pool)
