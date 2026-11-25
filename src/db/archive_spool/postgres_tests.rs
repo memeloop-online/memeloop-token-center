@@ -857,63 +857,19 @@ impl PgFixture {
             tenant_id: Uuid::new_v4(),
             reservation_id: Uuid::new_v4(),
         };
-        if full_schema {
-            db.migrate().await.unwrap();
-        } else {
-            // Same request columns exercised by the production spool API; there is
-            // deliberately no FK to billing tables, matching request_records.
-            sqlx::raw_sql("CREATE TABLE request_records (id TEXT PRIMARY KEY, tenant_id TEXT NOT NULL, reservation_id TEXT NOT NULL, completed_at BIGINT, request_object TEXT, response_object TEXT, status_code BIGINT NOT NULL DEFAULT 200, error_code TEXT, cost_micros BIGINT NOT NULL DEFAULT 123)")
-            .execute(&db.pool).await.unwrap();
-            // This focused fixture intentionally omits the production request
-            // projection tables. Keeping the locator table empty exercises the
-            // legacy/audit-row path where no request-stream signal is emitted.
-            sqlx::raw_sql("CREATE TABLE request_record_locators (id TEXT PRIMARY KEY, tenant_id TEXT NOT NULL, key_id TEXT NOT NULL)")
-            .execute(&db.pool).await.unwrap();
-            sqlx::raw_sql(include_str!(
-                "../../../migrations/common/0035_archive_staging_attempts.sql"
-            ))
-            .execute(&db.pool)
-            .await
-            .unwrap();
-            sqlx::raw_sql(include_str!(
-                "../../../migrations/common/0071_response_archive_spool.sql"
-            ))
-            .execute(&db.pool)
-            .await
-            .unwrap();
-            sqlx::raw_sql(include_str!(
-                "../../../migrations/common/0080_request_archive_spool.sql"
-            ))
-            .execute(&db.pool)
-            .await
-            .unwrap();
-            sqlx::raw_sql(include_str!(
-                "../../../migrations/common/0106_archive_budget_reservations.sql"
-            ))
-            .execute(&db.pool)
-            .await
-            .unwrap();
-            sqlx::raw_sql(include_str!(
-                "../../../migrations/postgres/0143_archive_spool_storage_accounting.sql"
-            ))
-            .execute(&db.pool)
-            .await
-            .unwrap();
-            sqlx::raw_sql(include_str!(
-                "../../../migrations/common/0143_archive_spool_ready_indexes.sql"
-            ))
-            .execute(&db.pool)
-            .await
-            .unwrap();
-            sqlx::query(
-                "INSERT INTO request_records (id, tenant_id, reservation_id) VALUES ($1, $2, $3)",
-            )
-            .bind(id.request_id.to_string())
-            .bind(id.tenant_id.to_string())
-            .bind(id.reservation_id.to_string())
-            .execute(&db.pool)
-            .await
-            .unwrap();
+        // Claims resolve the authoritative locator and completion emits the
+        // real request event. Keep both paths on the production schema.
+        db.migrate().await.unwrap();
+        if !full_schema {
+            sqlx::query("INSERT INTO request_records (id, tenant_id, key_id, created_at, protocol, model, input_tokens, output_tokens, cost_micros, request_object, reservation_id) VALUES ($1, $2, $3, 1, 'responses', 'spool-contract', 0, 0, 123, $4, $5)")
+                .bind(id.request_id.to_string())
+                .bind(id.tenant_id.to_string())
+                .bind(Uuid::new_v4().to_string())
+                .bind(format!("gap://{}/request", id.request_id))
+                .bind(id.reservation_id.to_string())
+                .execute(&db.pool)
+                .await
+                .unwrap();
         }
         let gate = i64::from(u32::from_be_bytes(
             nonce.as_bytes()[0..4].try_into().unwrap(),
@@ -1477,3 +1433,6 @@ mod postgres_cas_tests;
 mod postgres_load_tests;
 #[path = "postgres_reservation_tests.rs"]
 mod postgres_reservation_tests;
+
+#[path = "postgres_partition_claim_tests.rs"]
+mod postgres_partition_claim_tests;
