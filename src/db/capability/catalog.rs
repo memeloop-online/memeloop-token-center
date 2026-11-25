@@ -66,6 +66,13 @@ pub(in crate::db) async fn inspect(
         if !["r", "p"].contains(&kind.as_str()) || !row.try_get::<bool, _>("readable")? {
             return Err(drift("required relation inaccessible or incompatible"));
         }
+        if !matches!(role, CapabilityRole::HistoryReader) {
+            let writable: bool = sqlx::query_scalar("SELECT has_table_privilege(to_regclass($1),'INSERT') AND has_table_privilege(to_regclass($1),'UPDATE') AND has_table_privilege(to_regclass($1),'DELETE')")
+                .bind(table).fetch_one(&mut *c).await?;
+            if !writable {
+                return Err(drift("role requires transaction/recovery write privileges"));
+            }
+        }
         signatures.push(CatalogSignature {
             object: table.into(),
             signature: format!("{}:{kind}", row.try_get::<i64, _>("oid")?),
@@ -112,6 +119,16 @@ pub(in crate::db) async fn inspect(
         role,
         track,
         object_signatures: signatures,
+        available_capabilities: {
+            let mut ids = vec!["schema.legacy163.v1".to_owned()];
+            if last >= 164 {
+                ids.push("proxy.started_pending.v1".to_owned());
+            }
+            if last >= 165 {
+                ids.push("history.baseline_receipt.v1".to_owned());
+            }
+            ids
+        },
         verified_at: crate::db::unix_millis(),
     }))
 }

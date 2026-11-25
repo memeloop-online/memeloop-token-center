@@ -181,17 +181,25 @@ impl AppState {
     }
 
     pub async fn initialize(config: Config) -> Result<Self, InitializationError> {
-        Self::initialize_with_background(config, true).await
+        Self::initialize_for_role(config, config::RuntimeRole::All).await
     }
 
     /// Build the shared archive writer state without starting customer recovery work.
     pub async fn initialize_for_maintenance(config: Config) -> Result<Self, InitializationError> {
-        Self::initialize_with_background(config, false).await
+        Self::initialize_with_background(config, false, None).await
+    }
+
+    pub async fn initialize_for_role(
+        config: Config,
+        role: config::RuntimeRole,
+    ) -> Result<Self, InitializationError> {
+        Self::initialize_with_background(config, true, Some(role)).await
     }
 
     async fn initialize_with_background(
         config: Config,
         background: bool,
+        runtime_role: Option<config::RuntimeRole>,
     ) -> Result<Self, InitializationError> {
         let transport_proxy_groups = db::TransportProxyGroups::parse(
             &config.transport_proxy_groups,
@@ -228,9 +236,22 @@ impl AppState {
             .map_err(|error| InitializationError::Database(error.into()))?
             .with_terminal_projection_enabled(config.terminal_projection_enabled)
             .with_auxiliary_pool_max_connections(config.database_aux_pool_max_connections);
-        db.verify_capabilities(db::capability::CapabilityRole::Gateway)
-            .await
-            .map_err(|error| InitializationError::Database(error.into()))?;
+        let roles = match runtime_role {
+            Some(config::RuntimeRole::Gateway) => vec![db::capability::CapabilityRole::Gateway],
+            Some(config::RuntimeRole::Control) => vec![db::capability::CapabilityRole::Control],
+            Some(config::RuntimeRole::Worker) => vec![db::capability::CapabilityRole::Worker],
+            Some(config::RuntimeRole::All) => vec![
+                db::capability::CapabilityRole::Gateway,
+                db::capability::CapabilityRole::Control,
+                db::capability::CapabilityRole::Worker,
+            ],
+            None => vec![db::capability::CapabilityRole::Maintenance],
+        };
+        for role in roles {
+            db.verify_capabilities(role)
+                .await
+                .map_err(|error| InitializationError::Database(error.into()))?;
+        }
         db.refresh_http_settings()
             .await
             .map_err(InitializationError::Database)?;

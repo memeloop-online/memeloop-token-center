@@ -10,6 +10,7 @@ mod tests;
 #[serde(rename_all = "snake_case")]
 pub enum CapabilityRole {
     Gateway,
+    Control,
     Worker,
     HistoryReader,
     Maintenance,
@@ -53,6 +54,7 @@ pub struct CapabilityReport {
     pub role: CapabilityRole,
     pub track: SchemaTrack,
     pub object_signatures: Vec<CatalogSignature>,
+    pub available_capabilities: Vec<String>,
     pub verified_at: i64,
 }
 impl CapabilityManifest {
@@ -94,5 +96,21 @@ pub fn manifest() -> CapabilityManifest {
             },
             history::baseline_receipt(),
         ],
+    }
+}
+
+impl CapabilityReport {
+    pub fn require(&self, id: &str) -> Result<(), sqlx::Error> {
+        if self
+            .available_capabilities
+            .iter()
+            .any(|available| available == id)
+        {
+            Ok(())
+        } else {
+            Err(sqlx::Error::Protocol(format!(
+                "required capability unavailable: {id}"
+            )))
+        }
     }
 }
