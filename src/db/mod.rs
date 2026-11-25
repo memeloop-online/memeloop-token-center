@@ -756,7 +756,8 @@ impl Database {
             #[cfg(test)]
             oauth_refresh_write_phase_seam: std::sync::Arc::new(tokio::sync::Mutex::new(None)),
         };
-        if matches!(backend, DatabaseBackend::Sqlite) {
+        if matches!(backend, DatabaseBackend::Sqlite) && matches!(profile, ConnectionProfile::Serve)
+        {
             database.verify_sqlite_runtime().await?;
         }
         Ok(database)

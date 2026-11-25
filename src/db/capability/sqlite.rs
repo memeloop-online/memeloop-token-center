@@ -196,6 +196,25 @@ mod tests {
             .publish_pending_proxy_started_events()
             .await
             .unwrap();
+        // The explicit migration entry can repair an already-registered schema
+        // step; ordinary runtime connections must still reject that gap.
+        sqlx::query("DROP TABLE request_history_activation")
+            .execute(&reopened.pool)
+            .await
+            .unwrap();
+        sqlx::query("DELETE FROM schema_migrations WHERE version=160")
+            .execute(&reopened.pool)
+            .await
+            .unwrap();
+        assert!(Database::connect(&url).await.is_err());
+        let repair = Database::connect_for_migration(&url, 1).await.unwrap();
+        assert!(repair.legacy163_mode().is_err());
+        repair.migrate().await.unwrap();
+        assert!(!repair.legacy163_mode().unwrap());
+        repair.close().await;
+        let repaired = Database::connect(&url).await.unwrap();
+        assert!(!repaired.legacy163_mode().unwrap());
+        repaired.close().await;
         let receipt_name: String =
             sqlx::query_scalar("SELECT name FROM schema_migrations WHERE version=142")
                 .fetch_one(&reopened.pool)
