@@ -220,6 +220,20 @@ pub(super) async fn network_proxy_strategies(
     }.await)
 }
 
+pub(super) async fn get_network_proxy_selection(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path(account): Path<Uuid>,
+    Query(query): Query<ProxyTenantQuery>,
+) -> Response {
+    response(async {
+        authority(&headers, &state, &query.tenant_external_id).await?;
+        let mut body = state.db.get_network_proxy_selection(account, &query.tenant_external_id).await?;
+        state.transport_proxy_groups.describe_network_proxy_selection(account, &mut body);
+        Ok((StatusCode::OK, body))
+    }.await)
+}
+
 pub(super) async fn update_network_proxy_selection(
     State(state): State<AppState>,
     headers: HeaderMap,

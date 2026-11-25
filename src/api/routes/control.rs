@@ -31,7 +31,7 @@ pub(in crate::api) fn control_router(state: AppState) -> Router<AppState> {
         )
         .route(
             "/internal/v1/upstreams/{account_id}/transport-proxy-selection",
-            put(network_proxies::update_network_proxy_selection),
+            get(network_proxies::get_network_proxy_selection).put(network_proxies::update_network_proxy_selection),
         )
         .route(
             "/internal/v1/api-schema",

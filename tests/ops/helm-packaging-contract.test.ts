@@ -414,6 +414,8 @@ test('Helm chart packaging, security, ingress, and schema contracts', () => {
     }
     assert.notEqual(oldSchema.status, 0, 'chart accepted a schema override from the previous migration');
     assert.match(oldSchema.stderr, /migration.schemaVersion must match chart schema generation/);
+    const disabledOldSchema = run(helm, ['template', 'disabled-old-schema', chart, '--set', 'migration.enabled=false', '--set', `migration.schemaVersion=${sqlite - 1}`]);
+    assert.doesNotMatch(disabledOldSchema, /kind: Job/);
     const matchingSchema = run(helm, ['template', 'matching-schema', chart, '--set', `migration.schemaVersion=${sqlite}`]);
     assert.ok(matchingSchema.includes(`memeloop.io/schema-generation: "v${sqlite}"`));
     for (const budget of ['268435456', '805306368']) {
