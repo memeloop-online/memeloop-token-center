@@ -1680,7 +1680,7 @@ async fn codex_transient_400_is_not_replayed_across_accounts() {
         .respond_with(ResponseTemplate::new(400).set_body_json(json!({
             "error": {
                 "type": "temporarily_unavailable",
-                "message": "transient upstream detail must stay private"
+                "message": "transient upstream detail returned by supplier"
             }
         })))
         .expect(2)
@@ -1716,7 +1716,7 @@ async fn codex_transient_400_is_not_replayed_across_accounts() {
         .unwrap();
     let original = json!({"error": {
         "type": "temporarily_unavailable",
-        "message": "transient upstream detail must stay private"
+        "message": "transient upstream detail returned by supplier"
     }});
     assert_eq!(body.as_ref(), serde_json::to_vec(&original).unwrap());
     cancellation::assert_single_unknown_receipt(&fixture, 400, Some("http_400")).await;

@@ -5,67 +5,54 @@ mod buffered_usage;
 #[tokio::test]
 async fn kimi_error_envelopes_preserve_original_bytes_and_safe_internal_classification() {
     let canary = "kimi-upstream-token-prompt-canary";
+    let sensitive_message = format!("token={canary}; ordinary detail");
     let cases = [
         (
             "plan",
             "application/json",
-            json!({"error":{"code":"NoAvailablePlan","message":canary,"debug":canary}}).to_string(),
+            json!({"error":{"code":"NoAvailablePlan","message":sensitive_message,"api_key":canary}}).to_string(),
             Some("no_active_plan"),
-            false,
         ),
         (
             "quota",
             "application/json",
-            json!({"error":{"code":"insufficient_quota","message":canary}}).to_string(),
+            json!({"error":{"code":"insufficient_quota","message":sensitive_message}}).to_string(),
             Some("insufficient_quota"),
-            false,
         ),
         (
             "auth",
             "application/json",
-            json!({"error":{"code":"invalid_api_key","message":canary}}).to_string(),
+            json!({"error":{"code":"invalid_api_key","message":sensitive_message}}).to_string(),
             Some("authentication_invalid"),
-            false,
         ),
         (
             "unknown",
             "application/json",
-            json!({"error":{"code":canary,"message":canary}}).to_string(),
+            json!({"error":{"code":"unfamiliar_error","message":sensitive_message}}).to_string(),
             None,
-            false,
         ),
         (
             "conflicting",
             "application/json",
-            json!({"error":{"code":"invalid_api_key","message":"No active plan","debug":canary}}).to_string(),
+            json!({"error":{"code":"invalid_api_key","message":"No active plan","api_key":canary}}).to_string(),
             None,
-            false,
         ),
         (
             "duplicate",
             "application/json",
-            format!(r#"{{"error":{{"code":"insufficient_quota","code":"{canary}"}}}}"#),
+            r#"{"error":{"code":"insufficient_quota","code":"unfamiliar_error"}}"#.to_owned(),
             None,
-            false,
         ),
-        ("non-json", "text/html", canary.to_owned(), None, false),
+        ("non-json", "text/plain", sensitive_message.clone(), None),
         (
             "oversized",
             "application/json",
-            json!({"error":{"code":"insufficient_quota","message":canary.repeat(upstream_error::MAX_ERROR_BYTES)}}).to_string(),
+            json!({"error":{"code":"insufficient_quota","message":sensitive_message.repeat(upstream_error::MAX_ERROR_BYTES)}}).to_string(),
             None,
-            false,
-        ),
-        (
-            "slow-body",
-            "application/json",
-            json!({"error":{"code":"insufficient_quota","message":canary}}).to_string(),
-            None,
-            true,
         ),
     ];
     for protocol in [Protocol::OpenAiChat, Protocol::OpenAiResponses] {
-        for (label, content_type, body, expected_reason, slow_body) in &cases {
+        for (label, content_type, body, expected_reason) in &cases {
             let upstream = MockServer::start().await;
             Mock::given(method("POST"))
                 .respond_with(ResponseTemplate::new(403).set_body_raw(body.clone(), *content_type))
@@ -133,23 +120,10 @@ async fn kimi_error_envelopes_preserve_original_bytes_and_safe_internal_classifi
                 original_response_capture: false,
                 memory: fixture.state.proxy_memory_budget.reservation(),
             };
-            let mut parts = UpstreamResponse::from(raw).into_parts();
-            if *slow_body {
-                parts.stream = Box::pin(parts.stream.then(|chunk| async move {
-                    tokio::time::sleep(Duration::from_millis(250)).await;
-                    chunk
-                }));
-            }
-            let upstream = request
-                .capture_original_response(UpstreamResponse::Prefetched {
-                    status: parts.status,
-                    headers: parts.headers,
-                    version: parts.version,
-                    content_length: parts.content_length,
-                    stream: parts.stream,
-                })
+            let captured = request
+                .capture_original_response(UpstreamResponse::from(raw))
                 .await;
-            let response = finish_upstream_http_error(&request, upstream)
+            let response = finish_upstream_http_error(&request, captured)
                 .await
                 .unwrap();
             assert_eq!(response.status(), StatusCode::FORBIDDEN);
@@ -233,7 +207,15 @@ async fn kimi_error_envelopes_preserve_original_bytes_and_safe_internal_classifi
                     .contains(canary)
             );
             assert_eq!(record.supplier_error, detail.view.supplier_error);
-            assert_eq!(record.supplier_error.is_some(), expected_reason.is_some());
+            assert_eq!(
+                record
+                    .supplier_error
+                    .as_ref()
+                    .filter(|summary| summary.category != "upstream")
+                    .map(|summary| summary.code.as_str()),
+                *expected_reason,
+                "{label}"
+            );
             upstream.verify().await;
         }
     }

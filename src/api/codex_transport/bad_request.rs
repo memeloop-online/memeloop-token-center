@@ -76,7 +76,7 @@ pub(in crate::api) async fn inspect_bad_request_response(
     let (parts, prefix) = preview.body.as_mut().expect("preview owns the response");
     let disposition = match tokio::time::timeout(
         MAX_RETRYABLE_ERROR_WAIT,
-        read_bounded_body(&mut parts.stream, prefix),
+        read_bounded_body(&mut parts.stream, prefix, parts.content_length),
     )
     .await
     {
@@ -554,10 +554,13 @@ fn tool_rejection_reason(message: &str) -> Option<&'static str> {
 async fn read_bounded_body(
     stream: &mut super::super::upstream_response::UpstreamByteStream,
     prefix: &mut Vec<Result<bytes::Bytes, &'static str>>,
+    content_length: Option<u64>,
 ) -> Result<Value, BadRequestUnclassifiableReason> {
     use BadRequestUnclassifiableReason::*;
     let mut body = Vec::new();
+    let mut polled = 0usize;
     while let Some(chunk) = stream.next().await {
+        polled = polled.wrapping_add(1);
         match chunk {
             Ok(chunk) if chunk.len() <= MAX_RETRYABLE_ERROR_BYTES.saturating_sub(body.len()) => {
                 body.extend_from_slice(&chunk);
@@ -574,6 +577,12 @@ async fn read_bounded_body(
                 return Err(ReadFailed);
             }
         }
+        if polled.is_multiple_of(64) {
+            tokio::task::yield_now().await;
+        }
+    }
+    if content_length.is_some_and(|length| length != body.len() as u64) {
+        return Err(ReadFailed);
     }
     serde_json::from_slice(&body).map_err(|_| InvalidJson)
 }
@@ -596,26 +605,7 @@ fn has_single_json_content_type(response: &UpstreamResponse) -> bool {
         })
 }
 
-#[cfg(test)]
 pub(super) fn codex_transient_error(value: &Value) -> bool {
-    let Some(error) = value.get("error").and_then(Value::as_object) else {
-        return false;
-    };
-    if error
-        .get("type")
-        .and_then(Value::as_str)
-        .is_some_and(is_explicit_transient_error_type)
-    {
-        return true;
-    }
-    error
-        .get("message")
-        .and_then(Value::as_str)
-        .is_some_and(is_known_high_demand_message)
-}
-
-#[cfg(not(test))]
-fn codex_transient_error(value: &Value) -> bool {
     let Some(error) = value.get("error").and_then(Value::as_object) else {
         return false;
     };
@@ -975,6 +965,7 @@ mod tests {
         let (capture, captured) = tokio::sync::oneshot::channel();
         let prefix = Bytes::from_static(b"{\"error\":");
         let tail = Bytes::from_static(b"\"original\"}");
+        let expected_tail = tail.clone();
         let response = UpstreamResponse::Prefetched {
             status: http::StatusCode::BAD_REQUEST,
             headers,
@@ -999,7 +990,7 @@ mod tests {
         release.send(()).unwrap();
         let mut stream = captured.await.unwrap().bytes_stream();
         assert_eq!(stream.next().await, Some(Ok(prefix)));
-        assert_eq!(stream.next().await, Some(Ok(tail)));
+        assert_eq!(stream.next().await, Some(Ok(expected_tail)));
         assert!(stream.next().await.is_none());
     }
 

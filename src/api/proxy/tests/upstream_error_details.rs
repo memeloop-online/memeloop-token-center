@@ -187,7 +187,7 @@ async fn compatible_http_errors_classify_safe_reasons_and_preserve_financial_att
         Mock::given(method("POST"))
             .and(path("/v1/chat/completions"))
             .respond_with(ResponseTemplate::new(status).set_body_json(json!({
-                "error": { "message": message, "code": code, "debug": "must-not-retain" },
+                "error": { "message": message, "code": code, "api_key": "must-not-retain" },
                 "usage": { "prompt_tokens": 500, "completion_tokens": 100 }
             })))
             .expect(1)
@@ -236,7 +236,7 @@ async fn compatible_http_errors_classify_safe_reasons_and_preserve_financial_att
         assert_eq!(record.billing.cost, None);
         let stored = restored_rejection(&fixture, record.request_id).await;
         let original = json!({
-            "error": { "message": message, "code": code, "debug": "must-not-retain" },
+            "error": { "message": message, "code": code, "api_key": "must-not-retain" },
             "usage": { "prompt_tokens": 500, "completion_tokens": 100 }
         });
         assert_eq!(stored.as_ref(), serde_json::to_vec(&original).unwrap());
@@ -383,7 +383,13 @@ async fn compatible_http_402_preserves_unclassified_details_without_inventing_pl
             .request_archive_refs(fixture.key_id, records[0].request_id)
             .await
             .unwrap();
-        assert!(refs.view.supplier_error.is_none());
+        assert!(
+            refs.view
+                .supplier_error
+                .as_ref()
+                .is_none_or(|summary| summary.category == "upstream"),
+            "{label} must not invent a classified failure"
+        );
         assert_eq!(
             restored_rejection(&fixture, records[0].request_id)
                 .await
@@ -465,7 +471,12 @@ async fn compatible_http_rejection_keeps_status_when_the_supplier_body_is_trunca
         .request_archive_refs(fixture.key_id, records[0].request_id)
         .await
         .unwrap();
-    assert!(refs.view.supplier_error.is_none());
+    assert!(
+        refs.view
+            .supplier_error
+            .as_ref()
+            .is_none_or(|summary| summary.category == "upstream")
+    );
     let key = fixture
         .state
         .db

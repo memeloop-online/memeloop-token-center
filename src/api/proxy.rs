@@ -1758,8 +1758,10 @@ async fn proxy_with_cancellation_guard(
         };
         let (result, model_rejected) = match result {
             Ok(mut result)
-                if !route_candidates.as_slice().is_empty()
-                    || !deferred_shared_probes.is_empty() =>
+                if (!route_candidates.as_slice().is_empty()
+                    || !deferred_shared_probes.is_empty())
+                    && !(active_route.is_codex()
+                        && result.response.status() == StatusCode::BAD_REQUEST) =>
             {
                 let (response, rejected) =
                     upstream_error::inspect_model_rejection(result.response).await;
