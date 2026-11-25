@@ -35,4 +35,7 @@ jobs:
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6
       - uses: ./.github/actions/checkout-plugin-examples
       - name: Verify low-lock partitioned migration with real PostgreSQL
-        run: cargo test --locked --all-features --lib postgres_capability_ -- --nocapture
+        run: |
+          cargo test --locked --all-features --lib postgres_capability_ -- --nocapture
+          cargo test --locked --all-features --lib postgres_history_proof_guard_rejects_missing_and_below_floor_catalog -- --nocapture
+          cargo test --locked --all-features --lib history_proof_guard_rejects_missing_postgres_capability -- --nocapture

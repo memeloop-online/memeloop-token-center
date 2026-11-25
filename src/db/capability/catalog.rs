@@ -50,32 +50,34 @@ pub(in crate::db) async fn inspect(
         _ => SchemaTrack::Linear165,
     };
     let mut signatures = Vec::new();
-    // Every role relies on these existing transaction and recovery authorities.
-    for table in [
-        "request_records",
-        "request_record_locators",
-        "usage_reservations",
-        "request_events",
-        "terminal_projection_outbox",
-        "request_history_state",
-        "request_history_baseline_runs",
-    ] {
-        let row=sqlx::query("SELECT c.oid::bigint AS oid,c.relkind::text AS kind,has_table_privilege(c.oid,'SELECT') AS readable FROM pg_class c WHERE c.oid=to_regclass($1)")
+    for requirement in permissions::requirements(role) {
+        let table = requirement.table;
+        let row = sqlx::query("SELECT c.oid::bigint AS oid,c.relkind::text AS kind FROM pg_class c WHERE c.oid=to_regclass($1)")
             .bind(table).fetch_optional(&mut *c).await?.ok_or_else(||drift("required relation missing"))?;
         let kind: String = row.try_get("kind")?;
-        if !["r", "p"].contains(&kind.as_str()) || !row.try_get::<bool, _>("readable")? {
-            return Err(drift("required relation inaccessible or incompatible"));
+        if !["r", "p"].contains(&kind.as_str()) {
+            return Err(drift("required relation incompatible"));
         }
-        if !matches!(role, CapabilityRole::HistoryReader) {
-            let writable: bool = sqlx::query_scalar("SELECT has_table_privilege(to_regclass($1),'INSERT') AND has_table_privilege(to_regclass($1),'UPDATE') AND has_table_privilege(to_regclass($1),'DELETE')")
-                .bind(table).fetch_one(&mut *c).await?;
-            if !writable {
-                return Err(drift("role requires transaction/recovery write privileges"));
+        for operation in requirement.operations {
+            let allowed: bool =
+                sqlx::query_scalar("SELECT has_table_privilege(to_regclass($1),$2)")
+                    .bind(table)
+                    .bind(*operation)
+                    .fetch_one(&mut *c)
+                    .await?;
+            if !allowed {
+                return Err(drift(&format!(
+                    "role {role:?} requires {operation} on {table}"
+                )));
             }
         }
         signatures.push(CatalogSignature {
             object: table.into(),
-            signature: format!("{}:{kind}", row.try_get::<i64, _>("oid")?),
+            signature: format!(
+                "{}:{kind}:{}",
+                row.try_get::<i64, _>("oid")?,
+                requirement.operations.join(",")
+            ),
         });
     }
     let manifest = manifest();
@@ -161,6 +163,19 @@ impl Database {
             .ok_or_else(|| drift("legacy startup requires an existing verified database"))?;
         if report.track != SchemaTrack::Legacy163 {
             return Err(drift("legacy startup requires exact163"));
+        }
+        Ok(report)
+    }
+
+    pub async fn verify_startup_capabilities(
+        &self,
+        role: CapabilityRole,
+    ) -> Result<Option<CapabilityReport>, sqlx::Error> {
+        let report = self.verify_capabilities(role).await?;
+        if matches!(self.backend, DatabaseBackend::PostgreSql) && report.is_none() {
+            return Err(drift(
+                "PostgreSQL startup requires a proven supported schema",
+            ));
         }
         Ok(report)
     }
