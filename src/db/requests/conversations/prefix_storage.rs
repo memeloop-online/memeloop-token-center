@@ -140,11 +140,14 @@ impl PreparedCandidatePaths {
         leaf: Option<&str>,
     ) -> Result<&PrefixPaths, ConversationContentError> {
         let required = candidate_roots(candidates, leaf)?;
-        if self.tenant_id != tenant_id || !required.is_subset(&self.roots) {
+        if self.tenant_id != tenant_id {
             return Err(AppError::Conflict(
                 "conversation candidates changed during prefix preparation".into(),
             )
             .into());
+        }
+        if !required.is_subset(&self.roots) {
+            return Err(ConversationContentError::CandidatesChanged);
         }
         // Candidate metadata is always the freshly selected, locked-scope row.
         // Only tenant-scoped content-addressed nodes are reused.

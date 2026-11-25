@@ -36,6 +36,7 @@ struct Faults {
     gets: HashMap<String, Arc<ObjectReadGate>>,
     response_get: Option<(String, Arc<ObjectReadGate>)>,
     part_gate: Option<Arc<ObjectReadGate>>,
+    body_put_gate: Option<Arc<ObjectReadGate>>,
     abort_gate: Option<Arc<ObjectReadGate>>,
     puts: HashSet<String>,
     put_prefixes: HashSet<String>,
@@ -94,6 +95,11 @@ impl RecoveryObjectProxy {
     }
     pub(crate) fn endpoint(&self) -> &str {
         &self.endpoint
+    }
+    pub(crate) fn gate_body_put(&self) -> Arc<ObjectReadGate> {
+        let gate = Arc::new(ObjectReadGate::default());
+        self.state.faults.lock().unwrap().body_put_gate = Some(gate.clone());
+        gate
     }
     pub(crate) fn gate_multipart_part(&self) -> Arc<ObjectReadGate> {
         let gate = Arc::new(ObjectReadGate::default());
@@ -161,6 +167,16 @@ impl RecoveryObjectProxy {
             gate.release();
         }
         faults.gets.clear();
+        for gate in [
+            faults.part_gate.take(),
+            faults.abort_gate.take(),
+            faults.body_put_gate.take(),
+        ]
+        .into_iter()
+        .flatten()
+        {
+            gate.release();
+        }
     }
     pub(crate) fn failed_puts(&self) -> usize {
         self.state.failed_puts.load(Ordering::SeqCst)
@@ -168,9 +184,7 @@ impl RecoveryObjectProxy {
 }
 impl Drop for RecoveryObjectProxy {
     fn drop(&mut self) {
-        for gate in self.state.faults.lock().unwrap().gets.values() {
-            gate.release();
-        }
+        self.clear_faults();
         self.task.abort();
     }
 }
@@ -212,6 +226,8 @@ async fn forward(State(state): State<Arc<ProxyState>>, request: Request) -> Resp
                 faults.part_gate.clone()
             } else if request.method() == axum::http::Method::DELETE && query.contains("uploadId") {
                 faults.abort_gate.clone()
+            } else if class == "body_put" {
+                faults.body_put_gate.clone()
             } else {
                 None
             },
