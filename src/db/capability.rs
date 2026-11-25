@@ -41,6 +41,7 @@ pub struct CapabilityNode {
 #[derive(Clone, Debug, Serialize)]
 pub struct CapabilityManifest {
     pub format_version: u32,
+    pub role_operations: Vec<(CapabilityRole, Vec<permissions::RelationOperations>)>,
     pub nodes: Vec<CapabilityNode>,
 }
 #[derive(Clone, Debug, Serialize)]
@@ -67,6 +68,16 @@ impl CapabilityManifest {
 pub fn manifest() -> CapabilityManifest {
     CapabilityManifest {
         format_version: 1,
+        role_operations: [
+            CapabilityRole::Gateway,
+            CapabilityRole::Worker,
+            CapabilityRole::Control,
+            CapabilityRole::HistoryReader,
+            CapabilityRole::Maintenance,
+        ]
+        .into_iter()
+        .map(|role| (role, permissions::requirements(role)))
+        .collect(),
         nodes: vec![
             CapabilityNode {
                 id: "schema.legacy163.v1",
