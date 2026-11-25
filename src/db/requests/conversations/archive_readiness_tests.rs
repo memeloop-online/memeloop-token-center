@@ -3184,3 +3184,6 @@ async fn postgres_exact_legacy_body_rebuild_preserves_incomplete_and_financial_r
     );
     isolated.cleanup().await;
 }
+
+#[path = "rebuild_partition_tests.rs"]
+mod rebuild_partition_tests;
