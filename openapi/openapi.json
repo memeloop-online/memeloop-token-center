@@ -410,6 +410,67 @@
             "description": "Configuration or selection version conflict."
           }
         }
+      },
+      "get": {
+        "tags": [
+          "Upstream providers"
+        ],
+        "operationId": "getNetworkProxySelection",
+        "security": [
+          {
+            "serviceBearer": []
+          }
+        ],
+        "x-required-scope": "providers:write",
+        "parameters": [
+          {
+            "name": "account_id",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "format": "uuid"
+            }
+          },
+          {
+            "$ref": "#/components/parameters/RequiredTenant"
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Private, no-store. Background application and observations are asynchronous.",
+            "headers": {
+              "Cache-Control": {
+                "schema": {
+                  "type": "string",
+                  "const": "private, no-store"
+                }
+              }
+            },
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object"
+                }
+              }
+            }
+          },
+          "400": {
+            "$ref": "#/components/responses/InvalidRequest"
+          },
+          "401": {
+            "$ref": "#/components/responses/Unauthorized"
+          },
+          "403": {
+            "$ref": "#/components/responses/Forbidden"
+          },
+          "404": {
+            "$ref": "#/components/responses/NotFound"
+          },
+          "409": {
+            "description": "Configuration or selection version conflict."
+          }
+        }
       }
     },
     "/internal/v1/transport-proxies": {

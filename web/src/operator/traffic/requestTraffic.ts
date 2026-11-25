@@ -312,7 +312,7 @@ export function requestViewFromEvent(event: RequestEvent, previous?: RequestView
   };
   const eventStage = event.in_flight_stage;
   const normalizedStage = eventStage == null ? eventStage : recordedInFlightStage(event) ?? undefined;
-  const inFlightStage = observedValue(normalizedStage, previous ? recordedInFlightStage(previous) : undefined, authoritative && eventStage == null);
+  const inFlightStage = observedValue(normalizedStage, previous?.in_flight_stage == null ? previous?.in_flight_stage : recordedInFlightStage(previous) ?? undefined, authoritative && eventStage == null);
   if (inFlightStage !== undefined) request.in_flight_stage = inFlightStage;
   if (event.operational_terminal !== undefined) request.operational_terminal = event.operational_terminal;
   const supplierError = observedValue(event.supplier_error, previous?.supplier_error, authoritative);
