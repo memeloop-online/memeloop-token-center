@@ -112,6 +112,7 @@ pub(in crate::api::proxy) struct CandidatePreparationSummary {
     examined: usize,
     retired_provider: usize,
     unavailable_snapshot: usize,
+    pub(in crate::api::proxy) stale_pairs: std::collections::BTreeSet<(Uuid, Uuid)>,
     protocol_mismatch: usize,
     incompatible_usage: usize,
     reservation_metadata_unavailable: usize,
@@ -146,14 +147,28 @@ pub(in crate::api::proxy) async fn next_planned_proxy_candidate(
         let route = match request
             .state
             .db
-            .materialize_authorized_upstream_candidate(
+            .materialize_authorized_upstream_candidate_diagnostic(
                 &candidate,
                 request.state.config.key_pepper.as_bytes(),
             )
             .await
         {
-            Ok(Some(route)) => route,
-            Ok(None) => {
+            Ok((Some(route), _)) => route,
+            Ok((None, reason)) => {
+                let reason = reason.unwrap_or("snapshot_unavailable");
+                if matches!(
+                    reason,
+                    "credential_generation_changed" | "transport_revision_changed"
+                ) {
+                    summary
+                        .stale_pairs
+                        .insert((candidate.route_id, candidate.account_id));
+                }
+                tracing::info!(
+                    stage = "candidate_snapshot_unavailable",
+                    reason,
+                    "proxy skipped an unavailable authorized snapshot"
+                );
                 summary.unavailable_snapshot += 1;
                 continue;
             }

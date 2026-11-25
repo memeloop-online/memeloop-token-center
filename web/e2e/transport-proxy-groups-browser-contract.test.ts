@@ -1,4 +1,5 @@
 import assert from 'node:assert/strict';
+import { mkdir } from 'node:fs/promises';
 import { fileURLToPath } from 'node:url';
 import test from 'node:test';
 import { chromium, type Page } from 'playwright';
@@ -360,7 +361,7 @@ test('transport proxy groups: CRUD, policies, validation, CAS, secrets, permissi
         assert.equal(await page.locator('.proxy-groups-page').evaluate(element => getComputedStyle(element).borderTopWidth), '0px');
         await page.getByRole('button', { name: copy.edit('Research exits'), exact: true }).click();
         await page.getByRole('dialog', { name: copy.edit('Research exits'), exact: true }).waitFor();
-        assert.equal(await page.getByLabel(copy.replaceAddress, { exact: true }).getAttribute('placeholder'), 'socks5h://10.20.30.40:1080');
+        assert.equal(await page.getByLabel(copy.address, { exact: true }).inputValue(), '', 'redacted authenticated metadata cannot invent a stored address');
         await captureNavigationIdentity(page, 'proxy-groups', 'edit-address', locale);
         await page.getByRole('button', { name: copy.cancelEdit, exact: true }).click();
         await page.locator('.app-confirm-dialog button').last().click();
@@ -467,7 +468,7 @@ test('transport proxy groups: CRUD, policies, validation, CAS, secrets, permissi
       assert.equal(await workspace.count(), 1);
       assert.equal(await page.getByRole('button', { name: '选择代理组', exact: true }).count(), 0);
       assert.equal(await page.locator('.provider-detail-workspace .upstream-proxy-editor').count(), 0);
-      await workspace.getByLabel(fieldLabel(networkProxyCopy('zh-CN').targetProxy)).selectOption({ label: 'CSIL' });
+      await workspace.getByLabel(fieldLabel(networkProxyCopy('zh-CN').targetProxy)).selectOption(csilProxy.id);
       await workspace.getByRole('button', { name: networkProxyCopy('zh-CN').savePolicy, exact: true }).click();
       await workspace.getByText(networkProxyCopy('zh-CN').policySaved, { exact: true }).waitFor();
       const writes = await page.evaluate(() => window.proxyGroupFixture.writes);
@@ -504,7 +505,7 @@ test('transport proxy groups: CRUD, policies, validation, CAS, secrets, permissi
       await page.getByText(/代理组配置已保存/).waitFor();
       await assertWorkspaceFocus(page);
       await page.getByRole('button', { name: '编辑 研发出口组', exact: true }).click();
-      assert.equal(await page.getByLabel('替换代理地址（留空保留原值）', { exact: true }).inputValue(), '');
+      assert.equal(await page.getByLabel('私网代理地址', { exact: true }).inputValue(), privateProxySecret, 'authorized saved address remains directly editable');
       await page.getByRole('textbox', { name: /^代理组名称\s*\*?$/ }).fill('共享出口组');
       await page.getByRole('button', { name: '保存代理组', exact: true }).click();
       await page.getByRole('button', { name: '编辑 共享出口组', exact: true }).waitFor();
@@ -632,8 +633,8 @@ test('transport proxy groups: CRUD, policies, validation, CAS, secrets, permissi
         await workspace.getByText(new RegExp(`${copy.requestSuccessRate}: 90%`)).waitFor();
         const details = await workspace.locator('.network-proxy-item').innerText();
         assert.match(details, new RegExp(`${copy.transportSuccessRate}: 95%`));
-        assert.match(details, /4,096 B/);
-        assert.match(details, /16,384 B/);
+        assert.match(details, /4\.1 KB/);
+        assert.match(details, /16\.38 KB/);
         assert.match(details, new RegExp(`${copy.concurrency}: 1`));
         assert.match(details, new RegExp(`${copy.healthTitle}: ${copy.health.healthy}`));
         assert.ok(details.includes(copy.trafficTitle));
@@ -647,6 +648,28 @@ test('transport proxy groups: CRUD, policies, validation, CAS, secrets, permissi
         await captureNavigationIdentity(page, 'proxy-groups', 'network-exit-edit-address', locale);
         await page.close();
       }
+    });
+
+    await context.test('probing refreshes exit health and opened traffic observations without resubmitting the probe', async () => {
+      const page = await prepare(true, 'en', 'proxies');
+      const copy = networkProxyCopy('en');
+      const workspace = page.locator('.network-proxy-workspace');
+      await workspace.getByRole('button', { name: copy.probeNow, exact: true }).waitFor();
+      await workspace.getByRole('button', { name: copy.details, exact: true }).click();
+      await workspace.getByText(new RegExp(copy.recordedAttempts)).waitFor();
+      const before = await page.evaluate(() => {
+        const state = window.proxyGroupFixture;
+        state.proxies[0].active_health = { ...state.proxies[0].active_health, status: 'unhealthy', checked_at: 1_793_510_600_000 };
+        return { reads: state.reads, writes: state.writes.length };
+      });
+      await workspace.getByRole('button', { name: copy.probeNow, exact: true }).click();
+      await page.getByText(copy.probeQueued, { exact: true }).waitFor();
+      await workspace.getByText(new RegExp(`${copy.healthTitle}: ${copy.health.unhealthy}`)).first().waitFor();
+      const after = await page.evaluate(() => ({ reads: window.proxyGroupFixture.reads, writes: window.proxyGroupFixture.writes }));
+      assert.ok(after.reads >= before.reads + 3, 'list, concurrency and opened observations are read again');
+      assert.equal(after.writes.length, before.writes + 1, 'one accepted probe is never replayed');
+      assert.match(after.writes.at(-1)!.path, /\/probe$/);
+      await page.close();
     });
 
     await context.test('current exit follows the actual selected member and pending never claims direct or desired egress', async () => {
@@ -727,7 +750,7 @@ test('transport proxy groups: CRUD, policies, validation, CAS, secrets, permissi
       const policies = page.locator('.network-proxy-policy-workspace');
       await policies.getByRole('button', { name: '研发订阅', exact: true }).click();
       await policies.getByText(new RegExp(copy.policyLegacy)).waitFor();
-      await policies.getByLabel(fieldLabel(copy.targetProxy)).selectOption({ label: 'CSIL' });
+      await policies.getByLabel(fieldLabel(copy.targetProxy)).selectOption(csilProxy.id);
       await policies.getByRole('button', { name: copy.savePolicy, exact: true }).click();
       await policies.getByText(copy.policySaved, { exact: true }).waitFor();
       await captureNavigationIdentity(page, 'proxy-groups', 'account-policy-manual', 'zh-CN');
@@ -851,6 +874,44 @@ test('transport proxy groups: CRUD, policies, validation, CAS, secrets, permissi
       await page.getByRole('button', { name: '重试', exact: true }).click();
       await page.getByText('你没有管理代理组的权限，请联系管理员开通。', { exact: true }).waitFor();
       assert.equal(await page.evaluate(() => window.proxyGroupFixture.reads), 0);
+      await page.close();
+    });
+    await context.test('shared network surfaces preserve three tabs and distinct policy evidence in both themes', async () => {
+      const page = await prepare(true, 'en', 'proxies');
+      const copy = networkProxyCopy('en');
+      const groupCopy = transportProxyGroupCopy('en');
+      const root = fileURLToPath(new URL('../e2e-artifacts/network-unified/', import.meta.url));
+      await mkdir(root, { recursive: true });
+      const tabs = [copy.proxiesTab, groupCopy.title, copy.policiesTab];
+      const lightBackground = await page.locator('.proxy-groups-page').evaluate(e => getComputedStyle(e).backgroundColor);
+      for (const [index, name] of tabs.entries()) {
+        await page.getByRole('tab', { name, exact: true }).click();
+        assert.equal(await page.getByRole('tab', { name, exact: true }).getAttribute('aria-selected'), 'true');
+        if (index === 2) {
+          const policy = page.locator('.network-proxy-policy-workspace');
+          await policy.getByRole('button', { name: '研发订阅', exact: true }).click();
+          await policy.getByText(copy.policyObservationHint, { exact: true }).waitFor();
+          assert.equal(await policy.locator('dt').filter({ hasText: copy.currentPolicy }).count(), 1);
+          assert.equal(await policy.locator('dt').filter({ hasText: copy.effectiveSource }).count(), 1);
+        }
+        for (const theme of ['light', 'dark']) {
+          await page.evaluate(theme => { document.documentElement.dataset.theme = theme; }, theme);
+          await page.waitForFunction(({ light, theme }) => {
+            const surface = document.querySelector('.proxy-groups-page');
+            return surface && (getComputedStyle(surface).backgroundColor === light) === (theme === 'light');
+          }, { light: lightBackground, theme });
+          for (const width of [390, 1440]) {
+            await page.setViewportSize({ width, height: 900 });
+            assert.equal(await page.getByRole('tab', { name, exact: true }).getAttribute('aria-selected'), 'true');
+            assert.ok(await page.evaluate(() => document.documentElement.scrollWidth <= innerWidth), 'network surface must not overflow');
+            for (const tab of await page.getByRole('tab').all()) {
+              const box = await tab.boundingBox(); assert.ok(box && box.height >= 44, 'tabs retain visible touch targets');
+            }
+            await page.screenshot({ path: `${root}/network-${index}-${theme}-${width}.png`, fullPage: true, animations: 'disabled' });
+          }
+        }
+      }
+      assert.equal(await page.evaluate(() => window.proxyGroupFixture.writes.length), 0, 'navigation and policy inspection do not save or probe');
       await page.close();
     });
     assert.doesNotMatch(errors.join('\n'), /privateProxySecret|fixture-user/);

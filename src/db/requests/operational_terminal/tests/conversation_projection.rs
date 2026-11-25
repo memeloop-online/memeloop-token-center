@@ -163,6 +163,15 @@ async fn contract(fixture: Fixture) {
         .await
         .unwrap();
     super::unknown_bridge::drain_terminal(&fixture).await;
+    let financial_event: (i64, String) = {
+        let row = sqlx::query("SELECT event_at, event_id FROM request_events WHERE request_id = $1 AND event_kind = 'projected' ORDER BY event_at DESC, event_id DESC LIMIT 1")
+            .bind(request_id.to_string()).fetch_one(&fixture.database.pool).await.unwrap();
+        (
+            row.try_get("event_at").unwrap(),
+            row.try_get("event_id").unwrap(),
+        )
+    };
+
     let tasks = fixture
         .database
         .claim_conversation_projection_tasks(owner, 1)
@@ -194,9 +203,11 @@ async fn contract(fixture: Fixture) {
             .unwrap()
     );
     let event = sqlx::query(
-        "SELECT status_code, duration_ms, error_code FROM request_events WHERE request_id = $1 AND event_kind = 'projected'",
+        "SELECT status_code, duration_ms, error_code FROM request_events WHERE request_id = $1 AND event_kind = 'projected' AND (event_at > $2 OR (event_at = $2 AND event_id > $3))",
     )
     .bind(request_id.to_string())
+    .bind(financial_event.0)
+    .bind(&financial_event.1)
     .fetch_all(&fixture.database.pool)
     .await
     .unwrap();

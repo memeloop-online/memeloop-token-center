@@ -878,3 +878,137 @@ async fn gateway_component_without_configured_strategy_still_blocks_hard_quota()
     assert_eq!(after.probe_lease_until, before.probe_lease_until);
     assert_eq!(after.updated_at, before.updated_at);
 }
+
+#[tokio::test]
+async fn stale_refresh_enters_group_policy_with_current_snapshot_and_one_budget() {
+    let upstream = MockServer::start().await;
+    let label = "group-stale-refresh";
+    let mut fixture =
+        resilient_route_fixture(label, &[(upstream.uri(), 0), (upstream.uri(), 10)]).await;
+    let (tenant, _) = install_strategy(&mut fixture, label, 0).await;
+    let key = fixture
+        .state
+        .db
+        .authenticate_key(&fixture.key, fixture.state.config.key_pepper.as_bytes())
+        .await
+        .unwrap();
+    let request_id = Uuid::now_v7();
+    let selection = RouteSelectionOptions {
+        upstream_account_hint: None,
+        avoid_route_account: None,
+        selection_seed: request_id,
+    };
+    let candidates = fixture
+        .state
+        .db
+        .list_authorized_upstream_candidates_with_hint(
+            key.key_id,
+            tenant,
+            &fixture.model,
+            Protocol::OpenAiChat.name(),
+            selection,
+        )
+        .await
+        .unwrap();
+    assert_eq!(candidates.len(), 2);
+    assert!(
+        crate::group_routing::candidate_snapshot_if_enabled(&fixture.state, &candidates).is_some()
+    );
+    let pool = sqlx::AnyPool::connect(&fixture.database_url).await.unwrap();
+    sqlx::query("UPDATE upstream_accounts SET updated_at = updated_at + 1 WHERE id = $1")
+        .bind(fixture.accounts[0].to_string())
+        .execute(&pool)
+        .await
+        .unwrap();
+    sqlx::query("UPDATE upstream_accounts SET status = 'disabled' WHERE id = $1")
+        .bind(fixture.accounts[1].to_string())
+        .execute(&pool)
+        .await
+        .unwrap();
+    let request = json!({"model": fixture.model, "messages":[{"role":"user","content":"group snapshot contract"}], "stream":false});
+    let mut used = false;
+    let mut plan = prepare_authorized_proxy_routes(AuthorizedProxyRoutesInput {
+        request: ProxyRequestContext {
+            state: &fixture.state,
+            key: &key,
+            model: &fixture.model,
+            protocol: Protocol::OpenAiChat,
+            request_id,
+            request_json: &request,
+            request_memory: None,
+            codex_multi_agent_v2_request: false,
+        },
+        original_body_length: 100,
+        candidates,
+        selection,
+        snapshot_refresh_used: &mut used,
+    })
+    .await
+    .unwrap();
+    assert!(used);
+    let mut current = plan.refreshed_candidates.take().unwrap();
+    assert_eq!(current.len(), 1);
+    assert_eq!(current[0].account_id, fixture.accounts[0]);
+    drop(plan);
+    crate::group_routing::prepare(
+        &mut fixture.state,
+        tenant,
+        request_id,
+        request_id,
+        tokio::time::Instant::now() + Duration::from_secs(2),
+        &mut current,
+        None,
+    )
+    .await
+    .unwrap();
+    assert!(
+        fixture.state.group_routing.is_some(),
+        "real installed group hook must execute"
+    );
+    let group_plan = prepare_authorized_proxy_routes(AuthorizedProxyRoutesInput {
+        request: ProxyRequestContext {
+            state: &fixture.state,
+            key: &key,
+            model: &fixture.model,
+            protocol: Protocol::OpenAiChat,
+            request_id,
+            request_json: &request,
+            request_memory: None,
+            codex_multi_agent_v2_request: false,
+        },
+        original_body_length: 100,
+        candidates: current.clone(),
+        selection,
+        snapshot_refresh_used: &mut used,
+    })
+    .await
+    .unwrap();
+    assert_eq!(group_plan.primary.route.account_id, fixture.accounts[0]);
+    sqlx::query("UPDATE upstream_accounts SET updated_at = updated_at + 1 WHERE id = $1")
+        .bind(fixture.accounts[0].to_string())
+        .execute(&pool)
+        .await
+        .unwrap();
+    assert!(
+        prepare_authorized_proxy_routes(AuthorizedProxyRoutesInput {
+            request: ProxyRequestContext {
+                state: &fixture.state,
+                key: &key,
+                model: &fixture.model,
+                protocol: Protocol::OpenAiChat,
+                request_id,
+                request_json: &request,
+                request_memory: None,
+                codex_multi_agent_v2_request: false
+            },
+            original_body_length: 100,
+            candidates: current,
+            selection,
+            snapshot_refresh_used: &mut used,
+        })
+        .await
+        .is_err()
+    );
+    assert!(upstream.received_requests().await.unwrap().is_empty());
+    pool.close().await;
+}

@@ -62,6 +62,8 @@ pub enum HistoryCommand {
     },
     /// Queue one source page; delivery remains with the asynchronous exporter.
     BackfillPage {
+        #[arg(long, value_enum)]
+        source: Option<super::HistorySource>,
         #[arg(long, default_value_t = 64, value_parser = clap::value_parser!(i64).range(1..=64))]
         page_size: i64,
     },
@@ -136,10 +138,13 @@ pub async fn command(config: &Config, command: HistoryCommand) -> Result<Value, 
         HistoryCommand::UpgradeUpstreamCapture => {
             return database.history_upgrade_upstream_capture().await;
         }
-        HistoryCommand::BackfillPage { page_size } => {
-            let queued = database.history_backfill_page(*page_size).await?;
+        HistoryCommand::BackfillPage { page_size, source } => {
+            let queued = database
+                .history_backfill_source_page(*page_size, *source)
+                .await?;
             return Ok(json!({
                 "queued": queued,
+                "source": source.map(super::HistorySource::as_str),
                 "backfill_done": database.history_backfill_done().await?,
             }));
         }
@@ -227,6 +232,7 @@ pub async fn command(config: &Config, command: HistoryCommand) -> Result<Value, 
                     .await?
                     != 0
                 {}
+                source.verify_surface_parity(&database, &reader).await?;
                 source.finish(&database).await
             })
             .await
@@ -388,6 +394,7 @@ async fn export_batch_scoped(
     page_size: i64,
     scope: Option<&super::ExactEventExport>,
 ) -> Result<ExportReport, ExportFailure> {
+    let started = std::time::Instant::now();
     let failure = |stage, error| ExportFailure {
         stage,
         attempted: 0,
@@ -396,10 +403,16 @@ async fn export_batch_scoped(
         revision: None,
         error,
     };
+    database
+        .history_check_export_target(client)
+        .await
+        .map_err(|error| failure("target", error))?;
     let (mut lease, ceiling) = lease_database
         .history_delivery_lease()
         .await
         .map_err(|error| failure("lease", error))?;
+    let lease_ms = started.elapsed().as_millis() as u64;
+    let phase = std::time::Instant::now();
     let snapshots = database
         .history_pending_scoped(page_size, ceiling, scope)
         .await
@@ -407,6 +420,7 @@ async fn export_batch_scoped(
     if scope.is_some_and(|scope| snapshots.iter().any(|row| !scope.matches(row))) {
         return Err(failure("scope", HistoryError::Mismatch));
     }
+    let materialize_ms = phase.elapsed().as_millis() as u64;
     let failure = |stage, error| ExportFailure {
         stage,
         attempted: snapshots.len(),
@@ -421,10 +435,13 @@ async fn export_batch_scoped(
             .await
             .map_err(|error| failure("lease_validate", error.into()))?;
     }
+    let phase = std::time::Instant::now();
     client
         .append(&snapshots)
         .await
         .map_err(|error| failure("append", error))?;
+    let append_ms = phase.elapsed().as_millis() as u64;
+    let phase = std::time::Instant::now();
     let acked = database
         .history_acknowledge_count(&snapshots)
         .await
@@ -433,12 +450,25 @@ async fn export_batch_scoped(
             failure.acked = None;
             failure
         })?;
+    let acknowledge_ms = phase.elapsed().as_millis() as u64;
     if let Some(lease) = lease {
         lease.rollback().await.map_err(|error| {
             let mut failure = failure("lease_release", error.into());
             failure.acked = Some(acked);
             failure
         })?;
+    }
+    if !snapshots.is_empty() {
+        tracing::info!(
+            attempted = snapshots.len(),
+            acked,
+            lease_ms,
+            materialize_ms,
+            append_ms,
+            acknowledge_ms,
+            total_ms = started.elapsed().as_millis() as u64,
+            "request history export phase timings"
+        );
     }
     Ok(ExportReport {
         attempted: snapshots.len(),
@@ -597,6 +627,9 @@ mod export_diagnostic_tests {
 }
 
 pub async fn verify(database: &Database, client: &ClickHouse) -> Result<Value, HistoryError> {
+    if database.history_uses_watermark_proof() {
+        return database.history_verify_watermark(client).await;
+    }
     if !database.history_activation_baseline_proved().await?
         || !database.history_backfill_done().await?
         || database.history_pending_count().await? != 0
@@ -825,9 +858,9 @@ pub async fn verify(database: &Database, client: &ClickHouse) -> Result<Value, H
     Ok(report)
 }
 
-type DailyKey = (i64, String, Option<String>, Option<String>);
+pub(crate) type DailyKey = (i64, String, Option<String>, Option<String>);
 
-fn daily_key(bucket: &DailyBucket) -> DailyKey {
+pub(crate) fn daily_key(bucket: &DailyBucket) -> DailyKey {
     (
         bucket.day_bucket,
         bucket.outcome.clone(),
@@ -836,7 +869,7 @@ fn daily_key(bucket: &DailyBucket) -> DailyKey {
     )
 }
 
-fn add_daily(
+pub(crate) fn add_daily(
     buckets: &mut BTreeMap<DailyKey, DailyBucket>,
     row: &Value,
 ) -> Result<(), HistoryError> {

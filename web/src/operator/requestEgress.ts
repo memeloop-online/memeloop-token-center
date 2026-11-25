@@ -10,8 +10,10 @@ export function egressAddress(value: { scheme?: string | null; host?: string | n
 }
 
 export function egressBytes(value: number | null | undefined, locale: string): string {
-  return typeof value === 'number' && Number.isFinite(value) && value >= 0
-    ? `${new Intl.NumberFormat(locale).format(value)} B` : requestEgressCopy(locale).unknown;
+  if (typeof value !== 'number' || !Number.isFinite(value) || value < 0) return requestEgressCopy(locale).unknown;
+  const units = ['B', 'KB', 'MB', 'GB'];
+  const unit = value === 0 ? 0 : Math.max(0, Math.min(units.length - 1, Math.floor(Math.log(value) / Math.log(1000))));
+  return `${new Intl.NumberFormat(locale, { maximumFractionDigits: unit === 0 ? 0 : 2 }).format(value / 1000 ** unit)} ${units[unit]}`;
 }
 
 export function egressSelectionName(selected: SelectedRequestEgress, locale: string): string {

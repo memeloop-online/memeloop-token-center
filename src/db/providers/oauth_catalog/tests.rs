@@ -473,6 +473,58 @@ async fn verify_transport_edits(database: &Database, account_id: Uuid, tenant: &
             .unwrap()
             .unwrap();
         assert_eq!(materialized.upstream_model, "known-model");
+        let (diagnostic_ready, reason) = database
+            .materialize_authorized_upstream_candidate_diagnostic(&current, PEPPER)
+            .await
+            .unwrap();
+        assert_eq!(reason, None);
+        let diagnostic_ready = diagnostic_ready.unwrap();
+        assert_eq!(diagnostic_ready.route_id, materialized.route_id);
+        assert_eq!(diagnostic_ready.account_id, materialized.account_id);
+        assert_eq!(
+            diagnostic_ready.transport_revision,
+            materialized.transport_revision
+        );
+        assert_eq!(
+            diagnostic_ready.credential_generation,
+            materialized.credential_generation
+        );
+        assert_eq!(diagnostic_ready.config, materialized.config);
+        assert_eq!(diagnostic_ready.upstream_model, materialized.upstream_model);
+        for (revision, generation, expected) in [
+            (
+                current.transport_revision - 1,
+                current.credential_generation,
+                "transport_revision_changed",
+            ),
+            (
+                current.transport_revision,
+                current.credential_generation - 1,
+                "credential_generation_changed",
+            ),
+        ] {
+            let changed = crate::provider::AuthorizedUpstreamCandidate {
+                transport_revision: revision,
+                credential_generation: generation,
+                ..current.clone()
+            };
+            let (resolved, reason) = database
+                .materialize_authorized_upstream_candidate_diagnostic(&changed, PEPPER)
+                .await
+                .unwrap();
+            assert!(resolved.is_none());
+            assert_eq!(reason, Some(expected));
+        }
+        // A decryption failure must stay Err, never become unavailability.
+        assert!(
+            database
+                .materialize_authorized_upstream_candidate_diagnostic(
+                    &current,
+                    b"different synthetic pepper"
+                )
+                .await
+                .is_err()
+        );
         let stale = crate::provider::AuthorizedUpstreamCandidate {
             transport_revision: before.updated_at,
             credential_generation: before.credential_generation,

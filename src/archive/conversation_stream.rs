@@ -20,9 +20,9 @@ struct EventReferences {
     gaps: Vec<String>,
 }
 
-struct Chunks {
-    receiver: tokio::sync::mpsc::Receiver<Bytes>,
-    current: Bytes,
+pub(super) struct Chunks {
+    pub(super) receiver: tokio::sync::mpsc::Receiver<Bytes>,
+    pub(super) current: Bytes,
 }
 
 impl Read for Chunks {

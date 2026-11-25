@@ -293,11 +293,18 @@ async fn rewrite_session_body_observation_in_transaction(
     tenant_id: &str,
     request_id: &str,
     snapshot: &ConversationSemanticSnapshot,
+    prepared_paths: Option<&prefix_storage::PreparedCandidatePaths>,
 ) -> Result<bool, ConversationContentError> {
     if let Some(leaf) = snapshot.leaf.as_deref() {
         let mut roots = std::collections::BTreeSet::new();
         roots.insert(leaf.to_owned());
-        let graph = prefix_storage::load_paths(transaction, tenant_id, roots).await?;
+        let loaded;
+        let graph = if let Some(prepared) = prepared_paths {
+            prepared.for_fresh_candidates(tenant_id, &[], Some(leaf))?
+        } else {
+            loaded = prefix_storage::load_paths(transaction, tenant_id, roots).await?;
+            &loaded
+        };
         let full = graph.hashes(Some(leaf), None)?;
         if full
             .iter()
@@ -355,6 +362,7 @@ async fn rewrite_reopened_session_body_if_present(
         &tenant_id,
         &request_id,
         &snapshot,
+        None,
     )
     .await?;
     Ok(())
@@ -618,6 +626,16 @@ impl Database {
         lease_owner: Uuid,
         limit: i64,
     ) -> Result<Vec<ConversationProjectionTask>, AppError> {
+        self.claim_conversation_projection_tasks_from_turn(lease_owner, limit, 0)
+            .await
+    }
+
+    pub(crate) async fn claim_conversation_projection_tasks_from_turn(
+        &self,
+        lease_owner: Uuid,
+        limit: i64,
+        turn: usize,
+    ) -> Result<Vec<ConversationProjectionTask>, AppError> {
         let now = unix_millis();
         let expires_at = now.saturating_add(CONVERSATION_PROJECTION_LEASE_MILLIS);
         let limit = limit;
@@ -631,21 +649,29 @@ impl Database {
         // others. Both primary and terminal-snapshot claims share these budgets.
         // Retry order uses the previous deadline so one old failing row cannot
         // repeatedly jump ahead of other eligible work.
-        let rebuild_budget = limit / 4;
-        let retry_budget = limit / 4;
-        let fresh_budget = limit - rebuild_budget - retry_budget;
         let primary = "(lease_owner = 'session-body-rebuild' OR lease_expires_at IS NULL OR lease_expires_at <= $3)";
         let ordinary = "COALESCE(statistics_outcome, '') <> 'session_body' AND COALESCE(lease_owner, '') <> 'session-body-rebuild'";
-        let lanes = [
-            (format!("{ordinary} AND attempts = 0"), fresh_budget),
-            (format!("{ordinary} AND attempts > 0"), retry_budget),
-            (
-                "(statistics_outcome = 'session_body' OR lease_owner = 'session-body-rebuild')"
-                    .to_owned(),
-                rebuild_budget,
-            ),
-            ("1 = 1".to_owned(), limit),
+        let predicates = [
+            format!("{ordinary} AND attempts = 0"),
+            format!("{ordinary} AND attempts > 0"),
+            "(statistics_outcome = 'session_body' OR lease_owner = 'session-body-rebuild')"
+                .to_owned(),
         ];
+        let schedule = [0usize, 0, 1, 2];
+        let mut budgets = [0i64; 3];
+        let mut order = Vec::new();
+        for offset in 0..limit.max(0) as usize {
+            let lane = schedule[(turn.wrapping_add(offset)) % schedule.len()];
+            budgets[lane] += 1;
+            if !order.contains(&lane) {
+                order.push(lane);
+            }
+        }
+        let mut lanes: Vec<(String, i64)> = order
+            .into_iter()
+            .map(|lane| (predicates[lane].clone(), budgets[lane]))
+            .collect();
+        lanes.push(("1 = 1".to_owned(), limit));
         let mut rows = Vec::new();
         for (lane, lane_budget) in lanes {
             let budget = lane_budget.min(limit - rows.len() as i64);
@@ -1044,10 +1070,10 @@ impl Database {
         // committed content-only prefix retryable rather than user-visible.
         let mut prepared_payload = None;
         let mut rebuilt_snapshot = None;
-        let prepared_snapshot = {
+        let (prepared_snapshot, prepared_paths) = {
             let prepare_now = unix_millis();
             let prepare = sqlx::query(
-                "SELECT tenant_id, key_id, principal_id, request_json, observed_at, lease_owner, COALESCE(semantic_payload_snapshot_json, semantic_snapshot_json) AS semantic_snapshot_json, CAST(CASE WHEN semantic_payload_snapshot_json IS NOT NULL THEN 1 ELSE 0 END AS BIGINT) AS payload_required, statistics_outcome FROM conversation_projection_outbox WHERE request_id = $1 AND projected_at IS NULL AND COALESCE(terminal_lease_owner, lease_owner) = $2 AND COALESCE(terminal_lease_expires_at, lease_expires_at) >= $3",
+                "SELECT tenant_id, key_id, principal_id, request_json, hints_json, observed_at, lease_owner, COALESCE(semantic_payload_snapshot_json, semantic_snapshot_json) AS semantic_snapshot_json, CAST(CASE WHEN semantic_payload_snapshot_json IS NOT NULL THEN 1 ELSE 0 END AS BIGINT) AS payload_required, statistics_outcome FROM conversation_projection_outbox WHERE request_id = $1 AND projected_at IS NULL AND COALESCE(terminal_lease_owner, lease_owner) = $2 AND COALESCE(terminal_lease_expires_at, lease_expires_at) >= $3",
             )
             .bind(request_id.to_string())
             .bind(lease_owner.to_string())
@@ -1194,7 +1220,44 @@ impl Database {
                 )
                 .await?;
             }
-            snapshot
+            let tenant: String = prepare.try_get("tenant_id")?;
+            let principal: String = prepare.try_get("principal_id")?;
+            let key: String = prepare.try_get("key_id")?;
+            let hints: ConversationHints =
+                serde_json::from_str(&prepare.try_get::<String, _>("hints_json")?)
+                    .map_err(|_| AppError::internal("conversation_prepare_hints"))?;
+            let leaf = if let Some(semantic) = rebuilt_snapshot.as_ref().or(snapshot.as_ref()) {
+                semantic.leaf.clone()
+            } else {
+                let request: String = prepare.try_get("request_json")?;
+                let request: Value = serde_json::from_str(&request)
+                    .map_err(|_| AppError::internal("conversation_prepare_request"))?;
+                build_prefix(&extract_atoms(&request))
+                    .last()
+                    .map(|node| node.node_hash.clone())
+            };
+            // No request/session/projection gate is held while this potentially
+            // large immutable graph is received from PostgreSQL.
+            let mut read = self.pool.begin().await?;
+            let candidates = fetch_conversation_candidates(
+                &mut read,
+                &tenant,
+                &principal,
+                &key,
+                &hints,
+                prepare.try_get("observed_at")?,
+                &request_id.to_string(),
+            )
+            .await?;
+            let paths = prefix_storage::PreparedCandidatePaths::load(
+                &mut read,
+                tenant,
+                &candidates,
+                leaf.as_deref(),
+            )
+            .await?;
+            read.commit().await?;
+            (snapshot, paths)
         };
 
         let mut transaction = self.begin_write_transaction().await?;
@@ -1349,13 +1412,14 @@ impl Database {
                 &tenant,
                 &request,
                 snapshot,
+                Some(&prepared_paths),
             )
             .await?
         } else {
             false
         };
         if !rewrote_existing {
-            self.record_conversation_observation_with_snapshot_in_transaction(
+            self.record_conversation_observation_with_prepared_paths_in_transaction(
                 &mut transaction,
                 ConversationObservationInput {
                     key: &projection_key,
@@ -1369,6 +1433,7 @@ impl Database {
                     content_materialized: true,
                 },
                 snapshot.as_ref(),
+                Some(&prepared_paths),
             )
             .await?;
         }
@@ -1437,7 +1502,7 @@ impl Database {
                     sqlstate = retryable_sqlstate.unwrap_or("unclassified"),
                     "conversation projection transaction failed"
                 );
-                if rollback_confirmed && retryable_sqlstate.is_some() {
+                if rollback_confirmed && error.retry_after_confirmed_rollback() {
                     self.try_schedule_rolled_back_conversation_retry(request_id, lease_owner)
                         .await;
                 }
@@ -1495,9 +1560,14 @@ impl Database {
         transaction: &mut Transaction<'_, Any>,
         input: ConversationObservationInput<'_>,
     ) -> Result<Uuid, AppError> {
-        self.record_conversation_observation_with_snapshot_in_transaction(transaction, input, None)
-            .await
-            .map_err(Into::into)
+        self.record_conversation_observation_with_prepared_paths_in_transaction(
+            transaction,
+            input,
+            None,
+            None,
+        )
+        .await
+        .map_err(Into::into)
     }
 
     async fn record_conversation_observation_with_snapshot_in_transaction(
@@ -1505,6 +1575,22 @@ impl Database {
         transaction: &mut Transaction<'_, Any>,
         input: ConversationObservationInput<'_>,
         snapshot: Option<&ConversationSemanticSnapshot>,
+    ) -> Result<Uuid, ConversationContentError> {
+        self.record_conversation_observation_with_prepared_paths_in_transaction(
+            transaction,
+            input,
+            snapshot,
+            None,
+        )
+        .await
+    }
+
+    async fn record_conversation_observation_with_prepared_paths_in_transaction(
+        &self,
+        transaction: &mut Transaction<'_, Any>,
+        input: ConversationObservationInput<'_>,
+        snapshot: Option<&ConversationSemanticSnapshot>,
+        prepared_paths: Option<&prefix_storage::PreparedCandidatePaths>,
     ) -> Result<Uuid, ConversationContentError> {
         let ConversationObservationInput {
             key,
@@ -1636,11 +1722,7 @@ impl Database {
             ],
         )
         .await?;
-        // Every structured match below is decisive: the selection loop stops on
-        // a direct parent, same turn, or explicit session. Fetch only that one
-        // indexed row instead of reading and sorting up to 50 wide fingerprints
-        // through one OR predicate while the explicit-session lock is held.
-        let structured_candidate = fetch_structured_conversation_candidate(
+        let candidates = fetch_conversation_candidates(
             transaction,
             &tenant_id,
             &principal_id,
@@ -1650,34 +1732,21 @@ impl Database {
             &request_id,
         )
         .await?;
-        let candidates = if let Some(candidate) = structured_candidate {
-            vec![candidate]
-        } else if hints.parent_turn_id.is_some() {
-            // A declared parent is authoritative. If it is not committed yet,
-            // keep this observation isolated and durable for reconciliation
-            // instead of attaching it to an unrelated semantic candidate.
-            Vec::new()
-        } else {
-            sqlx::query(
-                "SELECT o.id, o.cluster_id, o.atom_hashes_json, o.leaf_node_hash, o.explicit_session_id, o.turn_id, o.upstream_response_id, o.branch_id, o.client_name, o.created_at FROM conversation_observations o JOIN conversation_clusters c ON c.id = o.cluster_id WHERE c.tenant_id = $1 AND c.principal_id = $2 AND o.key_id = $3 AND o.created_at <= $4 AND o.request_id <> $5 ORDER BY o.created_at DESC LIMIT 50",
-            )
-            .bind(&tenant_id)
-            .bind(&principal_id)
-            .bind(&key_id)
-            .bind(now)
-            .bind(&request_id)
-            .fetch_all(&mut **transaction)
-            .await?
-        };
 
         let fingerprint = prefix_storage::Fingerprint::from_hashes(&atom_hashes);
-        let graph = prefix_storage::load_candidate_paths(
-            transaction,
-            &tenant_id,
-            &candidates,
-            leaf.as_deref(),
-        )
-        .await?;
+        let loaded;
+        let graph = if let Some(prepared) = prepared_paths {
+            prepared.for_fresh_candidates(&tenant_id, &candidates, leaf.as_deref())?
+        } else {
+            loaded = prefix_storage::load_candidate_paths(
+                transaction,
+                &tenant_id,
+                &candidates,
+                leaf.as_deref(),
+            )
+            .await?;
+            &loaded
+        };
         {
             // A reference must never publish before its complete content-addressed
             // path exists, including when an importer claims content_materialized.
@@ -2255,6 +2324,48 @@ impl Database {
     }
 }
 
+async fn fetch_conversation_candidates(
+    transaction: &mut Transaction<'_, Any>,
+    tenant_id: &str,
+    principal_id: &str,
+    key_id: &str,
+    hints: &ConversationHints,
+    observed_at: i64,
+    excluded_request_id: &str,
+) -> Result<Vec<AnyRow>, AppError> {
+    let structured_candidate = fetch_structured_conversation_candidate(
+        transaction,
+        tenant_id,
+        principal_id,
+        key_id,
+        hints,
+        observed_at,
+        excluded_request_id,
+    )
+    .await?;
+    let candidates = if let Some(candidate) = structured_candidate {
+        vec![candidate]
+    } else if hints.parent_turn_id.is_some() {
+        // A declared parent is authoritative. If it is not committed yet,
+        // keep this observation isolated and durable for reconciliation
+        // instead of attaching it to an unrelated semantic candidate.
+        Vec::new()
+    } else {
+        sqlx::query(
+                "SELECT o.id, o.cluster_id, o.atom_hashes_json, o.leaf_node_hash, o.explicit_session_id, o.turn_id, o.upstream_response_id, o.branch_id, o.client_name, o.created_at FROM conversation_observations o JOIN conversation_clusters c ON c.id = o.cluster_id WHERE c.tenant_id = $1 AND c.principal_id = $2 AND o.key_id = $3 AND o.created_at <= $4 AND o.request_id <> $5 ORDER BY o.created_at DESC LIMIT 50",
+            )
+            .bind(tenant_id)
+            .bind(principal_id)
+            .bind(key_id)
+            .bind(observed_at)
+            .bind(excluded_request_id)
+            .fetch_all(&mut **transaction)
+            .await?
+    };
+
+    Ok(candidates)
+}
+
 async fn fetch_structured_conversation_candidate(
     transaction: &mut Transaction<'_, Any>,
     tenant_id: &str,
@@ -2372,6 +2483,8 @@ pub(super) async fn emit_conversation_projected_event_in_transaction(
     let request_id = request_id.to_string();
     let tenant_id = tenant_id.to_string();
     let key_id = key_id.to_string();
+    let pending_started =
+        super::lifecycle::prepare_pending_started_in_transaction(transaction, &request_id).await?;
     super::super::history_immutable_outbox::capture_request_in_transaction(
         transaction,
         &request_id,
@@ -2410,6 +2523,12 @@ pub(super) async fn emit_conversation_projected_event_in_transaction(
         ),
         None => None,
     };
+    crate::db::history_immutable_outbox::PreparedEventCapture::publish(
+        transaction,
+        pending_started,
+        unix_millis(),
+    )
+    .await?;
     let inserted = crate::db::history_immutable_outbox::PreparedEventCapture::publish(
         transaction,
         prepared,

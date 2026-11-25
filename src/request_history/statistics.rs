@@ -117,51 +117,41 @@ impl Accumulator {
     }
 }
 
-impl ClickHouse {
-    pub async fn statistics(&self, query: &HistoryQuery) -> Result<OperatorStats, HistoryError> {
-        let mut query = query.clone();
-        query.cursor = None;
-        let mut summary = Accumulator::default();
-        let mut models = BTreeMap::<String, Accumulator>::new();
-        let mut days = BTreeMap::<String, Accumulator>::new();
-        let mut errors = BTreeMap::<String, Accumulator>::new();
-        loop {
-            let mut page = self.read_snapshots(&query, true).await?;
-            page.truncate(query.limit);
-            if page.is_empty() {
-                break;
-            }
-            for snapshot in &page {
-                if snapshot.statistics.is_none() {
-                    continue;
-                }
-                let payload = snapshot.payload.as_ref().ok_or(HistoryError::Mismatch)?;
-                summary.accumulate(snapshot)?;
-                models
-                    .entry(payload["model"].as_str().unwrap_or_default().into())
-                    .or_default()
-                    .accumulate(snapshot)?;
-                let day = chrono::DateTime::from_timestamp_millis(snapshot.identity.created_at)
-                    .ok_or(HistoryError::Invalid("statistics date"))?
-                    .format("%Y-%m-%d")
-                    .to_string();
-                days.entry(day).or_default().accumulate(snapshot)?;
-                if let Some(error) = payload["error_code"]
-                    .as_str()
-                    .filter(|error| !error.is_empty())
-                {
-                    errors
-                        .entry(error.into())
-                        .or_default()
-                        .accumulate(snapshot)?;
-                }
-            }
-            let last = page.last().ok_or(HistoryError::Mismatch)?;
-            query.cursor = Some(HistoryCursor {
-                before_created_at: last.identity.created_at,
-                before_id: last.identity.request_id,
-            });
+#[derive(Default)]
+pub(crate) struct StatisticsAccumulator {
+    summary: Accumulator,
+    models: BTreeMap<String, Accumulator>,
+    days: BTreeMap<String, Accumulator>,
+    errors: BTreeMap<String, Accumulator>,
+}
+impl StatisticsAccumulator {
+    pub(crate) fn accumulate(&mut self, snapshot: &HistorySnapshot) -> Result<(), HistoryError> {
+        if snapshot.statistics.is_none() {
+            return Ok(());
         }
+        let payload = snapshot.payload.as_ref().ok_or(HistoryError::Mismatch)?;
+        self.summary.accumulate(snapshot)?;
+        self.models
+            .entry(payload["model"].as_str().unwrap_or_default().into())
+            .or_default()
+            .accumulate(snapshot)?;
+        let day = chrono::DateTime::from_timestamp_millis(snapshot.identity.created_at)
+            .ok_or(HistoryError::Invalid("statistics date"))?
+            .format("%Y-%m-%d")
+            .to_string();
+        self.days.entry(day).or_default().accumulate(snapshot)?;
+        if let Some(error) = payload["error_code"]
+            .as_str()
+            .filter(|error| !error.is_empty())
+        {
+            self.errors
+                .entry(error.into())
+                .or_default()
+                .accumulate(snapshot)?;
+        }
+        Ok(())
+    }
+    pub(crate) fn finish(self) -> Result<OperatorStats, HistoryError> {
         fn buckets(values: BTreeMap<String, Accumulator>, rank: bool) -> Vec<StatsBucket> {
             let mut values: Vec<_> = values
                 .into_iter()
@@ -179,10 +169,33 @@ impl ClickHouse {
             values
         }
         Ok(OperatorStats {
-            summary: summary.summary(),
-            by_model: buckets(models, true),
-            by_day: buckets(days, false),
-            errors: buckets(errors, true),
+            summary: self.summary.summary(),
+            by_model: buckets(self.models, true),
+            by_day: buckets(self.days, false),
+            errors: buckets(self.errors, true),
         })
+    }
+}
+impl ClickHouse {
+    pub async fn statistics(&self, query: &HistoryQuery) -> Result<OperatorStats, HistoryError> {
+        let mut query = query.clone();
+        query.cursor = None;
+        let mut expected = StatisticsAccumulator::default();
+        loop {
+            let mut page = self.read_snapshots(&query, true).await?;
+            page.truncate(query.limit);
+            if page.is_empty() {
+                break;
+            }
+            for snapshot in &page {
+                expected.accumulate(snapshot)?;
+            }
+            let last = page.last().ok_or(HistoryError::Mismatch)?;
+            query.cursor = Some(HistoryCursor {
+                before_created_at: last.identity.created_at,
+                before_id: last.identity.request_id,
+            });
+        }
+        expected.finish()
     }
 }

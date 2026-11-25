@@ -218,6 +218,50 @@ impl Database {
         selection: RouteSelectionOptions,
         recovery_probe: bool,
     ) -> Result<Vec<AuthorizedUpstreamCandidate>, AppError> {
+        self.list_dispatch_candidates_snapshot(
+            key_id,
+            tenant_id,
+            public_model,
+            protocol,
+            selection,
+            recovery_probe,
+            true,
+        )
+        .await
+    }
+
+    /// Fresh dispatch admission always repeats grants, eligibility and quota
+    /// filters; it cannot use the legacy empty-eligibility fallback.
+    pub(crate) async fn refresh_authorized_dispatch_candidates(
+        &self,
+        key_id: Uuid,
+        tenant_id: Uuid,
+        public_model: &str,
+        protocol: &str,
+        selection: RouteSelectionOptions,
+    ) -> Result<Vec<AuthorizedUpstreamCandidate>, AppError> {
+        self.list_dispatch_candidates_snapshot(
+            key_id,
+            tenant_id,
+            public_model,
+            protocol,
+            selection,
+            false,
+            false,
+        )
+        .await
+    }
+
+    async fn list_dispatch_candidates_snapshot(
+        &self,
+        key_id: Uuid,
+        tenant_id: Uuid,
+        public_model: &str,
+        protocol: &str,
+        selection: RouteSelectionOptions,
+        recovery_probe: bool,
+        allow_empty_fallback: bool,
+    ) -> Result<Vec<AuthorizedUpstreamCandidate>, AppError> {
         let RouteSelectionOptions {
             upstream_account_hint,
             avoid_route_account,
@@ -269,7 +313,7 @@ impl Database {
         .bind(unix_millis())
         .fetch_all(&self.pool)
         .await?;
-        let rows = if rows.is_empty() {
+        let rows = if rows.is_empty() && allow_empty_fallback {
             // An empty authorized set must not stop the request. Catalog
             // eligibility and grants can hide every account; dispatch still
             // needs one active upstream on this route.
@@ -470,27 +514,46 @@ impl Database {
         candidate: &AuthorizedUpstreamCandidate,
         key_material: &[u8],
     ) -> Result<Option<ResolvedUpstream>, AppError> {
+        Ok(self
+            .materialize_authorized_upstream_candidate_diagnostic(candidate, key_material)
+            .await?
+            .0)
+    }
+
+    pub(crate) async fn materialize_authorized_upstream_candidate_diagnostic(
+        &self,
+        candidate: &AuthorizedUpstreamCandidate,
+        key_material: &[u8],
+    ) -> Result<(Option<ResolvedUpstream>, Option<&'static str>), AppError> {
         let row = sqlx::query(
-            "SELECT route_candidate.upstream_model, account.driver,
-                    account.config_json, credential.credential_ciphertext
-             FROM model_routes route
-             JOIN model_route_eligible_upstream_accounts route_candidate
-               ON route_candidate.tenant_id = route.tenant_id
-              AND route_candidate.model_route_id = route.id
-              AND route_candidate.upstream_account_id = $2
-             JOIN upstream_accounts account
-               ON account.tenant_id = route.tenant_id
-              AND account.id = route_candidate.upstream_account_id
-              AND account.status = 'active'
-              AND account.updated_at = $3
-              AND account.credential_generation = $4
-              AND account.driver = $5
-             JOIN upstream_credentials credential
-               ON credential.upstream_account_id = account.id
-              AND credential.generation = account.credential_generation
-              AND credential.revoked_at IS NULL
-              AND (credential.expires_at IS NULL OR credential.expires_at > $6)
-             WHERE route.id = $1 AND route.enabled = 1 AND route.archived_at IS NULL",
+            "WITH snapshot AS (
+                SELECT route_candidate.upstream_model, account.driver,
+                       account.config_json, credential.credential_ciphertext,
+                       CASE
+                         WHEN route.enabled <> 1 OR route.archived_at IS NOT NULL THEN 'route_disabled'
+                         WHEN account.id IS NULL THEN 'account_missing'
+                         WHEN account.status <> 'active' THEN 'account_inactive'
+                         WHEN route_candidate.upstream_account_id IS NULL THEN 'route_ineligible'
+                         WHEN account.credential_generation <> $4 THEN 'credential_generation_changed'
+                         WHEN account.updated_at <> $3 THEN 'transport_revision_changed'
+                         WHEN account.driver <> $5 THEN 'driver_changed'
+                         WHEN credential.upstream_account_id IS NULL THEN 'credential_missing'
+                         WHEN credential.revoked_at IS NOT NULL THEN 'credential_revoked'
+                         WHEN credential.expires_at IS NOT NULL AND credential.expires_at <= $6 THEN 'credential_expired'
+                         ELSE 'ready'
+                       END AS readiness
+                FROM model_routes route
+                LEFT JOIN upstream_accounts account ON account.tenant_id = route.tenant_id AND account.id = $2
+                LEFT JOIN model_route_eligible_upstream_accounts route_candidate
+                  ON route_candidate.tenant_id = route.tenant_id AND route_candidate.model_route_id = route.id
+                 AND route_candidate.upstream_account_id = account.id
+                LEFT JOIN upstream_credentials credential
+                  ON credential.upstream_account_id = account.id AND credential.generation = account.credential_generation
+                WHERE route.id = $1
+             ) SELECT readiness, upstream_model, driver,
+                      CASE WHEN readiness = 'ready' THEN config_json ELSE NULL END AS config_json,
+                      CASE WHEN readiness = 'ready' THEN credential_ciphertext ELSE NULL END AS credential_ciphertext
+               FROM snapshot"
         )
         .bind(candidate.route_id.to_string())
         .bind(candidate.account_id.to_string())
@@ -501,8 +564,26 @@ impl Database {
         .fetch_optional(&self.pool)
         .await?;
         let Some(row) = row else {
-            return Ok(None);
+            return Ok((None, Some("route_missing")));
         };
+        let readiness: String = row.try_get("readiness")?;
+        let reason = match readiness.as_str() {
+            "ready" => None,
+            "route_disabled" => Some("route_disabled"),
+            "account_missing" => Some("account_missing"),
+            "account_inactive" => Some("account_inactive"),
+            "route_ineligible" => Some("route_ineligible"),
+            "credential_generation_changed" => Some("credential_generation_changed"),
+            "transport_revision_changed" => Some("transport_revision_changed"),
+            "driver_changed" => Some("driver_changed"),
+            "credential_missing" => Some("credential_missing"),
+            "credential_revoked" => Some("credential_revoked"),
+            "credential_expired" => Some("credential_expired"),
+            _ => return Err(AppError::internal("resolver_candidate_readiness")),
+        };
+        if reason.is_some() {
+            return Ok((None, reason));
+        }
         let config_json: String = row.try_get("config_json")?;
         let persisted_config: serde_json::Value =
             serde_json::from_str(&config_json).map_err(|_| {
@@ -517,24 +598,28 @@ impl Database {
             .expires_at()
             .is_some_and(|expires_at| expires_at <= now)
         {
-            return Ok(None);
+            return Ok((None, Some("credential_expired")));
         }
         credential.validate(now)?;
-        Ok(Some(ResolvedUpstream {
-            route_id: candidate.route_id,
-            account_id: candidate.account_id,
-            transport_revision: candidate.transport_revision,
-            credential_generation: candidate.credential_generation,
-            driver: row.try_get("driver")?,
-            base_url,
-            config,
-            upstream_model: if candidate.driver == crate::oauth::managed::kimi::PROVIDER_DRIVER {
-                candidate.upstream_model.clone()
-            } else {
-                row.try_get("upstream_model")?
-            },
-            credential,
-        }))
+        Ok((
+            Some(ResolvedUpstream {
+                route_id: candidate.route_id,
+                account_id: candidate.account_id,
+                transport_revision: candidate.transport_revision,
+                credential_generation: candidate.credential_generation,
+                driver: row.try_get("driver")?,
+                base_url,
+                config,
+                upstream_model: if candidate.driver == crate::oauth::managed::kimi::PROVIDER_DRIVER
+                {
+                    candidate.upstream_model.clone()
+                } else {
+                    row.try_get("upstream_model")?
+                },
+                credential,
+            }),
+            None,
+        ))
     }
 
     pub async fn granted_available_models(

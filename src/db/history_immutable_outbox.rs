@@ -4,7 +4,9 @@ use super::*;
 use sqlx::{Column, ValueRef};
 
 mod event_capture;
+mod summary_batch;
 pub(crate) use event_capture::{EventDraft, PreparedEventCapture};
+pub(super) use summary_batch::SummaryBatch;
 
 /// Preserve the original scalar types rather than coercing unknown money to zero.
 fn original_row(row: &AnyRow) -> Result<Value, AppError> {
@@ -408,12 +410,25 @@ async fn capture_event_envelope_in_transaction(
     identity: &crate::request_history::HistoryIdentity,
     revision: i64,
 ) -> Result<(), AppError> {
-    let request_id = identity.request_id.to_string();
-    let payload = Database::history_original_event_in_transaction(transaction, identity).await?;
-    let archive_identity=sqlx::query("SELECT e.request_id,CASE WHEN EXISTS(SELECT 1 FROM generation_jobs g WHERE g.id=e.request_id AND g.tenant_id=e.tenant_id AND g.key_id=e.key_id) THEN 'generation' ELSE 'native' END AS source FROM request_events e WHERE e.event_id=$1 AND e.tenant_id=$2 AND e.key_id=$3 AND e.event_at=$4")
-        .bind(&request_id).bind(identity.tenant_id.to_string()).bind(identity.key_id.to_string()).bind(identity.created_at).fetch_optional(&mut **transaction).await?;
-    let archive_identity=archive_identity.map(|row| -> Result<Value,AppError> {Ok(serde_json::json!({"tenant_id":identity.tenant_id,"request_id":row.try_get::<String,_>("request_id")?,"source":row.try_get::<String,_>("source")?}))}).transpose()?;
-    let original_event = original_event_in_transaction(transaction, identity).await?;
+    // Read the immutable event once. The same row owns its original fields,
+    // payload draft and archive identity; the helper column is not provenance.
+    let event = sqlx::query("SELECT e.*, CASE WHEN EXISTS(SELECT 1 FROM generation_jobs g WHERE g.id=e.request_id AND g.tenant_id=e.tenant_id AND g.key_id=e.key_id) THEN 'generation' ELSE 'native' END AS capture_archive_source FROM request_events e WHERE e.event_id=$1 AND e.tenant_id=$2 AND e.key_id=$3 AND e.event_at=$4")
+        .bind(identity.request_id.to_string()).bind(identity.tenant_id.to_string())
+        .bind(identity.key_id.to_string()).bind(identity.created_at)
+        .fetch_optional(&mut **transaction).await?;
+    let (payload, archive_identity, original_event) = if let Some(event) = event {
+        let draft = EventDraft::from_row(&event)?;
+        let payload = Database::history_draft_event_in_transaction(transaction, &draft).await?;
+        let archive_identity = serde_json::json!({"tenant_id":identity.tenant_id,"request_id":draft.request_id,"source":event.try_get::<String,_>("capture_archive_source")?});
+        let mut original = original_row(&event)?;
+        original
+            .as_object_mut()
+            .expect("original_row returns an object")
+            .remove("capture_archive_source");
+        (payload, Some(archive_identity), original)
+    } else {
+        (None, None, Value::Null)
+    };
     let envelope = serde_json::json!({"originals":{"event":original_event},"version":1,"source":"event","revision":revision,"request_id":identity.request_id,"tenant_id":identity.tenant_id,"key_id":identity.key_id,"created_at":identity.created_at,"payload":payload,"read_model":null,"statistics":null,"filter_cost_micros":null,"archive_identity":archive_identity});
     insert_envelope_in_transaction(transaction, &identity, revision, &envelope).await?;
     Ok(())
@@ -520,12 +535,34 @@ async fn insert_envelope_in_transaction(
     capture_identity_in_transaction(transaction, identity, revision).await?;
     let frozen = serde_json::to_string(envelope)
         .map_err(|_| AppError::storage("history_envelope_serialization"))?;
-    let stored:String=sqlx::query_scalar("INSERT INTO request_history_immutable_outbox (revision,source,request_id,tenant_id,key_id,created_at,snapshot) VALUES ($1,$2,$3,$4,$5,$6,$7) ON CONFLICT(revision) DO UPDATE SET snapshot=request_history_immutable_outbox.snapshot RETURNING snapshot")
-        .bind(revision).bind(&identity.source).bind(identity.request_id.to_string()).bind(identity.tenant_id.to_string()).bind(identity.key_id.to_string()).bind(identity.created_at).bind(&frozen).fetch_one(&mut **transaction).await?;
-    if stored != frozen {
+    let statement =
+        immutable_envelope_upsert_sql(transaction.as_mut().backend_name() == "PostgreSQL");
+    let changed = sqlx::query(sqlx::AssertSqlSafe(statement))
+        .bind(revision)
+        .bind(&identity.source)
+        .bind(identity.request_id.to_string())
+        .bind(identity.tenant_id.to_string())
+        .bind(identity.key_id.to_string())
+        .bind(identity.created_at)
+        .bind(&frozen)
+        .execute(&mut **transaction)
+        .await?;
+    if changed.rows_affected() != 1 {
         return Err(AppError::storage("history_envelope_revision_conflict"));
     }
     Ok(())
+}
+
+// Compare the exact stored bytes, matching the former Rust String equality.
+// A successful capture sends only CommandComplete, never the snapshot body.
+fn immutable_envelope_upsert_sql(postgres: bool) -> String {
+    let collation = if postgres { "\"C\"" } else { "BINARY" };
+    let equal = ["source", "request_id", "tenant_id", "key_id", "snapshot"]
+        .map(|field| format!("request_history_immutable_outbox.{field} COLLATE {collation} = excluded.{field} COLLATE {collation}"))
+        .join(" AND ");
+    format!(
+        "INSERT INTO request_history_immutable_outbox (revision,source,request_id,tenant_id,key_id,created_at,snapshot) VALUES ($1,$2,$3,$4,$5,$6,$7) ON CONFLICT(revision) DO UPDATE SET snapshot=request_history_immutable_outbox.snapshot WHERE {equal} AND request_history_immutable_outbox.created_at=excluded.created_at"
+    )
 }
 
 /// Decode the frozen capture without rebuilding its source at a newer schema.
@@ -603,6 +640,22 @@ impl Database {
         identity: crate::request_history::HistoryIdentity,
         revision: i64,
     ) -> Result<crate::request_history::HistorySnapshot, crate::request_history::HistoryError> {
+        self.history_materialize_envelope_with_batch(
+            envelope,
+            identity,
+            revision,
+            &mut SummaryBatch::default(),
+        )
+        .await
+    }
+
+    pub(crate) async fn history_materialize_envelope_with_batch(
+        &self,
+        envelope: &Value,
+        identity: crate::request_history::HistoryIdentity,
+        revision: i64,
+        summaries: &mut SummaryBatch,
+    ) -> Result<crate::request_history::HistorySnapshot, crate::request_history::HistoryError> {
         use crate::request_history::{HistoryError, HistorySnapshot};
         let mut payload: Option<Value> = serde_json::from_value(envelope["payload"].clone())?;
         let mut read_model = envelope["read_model"].clone();
@@ -642,9 +695,13 @@ impl Database {
             let native_request = envelope["archive_identity"]["request_id"]
                 .as_str()
                 .ok_or(HistoryError::Invalid("immutable event archive identity"))?;
-            if let Some(summary) = self
-                .body_archive()?
-                .supplier_summary(identity.tenant_id, parse_uuid(native_request.to_owned())?)
+            let request = parse_uuid(native_request.to_owned())?;
+            if let Some(summary) = summaries
+                .get_or_load(identity.tenant_id, request, || async {
+                    self.body_archive()?
+                        .supplier_summary(identity.tenant_id, request)
+                        .await
+                })
                 .await?
             {
                 payload["supplier_error"] = serde_json::to_value(summary)?;
@@ -842,6 +899,7 @@ impl Database {
         let rows = sqlx::query("SELECT revision,source,request_id,tenant_id,key_id,created_at,snapshot,delivery_snapshot FROM request_history_immutable_outbox WHERE revision <= COALESCE($2,9223372036854775807) AND ($3 IS NULL OR (revision=$3 AND source='event' AND request_id=$4 AND tenant_id=$5 AND key_id=$6 AND created_at=$7)) ORDER BY revision LIMIT $1")
             .bind(page_size).bind(ceiling).bind(scope.map(|s|s.revision)).bind(scope.map(|s|s.identity.request_id.to_string())).bind(scope.map(|s|s.identity.tenant_id.to_string())).bind(scope.map(|s|s.identity.key_id.to_string())).bind(scope.map(|s|s.identity.created_at)).fetch_all(&self.pool).await?;
         let mut snapshots = Vec::with_capacity(rows.len());
+        let mut summaries = SummaryBatch::default();
         for row in rows {
             let revision: i64 = row.try_get("revision")?;
             let stored_identity = HistoryIdentity {
@@ -872,7 +930,12 @@ impl Database {
             } else {
                 serde_json::to_string(
                     &self
-                        .history_materialize_envelope(&envelope, identity, revision)
+                        .history_materialize_envelope_with_batch(
+                            &envelope,
+                            identity,
+                            revision,
+                            &mut summaries,
+                        )
                         .await?,
                 )?
             };
@@ -1454,3 +1517,9 @@ mod tests {
 
 #[cfg(test)]
 mod reuse_tests;
+
+#[cfg(test)]
+mod event_capture_tests;
+
+#[cfg(test)]
+mod command_only_tests;

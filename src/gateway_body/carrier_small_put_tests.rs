@@ -1,0 +1,533 @@
+//! Real S3 operation/identity contracts; only synthetic fixture bytes are used.
+use super::*;
+use crate::archive_staging::{ArchiveStagingOwner, ArchiveStagingPurpose};
+#[path = "../../tests/support/recovery_object_proxy.rs"]
+mod recovery_proxy;
+use recovery_proxy::RecoveryObjectProxy;
+
+fn key() -> ArchiveStagingKey {
+    ArchiveStagingKey::new(
+        ArchiveStagingOwner::ProxyRequest(uuid::Uuid::now_v7()),
+        ArchiveStagingPurpose::Response,
+        uuid::Uuid::now_v7(),
+    )
+    .unwrap()
+}
+async fn config(proxy: &RecoveryObjectProxy) -> crate::config::Config {
+    let mut c = crate::config::Config::for_test("sqlite::memory:".into());
+    c.archive_backend = crate::config::ArchiveBackend::S3;
+    c.s3_endpoint = Some(proxy.endpoint().into());
+    c.s3_bucket = Some(std::env::var("MTC_RUSTFS_TEST_BUCKET").unwrap());
+    c.s3_access_key = Some(std::env::var("MTC_RUSTFS_TEST_ACCESS_KEY").unwrap());
+    c.s3_secret_key = Some(std::env::var("MTC_RUSTFS_TEST_SECRET_KEY").unwrap());
+    c.s3_allow_http = true;
+    c
+}
+async fn source(
+    archive: &ArchiveStore,
+    size: usize,
+    upload: Arc<crate::api::proxy::persistence::Persistence>,
+    staging: ArchiveStagingKey,
+) -> (Arc<BodyCarrier>, Arc<ProxyMemoryBudget>) {
+    let memory = Arc::new(ProxyMemoryBudget::new(u64::try_from(size + 65536).unwrap()));
+    let credit = memory.try_reserve_ingress_bytes(size).unwrap();
+    let mut carrier = BodyCarrier::capture_owned(
+        stream::iter([Ok::<_, std::io::Error>((
+            Bytes::from(vec![b'x'; size]),
+            Some(credit),
+        ))]),
+        CarrierCapture::new(memory.clone(), None, staging),
+    )
+    .await
+    .unwrap();
+    let inner = Arc::get_mut(&mut carrier).unwrap();
+    inner.archive = Some(archive.clone());
+    inner.workspace = Some(upload);
+    (carrier, memory)
+}
+#[tokio::test]
+#[ignore = "requires isolated RustFS fixture"]
+async fn real_s3_small_spill_uses_one_put_and_large_boundary_keeps_multipart() {
+    let endpoint = std::env::var("MTC_RUSTFS_TEST_ENDPOINT").unwrap();
+    let proxy = RecoveryObjectProxy::start(&endpoint).await;
+    let archive = ArchiveStore::from_config(&config(&proxy).await)
+        .await
+        .unwrap();
+    let upload = Arc::new(crate::api::proxy::persistence::Persistence::default());
+    for size in [
+        1,
+        65536,
+        crate::archive::ARCHIVE_MULTIPART_PART_BYTES,
+        crate::archive::ARCHIVE_MULTIPART_PART_BYTES + 1,
+    ] {
+        let before = proxy.counts();
+        let (carrier, memory) = source(&archive, size, upload.clone(), key()).await;
+        assert!(carrier.offload_one().await.unwrap());
+        assert_eq!(memory.snapshot().0, 0);
+        let after = proxy.counts();
+        let delta =
+            |k: &str| after.get(k).copied().unwrap_or(0) - before.get(k).copied().unwrap_or(0);
+        if size <= crate::archive::ARCHIVE_MULTIPART_PART_BYTES {
+            assert_eq!(delta("body_put"), 1);
+            assert_eq!(delta("multipart_create"), 0);
+        } else {
+            assert_eq!(delta("body_put"), 0);
+            assert_eq!(delta("multipart_create"), 1);
+            assert_eq!(delta("multipart_complete"), 1);
+        }
+        let guard = upload
+            .multipart_workspace(crate::api::proxy::persistence::WorkspaceRole::RequestRaw)
+            .await
+            .unwrap();
+        let mut stream = carrier.open_stream_with_workspace(guard);
+        let mut hasher = blake3::Hasher::new();
+        let mut count = 0;
+        while let Some(bytes) = stream.next().await {
+            let bytes = bytes.unwrap();
+            hasher.update(&bytes);
+            count += bytes.len();
+        }
+        assert_eq!(count, size);
+        assert_eq!(hasher.finalize().to_hex().as_str(), carrier.digest());
+        drop(stream);
+        drop(carrier);
+        assert_eq!(upload.upload_workspace.snapshot().0, 0);
+    }
+    eprintln!(
+        "synthetic_s3_operations {:?}; request_latency_us {:?}",
+        proxy.counts(),
+        proxy.timings()
+    );
+}
+
+#[tokio::test]
+#[ignore = "requires isolated RustFS fixture"]
+async fn real_s3_small_spill_lost_ack_retains_source_and_routes_both_backends() {
+    let endpoint = std::env::var("MTC_RUSTFS_TEST_ENDPOINT").unwrap();
+    for training in [false, true] {
+        let legacy_proxy = RecoveryObjectProxy::start(&endpoint).await;
+        let training_proxy = RecoveryObjectProxy::start(&endpoint).await;
+        let proxy = if training {
+            &training_proxy
+        } else {
+            &legacy_proxy
+        };
+        let mut c = config(&legacy_proxy).await;
+        if training {
+            c.training_s3 = Some(crate::config::TrainingS3Config {
+                endpoint: proxy.endpoint().into(),
+                bucket: c.s3_bucket.clone().unwrap(),
+                region: "us-east-1".into(),
+                access_key: c.s3_access_key.clone().unwrap(),
+                secret_key: c.s3_secret_key.clone().unwrap(),
+                allow_http: true,
+            });
+            c.training_staging_writes = true;
+            c.training_cas_writes = true;
+        }
+        let archive = ArchiveStore::from_config(&c).await.unwrap();
+        let upload = Arc::new(crate::api::proxy::persistence::Persistence::default());
+        let staging = archive.select_staging_key(key()).unwrap();
+        let (carrier, memory) = source(&archive, 4096, upload.clone(), staging).await;
+        proxy.lose_body_put_ack(true);
+        assert!(carrier.offload_one().await.is_err());
+        assert!(
+            memory.snapshot().0 >= 4096,
+            "lost ACK must retain original allocation"
+        );
+        assert!(matches!(
+            &*carrier.segments[0].lock().unwrap(),
+            Segment::Ram(_)
+        ));
+        assert!(
+            carrier
+                .owned_objects
+                .lock()
+                .unwrap()
+                .iter()
+                .all(|(_, settled)| !settled)
+        );
+        assert_eq!(upload.upload_workspace.snapshot().0, 0);
+        let bytes = carrier.read_range(0, 4096).await.unwrap();
+        assert_eq!(bytes, Bytes::from(vec![b'x'; 4096]));
+        drop(bytes);
+        proxy.lose_body_put_ack(false);
+        assert!(carrier.offload_one().await.unwrap());
+        assert_eq!(memory.snapshot().0, 0);
+        if training {
+            assert_eq!(
+                legacy_proxy.counts().get("body_put").copied().unwrap_or(0),
+                0,
+                "qualified staging writes must use the selected backend, not the legacy endpoint"
+            );
+        }
+        let reference = match &*carrier.segments[0].lock().unwrap() {
+            Segment::Object(r) => r.clone(),
+            _ => panic!("confirmed PUT must replace segment"),
+        };
+        assert_eq!(
+            reference.object_locator.starts_with("stores/staging/"),
+            training
+        );
+        let tenant = uuid::Uuid::now_v7();
+        let request = staging.owner.id();
+        let object = archive
+            .promote_staged_text_to_cas(tenant, &reference)
+            .await
+            .unwrap();
+        archive
+            .publish_raw_capture(tenant, request, "response", &object)
+            .await
+            .unwrap();
+        let root = archive
+            .raw_capture_reference(tenant, request, "response")
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            archive
+                .get_tenant_content(tenant, &root, 4096)
+                .await
+                .unwrap(),
+            Bytes::from(vec![b'x'; 4096])
+        );
+        drop(carrier);
+        assert_eq!(upload.upload_workspace.snapshot().0, 0);
+    }
+}
+
+#[tokio::test]
+#[ignore = "requires isolated RustFS fixture"]
+async fn real_s3_small_spill_compares_previous_multipart_at_same_distribution_and_concurrency() {
+    let endpoint = std::env::var("MTC_RUSTFS_TEST_ENDPOINT").unwrap();
+    for previous in [true, false, false, true] {
+        let proxy = RecoveryObjectProxy::start(&endpoint).await;
+        let archive = ArchiveStore::from_config(&config(&proxy).await)
+            .await
+            .unwrap();
+        let upload = Arc::new(crate::api::proxy::persistence::Persistence::default());
+        let sizes: Vec<usize> = [1024, 4096, 16384, 65536]
+            .into_iter()
+            .cycle()
+            .take(16)
+            .collect();
+        let total: usize = sizes.iter().sum();
+        let started = std::time::Instant::now();
+        let samples: Vec<u64> = stream::iter(sizes)
+            .map(|size| {
+                let archive = archive.clone();
+                let upload = upload.clone();
+                async move {
+                    let (carrier, memory) = source(&archive, size, upload.clone(), key()).await;
+                    let began = std::time::Instant::now();
+                    let hold_us;
+                    if previous {
+                        // Exact prior offload sequence, same receipt and envelope.
+                        let workspace = upload
+                            .multipart_workspace(
+                                crate::api::proxy::persistence::WorkspaceRole::CarrierSpill,
+                            )
+                            .await
+                            .unwrap();
+                        let bytes = match &*carrier.segments[0].lock().unwrap() {
+                            Segment::Ram(b) => b.clone(),
+                            _ => unreachable!(),
+                        };
+                        let locator = format!(
+                            "{}/carrier-{}",
+                            carrier.staging.canonical_prefix(),
+                            uuid::Uuid::now_v7()
+                        );
+                        let owner =
+                            CarrierObjectOwner::new(carrier.staging, locator.clone(), &bytes)
+                                .unwrap();
+                        carrier
+                            .owned_objects
+                            .lock()
+                            .unwrap()
+                            .push((owner.clone(), false));
+                        archive.begin_carrier_object(&owner).await.unwrap();
+                        let mut writer = archive.start_writer(&locator).await.unwrap();
+                        writer.retain_workspace(workspace);
+                        writer.write(bytes.clone()).await.unwrap();
+                        let staged = writer.finish_staged().await.unwrap();
+                        hold_us = began.elapsed().as_micros() as u64;
+                        carrier.owned_objects.lock().unwrap()[0].1 = true;
+                        assert_eq!(staged.size_bytes, size as u64);
+                        assert_eq!(staged.blake3_digest, carrier.digest());
+                        assert_eq!(
+                            archive
+                                .get_bounded(&staged.object_locator, size)
+                                .await
+                                .unwrap(),
+                            bytes
+                        );
+                        drop(bytes);
+                    } else {
+                        assert!(carrier.offload_one().await.unwrap());
+                        hold_us = began.elapsed().as_micros() as u64;
+                        let locator = match &*carrier.segments[0].lock().unwrap() {
+                            Segment::Object(r) => r.object_locator.clone(),
+                            _ => unreachable!(),
+                        };
+                        assert_eq!(
+                            archive.get_bounded(&locator, size).await.unwrap(),
+                            Bytes::from(vec![b'x'; size])
+                        );
+                    }
+                    let objects = std::mem::take(&mut *carrier.owned_objects.lock().unwrap());
+                    drop(carrier);
+                    for (owner, settled) in objects {
+                        assert!(settled);
+                        archive.release_carrier_object(&owner).await.unwrap();
+                    }
+                    assert_eq!(memory.snapshot().0, 0);
+                    hold_us
+                }
+            })
+            .buffer_unordered(2)
+            .collect()
+            .await;
+        let elapsed = started.elapsed();
+        let mut ordered = samples;
+        ordered.sort_unstable();
+        let counts = proxy.counts();
+        if previous {
+            assert_eq!(counts.get("multipart_create"), Some(&16));
+            assert_eq!(counts.get("multipart_complete"), Some(&16));
+        } else {
+            assert_eq!(counts.get("body_put"), Some(&16));
+            assert_eq!(counts.get("multipart_create").copied().unwrap_or(0), 0);
+        }
+        assert_eq!(upload.upload_workspace.snapshot().0, 0);
+        eprintln!(
+            "synthetic_spill_comparison previous={previous} concurrency=2 objects=16 bytes={total} elapsed_us={} throughput_bytes_s={:.2} owner_operation_p50_us={} owner_operation_p95_us={} owner_operation_p99_us={} operations={counts:?}",
+            elapsed.as_micros(),
+            total as f64 / elapsed.as_secs_f64(),
+            ordered[7],
+            ordered[15],
+            ordered[15]
+        );
+    }
+}
+
+#[tokio::test]
+async fn single_put_payload_keeps_workspace_until_last_sdk_clone_is_dropped() {
+    let upload = Arc::new(crate::api::proxy::persistence::Persistence::default());
+    let workspace = upload
+        .multipart_workspace(crate::api::proxy::persistence::WorkspaceRole::CarrierSpill)
+        .await
+        .unwrap();
+    let original = Bytes::from(vec![b'x'; 4096]);
+    let pointer = original.as_ptr();
+    let payload = Bytes::from_owner(WorkspaceWrite {
+        bytes: original.clone(),
+        _workspace: Some(workspace),
+    });
+    assert_eq!(
+        payload.as_ptr(),
+        pointer,
+        "payload must retain original allocation"
+    );
+    let sdk_clone = payload.clone();
+    drop(payload);
+    assert!(
+        upload.upload_workspace.snapshot().0 > 0,
+        "cancelled caller cannot release an SDK-owned envelope"
+    );
+    drop(sdk_clone);
+    assert_eq!(upload.upload_workspace.snapshot().0, 0);
+    assert_eq!(original, Bytes::from(vec![b'x'; 4096]));
+}
+
+/// Isolate HTTP range round-trip cost before changing the production reader.
+/// Each concurrent reader owns a separate existing workspace envelope.
+#[tokio::test]
+#[ignore = "requires isolated RustFS fixture"]
+async fn real_s3_workspace_range_round_trip_comparison() {
+    let endpoint = std::env::var("MTC_RUSTFS_TEST_ENDPOINT").unwrap();
+    let proxy = RecoveryObjectProxy::start(&endpoint).await;
+    let archive = ArchiveStore::from_config(&config(&proxy).await)
+        .await
+        .unwrap();
+    let upload = Arc::new(crate::api::proxy::persistence::Persistence::default());
+    let size = 8 * 1024 * 1024 + 17;
+    let (carrier, memory) = source(&archive, size, upload.clone(), key()).await;
+    assert!(carrier.offload_one().await.unwrap());
+    assert_eq!(memory.snapshot().0, 0);
+    let reference = match &*carrier.segments[0].lock().unwrap() {
+        Segment::Object(reference) => reference.clone(),
+        Segment::Ram(_) => panic!("fixture was not offloaded"),
+    };
+    for window in [64 * 1024, 256 * 1024, 256 * 1024, 64 * 1024] {
+        let before = proxy.counts();
+        let began = std::time::Instant::now();
+        let readers = stream::iter(0..2)
+            .map(|_| {
+                let archive = archive.clone();
+                let upload = upload.clone();
+                let reference = reference.clone();
+                async move {
+                    let guard = upload
+                        .multipart_workspace(
+                            crate::api::proxy::persistence::WorkspaceRole::RequestRaw,
+                        )
+                        .await
+                        .unwrap();
+                    let holding = std::time::Instant::now();
+                    let mut offset = 0;
+                    let mut hasher = blake3::Hasher::new();
+                    let mut peak_output = 0;
+                    while offset < reference.size_bytes {
+                        let end = (offset + window as u64).min(reference.size_bytes);
+                        let mut download = archive
+                            .open_stream(&reference.object_locator, Some(offset..end))
+                            .await
+                            .unwrap()
+                            .stream;
+                        let mut output = Vec::with_capacity((end - offset) as usize);
+                        while let Some(chunk) = download.next().await {
+                            let chunk = chunk.unwrap();
+                            assert!(chunk.len() <= (end - offset) as usize - output.len());
+                            output.extend_from_slice(&chunk);
+                        }
+                        assert_eq!(output.len(), (end - offset) as usize);
+                        peak_output = peak_output.max(output.capacity());
+                        hasher.update(&output);
+                        offset = end;
+                    }
+                    assert_eq!(offset, reference.size_bytes);
+                    assert_eq!(hasher.finalize().to_hex().as_str(), reference.blake3_digest);
+                    let held_us = holding.elapsed().as_micros();
+                    drop(guard);
+                    (offset, held_us, peak_output)
+                }
+            })
+            .buffer_unordered(2)
+            .collect::<Vec<_>>()
+            .await;
+        let elapsed_us = began.elapsed().as_micros();
+        let after = proxy.counts();
+        let gets = after.get("range_get").copied().unwrap_or(0)
+            - before.get("range_get").copied().unwrap_or(0);
+        assert_eq!(gets, size.div_ceil(window) * 2);
+        assert_eq!(upload.upload_workspace.snapshot().0, 0);
+        assert_eq!(memory.snapshot().0, 0);
+        eprintln!(
+            "synthetic_range_comparison window={window} concurrency=2 bytes={} range_gets={gets} elapsed_us={elapsed_us} reader_results={readers:?}",
+            size * 2
+        );
+    }
+    drop(carrier);
+}
+
+#[tokio::test]
+#[ignore = "requires isolated RustFS fixture"]
+async fn real_s3_multipart_workspace_reader_serializes_clones_and_writes_exact_bytes() {
+    use futures_util::FutureExt;
+    let proxy =
+        RecoveryObjectProxy::start(&std::env::var("MTC_RUSTFS_TEST_ENDPOINT").unwrap()).await;
+    let archive = ArchiveStore::from_config(&config(&proxy).await)
+        .await
+        .unwrap();
+    let upload = Arc::new(crate::api::proxy::persistence::Persistence::default());
+    let size = 8 * 1024 * 1024 + 17;
+    let (carrier, memory) = source(&archive, size, upload.clone(), key()).await;
+    carrier.offload_one().await.unwrap();
+    let guard = upload
+        .multipart_workspace(crate::api::proxy::persistence::WorkspaceRole::RequestRaw)
+        .await
+        .unwrap();
+    let part_gate = proxy.gate_multipart_part();
+    let abort_gate = proxy.gate_multipart_abort();
+    let first = tokio::spawn({
+        let carrier = carrier.clone();
+        let archive = archive.clone();
+        let guard = guard.clone();
+        async move {
+            carrier
+                .pump_to_staged(&archive, "staging/proxy/replay-contract/first", guard)
+                .await
+        }
+    });
+    part_gate.entered().await;
+    let mut second = Box::pin(carrier.pump_to_staged(
+        &archive,
+        "staging/proxy/replay-contract/second",
+        guard.clone(),
+    ));
+    assert!(second.as_mut().now_or_never().is_none());
+    first.abort();
+    assert!(first.await.unwrap_err().is_cancelled());
+    abort_gate.entered().await;
+    // A cancelled writer still owns its previous part until abort finishes.
+    assert!(second.as_mut().now_or_never().is_none());
+    assert!(upload.upload_workspace.snapshot().0 > 0);
+    part_gate.release();
+    abort_gate.release();
+    let recovered = second.await.unwrap();
+    assert_eq!(recovered.size_bytes, carrier.len());
+    assert_eq!(recovered.blake3_digest, carrier.digest());
+    drop(guard);
+    assert_eq!(upload.upload_workspace.snapshot().0, 0);
+    for widened in [false, true, true, false] {
+        let before = proxy.counts();
+        let started = std::time::Instant::now();
+        let results = stream::iter(0..2)
+            .map(|_| {
+                let carrier = carrier.clone();
+                let archive = archive.clone();
+                let upload = upload.clone();
+                async move {
+                    let workspace = upload
+                        .multipart_workspace(
+                            crate::api::proxy::persistence::WorkspaceRole::RequestRaw,
+                        )
+                        .await
+                        .unwrap();
+                    let holding = std::time::Instant::now();
+                    let location = format!(
+                        "{}/range-writer-{}",
+                        key().canonical_prefix(),
+                        uuid::Uuid::now_v7()
+                    );
+                    let written = if widened {
+                        carrier
+                            .pump_to_staged(&archive, &location, workspace)
+                            .await
+                            .unwrap()
+                    } else {
+                        let mut writer = archive.start_writer(&location).await.unwrap();
+                        writer.retain_workspace(workspace.clone());
+                        let mut input = carrier.open_stream_with_workspace(workspace);
+                        while let Some(chunk) = input.next().await {
+                            let chunk = chunk.unwrap();
+                            assert!(chunk.len() <= 64 * 1024);
+                            writer.write(chunk).await.unwrap();
+                        }
+                        drop(input);
+                        writer.finish_staged().await.unwrap()
+                    };
+                    assert_eq!(written.size_bytes, carrier.len());
+                    assert_eq!(written.blake3_digest, carrier.digest());
+                    holding.elapsed().as_micros()
+                }
+            })
+            .buffer_unordered(2)
+            .collect::<Vec<_>>()
+            .await;
+        let gets = proxy.counts().get("range_get").copied().unwrap_or(0)
+            - before.get("range_get").copied().unwrap_or(0);
+        assert_eq!(
+            gets,
+            size.div_ceil(if widened { 256 * 1024 } else { 64 * 1024 }) * 2
+        );
+        assert_eq!(upload.upload_workspace.snapshot().0, 0);
+        assert_eq!(memory.snapshot().0, 0);
+        eprintln!(
+            "synthetic_range_writer_comparison widened={widened} concurrency=2 bytes={} range_gets={gets} elapsed_us={} hold_us={results:?}",
+            size * 2,
+            started.elapsed().as_micros()
+        );
+    }
+}

@@ -21,6 +21,7 @@ pub(crate) type CarrierStream = Pin<Box<dyn Stream<Item = Result<Bytes, AppError
 
 pub(crate) struct CarrierCapture {
     memory: Arc<ProxyMemoryBudget>,
+    workspace: Option<Arc<crate::api::proxy::persistence::Persistence>>,
     archive: Option<ArchiveStore>,
     staging: ArchiveStagingKey,
     parent: Option<Arc<BodyCarrier>>,
@@ -34,10 +35,19 @@ impl CarrierCapture {
     ) -> Self {
         Self {
             memory,
+            workspace: None,
             archive,
             staging,
             parent: None,
         }
+    }
+
+    pub(crate) fn with_upload_workspace(
+        mut self,
+        workspace: Arc<crate::api::proxy::persistence::Persistence>,
+    ) -> Self {
+        self.workspace = Some(workspace);
+        self
     }
 
     /// Only pointer ranges owned by this sealed source may share its allocation
@@ -45,6 +55,7 @@ impl CarrierCapture {
     pub(crate) fn derived_from(source: &Arc<BodyCarrier>, staging: ArchiveStagingKey) -> Self {
         Self {
             memory: source.memory.clone(),
+            workspace: source.workspace.clone(),
             archive: source.archive.clone(),
             staging,
             parent: Some(source.clone()),
@@ -74,6 +85,7 @@ enum Segment {
 
 pub(crate) struct BodyCarrier {
     memory: Arc<ProxyMemoryBudget>,
+    workspace: Option<Arc<crate::api::proxy::persistence::Persistence>>,
     archive: Option<ArchiveStore>,
     staging: ArchiveStagingKey,
     segments: Vec<Mutex<Segment>>,
@@ -87,6 +99,38 @@ pub(crate) struct BodyCarrier {
     _external_owner: Option<Arc<dyn Send + Sync>>,
     published: Mutex<Option<Arc<BodyCarrier>>>,
     readers: std::sync::atomic::AtomicUsize,
+}
+
+// The SDK may retain a body clone after a cancelled upload future. Its
+// envelope follows those exact Bytes until the final network owner releases it.
+struct WorkspaceWrite {
+    bytes: Bytes,
+    _workspace: Option<Arc<dyn Send + Sync>>,
+}
+impl AsRef<[u8]> for WorkspaceWrite {
+    fn as_ref(&self) -> &[u8] {
+        &self.bytes
+    }
+}
+
+enum ResourceWake {
+    Memory(OwnedSemaphorePermit),
+    Workspace(Arc<crate::api::proxy::persistence::WorkspaceGuard>),
+}
+
+struct MultipartReplayOwner {
+    _workspace: Arc<crate::api::proxy::persistence::WorkspaceGuard>,
+    _exclusive: OwnedSemaphorePermit,
+}
+
+struct WorkspaceRead {
+    bytes: Vec<u8>,
+    _workspace: Arc<dyn Send + Sync>,
+}
+impl AsRef<[u8]> for WorkspaceRead {
+    fn as_ref(&self) -> &[u8] {
+        &self.bytes
+    }
 }
 
 struct CarrierReadOwner(Arc<BodyCarrier>);
@@ -143,6 +187,7 @@ impl BodyCarrier {
         };
         let replacement = Arc::new(Self {
             memory: self.memory.clone(),
+            workspace: self.workspace.clone(),
             archive: Some(archive),
             staging: self.staging,
             segments: vec![Mutex::new(Segment::Object(staged.clone()))],
@@ -215,6 +260,7 @@ impl BodyCarrier {
         let digest = blake3::hash(&encoded).to_hex().to_string();
         let source = Self {
             memory: capture.memory,
+            workspace: capture.workspace,
             archive: capture.archive,
             staging,
             segments: Vec::new(),
@@ -260,6 +306,7 @@ impl BodyCarrier {
         }
         Ok(Arc::new(Self {
             memory: capture.memory,
+            workspace: capture.workspace,
             archive: capture.archive,
             staging,
             length: reference.size_bytes,
@@ -286,6 +333,19 @@ impl BodyCarrier {
         S: Stream<Item = Result<Bytes, E>> + Send,
         E: Display,
     {
+        Self::capture_owned(input.map(|chunk| chunk.map(|bytes| (bytes, None))), capture).await
+    }
+
+    /// Adopt archival ingress credit with its allocation; never release and
+    /// reacquire the same budget between the ordered tap and the carrier.
+    pub(crate) async fn capture_owned<S, E>(
+        input: S,
+        capture: CarrierCapture,
+    ) -> Result<Arc<Self>, AppError>
+    where
+        S: Stream<Item = Result<(Bytes, Option<OwnedSemaphorePermit>), E>> + Send,
+        E: Display,
+    {
         let parent = capture.parent;
         let staging = match &capture.archive {
             Some(archive) => archive.select_staging_key(capture.staging)?,
@@ -293,6 +353,7 @@ impl BodyCarrier {
         };
         let mut source = Self {
             memory: capture.memory,
+            workspace: capture.workspace,
             archive: capture.archive,
             staging,
             segments: Vec::new(),
@@ -310,7 +371,7 @@ impl BodyCarrier {
         let mut hash = blake3::Hasher::new();
         futures_util::pin_mut!(input);
         while let Some(chunk) = input.next().await {
-            let chunk = chunk.map_err(|_| AppError::storage("carrier_input_failed"))?;
+            let (chunk, credit) = chunk.map_err(|_| AppError::storage("carrier_input_failed"))?;
             if chunk.is_empty() {
                 continue;
             }
@@ -319,6 +380,17 @@ impl BodyCarrier {
                 .checked_add(chunk.len() as u64)
                 .ok_or_else(|| AppError::storage("carrier_length_overflow"))?;
             hash.update(&chunk);
+            if let Some(credit) = credit {
+                let retained = source.memory.try_reserve_carrier_retained(chunk.len());
+                if retained.is_none() {
+                    // Preserve the existing response tap's opportunistic spill:
+                    // credited streams can exceed source RAM over their lifetime.
+                    let _ = source.offload_one().await;
+                }
+                let bytes = source.leased_bytes(chunk, credit, retained);
+                source.segments.push(Mutex::new(Segment::Ram(bytes)));
+                continue;
+            }
             let mut remaining = chunk;
             while !remaining.is_empty() {
                 // Bounded owned allocations prevent a small slice from pinning
@@ -340,16 +412,13 @@ impl BodyCarrier {
                         Ok(false) => {
                             break (source.reserve_workspace(part.len()).await?, None);
                         }
-                        Err(_) => {
-                            // Remote failure cannot discard the sole source. If
-                            // real RAM is available retain it and continue;
-                            // otherwise stop polling input and retry this owned
-                            // prefix, without a request deadline or fake seal.
-                            if let Some(lease) = source.memory.try_reserve_ingress_bytes(part.len())
+                        Err(error) => {
+                            if let Some(lease) = source
+                                .wait_after_spill(&source, part.len(), retry, &error)
+                                .await?
                             {
                                 break (lease, None);
                             }
-                            tokio::time::sleep(retry).await;
                             retry = (retry * 2).min(std::time::Duration::from_secs(300));
                         }
                     }
@@ -409,7 +478,27 @@ impl BodyCarrier {
     }
 
     async fn offload_one(&self) -> Result<bool, AppError> {
-        let _owner = self.offload.lock().await;
+        self.offload_one_with_workspace(None).await
+    }
+
+    async fn offload_one_with_workspace(
+        &self,
+        mut prepaid: Option<Arc<crate::api::proxy::persistence::WorkspaceGuard>>,
+    ) -> Result<bool, AppError> {
+        let _owner = if prepaid.is_some() {
+            match self.offload.try_lock() {
+                Ok(owner) => owner,
+                Err(_) => {
+                    // Another exact spill owns the target. Return our envelope
+                    // before waiting for it; re-evaluate RAM/segments afterwards.
+                    drop(prepaid.take());
+                    drop(self.offload.lock().await);
+                    return Ok(false);
+                }
+            }
+        } else {
+            self.offload.lock().await
+        };
         let Some(archive) = &self.archive else {
             return Ok(false);
         };
@@ -420,6 +509,20 @@ impl BodyCarrier {
         };
         let Segment::Ram(bytes) = self.segments[index].lock().unwrap().clone() else {
             unreachable!()
+        };
+        let workspace = match prepaid {
+            Some(workspace) => Some(workspace),
+            None => self
+                .workspace
+                .as_ref()
+                .map(|owner| {
+                    owner
+                        .try_multipart_workspace(
+                            crate::api::proxy::persistence::WorkspaceRole::CarrierSpill,
+                        )
+                        .map_err(|_| AppError::storage("carrier_workspace_unavailable"))
+                })
+                .transpose()?,
         };
         let locator = format!(
             "{}/carrier-{}",
@@ -434,12 +537,32 @@ impl BodyCarrier {
             .unwrap()
             .push((owner.clone(), false));
         archive.begin_carrier_object(&owner).await?;
-        let mut writer = archive.start_writer(&locator).await?;
-        if let Err(error) = writer.write(bytes.clone()).await {
-            let _ = writer.abort().await;
-            return Err(error);
-        }
-        let staged = writer.finish_staged().await?;
+        let staged = if bytes.len() <= crate::archive::ARCHIVE_MULTIPART_PART_BYTES {
+            // One owned segment already fits the existing multipart envelope.
+            // A single PUT retains these exact Bytes until its ACK; uncertain
+            // completion leaves RAM and the active receipt with this carrier.
+            let payload = Bytes::from_owner(WorkspaceWrite {
+                bytes: bytes.clone(),
+                _workspace: workspace.map(|guard| guard as Arc<dyn Send + Sync>),
+            });
+            archive.put(&locator, payload).await?;
+            StagedArchiveObject {
+                object_locator: locator,
+                size_bytes: bytes.len() as u64,
+                blake3_digest: blake3::hash(&bytes).to_hex().to_string(),
+            }
+        } else {
+            let mut writer = archive.start_writer(&locator).await?;
+            if let Some(workspace) = workspace {
+                writer.retain_workspace(workspace);
+            }
+            if let Err(error) = writer.write(bytes.clone()).await {
+                let _ = writer.abort().await;
+                return Err(error);
+            }
+            let staged = writer.finish_staged().await?;
+            staged
+        };
         if staged.size_bytes != bytes.len() as u64
             || staged.blake3_digest != blake3::hash(&bytes).to_hex().as_str()
         {
@@ -486,8 +609,12 @@ impl BodyCarrier {
                                 break;
                             }
                             Ok(false) => parent = source.parent.as_ref(),
-                            Err(_) => {
-                                tokio::time::sleep(retry).await;
+                            Err(error) => {
+                                if let Some(lease) =
+                                    self.wait_after_spill(source, bytes, retry, &error).await?
+                                {
+                                    return Ok(lease);
+                                }
                                 retry = (retry * 2).min(std::time::Duration::from_secs(300));
                                 released = true;
                                 break;
@@ -499,11 +626,70 @@ impl BodyCarrier {
                     }
                     return self.memory.reserve_carrier_bytes(bytes).await;
                 }
-                Err(_) => {
-                    tokio::time::sleep(retry).await;
+                Err(error) => {
+                    if let Some(lease) = self.wait_after_spill(self, bytes, retry, &error).await? {
+                        return Ok(lease);
+                    }
                     retry = (retry * 2).min(std::time::Duration::from_secs(300));
                 }
             }
+        }
+    }
+
+    /// Wait once on actual resource availability. Losing FIFO acquisitions are
+    /// dropped before a winning workspace starts I/O; no PUT is raced/cancelled.
+    async fn wait_after_spill(
+        &self,
+        target: &Self,
+        bytes: usize,
+        retry: std::time::Duration,
+        error: &AppError,
+    ) -> Result<Option<OwnedSemaphorePermit>, AppError> {
+        if matches!(
+            error,
+            AppError::Storage {
+                code: "carrier_workspace_unavailable",
+                ..
+            }
+        ) {
+            if let Some(persistence) = &target.workspace {
+                let winner = {
+                    let memory = self.memory.reserve_carrier_bytes(bytes);
+                    let workspace = persistence.multipart_workspace(
+                        crate::api::proxy::persistence::WorkspaceRole::CarrierSpill,
+                    );
+                    tokio::pin!(memory, workspace);
+                    tokio::select! {
+                        biased;
+                        lease = &mut memory => ResourceWake::Memory(lease?),
+                        workspace = &mut workspace => ResourceWake::Workspace(workspace?),
+                    }
+                };
+                return match winner {
+                    ResourceWake::Memory(lease) => Ok(Some(lease)),
+                    ResourceWake::Workspace(workspace) => {
+                        match target.offload_one_with_workspace(Some(workspace)).await {
+                            Ok(_) => Ok(None),
+                            // The remote attempt has ended. Retain source and
+                            // receipt while real I/O retry remains throttled.
+                            Err(_) => self.memory_or_retry(bytes, retry).await,
+                        }
+                    }
+                };
+            }
+        }
+        self.memory_or_retry(bytes, retry).await
+    }
+
+    async fn memory_or_retry(
+        &self,
+        bytes: usize,
+        retry: std::time::Duration,
+    ) -> Result<Option<OwnedSemaphorePermit>, AppError> {
+        tokio::select! {
+            biased;
+            lease = self.memory.reserve_carrier_bytes(bytes) => lease.map(Some),
+            () = tokio::time::sleep(retry) => Ok(None),
         }
     }
 
@@ -574,83 +760,164 @@ impl BodyCarrier {
     }
 
     pub(crate) fn open_stream(self: &Arc<Self>) -> CarrierStream {
+        self.open_stream_inner(None, 64 * 1024)
+    }
+
+    pub(crate) fn open_stream_with_workspace(
+        self: &Arc<Self>,
+        workspace: Arc<dyn Send + Sync>,
+    ) -> CarrierStream {
+        self.open_stream_inner(Some(workspace), 64 * 1024)
+    }
+
+    /// The larger scratch window never escapes as a general byte stream.
+    /// The same exclusive owner follows both the sequential sink and any SDK
+    /// body clones through completion or asynchronous cancellation/abort.
+    pub(crate) async fn pump_to_staged(
+        self: &Arc<Self>,
+        archive: &ArchiveStore,
+        location: &str,
+        workspace: Arc<crate::api::proxy::persistence::WorkspaceGuard>,
+    ) -> Result<StagedArchiveObject, AppError> {
+        let exclusive = workspace.reader().await;
+        let ownership: Arc<dyn Send + Sync> = Arc::new(MultipartReplayOwner {
+            _workspace: workspace,
+            _exclusive: exclusive,
+        });
+        let mut writer = archive.start_writer(location).await?;
+        writer.retain_workspace(ownership.clone());
+        let mut input = self.open_stream_inner(Some(ownership), 256 * 1024);
+        while let Some(chunk) = input.next().await {
+            match chunk {
+                Ok(chunk) => {
+                    if let Err(error) = writer.write(chunk).await {
+                        let _ = writer.abort().await;
+                        return Err(error);
+                    }
+                }
+                Err(error) => {
+                    let _ = writer.abort().await;
+                    return Err(error);
+                }
+            }
+        }
+        drop(input);
+        let staged = writer.finish_staged().await?;
+        if staged.size_bytes != self.len() || staged.blake3_digest != self.digest() {
+            return Err(AppError::storage("carrier_replay_identity_mismatch"));
+        }
+        Ok(staged)
+    }
+
+    fn open_stream_inner(
+        self: &Arc<Self>,
+        workspace: Option<Arc<dyn Send + Sync>>,
+        range_bytes: usize,
+    ) -> CarrierStream {
         let reader = self.read_owner();
         let published = self.published.lock().unwrap().clone();
         if let Some(published) = published {
-            return published.open_stream();
+            return published.open_stream_inner(workspace, range_bytes);
         }
         let source = self.clone();
         Box::pin(stream::unfold(
             (source, 0usize, None::<CarrierStream>, reader),
-            |(source, mut index, mut remote, reader)| async move {
-                loop {
-                    if let Some(stream) = &mut remote {
-                        if let Some(chunk) = stream.next().await {
-                            return Some((chunk, (source, index, remote, reader)));
+            move |(source, mut index, mut remote, reader)| {
+                let workspace = workspace.clone();
+                async move {
+                    loop {
+                        if let Some(stream) = &mut remote {
+                            if let Some(chunk) = stream.next().await {
+                                return Some((chunk, (source, index, remote, reader)));
+                            }
+                            remote = None;
                         }
-                        remote = None;
-                    }
-                    let segment = source.segments.get(index)?.lock().unwrap().clone();
-                    index += 1;
-                    match &segment {
-                        Segment::Ram(bytes) => {
-                            return Some((Ok(bytes.clone()), (source, index, remote, reader)));
-                        }
-                        Segment::Object(reference) => {
-                            let Some(archive) = &source.archive else {
-                                let end = source.segments.len();
-                                return Some((
-                                    Err(AppError::storage("carrier_backend_missing")),
-                                    (source, end, None, reader),
-                                ));
-                            };
-                            let _ = archive;
-                            let reference = reference.clone();
-                            remote = Some(Box::pin(stream::try_unfold(
-                                (source.clone(), reference, 0u64),
-                                |(source, reference, offset)| async move {
-                                    if offset == reference.size_bytes {
-                                        return Ok(None);
-                                    }
-                                    let count =
-                                        (reference.size_bytes - offset).min(64 * 1024) as usize;
-                                    // Reserve application destination before receiving the SDK
-                                    // frame. Each HTTP range is bounded independently; no slow
-                                    // consumer retains the backing of an entire object stream.
-                                    let lease = source.reserve_workspace(count).await?;
-                                    let archive = source.archive.as_ref().ok_or_else(|| {
-                                        AppError::storage("carrier_backend_missing")
-                                    })?;
-                                    let mut download = archive
-                                        .open_stream(
-                                            &reference.object_locator,
-                                            Some(offset..offset + count as u64),
-                                        )
-                                        .await?
-                                        .stream;
-                                    let mut output = Vec::with_capacity(count);
-                                    while let Some(chunk) = download.next().await {
-                                        let chunk = chunk.map_err(|_| {
-                                            AppError::storage("carrier_object_read_failed")
-                                        })?;
-                                        if chunk.len() > count.saturating_sub(output.len()) {
-                                            return Err(AppError::storage(
-                                                "carrier_object_read_failed",
-                                            ));
+                        let segment = source.segments.get(index)?.lock().unwrap().clone();
+                        index += 1;
+                        match &segment {
+                            Segment::Ram(bytes) => {
+                                return Some((Ok(bytes.clone()), (source, index, remote, reader)));
+                            }
+                            Segment::Object(reference) => {
+                                let Some(archive) = &source.archive else {
+                                    let end = source.segments.len();
+                                    return Some((
+                                        Err(AppError::storage("carrier_backend_missing")),
+                                        (source, end, None, reader),
+                                    ));
+                                };
+                                let _ = archive;
+                                let reference = reference.clone();
+                                let workspace = workspace.clone();
+                                remote = Some(Box::pin(stream::try_unfold(
+                                    (source.clone(), reference, 0u64),
+                                    move |(source, reference, offset)| {
+                                        let workspace = workspace.clone();
+                                        async move {
+                                            if offset == reference.size_bytes {
+                                                return Ok(None);
+                                            }
+                                            let count = (reference.size_bytes - offset)
+                                                .min(range_bytes as u64)
+                                                as usize;
+                                            // Reserve application destination before receiving the SDK
+                                            // frame. Each HTTP range is bounded independently; no slow
+                                            // consumer retains the backing of an entire object stream.
+                                            let lease = if workspace.is_some() {
+                                                None
+                                            } else {
+                                                Some(source.reserve_workspace(count).await?)
+                                            };
+                                            let archive =
+                                                source.archive.as_ref().ok_or_else(|| {
+                                                    AppError::storage("carrier_backend_missing")
+                                                })?;
+                                            let mut download = archive
+                                                .open_stream(
+                                                    &reference.object_locator,
+                                                    Some(offset..offset + count as u64),
+                                                )
+                                                .await?
+                                                .stream;
+                                            let mut output = Vec::with_capacity(count);
+                                            while let Some(chunk) = download.next().await {
+                                                let chunk = chunk.map_err(|_| {
+                                                    AppError::storage("carrier_object_read_failed")
+                                                })?;
+                                                if chunk.len() > count.saturating_sub(output.len())
+                                                {
+                                                    return Err(AppError::storage(
+                                                        "carrier_object_read_failed",
+                                                    ));
+                                                }
+                                                output.extend_from_slice(&chunk);
+                                            }
+                                            if output.len() != count {
+                                                return Err(AppError::storage(
+                                                    "carrier_object_read_failed",
+                                                ));
+                                            }
+                                            drop(download);
+                                            let owned = match lease {
+                                                Some(lease) => source.leased_bytes(
+                                                    Bytes::from(output),
+                                                    lease,
+                                                    None,
+                                                ),
+                                                None => Bytes::from_owner(WorkspaceRead {
+                                                    bytes: output,
+                                                    _workspace: workspace
+                                                        .expect("read workspace owner"),
+                                                }),
+                                            };
+                                            Ok(Some((
+                                                owned,
+                                                (source, reference, offset + count as u64),
+                                            )))
                                         }
-                                        output.extend_from_slice(&chunk);
-                                    }
-                                    if output.len() != count {
-                                        return Err(AppError::storage(
-                                            "carrier_object_read_failed",
-                                        ));
-                                    }
-                                    drop(download);
-                                    let owned =
-                                        source.leased_bytes(Bytes::from(output), lease, None);
-                                    Ok(Some((owned, (source, reference, offset + count as u64))))
-                                },
-                            )));
+                                    },
+                                )));
+                            }
                         }
                     }
                 }
@@ -1214,3 +1481,11 @@ mod tests {
         assert_eq!(hash.finalize().to_hex().as_str(), source.digest());
     }
 }
+
+#[cfg(test)]
+#[path = "carrier_small_put_tests.rs"]
+mod small_put_tests;
+
+#[cfg(test)]
+#[path = "carrier_resource_wakeup_tests.rs"]
+mod resource_wakeup_tests;

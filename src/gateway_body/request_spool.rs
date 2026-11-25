@@ -1,3 +1,4 @@
+mod capture_timing;
 use super::carrier::{BodyCarrier, CarrierCapture};
 use std::{
     path::PathBuf,
@@ -177,33 +178,14 @@ impl DurableRequestBodies {
                 // Its existing independent upload envelope must own those
                 // copies; retaining the source pool's replay lease here would
                 // wait on the very bytes queued in the multipart writer.
-                let _upload_memory = upload
-                    .stream_memory
-                    .temporary_wait(
-                        crate::archive::ARCHIVE_MULTIPART_PART_BYTES
-                            + 5 * REQUEST_SPOOL_CHUNK_BYTES,
-                        super::memory::CAPTURE_MEMORY_WEIGHT,
-                    )
+                let workspace = upload
+                    .multipart_workspace(crate::api::proxy::persistence::WorkspaceRole::RequestRaw)
                     .await
-                    .ok_or(())?;
-                let mut writer = archive.start_writer(key).await.map_err(|_| ())?;
-                let mut stream = source.open_stream();
-                while let Some(chunk) = stream.next().await {
-                    let chunk = match chunk {
-                        Ok(chunk) => chunk,
-                        Err(_) => {
-                            let _ = writer.abort().await;
-                            return Err(());
-                        }
-                    };
-                    let upload_bytes = Bytes::copy_from_slice(&chunk);
-                    drop(chunk);
-                    if writer.write(upload_bytes).await.is_err() {
-                        let _ = writer.abort().await;
-                        return Err(());
-                    }
-                }
-                let result = writer.finish_staged().await.map_err(|_| ())?;
+                    .map_err(|_| ())?;
+                let result = source
+                    .pump_to_staged(archive, key, workspace)
+                    .await
+                    .map_err(|_| ())?;
                 if result.size_bytes != source.len() || result.blake3_digest != source.digest() {
                     return Err(());
                 }
@@ -424,9 +406,15 @@ impl RequestSpoolAdmission {
         let mut hasher = blake3::Hasher::new();
         let mut scanner = super::memory::JsonMemoryScanner::default();
         let mut rejected = None;
-        let input = body.into_data_stream().map(|chunk| {
-            let chunk = chunk.map_err(|_| RequestSpoolCaptureError::BodyReadRejected)?;
+        let capture_summary = capture_timing::CaptureSummary::new(body_key);
+        let timing = capture_summary.timing();
+        let input = timing.input(body.into_data_stream()).map(|chunk| {
+            let chunk = chunk.map_err(|_| {
+                timing.error();
+                RequestSpoolCaptureError::BodyReadRejected
+            })?;
             if chunk.len() > maximum.saturating_sub(length) {
+                timing.error();
                 rejected = Some(RequestSpoolCaptureError::TooLarge);
                 return Err(RequestSpoolCaptureError::TooLarge);
             }
@@ -435,8 +423,11 @@ impl RequestSpoolAdmission {
                 .map_err(|_| RequestSpoolCaptureError::Unavailable)?
                 .record_written(chunk.len());
             length += chunk.len();
+            let scan_started = std::time::Instant::now();
             hasher.update(&chunk);
             scanner.observe(&chunk);
+            let scan_elapsed = scan_started.elapsed();
+            timing.scan(scan_elapsed, chunk.len());
             Ok(chunk)
         });
         let (body, carrier) = if let Some(memory) = memory {
@@ -467,6 +458,7 @@ impl RequestSpoolAdmission {
             let carrier = match result {
                 Ok(carrier) => carrier,
                 Err(_) => {
+                    timing.error();
                     return Err(rejected.unwrap_or(RequestSpoolCaptureError::BodyReadRejected));
                 }
             };
@@ -1003,6 +995,26 @@ fn verified_body(shared: &SharedBody, body: Bytes) -> Result<Bytes, RequestSpool
     Ok(body)
 }
 
+/// Only a verified published root or semantic retirement may replace RAM.
+/// A rejected handoff leaves both the source and its budget untouched.
+fn handoff_verified_request_source(
+    source: &Arc<SharedBody>,
+    database: &crate::db::Database,
+    object: &crate::archive::CasArchiveObject,
+) -> Result<(), crate::error::AppError> {
+    if object.size_bytes != source.length as u64
+        || object.blake3_digest != blake3::Hash::from_bytes(source.digest).to_hex().as_str()
+    {
+        return Err(crate::error::AppError::storage(
+            "request_source_publication_identity_mismatch",
+        ));
+    }
+    if let Some(carrier) = &source.carrier {
+        carrier.handoff_verified_publication(database.body_archive()?.clone(), object.clone())?;
+    }
+    Ok(())
+}
+
 fn release_resident_memory(shared: &SharedBody) {
     let removed = shared
         .body
@@ -1140,11 +1152,12 @@ fn publish_durable(shared: &Arc<SharedBody>) {
                     }
                     Err(_) => {}
                 }
-                if source.archived.load(Ordering::Acquire) {
-                    release_resident_memory(&source);
+                // Archive-bound originals still require the typed publication
+                // handoff below. A successful staging PUT alone is not that ACK.
+                if !source.archived.load(Ordering::Acquire) {
+                    residency.durable_settled.store(true, Ordering::Release);
+                    residency.release_if_idle();
                 }
-                residency.durable_settled.store(true, Ordering::Release);
-                residency.release_if_idle();
             } else {
                 tracing::warn!("request body stayed in memory; object storage write failed");
             }
@@ -1193,18 +1206,33 @@ fn publish_durable(shared: &Arc<SharedBody>) {
                                     source.digest,
                                 )
                                 .await;
-                            // Either the immutable raw root or verified semantic
-                            // retirement durably owns this exact object.
-                            if let Some(carrier) = &source.carrier
-                                && let Ok(archive) = database.body_archive()
-                                && carrier
-                                    .handoff_verified_publication(archive.clone(), object)
-                                    .is_err()
-                            {
-                                tracing::error!(
-                                    "request source durable handoff identity mismatch; retaining RAM"
-                                );
+                            // The publication owns these exact bytes before resident
+                            // credit can move to lightweight completion metadata.
+                            let mut attempt = 0_u32;
+                            loop {
+                                match handoff_verified_request_source(&source, &database, &object) {
+                                    Ok(()) => break,
+                                    Err(error) => {
+                                        attempt = attempt.saturating_add(1);
+                                        tracing::error!(request_id = %identity.request_id,
+                                            error_category = error.diagnostic_category(),
+                                            "request source durable handoff retains original owner");
+                                        let delay =
+                                            crate::archive_staging::cleanup_backoff_with_jitter(
+                                                identity.request_id,
+                                                attempt,
+                                            )
+                                            .min(30_000);
+                                        tokio::time::sleep(std::time::Duration::from_millis(
+                                            delay as u64,
+                                        ))
+                                        .await;
+                                    }
+                                }
                             }
+                            release_resident_memory(&source);
+                            residency.durable_settled.store(true, Ordering::Release);
+                            residency.release_if_idle();
                             Some(settlement)
                         } else {
                             None
@@ -1219,9 +1247,6 @@ fn publish_durable(shared: &Arc<SharedBody>) {
                         } else {
                             Some(database.request_source_completion().await)
                         };
-                        release_resident_memory(&source);
-                        residency.durable_settled.store(true, Ordering::Release);
-                        residency.release_if_idle();
                         (permit, settlement)
                     };
                     let (wrote, (permit, settlement)) = tokio::join!(lease, handoff);
@@ -1836,3 +1861,6 @@ mod tests {
         assert_eq!(file_count(&target), 0);
     }
 }
+
+#[cfg(test)]
+mod workspace_contracts;

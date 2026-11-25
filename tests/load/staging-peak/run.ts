@@ -47,7 +47,7 @@ export function targetEndpoints(env: NodeJS.ProcessEnv) {
   if (!runId || !/^[a-z0-9-]{1,40}$/.test(runId)) throw new Error("DNS-safe explicit run identity required");
   const gateway = new URL(env.MTC_TEST_GATEWAY_URL ?? (staging ? "http://mtc-staging-gateway:8080" : "http://memeloop-token-center-test-gateway:8080"));
   const control = new URL(env.MTC_TEST_CONTROL_URL ?? (staging ? "http://mtc-staging-control:8080" : "http://memeloop-token-center-test-control:8080"));
-  const mock = new URL(env.MTC_TEST_MOCK_URL ?? (staging ? "http://mtc-staging-mock:18080" : `http://mtc-peak-${runId}-mock:8080`));
+  const mock = new URL(env.MTC_TEST_MOCK_URL ?? (staging ? `http://mtc-peak-${runId}-mock:18080` : `http://mtc-peak-${runId}-mock:8080`));
   const forwarded = env.MTC_PEAK_OPERATOR_FORWARD === "1";
   const upstreamBase = forwarded ? new URL(env.MTC_PEAK_UPSTREAM_BASE_URL ?? "") : mock;
   if (forwarded && staging) throw new Error("staging requires direct isolated services");
@@ -55,7 +55,7 @@ export function targetEndpoints(env: NodeJS.ProcessEnv) {
     for (const [url, port] of [[gateway,"18090"],[control,"18089"],[mock,"18091"]] as const) if (url.protocol !== "http:" || url.hostname !== "127.0.0.1" || url.port !== port || url.pathname !== "/" || url.username || url.password || url.search || url.hash) throw new Error("invalid operator forward endpoint");
     if (upstreamBase.protocol !== "http:" || upstreamBase.hostname !== env.MTC_PEAK_TEST_GATEWAY_POD_IP || !/^10\.42\.\d{1,3}\.\d{1,3}$/.test(upstreamBase.hostname) || upstreamBase.port !== "18080" || upstreamBase.pathname !== "/" || upstreamBase.username || upstreamBase.password || upstreamBase.search || upstreamBase.hash) throw new Error("invalid TEST sidecar upstream");
   } else {
-    for (const [url, host] of [[gateway,staging ? "mtc-staging-gateway" : "memeloop-token-center-test-gateway"],[control,staging ? "mtc-staging-control" : "memeloop-token-center-test-control"],[mock,staging ? "mtc-staging-mock" : `mtc-peak-${runId}-mock`]] as const) if (url.protocol !== "http:" || url.hostname !== host || url.port !== (staging && url === mock ? "18080" : "8080") || url.pathname !== "/" || url.username || url.password || url.search || url.hash) throw new Error("isolated service identity mismatch");
+    for (const [url, host] of [[gateway,staging ? "mtc-staging-gateway" : "memeloop-token-center-test-gateway"],[control,staging ? "mtc-staging-control" : "memeloop-token-center-test-control"],[mock,`mtc-peak-${runId}-mock`]] as const) if (url.protocol !== "http:" || url.hostname !== host || url.port !== (staging && url === mock ? "18080" : "8080") || url.pathname !== "/" || url.username || url.password || url.search || url.hash) throw new Error("isolated service identity mismatch");
   }
   return { runId, gateway, control, mock, upstreamBase, forwarded };
 }
@@ -97,7 +97,7 @@ export async function run(plan: Plan, env = process.env): Promise<Record<string,
   for (const scenario of new Set(plan.arrivals.map(row => row.scenario))) {
     setupScenario=scenario; setupIndex=(setupIndex ?? -1)+1;
     const model = `staging-peak-${fixtureId}-${scenario}`;
-    if (reused) { models[scenario]=model; routes.push(reused.routes[scenario]); continue; }
+    if (reused) { const routeId=reused.routes[scenario]; if(!routeId)throw new Error("verified fixture route is missing"); models[scenario]=model; routes.push(routeId); continue; }
     const upstream = await call("upstream_setup", "/internal/v1/upstreams", { tenant_external_id:tenant, name:model, driver:"http-json", config:{ base_url:new URL(`/scenario/${scenario}`,upstreamBase).href, network_scope:"private" }, credential:{ type:"none" } });
     const route = await call("route_setup", "/internal/v1/model-routes", { tenant_external_id:tenant, public_model:model, upstream_account_id:upstream.id, upstream_model:model, protocol:"openai", priority:0, custom_model_confirmed:true });
     await call("price_setup", `/internal/v1/prices/USD/${model}`, { input_per_million:"0.01", output_per_million:"0.02" });
@@ -110,8 +110,9 @@ export async function run(plan: Plan, env = process.env): Promise<Record<string,
   const requests: Record<string,unknown>[] = [];
   let active=0, peakActive=0;
   const start=performance.now();
+  let receivedBytes=0;
   const timeline:Record<string,unknown>[]=[];
-  const sample=()=>{const counts:Record<string,number>={};for(const r of requests)counts[String(r.status??"transport")]=(counts[String(r.status??"transport")]??0)+1;timeline.push({utc:new Date().toISOString(),elapsed_ms:performance.now()-start,offered:plan.arrivals.filter(a=>a.at_ms<=performance.now()-start).length,client_active:active,started:requests.length+active,completed:requests.length,status_counts:counts});};
+  const sample=()=>{const counts:Record<string,number>={};for(const r of requests)counts[String(r.status??"transport")]=(counts[String(r.status??"transport")]??0)+1;timeline.push({utc:new Date().toISOString(),elapsed_ms:performance.now()-start,offered:plan.arrivals.filter(a=>a.at_ms<=performance.now()-start).length,client_active:active,received_bytes:receivedBytes,started:requests.length+active,completed:requests.length,status_counts:counts});};
   const sampler=setInterval(sample,1000);sample();
   const tasks: Promise<void>[]=[];
   for (const [index, arrival] of plan.arrivals.entries()) {
@@ -129,7 +130,7 @@ export async function run(plan: Plan, env = process.env): Promise<Record<string,
         const serialized=JSON.stringify(payload);serializedRequestBytes=Buffer.byteLength(serialized);
         const response=await fetch(new URL(arrival.protocol==="responses"?"/v1/responses":"/v1/chat/completions",gateway), {method:"POST",headers:{authorization:`Bearer ${key}`,"content-type":"application/json","x-mtc-conversation-id":session},body:serialized,signal:AbortSignal.timeout(plan.window_ms+plan.drain_timeout_ms)});
         status=response.status;requestId=response.headers.get("x-mtc-request-id");
-        if (response.body) for await (const chunk of response.body) { bytes+=chunk.length; hash.update(chunk); if(status===200&&arrival.scenario!=="tool-session")verifier.consume(chunk); const scan=tail+Buffer.from(chunk).toString("utf8");terminal ||= arrival.protocol==="responses"?scan.includes('"type":"response.completed"'):scan.includes("data: [DONE]");tail=scan.slice(-4096); if(arrival.client_read_delay_ms) await delay(arrival.client_read_delay_ms); }
+        if (response.body) for await (const chunk of response.body) { bytes+=chunk.length; receivedBytes+=chunk.length; hash.update(chunk); if(status===200&&arrival.scenario!=="tool-session")verifier.consume(chunk); const scan=tail+Buffer.from(chunk).toString("utf8");terminal ||= arrival.protocol==="responses"?scan.includes('"type":"response.completed"'):scan.includes("data: [DONE]");tail=scan.slice(-4096); if(arrival.client_read_delay_ms) await delay(arrival.client_read_delay_ms); }
         if(status===200&&arrival.scenario!=="tool-session"){fixtureEvidence=verifier.finish(bytes);if(fixtureEvidence.verified!==true)error="fixture_content_or_size_mismatch";}
         if(status!==arrival.expected_status) error="unexpected_gateway_status";
         if(arrival.stream && status===200 && !terminal) error="missing_stream_terminal";

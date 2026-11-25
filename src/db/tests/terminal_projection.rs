@@ -4,6 +4,8 @@ use std::time::Duration;
 
 mod archive_binding;
 mod cache_coverage;
+mod exact_recovery;
+mod fact_read;
 mod recovery;
 mod semantic_isolation;
 mod semantic_retry;
@@ -556,7 +558,7 @@ fn finish<'a>(
 }
 
 async fn assert_counts(database: &Database, request_id: Uuid, reservation_id: Uuid, facts: i64) {
-    let row = sqlx::query("SELECT (SELECT COUNT(*) FROM ledger_entries WHERE source = $1 AND kind = 'usage') AS ledger, (SELECT COUNT(*) FROM request_stats_facts WHERE request_id = $2) AS facts, (SELECT COUNT(*) FROM request_events WHERE request_id = $2 AND event_kind = 'finished') AS events")
+    let row = sqlx::query("SELECT (SELECT COUNT(*) FROM ledger_entries WHERE source = $1 AND kind = 'usage') AS ledger, (SELECT COUNT(*) FROM request_stats_facts WHERE request_id = $2) AS facts, (SELECT COUNT(*) FROM request_events WHERE request_id = $2 AND event_kind = 'projected') AS events")
         .bind(reservation_id.to_string()).bind(request_id.to_string()).fetch_one(&database.pool).await.unwrap();
     assert_eq!(row.get::<i64, _>("ledger"), 1);
     assert_eq!(row.get::<i64, _>("facts"), facts);

@@ -9,6 +9,9 @@ mod observation_prefix;
 mod online147;
 #[cfg(test)]
 mod online147_tests;
+mod online164;
+#[cfg(test)]
+mod online164_tests;
 mod plaintext_sweep;
 #[cfg(test)]
 mod transport_policy_tests;
@@ -863,6 +866,16 @@ pub(crate) const SQLITE_MIGRATIONS: &[Migration] = &[
         name: "history_event_backfill_cursor",
         sql: include_str!("../../../migrations/common/0163_history_event_backfill_cursor.sql"),
     },
+    Migration {
+        version: 164,
+        name: "proxy_started_obligation",
+        sql: include_str!("../../../migrations/common/0164_proxy_started_obligation.sql"),
+    },
+    Migration {
+        version: 165,
+        name: "history_watermark_proof",
+        sql: include_str!("../../../migrations/common/0165_history_watermark_proof.sql"),
+    },
 ];
 
 pub(crate) const POSTGRES_MIGRATIONS: &[Migration] = &[
@@ -1701,6 +1714,16 @@ pub(crate) const POSTGRES_MIGRATIONS: &[Migration] = &[
         name: "history_event_backfill_cursor",
         sql: include_str!("../../../migrations/common/0163_history_event_backfill_cursor.sql"),
     },
+    Migration {
+        version: 164,
+        name: "proxy_started_obligation",
+        sql: include_str!("../../../migrations/common/0164_proxy_started_obligation.sql"),
+    },
+    Migration {
+        version: 165,
+        name: "history_watermark_proof",
+        sql: include_str!("../../../migrations/common/0165_history_watermark_proof.sql"),
+    },
 ];
 
 impl Database {
@@ -1746,6 +1769,7 @@ impl Database {
                 .execute(&mut *connection)
                 .await?;
             online147::prepare(&mut connection).await?;
+            online164::prepare(&mut connection).await?;
         }
         let mut transaction = connection.begin().await?;
         if matches!(self.backend, DatabaseBackend::PostgreSql) {
@@ -1958,15 +1982,18 @@ pub(super) async fn apply_migration_range(
             .execute(&mut **transaction)
             .await?;
         }
-        let execution =
-            if migration.version == 147 && transaction.as_mut().backend_name() == "PostgreSQL" {
-                online147::apply(&mut *transaction, migration.sql).await
-            } else {
-                sqlx::raw_sql(migration.sql)
-                    .execute(&mut **transaction)
-                    .await
-                    .map(|_| ())
-            };
+        let execution = if migration.version == 147
+            && transaction.as_mut().backend_name() == "PostgreSQL"
+        {
+            online147::apply(&mut *transaction, migration.sql).await
+        } else if migration.version == 164 && transaction.as_mut().backend_name() == "PostgreSQL" {
+            online164::apply(&mut *transaction, migration.sql).await
+        } else {
+            sqlx::raw_sql(migration.sql)
+                .execute(&mut **transaction)
+                .await
+                .map(|_| ())
+        };
         if let Err(error) = execution {
             tracing::error!(
                 migration_version = migration.version,

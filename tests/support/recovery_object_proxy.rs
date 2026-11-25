@@ -34,6 +34,9 @@ impl ObjectReadGate {
 #[derive(Default)]
 struct Faults {
     gets: HashMap<String, Arc<ObjectReadGate>>,
+    part_gate: Option<Arc<ObjectReadGate>>,
+    body_put_gate: Option<Arc<ObjectReadGate>>,
+    abort_gate: Option<Arc<ObjectReadGate>>,
     puts: HashSet<String>,
     put_prefixes: HashSet<String>,
     put_scopes: HashSet<(String, String)>,
@@ -43,6 +46,9 @@ struct ProxyState {
     client: reqwest::Client,
     faults: Mutex<Faults>,
     failed_puts: AtomicUsize,
+    counts: Mutex<HashMap<String, usize>>,
+    timings: Mutex<HashMap<String, Vec<u64>>>,
+    lose_put_ack: AtomicBool,
 }
 pub(crate) struct RecoveryObjectProxy {
     endpoint: String,
@@ -59,6 +65,9 @@ impl RecoveryObjectProxy {
                 .unwrap(),
             faults: Mutex::new(Faults::default()),
             failed_puts: AtomicUsize::new(0),
+            counts: Mutex::default(),
+            timings: Mutex::default(),
+            lose_put_ack: AtomicBool::new(false),
         });
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let endpoint = format!("http://{}", listener.local_addr().unwrap());
@@ -74,8 +83,32 @@ impl RecoveryObjectProxy {
             task,
         }
     }
+    pub(crate) fn counts(&self) -> HashMap<String, usize> {
+        self.state.counts.lock().unwrap().clone()
+    }
+    pub(crate) fn timings(&self) -> HashMap<String, Vec<u64>> {
+        self.state.timings.lock().unwrap().clone()
+    }
+    pub(crate) fn lose_body_put_ack(&self, enabled: bool) {
+        self.state.lose_put_ack.store(enabled, Ordering::SeqCst);
+    }
     pub(crate) fn endpoint(&self) -> &str {
         &self.endpoint
+    }
+    pub(crate) fn gate_body_put(&self) -> Arc<ObjectReadGate> {
+        let gate = Arc::new(ObjectReadGate::default());
+        self.state.faults.lock().unwrap().body_put_gate = Some(gate.clone());
+        gate
+    }
+    pub(crate) fn gate_multipart_part(&self) -> Arc<ObjectReadGate> {
+        let gate = Arc::new(ObjectReadGate::default());
+        self.state.faults.lock().unwrap().part_gate = Some(gate.clone());
+        gate
+    }
+    pub(crate) fn gate_multipart_abort(&self) -> Arc<ObjectReadGate> {
+        let gate = Arc::new(ObjectReadGate::default());
+        self.state.faults.lock().unwrap().abort_gate = Some(gate.clone());
+        gate
     }
     pub(crate) fn gate_get(&self, path: &str) -> Arc<ObjectReadGate> {
         assert!(path.starts_with('/'));
@@ -128,6 +161,16 @@ impl RecoveryObjectProxy {
             gate.release();
         }
         faults.gets.clear();
+        for gate in [
+            faults.part_gate.take(),
+            faults.abort_gate.take(),
+            faults.body_put_gate.take(),
+        ]
+        .into_iter()
+        .flatten()
+        {
+            gate.release();
+        }
     }
     pub(crate) fn failed_puts(&self) -> usize {
         self.state.failed_puts.load(Ordering::SeqCst)
@@ -135,19 +178,50 @@ impl RecoveryObjectProxy {
 }
 impl Drop for RecoveryObjectProxy {
     fn drop(&mut self) {
-        for gate in self.state.faults.lock().unwrap().gets.values() {
-            gate.release();
-        }
+        self.clear_faults();
         self.task.abort();
     }
 }
 async fn forward(State(state): State<Arc<ProxyState>>, request: Request) -> Response {
+    let began = std::time::Instant::now();
+    let query = request.uri().query().unwrap_or("");
+    let receipt = request.uri().path().contains("carrier-owners/")
+        || request.uri().path().contains("carrier-releases/");
+    let class = if receipt {
+        "receipt"
+    } else if request.method() == axum::http::Method::POST && query.contains("uploads") {
+        "multipart_create"
+    } else if request.method() == axum::http::Method::POST && query.contains("uploadId") {
+        "multipart_complete"
+    } else if request.method() == axum::http::Method::PUT && query.contains("uploadId") {
+        "multipart_part"
+    } else if request.method() == axum::http::Method::PUT {
+        "body_put"
+    } else if request.method() == axum::http::Method::GET
+        && request.headers().contains_key(axum::http::header::RANGE)
+    {
+        "range_get"
+    } else {
+        "other"
+    };
+    *state
+        .counts
+        .lock()
+        .unwrap()
+        .entry(class.into())
+        .or_default() += 1;
     let path = request.uri().path();
     let (gate, fail_put) = {
         let faults = state.faults.lock().unwrap();
         (
             if request.method() == axum::http::Method::GET {
                 faults.gets.get(path).cloned()
+            } else if request.method() == axum::http::Method::PUT && query.contains("uploadId") {
+                faults.part_gate.clone()
+            } else if request.method() == axum::http::Method::DELETE && query.contains("uploadId") {
+                faults.abort_gate.clone()
+            } else if class == "body_put" {
+                faults.body_put_gate.clone()
             } else {
                 None
             },
@@ -202,6 +276,20 @@ async fn forward(State(state): State<Arc<ProxyState>>, request: Request) -> Resp
         Ok(response) => response,
         Err(_) => return Response::builder().status(502).body(Body::empty()).unwrap(),
     };
+    state
+        .timings
+        .lock()
+        .unwrap()
+        .entry(class.into())
+        .or_default()
+        .push(began.elapsed().as_micros().min(u64::MAX as u128) as u64);
+    if class == "body_put"
+        && state.lose_put_ack.load(Ordering::SeqCst)
+        && response.status().is_success()
+    {
+        // Upstream has persisted the bytes, but the caller receives no ACK.
+        return Response::builder().status(503).body(Body::empty()).unwrap();
+    }
     let mut output = Response::builder().status(response.status());
     *output.headers_mut().unwrap() = response.headers().clone();
     output

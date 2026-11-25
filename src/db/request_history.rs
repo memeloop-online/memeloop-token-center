@@ -472,6 +472,25 @@ impl Database {
         page_size: i64,
         ready: impl std::future::Future<Output = Result<(), HistoryError>>,
     ) -> Result<usize, HistoryError> {
+        self.history_backfill_source_page_after_ready(page_size, None, ready)
+            .await
+    }
+
+    pub async fn history_backfill_source_page(
+        &self,
+        page_size: i64,
+        source: Option<crate::request_history::HistorySource>,
+    ) -> Result<usize, HistoryError> {
+        self.history_backfill_source_page_after_ready(page_size, source, std::future::ready(Ok(())))
+            .await
+    }
+
+    async fn history_backfill_source_page_after_ready(
+        &self,
+        page_size: i64,
+        source: Option<crate::request_history::HistorySource>,
+        ready: impl std::future::Future<Output = Result<(), HistoryError>>,
+    ) -> Result<usize, HistoryError> {
         if page_size <= 0 || self.history_mode().await? == "off" {
             return Err(HistoryError::Invalid(
                 "start history capture before backfill; page_size must be positive",
@@ -503,9 +522,10 @@ impl Database {
             ""
         };
         let sql = format!(
-            "SELECT source, after_id, after_created_at, legacy_after_id FROM request_history_backfill WHERE done = 0 ORDER BY source LIMIT 1{lock}"
+            "SELECT source, after_id, after_created_at, legacy_after_id FROM request_history_backfill WHERE done = 0 AND (CAST($1 AS TEXT) IS NULL OR source=$1) ORDER BY source LIMIT 1{lock}"
         );
         let Some(checkpoint) = sqlx::query(sqlx::AssertSqlSafe(sql))
+            .bind(source.map(crate::request_history::HistorySource::as_str))
             .fetch_optional(&mut *transaction)
             .await?
         else {
@@ -603,11 +623,22 @@ impl Database {
         ceiling: Option<i64>,
         scope: Option<&crate::request_history::ExactEventExport>,
     ) -> Result<Vec<HistorySnapshot>, HistoryError> {
+        let started = std::time::Instant::now();
         self.history_capture_pending_scoped(page_size, ceiling, scope)
             .await?;
+        let capture_ms = started.elapsed().as_millis() as u64;
+        let phase = std::time::Instant::now();
         let immutable = self
             .history_immutable_pending_scoped(page_size, ceiling, scope)
             .await?;
+        if !immutable.is_empty() {
+            tracing::info!(
+                rows = immutable.len(),
+                capture_ms,
+                materialize_ms = phase.elapsed().as_millis() as u64,
+                "request history capture materialization timings"
+            );
+        }
         if !immutable.is_empty() {
             return Ok(immutable);
         }
@@ -761,6 +792,14 @@ impl Database {
     }
 
     pub async fn history_switch(&self, clickhouse: bool) -> Result<(), HistoryError> {
+        if clickhouse && matches!(self.backend, DatabaseBackend::PostgreSql) {
+            let client = crate::request_history::ClickHouse::reader_from_env(
+                self.http_clients
+                    .handle(crate::http_settings::HttpPurpose::General),
+            )?
+            .ok_or(HistoryError::Unavailable)?;
+            return self.history_switch_watermark(&client).await;
+        }
         if clickhouse && !self.history_activation_baseline_proved().await? {
             return Err(HistoryError::Changed);
         }
