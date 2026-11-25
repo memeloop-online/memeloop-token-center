@@ -182,23 +182,10 @@ impl DurableRequestBodies {
                     .multipart_workspace(crate::api::proxy::persistence::WorkspaceRole::RequestRaw)
                     .await
                     .map_err(|_| ())?;
-                let mut writer = archive.start_writer(key).await.map_err(|_| ())?;
-                writer.retain_workspace(workspace.clone());
-                let mut stream = source.open_stream_with_workspace(workspace);
-                while let Some(chunk) = stream.next().await {
-                    let chunk = match chunk {
-                        Ok(chunk) => chunk,
-                        Err(_) => {
-                            let _ = writer.abort().await;
-                            return Err(());
-                        }
-                    };
-                    if writer.write(chunk).await.is_err() {
-                        let _ = writer.abort().await;
-                        return Err(());
-                    }
-                }
-                let result = writer.finish_staged().await.map_err(|_| ())?;
+                let result = source
+                    .pump_to_staged(archive, key, workspace)
+                    .await
+                    .map_err(|_| ())?;
                 if result.size_bytes != source.len() || result.blake3_digest != source.digest() {
                     return Err(());
                 }

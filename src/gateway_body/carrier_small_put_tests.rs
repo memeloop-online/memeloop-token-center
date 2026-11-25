@@ -339,3 +339,195 @@ async fn single_put_payload_keeps_workspace_until_last_sdk_clone_is_dropped() {
     assert_eq!(upload.upload_workspace.snapshot().0, 0);
     assert_eq!(original, Bytes::from(vec![b'x'; 4096]));
 }
+
+/// Isolate HTTP range round-trip cost before changing the production reader.
+/// Each concurrent reader owns a separate existing workspace envelope.
+#[tokio::test]
+#[ignore = "requires isolated RustFS fixture"]
+async fn real_s3_workspace_range_round_trip_comparison() {
+    let endpoint = std::env::var("MTC_RUSTFS_TEST_ENDPOINT").unwrap();
+    let proxy = RecoveryObjectProxy::start(&endpoint).await;
+    let archive = ArchiveStore::from_config(&config(&proxy).await)
+        .await
+        .unwrap();
+    let upload = Arc::new(crate::api::proxy::persistence::Persistence::default());
+    let size = 8 * 1024 * 1024 + 17;
+    let (carrier, memory) = source(&archive, size, upload.clone(), key()).await;
+    assert!(carrier.offload_one().await.unwrap());
+    assert_eq!(memory.snapshot().0, 0);
+    let reference = match &*carrier.segments[0].lock().unwrap() {
+        Segment::Object(reference) => reference.clone(),
+        Segment::Ram(_) => panic!("fixture was not offloaded"),
+    };
+    for window in [64 * 1024, 256 * 1024, 256 * 1024, 64 * 1024] {
+        let before = proxy.counts();
+        let began = std::time::Instant::now();
+        let readers = stream::iter(0..2)
+            .map(|_| {
+                let archive = archive.clone();
+                let upload = upload.clone();
+                let reference = reference.clone();
+                async move {
+                    let guard = upload
+                        .multipart_workspace(
+                            crate::api::proxy::persistence::WorkspaceRole::RequestRaw,
+                        )
+                        .await
+                        .unwrap();
+                    let holding = std::time::Instant::now();
+                    let mut offset = 0;
+                    let mut hasher = blake3::Hasher::new();
+                    let mut peak_output = 0;
+                    while offset < reference.size_bytes {
+                        let end = (offset + window as u64).min(reference.size_bytes);
+                        let mut download = archive
+                            .open_stream(&reference.object_locator, Some(offset..end))
+                            .await
+                            .unwrap()
+                            .stream;
+                        let mut output = Vec::with_capacity((end - offset) as usize);
+                        while let Some(chunk) = download.next().await {
+                            let chunk = chunk.unwrap();
+                            assert!(chunk.len() <= (end - offset) as usize - output.len());
+                            output.extend_from_slice(&chunk);
+                        }
+                        assert_eq!(output.len(), (end - offset) as usize);
+                        peak_output = peak_output.max(output.capacity());
+                        hasher.update(&output);
+                        offset = end;
+                    }
+                    assert_eq!(offset, reference.size_bytes);
+                    assert_eq!(hasher.finalize().to_hex().as_str(), reference.blake3_digest);
+                    let held_us = holding.elapsed().as_micros();
+                    drop(guard);
+                    (offset, held_us, peak_output)
+                }
+            })
+            .buffer_unordered(2)
+            .collect::<Vec<_>>()
+            .await;
+        let elapsed_us = began.elapsed().as_micros();
+        let after = proxy.counts();
+        let gets = after.get("range_get").copied().unwrap_or(0)
+            - before.get("range_get").copied().unwrap_or(0);
+        assert_eq!(gets, size.div_ceil(window) * 2);
+        assert_eq!(upload.upload_workspace.snapshot().0, 0);
+        assert_eq!(memory.snapshot().0, 0);
+        eprintln!(
+            "synthetic_range_comparison window={window} concurrency=2 bytes={} range_gets={gets} elapsed_us={elapsed_us} reader_results={readers:?}",
+            size * 2
+        );
+    }
+    drop(carrier);
+}
+
+#[tokio::test]
+#[ignore = "requires isolated RustFS fixture"]
+async fn real_s3_multipart_workspace_reader_serializes_clones_and_writes_exact_bytes() {
+    use futures_util::FutureExt;
+    let proxy =
+        RecoveryObjectProxy::start(&std::env::var("MTC_RUSTFS_TEST_ENDPOINT").unwrap()).await;
+    let archive = ArchiveStore::from_config(&config(&proxy).await)
+        .await
+        .unwrap();
+    let upload = Arc::new(crate::api::proxy::persistence::Persistence::default());
+    let size = 8 * 1024 * 1024 + 17;
+    let (carrier, memory) = source(&archive, size, upload.clone(), key()).await;
+    carrier.offload_one().await.unwrap();
+    let guard = upload
+        .multipart_workspace(crate::api::proxy::persistence::WorkspaceRole::RequestRaw)
+        .await
+        .unwrap();
+    let part_gate = proxy.gate_multipart_part();
+    let abort_gate = proxy.gate_multipart_abort();
+    let first = tokio::spawn({
+        let carrier = carrier.clone();
+        let archive = archive.clone();
+        let guard = guard.clone();
+        async move {
+            carrier
+                .pump_to_staged(&archive, "staging/proxy/replay-contract/first", guard)
+                .await
+        }
+    });
+    part_gate.entered().await;
+    let mut second = Box::pin(carrier.pump_to_staged(
+        &archive,
+        "staging/proxy/replay-contract/second",
+        guard.clone(),
+    ));
+    assert!(second.as_mut().now_or_never().is_none());
+    first.abort();
+    assert!(first.await.unwrap_err().is_cancelled());
+    abort_gate.entered().await;
+    // A cancelled writer still owns its previous part until abort finishes.
+    assert!(second.as_mut().now_or_never().is_none());
+    assert!(upload.upload_workspace.snapshot().0 > 0);
+    part_gate.release();
+    abort_gate.release();
+    let recovered = second.await.unwrap();
+    assert_eq!(recovered.size_bytes, carrier.len());
+    assert_eq!(recovered.blake3_digest, carrier.digest());
+    drop(guard);
+    assert_eq!(upload.upload_workspace.snapshot().0, 0);
+    for widened in [false, true, true, false] {
+        let before = proxy.counts();
+        let started = std::time::Instant::now();
+        let results = stream::iter(0..2)
+            .map(|_| {
+                let carrier = carrier.clone();
+                let archive = archive.clone();
+                let upload = upload.clone();
+                async move {
+                    let workspace = upload
+                        .multipart_workspace(
+                            crate::api::proxy::persistence::WorkspaceRole::RequestRaw,
+                        )
+                        .await
+                        .unwrap();
+                    let holding = std::time::Instant::now();
+                    let location = format!(
+                        "{}/range-writer-{}",
+                        key().canonical_prefix(),
+                        uuid::Uuid::now_v7()
+                    );
+                    let written = if widened {
+                        carrier
+                            .pump_to_staged(&archive, &location, workspace)
+                            .await
+                            .unwrap()
+                    } else {
+                        let mut writer = archive.start_writer(&location).await.unwrap();
+                        writer.retain_workspace(workspace.clone());
+                        let mut input = carrier.open_stream_with_workspace(workspace);
+                        while let Some(chunk) = input.next().await {
+                            let chunk = chunk.unwrap();
+                            assert!(chunk.len() <= 64 * 1024);
+                            writer.write(chunk).await.unwrap();
+                        }
+                        drop(input);
+                        writer.finish_staged().await.unwrap()
+                    };
+                    assert_eq!(written.size_bytes, carrier.len());
+                    assert_eq!(written.blake3_digest, carrier.digest());
+                    holding.elapsed().as_micros()
+                }
+            })
+            .buffer_unordered(2)
+            .collect::<Vec<_>>()
+            .await;
+        let gets = proxy.counts().get("range_get").copied().unwrap_or(0)
+            - before.get("range_get").copied().unwrap_or(0);
+        assert_eq!(
+            gets,
+            size.div_ceil(if widened { 256 * 1024 } else { 64 * 1024 }) * 2
+        );
+        assert_eq!(upload.upload_workspace.snapshot().0, 0);
+        assert_eq!(memory.snapshot().0, 0);
+        eprintln!(
+            "synthetic_range_writer_comparison widened={widened} concurrency=2 bytes={} range_gets={gets} elapsed_us={} hold_us={results:?}",
+            size * 2,
+            started.elapsed().as_micros()
+        );
+    }
+}
