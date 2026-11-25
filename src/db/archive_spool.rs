@@ -839,10 +839,16 @@ impl Database {
     ) -> Result<Option<ArchiveSpoolTask>, AppError> {
         let mut tx = self.archive_state_transaction().await?;
         let hint_now = archive_clock(&mut tx, self.backend).await?;
-        let row = match self.backend {
+        let (mut tx, row) = match self.backend {
             DatabaseBackend::PostgreSql => {
-                self.partitioned_archive_spool_candidate(&mut tx, purpose, hint_now)
+                tx.commit().await?;
+                let Some((candidate_tx, candidate)) = self
+                    .partitioned_archive_spool_candidate(purpose, hint_now)
                     .await?
+                else {
+                    return Ok(None);
+                };
+                (candidate_tx, Some(candidate))
             }
             DatabaseBackend::Sqlite => {
                 let claim = "WITH pending AS (
@@ -859,10 +865,11 @@ impl Database {
                     ORDER BY s.lease_expires_at, s.request_id LIMIT 1
                  ) SELECT * FROM (SELECT * FROM pending UNION ALL SELECT * FROM expired_lease) candidates
                  ORDER BY CASE WHEN state = 'pending' THEN next_attempt_at ELSE lease_expires_at END, request_id LIMIT 1";
-                sqlx::query(sqlx::AssertSqlSafe(spool_sql(purpose, claim)))
+                let row = sqlx::query(sqlx::AssertSqlSafe(spool_sql(purpose, claim)))
                     .bind(hint_now)
                     .fetch_optional(&mut *tx)
-                    .await?
+                    .await?;
+                (tx, row)
             }
         };
         let Some(row) = row else {

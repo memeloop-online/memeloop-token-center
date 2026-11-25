@@ -4,10 +4,9 @@ use super::*;
 impl Database {
     pub(super) async fn partitioned_archive_spool_candidate(
         &self,
-        tx: &mut Transaction<'_, Any>,
         purpose: BufferedArchivePurpose,
         now: i64,
-    ) -> Result<Option<AnyRow>, AppError> {
+    ) -> Result<Option<(Transaction<'_, Any>, AnyRow)>, AppError> {
         let mut after: Option<(i64, String)> = None;
         loop {
             // This page touches only the non-partitioned recovery journal.
@@ -25,7 +24,9 @@ impl Database {
             if let Some((order, request_id)) = &after {
                 query = query.bind(*order).bind(request_id);
             }
-            let candidates = query.fetch_all(&mut **tx).await?;
+            let mut page_tx = self.archive_state_transaction().await?;
+            let candidates = query.fetch_all(&mut *page_tx).await?;
+            page_tx.commit().await?;
             if candidates.is_empty() {
                 return Ok(None);
             }
@@ -33,15 +34,19 @@ impl Database {
                 let request_id: String = candidate.try_get("request_id")?;
                 after = Some((candidate.try_get("claim_order")?, request_id));
                 let identity = identity_from_row(&candidate)?;
+                // At most this candidate's request partition is touched in
+                // one transaction; rejected dates never accumulate locks.
+                let mut tx = self.archive_state_transaction().await?;
                 let Some(locator) = self
                     .authoritative_request_locator_in_transaction(
-                        tx,
+                        &mut tx,
                         identity.request_id,
                         identity.tenant_id,
                     )
                     .await?
                 else {
                     // A missing authority never permits a parent-wide lookup.
+                    tx.commit().await?;
                     continue;
                 };
                 let created_at = locator.created_at_predicate(self.backend, "r.created_at", "$6");
@@ -58,11 +63,12 @@ impl Database {
                     .bind(identity.reservation_id.to_string())
                     .bind(now)
                     .bind(locator.key_id.to_string())
-                    .fetch_optional(&mut **tx)
+                    .fetch_optional(&mut *tx)
                     .await?;
-                if row.is_some() {
-                    return Ok(row);
+                if let Some(row) = row {
+                    return Ok(Some((tx, row)));
                 }
+                tx.commit().await?;
             }
         }
     }
