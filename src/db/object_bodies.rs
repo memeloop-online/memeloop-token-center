@@ -287,12 +287,21 @@ impl Database {
         if legacy.is_some() {
             Self::wait_raw_projection_gate_for_test(request_id).await;
         }
-        let statement = match side {
-            "request" => {
-                "UPDATE request_records SET request_object = $1 WHERE id = $2 AND tenant_id = $3 AND (($7 = 0 AND (request_object IS NULL OR request_object = '' OR request_object = $1 OR request_object = 'gap://' || id || '/request' OR request_object = 'staging/proxy/' || id || '/request/' || id || '/body.json')) OR ($7 = 1 AND request_object = $4 AND created_at = $5 AND key_id = $6))"
+        // Keep SQLite/Any positional arguments in first-occurrence order.
+        // A verified original has its own exclusive predicate, never the
+        // ordinary NULL/gap fallback and never optional placeholder bindings.
+        let statement = match (side, legacy.is_some()) {
+            ("request", false) => {
+                "UPDATE request_records SET request_object = $1 WHERE id = $2 AND tenant_id = $3 AND (request_object IS NULL OR request_object = '' OR request_object = $1 OR request_object = 'gap://' || id || '/request' OR request_object = 'staging/proxy/' || id || '/request/' || id || '/body.json')"
             }
-            "response" => {
-                "UPDATE request_records SET response_object = $1 WHERE id = $2 AND tenant_id = $3 AND (($7 = 0 AND (response_object IS NULL OR response_object = '' OR response_object = $1 OR response_object = 'gap://' || id || '/response')) OR ($7 = 1 AND response_object = $4 AND created_at = $5 AND key_id = $6))"
+            ("response", false) => {
+                "UPDATE request_records SET response_object = $1 WHERE id = $2 AND tenant_id = $3 AND (response_object IS NULL OR response_object = '' OR response_object = $1 OR response_object = 'gap://' || id || '/response')"
+            }
+            ("request", true) => {
+                "UPDATE request_records SET request_object = $1 WHERE id = $2 AND tenant_id = $3 AND request_object = $4 AND created_at = $5 AND key_id = $6"
+            }
+            ("response", true) => {
+                "UPDATE request_records SET response_object = $1 WHERE id = $2 AND tenant_id = $3 AND response_object = $4 AND created_at = $5 AND key_id = $6"
             }
             _ => return Err(AppError::BadRequest("invalid raw archive side".into())),
         };
@@ -329,16 +338,19 @@ impl Database {
                 return Ok(false);
             }
         }
-        let changed = sqlx::query(statement)
+        let query = sqlx::query(statement)
             .bind(&effective.object_locator)
             .bind(request_id.to_string())
-            .bind(tenant_id.to_string())
-            .bind(legacy.as_ref().map(|proof| proof.old_locator.as_str()))
-            .bind(legacy.as_ref().map(|proof| proof.created_at))
-            .bind(legacy.as_ref().map(|proof| proof.key_id.as_str()))
-            .bind(if legacy.is_some() { 1_i64 } else { 0_i64 })
-            .execute(&mut *transaction)
-            .await?;
+            .bind(tenant_id.to_string());
+        let query = if let Some(proof) = legacy.as_ref() {
+            query
+                .bind(&proof.old_locator)
+                .bind(proof.created_at)
+                .bind(&proof.key_id)
+        } else {
+            query
+        };
+        let changed = query.execute(&mut *transaction).await?;
         if changed.rows_affected() == 0 {
             transaction.rollback().await?;
             return Ok(false);
