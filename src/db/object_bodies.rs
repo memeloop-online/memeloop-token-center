@@ -27,6 +27,75 @@ impl Database {
             .await
     }
 
+    /// Resolve an already authorized immutable history identity against the
+    /// current exact committed binding; immutable snapshot bytes stay intact.
+    pub(crate) async fn resolve_history_raw_archive_roots(
+        &self,
+        tenant: Uuid,
+        key: Uuid,
+        refs: crate::model::RequestArchiveRefs,
+    ) -> Result<crate::model::RequestArchiveRefs, AppError> {
+        let request = refs.view.request_id;
+        let leaf: Option<String> = sqlx::query_scalar(
+            "SELECT o.leaf_node_hash FROM conversation_observations o
+             JOIN conversation_clusters c ON c.id=o.cluster_id
+             JOIN conversation_projection_outbox p ON p.request_id=o.request_id
+             WHERE c.tenant_id=$1 AND p.tenant_id=$1 AND o.key_id=$2
+               AND p.key_id=$2 AND o.request_id=$3 AND p.projected_at IS NOT NULL
+               AND p.statistics_outcome='session_body'",
+        )
+        .bind(tenant.to_string())
+        .bind(key.to_string())
+        .bind(request.to_string())
+        .fetch_optional(&self.pool)
+        .await?
+        .flatten();
+        // The SQL query and its connection finish before object-store reads.
+        let authority = match leaf {
+            Some(leaf) => {
+                self.body_archive()?
+                    .semantic_archive_authority(tenant, request, &leaf)
+                    .await?
+            }
+            None => None,
+        };
+        // A frozen Bound locator is its own reader obligation. A retirement
+        // for another physical locator cannot replace it, even on this request.
+        let archive = self.body_archive()?;
+        for (side, state, locator) in [
+            (
+                "request",
+                refs.request_archive_state,
+                Some(refs.request_object.as_str()),
+            ),
+            (
+                "response",
+                refs.response_archive_state,
+                refs.response_object.as_deref(),
+            ),
+        ] {
+            if state == crate::model::RequestArchiveState::Bound
+                && !matches!(
+                    archive
+                        .raw_reader_authority(
+                            tenant,
+                            request,
+                            side,
+                            locator,
+                            None,
+                            authority.as_ref(),
+                        )
+                        .await?,
+                    crate::archive::RawReaderAuthority::Canonical(_)
+                )
+            {
+                return Ok(refs);
+            }
+        }
+        self.resolve_raw_archive_roots_with_semantic_authority(tenant, refs, authority)
+            .await
+    }
+
     /// Frozen history snapshots pass their own exact authority. None is
     /// explicit pending and never triggers a new live-observation SQL lookup.
     pub(crate) async fn resolve_raw_archive_roots_with_semantic_authority(
@@ -68,18 +137,23 @@ impl Database {
                     crate::model::RequestArchiveState::Bound,
                     None,
                 )
-            } else if archive
-                .raw_capture_is_retired(tenant_id, request_id, side)
+            } else if match archive
+                .raw_reader_authority(
+                    tenant_id,
+                    request_id,
+                    side,
+                    None,
+                    None,
+                    refs.semantic_archive.as_ref(),
+                )
                 .await?
             {
-                if !refs.semantic_archive.as_ref().is_some_and(|authority| {
-                    authority.coverage.projection_state
-                        == crate::archive::SemanticProjectionState::Complete
-                        && authority.coverage.observed_terminal
-                        && authority.coverage.gaps.is_empty()
-                }) {
+                crate::archive::RawReaderAuthority::Canonical(_) => true,
+                crate::archive::RawReaderAuthority::LegacyBound => false,
+                crate::archive::RawReaderAuthority::Unknown => {
                     return Err(AppError::storage("raw_retired_semantic_authority_missing"));
                 }
+            } {
                 // Preserve the old URI as audit provenance while history
                 // consumers switch to the typed permanent authority. It does
                 // not mean raw bytes remain a permanent archive requirement.
