@@ -30,6 +30,7 @@ impl Database {
         let rows = sqlx::query("SELECT version,name FROM schema_migrations ORDER BY version")
             .fetch_all(&mut *tx)
             .await?;
+        let rows = super::sql_schema_rows(rows)?;
         let last = rows
             .last()
             .map(|r| r.try_get::<i64, _>("version"))
@@ -198,6 +199,10 @@ mod tests {
         );
         db.migrate().await.unwrap();
         assert!(!db.legacy163_mode().unwrap());
+        // AppState legitimately records its Rust conversion after SQL migration.
+        db.convert_sealed_state(b"sqlite-runtime-test-pepper")
+            .await
+            .unwrap();
         db.close().await;
         let reopened = Database::connect(&url).await.unwrap();
         let independent = Database::connect(&url).await.unwrap();
@@ -209,6 +214,26 @@ mod tests {
             .unwrap();
         independent
             .publish_pending_proxy_started_events()
+            .await
+            .unwrap();
+        let receipt_name: String =
+            sqlx::query_scalar("SELECT name FROM schema_migrations WHERE version=142")
+                .fetch_one(&reopened.pool)
+                .await
+                .unwrap();
+        // An unknown identity at that reserved version is not an exemption.
+        let mut tx = reopened.pool.begin().await.unwrap();
+        sqlx::query(
+            "UPDATE schema_migrations SET name='unrecognized conversion' WHERE version=142",
+        )
+        .execute(&mut *tx)
+        .await
+        .unwrap();
+        tx.commit().await.unwrap();
+        assert!(Database::connect(&url).await.is_err());
+        sqlx::query("UPDATE schema_migrations SET name=$1 WHERE version=142")
+            .bind(receipt_name)
+            .execute(&reopened.pool)
             .await
             .unwrap();
         reopened.close().await;
