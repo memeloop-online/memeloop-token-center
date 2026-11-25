@@ -2071,6 +2071,7 @@ fn request_session_context_from_row(
         ));
     }
     Ok(Some(RequestSessionContext {
+        captured: None,
         session_id,
         association,
         session_name: row.try_get("session_name")?,

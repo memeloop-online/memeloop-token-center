@@ -3071,6 +3071,7 @@ pub(crate) fn conversation_request_views(
                     ))?,
                     credential_identity: None,
                     session_context: Some(RequestSessionContext {
+                        captured: None,
                         association: if session_id.is_none() {
                             RequestSessionAssociation::Unlinked
                         } else {

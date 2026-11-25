@@ -7,6 +7,7 @@ pub(crate) mod owner;
 pub(crate) mod pending_settlement;
 mod pricing_stats;
 mod queries;
+mod session_attribution;
 mod session_routing;
 mod settlement;
 mod stats;
