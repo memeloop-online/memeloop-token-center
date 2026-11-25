@@ -896,7 +896,7 @@ jobs:
           for selector in \
             db::request_history::event_backfill_tests::request_history_real_services_acceptance_event_backfill_time_cursor \
             db::history_source_snapshot::tests::request_history_baseline_event_cursor_reuses_frozen_authority \
-            request_history::persistence_tests::request_history_real_services_acceptance_event_original_survives_ack_and_source_removal
+            db::request_history::tests::request_history_real_services_acceptance_event_original_survives_ack_and_source_removal
           do
             ignored=--ignored
             if [[ "$selector" == db::history_source_snapshot::tests::request_history_baseline_event_cursor_reuses_frozen_authority ]]; then ignored=; fi
