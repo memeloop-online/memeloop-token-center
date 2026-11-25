@@ -338,12 +338,12 @@ jobs:
           MTC_RUSTFS_TEST_SECRET_KEY: synthetic-test-only-secret-707
         run: |
           set -o pipefail
-          cargo test --locked --lib --no-run
-          timeout 90s cargo test --locked --lib gateway_body::carrier::resource_wakeup_tests -- --nocapture 2>&1 | tee /tmp/carrier-wakeup.log
-          grep -F '2 passed; 0 failed' /tmp/carrier-wakeup.log
-          timeout 180s cargo test --locked --lib gateway_body::carrier::resource_wakeup_tests -- --ignored --nocapture 2>&1 | tee /tmp/carrier-put-wakeup.log
-          grep -F '4 passed; 0 failed' /tmp/carrier-put-wakeup.log
-
+          cargo test --locked --lib db::archive_staging::backend_tests 2>&1 | tee /tmp/staging-db.log
+          grep -F '2 passed; 0 failed' /tmp/staging-db.log
+          cargo test --locked --lib archive::routing_tests 2>&1 | tee /tmp/staging-routing.log
+          grep -F '6 passed; 0 failed' /tmp/staging-routing.log
+          cargo test --locked --lib training_cas_real_s3_configuration_and_reader -- --ignored 2>&1 | tee /tmp/staging-rustfs.log
+          grep -F '1 passed; 0 failed' /tmp/staging-rustfs.log
   next-release-contract:
     if: inputs.contract == 'next-release'
     runs-on: ubuntu-24.04
