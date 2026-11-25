@@ -61,5 +61,6 @@ if retired:
   cursor=page.get('next_cursor')
   if not cursor: break
   page=json.loads(get(path+'?'+urllib.parse.urlencode({'cursor':cursor})))
+ print(json.dumps({'semantic_text_count':len(texts),'semantic_text_lengths':[len(t) for t in texts],'request_marker_present':any(data['marker'] in t for t in texts),'response_text_length':len(data['response_text']),'response_present':bool(data['response_text']) and any(data['response_text'] in t for t in texts)}),flush=True)
  if not any(data['marker'] in text for text in texts) or not data['response_text'] or not any(data['response_text'] in text for text in texts): raise RuntimeError('semantic request/response content missing')
 print(json.dumps({'request_id':rid,'original_request_and_archives':'matched','retired_semantic_verified':retired}))
