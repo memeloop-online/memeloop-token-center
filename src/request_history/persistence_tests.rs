@@ -160,6 +160,10 @@ async fn prove_activation_baseline(database: &Database, client: &ClickHouse) {
         .unwrap()
         != 0
     {}
+    snapshot
+        .verify_surface_parity(database, client)
+        .await
+        .unwrap();
     snapshot.finish(database).await.unwrap();
     database
         .history_resume_delivery(owner, epoch)
@@ -373,8 +377,19 @@ async fn request_history_real_services_acceptance() {
     let report = crate::request_history::migration::verify(&database, &client)
         .await
         .unwrap();
-    assert_eq!(report["count"], 1);
-    database.history_switch(true).await.unwrap();
+    assert_eq!(report["cutover_ready"], true);
+    assert_eq!(
+        client
+            .snapshots(&HistoryQuery {
+                limit: 500,
+                ..query.clone()
+            })
+            .await
+            .unwrap()
+            .len(),
+        1
+    );
+    database.history_switch_watermark(&client).await.unwrap();
     database.history_switch(false).await.unwrap();
     for _ in 0..2 {
         sqlx::query("INSERT INTO request_records (id, tenant_id, key_id, created_at, protocol, model, input_tokens, output_tokens, cost_micros, request_object, reservation_id, currency) VALUES ($1, $2, $3, 1, 'openai', 'history-model', 0, 0, 0, 'gap://fixture/request', $4, 'USD')")
@@ -403,7 +418,18 @@ async fn request_history_real_services_acceptance() {
     let report = crate::request_history::migration::verify(&database, &client)
         .await
         .unwrap();
-    assert_eq!(report["count"], 3);
+    assert_eq!(report["cutover_ready"], true);
+    assert_eq!(
+        client
+            .snapshots(&HistoryQuery {
+                limit: 500,
+                ..query.clone()
+            })
+            .await
+            .unwrap()
+            .len(),
+        3
+    );
     let stats = client.statistics(&query).await.unwrap();
     assert_eq!(stats.summary.pending_requests, 2);
     assert!(stats.summary.total_cost.is_none());
@@ -488,7 +514,7 @@ async fn request_history_real_services_acceptance() {
             .unwrap(),
     )
     .unwrap();
-    database.history_switch(true).await.unwrap();
+    database.history_switch_watermark(&client).await.unwrap();
     assert_eq!(
         serde_json::to_value(
             database

@@ -118,7 +118,10 @@ mod tests {
         database.history_bootstrap_capture().await.unwrap();
         // Simulate the known deployed v1 functions; trigger/partition OIDs stay
         // unchanged when PrepareActivation replaces only function bodies.
-        for definition in database.history_capture_definitions().unwrap() {
+        for definition in database
+            .history_capture_definitions_with_projection_guards(false, false)
+            .unwrap()
+        {
             let old=definition.body.replacen("BEGIN IF (SELECT mode FROM request_history_state WHERE id=1)='off' THEN RETURN NULL; END IF; ","BEGIN ",1);
             let manifest = format!(
                 "mtc-history-bootstrap-v1-{}",
