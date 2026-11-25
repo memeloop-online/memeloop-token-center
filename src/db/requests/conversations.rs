@@ -624,35 +624,46 @@ impl Database {
     /// `statistics_outcome = session_body` 留在完成之后，避免同一行被反复重开。
     /// locator 缺一就不重开。不改 `request_object` / `response_object`。
     pub async fn reopen_session_body_rebuilds(&self, limit: i64) -> Result<u64, AppError> {
-        let limit = limit;
-        let mut transaction = self.begin_write_transaction().await?;
-        // Serialize the count and replenishment across worker transactions.
-        // This background operation never waits for a busy replenisher.
-        if matches!(self.backend, DatabaseBackend::PostgreSql) {
-            let acquired: bool =
-                sqlx::query_scalar("SELECT pg_try_advisory_xact_lock(82420261105)")
-                    .fetch_one(&mut *transaction)
-                    .await?;
-            if !acquired {
-                transaction.rollback().await?;
-                return Ok(0);
-            }
-        }
-        let pending: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM conversation_projection_outbox WHERE projected_at IS NULL AND lease_owner=$1")
-            .bind(SESSION_BODY_REBUILD_LEASE_OWNER).fetch_one(&mut *transaction).await?;
-        let mut remaining = limit.saturating_sub(pending).max(0);
         let mut updated = 0_u64;
         let mut cursor: Option<(i64, String)> = None;
-        while remaining > 0 {
+        if limit <= 0 {
+            return Ok(0);
+        }
+        let Some(upper) = sqlx::query("SELECT observed_at,request_id FROM conversation_projection_outbox WHERE projected_at IS NOT NULL AND COALESCE(statistics_outcome,'') <> 'session_body' ORDER BY observed_at DESC,request_id DESC LIMIT 1")
+            .fetch_optional(&self.pool).await? else { return Ok(0); };
+        let upper_time: i64 = upper.try_get("observed_at")?;
+        let upper_id: String = upper.try_get("request_id")?;
+        loop {
             // Page only durable non-partitioned obligations. Ineligible rows
             // advance this cursor without taking row locks or starving later work.
             let (after_time, after_id) = cursor.clone().unwrap_or((i64::MIN, String::new()));
-            let rows = sqlx::query("SELECT request_id, tenant_id, key_id, observed_at FROM conversation_projection_outbox WHERE projected_at IS NOT NULL AND COALESCE(statistics_outcome,'') <> 'session_body' AND (observed_at>$1 OR (observed_at=$1 AND request_id>$2)) ORDER BY observed_at,request_id LIMIT 100")
-                .bind(after_time).bind(after_id).fetch_all(&mut *transaction).await?;
+            let rows = sqlx::query("SELECT request_id, tenant_id, key_id, observed_at FROM conversation_projection_outbox WHERE projected_at IS NOT NULL AND COALESCE(statistics_outcome,'') <> 'session_body' AND (observed_at>$1 OR (observed_at=$1 AND request_id>$2)) AND (observed_at<$3 OR (observed_at=$3 AND request_id<=$4)) ORDER BY observed_at,request_id LIMIT 100")
+                .bind(after_time).bind(after_id).bind(upper_time).bind(&upper_id).fetch_all(&self.pool).await?;
             if rows.is_empty() {
                 break;
             }
             for row in rows {
+                let mut transaction = self.begin_write_transaction().await?;
+                // Serialize the count and replenishment across worker transactions.
+                // This background operation never waits for a busy replenisher.
+                if matches!(self.backend, DatabaseBackend::PostgreSql) {
+                    let acquired: bool =
+                        sqlx::query_scalar("SELECT pg_try_advisory_xact_lock(82420261105)")
+                            .fetch_one(&mut *transaction)
+                            .await?;
+                    if !acquired {
+                        transaction.rollback().await?;
+                        return Ok(updated);
+                    }
+                }
+                let pending: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM conversation_projection_outbox WHERE projected_at IS NULL AND lease_owner=$1")
+            .bind(SESSION_BODY_REBUILD_LEASE_OWNER).fetch_one(&mut *transaction).await?;
+                let remaining = limit.saturating_sub(pending).max(0);
+                if remaining == 0 {
+                    transaction.commit().await?;
+                    return Ok(updated);
+                }
+
                 let request: String = row.try_get("request_id")?;
                 cursor = Some((row.try_get("observed_at")?, request.clone()));
                 let request_id = parse_uuid(request)?;
@@ -667,9 +678,11 @@ impl Database {
                     )
                     .await?
                 else {
+                    transaction.commit().await?;
                     continue;
                 };
                 if locator.key_id.to_string() != key {
+                    transaction.commit().await?;
                     continue;
                 }
                 let created = locator.created_at_predicate(self.backend, "r.created_at", "$4");
@@ -693,13 +706,13 @@ impl Database {
                 };
                 let count = query.execute(&mut *transaction).await?.rows_affected();
                 updated += count;
-                remaining -= count as i64;
-                if remaining == 0 {
-                    break;
+                // Every candidate releases its one-leaf footprint before the next.
+                transaction.commit().await?;
+                if count > 0 && remaining == count as i64 {
+                    return Ok(updated);
                 }
             }
         }
-        transaction.commit().await?;
         Ok(updated)
     }
 
