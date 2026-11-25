@@ -499,6 +499,11 @@ impl Database {
         prepared_snapshot: Option<&str>,
         previous_lease_owner: Option<Uuid>,
     ) -> Result<bool, AppError> {
+        // The legacy entry is initial-only. Prepared continuation requires a
+        // reviewed creation identity and exact expired lease in the same CAS.
+        if prepared_snapshot.is_some() || previous_lease_owner.is_some() {
+            return Ok(false);
+        }
         self.claim_exact_session_body_rebuild_inner(
             tenant_id,
             key_id,

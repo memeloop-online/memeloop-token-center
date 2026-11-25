@@ -2858,6 +2858,22 @@ async fn postgres_exact_legacy_body_rebuild_preserves_incomplete_and_financial_r
         .await
         .unwrap()
     );
+    assert!(
+        !db.claim_exact_session_body_rebuild(
+            fixture.key.tenant_id,
+            fixture.key.key_id,
+            fixture.request_id,
+            None,
+            &request_locator,
+            &response_locator,
+            Uuid::now_v7(),
+            Some(&prepared_snapshot),
+            Some(owner),
+        )
+        .await
+        .unwrap(),
+        "legacy prepared entry cannot bypass reviewed expiry"
+    );
     let resumed_owner = Uuid::now_v7();
     assert!(
         !db.claim_exact_session_body_rebuild(
