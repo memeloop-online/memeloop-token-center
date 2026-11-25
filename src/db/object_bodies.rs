@@ -289,10 +289,10 @@ impl Database {
         }
         let statement = match side {
             "request" => {
-                "UPDATE request_records SET request_object = $1 WHERE id = $2 AND tenant_id = $3 AND (request_object IS NULL OR request_object = '' OR request_object = $1 OR request_object = 'gap://' || id || '/request' OR request_object = 'staging/proxy/' || id || '/request/' || id || '/body.json' OR (request_object = $4 AND created_at = $5 AND key_id = $6))"
+                "UPDATE request_records SET request_object = $1 WHERE id = $2 AND tenant_id = $3 AND (($7 = 0 AND (request_object IS NULL OR request_object = '' OR request_object = $1 OR request_object = 'gap://' || id || '/request' OR request_object = 'staging/proxy/' || id || '/request/' || id || '/body.json')) OR ($7 = 1 AND request_object = $4 AND created_at = $5 AND key_id = $6))"
             }
             "response" => {
-                "UPDATE request_records SET response_object = $1 WHERE id = $2 AND tenant_id = $3 AND (response_object IS NULL OR response_object = '' OR response_object = $1 OR response_object = 'gap://' || id || '/response' OR (response_object = $4 AND created_at = $5 AND key_id = $6))"
+                "UPDATE request_records SET response_object = $1 WHERE id = $2 AND tenant_id = $3 AND (($7 = 0 AND (response_object IS NULL OR response_object = '' OR response_object = $1 OR response_object = 'gap://' || id || '/response')) OR ($7 = 1 AND response_object = $4 AND created_at = $5 AND key_id = $6))"
             }
             _ => return Err(AppError::BadRequest("invalid raw archive side".into())),
         };
@@ -336,6 +336,7 @@ impl Database {
             .bind(legacy.as_ref().map(|proof| proof.old_locator.as_str()))
             .bind(legacy.as_ref().map(|proof| proof.created_at))
             .bind(legacy.as_ref().map(|proof| proof.key_id.as_str()))
+            .bind(if legacy.is_some() { 1_i64 } else { 0_i64 })
             .execute(&mut *transaction)
             .await?;
         if changed.rows_affected() == 0 {
