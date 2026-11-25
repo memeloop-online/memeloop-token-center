@@ -19,6 +19,7 @@ pub(in crate::db) async fn inspect(
     let rows = sqlx::query("SELECT version,name FROM schema_migrations ORDER BY version")
         .fetch_all(&mut *c)
         .await?;
+    let rows = super::sql_schema_rows(rows)?;
     let versions: Vec<i64> = rows
         .iter()
         .map(|r| r.try_get("version"))

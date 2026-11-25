@@ -35,6 +35,12 @@ pub(crate) struct Migration {
     pub(crate) sql: &'static str,
 }
 
+// Rust data conversions share the historical ledger but are not SQL schema
+// steps. Keep their identity owned by the conversion that writes the receipt.
+pub(crate) fn is_data_conversion_receipt(version: i64, name: &str) -> bool {
+    version == plaintext_sweep::SWEEP_VERSION && name == plaintext_sweep::SWEEP_NAME
+}
+
 pub(crate) const SQLITE_MIGRATIONS: &[Migration] = &[
     Migration {
         version: 1,

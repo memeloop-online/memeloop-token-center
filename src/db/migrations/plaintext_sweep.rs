@@ -21,8 +21,8 @@ use crate::provider::open_envelope;
 
 /// Schema version recorded once the sweep completes. It is not part of the
 /// ordered migration list because the conversion is Rust code, not SQL.
-const SWEEP_VERSION: i64 = 142;
-const SWEEP_NAME: &str = "plaintext state instead of sealed envelopes";
+pub(super) const SWEEP_VERSION: i64 = 142;
+pub(super) const SWEEP_NAME: &str = "plaintext state instead of sealed envelopes";
 
 const MEMBERS_AAD: &[u8] = b"mtc/transport-proxy-members/v1";
 const KEY_CREDENTIAL_RECOVERY_AAD: &str = "memeloop-token-center/key-credential-recovery/v1";

@@ -127,3 +127,18 @@ impl CapabilityReport {
         }
     }
 }
+
+/// Separate known Rust conversion receipts without weakening SQL sequence checks.
+fn sql_schema_rows(rows: Vec<sqlx::any::AnyRow>) -> Result<Vec<sqlx::any::AnyRow>, sqlx::Error> {
+    use sqlx::Row;
+    let mut schema = Vec::with_capacity(rows.len());
+    for row in rows {
+        if !crate::db::migrations::is_data_conversion_receipt(
+            row.try_get("version")?,
+            &row.try_get::<String, _>("name")?,
+        ) {
+            schema.push(row);
+        }
+    }
+    Ok(schema)
+}
