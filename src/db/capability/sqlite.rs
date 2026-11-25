@@ -117,22 +117,34 @@ mod tests {
         );
         let db = Database::connect(&url).await.unwrap();
         db.migrate().await.unwrap();
-        for column in [
-            "read_model_version",
-            "activation_epoch",
-            "chunk_count",
-            "manifest_hash",
-            "sources_complete",
-            "parity_json",
-            "target_identity",
-        ] {
-            sqlx::query(&format!(
-                "ALTER TABLE request_history_baseline_runs DROP COLUMN {column}"
-            ))
+        sqlx::query("ALTER TABLE request_history_baseline_runs DROP COLUMN read_model_version")
             .execute(&db.pool)
             .await
             .unwrap();
-        }
+        sqlx::query("ALTER TABLE request_history_baseline_runs DROP COLUMN activation_epoch")
+            .execute(&db.pool)
+            .await
+            .unwrap();
+        sqlx::query("ALTER TABLE request_history_baseline_runs DROP COLUMN chunk_count")
+            .execute(&db.pool)
+            .await
+            .unwrap();
+        sqlx::query("ALTER TABLE request_history_baseline_runs DROP COLUMN manifest_hash")
+            .execute(&db.pool)
+            .await
+            .unwrap();
+        sqlx::query("ALTER TABLE request_history_baseline_runs DROP COLUMN sources_complete")
+            .execute(&db.pool)
+            .await
+            .unwrap();
+        sqlx::query("ALTER TABLE request_history_baseline_runs DROP COLUMN parity_json")
+            .execute(&db.pool)
+            .await
+            .unwrap();
+        sqlx::query("ALTER TABLE request_history_baseline_runs DROP COLUMN target_identity")
+            .execute(&db.pool)
+            .await
+            .unwrap();
         sqlx::query("DELETE FROM schema_migrations WHERE version=165")
             .execute(&db.pool)
             .await
