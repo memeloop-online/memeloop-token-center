@@ -330,7 +330,7 @@ jobs:
             sleep 2
           done
           exit 1
-      - name: Verify shared raw retirement authority and frozen history
+      - name: Verify staging identity, routing and real RustFS
         env:
           MTC_RUSTFS_TEST_ENDPOINT: http://127.0.0.1:19000
           MTC_RUSTFS_TEST_BUCKET: conversation-contract-test
@@ -338,14 +338,12 @@ jobs:
           MTC_RUSTFS_TEST_SECRET_KEY: synthetic-test-only-secret-707
         run: |
           set -o pipefail
-          failures=0
-          for selector in complete_coverage_retires_exact_roots_and_rejects_stale_backend_versions sqlite_semantic_coverage_recovers_committed_projection_and_failed_put postgres_semantic_coverage_recovers_committed_projection_and_failed_put sqlite_runtime_reopen_and_independent_pool_verify_same_track sqlite_upgrade_rejects_missing_preexisting_marker_index postgres_capability_163_skips_hot_ddl_and_preserves_true_ledger; do
-            if ! cargo test --locked --lib "$selector" 2>&1 | tee /tmp/raw-authority.log; then failures=$((failures + 1)); fi
-            if ! grep -F '1 passed; 0 failed' /tmp/raw-authority.log; then failures=$((failures + 1)); fi
-          done
-          if ! cargo test --locked --lib rustfs_complete_coverage_retires_exact_roots_and_rejects_stale_backend_versions -- --ignored 2>&1 | tee /tmp/raw-authority-rustfs.log; then failures=$((failures + 1)); fi
-          if ! grep -F '1 passed; 0 failed' /tmp/raw-authority-rustfs.log; then failures=$((failures + 1)); fi
-          test "$failures" -eq 0
+          cargo test --locked --lib db::archive_staging::backend_tests 2>&1 | tee /tmp/staging-db.log
+          grep -F '2 passed; 0 failed' /tmp/staging-db.log
+          cargo test --locked --lib archive::routing_tests 2>&1 | tee /tmp/staging-routing.log
+          grep -F '6 passed; 0 failed' /tmp/staging-routing.log
+          cargo test --locked --lib training_cas_real_s3_configuration_and_reader -- --ignored 2>&1 | tee /tmp/staging-rustfs.log
+          grep -F '1 passed; 0 failed' /tmp/staging-rustfs.log
   next-release-contract:
     if: inputs.contract == 'next-release'
     runs-on: ubuntu-24.04
