@@ -86,6 +86,20 @@ pub async fn command(config: &Config, command: HistoryCommand) -> Result<Value, 
     let database =
         Database::connect_for_migration(&config.database_url, config.database_max_connections)
             .await?;
+    // Proof and watermark commands require the verified receipt schema before
+    // they acquire a delivery fence or begin a baseline. Legacy queries and
+    // SQLite's existing verification path keep their original requirements.
+    if matches!(
+        &command,
+        HistoryCommand::BaselineSource { .. } | HistoryCommand::Verify | HistoryCommand::Switch
+    ) {
+        if let Some(report) = database
+            .verify_capabilities(crate::db::capability::CapabilityRole::HistoryReader)
+            .await?
+        {
+            report.require("history.baseline_receipt.v1")?;
+        }
+    }
     if matches!(command, HistoryCommand::Rollback) {
         database.history_switch(false).await?;
         return Ok(json!({"mode": "shadow"}));
