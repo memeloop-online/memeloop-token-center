@@ -15,7 +15,7 @@ if CHECKPOINT:
     assert (artifact / 'source.txt').read_text().strip() == SOURCE
     IMAGE = (artifact / 'immutable-image.txt').read_text().strip()
     assert IMAGE.startswith('ghcr.io/memeloop-online/memeloop-token-center:maintenance-1086-' + SOURCE + '-45679706853@sha256:')
-    assert len(IMAGE.rsplit('sha256:', 1)[1]) == 64
+    assert IMAGE.rsplit('sha256:', 1)[1] == '561cd3f535c833db4db1456da5deeb1cedbf4ce71052e77217a580032f0d1717'
 IDENTITY = 'https://github.com/memeloop-online/memeloop-token-center/.github/workflows/exact-reader-contract.yml@refs/heads/ci/history-event-only-proof-20261125'
 run = ('checkpoint1086_' if CHECKPOINT else 'history1073_') + os.environ['GITHUB_RUN_ID'] + '_' + os.environ['GITHUB_RUN_ATTEMPT']
 pg, ch = run + '_pg', run + '_ch'
@@ -107,13 +107,17 @@ try:
     if CHECKPOINT:
         # Historical synthetic rows exist before source capture is installed.
         tenant, key, target, neighbour = seed_events()
-        sql("UPDATE request_history_backfill SET done=1 WHERE source IN ('archive','generation')")
     bootstrap = cli('request-history', 'bootstrap')
     assert sql('SELECT mode FROM request_history_state WHERE id=1') == 'off'
     cli('request-history', 'prepare-activation')
     cli('request-history', 'activate')
     assert cli('request-history', 'capture-horizon')['capture_horizon_ready'] is True
     assert sql('SELECT mode FROM request_history_state WHERE id=1') == 'shadow'
+    if CHECKPOINT:
+        for source in ['archive', 'generation']:
+            empty = cli('request-history', 'backfill-page', '--source', source, '--page-size', '1')
+            assert empty['queued'] == 0
+            assert sql(f"SELECT done FROM request_history_backfill WHERE source='{source}'") == '1'
     if not CHECKPOINT:
         tenant, key, target, neighbour = seed_events()
     created = 42
@@ -185,7 +189,7 @@ try:
     assert fingerprint() == after
     table_uuid = click(f"SELECT toString(uuid) FROM system.tables WHERE database='{run}' AND name='request_history_v1'")
     assert table_uuid and uuid.UUID(table_uuid).int != 0
-    (evidence / 'receipt.json').write_text(json.dumps({'image': IMAGE, 'source': SOURCE, 'database': run, 'table_uuid': table_uuid, 'identity':row, 'wrong_scope':wrong_report,'exact_ack':report,'repeat':repeated,'cursor_unchanged':True,'neighbour_untouched':True,'checkpoint_pages':pages}, indent=2))
+    (evidence / 'receipt.json').write_text(json.dumps({'image': IMAGE, 'source': SOURCE, 'database': run, 'table_uuid': table_uuid, 'identity':row, 'wrong_scope':wrong_report,'exact_ack':report,'repeat':repeated,'cursor_unchanged_during_export':True,'neighbour_untouched':True,'checkpoint_pages':pages,'other_source_cursors_unchanged_during_event_pages':CHECKPOINT,'done_event_noop_unchanged':CHECKPOINT,'oci_page_scope':'event' if CHECKPOINT else None}, indent=2))
     print('isolated immutable CLI checkpoint and exact event: PASS' if CHECKPOINT else 'isolated immutable CLI exact event: PASS')
 finally:
     for container in [pg, ch]:
