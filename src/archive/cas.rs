@@ -137,6 +137,39 @@ impl ArchiveStore {
         })
     }
 
+    /// Verify an existing immutable original against the published CAS without
+    /// retaining its decoded bytes. Sources lacking a storage version fail closed.
+    pub(crate) async fn verified_legacy_source(
+        &self,
+        locator: &str,
+        object: &CasArchiveObject,
+    ) -> Result<bool, AppError> {
+        let (store, path) = self.resolve(locator)?;
+        let before = store.head(&path).await?;
+        if before.e_tag.is_none() && before.version.is_none() {
+            return Ok(false);
+        }
+        let download = self.open_stream(locator, None).await?;
+        let mut stream = download.stream;
+        let mut size = 0_u64;
+        let mut digest = blake3::Hasher::new();
+        while let Some(chunk) = stream.next().await {
+            let chunk =
+                chunk.map_err(|_| AppError::storage("archive_cas_object_integrity_failure"))?;
+            size = size
+                .checked_add(chunk.len() as u64)
+                .ok_or_else(|| AppError::storage("archive_cas_object_integrity_failure"))?;
+            digest.update(&chunk);
+        }
+        let after = store.head(&path).await?;
+        Ok(before.e_tag == after.e_tag
+            && before.version == after.version
+            && before.size == after.size
+            && before.last_modified == after.last_modified
+            && size == object.size_bytes
+            && digest.finalize().to_hex().as_str() == object.blake3_digest)
+    }
+
     async fn verify_exact_object(
         &self,
         locator: &str,

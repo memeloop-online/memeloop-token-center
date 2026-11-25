@@ -2911,6 +2911,74 @@ async fn postgres_exact_legacy_body_rebuild_preserves_incomplete_and_financial_r
         .unwrap()
     );
     let owner = resumed_owner;
+    let raw_response = fixture
+        .state
+        .archive
+        .raw_capture_reference(fixture.key.tenant_id, fixture.request_id, "response")
+        .await
+        .unwrap()
+        .unwrap();
+    let before_rejection: String = sqlx::query_scalar(
+        "SELECT to_jsonb(o)::TEXT FROM conversation_projection_outbox o WHERE request_id=$1",
+    )
+    .bind(fixture.request_id.to_string())
+    .fetch_one(&db.pool)
+    .await
+    .unwrap();
+    assert!(
+        !db.bind_raw_capture_for_projection(
+            fixture.key.tenant_id,
+            fixture.request_id,
+            "response",
+            &raw_response,
+            Uuid::now_v7()
+        )
+        .await
+        .unwrap()
+    );
+    let mut different = response.to_vec();
+    different[0] = b'[';
+    fixture
+        .state
+        .archive
+        .put(&response_locator, Bytes::from(different))
+        .await
+        .unwrap();
+    assert!(
+        !db.bind_raw_capture_for_projection(
+            fixture.key.tenant_id,
+            fixture.request_id,
+            "response",
+            &raw_response,
+            owner
+        )
+        .await
+        .unwrap(),
+        "same length with different decoded bytes must not replace the original"
+    );
+    let after_rejection: String = sqlx::query_scalar(
+        "SELECT to_jsonb(o)::TEXT FROM conversation_projection_outbox o WHERE request_id=$1",
+    )
+    .bind(fixture.request_id.to_string())
+    .fetch_one(&db.pool)
+    .await
+    .unwrap();
+    assert_eq!(before_rejection, after_rejection);
+    let unchanged_locator: String = sqlx::query_scalar(
+        "SELECT response_object FROM request_records WHERE id=$1 AND created_at=$2",
+    )
+    .bind(fixture.request_id.to_string())
+    .bind(created_at)
+    .fetch_one(&db.pool)
+    .await
+    .unwrap();
+    assert_eq!(unchanged_locator, response_locator);
+    fixture
+        .state
+        .archive
+        .put(&response_locator, response.clone())
+        .await
+        .unwrap();
     let pending = db
         .session_body_locators(fixture.request_id)
         .await
