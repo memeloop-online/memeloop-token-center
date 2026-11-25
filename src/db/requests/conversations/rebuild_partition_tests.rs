@@ -64,7 +64,7 @@ async fn postgres_rebuild_partition_locks_and_ineligible_prefix() {
             .await
             .unwrap();
         assert_eq!(actual, mode);
-        let schema: String = sqlx::query_scalar("SELECT current_schema()")
+        let schema: String = sqlx::query_scalar("SELECT current_schema()::text")
             .fetch_one(&db.pool)
             .await
             .unwrap();
