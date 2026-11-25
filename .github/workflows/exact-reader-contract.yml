@@ -338,12 +338,14 @@ jobs:
           MTC_RUSTFS_TEST_SECRET_KEY: synthetic-test-only-secret-707
         run: |
           set -o pipefail
+          failures=0
           for selector in complete_coverage_retires_exact_roots_and_rejects_stale_backend_versions sqlite_semantic_coverage_recovers_committed_projection_and_failed_put postgres_semantic_coverage_recovers_committed_projection_and_failed_put sqlite_runtime_reopen_and_independent_pool_verify_same_track sqlite_upgrade_rejects_missing_preexisting_marker_index; do
-            cargo test --locked --lib "$selector" 2>&1 | tee /tmp/raw-authority.log
-            grep -F '1 passed; 0 failed' /tmp/raw-authority.log
+            if ! cargo test --locked --lib "$selector" 2>&1 | tee /tmp/raw-authority.log; then failures=$((failures + 1)); fi
+            if ! grep -F '1 passed; 0 failed' /tmp/raw-authority.log; then failures=$((failures + 1)); fi
           done
-          cargo test --locked --lib rustfs_complete_coverage_retires_exact_roots_and_rejects_stale_backend_versions -- --ignored 2>&1 | tee /tmp/raw-authority-rustfs.log
-          grep -F '1 passed; 0 failed' /tmp/raw-authority-rustfs.log
+          if ! cargo test --locked --lib rustfs_complete_coverage_retires_exact_roots_and_rejects_stale_backend_versions -- --ignored 2>&1 | tee /tmp/raw-authority-rustfs.log; then failures=$((failures + 1)); fi
+          if ! grep -F '1 passed; 0 failed' /tmp/raw-authority-rustfs.log; then failures=$((failures + 1)); fi
+          test "$failures" -eq 0
   next-release-contract:
     if: inputs.contract == 'next-release'
     runs-on: ubuntu-24.04
