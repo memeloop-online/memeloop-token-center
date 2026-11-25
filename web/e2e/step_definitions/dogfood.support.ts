@@ -89,7 +89,7 @@ export async function connectOperator(
   // replacement-credential form. Target the form instead of its translated
   // submit label so both entry points exercise the same user flow.
   const accessForm = operatorCredentialEntryForm(page);
-  const credentialInput = accessForm.locator('input[type="password"]');
+  const credentialInput = accessForm.getByRole('textbox', { name: /^(服务凭据|Service credential)$/, exact: true });
   await credentialInput.waitFor({ state: 'visible' });
   await credentialInput.fill(expectedCredential);
   await assertValue(credentialInput, expectedCredential);
