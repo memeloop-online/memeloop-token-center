@@ -109,10 +109,23 @@ async function visible(locator: Locator) {
 }
 
 async function noHorizontalOverflow(page: Page) {
-  const overflow = await page.evaluate(() => ({
-    document: document.documentElement.scrollWidth - document.documentElement.clientWidth,
-    body: document.body.scrollWidth - document.body.clientWidth,
-  }));
+  const overflow = await page.evaluate(() => {
+    const documentOverflow = document.documentElement.scrollWidth - document.documentElement.clientWidth;
+    const bodyOverflow = document.body.scrollWidth - document.body.clientWidth;
+    const viewport = document.documentElement.clientWidth;
+    const elements = documentOverflow <= 1 && bodyOverflow <= 1 ? [] : [...document.body.querySelectorAll<HTMLElement>('*')]
+      .flatMap(element => {
+        const rect = element.getBoundingClientRect();
+        if (rect.width === 0 || rect.height === 0 || (rect.right <= viewport + 1 && rect.left >= -1)) return [];
+        const style = getComputedStyle(element);
+        return [{
+          element: element.tagName.toLowerCase(), className: element.className, role: element.getAttribute('role'),
+          left: rect.left, right: rect.right, width: rect.width, clientWidth: element.clientWidth, scrollWidth: element.scrollWidth,
+          display: style.display, minWidth: style.minWidth, maxWidth: style.maxWidth, whiteSpace: style.whiteSpace, overflowX: style.overflowX,
+        }];
+      }).sort((left, right) => right.right - left.right).slice(0, 24);
+    return { document: documentOverflow, body: bodyOverflow, viewport, elements };
+  });
   assert.ok(overflow.document <= 1 && overflow.body <= 1, `horizontal overflow: ${JSON.stringify(overflow)}`);
 }
 
