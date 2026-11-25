@@ -2254,6 +2254,19 @@ async fn semantic_coverage_committed_recovery_contract(database_url: String) {
             .await
             .unwrap();
         assert_eq!(serde_json::to_vec(&foreign).unwrap(), immutable);
+        let mut inline_response = frozen.clone();
+        inline_response.response_object = None;
+        inline_response.response_json = Some(serde_json::json!({"legacy": "inline"}));
+        let inline_bytes = serde_json::to_vec(&inline_response).unwrap();
+        let inline_resolved = db
+            .resolve_history_raw_archive_roots(
+                fixture.key.tenant_id,
+                fixture.key.key_id,
+                inline_response,
+            )
+            .await
+            .unwrap();
+        assert_eq!(serde_json::to_vec(&inline_resolved).unwrap(), inline_bytes);
         let mut other_locator = frozen.clone();
         other_locator.request_object =
             format!("{}/different-source", sources.request.object_locator);

@@ -62,6 +62,7 @@ impl Database {
         // A frozen Bound locator is its own reader obligation. A retirement
         // for another physical locator cannot replace it, even on this request.
         let archive = self.body_archive()?;
+        let mut all_bound_sources_covered = true;
         for (side, state, locator) in [
             (
                 "request",
@@ -75,22 +76,27 @@ impl Database {
             ),
         ] {
             if state == crate::model::RequestArchiveState::Bound
-                && !matches!(
-                    archive
-                        .raw_reader_authority(
-                            tenant,
-                            request,
-                            side,
-                            locator,
-                            None,
-                            authority.as_ref(),
-                        )
-                        .await?,
-                    crate::archive::RawReaderAuthority::Canonical(_)
-                )
+                && (locator.is_none()
+                    || !matches!(
+                        archive
+                            .raw_reader_authority(
+                                tenant,
+                                request,
+                                side,
+                                locator,
+                                None,
+                                authority.as_ref(),
+                            )
+                            .await?,
+                        crate::archive::RawReaderAuthority::Canonical(_)
+                    ))
             {
-                return Ok(refs);
+                all_bound_sources_covered = false;
+                break;
             }
+        }
+        if !all_bound_sources_covered {
+            return Ok(refs);
         }
         self.resolve_raw_archive_roots_with_semantic_authority(tenant, refs, authority)
             .await
