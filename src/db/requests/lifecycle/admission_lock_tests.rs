@@ -372,31 +372,41 @@ async fn postgres_started_draft_known_partition_limits_relations_while_cursor_wa
         assert!(std::env::var_os("CI").is_none());
         return;
     };
-    let pool = sqlx::PgPool::connect(&database_url).await.unwrap();
-    let mut blocker = pool.begin().await.unwrap();
-    sqlx::query("SELECT pg_advisory_xact_lock($1,$2)")
-        .bind(REQUEST_EVENT_CURSOR_LOCK_NAMESPACE)
-        .bind(REQUEST_EVENT_CURSOR_LOCK_KEY)
-        .execute(&mut *blocker)
+    let admin = sqlx::PgPool::connect(&database_url).await.unwrap();
+    let schema = format!("draft_locks_{}", Uuid::new_v4().simple());
+    sqlx::query(sqlx::AssertSqlSafe(format!("CREATE SCHEMA {schema}")))
+        .execute(&admin)
         .await
         .unwrap();
+    let mut url = url::Url::parse(&database_url).unwrap();
+    url.query_pairs_mut()
+        .append_pair("options", &format!("-csearch_path={schema}"));
+    let pool = sqlx::PgPool::connect(url.as_str()).await.unwrap();
+    // Publish the catalog before either tested transaction or its observer starts.
+    for statement in [
+        "CREATE TABLE request_records(id TEXT, tenant_id TEXT, key_id TEXT, created_at BIGINT) PARTITION BY RANGE(created_at)",
+        "CREATE TABLE draft_old PARTITION OF request_records FOR VALUES FROM(0) TO(1000)",
+        "CREATE TABLE draft_current PARTITION OF request_records FOR VALUES FROM(1000) TO(2000)",
+        "CREATE TABLE draft_new PARTITION OF request_records FOR VALUES FROM(2000) TO(3000)",
+        "CREATE INDEX ON request_records(id)",
+        "INSERT INTO request_records VALUES('request','tenant','key',1500)",
+    ] {
+        sqlx::query(statement).execute(&pool).await.unwrap();
+    }
     let mut counts = Vec::new();
     for bounded in [false, true] {
+        let mut blocker = pool.begin().await.unwrap();
+        sqlx::query("SELECT pg_advisory_xact_lock($1,$2)")
+            .bind(REQUEST_EVENT_CURSOR_LOCK_NAMESPACE)
+            .bind(REQUEST_EVENT_CURSOR_LOCK_KEY)
+            .execute(&mut *blocker)
+            .await
+            .unwrap();
         let mut tx = pool.begin().await.unwrap();
         let pid: i32 = sqlx::query_scalar("SELECT pg_backend_pid()")
             .fetch_one(&mut *tx)
             .await
             .unwrap();
-        for statement in [
-            "CREATE TEMP TABLE request_records(id TEXT, tenant_id TEXT, key_id TEXT, created_at BIGINT) PARTITION BY RANGE(created_at)",
-            "CREATE TEMP TABLE draft_old PARTITION OF request_records FOR VALUES FROM(0) TO(1000)",
-            "CREATE TEMP TABLE draft_current PARTITION OF request_records FOR VALUES FROM(1000) TO(2000)",
-            "CREATE TEMP TABLE draft_new PARTITION OF request_records FOR VALUES FROM(2000) TO(3000)",
-            "CREATE INDEX ON request_records(id)",
-            "INSERT INTO request_records VALUES('request','tenant','key',1500)",
-        ] {
-            sqlx::query(statement).execute(&mut *tx).await.unwrap();
-        }
         let sql = if bounded {
             STARTED_EVENT_DRAFT_SQL.to_owned()
         } else {
@@ -431,8 +441,8 @@ async fn postgres_started_draft_known_partition_limits_relations_while_cursor_wa
                 tokio::time::sleep(Duration::from_millis(10)).await;
             }
         }).await.unwrap();
-        let relations: Vec<String> = sqlx::query_scalar("SELECT DISTINCT c.relname FROM pg_locks l JOIN pg_class c ON c.oid=l.relation WHERE l.pid=$1 AND l.granted AND l.mode='AccessShareLock' AND c.relname LIKE 'draft_%' ORDER BY c.relname")
-            .bind(pid).fetch_all(&pool).await.unwrap();
+        let relations: Vec<String> = sqlx::query_scalar("SELECT DISTINCT c.relname FROM pg_locks l JOIN pg_class c ON c.oid=l.relation JOIN pg_namespace n ON n.oid=c.relnamespace WHERE l.pid=$1 AND n.nspname=$2 AND l.granted AND l.mode='AccessShareLock' AND c.relname LIKE 'draft_%' ORDER BY c.relname")
+            .bind(pid).bind(&schema).fetch_all(&pool).await.unwrap();
         assert!(relations.iter().any(|name| name == "draft_current"));
         if bounded {
             assert!(
@@ -446,13 +456,16 @@ async fn postgres_started_draft_known_partition_limits_relations_while_cursor_wa
             assert!(relations.iter().any(|name| name == "draft_new"));
         }
         counts.push(relations.len());
-        pending.abort();
-        let _ = pending.await;
-        // The dropped contender rolls back; the global cursor blocker remains held.
+        blocker.rollback().await.unwrap();
+        pending.await.unwrap();
     }
     assert!(counts[1] < counts[0], "{counts:?}");
-    blocker.rollback().await.unwrap();
     pool.close().await;
+    sqlx::query(sqlx::AssertSqlSafe(format!("DROP SCHEMA {schema} CASCADE")))
+        .execute(&admin)
+        .await
+        .unwrap();
+    admin.close().await;
 }
 
 #[tokio::test]
