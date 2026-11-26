@@ -36,7 +36,7 @@ jobs:
   metadata-refresh-contract:
     if: inputs.contract == 'metadata-refresh'
     runs-on: ubuntu-24.04
-    timeout-minutes: 40
+    timeout-minutes: 20
     env:
       CARGO_BUILD_JOBS: '2'
       CARGO_INCREMENTAL: '0'
@@ -44,25 +44,85 @@ jobs:
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
         with:
-          ref: ${{ inputs.source_revision }}
+          ref: adf83dedb80d91377257024344644277a5bf7921
           persist-credentials: false
       - uses: dtolnay/rust-toolchain@4360b52568e2003a75bf9bc1d59f33a8e3fc893c
         with:
           toolchain: 1.95.0
-      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6
-      - uses: ./.github/actions/checkout-plugin-examples
-      - name: Verify signed clock boundaries
+      - name: Resolve only new time dependencies and enforce unchanged existing lock entries
         run: |
           set -euo pipefail
-          test "$(git rev-parse HEAD)" = 'bb2fa230e4c632913fe6c12d348a4f33b487daa8'
-          git rev-parse HEAD
-          cargo test --locked --lib db::time::tests -- --nocapture 2>&1 | tee /tmp/signedclock.log
-          grep -F '2 passed; 0 failed; 0 ignored;' /tmp/signedclock.log
+          test "$(git rev-parse HEAD)" = adf83dedb80d91377257024344644277a5bf7921
+          mkdir -p "$RUNNER_TEMP/time-evidence"
+          cp Cargo.lock "$RUNNER_TEMP/time-evidence/Cargo.lock.before"
+          cargo update --workspace 2>&1 | tee "$RUNNER_TEMP/time-evidence/resolve.log"
+          cp Cargo.lock "$RUNNER_TEMP/time-evidence/Cargo.lock"
+          git diff -- Cargo.lock > "$RUNNER_TEMP/time-evidence/lock.diff"
+          python3 - <<'LOCKPY'
+          import json,os,pathlib,tomllib
+          root=pathlib.Path(os.environ['RUNNER_TEMP'])/'time-evidence'
+          old=tomllib.loads((root/'Cargo.lock.before').read_text())['package'];new=tomllib.loads((root/'Cargo.lock').read_text())['package']
+          def key(p):return (p['name'],p['version'],p.get('source'))
+          before={key(p):p for p in old};after={key(p):p for p in new}
+          for k,p in before.items():
+              if k not in after:raise SystemExit('existing locked package removed or upgraded: '+str(k))
+              expected=dict(p)
+              if p['name']=='memeloop-token-center':expected['dependencies']=sorted([*p['dependencies'],'time'])
+              if after[k]!=expected:raise SystemExit('existing locked package changed: '+str(k))
+          added=[p for k,p in after.items() if k not in before]
+          if len(added)!=5 or {p['name'] for p in added}!={'time','time-core','deranged','num-conv','powerfmt'}:raise SystemExit('unexpected new dependency closure: '+str([(p['name'],p['version']) for p in added]))
+          package=next(p for p in added if p['name']=='time')
+          if package['version']!='0.3.55' or package['checksum']!='cdb87b95ec50ddfa440816d227a17b2ccbdda963a316a727fda0fc4334f7d134':raise SystemExit('time exact registry version/checksum mismatch')
+          (root/'lock-scope.json').write_text(json.dumps({'source':'adf83dedb80d91377257024344644277a5bf7921','run':os.environ['GITHUB_RUN_ID'],'new_packages':added,'unchanged_existing_packages':len(before)},indent=2)+'\n')
+          print(json.dumps([(p['name'],p['version'],p.get('checksum')) for p in added]))
+          LOCKPY
+      - name: Compile only the isolated old-calendar oracle against actual source
+        run: |
+          set -euo pipefail
+          mkdir -p "$RUNNER_TEMP/time-oracle/src"
+          cat > "$RUNNER_TEMP/time-oracle/Cargo.toml" <<'TOML'
+          [package]
+          name = "mtc-time-legacy-oracle"
+          version = "0.0.0"
+          edition = "2024"
+          [workspace]
+          [dependencies]
+          chrono = "=0.4.45"
+          time = { version = "=0.3.55", default-features = false, features = ["std", "parsing", "formatting", "large-dates"] }
+          TOML
+          cat > "$RUNNER_TEMP/time-oracle/src/lib.rs" <<'RUST'
+          // GHA-only oracle; compile alongside the exact product checkout, not a copy.
+          mod candidate { include!(concat!(env!("MTC_PRODUCT_SOURCE"), "/src/db/time.rs")); }
+          #[test]
+          fn legacy_chrono_and_time_dates_match_at_original_boundaries() {
+              let min = chrono::DateTime::<chrono::Utc>::MIN_UTC.timestamp().div_euclid(86400);
+              let max = chrono::DateTime::<chrono::Utc>::MAX_UTC.timestamp().div_euclid(86400);
+              let mut days = vec![min - 1, min, min + 1, -1, 0, 1, max - 1, max, max + 1, i64::MIN, i64::MAX];
+              for (year, month, day) in [(10000, 1, 1), (-10000, 1, 1), (2024, 2, 29)] {
+                  days.push(chrono::NaiveDate::from_ymd_opt(year, month, day).unwrap().and_hms_opt(0, 0, 0).unwrap().and_utc().timestamp().div_euclid(86400));
+              }
+              for day in days {
+                  let old = chrono::DateTime::from_timestamp(day.saturating_mul(86400), 0)
+                      .map(|date| date.format("%Y-%m-%d").to_string());
+                  let new = candidate::format_legacy_stats_day(day);
+                  assert_eq!(new, old, "epoch-day={day}");
+              }
+          }
+          RUST
+          export MTC_PRODUCT_SOURCE="$GITHUB_WORKSPACE"
+          cargo generate-lockfile --manifest-path "$RUNNER_TEMP/time-oracle/Cargo.toml"
+          cp "$RUNNER_TEMP/time-oracle/Cargo.lock" "$RUNNER_TEMP/time-evidence/oracle.Cargo.lock"
+          cargo test --locked --manifest-path "$RUNNER_TEMP/time-oracle/Cargo.toml" legacy_chrono_and_time_dates_match_at_original_boundaries -- --exact --nocapture 2>&1 | tee "$RUNNER_TEMP/time-evidence/oracle.log"
+          grep -E '^test result: ok\. 1 passed; 0 failed; 0 ignored;' "$RUNNER_TEMP/time-evidence/oracle.log"
+          cargo test --locked --manifest-path "$RUNNER_TEMP/time-oracle/Cargo.toml" candidate::tests:: -- --nocapture 2>&1 | tee "$RUNNER_TEMP/time-evidence/candidate-time.log"
+          grep -E '^test result: ok\. 4 passed; 0 failed; 0 ignored;' "$RUNNER_TEMP/time-evidence/candidate-time.log"
       - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
         if: always()
         with:
-          name: signedclock-bb2fa
-          path: /tmp/signedclock.log
+          name: time-lock-and-isolated-oracle-adf83
+          path: ${{ runner.temp }}/time-evidence/
+          if-no-files-found: error
+          retention-days: 7
 
   orphan-reaper-contract:
     if: inputs.contract == 'orphan-reaper-971'
