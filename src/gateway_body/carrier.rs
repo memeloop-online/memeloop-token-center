@@ -147,6 +147,10 @@ impl Drop for CarrierReadOwner {
     }
 }
 
+#[path = "carrier_spill_observation.rs"]
+mod spill_observation;
+use spill_observation::SpillObservation;
+
 impl BodyCarrier {
     fn read_owner(self: &Arc<Self>) -> CarrierReadOwner {
         self.readers
@@ -368,6 +372,11 @@ impl BodyCarrier {
             published: Mutex::new(None),
             readers: std::sync::atomic::AtomicUsize::new(0),
         };
+        let mut spill_observation = SpillObservation::new(
+            source.memory.clone(),
+            source.workspace.clone(),
+            source.staging,
+        );
         let mut hash = blake3::Hasher::new();
         futures_util::pin_mut!(input);
         while let Some(chunk) = input.next().await {
@@ -385,12 +394,17 @@ impl BodyCarrier {
                 if retained.is_none() {
                     // Preserve the existing response tap's opportunistic spill:
                     // credited streams can exceed source RAM over their lifetime.
-                    let _ = source.offload_one().await;
+                    spill_observation.begin(chunk.len());
+                    let result = source.offload_one_bytes(None).await;
+                    spill_observation.finish(&result);
                 }
+                let length = chunk.len();
                 let bytes = source.leased_bytes(chunk, credit, retained);
                 source.segments.push(Mutex::new(Segment::Ram(bytes)));
+                spill_observation.accepted(length);
                 continue;
             }
+            spill_observation.unobserved_segment_transition();
             let mut remaining = chunk;
             while !remaining.is_empty() {
                 // Bounded owned allocations prevent a small slice from pinning
@@ -427,6 +441,7 @@ impl BodyCarrier {
                 source.segments.push(Mutex::new(Segment::Ram(bytes)));
             }
         }
+        spill_observation.completed = true;
         source.digest = hash.finalize().to_hex().to_string();
         source.sealed_reference = match source.segments.as_slice() {
             [segment] => match &*segment.lock().unwrap() {
@@ -483,8 +498,17 @@ impl BodyCarrier {
 
     async fn offload_one_with_workspace(
         &self,
-        mut prepaid: Option<Arc<crate::api::proxy::persistence::WorkspaceGuard>>,
+        prepaid: Option<Arc<crate::api::proxy::persistence::WorkspaceGuard>>,
     ) -> Result<bool, AppError> {
+        self.offload_one_bytes(prepaid)
+            .await
+            .map(|bytes| bytes.is_some())
+    }
+
+    async fn offload_one_bytes(
+        &self,
+        mut prepaid: Option<Arc<crate::api::proxy::persistence::WorkspaceGuard>>,
+    ) -> Result<Option<usize>, AppError> {
         let _owner = if prepaid.is_some() {
             match self.offload.try_lock() {
                 Ok(owner) => owner,
@@ -493,19 +517,19 @@ impl BodyCarrier {
                     // before waiting for it; re-evaluate RAM/segments afterwards.
                     drop(prepaid.take());
                     drop(self.offload.lock().await);
-                    return Ok(false);
+                    return Ok(None);
                 }
             }
         } else {
             self.offload.lock().await
         };
         let Some(archive) = &self.archive else {
-            return Ok(false);
+            return Ok(None);
         };
         let Some(index) = self.segments.iter().position(
             |segment| matches!(&*segment.lock().unwrap(), Segment::Ram(bytes) if !bytes.is_empty()),
         ) else {
-            return Ok(false);
+            return Ok(None);
         };
         let Segment::Ram(bytes) = self.segments[index].lock().unwrap().clone() else {
             unreachable!()
@@ -583,7 +607,7 @@ impl BodyCarrier {
         // A complete object, not an UploadPart ACK, is now replayable. Only
         // replacing this segment releases the unique RAM allocation lease.
         *self.segments[index].lock().unwrap() = Segment::Object(staged);
-        Ok(true)
+        Ok(Some(bytes.len()))
     }
 
     // Never join the semaphore queue while this source can release its own
