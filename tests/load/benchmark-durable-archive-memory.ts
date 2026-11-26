@@ -535,21 +535,30 @@ export async function run(binary: string, output: string): Promise<boolean> {
       reader.exec("PRAGMA busy_timeout = 1000");
       const recordArchiveEvidence = (): void => {
         try {
-          const records = reader.prepare("SELECT id, tenant_id, status_code, completed_at, request_object, response_object FROM request_records ORDER BY created_at LIMIT 32").all();
-          const roots = records.map((record) => ({
-            request_id: record.id,
+          const selected = unknownRequestId !== undefined
+            ? reader.prepare("SELECT id, tenant_id, status_code, completed_at, request_object, response_object FROM request_records WHERE id = ?").all(unknownRequestId)
+            : reader.prepare("SELECT id, tenant_id, status_code, completed_at, request_object, response_object FROM request_records WHERE status_code = 200 AND (request_object LIKE 'gap:%' OR response_object IS NULL OR response_object LIKE 'gap:%') ORDER BY created_at LIMIT 33").all();
+          const records = selected.slice(0, 32);
+          const requests = records.map((record) => ({
+            request_id: record.id, status_code: record.status_code, completed_at: record.completed_at,
             sides: ["request", "response"].map((side) => {
               const root = join(archive, "tenants", String(record.tenant_id), "raw", "v1", String(record.id), `${side}.json`);
               const exists = existsSync(root);
-              return { side, root_exists: exists,
-                root_reference: exists && statSync(root).size <= 4096 ? JSON.parse(readFileSync(root, "utf8")) : null,
+              const rootBytes = exists ? statSync(root).size : null;
+              const reference = rootBytes !== null && rootBytes <= 4096 ? JSON.parse(readFileSync(root, "utf8")) : null;
+              const locator = record[`${side}_object`];
+              return { side, locator_present: typeof locator === "string", locator_is_gap: typeof locator === "string" && locator.startsWith("gap:"),
+                root_exists: exists, root_bytes: rootBytes,
+                root_digest: typeof reference?.blake3_digest === "string" ? reference.blake3_digest : null,
+                source_bytes: typeof reference?.size_bytes === "number" ? reference.size_bytes : null,
                 failed: existsSync(`${root}.failed`),
                 retired: existsSync(join(archive, "tenants", String(record.tenant_id), "semantic", "v2", "requests", String(record.id), `retired-${side}.json`)),
               };
             }),
+            spool: reader.prepare("SELECT state, chunk_count, byte_count, cipher_bytes FROM response_archive_spools WHERE request_id = ?").get(String(record.id)) ?? null,
           }));
-          report.archive_drain_evidence = { records, roots,
-            spools: reader.prepare("SELECT request_id, state, chunk_count, byte_count, cipher_bytes FROM response_archive_spools ORDER BY request_id LIMIT 32").all(),
+          report.archive_drain_evidence = { selection: unknownRequestId !== undefined ? "exact_unknown_request" : "successful_archive_gaps",
+            unknown: records.length === 0, truncated: selected.length > 32, requests,
           };
         } catch (error) {
           report.archive_drain_evidence_error = String(error);
