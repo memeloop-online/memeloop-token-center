@@ -89,7 +89,8 @@ jobs:
           (root/'lock-scope.json').write_text(json.dumps({'source':'adf83dedb80d91377257024344644277a5bf7921','run':os.environ['GITHUB_RUN_ID'],'new_packages':added,'unchanged_existing_packages':len(before)},indent=2)+'\n')
           print(json.dumps([(p['name'],p['version'],p.get('checksum')) for p in added]))
           LOCKPY
-          cargo tree --locked -p memeloop-token-center -e normal,build,features --target x86_64-unknown-linux-gnu 2>&1 | tee "$RUNNER_TEMP/time-evidence/product-feature-tree.log"
+          cargo tree --color never --locked -p memeloop-token-center -e normal,build,features --target x86_64-unknown-linux-gnu > "$RUNNER_TEMP/time-evidence/product-feature-tree.log" 2> "$RUNNER_TEMP/time-evidence/product-feature-resolution.log"
+          cat "$RUNNER_TEMP/time-evidence/product-feature-tree.log"
           grep -F 'time v0.3.55' "$RUNNER_TEMP/time-evidence/product-feature-tree.log"
           if grep -F 'time-macros v0.2.32' "$RUNNER_TEMP/time-evidence/product-feature-tree.log"; then
             echo 'optional time-macros entered actual product feature graph' >&2
