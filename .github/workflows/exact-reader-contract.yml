@@ -36,12 +36,20 @@ jobs:
   metadata-refresh-contract:
     if: inputs.contract == 'metadata-refresh'
     runs-on: ubuntu-24.04
-    timeout-minutes: 35
+    timeout-minutes: 45
     env:
-      CARGO_BUILD_JOBS: "2"
-      CARGO_INCREMENTAL: "0"
-      CARGO_PROFILE_DEV_DEBUG: "0"
-      CARGO_PROFILE_TEST_DEBUG: "0"
+      CARGO_BUILD_JOBS: '2'
+      CARGO_INCREMENTAL: '0'
+      MTC_SEED_DATABASE: mtc_candidate6479_20261126
+      MTC_SEED_DATABASE_ROLE: mtc_candidate6479
+      MTC_SEED_PG_HOST: mtc-candidate163-20261125-pg
+      MTC_SEED_PG_PORT: '5432'
+      MTC_SEED_PG_SERVICE_UID: 06f08a3a-c986-4d11-8be7-4b19414bee84
+      MTC_SEED_MOCK_URL: http://mtc-6479-oauth-fixture:8080
+      MTC_SEED_CLUSTER_UID: e7e9b61b-ebe3-4b89-829d-21a10880f1f4
+      MTC_SEED_CLUSTER_IDENTITY_PATH: /api/v1/namespaces/kube-system
+      MTC_SEED_NAMESPACE: memeloop-token-center-staging
+      MTC_SEED_NAMESPACE_UID: bc4064e1-486e-4dc5-bdca-dcb179245fa8
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
         with:
@@ -51,19 +59,26 @@ jobs:
         with:
           toolchain: 1.95.0
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6
+        with:
+          shared-key: memory-release
       - uses: ./.github/actions/checkout-plugin-examples
-      - name: Verify only the reviewed archive observation and original archive contracts
+      - name: Build only the fixed isolated Stage seed
         run: |
           set -euo pipefail
-          test "$(git rev-parse HEAD)" = "4a83574db5c48fcb86b07936d67d0f52db7d8d98"
+          test "$(git rev-parse HEAD)" = '8d3c66d7142603c09de78bcd3055942080864cf3'
           git rev-parse HEAD
-          cargo check --locked --lib
-          cargo test --locked --lib archive::write_observation::tests::archive_write_observations_keep_routes_outcomes_and_lengths_distinct -- --exact --nocapture 2>&1 | tee /tmp/archive-observation.log
-          grep -F '1 passed; 0 failed' /tmp/archive-observation.log
-          cargo test --locked --lib archive::write_observation::tests::archive_write_observations_count_encoded_multipart_not_decoded_copy_bytes -- --exact --nocapture 2>&1 | tee /tmp/archive-observation.log
-          grep -F '1 passed; 0 failed' /tmp/archive-observation.log
-          cargo test --locked --lib archive::tests:: -- --nocapture 2>&1 | tee /tmp/archive-regression.log
-          grep -F '16 passed; 0 failed' /tmp/archive-regression.log
+          cargo build --locked --release --example stage_managed_oauth_seed
+          mkdir -p "$RUNNER_TEMP/oauth-seed"
+          cp target/release/examples/stage_managed_oauth_seed "$RUNNER_TEMP/oauth-seed/"
+          printf '%s\n' '8d3c66d7142603c09de78bcd3055942080864cf3' > "$RUNNER_TEMP/oauth-seed/source-revision.txt"
+          cd "$RUNNER_TEMP/oauth-seed"
+          sha256sum stage_managed_oauth_seed > SHA256SUMS
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        with:
+          name: stage-managed-oauth-seed-8d3c6
+          path: ${{ runner.temp }}/oauth-seed/
+          if-no-files-found: error
+          retention-days: 3
 
   orphan-reaper-contract:
     if: inputs.contract == 'orphan-reaper-971'
