@@ -2091,6 +2091,20 @@ async fn postgres_archive_binding_and_financial_terminal_preserve_bodies_in_both
     isolated.cleanup().await;
 }
 
+async fn replay_retention_enqueue(fixture: &Fixture, observed_at: i64) {
+    let hints = ConversationHints::default();
+    let mut tx = fixture.state.db.begin_write_transaction().await.unwrap();
+    enqueue_conversation_projection_in_transaction(&mut tx, ConversationProjectionEnqueueInput {
+        request_id: fixture.request_id,
+        key: &fixture.key,
+        hints: &hints,
+        client_name: None,
+        upstream_response_id: None,
+        observed_at,
+    }).await.unwrap();
+    tx.commit().await.unwrap();
+}
+
 async fn semantic_coverage_committed_recovery_contract(database_url: String) {
     for fault in ["projection_commit_ack", "coverage_put"] {
         let fixture = Fixture::new(database_url.clone(), true).await;
@@ -2421,6 +2435,13 @@ async fn semantic_coverage_committed_recovery_contract(database_url: String) {
             sqlx::query("UPDATE conversation_observations SET leaf_node_hash=$2 WHERE request_id=$1")
                 .bind(fixture.request_id.to_string()).bind(&before.2).execute(&db.pool).await.unwrap();
         }
+        let observed_at: i64=sqlx::query_scalar("SELECT observed_at FROM conversation_projection_outbox WHERE request_id=$1")
+            .bind(fixture.request_id.to_string()).fetch_one(&db.pool).await.unwrap();
+        let ledger_before: (i64,i64)=sqlx::query_as("SELECT COUNT(*),CAST(COALESCE(SUM(amount_micros),0) AS BIGINT) FROM ledger_entries WHERE kind='usage' AND source=$1")
+            .bind(fixture.identity.reservation_id.to_string()).fetch_one(&db.pool).await.unwrap();
+        // A late same-identity enqueue before retention is an idempotent replay,
+        // not permission to erase or re-ack another generation.
+        replay_retention_enqueue(&fixture,observed_at).await;
         // Unknown old rows cannot starve a later proven row. Only metadata
         // pages are retained between ticks, not their original snapshot bytes.
         let mut unknown_rows = Vec::new();
@@ -2444,6 +2465,19 @@ async fn semantic_coverage_committed_recovery_contract(database_url: String) {
             fixture.key.tenant_id, fixture.request_id, &before.2).await.unwrap().unwrap();
         assert_eq!(authority_before.publication.revision, authority_after.publication.revision);
         assert_eq!(authority_before.semantic_head.node_hash, authority_after.semantic_head.node_hash);
+        // Delete winning first leaves no stale ACK: the original enqueue owns
+        // a fresh pending snapshot/lease, and a second replay keeps that task.
+        replay_retention_enqueue(&fixture,observed_at).await;
+        replay_retention_enqueue(&fixture,observed_at).await;
+        let recreated:(Option<i64>,String,i64)=sqlx::query_as("SELECT projected_at,lease_owner,lease_expires_at FROM conversation_projection_outbox WHERE request_id=$1")
+            .bind(fixture.request_id.to_string()).fetch_one(&db.pool).await.unwrap();
+        assert_eq!(recreated,(None,"terminal-v118".to_owned(),i64::MAX));
+        assert_eq!(db.delete_durably_retired_conversation_outbox(100,i64::MAX).await.unwrap(),0);
+        let ledger_after: (i64,i64)=sqlx::query_as("SELECT COUNT(*),CAST(COALESCE(SUM(amount_micros),0) AS BIGINT) FROM ledger_entries WHERE kind='usage' AND source=$1")
+            .bind(fixture.identity.reservation_id.to_string()).fetch_one(&db.pool).await.unwrap();
+        assert_eq!(ledger_after,ledger_before,"retention/enqueue never replay financial settlement");
+        sqlx::query("DELETE FROM conversation_projection_outbox WHERE request_id=$1")
+            .bind(fixture.request_id.to_string()).execute(&db.pool).await.unwrap();
     }
 }
 
