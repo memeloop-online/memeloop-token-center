@@ -438,8 +438,7 @@ async fn postgres_terminal_owner_read_lock_rechecks_pending_without_update_side_
         sqlx::query_scalar::<_, i64>("SELECT COUNT(*) FROM terminal_owner_update_probe")
             .fetch_one(&mut *old)
             .await
-            .unwrap()
-            .0,
+            .unwrap(),
         1
     );
     let old_revision: i64 = sqlx::query_scalar("SELECT COALESCE(MAX(revision),0) FROM request_history_export WHERE source='native' AND request_id=$1").bind(owner.request_id.to_string()).fetch_one(&mut *old).await.unwrap();

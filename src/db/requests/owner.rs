@@ -42,7 +42,7 @@ impl Database {
             let sql = format!(
                 "UPDATE request_records SET completed_at = completed_at WHERE id=$1 AND tenant_id=$2 AND key_id=$3 AND reservation_id=$4{partition}{pending}"
             );
-            let affected = sqlx::query(&sql)
+            let affected = sqlx::query(sqlx::AssertSqlSafe(sql))
                 .bind(request_id.to_string())
                 .bind(tenant_id.to_string())
                 .bind(key_id.to_string())
@@ -72,7 +72,7 @@ impl Database {
         let sql = format!(
             "SELECT 1 FROM request_records WHERE id=$1 AND tenant_id=$2 AND key_id=$3 AND reservation_id=$4 AND created_at={created_at}{pending} FOR UPDATE"
         );
-        let matched = sqlx::query(&sql)
+        let matched = sqlx::query(sqlx::AssertSqlSafe(sql))
             .persistent(false)
             .bind(request_id.to_string())
             .bind(tenant_id.to_string())
