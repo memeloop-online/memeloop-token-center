@@ -654,7 +654,7 @@ jobs:
   pg-executor-contract:
     if: inputs.contract == 'pg-executor-959'
     runs-on: ubuntu-24.04
-    timeout-minutes: 40
+    timeout-minutes: 60
     services:
       clickhouse:
         image: clickhouse/clickhouse-server:25.8
@@ -691,43 +691,22 @@ jobs:
           toolchain: 1.95.0
           components: rustfmt, clippy
           targets: wasm32-unknown-unknown
-      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020
-        with:
-          node-version: 24.18.0
-      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6
-        with:
-          shared-key: memory-release
       - uses: ./.github/actions/checkout-plugin-examples
-      - name: Verify the seven exact owner read lock contracts
+      - name: Verify only the two corrected OAuth readback contracts
         run: |
           set -euo pipefail
-          test "$(git rev-parse HEAD)" = "7b4176a154f6858140c46d12c86258acc496f92f"
-          git rev-parse HEAD
-          cargo check --locked --lib
+          test "$(git rev-parse HEAD)" = 038fcf312c17f6d94d245907568727976af573d3
+          cargo test --locked --all-features --lib --no-run
           failures=0
-          mkdir -p /tmp/owner-read-lock
-          while IFS= read -r selector; do
-            log="/tmp/owner-read-lock/${selector//::/_}.log"
-            if ! cargo test --locked --lib "$selector" -- --exact --nocapture 2>&1 | tee "$log"; then failures=1; fi
-            if ! grep -F '1 passed; 0 failed; 0 ignored;' "$log"; then failures=1; fi
-          done <<'SELECTORS'
-          db::requests::owner::tests::postgres_terminal_owner_read_lock_rechecks_pending_without_update_side_effects
-          db::requests::owner::tests::postgres_reaper_rechecks_renewal_under_lock_and_races_late_finish_once
-          db::requests::owner::tests::postgres_terminal_completion_keeps_owner_reads_on_one_leaf_before_settlement
-          db::requests::operational_terminal::tests::unknown_bridge::sqlite_unknown_bridge_preserves_failures_and_replaces_financial_facts_once
-          db::requests::operational_terminal::tests::unknown_bridge::postgres_unknown_bridge_preserves_failures_and_replaces_financial_facts_once
-          db::requests::operational_terminal::tests::lifecycle_events::sqlite_lifecycle_events_do_not_wait_for_archive_or_financial_projection
-          db::requests::operational_terminal::tests::lifecycle_events::postgres_lifecycle_events_do_not_wait_for_archive_or_financial_projection
-          SELECTORS
+          while IFS= read -r name; do
+            output="$(mktemp)"
+            if ! timeout --signal=TERM --kill-after=10s 180s cargo test --locked --all-features --lib "$name" -- --exact --nocapture 2>&1 | tee "$output"; then failures=1; fi
+            if ! grep -Eq '^test result: ok\. 1 passed; 0 failed; 0 ignored;' "$output"; then failures=1; fi
+          done <<'CONTRACTS'
+          worker::oauth_role_tests::oauth_rejection_delivery_crosses_gateway_control_and_worker_process_roles
+          worker::tests::oauth_rejected_generation_renews_once_and_failed_readback_does_not_requeue
+          CONTRACTS
           exit "$failures"
-      - name: Retain exact owner read lock evidence
-        if: always()
-        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
-        with:
-          name: owner-read-lock-7b417
-          path: /tmp/owner-read-lock/
-          if-no-files-found: warn
-          retention-days: 7
 
   semantic-reader-scope-contract:
     if: inputs.contract == 'semantic-reader-scope'
