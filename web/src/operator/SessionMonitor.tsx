@@ -18,7 +18,7 @@ import { defaultRequestRefreshInterval } from './traffic/requestRefresh.js';
 import {
   drainSessionEventIdentities, mergeIncrementalSessionSummaries, mergeSessionPage,
   sessionEventsRequireDetailRefresh, sessionEventTargetsSelection, sessionIdentityKey,
-  sessionRefreshDelayMs, sessionSummaryTargets,
+  sessionRefreshDelayMs, sessionSummaryTargets, sessionEventsStartNewActiveMember,
 } from './sessionRefresh.js';
 import { LatestRequestGate } from './latestRequestGate.js';
 import type {
@@ -463,8 +463,14 @@ export function SessionMonitor({ token, tenant, revision, eventKeyIds, eventOver
       let retryDelay = 0;
       const refresh = async () => {
         const targets = sessionSummaryTargets(batchEventIdentities, filtersRef.current.state);
+        // A real new start may add a row to this short active page. Read its
+        // authoritative membership once; a summary would still need that page
+        // when the new session matches. Qualified filters keep exact summaries.
+        const newActiveMember = firstPageSize.current < sessionPageLimit
+          && filtersRef.current.state === 'active' && !filtersRef.current.q.trim() && !filtersRef.current.model.trim()
+          && sessionEventsStartNewActiveMember(batchEventIdentities, sessionsRef.current, filtersRef.current.keyId.trim());
         let listLoaded = false;
-        if (forceFullList || targets.requiresFullReload) {
+        if (forceFullList || targets.requiresFullReload || newActiveMember) {
           listLoaded = await loadSessions(false, filtersRef.current, true);
         } else if (targets.identities.length === 0) {
           listLoaded = true;
