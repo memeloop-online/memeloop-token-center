@@ -4,7 +4,7 @@
 import { spawn, spawnSync, type ChildProcess } from "node:child_process";
 import { createHash } from "node:crypto";
 import { once } from "node:events";
-import { accessSync, constants, mkdirSync, mkdtempSync, readFileSync, readdirSync, rmSync, writeFileSync } from "node:fs";
+import { accessSync, constants, existsSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, rmSync, statSync, writeFileSync } from "node:fs";
 import { createServer, request, type ClientRequest, type ServerResponse } from "node:http";
 import { tmpdir } from "node:os";
 import { dirname, join, resolve } from "node:path";
@@ -216,7 +216,8 @@ export function permitEvidence(metrics: string): Record<string, number> {
     retained_request_memory: 'memeloop_token_center_proxy_memory_bytes{pool="retained_request",measure="used"}',
     body_readers: 'memeloop_token_center_background_work_items{queue="gateway_body_reads",state="active"}',
     lifecycles: 'memeloop_token_center_background_work_items{queue="proxy_lifecycles",state="active"}',
-    archive_workers: 'memeloop_token_center_background_work_items{queue="proxy_archive_streams",state="active"}',
+    upload_permits_in_use: 'memeloop_token_center_background_work_items{queue="proxy_archive_streams",state="active"}',
+    archive_activities: 'memeloop_token_center_background_work_items{queue="archive_activities",state="active"}',
     deferred_jobs: 'memeloop_token_center_deferred_persistence_jobs',
     deferred_bytes: 'memeloop_token_center_deferred_persistence_bytes',
     deferred_stream_bytes: 'memeloop_token_center_deferred_stream_memory_bytes',
@@ -532,6 +533,28 @@ export async function run(binary: string, output: string): Promise<boolean> {
     const drain = async (unknownRequestId?: string, previousSemantics?: Record<string, unknown>, archiveGapBaseline?: ArchiveGapBaseline): Promise<Record<string, unknown>> => {
       const reader = new DatabaseSync(database, { readOnly: true });
       reader.exec("PRAGMA busy_timeout = 1000");
+      const recordArchiveEvidence = (): void => {
+        try {
+          const records = reader.prepare("SELECT id, tenant_id, status_code, completed_at, request_object, response_object FROM request_records ORDER BY created_at LIMIT 32").all();
+          const roots = records.map((record) => ({
+            request_id: record.id,
+            sides: ["request", "response"].map((side) => {
+              const root = join(archive, "tenants", String(record.tenant_id), "raw", "v1", String(record.id), `${side}.json`);
+              const exists = existsSync(root);
+              return { side, root_exists: exists,
+                root_reference: exists && statSync(root).size <= 4096 ? JSON.parse(readFileSync(root, "utf8")) : null,
+                failed: existsSync(`${root}.failed`),
+                retired: existsSync(join(archive, "tenants", String(record.tenant_id), "semantic", "v2", "requests", String(record.id), `retired-${side}.json`)),
+              };
+            }),
+          }));
+          report.archive_drain_evidence = { records, roots,
+            spools: reader.prepare("SELECT request_id, state, chunk_count, byte_count, cipher_bytes FROM response_archive_spools ORDER BY request_id LIMIT 32").all(),
+          };
+        } catch (error) {
+          report.archive_drain_evidence_error = String(error);
+        }
+      };
       try {
         return await deadline((async () => {
           while (true) {
@@ -638,6 +661,7 @@ export async function run(binary: string, output: string): Promise<boolean> {
                 const requestPersistence = requestPersistenceEvidence(metricsText);
                 const requestGaps = Number(successfulGaps?.request_gaps);
                 const responseGaps = Number(successfulGaps?.response_gaps);
+                recordArchiveEvidence();
                 if (archiveGapBaseline) {
                   assertArchiveReplayGapEvidence(requestGaps, responseGaps, requestPersistence, persistence, archiveGapBaseline);
                 } else {
@@ -650,6 +674,9 @@ export async function run(binary: string, output: string): Promise<boolean> {
             await delay(100);
           }
         })(), 30_000, "archive drain");
+      } catch (error) {
+        recordArchiveEvidence();
+        throw error;
       } finally { reader.close(); }
     };
     const phase = async (name: string, operation: () => Promise<unknown>, expectUnknown = false): Promise<void> => {
