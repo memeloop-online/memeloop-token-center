@@ -512,6 +512,8 @@ jobs:
           grep -F '1 passed; 0 failed' /tmp/exact-prepared-resume.log || failed=1
           cargo test --locked --all-features --lib db::requests::conversations::archive_readiness_tests::rebuild_partition_tests::postgres_rebuild_partition_locks_and_ineligible_prefix -- --exact --nocapture 2>&1 | tee /tmp/rebuild-partition-locks.log || failed=1
           grep -F '1 passed; 0 failed' /tmp/rebuild-partition-locks.log || failed=1
+          cargo test --locked --all-features --lib db::requests::conversations::archive_readiness_tests::postgres_identity_projection_busy_yields_and_preserves_page_cursor -- --exact --nocapture 2>&1 | tee /tmp/identity-projection-busy.log || failed=1
+          grep -F '1 passed; 0 failed' /tmp/identity-projection-busy.log || failed=1
           exit "$failed"
 
   legacy-archive-bound-contract:
