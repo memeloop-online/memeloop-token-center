@@ -67,6 +67,10 @@ async fn get_usage(
                 .send()
                 .await
                 .map_err(retry::Failure::reqwest)?;
+            session.observe_bearer_rejection(context, response.status(),
+                matches!(credential, UpstreamCredential::OAuth { header, prefix, .. }
+                    if header.eq_ignore_ascii_case("authorization") && prefix.eq_ignore_ascii_case("Bearer ")),
+            ).await;
             if let Some(failure) =
                 retry::Failure::status(response.status().as_u16(), response.headers())
             {

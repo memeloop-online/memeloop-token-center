@@ -24,7 +24,7 @@ impl Database {
             .last()
             .map(|r| r.try_get::<i64, _>("version"))
             .transpose()?;
-        if last.is_none_or(|v| v < 165) {
+        if last.is_none_or(|v| v < 166) {
             return Ok(false);
         }
         if rows.len() != SQLITE_MIGRATIONS.len() {
@@ -100,8 +100,37 @@ impl Database {
                 "SQLite runtime started index differs".into(),
             ));
         }
+        let columns = sqlx::query("PRAGMA table_info(upstream_oauth_rejected_generations)")
+            .fetch_all(&mut *tx)
+            .await?;
+        let node = super::manifest()
+            .nodes
+            .into_iter()
+            .find(|node| node.id == "oauth.rejected_generation.v1")
+            .expect("owned capability");
+        for expected in node.columns {
+            let column = columns
+                .iter()
+                .find(|row| {
+                    row.try_get::<String, _>("name")
+                        .is_ok_and(|name| name == expected.name)
+                })
+                .ok_or_else(|| {
+                    sqlx::Error::Protocol("SQLite OAuth evidence column missing".into())
+                })?;
+            // SQLite TEXT PRIMARY KEY reports notnull=0 despite its key contract.
+            let primary = expected.name == "upstream_account_id";
+            if column.try_get::<String, _>("type")?.to_lowercase() != expected.postgres_type
+                || (primary && column.try_get::<i64, _>("pk")? != 1)
+                || (!primary && (column.try_get::<i64, _>("notnull")? == 0) != expected.nullable)
+            {
+                return Err(sqlx::Error::Protocol(
+                    "SQLite OAuth evidence column differs".into(),
+                ));
+            }
+        }
         tx.commit().await?;
-        self.install_schema_track(super::SchemaTrack::Linear165)?;
+        self.install_schema_track(super::SchemaTrack::Linear166)?;
         Ok(true)
     }
 }

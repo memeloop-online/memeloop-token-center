@@ -9,14 +9,16 @@ use crate::cursor_native::{
 
 pub(super) async fn read(
     state: &AppState,
+    account: &UpstreamAccountView,
     credential: &UpstreamCredential,
     mut snapshot: QuotaSnapshot,
+    trigger: QuotaReadTrigger,
 ) -> Result<QuotaSnapshot, &'static str> {
     // The existing quota cache supplies the overall eight-second deadline.
     // Optional plan metadata must not hold a successful quota read until that
     // deadline; failure leaves its name/reset fallback unknown.
     let (usage, plan_info) = tokio::join!(
-        cursor_native::unary(state, credential, Method::CurrentPeriodUsage),
+        cursor_native::quota_usage(state, credential, account, trigger),
         tokio::time::timeout(
             Duration::from_secs(3),
             cursor_native::unary(state, credential, Method::PlanInfo)

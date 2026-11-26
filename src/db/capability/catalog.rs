@@ -28,7 +28,7 @@ pub(in crate::db) async fn inspect(
         return Ok(None);
     }
     let last = *versions.last().unwrap();
-    if ![163, 164, 165].contains(&last) {
+    if ![163, 164, 165, 166].contains(&last) {
         return Err(drift("unsupported migration sequence"));
     }
     let expected: Vec<_> = POSTGRES_MIGRATIONS
@@ -48,10 +48,11 @@ pub(in crate::db) async fn inspect(
     let track = match last {
         163 => SchemaTrack::Legacy163,
         164 => SchemaTrack::Linear164,
-        _ => SchemaTrack::Linear165,
+        165 => SchemaTrack::Linear165,
+        _ => SchemaTrack::Linear166,
     };
     let mut signatures = Vec::new();
-    for requirement in permissions::requirements(role) {
+    for requirement in permissions::requirements_at(role, last) {
         let table = requirement.table;
         let row = sqlx::query("SELECT c.oid::bigint AS oid,c.relkind::text AS kind FROM pg_class c WHERE c.oid=to_regclass($1)")
             .bind(table).fetch_optional(&mut *c).await?.ok_or_else(||drift("required relation missing"))?;
@@ -86,11 +87,13 @@ pub(in crate::db) async fn inspect(
         for column in &node.columns {
             let row=sqlx::query("SELECT format_type(a.atttypid,a.atttypmod) AS typ,a.attnotnull FROM pg_attribute a WHERE a.attrelid=to_regclass($1) AND a.attname=$2 AND NOT a.attisdropped")
                 .bind(column.table).bind(column.name).fetch_optional(&mut *c).await?;
-            let required = if node.id == "proxy.started_pending.v1" {
-                last >= 164
-            } else {
-                last >= 165
-            };
+            let required = last
+                >= match node.id {
+                    "proxy.started_pending.v1" => 164,
+                    "history.baseline_receipt.v1" => 165,
+                    "oauth.rejected_generation.v1" => 166,
+                    _ => return Err(drift("unknown capability node")),
+                };
             if required {
                 let row = row.ok_or_else(|| drift("required capability column missing"))?;
                 if row.try_get::<String, _>("typ")? != column.postgres_type
@@ -126,6 +129,9 @@ pub(in crate::db) async fn inspect(
             }
             if last >= 165 {
                 ids.push("history.baseline_receipt.v1".to_owned());
+            }
+            if last >= 166 {
+                ids.push("oauth.rejected_generation.v1".to_owned());
             }
             ids
         },
