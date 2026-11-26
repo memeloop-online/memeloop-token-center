@@ -15,6 +15,9 @@ declare global {
       requestQueryBodies: unknown[];
       route: string;
       openOverview: () => void;
+      openRequests: () => void;
+      holdNextQuery: boolean;
+      releaseLateQuery: (failed: boolean) => void;
     };
   }
 }
@@ -50,7 +53,7 @@ test('Overview request actions open focused details and bucket drilldowns preser
   try {
     const page = await browser.newPage({ viewport: { width: 1440, height: 900 } });
     await page.addInitScript(() => localStorage.setItem('mtc-locale', 'en'));
-    await page.goto(`http://127.0.0.1:${address.port}/e2e/fixtures/operator-overview-drilldown.html`);
+    await page.goto(`http://127.0.0.1:${address.port}/e2e/fixtures/operator-overview-drilldown.html?filter-state=1`);
     await page.getByRole('button', { name: 'Open details for drilled-model', exact: true }).click();
     await page.getByRole('dialog', { name: 'drilled-model', exact: true }).waitFor();
     assert.equal(await page.evaluate(() => window.overviewDrilldownFixture.route), 'requests', 'the Overview row action uses the operator request route');
@@ -76,6 +79,40 @@ test('Overview request actions open focused details and bucket drilldowns preser
       },
     });
     assert.equal((await page.evaluate(() => window.overviewDrilldownFixture.calls)).some((call) => call.includes('/internal/v1/requests/query')), true);
+    const filteredBody = queryBodies.at(-1);
+    const filteredCount = queryBodies.length;
+    await page.evaluate(() => window.overviewDrilldownFixture.openOverview());
+    await page.locator('.overview-trend-card').first().waitFor();
+    await page.evaluate(() => window.overviewDrilldownFixture.openRequests());
+    await page.getByText('drilled-model', { exact: true }).waitFor();
+    assert.equal(await page.evaluate(() => window.overviewDrilldownFixture.requestQueryBodies.length), filteredCount + 1);
+    assert.deepEqual(await page.evaluate(() => window.overviewDrilldownFixture.requestQueryBodies.at(-1)), filteredBody);
+    await page.getByRole('button', { name: 'Refresh', exact: true }).click();
+    await page.waitForFunction(count => window.overviewDrilldownFixture.requestQueryBodies.length === count, filteredCount + 2);
+    assert.deepEqual(await page.evaluate(() => window.overviewDrilldownFixture.requestQueryBodies.at(-1)), filteredBody);
+
+    const tenantPicker = page.locator('.tenant-picker select');
+    for (const failed of [false, true]) {
+      await page.evaluate(() => { window.overviewDrilldownFixture.holdNextQuery = true; });
+      await page.getByRole('button', { name: 'Refresh', exact: true }).click();
+      const beforeSwitch = await page.evaluate(() => window.overviewDrilldownFixture.requestQueryBodies.length);
+      await tenantPicker.selectOption('second-tenant');
+      await page.waitForFunction(count => window.overviewDrilldownFixture.requestQueryBodies.length === count, beforeSwitch + 1);
+      assert.deepEqual(await page.evaluate(() => window.overviewDrilldownFixture.requestQueryBodies.at(-1)), {
+        tenant_external_id: 'second-tenant', limit: 100, paged: true,
+        ast: { logical_operator: 'and', conditions: [] },
+      });
+      await page.evaluate(value => window.overviewDrilldownFixture.releaseLateQuery(value), failed);
+      await tenantPicker.selectOption('drilldown-tenant');
+      await page.waitForFunction(count => window.overviewDrilldownFixture.requestQueryBodies.length === count, beforeSwitch + 2);
+      assert.deepEqual(await page.evaluate(() => window.overviewDrilldownFixture.requestQueryBodies.at(-1)), {
+        tenant_external_id: 'drilldown-tenant', limit: 100, paged: true,
+        ast: { logical_operator: 'and', conditions: [] },
+      });
+      assert.equal(await page.getByText('stale-scope-row', { exact: true }).count(), 0);
+      assert.equal(await page.getByText('stale-scope-error', { exact: false }).count(), 0);
+    }
+
   } finally {
     await browser.close();
     await server.close();
