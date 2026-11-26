@@ -721,7 +721,7 @@ jobs:
           grep -F '1 passed; 0 failed' /tmp/terminal-ack-rollback.log
 
   routing-snapshot-contract:
-    if: inputs.contract == 'quota-outage' || inputs.contract == 'admission-cancel' || inputs.contract == 'orphan-reaper-971'
+    if: inputs.contract == 'quota-outage' || inputs.contract == 'admission-cancel'
     runs-on: ubuntu-24.04
     timeout-minutes: 30
     services:
@@ -779,3 +779,44 @@ jobs:
           done
           cargo test --locked --bin memeloop-token-center terminal_recovery_cli_tests::exact_recovery_requires_identity_and_defaults_to_inspection -- --exact --nocapture 2>&1 | tee /tmp/terminal-exact-cli.log
           grep -F '1 passed; 0 failed' /tmp/terminal-exact-cli.log
+
+  tps-output-contract:
+    if: inputs.contract == 'orphan-reaper-971'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    services:
+      postgres:
+        image: postgres:16-alpine
+        env:
+          POSTGRES_USER: token_center
+          POSTGRES_PASSWORD: token_center
+          POSTGRES_DB: token_center_test
+        ports: ['5432:5432']
+        options: --health-cmd pg_isready --health-interval 5s --health-timeout 5s --health-retries 10
+    env:
+      MTC_TEST_POSTGRES_URL: postgres://token_center:token_center@127.0.0.1:5432/token_center_test
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+        with:
+          ref: ${{ inputs.source_revision }}
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@4360b52568e2003a75bf9bc1d59f33a8e3fc893c
+        with:
+          toolchain: 1.95.0
+      - uses: ./.github/actions/checkout-plugin-examples
+      - run: |
+          set -o pipefail
+          test "$(git rev-parse HEAD)" = "${{ inputs.source_revision }}"
+          cargo test --locked --lib api::proxy::streaming::timing::tests -- --nocapture 2>&1 | tee /tmp/tps-timing.log
+          grep -F '6 passed; 0 failed' /tmp/tps-timing.log
+          for backend in sqlite postgres; do
+            cargo test --locked --lib "db::requests::queries::event_contract_tests::${backend}_event_enrichment_preserves_recorded_fields_and_tenant_ownership" -- --exact --nocapture 2>&1 | tee /tmp/tps-dto.log
+            grep -F '1 passed; 0 failed' /tmp/tps-dto.log
+          done
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020
+        with:
+          node-version: '22'
+      - run: npm ci
+        working-directory: web
+      - run: node --import tsx --test e2e/request-table-presentation-contract.test.ts
+        working-directory: web
