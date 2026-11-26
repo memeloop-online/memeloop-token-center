@@ -61,19 +61,30 @@ jobs:
           toolchain: 1.95.0
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6
       - uses: ./.github/actions/checkout-plugin-examples
-      - name: Verify fixed OAuth existing-pool contracts
+      - name: Verify fixed schema163 projection and cold OAuth contracts
         run: |
           set -euo pipefail
-          test "$(git rev-parse HEAD)" = '66916ed4c48bcfdbea3c7f603baa561809e44066'
+          test "$(git rev-parse HEAD)" = 'cc3a66ff9dfc482263f9a9afb04829097075d555'
           git rev-parse HEAD
-          mkdir -p /tmp/oauth-existing-pool-evidence
-          cargo test --locked --lib --all-features worker::oauth_role_tests::oauth_rejection_delivery_crosses_gateway_control_and_worker_process_roles -- --exact --nocapture 2>&1 | tee /tmp/oauth-existing-pool-evidence/3.log
-          grep -F '1 passed; 0 failed' /tmp/oauth-existing-pool-evidence/3.log
+          mkdir -p /tmp/schema163-evidence
+          failures=0
+          if ! cargo test --locked --all-features --lib db::requests::conversations::prefix_storage::tests::postgres_prefix_preload_releases_projection_scope_before_graph_receive -- --exact --ignored --nocapture 2>&1 | tee /tmp/schema163-evidence/0.log; then failures=1; fi
+          if ! grep -F '1 passed; 0 failed; 0 ignored;' /tmp/schema163-evidence/0.log; then failures=1; fi
+          if ! cargo test --locked --all-features --lib db::requests::conversations::archive_readiness_tests::postgres_identity_projection_busy_yields_and_preserves_page_cursor -- --exact --nocapture 2>&1 | tee /tmp/schema163-evidence/1.log; then failures=1; fi
+          if ! grep -F '1 passed; 0 failed; 0 ignored;' /tmp/schema163-evidence/1.log; then failures=1; fi
+          if ! cargo test --locked --all-features --lib db::requests::conversations::archive_readiness_tests::postgres_declared_identity_is_readable_while_body_is_pending -- --exact --nocapture 2>&1 | tee /tmp/schema163-evidence/2.log; then failures=1; fi
+          if ! grep -F '1 passed; 0 failed; 0 ignored;' /tmp/schema163-evidence/2.log; then failures=1; fi
+          if ! cargo test --locked --all-features --lib db::requests::conversations::archive_readiness_tests::postgres_coverage_read_does_not_block_body_worker -- --exact --nocapture 2>&1 | tee /tmp/schema163-evidence/3.log; then failures=1; fi
+          if ! grep -F '1 passed; 0 failed; 0 ignored;' /tmp/schema163-evidence/3.log; then failures=1; fi
+          if ! cargo test --locked --all-features --lib plugin::application::oauth_background_tests::postgres_cold_oauth_authority_uses_existing_pool_and_preserves_shared_authority -- --exact --ignored --nocapture 2>&1 | tee /tmp/schema163-evidence/4.log; then failures=1; fi
+          if ! grep -F '1 passed; 0 failed; 0 ignored;' /tmp/schema163-evidence/4.log; then failures=1; fi
+          if ! grep -F 'schema_max=163, schema163_receipts=1' /tmp/schema163-evidence/4.log; then failures=1; fi
+          exit "$failures"
       - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
         if: always()
         with:
-          name: oauth-role-66916
-          path: /tmp/oauth-existing-pool-evidence/
+          name: schema163-projection-oauth-cc3
+          path: /tmp/schema163-evidence/
           if-no-files-found: warn
 
   orphan-reaper-contract:
