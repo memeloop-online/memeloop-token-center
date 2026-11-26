@@ -1642,20 +1642,19 @@ impl Database {
             // cannot acquire timestamps in the opposite order from their commits.
             let now = unix_millis();
 
-            // This no-op update is the portable owner CAS. PostgreSQL takes a row
-            // lock and rechecks the pending predicate after a concurrent owner
-            // commits; as the first SQLite statement it acquires the write lock
-            // without a deferred read-to-write upgrade race. Only the winner may
-            // settle usage or create terminal lineage/statistics.
-            let claimed = sqlx::query(
-            "UPDATE request_records SET completed_at = completed_at WHERE id = $1 AND tenant_id = $2 AND key_id = $3 AND reservation_id = $4 AND completed_at IS NULL",
-        )
-        .bind(&request_id)
-        .bind(&tenant_id)
-        .bind(&key_id)
-        .bind(&reservation_id)
-        .execute(&mut *transaction)
-        .await?;
+            // Preserve the owner CAS and post-lock guard ordering. A missing
+            // locator returns no owner so deferred outbox replay still runs.
+            let claimed = self
+                .lock_request_terminal_owner(
+                    &mut transaction,
+                    input.request_id,
+                    input.tenant_id,
+                    input.reservation.key_id,
+                    input.reservation.id,
+                    None,
+                    true,
+                )
+                .await?;
             if let Some(result) =
                 super::pending_settlement::guard(&mut transaction, &input, pending_receipt).await?
             {
@@ -1665,12 +1664,12 @@ impl Database {
                 }
                 return Ok(result);
             }
-            if pending_receipt.is_some() && claimed.rows_affected() == 0 {
+            if pending_receipt.is_some() && claimed == 0 {
                 return Err(AppError::Conflict(
                     "request completed without matching settlement receipt".into(),
                 ));
             }
-            if reap_orphan && claimed.rows_affected() == 1 {
+            if reap_orphan && claimed == 1 {
                 let expires_at: Option<i64> = sqlx::query_scalar("SELECT proxy_owner_expires_at FROM request_records WHERE id = $1 AND tenant_id = $2 AND key_id = $3 AND reservation_id = $4")
                     .bind(&request_id).bind(&tenant_id).bind(&key_id).bind(&reservation_id)
                     .fetch_one(&mut *transaction).await?;
@@ -1681,11 +1680,11 @@ impl Database {
                     ));
                 }
             }
-            if claimed.rows_affected() == 1 && sqlx::query("SELECT 1 FROM request_records WHERE id = $1 AND key_id = $2 AND submission_started_at IS NOT NULL")
+            if claimed == 1 && sqlx::query("SELECT 1 FROM request_records WHERE id = $1 AND key_id = $2 AND submission_started_at IS NOT NULL")
                 .bind(&request_id).bind(&key_id).fetch_optional(&mut *transaction).await?.is_some() {
                 return Err(AppError::Conflict("submitted image requires authoritative image settlement or quarantine".into()));
             }
-            if claimed.rows_affected() == 0 && defer_projection
+            if claimed == 0 && defer_projection
                 && let Some(existing) = sqlx::query("SELECT status_code, cost_micros, NULLIF(error_code, '') AS error_code, response_object FROM terminal_projection_outbox WHERE request_id = $1 AND tenant_id = $2 AND key_id = $3 AND reservation_id = $4")
                     .bind(&request_id).bind(&tenant_id).bind(&key_id).bind(&reservation_id)
                     .fetch_optional(&mut *transaction).await?
@@ -1715,7 +1714,7 @@ impl Database {
             {
                 return Err(AppError::NotFound);
             }
-            if claimed.rows_affected() == 0 {
+            if claimed == 0 {
                 let existing = sqlx::query(
                 "SELECT reservation_id, completed_at, status_code, cost_micros, error_code, response_object FROM request_records WHERE id = $1 AND created_at = $2 AND tenant_id = $3 AND key_id = $4",
             )
