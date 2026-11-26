@@ -318,7 +318,19 @@ async fn credited_long_response_preserves_opportunistic_spill_above_source_capac
     .await
     .unwrap();
     assert_eq!(source.len(), 5 * 1024 * 1024);
-    assert!(peak.load(std::sync::atomic::Ordering::Relaxed) <= 4 * 1024 * 1024);
+    // Healthy equal-sized ACKs must reclaim the prior allocation rather
+    // than alternate retained and unretained RAM segments.
+    let retained_limit = memory.snapshot().3;
+    assert!(peak.load(std::sync::atomic::Ordering::Relaxed) <= retained_limit + 64 * 1024);
+    let ram_bytes: usize = source
+        .segments
+        .iter()
+        .map(|segment| match &*segment.lock().unwrap() {
+            Segment::Ram(bytes) => bytes.len(),
+            Segment::Object(_) => 0,
+        })
+        .sum();
+    assert!(ram_bytes <= retained_limit);
     assert!(
         source
             .segments
