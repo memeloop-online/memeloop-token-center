@@ -727,6 +727,16 @@ impl ResponseArchiveProducer {
         identity: ArchiveSpoolIdentity,
         target: CaptureTarget,
     ) -> impl std::future::Future<Output = Option<Self>> + Send + 'static {
+        Self::admit_target_with_scope(state, identity, target, None)
+    }
+
+    pub(crate) fn admit_target_with_scope(
+        state: &AppState,
+        identity: ArchiveSpoolIdentity,
+        target: CaptureTarget,
+        scope: Option<crate::archive::TrustedArchiveWriteScope>,
+    ) -> impl std::future::Future<Output = Option<Self>> + Send + 'static {
+        let scope = scope.filter(|scope| scope.belongs_to(identity.tenant_id));
         let state = state.clone();
         let admission = OriginalAdmission {
             state: Some(state.clone()),
@@ -736,7 +746,7 @@ impl ResponseArchiveProducer {
         async move {
             // Capture takes real RAM/object ownership independently of upload
             // admission. The writer retains it until the CAS/root acknowledgement.
-            let producer = Self::begin_admitted(&state, identity, None, None, target);
+            let producer = Self::begin_admitted(&state, identity, None, None, target, scope);
             admission.disarm();
             Some(producer)
         }
@@ -772,6 +782,7 @@ impl ResponseArchiveProducer {
             Some(memory),
             Some(archive_permit),
             CaptureTarget::Response,
+            None,
         ))
     }
 
@@ -781,6 +792,7 @@ impl ResponseArchiveProducer {
         memory: Option<Arc<crate::gateway_body::memory::ProxyMemoryReservation>>,
         archive_permit: Option<tokio::sync::OwnedSemaphorePermit>,
         target: CaptureTarget,
+        scope: Option<crate::archive::TrustedArchiveWriteScope>,
     ) -> Self {
         let queue_memory = Arc::new(CaptureQueueMemory {
             _local_metrics: None,
@@ -801,15 +813,9 @@ impl ResponseArchiveProducer {
         let captured = super::OwnedTask::spawn(
             async move {
                 let _source_owner = source_owner;
-                let key = capture_state.archive.select_staging_key(
-                    crate::archive_staging::ArchiveStagingKey::new(
-                        crate::archive_staging::ArchiveStagingOwner::ProxyRequest(
-                            identity.request_id,
-                        ),
-                        crate::archive_staging::ArchiveStagingPurpose::Response,
-                        uuid::Uuid::now_v7(),
-                    )?,
-                )?;
+                let key = capture_state
+                    .archive
+                    .new_response_staging_key(identity.request_id, scope)?;
                 let capture = crate::gateway_body::carrier::CarrierCapture::new(
                     capture_state
                         .persistence

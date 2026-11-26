@@ -1,87 +1,7 @@
-//! Isolated synthetic contract. No runtime configuration or production routing.
+//! Synthetic fixtures exercise the production selector; no alternate policy.
 use super::*;
-use crate::{
-    archive_staging::{ArchiveStagingKey, ArchiveStagingOwner, ArchiveStagingPurpose},
-    model::AuthenticatedKey,
-};
 use bytes::Bytes;
-use serde::Deserialize;
 use uuid::Uuid;
-
-#[derive(Clone, Copy)]
-struct TrustedScope {
-    tenant: Uuid,
-    key: Uuid,
-}
-impl From<&AuthenticatedKey> for TrustedScope {
-    fn from(key: &AuthenticatedKey) -> Self {
-        Self {
-            tenant: key.tenant_id,
-            key: key.key_id,
-        }
-    }
-}
-#[derive(Default, Deserialize)]
-#[serde(deny_unknown_fields)]
-struct Rules {
-    version: u32,
-    rules: Vec<Rule>,
-}
-#[derive(Deserialize)]
-#[serde(deny_unknown_fields)]
-struct Rule {
-    tenant: Uuid,
-    key: Uuid,
-    purpose: String,
-    backend_identity: String,
-}
-impl Rules {
-    fn validate(&self, archive: &ArchiveStore) -> Result<(), &'static str> {
-        if self.version != 1 {
-            return Err("unsupported_version");
-        }
-        let mut seen = std::collections::HashSet::new();
-        for rule in &self.rules {
-            if rule.purpose != "response" {
-                return Err("unsupported_purpose");
-            }
-            if archive.training.as_ref().map(|s| s.identity.as_str())
-                != Some(rule.backend_identity.as_str())
-            {
-                return Err("unknown_backend");
-            }
-            if !seen.insert((rule.tenant, rule.key)) {
-                return Err("duplicate_scope");
-            }
-        }
-        Ok(())
-    }
-    fn select(
-        &self,
-        archive: &ArchiveStore,
-        key: ArchiveStagingKey,
-        scope: Option<TrustedScope>,
-    ) -> Result<ArchiveStagingKey, crate::error::AppError> {
-        // The sole existing selector remains responsible for existing bindings.
-        if key.backend_identity.is_some() {
-            return archive.select_staging_key(key);
-        }
-        if key.purpose == ArchiveStagingPurpose::Response {
-            if let Some(scope) = scope {
-                if let Some(rule) = self
-                    .rules
-                    .iter()
-                    .find(|r| r.tenant == scope.tenant && r.key == scope.key)
-                {
-                    return archive.select_staging_key(
-                        key.with_backend_identity(Some(&rule.backend_identity))?,
-                    );
-                }
-            }
-        }
-        archive.select_staging_key(key)
-    }
-}
 
 #[tokio::test]
 async fn synthetic_scoped_response_route_preserves_binding_and_revert_reads() {
@@ -89,31 +9,25 @@ async fn synthetic_scoped_response_route_preserves_binding_and_revert_reads() {
     archive.training_cas_writes = false;
     archive.training_staging_writes = false;
     let tenant = Uuid::now_v7();
-    let a = TrustedScope {
-        tenant,
-        key: Uuid::now_v7(),
-    };
-    let b = TrustedScope {
-        tenant,
-        key: Uuid::now_v7(),
-    };
+    let a_key = Uuid::now_v7();
+    let a = trusted_scope(tenant, a_key);
+    let b = trusted_scope(tenant, Uuid::now_v7());
     let identity = archive.training.as_ref().unwrap().identity.clone();
-    let rules: Rules = serde_json::from_value(serde_json::json!({"version":1,"rules":[{"tenant":tenant,"key":a.key,"purpose":"response","backend_identity":identity}]})).unwrap();
-    rules.validate(&archive).unwrap();
-    let empty = Rules {
-        version: 1,
-        ..Default::default()
-    };
-    empty.validate(&archive).unwrap();
-    for scope in [Some(a), Some(b), None] {
-        let key = ArchiveStagingKey::new(
-            ArchiveStagingOwner::ProxyRequest(Uuid::now_v7()),
-            ArchiveStagingPurpose::Response,
-            Uuid::now_v7(),
-        )
+    let input = serde_json::json!({"version":1,"rules":[{"tenant":tenant,"key":a_key,"purpose":"response","backend_identity":identity}]}).to_string();
+    let rules = routing::ArchiveWriteRules::parse(Some(&input), Some(&identity)).unwrap();
+    let empty = routing::ArchiveWriteRules::parse(None, Some(&identity)).unwrap();
+    let old_primary = archive
+        .new_response_staging_key(Uuid::now_v7(), Some(a))
         .unwrap();
-        let selected = rules.select(&archive, key, scope).unwrap();
-        let qualified = scope.is_some_and(|s| s.key == a.key);
+    assert!(old_primary.backend_identity.is_none());
+    archive.write_rules = rules.clone();
+    assert!(archive.resolve(&old_primary.canonical_prefix()).is_ok());
+    assert!(old_primary.backend_identity.is_none());
+    for (scope, qualified) in [(Some(a), true), (Some(b), false), (None, false)] {
+        archive.write_rules = rules.clone();
+        let selected = archive
+            .new_response_staging_key(Uuid::now_v7(), scope)
+            .unwrap();
         assert_eq!(selected.backend_identity.is_some(), qualified);
         let mut writer = archive
             .start_writer(&format!("{}/body", selected.canonical_prefix()))
@@ -132,7 +46,7 @@ async fn synthetic_scoped_response_route_preserves_binding_and_revert_reads() {
             object.object_locator.starts_with("stores/training/"),
             qualified
         );
-        assert_eq!(empty.select(&archive, selected, Some(b)).unwrap(), selected);
+        archive.write_rules = empty.clone();
         assert_eq!(
             archive.get(&staged.object_locator).await.unwrap(),
             "synthetic original"
@@ -158,4 +72,24 @@ async fn synthetic_scoped_response_route_preserves_binding_and_revert_reads() {
                 .is_err()
         );
     }
+    for invalid in [
+        input.replace("response", "request"),
+        input.replace(&identity, &"b".repeat(64)),
+        input.replace("\"version\":1", "\"version\":2"),
+    ] {
+        assert!(routing::ArchiveWriteRules::parse(Some(&invalid), Some(&identity)).is_err());
+    }
+}
+
+fn trusted_scope(tenant: Uuid, key: Uuid) -> TrustedArchiveWriteScope {
+    TrustedArchiveWriteScope::from(&crate::model::AuthenticatedKey {
+        key_id: key,
+        tenant_id: tenant,
+        principal_id: Uuid::now_v7(),
+        account_id: Uuid::now_v7(),
+        alias: "synthetic".into(),
+        currency: "USD".into(),
+        credential_generation: 1,
+        policy: Default::default(),
+    })
 }

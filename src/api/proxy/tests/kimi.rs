@@ -118,6 +118,7 @@ async fn native_kimi_rejections_preserve_classification_and_original_explanation
                 .await
                 .unwrap();
             let mut request = BufferedRequest {
+                archive_write_scope: None,
                 session_preference: None,
                 state: &fixture.state,
                 reservation,

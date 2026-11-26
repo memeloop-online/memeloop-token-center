@@ -80,6 +80,7 @@ async fn native_kimi_buffered_usage(output_tokens: i64) {
         .await
         .unwrap();
     let mut request = BufferedRequest {
+        archive_write_scope: None,
         session_preference: None,
         state: &fixture.state,
         reservation,
