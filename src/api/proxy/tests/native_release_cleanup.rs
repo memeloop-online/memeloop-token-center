@@ -1,6 +1,6 @@
 //! Real publisher/reaper contract, restricted to one isolated synthetic bucket.
 use super::*;
-use futures_util::{StreamExt, TryStreamExt};
+use futures_util::{FutureExt, StreamExt, TryStreamExt};
 use object_store::{ObjectStore, ObjectStoreExt, aws::AmazonS3Builder, path::Path};
 use sha2::{Digest, Sha256};
 
@@ -39,6 +39,7 @@ async fn rustfs_native_publisher_release_reclaims_exact_nonzero_temporary() {
     config.s3_secret_key = Some(std::env::var("MTC_RUSTFS_TEST_SECRET_KEY").unwrap());
     config.s3_region = "us-east-1".into();
     config.s3_allow_http = true;
+    println!("native_release_phase initialize_s3_fixture");
     let fixture = response_usage_fixture_with_archive_config(
         "native-exact-release",
         upstream.uri(),
@@ -54,6 +55,7 @@ async fn rustfs_native_publisher_release_reclaims_exact_nonzero_temporary() {
             Some(config.clone()),
         ),
     )
+    .boxed_local()
     .await;
     let object_store = AmazonS3Builder::new()
         .with_endpoint(proxy.endpoint())
@@ -84,7 +86,10 @@ async fn rustfs_native_publisher_release_reclaims_exact_nonzero_temporary() {
     let request = json!({"model":fixture.model,"input":"xxxxxxxxxxxxxxxxxxxxxxxxxx","stream":false,"max_output_tokens":16});
     let raw_request = serde_json::to_vec(&request).unwrap();
     // Actual HTTP router/authentication, mock upstream, original capture and finalizer.
-    let response = send_response_usage_request(&fixture, &request).await;
+    println!("native_release_phase authenticated_http");
+    let response = send_response_usage_request(&fixture, &request)
+        .boxed_local()
+        .await;
     assert_eq!(response.status(), StatusCode::OK);
     assert_eq!(
         to_bytes(response.into_body(), MAX_PROXY_RESPONSE_BODY)
@@ -93,8 +98,11 @@ async fn rustfs_native_publisher_release_reclaims_exact_nonzero_temporary() {
             .as_ref(),
         raw_response.as_slice()
     );
-    wait_for_request_settlement(&fixture, 1).await;
-    drain_completed_response_archive(&fixture).await;
+    println!("native_release_phase publisher_drain");
+    wait_for_request_settlement(&fixture, 1).boxed_local().await;
+    drain_completed_response_archive(&fixture)
+        .boxed_local()
+        .await;
     let rows = fixture
         .state
         .db
@@ -214,7 +222,10 @@ async fn rustfs_native_publisher_release_reclaims_exact_nonzero_temporary() {
         .unwrap();
 
     // Original semantic worker and all existing once-only financial assertions.
-    assert_exactly_once_side_effects(&fixture, request_id, Some("resp-usage-contract")).await;
+    println!("native_release_phase canonical_and_financial");
+    assert_exactly_once_side_effects(&fixture, request_id, Some("resp-usage-contract"))
+        .boxed_local()
+        .await;
     let pool = sqlx::AnyPool::connect(&fixture.database_url).await.unwrap();
     let leaf: String = sqlx::query_scalar(
         "SELECT leaf_node_hash FROM conversation_observations WHERE request_id = $1",
@@ -253,7 +264,8 @@ async fn rustfs_native_publisher_release_reclaims_exact_nonzero_temporary() {
         archive.clone(),
         crate::archive_staging::ArchiveStagingLeaseOwner::new("native-exact-release-test").unwrap(),
     );
-    reaper.reap_once().await.unwrap();
+    println!("native_release_phase native_reaper");
+    reaper.reap_once().boxed_local().await.unwrap();
     assert!(matches!(
         object_store.head(&temporary).await,
         Err(object_store::Error::NotFound { .. })
@@ -304,7 +316,10 @@ async fn rustfs_native_publisher_release_reclaims_exact_nonzero_temporary() {
             .unwrap(),
         manifest
     );
-    assert_exactly_once_side_effects(&fixture, request_id, Some("resp-usage-contract")).await;
+    println!("native_release_phase canonical_and_financial");
+    assert_exactly_once_side_effects(&fixture, request_id, Some("resp-usage-contract"))
+        .boxed_local()
+        .await;
     upstream.verify().await;
     println!(
         "native_release_nonzero encoded_bytes={} decoded_response_bytes={} exact_cleanup=true dual_cas_sha=true canonical_unchanged=true unique_financial=true",

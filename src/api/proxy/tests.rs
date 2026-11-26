@@ -938,7 +938,7 @@ async fn response_usage_fixture_with_archive_config(
     });
     config.database_url = database_url.clone();
     // Archive, SQL readers and durable journals bind the same store once.
-    let state = AppState::initialize(config).await.unwrap();
+    let state = Box::pin(AppState::initialize(config)).await.unwrap();
     let tenant = format!("compatibility-route-{label}");
     let model = public_model.to_owned();
     let mut upstream_config = json!({
