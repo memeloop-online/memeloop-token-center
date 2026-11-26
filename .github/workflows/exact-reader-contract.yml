@@ -630,7 +630,7 @@ jobs:
   pg-executor-contract:
     if: inputs.contract == 'pg-executor-959'
     runs-on: ubuntu-24.04
-    timeout-minutes: 90
+    timeout-minutes: 60
     services:
       clickhouse:
         image: clickhouse/clickhouse-server:25.8
@@ -667,43 +667,44 @@ jobs:
           toolchain: 1.95.0
           components: rustfmt, clippy
           targets: wasm32-unknown-unknown
-      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020
-        with:
-          node-version: 24.18.0
-      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6
-        with:
-          shared-key: memory-release
       - uses: ./.github/actions/checkout-plugin-examples
-      - name: Verify the two unchanged writer drain contracts
+      - name: Run the fifteen exact master contracts after the recorded Clippy result
         run: |
-          set -euo pipefail
-          test "$(git rev-parse HEAD)" = "7baf3c70082442b98a9ef79e2d5faf6bc9b2f94e"
+          set +e
+          set -uo pipefail
           git rev-parse HEAD
-          mkdir -p "$RUNNER_TEMP/pr1041-writer-evidence"
-          cargo test --locked --lib response_archive_spool::tests::cancelled_producer_fences_a_begin_that_committed_late -- --exact --nocapture 2>&1 | tee "$RUNNER_TEMP/pr1041-writer-evidence/begin-gate.log"
-          grep -F '1 passed; 0 failed' "$RUNNER_TEMP/pr1041-writer-evidence/begin-gate.log"
-          cargo test --locked --lib response_archive_spool::tests::terminal_tail_survives_observer_cancellation_without_waiting_for_database_ack -- --exact --nocapture 2>&1 | tee "$RUNNER_TEMP/pr1041-writer-evidence/terminal-gate.log"
-          grep -F '1 passed; 0 failed' "$RUNNER_TEMP/pr1041-writer-evidence/terminal-gate.log"
-      - name: Build the same-source optimized memory service
-        env:
-          MTC_BUILD_GIT_SHA: ${{ inputs.source_revision }}
-        run: cargo build --locked --release --bin memeloop-token-center
-      - name: Run the original complete durable archive RSS gate
-        timeout-minutes: 6
-        run: |
-          set -euo pipefail
-          node tests/load/benchmark-durable-archive-memory.ts target/release/memeloop-token-center "$RUNNER_TEMP/pr1041-writer-evidence/durable-archive-rss-7baf.json" 2>&1 | tee "$RUNNER_TEMP/pr1041-writer-evidence/durable-harness.log"
-      - name: Run the unchanged fifteen-minute acceptance after the quick gate
-        timeout-minutes: 30
-        run: |
-          set -euo pipefail
-          node tests/load/benchmark-memory.ts --profile acceptance --binary target/release/memeloop-token-center --gateway-limit-mib 256 --gateway-headroom-mib 32 --output "$RUNNER_TEMP/pr1041-writer-evidence/memory-7baf.json" 2>&1 | tee "$RUNNER_TEMP/pr1041-writer-evidence/memory-harness.log"
-      - name: Retain exact-source writer and memory evidence
+          test "$(git rev-parse HEAD)" = "4430439e0279d66b34a7dd6b87d200b66486244e" || exit 1
+          mkdir -p /tmp/master4430-evidence
+          status=0
+          while IFS= read -r selector; do
+            log="/tmp/master4430-evidence/${selector//::/_}.log"
+            cargo test --locked --all-features --lib "$selector" -- --exact --nocapture 2>&1 | tee "$log"
+            test "${PIPESTATUS[0]}" = 0 || status=1
+            grep -F 'running 1 test' "$log" || status=1
+          done <<'SELECTORS'
+          api::proxy::tests::codex_http2_failure_safety::http_502_preserves_verified_final_response_reset_independently
+          api::proxy::tests::downstream_disconnect_records_unknown_without_waiting_for_stalled_upstream
+          api::proxy::tests::persistence_isolation::pending_response_archive_begin_does_not_hold_first_byte_or_eof
+          api::proxy::tests::shutdown_durability::buffered_http_200_sigterm_waits_for_durable_capture_before_exit
+          api::proxy::tests::supplier_quota::forbidden::explicit403_quota_fails_over_avoids_failed_model_and_recovers_only_from_real_probe
+          db::allocation_history::tests::sqlite_allocation_history_exact_coverage_and_restart
+          db::migrations::proxy_group_tests::postgres_proxy_group_116_accepts_empty_113_and_later_114_115
+          db::migrations::observation_prefix::tests::postgres_legacy_conversion_is_atomic_verified_and_replayable
+          db::requests::conversations::archive_readiness_tests::postgres_archive_binding_and_financial_terminal_preserve_bodies_in_both_orders
+          db::requests::lifecycle::unlimited_admission_tests::postgres_unlimited_admission_and_terminal_ignore_shared_financial_and_stats_locks
+          db::tests::session_analytics::postgres_public_session_and_conversation_lists_cap_at_100
+          db::tests::terminal_projection::sqlite_deferred_session_edges_follow_admission_when_settlement_is_reversed
+          db::tests::terminal_projection::terminal_projection_configuration_reaches_real_finalization_and_persistence_pool
+          db::tests::terminal_projection::cache_coverage::postgres_cache_coverage_terminal_replay_filters_and_daily_edges
+          upstream_quota::r2_tests::accepted_reset_coalesced_nonreset_owner_applies_supplier_start_fence
+          SELECTORS
+          exit "$status"
+      - name: Retain the unchanged master comparison results
         if: always()
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
         with:
-          name: pr1041-writer-memory-7baf
-          path: ${{ runner.temp }}/pr1041-writer-evidence/
+          name: master4430-fifteen-contracts
+          path: /tmp/master4430-evidence/
           if-no-files-found: warn
           retention-days: 7
 
