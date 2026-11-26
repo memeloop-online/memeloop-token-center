@@ -782,6 +782,9 @@ impl ResponseArchiveProducer {
         archive_permit: Option<tokio::sync::OwnedSemaphorePermit>,
         target: CaptureTarget,
     ) -> Self {
+        // Register before spawn so shutdown/drain cannot overtake an accepted
+        // writer after admission has handed off its own activity guard.
+        let writer_activity = state.persistence.register_archive();
         let queue_memory = Arc::new(CaptureQueueMemory {
             _local_metrics: None,
             reservation: memory,
@@ -836,6 +839,7 @@ impl ResponseArchiveProducer {
         let writer_memory = queue_memory.clone();
         let writer = super::OwnedTask::spawn(
             async move {
+                let _writer_activity = writer_activity;
                 let _queue_memory = writer_memory.clone();
                 let _source_owner = capture_owner;
                 match run_response_archive_writer(

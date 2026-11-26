@@ -1063,6 +1063,9 @@ async fn cancelled_producer_fences_a_begin_that_committed_late() {
         .await
         .expect("writer begin must commit before the deterministic pause")
         .unwrap();
+    assert_eq!(state.persistence.pending_archives_for_test(), 1);
+    let mut draining = Box::pin(state.persistence.drain());
+    assert!(futures_util::poll!(&mut draining).is_pending());
     drop(producer);
     release.send(()).unwrap();
     tokio::time::timeout(std::time::Duration::from_secs(5), fence_entered)
@@ -1070,6 +1073,11 @@ async fn cancelled_producer_fences_a_begin_that_committed_late() {
         .unwrap()
         .unwrap();
     assert_eq!(fence_probe.calls(), 1);
+    assert_eq!(state.persistence.pending_archives_for_test(), 1);
+    assert!(
+        futures_util::poll!(&mut draining).is_pending(),
+        "failure fence must remain an owned archive activity"
+    );
     release_fence.send(()).unwrap();
     tokio::time::timeout(std::time::Duration::from_secs(1), async {
         while !state
@@ -1099,6 +1107,10 @@ async fn cancelled_producer_fences_a_begin_that_committed_late() {
             .unwrap();
     assert_eq!(spools, 0);
     assert_eq!(fence_probe.calls(), 1);
+    tokio::time::timeout(std::time::Duration::from_secs(1), draining)
+        .await
+        .unwrap();
+    assert_eq!(state.persistence.pending_archives_for_test(), 0);
 }
 
 #[tokio::test]
@@ -1196,6 +1208,12 @@ async fn terminal_tail_survives_observer_cancellation_without_waiting_for_databa
         .seal()
         .expect("terminal handoff must not wait for SQL");
     drop(settlement);
+    assert_eq!(state.persistence.pending_archives_for_test(), 1);
+    let mut draining = Box::pin(state.persistence.drain());
+    assert!(
+        futures_util::poll!(&mut draining).is_pending(),
+        "EOF and cancelled observer cannot hide the unacknowledged writer"
+    );
     release.send(()).unwrap();
     let object = tokio::time::timeout(std::time::Duration::from_secs(1), async {
         loop {
@@ -1233,6 +1251,10 @@ async fn terminal_tail_survives_observer_cancellation_without_waiting_for_databa
             .await
             .unwrap();
     assert_eq!(spools, 0);
+    tokio::time::timeout(std::time::Duration::from_secs(1), draining)
+        .await
+        .unwrap();
+    assert_eq!(state.persistence.pending_archives_for_test(), 0);
 }
 
 #[tokio::test]
