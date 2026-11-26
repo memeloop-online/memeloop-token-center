@@ -22,13 +22,13 @@ export function verifyEndpointSlice(item: Resource, service: Resource, namespace
   requireIdentity(item.metadata.labels?.["endpointslice.kubernetes.io/managed-by"] === "endpointslice-controller.k8s.io", "untrusted EndpointSlice controller");
   requireIdentity(item.metadata.ownerReferences?.some((owner: Resource) => owner.kind === "Service" && owner.uid === service.metadata.uid && owner.controller === true), "foreign service owner");
   const ports = item.ports ?? [];
-  requireIdentity(ports.length === 1 && ports[0].port === 8080 && (ports[0].protocol ?? "TCP") === "TCP", "unexpected endpoint port");
+  requireIdentity(ports.length === 1 && ports[0].port === 8080 && (ports[0].protocol === undefined ? "TCP" : ports[0].protocol) === "TCP", "unexpected endpoint port");
   const family = ({ IPv4: 4, IPv6: 6 } as Record<string, number>)[item.addressType];
   requireIdentity(family !== undefined, "unsupported address type");
   let count = 0;
   for (const endpoint of item.endpoints) {
     const ref = endpoint.targetRef ?? {};
-    requireIdentity(ref.kind === "Pod" && (ref.namespace ?? namespace) === namespace && ref.uid, "endpoint is not a namespaced pod");
+    requireIdentity(ref.kind === "Pod" && (ref.namespace === undefined ? namespace : ref.namespace) === namespace && ref.uid, "endpoint is not a namespaced pod");
     const pod = podByName(ref.name);
     requireIdentity(pod.metadata.uid === ref.uid, "pod uid mismatch");
     requireIdentity(Object.entries(service.spec.selector).every(([key, value]) => pod.metadata.labels?.[key] === value), "pod selector mismatch");
@@ -54,7 +54,7 @@ export function verifyStagingIdentities(meta: Resource, get: ReadResource): Reco
     const service = get("-n", namespace, "get", "service", name);
     requireIdentity(service.spec.type !== "ExternalName" && isDeepStrictEqual(service.spec.selector, meta[`${role}Selector`]) && Object.keys(service.spec.selector ?? {}).length > 0, "service selector mismatch");
     const ports = service.spec.ports ?? [];
-    requireIdentity(ports.length === 1 && ports[0].port === 8080 && (ports[0].protocol ?? "TCP") === "TCP", "unexpected service port");
+    requireIdentity(ports.length === 1 && ports[0].port === 8080 && (ports[0].protocol === undefined ? "TCP" : ports[0].protocol) === "TCP", "unexpected service port");
     const slices = get("-n", namespace, "get", "endpointslices", "-l", `kubernetes.io/service-name=${name}`).items;
     requireIdentity(Array.isArray(slices) && slices.length > 0, "no EndpointSlices");
     const count = slices.reduce((sum: number, item: Resource) => sum + verifyEndpointSlice(item, service, namespace, (pod) => get("-n", namespace, "get", "pod", pod)), 0);

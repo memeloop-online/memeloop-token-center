@@ -19,6 +19,8 @@ for (const [name, mutate] of Object.entries({
   "foreign Service UID": (f: any) => { f.slice.metadata.ownerReferences[0].uid = "foreign"; },
   "noncontroller owner": (f: any) => { f.slice.metadata.ownerReferences[0].controller = false; },
   "wrong protocol": (f: any) => { f.slice.ports[0].protocol = "UDP"; },
+  "null protocol": (f: any) => { f.slice.ports[0].protocol = null; },
+  "null target namespace": (f: any) => { f.slice.endpoints[0].targetRef.namespace = null; },
   "unsupported address type": (f: any) => { f.slice.addressType = "FQDN"; },
   "foreign namespace": (f: any) => { f.slice.endpoints[0].targetRef.namespace = "other"; },
   "nonPod target": (f: any) => { f.slice.endpoints[0].targetRef.kind = "Service"; },
