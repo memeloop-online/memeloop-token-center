@@ -701,7 +701,7 @@ jobs:
       - name: Verify fixed diagnostic source
         run: |
           set -euo pipefail
-          test "$(git rev-parse HEAD)" = "9657a7bd7fbed9fce88c37fed165d2d8fa2bf2c9"
+          test "$(git rev-parse HEAD)" = "d47192b4f294482641e29f12ed9f9bd3bd0f82a6"
           git rev-parse HEAD
           mkdir -p "$RUNNER_TEMP/pr1041-writer-evidence"
       - name: Start isolated RustFS fixture
@@ -730,24 +730,32 @@ jobs:
           MTC_RUSTFS_TEST_SECRET_KEY: synthetic-test-only-secret-707
         run: |
           set -euo pipefail
-          for name in credited_mixed_grains_replace_bytes_without_releasing_external_clones credited_long_response_preserves_opportunistic_spill_above_source_capacity actual_put_is_not_cancelled_when_ram_wakes_and_lost_ack_keeps_source credited_spill_observation_distinguishes_workspace_pressure_from_put_ack; do
-            cargo test --locked --lib "gateway_body::carrier::resource_wakeup_tests::$name" -- --exact --ignored --nocapture 2>&1 | tee "$RUNNER_TEMP/pr1041-writer-evidence/$name.log"
+          for name in credited_mixed_grains_replace_bytes_without_releasing_external_clones credited_long_response_preserves_opportunistic_spill_above_source_capacity actual_put_is_not_cancelled_when_ram_wakes_and_lost_ack_keeps_source credited_spill_observation_distinguishes_workspace_pressure_from_put_ack request_capture_eof_does_not_join_owned_put_when_retained_credit_wakes first_request_segment_waits_for_retained_credit_despite_free_global_ram request_without_archive_preserves_capture_above_retained_window sub_quantum_retained_window_preserves_existing_archive_spill; do
+            cargo test --locked --lib "gateway_body::carrier::resource_wakeup_tests::$name" -- --exact --include-ignored --nocapture 2>&1 | tee "$RUNNER_TEMP/pr1041-writer-evidence/$name.log"
             grep -F '1 passed; 0 failed; 0 ignored' "$RUNNER_TEMP/pr1041-writer-evidence/$name.log"
           done
-      - name: Build the same-source optimized memory service
+      - uses: azure/setup-helm@1a275c3b69536ee54be43f2070a358922e12c8d4
+      - name: Install existing pinned Helm contract prerequisites
+        run: |
+          npm ci --ignore-scripts --no-audit
+          curl --fail --location --retry 3 https://github.com/yannh/kubeconform/releases/download/v0.6.7/kubeconform-linux-amd64.tar.gz --output /tmp/kubeconform.tar.gz
+          echo '95f14e87aa28c09d5941f11bd024c1d02fdc0303ccaa23f61cef67bc92619d73  /tmp/kubeconform.tar.gz' | sha256sum --check
+          tar -xzf /tmp/kubeconform.tar.gz -C /tmp kubeconform
+      - name: Verify Helm migration enabled and disabled schema contracts
         env:
-          MTC_BUILD_GIT_SHA: ${{ inputs.source_revision }}
-        run: cargo build --locked --release --bin memeloop-token-center
-      - name: Run the original complete durable archive RSS gate
-        timeout-minutes: 6
+          KUBECONFORM_BIN: /tmp/kubeconform
         run: |
           set -euo pipefail
-          node tests/load/benchmark-durable-archive-memory.ts target/release/memeloop-token-center "$RUNNER_TEMP/pr1041-writer-evidence/durable-archive-rss-9657a.json" 2>&1 | tee "$RUNNER_TEMP/pr1041-writer-evidence/durable-harness.log"
+          git rev-parse HEAD
+          test "$(git rev-parse HEAD)" = "${{ inputs.source_revision }}"
+          node --test --test-reporter=tap --test-name-pattern='^Helm chart packaging, security, ingress, and schema contracts$' tests/ops/helm-packaging-contract.test.ts 2>&1 | tee $RUNNER_TEMP/pr1041-writer-evidence/helm-migration.log
+          grep -Fx '# pass 1' $RUNNER_TEMP/pr1041-writer-evidence/helm-migration.log
+          grep -Fx '# fail 0' $RUNNER_TEMP/pr1041-writer-evidence/helm-migration.log
       - name: Retain exact-source writer and memory evidence
         if: always()
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
         with:
-          name: pr1041-writer-memory-9657a
+          name: pr1041-writer-memory-d4719
           path: ${{ runner.temp }}/pr1041-writer-evidence/
           if-no-files-found: warn
           retention-days: 7
