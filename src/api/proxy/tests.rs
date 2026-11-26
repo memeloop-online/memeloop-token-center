@@ -55,6 +55,7 @@ mod lifecycle_activity;
 mod lifecycle_duration;
 mod memory_admission;
 mod memory_metrics;
+mod native_release_cleanup;
 mod passthrough_reservation;
 mod pending_delivery;
 mod persistence_isolation;

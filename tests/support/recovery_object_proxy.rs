@@ -31,8 +31,82 @@ impl ObjectReadGate {
         self.release.notify_one();
     }
 }
+/// One run-owned physical object, bound before its successful PUT ACK escapes.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct ExactDeleteBinding {
+    pub(crate) backend: String,
+    pub(crate) host: String,
+    pub(crate) path: String,
+}
+#[derive(Default)]
+pub(crate) struct ExactCarrierDeleteFault {
+    bucket: String,
+    binding: Mutex<Option<ExactDeleteBinding>>,
+    ambiguous: AtomicBool,
+    enabled: AtomicBool,
+    rejected: AtomicUsize,
+}
+impl ExactCarrierDeleteFault {
+    fn observes_response_carrier(&self, path: &str) -> bool {
+        let fields: Vec<_> = path.trim_start_matches('/').split('/').collect();
+        fields.len() == 7
+            && fields[0] == self.bucket
+            && fields[1] == "staging"
+            && fields[2] == "proxy"
+            && fields[4] == "response"
+            && [fields[3], fields[5]]
+                .into_iter()
+                .all(|id| uuid::Uuid::parse_str(id).is_ok())
+            && fields[6]
+                .strip_prefix("carrier-")
+                .is_some_and(|id| uuid::Uuid::parse_str(id).is_ok())
+    }
+    fn bind_after_put(&self, backend: &str, host: &str, path: &str) {
+        if !self.observes_response_carrier(path) {
+            return;
+        }
+        let candidate = ExactDeleteBinding {
+            backend: backend.into(),
+            host: host.into(),
+            path: path.into(),
+        };
+        let mut bound = self.binding.lock().unwrap();
+        match bound.as_ref() {
+            None => *bound = Some(candidate),
+            Some(existing) if existing == &candidate => {}
+            Some(_) => {
+                self.ambiguous.store(true, Ordering::SeqCst);
+            }
+        }
+    }
+    fn rejects(&self, backend: &str, host: &str, path: &str, query: Option<&str>) -> bool {
+        self.enabled.load(Ordering::SeqCst)
+            && query.is_none()
+            && self.binding.lock().unwrap().as_ref().is_some_and(|bound| {
+                bound.backend == backend && bound.host == host && bound.path == path
+            })
+    }
+    pub(crate) fn binding(&self) -> ExactDeleteBinding {
+        assert!(
+            !self.ambiguous.load(Ordering::SeqCst),
+            "multiple response carrier objects in exclusive run"
+        );
+        self.binding
+            .lock()
+            .unwrap()
+            .clone()
+            .expect("real PUT ACK must bind the object")
+    }
+    pub(crate) fn rejected(&self) -> usize {
+        self.rejected.load(Ordering::SeqCst)
+    }
+    pub(crate) fn release(&self) {
+        self.enabled.store(false, Ordering::SeqCst);
+    }
+}
 #[derive(Default)]
 struct Faults {
+    exact_carrier_delete: Option<Arc<ExactCarrierDeleteFault>>,
     gets: HashMap<String, Arc<ObjectReadGate>>,
     response_get: Option<(String, Arc<ObjectReadGate>)>,
     part_gate: Option<Arc<ObjectReadGate>>,
@@ -83,6 +157,27 @@ impl RecoveryObjectProxy {
             state,
             task,
         }
+    }
+    pub(crate) fn fail_one_response_carrier_delete_after_put(
+        &self,
+        bucket: &str,
+    ) -> Arc<ExactCarrierDeleteFault> {
+        assert!(!bucket.is_empty() && !bucket.contains('/'));
+        let fault = Arc::new(ExactCarrierDeleteFault {
+            bucket: bucket.into(),
+            enabled: AtomicBool::new(true),
+            ..Default::default()
+        });
+        assert!(
+            self.state
+                .faults
+                .lock()
+                .unwrap()
+                .exact_carrier_delete
+                .replace(fault.clone())
+                .is_none()
+        );
+        fault
     }
     pub(crate) fn counts(&self) -> HashMap<String, usize> {
         self.state.counts.lock().unwrap().clone()
@@ -160,6 +255,9 @@ impl RecoveryObjectProxy {
     }
     pub(crate) fn clear_faults(&self) {
         let mut faults = self.state.faults.lock().unwrap();
+        if let Some(fault) = faults.exact_carrier_delete.take() {
+            fault.release();
+        }
         faults.puts.clear();
         faults.put_prefixes.clear();
         faults.put_scopes.clear();
@@ -190,6 +288,35 @@ impl Drop for RecoveryObjectProxy {
 }
 async fn forward(State(state): State<Arc<ProxyState>>, request: Request) -> Response {
     let began = std::time::Instant::now();
+    let exact_fault = state.faults.lock().unwrap().exact_carrier_delete.clone();
+    let original_path = request.uri().path().to_owned();
+    let original_host = request
+        .headers()
+        .get(axum::http::header::HOST)
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or("")
+        .to_owned();
+    let original_method = request.method().clone();
+    if original_method == axum::http::Method::DELETE
+        && exact_fault.as_ref().is_some_and(|fault| {
+            fault.rejects(
+                &state.upstream,
+                &original_host,
+                &original_path,
+                request.uri().query(),
+            )
+        })
+    {
+        exact_fault
+            .as_ref()
+            .unwrap()
+            .rejected
+            .fetch_add(1, Ordering::SeqCst);
+        return Response::builder()
+            .status(503)
+            .body(Body::from("exact synthetic cleanup unavailable"))
+            .unwrap();
+    }
     let query = request.uri().query().unwrap_or("");
     let receipt = request.uri().path().contains("carrier-owners/")
         || request.uri().path().contains("carrier-releases/");
@@ -299,6 +426,14 @@ async fn forward(State(state): State<Arc<ProxyState>>, request: Request) -> Resp
         Ok(response) => response,
         Err(_) => return Response::builder().status(502).body(Body::empty()).unwrap(),
     };
+    if original_method == axum::http::Method::PUT
+        && response.status().is_success()
+        && let Some(fault) = &exact_fault
+    {
+        // This runs before forwarding the accepted part/body ACK to publisher.
+        // The physical endpoint + signed Host + bucket/object path stay exact.
+        fault.bind_after_put(&state.upstream, &original_host, &original_path);
+    }
     state
         .timings
         .lock()
@@ -328,4 +463,50 @@ async fn forward(State(state): State<Arc<ProxyState>>, request: Request) -> Resp
     output
         .body(Body::from_stream(response.bytes_stream()))
         .unwrap()
+}
+
+#[cfg(test)]
+mod exact_delete_tests {
+    use super::*;
+
+    #[test]
+    fn exact_carrier_delete_fault_keeps_backend_host_query_and_neighbor_boundaries() {
+        let fault = ExactCarrierDeleteFault {
+            bucket: "isolated".into(),
+            enabled: AtomicBool::new(true),
+            ..Default::default()
+        };
+        let owner = uuid::Uuid::now_v7();
+        let attempt = uuid::Uuid::now_v7();
+        let path = format!(
+            "/isolated/staging/proxy/{owner}/response/{attempt}/carrier-{}",
+            uuid::Uuid::now_v7()
+        );
+        assert!(!fault.rejects("backend", "signed-host", &path, None));
+        fault.bind_after_put("backend", "signed-host", &path);
+        assert_eq!(fault.binding().path, path);
+        assert!(fault.rejects("backend", "signed-host", &path, None));
+        for query in ["uploadId=abc", "versionId=abc", "delete", ""] {
+            assert!(!fault.rejects("backend", "signed-host", &path, Some(query)));
+        }
+        assert!(!fault.rejects("other-backend", "signed-host", &path, None));
+        assert!(!fault.rejects("backend", "other-host", &path, None));
+        assert!(!fault.rejects("backend", "signed-host", &format!("{path}-neighbor"), None));
+        assert!(!fault.observes_response_carrier(&path.replace("/isolated/", "/other-bucket/")));
+        assert!(!fault.observes_response_carrier("/isolated/carrier-releases/v1/receipt.json"));
+        fault.bind_after_put("backend", "signed-host", &path);
+        assert!(!fault.ambiguous.load(Ordering::SeqCst));
+        let second = format!(
+            "/isolated/staging/proxy/{owner}/response/{attempt}/carrier-{}",
+            uuid::Uuid::now_v7()
+        );
+        fault.bind_after_put("backend", "signed-host", &second);
+        assert!(
+            fault.ambiguous.load(Ordering::SeqCst),
+            "different actual object makes the run unprovable"
+        );
+        assert!(!fault.rejects("backend", "signed-host", &second, None));
+        fault.release();
+        assert!(!fault.rejects("backend", "signed-host", &path, None));
+    }
 }
