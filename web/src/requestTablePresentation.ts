@@ -52,7 +52,7 @@ export function averageRequestOutputTps(request: RequestView): number | null {
   return Number.isFinite(rate) ? rate : null;
 }
 
-/** Gateway-observed output rate for successful provider-reported requests over the recorded first-output-to-terminal interval; may include buffered delivery, never a model decoding measurement. */
+/** Gateway-observed output rate for successful provider-reported requests over the recorded first-to-last-output interval; never a supplier-internal model decoding measurement. */
 export function generationRequestOutputTps(request: RequestView): number | null {
   const first = request.first_output_ms;
   const generation = request.generation_duration_ms;

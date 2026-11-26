@@ -59,15 +59,27 @@ fn has_output_delta(frame: &[u8]) -> bool {
     };
     // The existing SSE capture has already assembled complete events. JSON
     // data lines may be folded; comments and transport chunks are not tokens.
-    let data = frame
-        .lines()
-        .filter_map(|line| {
-            line.strip_prefix("data:")
-                .map(|line| line.strip_prefix(' ').unwrap_or(line))
-        })
-        .collect::<Vec<_>>()
-        .join("\n");
-    let Ok(value) = serde_json::from_str::<Value>(&data) else {
+    let mut lines = frame.lines().filter_map(|line| {
+        line.strip_prefix("data:")
+            .map(|line| line.strip_prefix(' ').unwrap_or(line))
+    });
+    let Some(first) = lines.next() else {
+        return false;
+    };
+    // Most events have one data line: borrow it instead of allocating a
+    // Vec and joined String on every output observation.
+    let folded;
+    let data = if let Some(second) = lines.next() {
+        folded = std::iter::once(first)
+            .chain(std::iter::once(second))
+            .chain(lines)
+            .collect::<Vec<_>>()
+            .join("\n");
+        folded.as_str()
+    } else {
+        first
+    };
+    let Ok(value) = serde_json::from_str::<Value>(data) else {
         return false;
     };
     match value.get("type").and_then(Value::as_str) {
@@ -181,6 +193,59 @@ mod tests {
         assert_eq!(timing.finish(true), (Some(100), None));
         timing.observe(b"data: {}\n\n", true, 900);
         assert_eq!(timing.finish(true), (Some(100), Some(100)));
+    }
+
+    #[test]
+    fn late_usage_done_and_post_terminal_content_do_not_extend_output_window() {
+        let mut timing = OutputTiming::default();
+        timing.observe(
+            b"data: {\"choices\":[{\"delta\":{\"content\":\"x\"}}]}\n\n",
+            false,
+            10,
+        );
+        // A Chat frame may contain both the final content and finish marker.
+        timing.observe(
+            b"data: {\"choices\":[{\"delta\":{\"content\":\"y\"},\"finish_reason\":\"stop\"}]}\n\n",
+            true,
+            30,
+        );
+        timing.observe(
+            b"data: {\"usage\":{\"completion_tokens\":40}}\n\n",
+            false,
+            500,
+        );
+        timing.observe(b"data: [DONE]\n\n", true, 900);
+        timing.observe(
+            b"data: {\"choices\":[{\"delta\":{\"content\":\"z\"}}]}\n\n",
+            false,
+            1000,
+        );
+        assert_eq!(timing.finish(true), (Some(10), Some(20)));
+    }
+
+    #[test]
+    fn heartbeats_and_comments_are_not_output_but_folded_data_is() {
+        let mut timing = OutputTiming::default();
+        timing.observe(b": heartbeat\n\n", false, 1);
+        timing.observe(b"data: {}\n\n", false, 2);
+        timing.observe(
+            b"data: {\"type\":\"content_block_delta\",\n data: ignored\n",
+            false,
+            3,
+        );
+        assert_eq!(timing.finish(true), (None, None));
+        timing.observe(
+            b"data: {\"type\":\"content_block_delta\",\ndata: \"delta\":{\"thinking\":\"x\"}}\n\n",
+            false,
+            10,
+        );
+        timing.observe(
+            b"data: {\"type\":\"content_block_delta\",\"delta\":{\"partial_json\":\"{}\"}}\n\n",
+            false,
+            20,
+        );
+        timing.observe(b"data: [DONE]\n\n", true, 30);
+        assert_eq!(timing.finish(true), (Some(10), Some(10)));
     }
 
     #[test]
