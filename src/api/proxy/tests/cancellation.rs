@@ -85,6 +85,7 @@ pub(super) async fn assert_unknown_request_state(
                  o.completed_at AS operational_completed, o.stage AS operational_stage, \
                  (SELECT COUNT(*) FROM ledger_entries l WHERE l.source = q.reservation_id) AS ledger_count, \
                  (SELECT COUNT(*) FROM request_events e WHERE e.request_id = q.id AND e.event_kind = 'finished') AS event_count, \
+                 (SELECT COUNT(*) FROM request_events e WHERE e.request_id = q.id AND e.tenant_id = q.tenant_id AND e.key_id = q.key_id AND e.event_kind = 'finished' AND e.status_code = o.status_code AND e.event_at = o.completed_at) AS operational_event_count, \
                  (SELECT COUNT(*) FROM request_stats_facts f WHERE f.request_id = q.id) AS fact_count, \
                  (SELECT COUNT(*) FROM conversation_observations o WHERE o.request_id = q.id) AS observation_count \
                  FROM request_records q JOIN usage_reservations r ON r.id = q.reservation_id \
@@ -124,9 +125,13 @@ pub(super) async fn assert_unknown_request_state(
                 assert_eq!(row.get::<Option<String>, _>("receipt_id"), None);
                 assert_eq!(row.get::<Option<String>, _>("receipt_digest"), None);
                 assert_eq!(row.get::<Option<i64>, _>("cost_micros"), None);
-                for field in ["ledger_count", "event_count", "fact_count", "observation_count"] {
+                for field in ["ledger_count", "fact_count", "observation_count"] {
                     assert_eq!(row.get::<i64, _>(field), 0, "{field}");
                 }
+                // Operational completion is published once even while billing
+                // remains unknown; it is not a financial settlement receipt.
+                assert_eq!(row.get::<i64, _>("event_count"), 1);
+                assert_eq!(row.get::<i64, _>("operational_event_count"), 1);
                 let records = state.db.list_requests(key_id, 10).await.unwrap();
                 let record = records.iter().find(|record| record.request_id == request_id).unwrap();
                 assert_eq!(record.status_code, row.get::<Option<i64>, _>("operational_status"));
