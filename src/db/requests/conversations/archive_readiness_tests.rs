@@ -940,14 +940,33 @@ impl Fixture {
             .await
             .unwrap();
         let terminal_owner = Uuid::now_v7();
-        assert!(
-            state
-                .db
-                .claim_terminal_projection_tasks(terminal_owner, 32)
-                .await
-                .unwrap()
-                .contains(&request_id)
-        );
+        let terminal_claims = state
+            .db
+            .claim_terminal_projection_tasks(terminal_owner, 32)
+            .await
+            .unwrap();
+        if !terminal_claims.contains(&request_id) {
+            let probe = async {
+                let row = sqlx::query("SELECT projected_at, account_projected_at, attempts, lease_owner, lease_expires_at FROM terminal_projection_outbox WHERE request_id=$1")
+                    .bind(request_id.to_string()).fetch_optional(&state.db.pool).await?;
+                row.map(|r| -> Result<_, sqlx::Error> {
+                    Ok((
+                        r.try_get::<Option<i64>, _>("projected_at")?,
+                        r.try_get::<Option<i64>, _>("account_projected_at")?,
+                        r.try_get::<i64, _>("attempts")?,
+                        r.try_get::<Option<String>, _>("lease_owner")?,
+                        r.try_get::<Option<i64>, _>("lease_expires_at")?,
+                    ))
+                })
+                .transpose()
+            };
+            let state = tokio::time::timeout(std::time::Duration::from_secs(1), probe).await;
+            eprintln!(
+                "fixture terminal claim missing: state={state:?}, claimed_count={}",
+                terminal_claims.len()
+            );
+        }
+        assert!(terminal_claims.contains(&request_id));
         assert!(
             state
                 .db
@@ -1072,6 +1091,13 @@ impl Fixture {
     }
 
     async fn assert_completed_by(&self, owner: Uuid, assistant: bool) {
+        let events_before: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM request_events WHERE request_id=$1 AND event_kind='projected'",
+        )
+        .bind(self.request_id.to_string())
+        .fetch_one(&self.state.db.pool)
+        .await
+        .unwrap();
         assert!(
             crate::worker::archive_session_body(&self.state, owner, self.request_id)
                 .await
@@ -1109,7 +1135,10 @@ impl Fixture {
         );
         let events: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM request_events WHERE request_id = $1 AND event_kind = 'projected'")
             .bind(self.request_id.to_string()).fetch_one(&self.state.db.pool).await.unwrap();
-        assert_eq!(events, 1);
+        assert_eq!(
+            events, 1,
+            "fixture projected events before body={events_before}, after body={events}"
+        );
     }
 }
 
