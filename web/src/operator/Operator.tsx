@@ -129,7 +129,7 @@ export function Operator({ route, onRouteChange, onPluginNavigation, navigationC
   }
   const activeRequestFilters = requestFilters.scope === filterScope ? requestFilters : { scope: filterScope, ast: emptyTypedFilterAst, revision: requestFilters.revision + 1 };
   function applyRequestFilters(ast: TypedFilterAst) {
-    if (ast.conditions.length === 0) clearRequestFilterReload();
+    clearRequestFilterReload();
     setRequestFilters(current => ({ scope: filterScope, ast, revision: current.revision + 1 }));
   }
   useEffect(() => {

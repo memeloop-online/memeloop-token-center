@@ -2,12 +2,41 @@ import assert from 'node:assert/strict';
 import { readFile } from 'node:fs/promises';
 import test from 'node:test';
 import { decodeTypedFilterAst } from '../src/operator/typedFilterContract.js';
+import { rememberRequestFilterReload } from '../src/operator/requestFilterReload.js';
+import { operatorLoginCycleStorageKey } from '../src/credentialStorage.js';
 
 const builder = await readFile(new URL('../src/operator/TypedFilterBuilder.tsx', import.meta.url), 'utf8');
 const contract = await readFile(new URL('../src/operator/typedFilterContract.ts', import.meta.url), 'utf8');
 const requests = await readFile(new URL('../src/operator/pages/RequestsPage.tsx', import.meta.url), 'utf8');
 const settings = await readFile(new URL('../src/operator/pages/SystemSettingsPage.tsx', import.meta.url), 'utf8');
 const catalog = await readFile(new URL('../src/operator/modelCatalog.ts', import.meta.url), 'utf8');
+
+test('a failed snapshot write removes the previous applied filter', () => {
+  const original = Object.getOwnPropertyDescriptor(globalThis, 'window');
+  const values = new Map<string, string>();
+  let blocked = false;
+  Object.defineProperty(globalThis, 'window', { configurable: true, value: {
+    localStorage: { getItem: (key: string) => key === operatorLoginCycleStorageKey ? 'synthetic-cycle' : null },
+    sessionStorage: {
+      setItem: (key: string, value: string) => { if (blocked) throw new Error('synthetic quota exceeded'); values.set(key, value); },
+      removeItem: (key: string) => { values.delete(key); },
+    },
+  } });
+  try {
+    const ast = decodeTypedFilterAst({ logical_operator: 'and', conditions: [{ field: 'model', operator: 'equals', value: { type: 'model', value: 'synthetic-model' } }] });
+    assert.ok(ast);
+    rememberRequestFilterReload({ cycle: 'synthetic-cycle', tenant: 'synthetic-tenant', ast });
+    assert.equal(values.size, 1);
+    blocked = true;
+    rememberRequestFilterReload({ cycle: 'synthetic-cycle', tenant: 'synthetic-tenant', ast: {
+      logical_operator: 'and', conditions: [{ field: 'model', operator: 'equals', value: { type: 'model', value: 'synthetic-replacement-model' } }],
+    } });
+    assert.equal(values.size, 0, 'a reload must not silently replay the old filter after a quota failure');
+  } finally {
+    if (original) Object.defineProperty(globalThis, 'window', original);
+    else Reflect.deleteProperty(globalThis, 'window');
+  }
+});
 
 test('professional request filters are schema-backed, previewed, and bound to public model routes', () => {
   assert.match(builder, /role="dialog"/);

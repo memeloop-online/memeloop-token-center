@@ -36,5 +36,5 @@ export function rememberRequestFilterReload(snapshot: RequestFilterReload) {
   if (!isOperatorLoginCycleCurrent(snapshot.cycle)) return;
   if (snapshot.ast.conditions.length === 0) { clearRequestFilterReload(); return; }
   try { window.sessionStorage.setItem(storageKey, JSON.stringify({ v: 1, ...snapshot })); }
-  catch { /* A blocked store does not prevent applying a filter. */ }
+  catch { clearRequestFilterReload(); }
 }

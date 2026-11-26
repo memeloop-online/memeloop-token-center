@@ -20,7 +20,7 @@ declare global {
       holdNextQuery: boolean;
       releaseLateQuery: (failed: boolean) => void;
       authPending: boolean;
-      releaseTenants: (tenants?: string[]) => void;
+      releaseTenants: (tenants?: string[], status?: number) => void;
     };
   }
 }
@@ -41,7 +41,7 @@ test('hard reload restores applied filters only after current login and tenant r
   assert.ok(address && typeof address !== 'string');
   const browser = await chromium.launch({ executablePath, headless: true });
   try {
-    for (const boundary of ['tenant', 'logout'] as const) {
+    for (const boundary of ['tenant', 'logout', 'revoked-401', 'revoked-403', 'failed-candidate'] as const) {
       const page = await browser.newPage();
       await page.addInitScript(() => localStorage.setItem('mtc-locale', 'en'));
       await page.goto(`http://127.0.0.1:${address.port}/e2e/fixtures/operator-overview-drilldown.html?filter-state=1&reload-filter=1&initial-requests=1`);
@@ -65,14 +65,37 @@ test('hard reload restores applied filters only after current login and tenant r
         await page.waitForFunction(() => window.overviewDrilldownFixture.authPending);
         assert.equal(await page.evaluate(() => window.overviewDrilldownFixture.requestQueryBodies.length), 0);
         await page.evaluate(() => window.overviewDrilldownFixture.releaseTenants(['second-tenant']));
-      } else {
-        await page.evaluate(() => window.overviewDrilldownFixture.openAccess());
-        await page.getByRole('button', { name: 'Clear credential', exact: true }).click();
+      } else if (boundary === 'revoked-401' || boundary === 'revoked-403') {
+        await page.reload();
+        await page.waitForFunction(() => window.overviewDrilldownFixture.authPending);
+        await page.evaluate(status => window.overviewDrilldownFixture.releaseTenants(undefined, status), boundary === 'revoked-401' ? 401 : 403);
+        await page.getByRole('button', { name: 'Connect', exact: true }).waitFor();
+        assert.equal(await page.evaluate(() => window.overviewDrilldownFixture.requestQueryBodies.length), 0, 'a revoked identity cannot issue the cached query');
         await page.getByRole('textbox', { name: 'Service credential', exact: true }).fill('mts_overview_drilldown_fixture');
         await page.getByRole('button', { name: 'Connect', exact: true }).click();
         await page.waitForFunction(() => window.overviewDrilldownFixture.authPending);
         await page.evaluate(() => window.overviewDrilldownFixture.releaseTenants());
-        await page.getByText('Connected', { exact: true }).waitFor();
+      } else {
+        await page.evaluate(() => window.overviewDrilldownFixture.openAccess());
+        if (boundary === 'logout') {
+          await page.getByRole('button', { name: 'Clear credential', exact: true }).click();
+          await page.getByRole('textbox', { name: 'Service credential', exact: true }).fill('mts_overview_drilldown_fixture');
+          await page.getByRole('button', { name: 'Connect', exact: true }).click();
+          await page.waitForFunction(() => window.overviewDrilldownFixture.authPending);
+          await page.evaluate(() => window.overviewDrilldownFixture.releaseTenants());
+          await page.getByText('Connected', { exact: true }).waitFor();
+        } else {
+          await page.getByRole('textbox', { name: 'Service credential', exact: true }).fill('mts_synthetic_denied_replacement');
+          await page.getByRole('button', { name: 'Replace credential', exact: true }).click();
+          await page.waitForFunction(() => window.overviewDrilldownFixture.authPending);
+          await page.evaluate(() => window.overviewDrilldownFixture.releaseTenants(undefined, 403));
+          await page.getByRole('alert').filter({ hasText: 'synthetic scope denied' }).waitFor();
+          await page.evaluate(() => window.overviewDrilldownFixture.openOverview());
+          const nextChart = page.locator('.overview-trend-card').first();
+          await nextChart.getByRole('tab', { name: 'Data', exact: true }).click();
+          await nextChart.locator('.overview-trend-data tbody button').nth(1).click();
+          await page.getByText('drilled-model', { exact: true }).waitFor();
+        }
         await page.reload();
         await page.waitForFunction(() => window.overviewDrilldownFixture.authPending);
         assert.equal(await page.evaluate(() => window.overviewDrilldownFixture.requestQueryBodies.length), 0);

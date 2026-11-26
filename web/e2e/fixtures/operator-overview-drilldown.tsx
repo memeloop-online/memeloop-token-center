@@ -25,7 +25,7 @@ declare global {
       holdNextQuery: boolean;
       releaseLateQuery: (failed: boolean) => void;
       authPending: boolean;
-      releaseTenants: (tenants?: string[]) => void;
+      releaseTenants: (tenants?: string[], status?: number) => void;
     };
   }
 }
@@ -112,9 +112,10 @@ globalThis.fetch = async (input: RequestInfo | URL, init?: RequestInit) => {
     if (holdReloadAuth) {
       window.overviewDrilldownFixture.authPending = true;
       return new Promise<Response>(resolve => {
-        window.overviewDrilldownFixture.releaseTenants = (allowed = tenants) => {
+        window.overviewDrilldownFixture.releaseTenants = (allowed = tenants, status = 200) => {
           window.overviewDrilldownFixture.authPending = false;
-          resolve(json(allowed.map(external_id => ({ external_id }))));
+          resolve(status === 200 ? json(allowed.map(external_id => ({ external_id })))
+            : json({ error: { message: 'synthetic scope denied' } }, status));
         };
       });
     }
