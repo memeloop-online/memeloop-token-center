@@ -69,6 +69,10 @@ async fn refresh_expiring_oauth(
     generation: i64,
     blocking: &BlockingTasks,
 ) -> Result<(), AppError> {
+    // Reuse the existing pool across claim, dispatch guard and result persistence.
+    let mut background = state.clone();
+    background.db = state.routing_persistence_db.clone();
+    let state = &background;
     let recovery_key = state
         .db
         .upstream_oauth_refresh_recovery_key(account_id, generation)
@@ -602,7 +606,7 @@ pub(crate) async fn run_until_shutdown_with_reaper_period(
             let refresh_before =
                 crate::db::unix_millis().saturating_add(OAUTH_REFRESH_AHEAD_MILLIS);
             match state
-                .db
+                .routing_persistence_db
                 .list_managed_oauth_refresh_candidates(refresh_before, 20)
                 .await
             {
