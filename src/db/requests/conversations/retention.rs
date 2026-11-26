@@ -4,7 +4,6 @@ use super::*;
 type Position = (i64, String);
 type Scan = (Option<Position>, Option<Position>);
 const PAGE: i64 = 32;
-const RECEIPT_BYTES: i64 = 8192;
 
 #[cfg(test)]
 tokio::task_local! {
@@ -85,8 +84,8 @@ impl Database {
                 visited += 1;
                 // Completed receipts are small. Oversized legacy snapshots stay
                 // protected, and are never fetched in full to test eligibility.
-                let candidate=sqlx::query("SELECT SUBSTR(COALESCE(p.semantic_snapshot_json,p.semantic_payload_snapshot_json),1,$4) AS receipt,o.leaf_node_hash FROM conversation_projection_outbox p JOIN conversation_observations o ON o.request_id=p.request_id JOIN conversation_clusters c ON c.id=o.cluster_id AND c.tenant_id=p.tenant_id AND c.key_id=p.key_id WHERE p.request_id=$1 AND p.tenant_id=$2 AND p.key_id=$3 AND p.statistics_outcome='session_body' AND p.lease_owner IS NULL AND p.lease_expires_at IS NULL AND p.terminal_lease_owner IS NULL AND p.terminal_lease_expires_at IS NULL AND LENGTH(COALESCE(p.semantic_snapshot_json,p.semantic_payload_snapshot_json))<=$4 AND o.leaf_node_hash IS NOT NULL")
-                    .bind(&request).bind(&tenant).bind(&key).bind(RECEIPT_BYTES).fetch_optional(&self.pool).await?;
+                let candidate=sqlx::query("SELECT SUBSTR(COALESCE(p.semantic_snapshot_json,p.semantic_payload_snapshot_json),1,8192) AS receipt,o.leaf_node_hash FROM conversation_projection_outbox p JOIN conversation_observations o ON o.request_id=p.request_id JOIN conversation_clusters c ON c.id=o.cluster_id AND c.tenant_id=p.tenant_id AND c.key_id=p.key_id WHERE p.request_id=$1 AND p.tenant_id=$2 AND p.key_id=$3 AND p.statistics_outcome='session_body' AND p.lease_owner IS NULL AND p.lease_expires_at IS NULL AND p.terminal_lease_owner IS NULL AND p.terminal_lease_expires_at IS NULL AND LENGTH(COALESCE(p.semantic_snapshot_json,p.semantic_payload_snapshot_json))<=8192 AND o.leaf_node_hash IS NOT NULL")
+                    .bind(&request).bind(&tenant).bind(&key).fetch_optional(&self.pool).await?;
                 let Some(candidate) = candidate else {
                     missing += 1;
                     continue;
