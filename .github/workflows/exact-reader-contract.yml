@@ -217,7 +217,7 @@ jobs:
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
         with:
-          ref: d1229a87e1f2d4b22483e8435bd0b12ef987e943
+          ref: 4a8b187c9d24c191c1cdef0d7629ac02159b4508
           persist-credentials: false
       - name: Record checked-out source
         run: git rev-parse HEAD
@@ -274,7 +274,7 @@ jobs:
           MTC_RUSTFS_TEST_SECRET_KEY: synthetic-test-only-secret-707
         run: |
           set -euo pipefail
-          test "$(git rev-parse HEAD)" = "d1229a87e1f2d4b22483e8435bd0b12ef987e943"
+          test "$(git rev-parse HEAD)" = "4a8b187c9d24c191c1cdef0d7629ac02159b4508"
           git rev-parse HEAD
           mkdir -p /tmp/native-release-evidence
           cargo test --locked --lib recovery_object_proxy::exact_delete_tests::exact_carrier_delete_fault_keeps_backend_host_query_and_neighbor_boundaries -- --exact --nocapture 2>&1 | tee /tmp/native-release-evidence/delete.log
@@ -285,7 +285,7 @@ jobs:
         if: always()
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
         with:
-          name: native-release-d122
+          name: native-release-4a8b
           path: /tmp/native-release-evidence/
           if-no-files-found: warn
           retention-days: 7
