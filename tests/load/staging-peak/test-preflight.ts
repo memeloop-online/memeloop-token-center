@@ -16,6 +16,10 @@ for (const [name, mutate] of Object.entries({
   "address family mismatch": (f: any) => { f.slice.endpoints[0].addresses = ["fd00::1"]; },
   "manual controller": (f: any) => { f.slice.metadata.labels["endpointslice.kubernetes.io/managed-by"] = "manual"; },
   "wrong port": (f: any) => { f.slice.ports[0].port = 9999; },
+  "both Service UIDs missing": (f: any) => { delete f.service.metadata.uid; delete f.slice.metadata.ownerReferences[0].uid; },
+  "both Service UIDs empty": (f: any) => { f.service.metadata.uid = ""; f.slice.metadata.ownerReferences[0].uid = ""; },
+  "both Pod UIDs missing": (f: any) => { delete f.pod.metadata.uid; delete f.slice.endpoints[0].targetRef.uid; },
+  "empty Pod name": (f: any) => { f.slice.endpoints[0].targetRef.name = ""; },
   "foreign Service UID": (f: any) => { f.slice.metadata.ownerReferences[0].uid = "foreign"; },
   "noncontroller owner": (f: any) => { f.slice.metadata.ownerReferences[0].controller = false; },
   "wrong protocol": (f: any) => { f.slice.ports[0].protocol = "UDP"; },
@@ -32,7 +36,7 @@ for (const [name, mutate] of Object.entries({
 function clusterFixture() {
   const f = fixture();
   f.slice.endpoints[0].targetRef.namespace = "memeloop-token-center-staging";
-  const meta = { clusterUid: "cluster", namespaceUid: "namespace", gatewaySelector: { app: "gateway" }, controlSelector: { app: "gateway" } };
+  const meta = { context: "fixture-context", clusterUid: "cluster", namespaceUid: "namespace", gatewaySelector: { app: "gateway" }, controlSelector: { app: "gateway" } };
   const services: any = { ...f.service, spec: { ...f.service.spec, ports: [{ port: 8080, protocol: "TCP" }] } };
   const resources = { slices: [f.slice] };
   const calls: string[][] = [];
@@ -50,6 +54,10 @@ function clusterFixture() {
 }
 test("verifies both services with read-only lookups", () => { const f = clusterFixture(); assert.deepEqual(f.check(), { gateway: 1, control: 1 }); assert.equal(f.calls.length, 8); });
 for (const [name, mutate] of Object.entries({
+  "missing cluster UID": (f: any) => { delete f.meta.clusterUid; },
+  "empty namespace UID": (f: any) => { f.meta.namespaceUid = ""; },
+  "missing context": (f: any) => { delete f.meta.context; },
+  "null context": (f: any) => { f.meta.context = null; },
   "cluster UID": (f: any) => { f.meta.clusterUid = "wrong"; },
   "namespace UID": (f: any) => { f.meta.namespaceUid = "wrong"; },
   "service selector": (f: any) => { f.meta.gatewaySelector = { app: "other" }; },

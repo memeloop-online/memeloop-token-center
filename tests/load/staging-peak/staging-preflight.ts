@@ -10,6 +10,9 @@ type ReadResource = (...args: string[]) => Resource;
 function requireIdentity(ok: unknown, message: string): asserts ok {
   if (!ok) throw new Error(message);
 }
+function identity(value: unknown): value is string {
+  return typeof value === "string" && value.length > 0;
+}
 function address(value: string): { family: number; canonical: string } {
   const family = isIP(value);
   requireIdentity(family !== 0, "invalid IP address");
@@ -19,6 +22,7 @@ function address(value: string): { family: number; canonical: string } {
   return { family, canonical: scope === undefined ? canonical : `${canonical}%${scope}` };
 }
 export function verifyEndpointSlice(item: Resource, service: Resource, namespace: string, podByName: (name: string) => Resource): number {
+  requireIdentity(identity(service.metadata.uid), "missing Service UID");
   requireIdentity(item.metadata.labels?.["endpointslice.kubernetes.io/managed-by"] === "endpointslice-controller.k8s.io", "untrusted EndpointSlice controller");
   requireIdentity(item.metadata.ownerReferences?.some((owner: Resource) => owner.kind === "Service" && owner.uid === service.metadata.uid && owner.controller === true), "foreign service owner");
   const ports = item.ports ?? [];
@@ -28,7 +32,7 @@ export function verifyEndpointSlice(item: Resource, service: Resource, namespace
   let count = 0;
   for (const endpoint of item.endpoints) {
     const ref = endpoint.targetRef ?? {};
-    requireIdentity(ref.kind === "Pod" && (ref.namespace === undefined ? namespace : ref.namespace) === namespace && ref.uid, "endpoint is not a namespaced pod");
+    requireIdentity(ref.kind === "Pod" && (ref.namespace === undefined ? namespace : ref.namespace) === namespace && identity(ref.uid) && identity(ref.name), "endpoint is not a namespaced pod");
     const pod = podByName(ref.name);
     requireIdentity(pod.metadata.uid === ref.uid, "pod uid mismatch");
     requireIdentity(Object.entries(service.spec.selector).every(([key, value]) => pod.metadata.labels?.[key] === value), "pod selector mismatch");
@@ -45,6 +49,7 @@ export function verifyEndpointSlice(item: Resource, service: Resource, namespace
   return count;
 }
 export function verifyStagingIdentities(meta: Resource, get: ReadResource): Record<string, number> {
+  requireIdentity(identity(meta.context) && identity(meta.clusterUid) && identity(meta.namespaceUid), "missing context or identity UID");
   const namespace = "memeloop-token-center-staging";
   requireIdentity(get("get", "namespace", "kube-system").metadata.uid === meta.clusterUid, "cluster UID mismatch");
   requireIdentity(get("get", "namespace", namespace).metadata.uid === meta.namespaceUid, "namespace UID mismatch");
