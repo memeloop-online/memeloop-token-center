@@ -26,7 +26,7 @@ jobs:
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
         with:
-          ref: 291c684beb44e20034b470fc19be7f29cd6e36bf
+          ref: 5217d0ab6e68a86bd2f8799e4173c4bfff307767
           persist-credentials: false
       - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020
         with:
@@ -53,7 +53,7 @@ jobs:
       - name: Verify one membership baseline and fixed session refresh contracts
         run: |
           set -euo pipefail
-          fixed=291c684beb44e20034b470fc19be7f29cd6e36bf
+          fixed=5217d0ab6e68a86bd2f8799e4173c4bfff307767
           base=68403da1c8f04e14e65e31df927ba19ac8ee2529
           test "$(git rev-parse HEAD)" = "$fixed"
           git fetch --no-tags origin "$base"
