@@ -2381,7 +2381,58 @@ async fn semantic_coverage_committed_recovery_contract(database_url: String) {
         );
         let authority_before = fixture.state.archive.semantic_archive_authority(
             fixture.key.tenant_id, fixture.request_id, &before.2).await.unwrap().unwrap();
-        assert_eq!(db.delete_durably_retired_conversation_outbox(100, i64::MAX).await.unwrap(), 1);
+        // The proof is deliberately paused before its original owner row
+        // fence. A claim, a new source/revision, or a changed row generation
+        // must invalidate deletion without losing its recovery obligation.
+        let original: (String, i64) = sqlx::query_as("SELECT COALESCE(semantic_snapshot_json,semantic_payload_snapshot_json),projected_at FROM conversation_projection_outbox WHERE request_id=$1")
+            .bind(fixture.request_id.to_string()).fetch_one(&db.pool).await.unwrap();
+        for mutation in ["claim", "source_revision", "row_generation", "leaf"] {
+            let gate = std::sync::Arc::new((tokio::sync::Notify::new(),tokio::sync::Notify::new()));
+            let deleting = super::retention::with_retention_fence_gate(gate.clone(), db.delete_durably_retired_conversation_outbox(100,i64::MAX));
+            let change = async {
+                gate.0.notified().await;
+                match mutation {
+                    "claim" => {
+                        sqlx::query("UPDATE conversation_projection_outbox SET lease_owner='session-body-rebuild',lease_expires_at=9223372036854775807 WHERE request_id=$1")
+                            .bind(fixture.request_id.to_string()).execute(&db.pool).await.unwrap();
+                    }
+                    "source_revision" => {
+                        let mut changed: serde_json::Value=serde_json::from_str(&original.0).unwrap();
+                        changed["semantic_coverage_pending"]["revision"]=serde_json::json!(authority_before.publication.revision+1);
+                        sqlx::query("UPDATE conversation_projection_outbox SET semantic_snapshot_json=$2 WHERE request_id=$1")
+                            .bind(fixture.request_id.to_string()).bind(changed.to_string()).execute(&db.pool).await.unwrap();
+                    }
+                    "row_generation" => {
+                        sqlx::query("UPDATE conversation_projection_outbox SET projected_at=projected_at+1 WHERE request_id=$1")
+                            .bind(fixture.request_id.to_string()).execute(&db.pool).await.unwrap();
+                    }
+                    "leaf" => {
+                        sqlx::query("UPDATE conversation_observations SET leaf_node_hash=$2 WHERE request_id=$1")
+                            .bind(fixture.request_id.to_string()).bind("0".repeat(64)).execute(&db.pool).await.unwrap();
+                    }
+                    _ => unreachable!(),
+                }
+                gate.1.notify_one();
+            };
+            let (deleted, ())=tokio::join!(deleting,change);
+            assert_eq!(deleted.unwrap(),0,"changed {mutation} must retain the row");
+            sqlx::query("UPDATE conversation_projection_outbox SET semantic_snapshot_json=$2,projected_at=$3,lease_owner=NULL,lease_expires_at=NULL WHERE request_id=$1")
+                .bind(fixture.request_id.to_string()).bind(&original.0).bind(original.1).execute(&db.pool).await.unwrap();
+            sqlx::query("UPDATE conversation_observations SET leaf_node_hash=$2 WHERE request_id=$1")
+                .bind(fixture.request_id.to_string()).bind(&before.2).execute(&db.pool).await.unwrap();
+        }
+        // Unknown old rows cannot starve a later proven row. Only metadata
+        // pages are retained between ticks, not their original snapshot bytes.
+        for _ in 0..35 {
+            sqlx::query("INSERT INTO conversation_projection_outbox(request_id,tenant_id,key_id,principal_id,request_json,hints_json,observed_at,key_snapshot_json,semantic_snapshot_json,projected_at,statistics_outcome) SELECT $1,tenant_id,key_id,principal_id,request_json,hints_json,observed_at,key_snapshot_json,$2,$3,statistics_outcome FROM conversation_projection_outbox WHERE request_id=$4")
+                .bind(Uuid::now_v7().to_string()).bind("x".repeat(16384)).bind(original.1-1).bind(fixture.request_id.to_string()).execute(&db.pool).await.unwrap();
+        }
+        let mut scan=(None,None);
+        let mut removed=0;
+        for _ in 0..4 {
+            removed+=db.delete_retired_outbox_page(10,i64::MAX,&mut scan).await.unwrap();
+        }
+        assert_eq!(removed,1,"metadata cursor must pass unknown heads and reach the proven row");
         let authority_after = fixture.state.archive.semantic_archive_authority(
             fixture.key.tenant_id, fixture.request_id, &before.2).await.unwrap().unwrap();
         assert_eq!(authority_before.publication.revision, authority_after.publication.revision);

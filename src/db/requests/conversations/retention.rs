@@ -6,6 +6,21 @@ type Scan = (Option<Position>, Option<Position>);
 const PAGE: i64 = 32;
 const RECEIPT_BYTES: i64 = 8192;
 
+#[cfg(test)]
+tokio::task_local! {
+    static BEFORE_FENCE: std::cell::RefCell<Option<std::sync::Arc<(tokio::sync::Notify, tokio::sync::Notify)>>>;
+}
+
+#[cfg(test)]
+pub(super) async fn with_retention_fence_gate<T>(
+    gate: std::sync::Arc<(tokio::sync::Notify, tokio::sync::Notify)>,
+    work: impl std::future::Future<Output = T>,
+) -> T {
+    BEFORE_FENCE
+        .scope(std::cell::RefCell::new(Some(gate)), work)
+        .await
+}
+
 impl Database {
     pub(crate) async fn delete_projected_conversation_outbox_page(
         &self,
@@ -25,7 +40,7 @@ impl Database {
             .await
     }
 
-    async fn delete_retired_outbox_page(
+    pub(super) async fn delete_retired_outbox_page(
         &self,
         limit: i64,
         cutoff: i64,
@@ -162,6 +177,15 @@ impl Database {
                 }
                 if !covered {
                     continue;
+                }
+                #[cfg(test)]
+                if let Some(gate) = BEFORE_FENCE
+                    .try_with(|slot| slot.borrow_mut().take())
+                    .ok()
+                    .flatten()
+                {
+                    gate.0.notify_one();
+                    gate.1.notified().await;
                 }
                 // The existing outbox row is the publisher/claim fence. Its
                 // generation is revalidated under the same row lock used by
