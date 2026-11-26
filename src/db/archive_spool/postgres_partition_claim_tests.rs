@@ -2,7 +2,7 @@
 use super::*;
 
 async fn locked_request_children(fixture: &PgFixture, pid: i32, indexes: bool) -> Vec<String> {
-    sqlx::query_scalar("SELECT DISTINCT c.relname FROM pg_locks l JOIN pg_class c ON c.oid=l.relation JOIN pg_namespace n ON n.oid=c.relnamespace WHERE l.pid=$1 AND l.granted AND n.nspname=$2 AND c.oid IN (SELECT relid FROM pg_partition_tree('request_records'::regclass) WHERE isleaf AND NOT $3 UNION ALL SELECT i.indexrelid FROM pg_index i JOIN pg_partition_tree('request_records'::regclass) p ON p.relid=i.indrelid WHERE p.isleaf AND $3) ORDER BY c.relname")
+    sqlx::query_scalar("SELECT DISTINCT CAST(c.relname AS TEXT) AS relname FROM pg_locks l JOIN pg_class c ON c.oid=l.relation JOIN pg_namespace n ON n.oid=c.relnamespace WHERE l.pid=$1 AND l.granted AND n.nspname=$2 AND c.oid IN (SELECT relid FROM pg_partition_tree('request_records'::regclass) WHERE isleaf AND NOT $3 UNION ALL SELECT i.indexrelid FROM pg_index i JOIN pg_partition_tree('request_records'::regclass) p ON p.relid=i.indrelid WHERE p.isleaf AND $3) ORDER BY c.relname")
         .bind(pid).bind(&fixture.schema).bind(indexes).fetch_all(&fixture.db.pool).await.unwrap()
 }
 
