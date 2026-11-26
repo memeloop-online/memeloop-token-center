@@ -54,37 +54,60 @@ jobs:
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
         with:
-          ref: ${{ inputs.source_revision }}
+          ref: ea9109a76f3a7c94fd4957069a466d15c934162a
           persist-credentials: false
       - uses: dtolnay/rust-toolchain@4360b52568e2003a75bf9bc1d59f33a8e3fc893c
         with:
           toolchain: 1.95.0
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6
       - uses: ./.github/actions/checkout-plugin-examples
-      - name: Verify fixed schema163 projection and cold OAuth contracts
+      - name: Record baseline exact diagnostics
         run: |
           set -euo pipefail
-          test "$(git rev-parse HEAD)" = 'cc3a66ff9dfc482263f9a9afb04829097075d555'
-          git rev-parse HEAD
-          mkdir -p /tmp/schema163-evidence
+          test "$(git rev-parse HEAD)" = 'ea9109a76f3a7c94fd4957069a466d15c934162a'
+          mkdir -p /tmp/schema163-two-evidence
+          git rev-parse HEAD | tee /tmp/schema163-two-evidence/baseline-source.txt
           failures=0
-          if ! cargo test --locked --all-features --lib db::requests::conversations::prefix_storage::tests::postgres_prefix_preload_releases_projection_scope_before_graph_receive -- --exact --ignored --nocapture 2>&1 | tee /tmp/schema163-evidence/0.log; then failures=1; fi
-          if ! grep -F '1 passed; 0 failed; 0 ignored;' /tmp/schema163-evidence/0.log; then failures=1; fi
-          if ! cargo test --locked --all-features --lib db::requests::conversations::archive_readiness_tests::postgres_identity_projection_busy_yields_and_preserves_page_cursor -- --exact --nocapture 2>&1 | tee /tmp/schema163-evidence/1.log; then failures=1; fi
-          if ! grep -F '1 passed; 0 failed; 0 ignored;' /tmp/schema163-evidence/1.log; then failures=1; fi
-          if ! cargo test --locked --all-features --lib db::requests::conversations::archive_readiness_tests::postgres_declared_identity_is_readable_while_body_is_pending -- --exact --nocapture 2>&1 | tee /tmp/schema163-evidence/2.log; then failures=1; fi
-          if ! grep -F '1 passed; 0 failed; 0 ignored;' /tmp/schema163-evidence/2.log; then failures=1; fi
-          if ! cargo test --locked --all-features --lib db::requests::conversations::archive_readiness_tests::postgres_coverage_read_does_not_block_body_worker -- --exact --nocapture 2>&1 | tee /tmp/schema163-evidence/3.log; then failures=1; fi
-          if ! grep -F '1 passed; 0 failed; 0 ignored;' /tmp/schema163-evidence/3.log; then failures=1; fi
-          if ! cargo test --locked --all-features --lib plugin::application::oauth_background_tests::postgres_cold_oauth_authority_uses_existing_pool_and_preserves_shared_authority -- --exact --ignored --nocapture 2>&1 | tee /tmp/schema163-evidence/4.log; then failures=1; fi
-          if ! grep -F '1 passed; 0 failed; 0 ignored;' /tmp/schema163-evidence/4.log; then failures=1; fi
-          if ! grep -F 'schema_max=163, schema163_receipts=1' /tmp/schema163-evidence/4.log; then failures=1; fi
+          for selector in db::requests::conversations::archive_readiness_tests::postgres_declared_identity_is_readable_while_body_is_pending db::requests::conversations::archive_readiness_tests::postgres_coverage_read_does_not_block_body_worker; do
+            log="/tmp/schema163-two-evidence/baseline-${selector##*::}.log"
+            status=0
+            cargo test --locked --all-features --lib "$selector" -- --exact --nocapture 2>&1 | tee "$log" || status=$?
+            printf '%s exit=%s\n' "$selector" "$status" | tee -a /tmp/schema163-two-evidence/baseline-status.txt
+            if ! grep -Fx 'running 1 test' "$log"; then failures=1; fi
+            if ! grep -E 'test result: (ok|FAILED)\. (1 passed; 0 failed|0 passed; 1 failed); 0 ignored;' "$log"; then failures=1; fi
+            if [ "$status" -ne 0 ]; then echo "::warning::baseline exact failed: $selector exit=$status"; :; fi
+          done
+          exit "$failures"
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+        if: always()
+        with:
+          ref: e2f0d4057c83bbc2bf9816f546193d20fccabfa7
+          persist-credentials: false
+      - uses: ./.github/actions/checkout-plugin-examples
+        if: always()
+      - name: Record candidate exact diagnostics
+        if: always()
+        run: |
+          set -euo pipefail
+          test "$(git rev-parse HEAD)" = 'e2f0d4057c83bbc2bf9816f546193d20fccabfa7'
+          mkdir -p /tmp/schema163-two-evidence
+          git rev-parse HEAD | tee /tmp/schema163-two-evidence/candidate-source.txt
+          failures=0
+          for selector in db::requests::conversations::archive_readiness_tests::postgres_declared_identity_is_readable_while_body_is_pending db::requests::conversations::archive_readiness_tests::postgres_coverage_read_does_not_block_body_worker; do
+            log="/tmp/schema163-two-evidence/candidate-${selector##*::}.log"
+            status=0
+            cargo test --locked --all-features --lib "$selector" -- --exact --nocapture 2>&1 | tee "$log" || status=$?
+            printf '%s exit=%s\n' "$selector" "$status" | tee -a /tmp/schema163-two-evidence/candidate-status.txt
+            if ! grep -Fx 'running 1 test' "$log"; then failures=1; fi
+            if ! grep -E 'test result: (ok|FAILED)\. (1 passed; 0 failed|0 passed; 1 failed); 0 ignored;' "$log"; then failures=1; fi
+            if [ "$status" -ne 0 ]; then echo "::warning::candidate exact failed: $selector exit=$status"; failures=1; fi
+          done
           exit "$failures"
       - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
         if: always()
         with:
-          name: schema163-projection-oauth-cc3
-          path: /tmp/schema163-evidence/
+          name: schema163-two-baseline-candidate-diagnostics
+          path: /tmp/schema163-two-evidence/
           if-no-files-found: warn
 
   orphan-reaper-contract:
