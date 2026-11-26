@@ -882,6 +882,11 @@ pub(crate) const SQLITE_MIGRATIONS: &[Migration] = &[
         name: "history_watermark_proof",
         sql: include_str!("../../../migrations/common/0165_history_watermark_proof.sql"),
     },
+    Migration {
+        version: 166,
+        name: "oauth_rejected_generation",
+        sql: include_str!("../../../migrations/common/0166_oauth_rejected_generation.sql"),
+    },
 ];
 
 pub(crate) const POSTGRES_MIGRATIONS: &[Migration] = &[
@@ -1729,6 +1734,11 @@ pub(crate) const POSTGRES_MIGRATIONS: &[Migration] = &[
         version: 165,
         name: "history_watermark_proof",
         sql: include_str!("../../../migrations/common/0165_history_watermark_proof.sql"),
+    },
+    Migration {
+        version: 166,
+        name: "oauth_rejected_generation",
+        sql: include_str!("../../../migrations/common/0166_oauth_rejected_generation.sql"),
     },
 ];
 

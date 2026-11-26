@@ -984,6 +984,9 @@ impl Database {
             ));
         }
         let generation: i64 = account.try_get("credential_generation")?;
+        if expected_generation.is_some() && account.try_get::<String, _>("status")? != "active" {
+            return Err(AppError::Conflict("OAuth account was disabled before automatic refresh".into()));
+        }
         if expected_generation.is_some_and(|expected| expected != generation) {
             return Err(AppError::Conflict(
                 "OAuth credential changed after automatic refresh was scheduled".into(),
@@ -1502,7 +1505,7 @@ impl Database {
         limit: i64,
     ) -> Result<Vec<(Uuid, i64)>, AppError> {
         let rows = sqlx::query(
-            "SELECT a.id, a.credential_generation FROM upstream_accounts a JOIN upstream_credentials c ON c.upstream_account_id = a.id AND c.generation = a.credential_generation AND c.revoked_at IS NULL WHERE a.status = 'active' AND a.auth_kind = 'oauth' AND a.oauth_session_id IS NOT NULL AND a.oauth_refresh_url IS NOT NULL AND a.driver <> 'cpa-gemini-oauth-legacy' AND c.expires_at IS NOT NULL AND c.expires_at <= $1 AND NOT EXISTS (SELECT 1 FROM upstream_oauth_refresh_leases l WHERE l.account_id = a.id AND l.credential_generation = a.credential_generation AND l.request_started_at IS NOT NULL AND l.pending_credential_ciphertext IS NULL) ORDER BY c.expires_at, a.id LIMIT $2",
+            "SELECT a.id, a.credential_generation FROM upstream_accounts a JOIN upstream_credentials c ON c.upstream_account_id = a.id AND c.generation = a.credential_generation AND c.revoked_at IS NULL WHERE a.status = 'active' AND a.auth_kind = 'oauth' AND a.oauth_session_id IS NOT NULL AND a.oauth_refresh_url IS NOT NULL AND a.driver <> 'cpa-gemini-oauth-legacy' AND ((c.expires_at IS NOT NULL AND c.expires_at <= $1) OR EXISTS (SELECT 1 FROM upstream_oauth_rejected_generations r WHERE r.upstream_account_id = a.id AND r.credential_generation = a.credential_generation)) AND NOT EXISTS (SELECT 1 FROM upstream_oauth_refresh_leases l WHERE l.account_id = a.id AND l.credential_generation = a.credential_generation AND l.request_started_at IS NOT NULL AND l.pending_credential_ciphertext IS NULL) ORDER BY c.expires_at, a.id LIMIT $2",
         )
         .bind(refresh_before)
         .bind(limit)
@@ -1516,6 +1519,27 @@ impl Database {
                 ))
             })
             .collect()
+    }
+
+    pub(crate) async fn observe_rejected_oauth_generation(
+        &self,
+        account_id: Uuid,
+        generation: i64,
+    ) -> Result<(), AppError> {
+        sqlx::query("INSERT INTO upstream_oauth_rejected_generations (upstream_account_id, credential_generation, observed_at) SELECT a.id, a.credential_generation, $3 FROM upstream_accounts a JOIN upstream_credentials c ON c.upstream_account_id=a.id AND c.generation=a.credential_generation WHERE a.id=$1 AND a.credential_generation=$2 AND a.status='active' AND a.auth_kind='oauth' AND a.oauth_session_id IS NOT NULL AND a.oauth_refresh_url IS NOT NULL AND c.revoked_at IS NULL ON CONFLICT (upstream_account_id) DO UPDATE SET credential_generation=excluded.credential_generation, observed_at=excluded.observed_at WHERE upstream_oauth_rejected_generations.credential_generation < excluded.credential_generation")
+            .bind(account_id.to_string()).bind(generation).bind(unix_millis())
+            .execute(&self.pool).await?;
+        Ok(())
+    }
+
+    pub(crate) async fn has_rejected_oauth_generation(
+        &self,
+        account_id: Uuid,
+        generation: i64,
+    ) -> Result<bool, AppError> {
+        Ok(sqlx::query("SELECT 1 FROM upstream_oauth_rejected_generations WHERE upstream_account_id=$1 AND credential_generation=$2")
+            .bind(account_id.to_string()).bind(generation)
+            .fetch_optional(&self.pool).await?.is_some())
     }
     #[allow(clippy::too_many_arguments)]
     async fn rotate_upstream_credential_claimed(

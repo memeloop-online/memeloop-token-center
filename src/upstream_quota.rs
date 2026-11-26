@@ -788,7 +788,7 @@ impl QuotaCache {
                 "kimi-oauth" => {
                     kimi::read(state, account, credential, empty(None), trigger, &session).await
                 }
-                "cursor" => cursor::read(state, credential, empty(None)).await,
+                "cursor" => cursor::read(state, account, credential, empty(None)).await,
                 _ => read_codex(state, account, credential, empty(None), trigger, &session).await,
             }
         })
@@ -1255,6 +1255,12 @@ async fn get_codex_json_with_routes(
                     retry::Failure::transport(error)
                 }
             })?;
+            session.observe_bearer_rejection(
+                context, response.status(),
+                auth.credential_header == http::header::AUTHORIZATION
+                    && auth.credential_value.as_bytes().get(..7)
+                        .is_some_and(|prefix| prefix.eq_ignore_ascii_case(b"Bearer ")),
+            ).await;
             if let Some(failure) =
                 retry::Failure::status(response.status().as_u16(), response.headers())
             {

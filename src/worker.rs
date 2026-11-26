@@ -619,6 +619,19 @@ pub(crate) async fn run_until_shutdown_with_reaper_period(
                                 .await
                         {
                             tracing::warn!(%error, %account_id, "worker failed to refresh managed OAuth credential");
+                        } else if state.db.has_rejected_oauth_generation(account_id, generation).await.unwrap_or(false) {
+                            // Reload the committed generation, never replay the rejected
+                            // credential or publish its stale quota observation.
+                            if let Ok((account, credential)) = state.db.upstream_account_with_credential(
+                                account_id, state.config.key_pepper.as_bytes(),
+                            ).await
+                                && account.status == "active"
+                                && account.credential_generation > generation
+                                && let Some(tenant) = account.tenant_external_id.as_deref()
+                            {
+                                state.upstream_quota.read_fresh(state, &account, &credential,
+                                    tenant, crate::upstream_quota::QuotaReadTrigger::BackgroundRecovery).await;
+                            }
                         }
                     }
                 }

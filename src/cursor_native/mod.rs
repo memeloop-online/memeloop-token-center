@@ -33,6 +33,26 @@ pub(crate) async fn unary(
     credential: &UpstreamCredential,
     method: Method,
 ) -> Result<Vec<u8>, &'static str> {
+    unary_with_rejection(state, credential, method, None).await
+}
+
+/// Only the main usage RPC can supply quota-triggered renewal evidence.
+/// Optional plan/model RPCs retain the existing read-only error contract.
+pub(crate) async fn quota_usage(
+    state: &AppState,
+    credential: &UpstreamCredential,
+    account: &crate::provider::UpstreamAccountView,
+) -> Result<Vec<u8>, &'static str> {
+    unary_with_rejection(state, credential, Method::CurrentPeriodUsage,
+        Some((account.id, account.credential_generation))).await
+}
+
+async fn unary_with_rejection(
+    state: &AppState,
+    credential: &UpstreamCredential,
+    method: Method,
+    rejection: Option<(uuid::Uuid, i64)>,
+) -> Result<Vec<u8>, &'static str> {
     let now = chrono::Utc::now().timestamp_millis();
     credential.validate(now).map_err(|_| "credential_invalid")?;
     crate::oauth::cursor_account_id(credential).map_err(|_| "credential_invalid")?;
@@ -43,18 +63,29 @@ pub(crate) async fn unary(
         network::client_for_oauth_url_no_retry(&state.http, BACKEND, credential.proxy(), false)
             .await
             .map_err(|_| "destination_invalid")?;
-    send(
+    send_with_rejection(
         &client,
         &format!("{BACKEND}{}", method.path()),
         access_token,
+        rejection.map(|(id, generation)| (&state.db, id, generation)),
     )
     .await
 }
 
+#[cfg(test)]
 async fn send(
     client: &reqwest::Client,
     url: &str,
     access_token: &str,
+) -> Result<Vec<u8>, &'static str> {
+    send_with_rejection(client, url, access_token, None).await
+}
+
+async fn send_with_rejection(
+    client: &reqwest::Client,
+    url: &str,
+    access_token: &str,
+    rejection: Option<(&crate::db::Database, uuid::Uuid, i64)>,
 ) -> Result<Vec<u8>, &'static str> {
     let mut authorization =
         reqwest::header::HeaderValue::from_str(&format!("Bearer {access_token}"))
@@ -77,6 +108,13 @@ async fn send(
         .await
         .map_err(|_| "connection_failed")?;
     let status = response.status();
+    if status == reqwest::StatusCode::UNAUTHORIZED
+        && let Some((db, account_id, generation)) = rejection
+        && let Err(error) = db.observe_rejected_oauth_generation(account_id, generation).await
+    {
+        tracing::warn!(upstream_account_id = %account_id, credential_generation = generation,
+            error_category = error.diagnostic_category(), "supplier OAuth rejection evidence could not be recorded");
+    }
     if status.is_redirection() {
         return Err("redirect_rejected");
     }
