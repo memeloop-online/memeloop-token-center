@@ -344,7 +344,7 @@ async fn credited_long_response_preserves_opportunistic_spill_above_source_capac
 #[ignore = "requires isolated RustFS fixture"]
 async fn request_capture_eof_does_not_join_owned_put_when_retained_credit_wakes() {
     use recovery_proxy::RecoveryObjectProxy;
-    for lose_ack in [false, true] {
+    for (lose_ack, cancel_capture) in [(false, false), (true, false), (false, true)] {
         let proxy =
             RecoveryObjectProxy::start(&std::env::var("MTC_RUSTFS_TEST_ENDPOINT").unwrap()).await;
         let mut config = crate::config::Config::for_test("sqlite::memory:".into());
@@ -387,6 +387,19 @@ async fn request_capture_eof_does_not_join_owned_put_when_retained_credit_wakes(
             .unwrap();
         assert!(!capture.is_finished());
         assert_eq!(persistence.pending_archives_for_test(), 1);
+        if cancel_capture {
+            capture.abort();
+            assert!(capture.await.unwrap_err().is_cancelled());
+            assert_eq!(persistence.pending_archives_for_test(), 1);
+            assert_eq!(proxy.counts().get("body_put"), Some(&1));
+            drop(outside);
+            put.release();
+            persistence.drain_for_test().await;
+            assert_eq!(memory.snapshot().0, 0);
+            assert_eq!(persistence.pending_archives_for_test(), 0);
+            assert_eq!(proxy.counts().get("body_put"), Some(&1));
+            continue;
+        }
         drop(outside);
         let source = tokio::time::timeout(std::time::Duration::from_secs(5), capture)
             .await
