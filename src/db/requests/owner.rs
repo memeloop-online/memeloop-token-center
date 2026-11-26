@@ -35,7 +35,7 @@ impl Database {
         } else {
             ""
         };
-        if self.backend == DatabaseBackend::Sqlite {
+        if matches!(self.backend, DatabaseBackend::Sqlite) {
             let partition = created_at
                 .map(|value| format!(" AND created_at={value}"))
                 .unwrap_or_default();
