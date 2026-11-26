@@ -8,6 +8,9 @@ async fn stage165_prepare_reviewed_exact_fixture() {
     let directory = std::path::PathBuf::from(
         std::env::var("MTC_STAGE_EXACT_INPUT_DIR").expect("fixed Stage input directory"),
     );
+    let run_uid =
+        Uuid::parse_str(&std::env::var("MTC_STAGE_EXACT_RUN_UID").expect("run-owned fixture UID"))
+            .unwrap();
     let output = directory.join("prepared");
     std::fs::create_dir(&output).expect("a fixture intent must never be overwritten");
     let request = std::fs::read(directory.join("request.json")).unwrap();
@@ -24,6 +27,10 @@ async fn stage165_prepare_reviewed_exact_fixture() {
         config.archive_backend,
         crate::config::ArchiveBackend::S3
     ));
+    assert!(
+        config.training_s3.is_none(),
+        "fixture cannot borrow another object backend"
+    );
     config.run_migrations_on_start = false;
     let check = Database::connect(&config.database_url).await.unwrap();
     let database: String = sqlx::query_scalar("SELECT current_database()::text")
@@ -120,8 +127,8 @@ async fn stage165_prepare_reviewed_exact_fixture() {
     .unwrap();
     let empty_decoded: ConversationSemanticSnapshot = serde_json::from_str(&empty).unwrap();
     assert!(empty_semantic_snapshot(&empty_decoded));
-    let initialized=sqlx::query("UPDATE conversation_projection_outbox SET semantic_snapshot_json=NULL,lease_owner=NULL WHERE request_id=$1 AND tenant_id=$2 AND key_id=$3 AND projected_at IS NULL AND attempts=0 AND semantic_snapshot_json=$4 AND semantic_payload_snapshot_json IS NULL AND lease_owner='terminal-v118' AND lease_expires_at=9223372036854775807 AND terminal_lease_owner IS NULL AND terminal_lease_expires_at IS NULL AND NOT EXISTS(SELECT 1 FROM conversation_observations WHERE request_id=$1)")
-        .bind(fixture.request_id.to_string()).bind(fixture.key.tenant_id.to_string()).bind(fixture.key.key_id.to_string()).bind(&empty).execute(&db.pool).await.unwrap().rows_affected();
+    let initialized=sqlx::query("UPDATE conversation_projection_outbox SET semantic_snapshot_json=NULL,lease_owner=NULL WHERE request_id=$1 AND tenant_id=$2 AND key_id=$3 AND projected_at IS NULL AND attempts=0 AND semantic_snapshot_json=$4 AND semantic_payload_snapshot_json IS NULL AND lease_owner='terminal-v118' AND lease_expires_at=9223372036854775807 AND terminal_lease_owner IS NULL AND terminal_lease_expires_at IS NULL AND NOT EXISTS(SELECT 1 FROM conversation_observations WHERE request_id=$1) AND EXISTS(SELECT 1 FROM request_records r WHERE r.id=$1 AND r.tenant_id=$2 AND r.key_id=$3 AND r.created_at=$5 AND r.request_object=$6 AND r.response_object=$7)")
+        .bind(fixture.request_id.to_string()).bind(fixture.key.tenant_id.to_string()).bind(fixture.key.key_id.to_string()).bind(&empty).bind(created).bind(&locators[0]).bind(&locators[1]).execute(&db.pool).await.unwrap().rows_affected();
     assert_eq!(initialized, 1);
     let owner = Uuid::now_v7();
     assert!(
@@ -166,7 +173,7 @@ async fn stage165_prepare_reviewed_exact_fixture() {
     let plan = serde_json::json!({"format_version":1,"tenant_id":fixture.key.tenant_id,"key_id":fixture.key.key_id,"request_id":fixture.request_id,"expected_projected_at":0,"request":source(0,&request),"response":source(1,&response)});
     let plan_bytes = serde_json::to_vec_pretty(&plan).unwrap();
     std::fs::write(output.join("plan.json"), &plan_bytes).unwrap();
-    let prior = serde_json::json!({"format_version":1,"identity":blake3::hash(&plan_bytes).to_hex().to_string(),"request_id":fixture.request_id,"claim_intent":true,"claimed":true,"lease_owner":owner,"canonical_rebuilt":false,"financial_replay":false,"fixture_only":true,"synthetic_empty_marker_normalized":true,"empty_snapshot_before":empty,"claim_method":"real_initial_exact_claim_after_synthetic_empty_marker_normalization","prepared_snapshot_sha256":format!("{:x}",Sha256::digest(snapshot.as_bytes())),"actual_lease_expires_at":expiry});
+    let prior = serde_json::json!({"format_version":1,"identity":blake3::hash(&plan_bytes).to_hex().to_string(),"request_id":fixture.request_id,"claim_intent":true,"claimed":true,"lease_owner":owner,"canonical_rebuilt":false,"financial_replay":false,"fixture_only":true,"fixture_run_uid":run_uid,"synthetic_empty_marker_normalized":true,"empty_snapshot_before":empty,"claim_method":"real_initial_exact_claim_after_synthetic_empty_marker_normalization","prepared_snapshot_sha256":format!("{:x}",Sha256::digest(snapshot.as_bytes())),"actual_lease_expires_at":expiry});
     std::fs::write(
         output.join("prior.json"),
         serde_json::to_vec_pretty(&prior).unwrap(),
