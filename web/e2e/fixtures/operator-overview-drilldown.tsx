@@ -21,8 +21,11 @@ declare global {
       route: OperatorRouteKey;
       openOverview: () => void;
       openRequests: () => void;
+      openAccess: () => void;
       holdNextQuery: boolean;
       releaseLateQuery: (failed: boolean) => void;
+      authPending: boolean;
+      releaseTenants: (tenants?: string[]) => void;
     };
   }
 }
@@ -38,7 +41,10 @@ const initialRequests = new URLSearchParams(location.search).has('initial-reques
 const sessionKey = '5dae9b5a-6bd0-54a7-ae14-fb5aa4f61650';
 const realSession = '00000000-0000-4000-8000-000000000002';
 
-window.overviewDrilldownFixture = { calls: [], requestQueryBodies: [], route: 'overview', openOverview: () => undefined, openRequests: () => undefined, holdNextQuery: false, releaseLateQuery: () => undefined };
+const holdReloadAuth = new URLSearchParams(location.search).has('reload-filter')
+  && (performance.getEntriesByType('navigation')[0] as PerformanceNavigationTiming | undefined)?.type === 'reload';
+
+window.overviewDrilldownFixture = { calls: [], requestQueryBodies: [], route: 'overview', openOverview: () => undefined, openRequests: () => undefined, openAccess: () => undefined, holdNextQuery: false, releaseLateQuery: () => undefined, authPending: false, releaseTenants: () => undefined };
 
 function json(value: unknown, status = 200) {
   return new Response(JSON.stringify(value), { status, headers: { 'Content-Type': 'application/json' } });
@@ -101,7 +107,19 @@ globalThis.fetch = async (input: RequestInfo | URL, init?: RequestInit) => {
   if (url.pathname === '/internal/v1/request-events') return new Response(new ReadableStream({
     start(controller) { controller.enqueue(new TextEncoder().encode(': fixture connected\n\n')); },
   }), { headers: { 'Content-Type': 'text/event-stream' } });
-  if (url.pathname === '/internal/v1/tenants') return json([{ external_id: tenant }, ...(new URLSearchParams(location.search).has('filter-state') ? [{ external_id: 'second-tenant' }] : [])]);
+  if (url.pathname === '/internal/v1/tenants') {
+    const tenants = [tenant, ...(new URLSearchParams(location.search).has('filter-state') ? ['second-tenant'] : [])];
+    if (holdReloadAuth) {
+      window.overviewDrilldownFixture.authPending = true;
+      return new Promise<Response>(resolve => {
+        window.overviewDrilldownFixture.releaseTenants = (allowed = tenants) => {
+          window.overviewDrilldownFixture.authPending = false;
+          resolve(json(allowed.map(external_id => ({ external_id }))));
+        };
+      });
+    }
+    return json(tenants.map(external_id => ({ external_id })));
+  }
   if (url.pathname === '/internal/v1/plugins') return json([]);
   if (url.pathname === '/internal/v1/usage-analysis/trends') return json(usageTrends);
   if (url.pathname === '/internal/v1/usage-analysis') return json(usageAnalysis);
@@ -180,6 +198,7 @@ globalThis.fetch = async (input: RequestInfo | URL, init?: RequestInit) => {
 function Fixture() {
   const [route, setRoute] = useState<OperatorRouteKey>(initialSessions ? 'sessions' : initialRequests ? 'requests' : usageSessions ? 'usage' : 'overview');
   window.overviewDrilldownFixture.openRequests = () => setRoute('requests');
+  window.overviewDrilldownFixture.openAccess = () => setRoute('system-settings');
   window.overviewDrilldownFixture.openOverview = () => setRoute(usageSessions ? 'usage' : 'overview');
   useEffect(() => { window.overviewDrilldownFixture.route = route; }, [route]);
   return <>

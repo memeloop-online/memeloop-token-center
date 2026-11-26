@@ -15,38 +15,7 @@ import type {
   UpstreamAccount,
 } from '../types';
 
-type BuilderScope = 'requests' | 'usage';
-type ValueType = TypedFilterValue['type'];
-
-interface FieldDefinition {
-  id: TypedFilterField;
-  type: ValueType;
-  usage: boolean;
-}
-
-const fields: FieldDefinition[] = [
-  { id: 'created_at', type: 'timestamp', usage: true },
-  { id: 'model', type: 'model', usage: true },
-  { id: 'key_id', type: 'uuid', usage: true },
-  { id: 'upstream_account_id', type: 'uuid', usage: true },
-  { id: 'protocol', type: 'protocol', usage: true },
-  { id: 'status', type: 'status', usage: true },
-  { id: 'error_code', type: 'text', usage: true },
-  { id: 'route_id', type: 'uuid', usage: false },
-  { id: 'duration_ms', type: 'integer', usage: false },
-  { id: 'cost_micros', type: 'money_micros', usage: false },
-  { id: 'key_alias', type: 'text', usage: true },
-  { id: 'principal', type: 'text', usage: false },
-  { id: 'session_association', type: 'text', usage: false },
-  { id: 'session_id', type: 'text', usage: false },
-  { id: 'client_session_id', type: 'text', usage: false },
-];
-
-const numericOperators: TypedFilterOperator[] = [
-  'equals', 'not_equals', 'greater_than', 'greater_than_or_equal', 'less_than', 'less_than_or_equal', 'between',
-];
-const textOperators: TypedFilterOperator[] = ['equals', 'not_equals', 'contains'];
-const exactOperators: TypedFilterOperator[] = ['equals', 'not_equals'];
+import { fields, operatorsFor, type BuilderScope, type FieldDefinition, type ValueType } from './typedFilterContract';
 
 export const emptyTypedFilterAst: TypedFilterAst = { logical_operator: 'and', conditions: [] };
 
@@ -85,14 +54,6 @@ function blankCondition(scope: BuilderScope): TypedFilterCondition {
     value: { type: 'timestamp', value: Date.now() - 86_400_000 },
     upper: { type: 'timestamp', value: Date.now() },
   };
-}
-
-function operatorsFor(field: FieldDefinition, scope: BuilderScope): TypedFilterOperator[] {
-  if (scope === 'usage') return field.id === 'created_at' ? ['between'] : ['equals'];
-  if (field.id === 'session_association' || field.id === 'session_id' || field.id === 'client_session_id') return exactOperators;
-  if (field.type === 'timestamp' || field.type === 'integer' || field.type === 'money_micros') return numericOperators;
-  if (field.type === 'text' || field.type === 'model') return textOperators;
-  return exactOperators;
 }
 
 function conditionLabel(condition: TypedFilterCondition, t: (key: string) => string) {

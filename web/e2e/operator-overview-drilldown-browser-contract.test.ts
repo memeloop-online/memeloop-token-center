@@ -16,8 +16,11 @@ declare global {
       route: string;
       openOverview: () => void;
       openRequests: () => void;
+      openAccess: () => void;
       holdNextQuery: boolean;
       releaseLateQuery: (failed: boolean) => void;
+      authPending: boolean;
+      releaseTenants: (tenants?: string[]) => void;
     };
   }
 }
@@ -25,6 +28,65 @@ declare global {
 const webRoot = fileURLToPath(new URL('..', import.meta.url));
 const fixtureNow = Date.UTC(2026, 8, 8, 12, 0, 0);
 const bucketStart = fixtureNow - 3_600_000;
+
+test('hard reload restores applied filters only after current login and tenant revalidation', { timeout: 60_000 }, async (context) => {
+  const executablePath = await localChromiumExecutable();
+  if (!executablePath) {
+    if (process.env.MTC_REQUIRE_BROWSER === '1') throw new Error('Chromium required');
+    return context.skip('Chromium required');
+  }
+  const server = await createServer({ root: webRoot, configFile: false, logLevel: 'silent', server: { host: '127.0.0.1', port: 0 } });
+  await server.listen();
+  const address = server.httpServer?.address();
+  assert.ok(address && typeof address !== 'string');
+  const browser = await chromium.launch({ executablePath, headless: true });
+  try {
+    for (const boundary of ['tenant', 'logout'] as const) {
+      const page = await browser.newPage();
+      await page.addInitScript(() => localStorage.setItem('mtc-locale', 'en'));
+      await page.goto(`http://127.0.0.1:${address.port}/e2e/fixtures/operator-overview-drilldown.html?filter-state=1&reload-filter=1&initial-requests=1`);
+      await page.waitForFunction(() => window.overviewDrilldownFixture.requestQueryBodies.length === 1);
+      await page.evaluate(() => window.overviewDrilldownFixture.openOverview());
+      const chart = page.locator('.overview-trend-card').first();
+      await chart.getByRole('tab', { name: 'Data', exact: true }).click();
+      await chart.locator('.overview-trend-data tbody button').first().click();
+      await page.getByText('drilled-model', { exact: true }).waitFor();
+      const applied = await page.evaluate(() => window.overviewDrilldownFixture.requestQueryBodies.at(-1));
+
+      await page.reload();
+      await page.waitForFunction(() => window.overviewDrilldownFixture.authPending);
+      assert.equal(await page.evaluate(() => window.overviewDrilldownFixture.requestQueryBodies.length), 0, 'reload cannot query requests before tenant revalidation');
+      await page.evaluate(() => window.overviewDrilldownFixture.releaseTenants());
+      await page.getByText('drilled-model', { exact: true }).waitFor();
+      assert.deepEqual(await page.evaluate(() => window.overviewDrilldownFixture.requestQueryBodies), [applied], 'the first and only initial query uses the applied AST');
+
+      if (boundary === 'tenant') {
+        await page.reload();
+        await page.waitForFunction(() => window.overviewDrilldownFixture.authPending);
+        assert.equal(await page.evaluate(() => window.overviewDrilldownFixture.requestQueryBodies.length), 0);
+        await page.evaluate(() => window.overviewDrilldownFixture.releaseTenants(['second-tenant']));
+      } else {
+        await page.evaluate(() => window.overviewDrilldownFixture.openAccess());
+        await page.getByRole('button', { name: 'Clear credential', exact: true }).click();
+        await page.getByRole('textbox', { name: 'Service credential', exact: true }).fill('mts_overview_drilldown_fixture');
+        await page.getByRole('button', { name: 'Connect', exact: true }).click();
+        await page.waitForFunction(() => window.overviewDrilldownFixture.authPending);
+        await page.evaluate(() => window.overviewDrilldownFixture.releaseTenants());
+        await page.getByText('Connected', { exact: true }).waitFor();
+        await page.reload();
+        await page.waitForFunction(() => window.overviewDrilldownFixture.authPending);
+        assert.equal(await page.evaluate(() => window.overviewDrilldownFixture.requestQueryBodies.length), 0);
+        await page.evaluate(() => window.overviewDrilldownFixture.releaseTenants());
+      }
+      await page.waitForFunction(() => window.overviewDrilldownFixture.requestQueryBodies.length === 1);
+      assert.deepEqual(await page.evaluate(() => window.overviewDrilldownFixture.requestQueryBodies.at(-1)), {
+        tenant_external_id: boundary === 'tenant' ? 'second-tenant' : 'drilldown-tenant',
+        limit: 100, paged: true, ast: { logical_operator: 'and', conditions: [] },
+      }, 'a different authorized tenant or a new login cycle cannot restore the old filter');
+      await page.close();
+    }
+  } finally { await browser.close(); await server.close(); }
+});
 
 test('Overview request actions open focused details and bucket drilldowns preserve the tenant-scoped filter', { timeout: 60_000 }, async (context) => {
   const executablePath = await localChromiumExecutable();
