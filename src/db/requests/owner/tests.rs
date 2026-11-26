@@ -396,6 +396,8 @@ async fn postgres_terminal_owner_read_lock_rechecks_pending_without_update_side_
     let (owner, _reservation) = fixture.request().await;
     fixture.database.history_start().await.unwrap();
     for statement in [
+        "CREATE TABLE terminal_owner_unrelated_old PARTITION OF request_records FOR VALUES FROM (-2000) TO (-1000)",
+        "CREATE TABLE terminal_owner_unrelated_new PARTITION OF request_records FOR VALUES FROM (-1000) TO (0)",
         "CREATE TABLE terminal_owner_update_probe (request_id TEXT NOT NULL)",
         "CREATE FUNCTION terminal_owner_update_probe_fn() RETURNS trigger LANGUAGE plpgsql AS $$ BEGIN INSERT INTO terminal_owner_update_probe VALUES (NEW.id); RETURN NEW; END $$",
         "CREATE TRIGGER terminal_owner_update_probe AFTER UPDATE ON request_records FOR EACH ROW EXECUTE FUNCTION terminal_owner_update_probe_fn()",
@@ -436,6 +438,15 @@ async fn postgres_terminal_owner_read_lock_rechecks_pending_without_update_side_
     old.rollback().await.unwrap();
 
     let mut first = fixture.database.begin_write_transaction().await.unwrap();
+    sqlx::query("SET LOCAL plan_cache_mode=force_generic_plan")
+        .execute(&mut *first)
+        .await
+        .unwrap();
+    let mode: String = sqlx::query_scalar("SHOW plan_cache_mode")
+        .fetch_one(&mut *first)
+        .await
+        .unwrap();
+    assert_eq!(mode, "force_generic_plan");
     let pid: i32 = sqlx::query_scalar("SELECT pg_backend_pid()")
         .fetch_one(&mut *first)
         .await
