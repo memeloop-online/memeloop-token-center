@@ -84,7 +84,7 @@ impl Database {
                 visited += 1;
                 // Completed receipts are small. Oversized legacy snapshots stay
                 // protected, and are never fetched in full to test eligibility.
-                let candidate=sqlx::query("SELECT SUBSTR(COALESCE(p.semantic_payload_snapshot_json,p.semantic_snapshot_json),1,8192) AS receipt,o.leaf_node_hash FROM conversation_projection_outbox p JOIN conversation_observations o ON o.request_id=p.request_id JOIN conversation_clusters c ON c.id=o.cluster_id AND c.tenant_id=p.tenant_id AND c.key_id=p.key_id WHERE p.request_id=$1 AND p.tenant_id=$2 AND p.key_id=$3 AND p.statistics_outcome='session_body' AND p.lease_owner IS NULL AND p.lease_expires_at IS NULL AND p.terminal_lease_owner IS NULL AND p.terminal_lease_expires_at IS NULL AND LENGTH(COALESCE(p.semantic_payload_snapshot_json,p.semantic_snapshot_json))<=8192 AND o.leaf_node_hash IS NOT NULL")
+                let candidate=sqlx::query("SELECT SUBSTR(COALESCE(p.semantic_payload_snapshot_json,p.semantic_snapshot_json),1,8192) AS receipt,o.leaf_node_hash FROM conversation_projection_outbox p JOIN conversation_observations o ON o.request_id=p.request_id JOIN conversation_clusters c ON c.id=o.cluster_id AND c.tenant_id=p.tenant_id AND o.key_id=p.key_id WHERE p.request_id=$1 AND p.tenant_id=$2 AND p.key_id=$3 AND p.statistics_outcome='session_body' AND p.lease_owner IS NULL AND p.lease_expires_at IS NULL AND p.terminal_lease_owner IS NULL AND p.terminal_lease_expires_at IS NULL AND LENGTH(COALESCE(p.semantic_payload_snapshot_json,p.semantic_snapshot_json))<=8192 AND o.leaf_node_hash IS NOT NULL")
                     .bind(&request).bind(&tenant).bind(&key).fetch_optional(&self.pool).await?;
                 let Some(candidate) = candidate else {
                     missing += 1;
@@ -210,7 +210,7 @@ impl Database {
                     tx.rollback().await?;
                     continue;
                 }
-                deleted+=sqlx::query("DELETE FROM conversation_projection_outbox WHERE request_id=$1 AND tenant_id=$2 AND key_id=$3 AND projected_at=$4 AND COALESCE(semantic_payload_snapshot_json,semantic_snapshot_json)=$5 AND EXISTS(SELECT 1 FROM conversation_observations o JOIN conversation_clusters c ON c.id=o.cluster_id WHERE o.request_id=$1 AND o.leaf_node_hash=$6 AND c.tenant_id=$2 AND c.key_id=$3)")
+                deleted+=sqlx::query("DELETE FROM conversation_projection_outbox WHERE request_id=$1 AND tenant_id=$2 AND key_id=$3 AND projected_at=$4 AND COALESCE(semantic_payload_snapshot_json,semantic_snapshot_json)=$5 AND EXISTS(SELECT 1 FROM conversation_observations o JOIN conversation_clusters c ON c.id=o.cluster_id WHERE o.request_id=$1 AND o.leaf_node_hash=$6 AND c.tenant_id=$2 AND o.key_id=$3)")
                     .bind(&request).bind(&tenant).bind(&key).bind(projected).bind(&receipt).bind(&leaf).execute(&mut *tx).await?.rows_affected();
                 tx.commit().await?;
             }
