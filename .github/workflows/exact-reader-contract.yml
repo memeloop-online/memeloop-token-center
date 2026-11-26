@@ -816,12 +816,8 @@ jobs:
       - run: |
           set -o pipefail
           git rev-parse HEAD
-          failures=0
-          for selector in postgres_spool_candidate_prunes_unrelated_request_partition_locks postgres_claims_ignore_busy_budget_and_still_claim_once postgres_claim_cancelled_inside_commit_is_reclaimed_with_new_fence postgres_archive_backlog_uses_ready_indexes_and_recovers_unsettled_uploads postgres_seal_precedes_terminal_delivery_and_survives_producer_loss postgres_complete_cancelled_inside_commit_keeps_atomic_binding; do
-            if ! cargo test --locked --lib "$selector" -- --nocapture 2>&1 | tee /tmp/spool-partition-claim.log; then failures=$((failures + 1)); fi
-            if ! grep -F '1 passed; 0 failed' /tmp/spool-partition-claim.log; then failures=$((failures + 1)); fi
-          done
-          test "$failures" -eq 0
+          cargo test --locked --lib db::request_pool::tests::postgres_paused_returning_stream_retains_transaction_until_drop_but_execute_commits -- --exact --nocapture 2>&1 | tee /tmp/pg-executor.log
+          grep -F '1 passed; 0 failed' /tmp/pg-executor.log
 
   semantic-reader-scope-contract:
     if: inputs.contract == 'semantic-reader-scope'
