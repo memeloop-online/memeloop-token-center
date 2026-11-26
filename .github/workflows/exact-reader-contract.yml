@@ -502,8 +502,16 @@ jobs:
         run: |
           set -o pipefail
           git rev-parse HEAD
-          cargo test --locked --all-features --lib db::requests::conversations::archive_readiness_tests::postgres_coverage_read_does_not_block_body_worker -- --exact --nocapture 2>&1 | tee /tmp/projection-scheduler.log
-          grep -F '1 passed; 0 failed' /tmp/projection-scheduler.log
+          failed=0
+          for selector in \
+            db::requests::conversations::archive_readiness_tests::sqlite_semantic_coverage_recovers_committed_projection_and_failed_put \
+            db::requests::conversations::archive_readiness_tests::postgres_semantic_coverage_recovers_committed_projection_and_failed_put
+          do
+            cargo test --locked --all-features --lib "$selector" -- --exact --nocapture 2>&1 | tee /tmp/outbox-retention.log || failed=1
+            grep -F '1 passed; 0 failed' /tmp/outbox-retention.log || failed=1
+            grep -F '0 ignored' /tmp/outbox-retention.log || failed=1
+          done
+          exit "$failed"
 
   legacy-archive-bound-contract:
     if: inputs.contract == 'legacy-archive-bound'
