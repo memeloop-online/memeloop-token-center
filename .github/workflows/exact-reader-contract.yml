@@ -654,7 +654,7 @@ jobs:
   pg-executor-contract:
     if: inputs.contract == 'pg-executor-959'
     runs-on: ubuntu-24.04
-    timeout-minutes: 60
+    timeout-minutes: 90
     services:
       clickhouse:
         image: clickhouse/clickhouse-server:25.8
@@ -691,29 +691,45 @@ jobs:
           toolchain: 1.95.0
           components: rustfmt, clippy
           targets: wasm32-unknown-unknown
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020
+        with:
+          node-version: 24.18.0
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6
+        with:
+          shared-key: memory-release
       - uses: ./.github/actions/checkout-plugin-examples
-      - name: Verify the nine fixed OAuth recovery and archive contracts
+      - name: Verify the two writer activity metric gates
         run: |
           set -euo pipefail
-          test "$(git rev-parse HEAD)" = fea3f4cf1e879908a8966666b3e4078e608aa67c
-          cargo test --locked --all-features --lib --no-run
-          failures=0
-          while IFS= read -r name; do
-            output="$(mktemp)"
-            if ! timeout --signal=TERM --kill-after=10s 180s cargo test --locked --all-features --lib "$name" -- --exact --nocapture 2>&1 | tee "$output"; then failures=1; fi
-            if ! grep -Eq '^test result: ok\. 1 passed; 0 failed; 0 ignored;' "$output"; then failures=1; fi
-          done <<'CONTRACTS'
-          worker::oauth_role_tests::oauth_rejection_delivery_crosses_gateway_control_and_worker_process_roles
-          cursor_native::tests::cursor_usage_rejection_distinguishes_verification_and_optional_reads
-          db::archive_spool::tests::postgres_tests::postgres_request_preseal_and_capture_do_not_hold_the_event_cursor
-          db::archive_spool::tests::postgres_tests::postgres_seal_cancelled_inside_commit_remains_recoverable_after_reconnect
-          db::archive_spool::tests::postgres_tests::postgres_reservation_tests::postgres_expired_reservation_recovery_skips_a_live_owner_and_is_exact
-          db::archive_spool::tests::postgres_tests::postgres_load_tests::postgres_cancelled_cleanup_caller_leaves_batch_owned_until_commit_finishes
-          worker::tests::oauth_rejected_generation_renews_once_and_failed_readback_does_not_requeue
-          upstream_quota::retry::tests::only_primary_bearer_401_records_current_managed_generation
-          upstream_quota::oauth_recovery::tests::queue_is_bounded_coalesces_generations_and_reports_pressure
-          CONTRACTS
-          exit "$failures"
+          test "$(git rev-parse HEAD)" = "cdf98cddc010351a00e52b32e586c2c95d6d21c1"
+          git rev-parse HEAD
+          mkdir -p "$RUNNER_TEMP/pr1041-writer-evidence"
+          cargo test --locked --lib response_archive_spool::tests::cancelled_producer_fences_a_begin_that_committed_late -- --exact --nocapture 2>&1 | tee "$RUNNER_TEMP/pr1041-writer-evidence/begin-gate.log"
+          grep -F '1 passed; 0 failed' "$RUNNER_TEMP/pr1041-writer-evidence/begin-gate.log"
+          cargo test --locked --lib response_archive_spool::tests::terminal_tail_survives_observer_cancellation_without_waiting_for_database_ack -- --exact --nocapture 2>&1 | tee "$RUNNER_TEMP/pr1041-writer-evidence/terminal-gate.log"
+          grep -F '1 passed; 0 failed' "$RUNNER_TEMP/pr1041-writer-evidence/terminal-gate.log"
+      - name: Build the same-source optimized memory service
+        env:
+          MTC_BUILD_GIT_SHA: ${{ inputs.source_revision }}
+        run: cargo build --locked --release --bin memeloop-token-center
+      - name: Run the original complete durable archive RSS gate
+        timeout-minutes: 6
+        run: |
+          set -euo pipefail
+          node tests/load/benchmark-durable-archive-memory.ts target/release/memeloop-token-center "$RUNNER_TEMP/pr1041-writer-evidence/durable-archive-rss-cdf98.json" 2>&1 | tee "$RUNNER_TEMP/pr1041-writer-evidence/durable-harness.log"
+      - name: Run the unchanged fifteen-minute acceptance after the quick gate
+        timeout-minutes: 30
+        run: |
+          set -euo pipefail
+          node tests/load/benchmark-memory.ts --profile acceptance --binary target/release/memeloop-token-center --gateway-limit-mib 256 --gateway-headroom-mib 32 --output "$RUNNER_TEMP/pr1041-writer-evidence/memory-cdf98.json" 2>&1 | tee "$RUNNER_TEMP/pr1041-writer-evidence/memory-harness.log"
+      - name: Retain exact-source writer and memory evidence
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        with:
+          name: pr1041-writer-memory-cdf98
+          path: ${{ runner.temp }}/pr1041-writer-evidence/
+          if-no-files-found: warn
+          retention-days: 7
 
   semantic-reader-scope-contract:
     if: inputs.contract == 'semantic-reader-scope'
