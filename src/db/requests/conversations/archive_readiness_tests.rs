@@ -2474,6 +2474,30 @@ async fn semantic_coverage_committed_recovery_contract(database_url: String) {
             fixture.key.tenant_id,fixture.key.key_id,other_locator.clone()).await.unwrap();
         assert_eq!(serde_json::to_vec(&unmatched_after_expiry).unwrap(),unmatched_bytes,
             "retirement of source B never substitutes for frozen Bound A");
+        let history_identity = crate::request_history::HistoryIdentity {
+            tenant_id: fixture.key.tenant_id,
+            key_id: fixture.key.key_id,
+            request_id: fixture.request_id,
+            created_at: frozen.view.created_at,
+            source: crate::request_history::HistorySource::Native.as_str().to_owned(),
+        };
+        let native_after=db.resolve_history_snapshot_archive(&history_identity,frozen.clone()).await.unwrap();
+        assert_eq!(serde_json::to_vec(&native_after).unwrap(),serde_json::to_vec(&resolved).unwrap());
+        let mut imported_identity=history_identity.clone();
+        imported_identity.source=crate::request_history::HistorySource::Archive.as_str().to_owned();
+        let imported=db.resolve_history_snapshot_archive(&imported_identity,frozen.clone()).await.unwrap();
+        assert_eq!(serde_json::to_vec(&imported).unwrap(),immutable,
+            "a scoped imported source with identical UUID is never native authority");
+        let mut stale_identity=history_identity.clone();
+        stale_identity.created_at+=1;
+        let stale=db.resolve_history_snapshot_archive(&stale_identity,frozen.clone()).await.unwrap();
+        assert_eq!(serde_json::to_vec(&stale).unwrap(),immutable);
+        let mut stale_record=frozen.clone();
+        stale_record.view.created_at=stale_identity.created_at;
+        let stale_bytes=serde_json::to_vec(&stale_record).unwrap();
+        let stale=db.resolve_history_snapshot_archive(&stale_identity,stale_record).await.unwrap();
+        assert_eq!(serde_json::to_vec(&stale).unwrap(),stale_bytes,
+            "matching stale frozen fields cannot replace the authoritative native locator");
         let manifest_after = fixture.state.archive.get_semantic_manifest_streamed(
             fixture.key.tenant_id,&authority_after.publication.manifest).await.unwrap();
         let sources_after=manifest_after.raw_sources.unwrap();
