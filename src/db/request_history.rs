@@ -130,7 +130,8 @@ impl Database {
         if matches!(scope, HistoryScope::Key { .. }) {
             refs.view.credential_identity = None;
         }
-        self.resolve_history_snapshot_archive(&snapshot.identity, refs).await
+        self.resolve_history_snapshot_archive(&snapshot.identity, refs)
+            .await
     }
 
     /// Scoped frozen imports retain their own authority even if their UUID
@@ -149,7 +150,8 @@ impl Database {
         {
             return Ok(refs);
         }
-        self.resolve_history_raw_archive_roots(identity.tenant_id, identity.key_id, refs).await
+        self.resolve_history_raw_archive_roots(identity.tenant_id, identity.key_id, refs)
+            .await
     }
 
     pub(crate) async fn history_session_directory(
