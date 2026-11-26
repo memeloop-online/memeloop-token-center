@@ -457,13 +457,24 @@ async fn credited_mixed_grains_replace_bytes_without_releasing_external_clones()
         let memory = Arc::new(ProxyMemoryBudget::new_archive_source(4 * 1024 * 1024));
         let mut expected = blake3::Hasher::new();
         let mut length = 0usize;
-        let input = stream::iter(0..80).map({
+        // Fill retained with equal old segments before changing grain.
+        let schedule: Vec<usize> = (0..96)
+            .map(|index| {
+                if index < 16 {
+                    sizes[0]
+                } else {
+                    sizes[(index / 16) % 2]
+                }
+            })
+            .collect();
+        for (index, size) in schedule.iter().copied().enumerate() {
+            expected.update(&vec![index as u8; size]);
+            length += size;
+        }
+        let input = stream::iter(schedule.into_iter().enumerate()).map({
             let memory = memory.clone();
-            move |index| {
-                let size = sizes[index % 2];
+            move |(index, size)| {
                 let bytes = Bytes::from(vec![index as u8; size]);
-                expected.update(&bytes);
-                length += size;
                 let credit = memory
                     .try_reserve_ingress_bytes(size)
                     .expect("healthy mixed-grain ACKs reclaim source credit");
