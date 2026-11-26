@@ -95,6 +95,7 @@ test('hard reload restores applied filters only after current login and tenant r
           await nextChart.getByRole('tab', { name: 'Data', exact: true }).click();
           await nextChart.locator('.overview-trend-data tbody button').nth(1).click();
           await page.getByText('drilled-model', { exact: true }).waitFor();
+          assert.notDeepEqual(await page.evaluate(() => window.overviewDrilldownFixture.requestQueryBodies.at(-1)), applied, 'the failed-candidate state applies a different filter before reload');
         }
         await page.reload();
         await page.waitForFunction(() => window.overviewDrilldownFixture.authPending);

@@ -41,7 +41,8 @@ const initialRequests = new URLSearchParams(location.search).has('initial-reques
 const sessionKey = '5dae9b5a-6bd0-54a7-ae14-fb5aa4f61650';
 const realSession = '00000000-0000-4000-8000-000000000002';
 
-const holdReloadAuth = new URLSearchParams(location.search).has('reload-filter')
+const reloadFilter = new URLSearchParams(location.search).has('reload-filter');
+const holdReloadAuth = reloadFilter
   && (performance.getEntriesByType('navigation')[0] as PerformanceNavigationTiming | undefined)?.type === 'reload';
 
 window.overviewDrilldownFixture = { calls: [], requestQueryBodies: [], route: 'overview', openOverview: () => undefined, openRequests: () => undefined, openAccess: () => undefined, holdNextQuery: false, releaseLateQuery: () => undefined, authPending: false, releaseTenants: () => undefined };
@@ -61,7 +62,7 @@ function metrics(): UsageAnalysisMetrics {
 const usageAnalysis: OperatorUsageAnalysis = {
   from_created_at: bucketStart, to_created_at: now, granularity: 'hour', time_zone: 'UTC',
   p95_is_approximate: true, p95_method: 'fixture_histogram', upstream_grouping: 'stable_account',
-  summary: metrics(), time_series: [{ ...metrics(), bucket_start: bucketStart }],
+  summary: metrics(), time_series: [{ ...metrics(), bucket_start: bucketStart }, ...(reloadFilter ? [{ ...metrics(), bucket_start: bucketStart - 3_600_000 }] : [])],
   by_model: [], by_key: [], by_session: usageSessions ? [
     { ...metrics(), id: `unlinked:${sessionKey}`, label: 'Codex credential', key_id: sessionKey, key_alias: 'Codex credential', unlinked: true },
     { ...metrics(), id: realSession, label: 'Named Codex conversation', key_id: sessionKey, key_alias: 'Codex credential', unlinked: false },
