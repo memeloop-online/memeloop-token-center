@@ -169,6 +169,36 @@ impl ProxyMemoryBudget {
         Some((allocation, retained))
     }
 
+    /// Acquire the existing retained and allocation credits without holding
+    /// either class while awaiting the other. The quarter-window is unchanged.
+    pub(crate) async fn reserve_carrier_ingress(
+        &self,
+        bytes: usize,
+    ) -> Result<(OwnedSemaphorePermit, OwnedSemaphorePermit), crate::error::AppError> {
+        let units = u32::try_from(bytes.div_ceil(self.unit_bytes))
+            .map_err(|_| crate::error::AppError::internal("carrier_allocation_overflow"))?;
+        if units as usize > self.capacity / 4 / self.unit_bytes {
+            return Err(crate::error::AppError::storage(
+                "carrier_retained_window_exceeded",
+            ));
+        }
+        loop {
+            let retained = self
+                .retained_requests
+                .clone()
+                .acquire_many_owned(units)
+                .await
+                .map_err(|_| crate::error::AppError::internal("carrier_budget_closed"))?;
+            if let Ok(allocation) = self.permits.clone().try_acquire_many_owned(units) {
+                return Ok((allocation, retained));
+            }
+            drop(retained);
+            // Wake on allocation availability, release that wakeup, then
+            // compose both credits again. No partial reservation crosses await.
+            drop(self.reserve_carrier_bytes(bytes).await?);
+        }
+    }
+
     pub(crate) async fn reserve_carrier_bytes(
         &self,
         bytes: usize,

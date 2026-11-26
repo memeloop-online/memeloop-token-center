@@ -339,3 +339,110 @@ async fn credited_long_response_preserves_opportunistic_spill_above_source_capac
     assert_eq!(memory.snapshot().0, 0);
     assert_eq!(workspace.upload_workspace.snapshot().0, 0);
 }
+
+#[tokio::test]
+#[ignore = "requires isolated RustFS fixture"]
+async fn request_capture_eof_does_not_join_owned_put_when_retained_credit_wakes() {
+    use recovery_proxy::RecoveryObjectProxy;
+    for lose_ack in [false, true] {
+        let proxy =
+            RecoveryObjectProxy::start(&std::env::var("MTC_RUSTFS_TEST_ENDPOINT").unwrap()).await;
+        let mut config = crate::config::Config::for_test("sqlite::memory:".into());
+        config.archive_backend = crate::config::ArchiveBackend::S3;
+        config.s3_endpoint = Some(proxy.endpoint().into());
+        config.s3_bucket = Some(std::env::var("MTC_RUSTFS_TEST_BUCKET").unwrap());
+        config.s3_access_key = Some(std::env::var("MTC_RUSTFS_TEST_ACCESS_KEY").unwrap());
+        config.s3_secret_key = Some(std::env::var("MTC_RUSTFS_TEST_SECRET_KEY").unwrap());
+        config.s3_allow_http = true;
+        let archive = ArchiveStore::from_config(&config).await.unwrap();
+        let memory = Arc::new(ProxyMemoryBudget::new(512 * 1024));
+        let persistence = Arc::new(Persistence::default());
+        let outside = memory.try_reserve_carrier_ingress(64 * 1024).unwrap();
+        let staging = ArchiveStagingKey::new(
+            crate::archive_staging::ArchiveStagingOwner::ProxyRequest(uuid::Uuid::now_v7()),
+            crate::archive_staging::ArchiveStagingPurpose::Request,
+            uuid::Uuid::now_v7(),
+        )
+        .unwrap();
+        let expected = [vec![b'a'; 64 * 1024], vec![b'b'; 64 * 1024]].concat();
+        let put = proxy.gate_body_put();
+        proxy.lose_body_put_ack(lose_ack);
+        let capture = tokio::spawn({
+            let memory = memory.clone();
+            let persistence = persistence.clone();
+            async move {
+                BodyCarrier::capture_owned(
+                    stream::iter([
+                        Ok::<_, std::io::Error>((Bytes::from(vec![b'a'; 64 * 1024]), None)),
+                        Ok((Bytes::from(vec![b'b'; 64 * 1024]), None)),
+                    ]),
+                    CarrierCapture::new(memory, Some(archive), staging)
+                        .with_background_spill(persistence),
+                )
+                .await
+            }
+        });
+        tokio::time::timeout(std::time::Duration::from_secs(10), put.entered())
+            .await
+            .unwrap();
+        assert!(!capture.is_finished());
+        assert_eq!(persistence.pending_archives_for_test(), 1);
+        drop(outside);
+        let source = tokio::time::timeout(std::time::Duration::from_secs(5), capture)
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap();
+        assert_eq!(proxy.counts().get("body_put"), Some(&1));
+        assert_eq!(persistence.pending_archives_for_test(), 1);
+        assert!(matches!(
+            &*source.segments[0].lock().unwrap(),
+            Segment::Ram(_)
+        ));
+        let mut replay = source.open_stream();
+        let mut actual = Vec::new();
+        while let Some(chunk) = replay.next().await {
+            actual.extend_from_slice(&chunk.unwrap());
+        }
+        drop(replay);
+        assert_eq!(
+            actual, expected,
+            "forwardable original must precede PUT ACK"
+        );
+        assert_eq!(source.digest(), blake3::hash(&expected).to_hex().as_str());
+        assert!(memory.snapshot().0 <= 512 * 1024);
+        put.release();
+        persistence.drain_for_test().await;
+        assert_eq!(persistence.pending_archives_for_test(), 0);
+        if lose_ack {
+            assert!(matches!(
+                &*source.segments[0].lock().unwrap(),
+                Segment::Ram(_)
+            ));
+            assert!(
+                source
+                    .owned_objects
+                    .lock()
+                    .unwrap()
+                    .iter()
+                    .any(|(_, settled)| !settled)
+            );
+        } else {
+            assert!(matches!(
+                &*source.segments[0].lock().unwrap(),
+                Segment::Object(_)
+            ));
+        }
+        proxy.lose_body_put_ack(false);
+        let mut replay = source.open_stream();
+        let mut restored = Vec::new();
+        while let Some(chunk) = replay.next().await {
+            restored.extend_from_slice(&chunk.unwrap());
+        }
+        drop(replay);
+        assert_eq!(restored, expected);
+        drop(source);
+        assert_eq!(memory.snapshot().0, 0);
+        assert_eq!(persistence.upload_workspace.snapshot().0, 0);
+    }
+}

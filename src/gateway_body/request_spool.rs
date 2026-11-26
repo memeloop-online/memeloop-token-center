@@ -452,7 +452,8 @@ impl RequestSpoolAdmission {
                 });
             let result = BodyCarrier::capture(
                 input,
-                CarrierCapture::new(memory.shared_budget(), archive, staging),
+                CarrierCapture::new(memory.shared_budget(), archive, staging)
+                    .with_background_spill(self.usage.upload_memory.clone()),
             )
             .await;
             let carrier = match result {
