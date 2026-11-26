@@ -26,7 +26,7 @@ jobs:
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
         with:
-          ref: 0b7297a781fa692f7f3a918f05f777fa06cdaab3
+          ref: 31caf3aa305813587b88246dc77182315e06f4bb
           persist-credentials: false
       - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020
         with:
@@ -49,7 +49,7 @@ jobs:
       - name: Verify fixed ID52 authenticated reload and typed-filter contracts
         run: |
           set -euo pipefail
-          test "$(git rev-parse HEAD)" = '0b7297a781fa692f7f3a918f05f777fa06cdaab3'
+          test "$(git rev-parse HEAD)" = '31caf3aa305813587b88246dc77182315e06f4bb'
           git rev-parse HEAD
           MTC_REQUIRE_BROWSER=1 node --import tsx --test --test-reporter=tap --test-concurrency=1 --test-name-pattern='^(hard reload restores applied filters only after current login and tenant revalidation|Overview request actions open focused details and bucket drilldowns preserve the tenant-scoped filter)$' e2e/operator-overview-drilldown-browser-contract.test.ts 2>&1 | tee /tmp/id52-overview.log
           grep -Fx '# pass 2' /tmp/id52-overview.log
