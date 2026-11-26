@@ -36,87 +36,28 @@ jobs:
   metadata-refresh-contract:
     if: inputs.contract == 'metadata-refresh'
     runs-on: ubuntu-24.04
-    timeout-minutes: 30
-    permissions:
-      contents: read
-      actions: read
-    env:
-      SOURCE_DIGEST: sha256:3423607a747fe86cf2110e048b6438b2a9fbde43ecdad4c611176ae5d9c1f467
+    timeout-minutes: 5
     steps:
-      - name: Install the distribution OCI transport client
-        run: sudo apt-get update && sudo apt-get install -y --no-install-recommends skopeo
-      - name: Export the complete approved index without changing its digest
-        run: |
-          set -euo pipefail
-          mkdir -p "$RUNNER_TEMP/service-3423607a-oci"
-          source="docker://ghcr.io/memeloop-online/memeloop-token-center@$SOURCE_DIGEST"
-          skopeo inspect --raw "$source" > "$RUNNER_TEMP/service-3423607a-oci/source-manifest.json"
-          printf '%s  %s\n' "${SOURCE_DIGEST#sha256:}" "$RUNNER_TEMP/service-3423607a-oci/source-manifest.json" | sha256sum --check
-          timeout --kill-after=10s 18m skopeo copy --all --preserve-digests "$source" "oci-archive:$RUNNER_TEMP/service-3423607a-oci/service-3423607a.oci.tar:approved-3423607a"
-          skopeo inspect --raw "oci-archive:$RUNNER_TEMP/service-3423607a-oci/service-3423607a.oci.tar:approved-3423607a" > "$RUNNER_TEMP/service-3423607a-oci/archive-manifest.json"
-          cmp "$RUNNER_TEMP/service-3423607a-oci/source-manifest.json" "$RUNNER_TEMP/service-3423607a-oci/archive-manifest.json"
-      - name: Preserve the original signed release provenance
+      - name: Require an exact source commit
         env:
-          GH_TOKEN: ${{ github.token }}
-        run: |
-          set -euo pipefail
-          root="$RUNNER_TEMP/service-3423607a-oci"
-          gh api repos/memeloop-online/memeloop-token-center/actions/artifacts/15094162347/zip > "$RUNNER_TEMP/signed-release-manifest.zip"
-          unzip -q "$RUNNER_TEMP/signed-release-manifest.zip" -d "$root/signed-release-manifest"
-          printf '%s\n' '{"verification_run":"https://github.com/memeloop-online/memeloop-token-center/actions/runs/45766126016","manifest_artifact":15094162347,"source_revision":"8de37857d8889502779daf4bd08f4996b8103616","service_digest":"sha256:3423607a747fe86cf2110e048b6438b2a9fbde43ecdad4c611176ae5d9c1f467"}' > "$root/signed-release-source.json"
-      - name: Verify every OCI blob and the complete source descriptor graph
-        run: |
-          set -euo pipefail
-          python3 - <<'PYVERIFY'
-          import hashlib, json, os, pathlib, tarfile
-          root = pathlib.Path(os.environ['RUNNER_TEMP']) / 'service-3423607a-oci'
-          source = os.environ['SOURCE_DIGEST']
-          with tarfile.open(root / 'service-3423607a.oci.tar') as archive:
-              members = {m.name.removeprefix('./'): m for m in archive.getmembers() if m.isfile()}
-              def read(name):
-                  member = members[name]
-                  return archive.extractfile(member).read()
-              verified = set()
-              def check(descriptor):
-                  digest = descriptor['digest']
-                  algorithm, value = digest.split(':', 1)
-                  assert algorithm == 'sha256'
-                  name = 'blobs/sha256/' + value
-                  data = read(name)
-                  assert len(data) == descriptor['size'], digest
-                  assert hashlib.sha256(data).hexdigest() == value, digest
-                  if digest in verified:
-                      return
-                  verified.add(digest)
-                  media = descriptor.get('mediaType', '')
-                  if 'manifest' in media or 'index' in media:
-                      document = json.loads(data)
-                      children = document.get('manifests', []) + document.get('layers', [])
-                      if 'config' in document:
-                          children.append(document['config'])
-                      for child in children:
-                          check(child)
-              index = json.loads(read('index.json'))
-              for descriptor in index['manifests']:
-                  check(descriptor)
-              assert source in verified, 'original source index must remain in archive'
-              for name, member in members.items():
-                  if name.startswith('blobs/sha256/'):
-                      assert hashlib.sha256(read(name)).hexdigest() == name.rsplit('/', 1)[1]
-              evidence = {'source_digest': source, 'verified_descriptors': sorted(verified), 'archive_sha256': hashlib.sha256((root / 'service-3423607a.oci.tar').read_bytes()).hexdigest()}
-              (root / 'integrity.json').write_text(json.dumps(evidence, indent=2) + '\n')
-              print('SERVICE_3423607A_OCI_GRAPH_PASS descriptors=' + str(len(verified)))
-          PYVERIFY
-          cd "$RUNNER_TEMP/service-3423607a-oci"
-          sha256sum service-3423607a.oci.tar > SHA256SUMS
-      - name: Preserve the complete unchanged image and integrity evidence
-        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+          SOURCE_REVISION: ${{ inputs.source_revision }}
+        run: '[[ "$SOURCE_REVISION" =~ ^[0-9a-f]{40}$ ]]'
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
         with:
-          name: service-3423607a-oci-complete
-          path: ${{ runner.temp }}/service-3423607a-oci/
-          compression-level: 0
-          if-no-files-found: error
-          retention-days: 3
+          ref: ${{ inputs.source_revision }}
+          persist-credentials: false
+      - run: git rev-parse HEAD
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020
+        with:
+          node-version: 24.18.0
+      - run: npm ci --ignore-scripts --no-audit
+      - run: npm run typecheck
+      - name: Verify staging peak harness contracts
+        run: |
+          set -euo pipefail
+          node --test --test-reporter=tap tests/load/staging-peak/test-framework.ts 2>&1 | tee /tmp/staging-peak-types.log
+          grep -E '^# pass [1-9][0-9]*$' /tmp/staging-peak-types.log
+          grep -Fx '# fail 0' /tmp/staging-peak-types.log
 
   orphan-reaper-contract:
     if: inputs.contract == 'orphan-reaper-971'
@@ -689,10 +630,10 @@ jobs:
   pg-executor-contract:
     if: inputs.contract == 'pg-executor-959'
     runs-on: ubuntu-24.04
-    timeout-minutes: 30
+    timeout-minutes: 60
     services:
       clickhouse:
-        image: clickhouse/clickhouse-server:25.4.2
+        image: clickhouse/clickhouse-server:25.8
         env:
           CLICKHOUSE_SKIP_USER_SETUP: "1"
         ports: ["8123:8123"]
@@ -702,12 +643,16 @@ jobs:
         env:
           POSTGRES_USER: token_center
           POSTGRES_PASSWORD: token_center
-          POSTGRES_DB: token_center_test
+          POSTGRES_DB: memeloop_token_center_test
         ports: ['5432:5432']
         options: --health-cmd pg_isready --health-interval 5s --health-timeout 5s --health-retries 10
     env:
+      CARGO_BUILD_JOBS: "2"
+      CARGO_INCREMENTAL: "0"
+      CARGO_PROFILE_DEV_DEBUG: "0"
+      CARGO_PROFILE_TEST_DEBUG: "0"
       MTC_TEST_CLICKHOUSE_URL: http://127.0.0.1:8123
-      MTC_TEST_POSTGRES_URL: postgres://token_center:token_center@127.0.0.1:5432/token_center_test
+      MTC_TEST_POSTGRES_URL: postgres://token_center:token_center@127.0.0.1:5432/memeloop_token_center_test
     steps:
       - name: Require an exact source commit
         env:
@@ -720,25 +665,49 @@ jobs:
       - uses: dtolnay/rust-toolchain@4360b52568e2003a75bf9bc1d59f33a8e3fc893c
         with:
           toolchain: 1.95.0
+          components: rustfmt, clippy
+          targets: wasm32-unknown-unknown
       - uses: ./.github/actions/checkout-plugin-examples
-      - name: Verify wire delivery and real HTTP2 cancellation
+      - name: Compare exact master Clippy and the fifteen failing contracts
         run: |
-          set -euo pipefail
+          set -uo pipefail
           git rev-parse HEAD
-          test "$(git rev-parse HEAD)" = "${{ inputs.source_revision }}"
-          cargo check --locked --lib
-          cargo test --locked --lib api::proxy::tests::codex_wire_delivery::confirmed_connect_refusal_uses_original_candidate_and_one_reservation -- --exact --nocapture 2>&1 | tee /tmp/wire-delivery.log
-          grep -F '1 passed; 0 failed' /tmp/wire-delivery.log
-          cargo test --locked --lib api::proxy::tests::codex_wire_delivery::full_post_then_eof_never_replays_or_reserves_twice -- --exact --nocapture 2>&1 | tee /tmp/wire-delivery.log
-          grep -F '1 passed; 0 failed' /tmp/wire-delivery.log
-          cargo test --locked --lib api::proxy::tests::codex_wire_delivery::full_post_then_h2_reset_never_replays_or_reserves_twice -- --exact --nocapture 2>&1 | tee /tmp/wire-delivery.log
-          grep -F '1 passed; 0 failed' /tmp/wire-delivery.log
-          cargo test --locked --lib api::proxy::routing::codex::send_diagnostics::tests::wire_delivery_requires_connect_proof_and_unconsumed_attempt_body -- --exact --nocapture 2>&1 | tee /tmp/wire-delivery.log
-          grep -F '1 passed; 0 failed' /tmp/wire-delivery.log
-          cargo test --locked --lib api::proxy::tests::codex_http2_downstream_cancel::real_http2_downstream_reset_and_tcp_close_cancel_once_and_release_permits -- --exact --nocapture 2>&1 | tee /tmp/wire-delivery.log
-          grep -F '1 passed; 0 failed' /tmp/wire-delivery.log
-          cargo test --locked --lib api::proxy::tests::codex_http2_failure_safety -- --nocapture 2>&1 | tee /tmp/h2-failure-safety.log
-          grep -F '11 passed; 0 failed' /tmp/h2-failure-safety.log
+          test "$(git rev-parse HEAD)" = "4430439e0279d66b34a7dd6b87d200b66486244e" || exit 1
+          mkdir -p /tmp/master4430-evidence
+          status=0
+          cargo clippy --locked --all-targets --all-features -- -D warnings 2>&1 | tee /tmp/master4430-evidence/clippy.log
+          test "${PIPESTATUS[0]}" = 0 || status=1
+          while IFS= read -r selector; do
+            log="/tmp/master4430-evidence/${selector//::/_}.log"
+            cargo test --locked --all-features --lib "$selector" -- --exact --nocapture 2>&1 | tee "$log"
+            test "${PIPESTATUS[0]}" = 0 || status=1
+            grep -F 'running 1 test' "$log" || status=1
+          done <<'SELECTORS'
+          api::proxy::tests::codex_http2_failure_safety::http_502_preserves_verified_final_response_reset_independently
+          api::proxy::tests::downstream_disconnect_records_unknown_without_waiting_for_stalled_upstream
+          api::proxy::tests::persistence_isolation::pending_response_archive_begin_does_not_hold_first_byte_or_eof
+          api::proxy::tests::shutdown_durability::buffered_http_200_sigterm_waits_for_durable_capture_before_exit
+          api::proxy::tests::supplier_quota::forbidden::explicit403_quota_fails_over_avoids_failed_model_and_recovers_only_from_real_probe
+          db::allocation_history::tests::sqlite_allocation_history_exact_coverage_and_restart
+          db::migrations::proxy_group_tests::postgres_proxy_group_116_accepts_empty_113_and_later_114_115
+          db::migrations::observation_prefix::tests::postgres_legacy_conversion_is_atomic_verified_and_replayable
+          db::requests::conversations::archive_readiness_tests::postgres_archive_binding_and_financial_terminal_preserve_bodies_in_both_orders
+          db::requests::lifecycle::unlimited_admission_tests::postgres_unlimited_admission_and_terminal_ignore_shared_financial_and_stats_locks
+          db::tests::session_analytics::postgres_public_session_and_conversation_lists_cap_at_100
+          db::tests::terminal_projection::sqlite_deferred_session_edges_follow_admission_when_settlement_is_reversed
+          db::tests::terminal_projection::terminal_projection_configuration_reaches_real_finalization_and_persistence_pool
+          db::tests::terminal_projection::cache_coverage::postgres_cache_coverage_terminal_replay_filters_and_daily_edges
+          upstream_quota::r2_tests::accepted_reset_coalesced_nonreset_owner_applies_supplier_start_fence
+          SELECTORS
+          exit "$status"
+      - name: Retain the unchanged master comparison results
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        with:
+          name: master4430-clippy-fifteen-contracts
+          path: /tmp/master4430-evidence/
+          if-no-files-found: warn
+          retention-days: 7
 
   semantic-reader-scope-contract:
     if: inputs.contract == 'semantic-reader-scope'
