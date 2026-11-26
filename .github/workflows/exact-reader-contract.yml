@@ -231,6 +231,9 @@ jobs:
           RUSTFS_ACCESS_KEY: rustfs-test-fixture
           RUSTFS_SECRET_KEY: synthetic-test-only-secret-707
         run: |
+          set -euo pipefail
+          mkdir -p /tmp/native-release-evidence
+          trap 'docker logs rustfs-contract > /tmp/native-release-evidence/rustfs.log 2>&1 || true' EXIT
           docker run --detach --name rustfs-contract --publish 127.0.0.1:19000:9000 \
             --memory 1g --cpus 2 --env RUSTFS_ACCESS_KEY --env RUSTFS_SECRET_KEY \
             --env RUSTFS_ADDRESS=:9000 --env RUSTFS_CONSOLE_ENABLE=false \
@@ -242,13 +245,26 @@ jobs:
           echo "MTC_RUSTFS_TEST_BUCKET=$bucket" >> "$GITHUB_ENV"
           ready=false
           for attempt in $(seq 1 60); do
-            if curl -q --noproxy '*' --silent --output /dev/null http://127.0.0.1:19000/health; then ready=true; break; fi
+            code=$(curl -q --noproxy '*' --silent --show-error --connect-timeout 2 --max-time 3 \
+              --aws-sigv4 'aws:amz:us-east-1:s3' --user "$RUSTFS_ACCESS_KEY:$RUSTFS_SECRET_KEY" \
+              --output /tmp/native-release-evidence/ready.xml --write-out '%{http_code}' http://127.0.0.1:19000/ || true)
+            printf 'signed readiness attempt=%s HTTP%s\n' "$attempt" "$code" | tee -a /tmp/native-release-evidence/setup.log
+            if test "$code" = 200; then ready=true; break; fi
             sleep 2
           done
           test "$ready" = true
-          status=$(curl -q --noproxy '*' --silent --show-error --output /tmp/native-bucket-create.txt --write-out '%{http_code}' \
+          status=$(curl -q --noproxy '*' --silent --show-error --output /tmp/native-release-evidence/bucket-create.xml --write-out '%{http_code}' \
             --aws-sigv4 'aws:amz:us-east-1:s3' --user "$RUSTFS_ACCESS_KEY:$RUSTFS_SECRET_KEY" \
             --request PUT "http://127.0.0.1:19000/$bucket")
+          printf 'new bucket create HTTP%s\n' "$status" | tee -a /tmp/native-release-evidence/setup.log
+          python3 - <<'XMLCODE'
+          import pathlib,xml.etree.ElementTree as ET
+          p=pathlib.Path('/tmp/native-release-evidence/bucket-create.xml')
+          if p.stat().st_size:
+              root=ET.fromstring(p.read_bytes())
+              for node in root.iter():
+                  if node.tag.rsplit('}',1)[-1]=='Code':print('bucket_create_error_code='+str(node.text))
+          XMLCODE
           test "$status" = 200
           printf 'Created new run-owned bucket HTTP%s\n' "$status"
       - name: Verify reviewed exact nonzero native retirement
