@@ -36,12 +36,21 @@ jobs:
   metadata-refresh-contract:
     if: inputs.contract == 'metadata-refresh'
     runs-on: ubuntu-24.04
-    timeout-minutes: 35
+    timeout-minutes: 40
+    services:
+      postgres:
+        image: postgres:16-alpine
+        env:
+          POSTGRES_USER: token_center
+          POSTGRES_PASSWORD: token_center
+          POSTGRES_DB: token_center_test
+        ports: ['5432:5432']
+        options: --health-cmd "pg_isready -U token_center" --health-interval 5s --health-timeout 5s --health-retries 10
     env:
-      CARGO_BUILD_JOBS: "2"
-      CARGO_INCREMENTAL: "0"
-      CARGO_PROFILE_DEV_DEBUG: "0"
-      CARGO_PROFILE_TEST_DEBUG: "0"
+      CARGO_BUILD_JOBS: '2'
+      CARGO_INCREMENTAL: '0'
+      CARGO_PROFILE_TEST_DEBUG: '0'
+      MTC_TEST_POSTGRES_URL: postgres://token_center:token_center@127.0.0.1:5432/token_center_test
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
         with:
@@ -52,18 +61,26 @@ jobs:
           toolchain: 1.95.0
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6
       - uses: ./.github/actions/checkout-plugin-examples
-      - name: Verify only the reviewed archive observation and original archive contracts
+      - name: Verify fixed OAuth existing-pool contracts
         run: |
           set -euo pipefail
-          test "$(git rev-parse HEAD)" = "4a83574db5c48fcb86b07936d67d0f52db7d8d98"
+          test "$(git rev-parse HEAD)" = '7e62cfc6c58d0ca1d4744285c9b4ba0dc9d9e39d'
           git rev-parse HEAD
-          cargo check --locked --lib
-          cargo test --locked --lib archive::write_observation::tests::archive_write_observations_keep_routes_outcomes_and_lengths_distinct -- --exact --nocapture 2>&1 | tee /tmp/archive-observation.log
-          grep -F '1 passed; 0 failed' /tmp/archive-observation.log
-          cargo test --locked --lib archive::write_observation::tests::archive_write_observations_count_encoded_multipart_not_decoded_copy_bytes -- --exact --nocapture 2>&1 | tee /tmp/archive-observation.log
-          grep -F '1 passed; 0 failed' /tmp/archive-observation.log
-          cargo test --locked --lib archive::tests:: -- --nocapture 2>&1 | tee /tmp/archive-regression.log
-          grep -F '16 passed; 0 failed' /tmp/archive-regression.log
+          mkdir -p /tmp/oauth-existing-pool-evidence
+          cargo test --locked --lib --all-features worker::oauth_pool_tests::postgres_oauth_auto_recovery_uses_existing_pool_while_primary_is_exhausted -- --exact --ignored --nocapture 2>&1 | tee /tmp/oauth-existing-pool-evidence/0.log
+          grep -F '1 passed; 0 failed' /tmp/oauth-existing-pool-evidence/0.log
+          cargo test --locked --lib --all-features worker::tests::oauth_worker_reclaims_stale_undispatched_claim_but_not_unknown_outcome -- --exact --nocapture 2>&1 | tee /tmp/oauth-existing-pool-evidence/1.log
+          grep -F '1 passed; 0 failed' /tmp/oauth-existing-pool-evidence/1.log
+          cargo test --locked --lib --all-features worker::tests::oauth_rejected_generation_renews_once_and_failed_readback_does_not_requeue -- --exact --nocapture 2>&1 | tee /tmp/oauth-existing-pool-evidence/2.log
+          grep -F '1 passed; 0 failed' /tmp/oauth-existing-pool-evidence/2.log
+          cargo test --locked --lib --all-features worker::oauth_role_tests::oauth_rejection_delivery_crosses_gateway_control_and_worker_process_roles -- --exact --nocapture 2>&1 | tee /tmp/oauth-existing-pool-evidence/3.log
+          grep -F '1 passed; 0 failed' /tmp/oauth-existing-pool-evidence/3.log
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        if: always()
+        with:
+          name: oauth-existing-pool-7e62
+          path: /tmp/oauth-existing-pool-evidence/
+          if-no-files-found: warn
 
   orphan-reaper-contract:
     if: inputs.contract == 'orphan-reaper-971'
