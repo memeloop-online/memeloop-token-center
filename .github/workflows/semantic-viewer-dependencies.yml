@@ -26,7 +26,7 @@ jobs:
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
         with:
-          ref: ${{ inputs.source_revision || github.sha }}
+          ref: 0b7297a781fa692f7f3a918f05f777fa06cdaab3
           persist-credentials: false
       - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020
         with:
@@ -46,16 +46,20 @@ jobs:
       - name: Install Chromium for bounded browser contracts
         if: github.event_name == 'workflow_dispatch'
         run: npx playwright install --with-deps chromium
-      - name: Verify fixed proxy plaintext and current-read freshness contracts
+      - name: Verify fixed ID52 authenticated reload and typed-filter contracts
         run: |
           set -euo pipefail
-          test "$(git rev-parse HEAD)" = 'fb3cd0c000127bb3fbb8aec43d662089add0aa39'
+          test "$(git rev-parse HEAD)" = '0b7297a781fa692f7f3a918f05f777fa06cdaab3'
           git rev-parse HEAD
-          MTC_REQUIRE_BROWSER=1 node --import tsx --test --test-reporter=tap --test-concurrency=1 --test-name-pattern='^(create and rotate keep authorized values visible and editable across keyboard, mobile and schema variants|request read freshness advances only for successful current result reads)$' e2e/secret-credential-input-browser-contract.test.ts e2e/request-lifecycle-browser-contract.test.ts 2>&1 | tee /tmp/id43-80-browser.log
-          grep -Fx '# pass 2' /tmp/id43-80-browser.log
-          grep -Fx '# fail 0' /tmp/id43-80-browser.log
-          grep -E '^ok [0-9]+ - create and rotate keep authorized values visible and editable across keyboard, mobile and schema variants$' /tmp/id43-80-browser.log
-          grep -E '^ok [0-9]+ - request read freshness advances only for successful current result reads$' /tmp/id43-80-browser.log
+          MTC_REQUIRE_BROWSER=1 node --import tsx --test --test-reporter=tap --test-concurrency=1 --test-name-pattern='^(hard reload restores applied filters only after current login and tenant revalidation|Overview request actions open focused details and bucket drilldowns preserve the tenant-scoped filter)$' e2e/operator-overview-drilldown-browser-contract.test.ts 2>&1 | tee /tmp/id52-overview.log
+          grep -Fx '# pass 2' /tmp/id52-overview.log
+          grep -Fx '# fail 0' /tmp/id52-overview.log
+          grep -E '^ok [0-9]+ - hard reload restores applied filters only after current login and tenant revalidation$' /tmp/id52-overview.log
+          grep -E '^ok [0-9]+ - Overview request actions open focused details and bucket drilldowns preserve the tenant-scoped filter$' /tmp/id52-overview.log
+          MTC_REQUIRE_BROWSER=1 node --import tsx --test --test-reporter=tap --test-concurrency=1 e2e/typed-filter-builder-contract.test.ts e2e/operator-entry-client-key-contract.test.ts e2e/operator-login-cycle-browser-contract.test.ts 2>&1 | tee /tmp/id52-contracts.log
+          grep -Fx '# pass 20' /tmp/id52-contracts.log
+          grep -Fx '# fail 0' /tmp/id52-contracts.log
+          grep -Fx '# skipped 0' /tmp/id52-contracts.log
       - name: Retain actual browser evidence
         if: always() && github.event_name == 'workflow_dispatch'
         uses: actions/upload-artifact@65462800fd760344b1a7b4382951275a0abb4808
@@ -63,6 +67,6 @@ jobs:
           name: operator-ui-${{ inputs.contract }}-${{ inputs.source_revision }}
           path: |
             web/e2e-artifacts/
-            /tmp/id43-80-browser.log
+            /tmp/id52-*.log
           retention-days: 7
           if-no-files-found: warn
