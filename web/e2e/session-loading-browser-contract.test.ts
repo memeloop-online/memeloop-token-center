@@ -364,7 +364,7 @@ test('a new confirmed start reads active-page membership once and keeps exact re
     await page.waitForFunction(() => window.sessionListReads === 1);
     await page.evaluate(() => window.resolveSessionList(true));
     await settleRenderedRefresh(page, 1);
-    await page.locator('.session-controls').getByLabel('Session state', { exact: true }).selectOption('active');
+    await page.locator('.session-controls').getByRole('combobox', { name: /^Session state/ }).selectOption('active');
     await page.getByRole('button', { name: 'Apply filters', exact: true }).click();
     await page.waitForFunction(() => window.sessionListReads === 2);
     await page.evaluate(() => window.resolveSessionList(true));
