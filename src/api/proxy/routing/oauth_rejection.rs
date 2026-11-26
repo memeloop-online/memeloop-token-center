@@ -30,7 +30,12 @@ pub(super) async fn observe(
     // Called only after execute returned a supplier HTTP response. Local auth,
     // transport failures and 403 permissions/limits cannot enter this branch.
     // Successful inference has no database query and no additional task.
-    if status != StatusCode::UNAUTHORIZED || !account_bearer {
+    if status != StatusCode::UNAUTHORIZED
+        || !account_bearer
+        || crate::api::proxy::independent_probe::TARGET
+            .try_with(|_| ())
+            .is_ok()
+    {
         return;
     }
     if let Err(error) = state
@@ -106,6 +111,25 @@ mod tests {
                     .unwrap()
             );
         }
+        let target = crate::api::proxy::independent_probe::IndependentProbeTarget::new(
+            account.id,
+            "fixture-model".into(),
+            1,
+            account.updated_at,
+        );
+        crate::api::proxy::independent_probe::TARGET
+            .scope(
+                target,
+                observe(&state, account.id, 1, StatusCode::UNAUTHORIZED, true),
+            )
+            .await;
+        assert!(
+            !state
+                .db
+                .has_rejected_oauth_generation(account.id, 1)
+                .await
+                .unwrap()
+        );
         observe(&state, account.id, 1, StatusCode::UNAUTHORIZED, true).await;
         assert_eq!(
             state
