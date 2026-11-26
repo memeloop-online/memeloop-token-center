@@ -51,6 +51,17 @@ jobs:
       CARGO_INCREMENTAL: '0'
       CARGO_PROFILE_TEST_DEBUG: '0'
       MTC_TEST_POSTGRES_URL: postgres://token_center:token_center@127.0.0.1:5432/token_center_test
+      MTC_STAGE_FIXTURE_SOURCE: '83b1e8bef727c40599f005a47981925c64f3dc87'
+      MTC_STAGE_FIXTURE_DATABASE: 'mtc_hotfix163_20261126'
+      MTC_STAGE_FIXTURE_DATABASE_ROLE: 'mtc_hotfix163'
+      MTC_STAGE_FIXTURE_CLUSTER_UID: 'e7e9b61b-ebe3-4b89-829d-21a10880f1f4'
+      MTC_STAGE_FIXTURE_CLUSTER_IDENTITY_PATH: '/api/v1/namespaces/kube-system'
+      MTC_STAGE_FIXTURE_NAMESPACE: 'memeloop-token-center-staging'
+      MTC_STAGE_FIXTURE_NAMESPACE_UID: 'bc4064e1-486e-4dc5-bdca-dcb179245fa8'
+      MTC_STAGE_FIXTURE_PG_HOST: 'mtc-candidate163-20261125-pg'
+      MTC_STAGE_FIXTURE_PG_PORT: '5432'
+      MTC_STAGE_FIXTURE_PG_SERVICE_UID: '06f08a3a-c986-4d11-8be7-4b19414bee84'
+      MTC_STAGE_FIXTURE_WORK_ROOT: '/evidence/hotfix163-oauth'
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
         with:
@@ -61,20 +72,33 @@ jobs:
           toolchain: 1.95.0
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6
       - uses: ./.github/actions/checkout-plugin-examples
-      - name: Verify fixed OAuth existing-pool contracts
+      - name: Build and authenticate the exact Stage fixture bundle
         run: |
           set -euo pipefail
-          test "$(git rev-parse HEAD)" = '66916ed4c48bcfdbea3c7f603baa561809e44066'
+          test "$(git rev-parse HEAD)" = "$MTC_STAGE_FIXTURE_SOURCE"
+          test "$MTC_STAGE_FIXTURE_WORK_ROOT" != PENDING_SOLEOPS_PATH
           git rev-parse HEAD
-          mkdir -p /tmp/oauth-existing-pool-evidence
-          cargo test --locked --lib --all-features worker::oauth_role_tests::oauth_rejection_delivery_crosses_gateway_control_and_worker_process_roles -- --exact --nocapture 2>&1 | tee /tmp/oauth-existing-pool-evidence/3.log
-          grep -F '1 passed; 0 failed' /tmp/oauth-existing-pool-evidence/3.log
+          mkdir -p "$RUNNER_TEMP/stage-fixture-evidence"
+          cargo test --locked --lib --all-features --no-run --message-format=json > "$RUNNER_TEMP/stage-oauth-build.json"
+          python3 scripts/stage_oauth_fixture_bundle.py package --messages "$RUNNER_TEMP/stage-oauth-build.json" --bundle "$RUNNER_TEMP/stage-oauth-fixture"
+          readelf -h "$RUNNER_TEMP/stage-oauth-fixture/oauth-fixture" > "$RUNNER_TEMP/stage-fixture-evidence/elf-header.txt"
+          readelf --version-info "$RUNNER_TEMP/stage-oauth-fixture/oauth-fixture" > "$RUNNER_TEMP/stage-fixture-evidence/elf-versions.txt"
+          sha256sum "$RUNNER_TEMP/stage-oauth-fixture/oauth-fixture" > "$RUNNER_TEMP/stage-fixture-evidence/binary-sha256.txt"
+          printf 'run=%s\njob=%s\nsource=%s\n' "$GITHUB_RUN_ID" "$GITHUB_JOB" "$MTC_STAGE_FIXTURE_SOURCE" > "$RUNNER_TEMP/stage-fixture-evidence/source-run.txt"
+      - name: Verify the extracted shared disposable PG contract
+        run: |
+          set -euo pipefail
+          cargo test --locked --all-features --lib plugin::application::oauth_background_tests::postgres_cold_oauth_authority_uses_existing_pool_and_preserves_shared_authority -- --exact --ignored --nocapture 2>&1 | tee "$RUNNER_TEMP/stage-fixture-evidence/shared-pg.log"
+          grep -F '1 passed; 0 failed; 0 ignored;' "$RUNNER_TEMP/stage-fixture-evidence/shared-pg.log"
+          grep -F 'schema_max=163, schema163_receipts=1' "$RUNNER_TEMP/stage-fixture-evidence/shared-pg.log"
       - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
         if: always()
         with:
-          name: oauth-role-66916
-          path: /tmp/oauth-existing-pool-evidence/
-          if-no-files-found: warn
+          name: stage-oauth-fixture-83b1
+          path: |
+            ${{ runner.temp }}/stage-oauth-fixture/
+            ${{ runner.temp }}/stage-fixture-evidence/
+          if-no-files-found: error
 
   orphan-reaper-contract:
     if: inputs.contract == 'orphan-reaper-971'
