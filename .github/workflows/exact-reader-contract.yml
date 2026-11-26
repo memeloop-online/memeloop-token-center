@@ -252,7 +252,7 @@ jobs:
           MTC_RUSTFS_TEST_SECRET_KEY: synthetic-test-only-secret-707
         run: |
           set -euo pipefail
-          test "$(git rev-parse HEAD)" = "f1f925998f93ae5e2a1ac4dd4d4ab35c38fb82d1"
+          test "$(git rev-parse HEAD)" = "acd77f9c7d244aa6d8896cdce3ebacd2d9b39f42"
           git rev-parse HEAD
           mkdir -p /tmp/request-singleflight-evidence
           cargo test --locked --lib gateway_body::carrier::resource_wakeup_tests::first_request_segment_waits_for_retained_credit_despite_free_global_ram -- --exact --nocapture 2>&1 | tee /tmp/request-singleflight-evidence/contract-1.log
@@ -265,11 +265,13 @@ jobs:
           grep -F '1 passed; 0 failed' /tmp/request-singleflight-evidence/contract-4.log
           cargo test --locked --lib gateway_body::carrier::resource_wakeup_tests::request_without_archive_preserves_capture_above_retained_window -- --exact --nocapture 2>&1 | tee /tmp/request-singleflight-evidence/contract-5.log
           grep -F '1 passed; 0 failed' /tmp/request-singleflight-evidence/contract-5.log
+          cargo test --locked --lib gateway_body::carrier::resource_wakeup_tests::sub_quantum_retained_window_preserves_existing_archive_spill -- --exact --nocapture 2>&1 | tee /tmp/request-singleflight-evidence/contract-6.log
+          grep -F '1 passed; 0 failed' /tmp/request-singleflight-evidence/contract-6.log
       - name: Retain request singleflight evidence
         if: always()
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
         with:
-          name: request-singleflight-f1f925
+          name: request-singleflight-acd77
           path: /tmp/request-singleflight-evidence/
           if-no-files-found: warn
           retention-days: 7
