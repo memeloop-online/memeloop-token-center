@@ -159,7 +159,7 @@ async fn rustfs_native_publisher_release_reclaims_exact_nonzero_temporary() {
         "at least one stable physical object identity must be present"
     );
     assert!(
-        delete_fault.rejected() > 0,
+        delete_fault.rejected() > 0 && delete_fault.bulk_rejected() > 0,
         "normal inline release must actually attempt cleanup"
     );
     let release_objects = object_store

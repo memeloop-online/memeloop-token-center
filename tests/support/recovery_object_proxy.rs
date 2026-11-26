@@ -6,6 +6,7 @@ use axum::{
     response::Response,
     routing::any,
 };
+use futures_util::StreamExt;
 use std::{
     collections::{HashMap, HashSet},
     sync::{
@@ -45,6 +46,7 @@ pub(crate) struct ExactCarrierDeleteFault {
     ambiguous: AtomicBool,
     enabled: AtomicBool,
     rejected: AtomicUsize,
+    bulk_rejected: AtomicUsize,
 }
 impl ExactCarrierDeleteFault {
     fn observes_response_carrier(&self, path: &str) -> bool {
@@ -85,6 +87,33 @@ impl ExactCarrierDeleteFault {
             && self.binding.lock().unwrap().as_ref().is_some_and(|bound| {
                 bound.backend == backend && bound.host == host && bound.path == path
             })
+    }
+    fn bulk_body(
+        &self,
+        backend: &str,
+        host: &str,
+        path: &str,
+        query: Option<&str>,
+    ) -> Option<Vec<u8>> {
+        if !self.enabled.load(Ordering::SeqCst)
+            || self.ambiguous.load(Ordering::SeqCst)
+            || query != Some("delete")
+        {
+            return None;
+        }
+        let binding = self.binding.lock().unwrap();
+        let bound = binding.as_ref()?;
+        if bound.backend != backend || bound.host != host || path != format!("/{}", self.bucket) {
+            return None;
+        }
+        let key = bound.path.strip_prefix(&format!("/{}/", self.bucket))?;
+        if !key.is_ascii() || key.bytes().any(|b| matches!(b, b'&' | b'<' | b'>')) {
+            return None;
+        }
+        Some(format!("<Delete xmlns=\"http://s3.amazonaws.com/doc/2006-03-01/\"><Object><Key>{key}</Key></Object></Delete>").into_bytes())
+    }
+    pub(crate) fn bulk_rejected(&self) -> usize {
+        self.bulk_rejected.load(Ordering::SeqCst)
     }
     pub(crate) fn binding(&self) -> ExactDeleteBinding {
         assert!(
@@ -286,7 +315,37 @@ impl Drop for RecoveryObjectProxy {
         self.task.abort();
     }
 }
-async fn forward(State(state): State<Arc<ProxyState>>, request: Request) -> Response {
+// Inspect only the SDK's exact canonical single-key metadata. Every consumed
+// frame is retained and chained back unchanged on mismatch, including errors.
+async fn compare_bulk_body(request: Request, expected: &[u8]) -> (Request, bool) {
+    let (parts, body) = request.into_parts();
+    let mut stream = body.into_data_stream();
+    let mut prefix = Vec::new();
+    let mut offset: usize = 0;
+    let matched = loop {
+        match stream.next().await {
+            None => break offset == expected.len(),
+            Some(frame) => {
+                let equal = match &frame {
+                    Ok(bytes) => expected
+                        .get(offset..offset.saturating_add(bytes.len()))
+                        .is_some_and(|slice| slice == bytes.as_ref()),
+                    Err(_) => false,
+                };
+                if let Ok(bytes) = &frame {
+                    offset = offset.saturating_add(bytes.len());
+                }
+                prefix.push(frame);
+                if !equal || prefix.len() > expected.len().saturating_add(1) {
+                    break false;
+                }
+            }
+        }
+    };
+    let body = Body::from_stream(futures_util::stream::iter(prefix).chain(stream));
+    (Request::from_parts(parts, body), matched)
+}
+async fn forward(State(state): State<Arc<ProxyState>>, mut request: Request) -> Response {
     let began = std::time::Instant::now();
     let exact_fault = state.faults.lock().unwrap().exact_carrier_delete.clone();
     let original_path = request.uri().path().to_owned();
@@ -297,6 +356,41 @@ async fn forward(State(state): State<Arc<ProxyState>>, request: Request) -> Resp
         .unwrap_or("")
         .to_owned();
     let original_method = request.method().clone();
+    if original_method == axum::http::Method::POST
+        && !request
+            .headers()
+            .contains_key(axum::http::header::TRANSFER_ENCODING)
+        && !request
+            .headers()
+            .contains_key(axum::http::header::CONTENT_ENCODING)
+        && let Some(fault) = &exact_fault
+        && let Some(expected) = fault.bulk_body(
+            &state.upstream,
+            &original_host,
+            &original_path,
+            request.uri().query(),
+        )
+    {
+        let lengths: Vec<_> = request
+            .headers()
+            .get_all(axum::http::header::CONTENT_LENGTH)
+            .iter()
+            .collect();
+        if lengths.len() == 1
+            && lengths[0].to_str().ok() == Some(expected.len().to_string().as_str())
+        {
+            let (restored, matched) = compare_bulk_body(request, &expected).await;
+            request = restored;
+            if matched && fault.enabled.load(Ordering::SeqCst) {
+                fault.rejected.fetch_add(1, Ordering::SeqCst);
+                fault.bulk_rejected.fetch_add(1, Ordering::SeqCst);
+                return Response::builder()
+                    .status(503)
+                    .body(Body::from("exact synthetic cleanup unavailable"))
+                    .unwrap();
+            }
+        }
+    }
     if original_method == axum::http::Method::DELETE
         && exact_fault.as_ref().is_some_and(|fault| {
             fault.rejects(
@@ -469,8 +563,8 @@ async fn forward(State(state): State<Arc<ProxyState>>, request: Request) -> Resp
 mod exact_delete_tests {
     use super::*;
 
-    #[test]
-    fn exact_carrier_delete_fault_keeps_backend_host_query_and_neighbor_boundaries() {
+    #[tokio::test]
+    async fn exact_carrier_delete_fault_keeps_backend_host_query_and_neighbor_boundaries() {
         let fault = ExactCarrierDeleteFault {
             bucket: "isolated".into(),
             enabled: AtomicBool::new(true),
@@ -485,6 +579,55 @@ mod exact_delete_tests {
         assert!(!fault.rejects("backend", "signed-host", &path, None));
         fault.bind_after_put("backend", "signed-host", &path);
         assert_eq!(fault.binding().path, path);
+        let expected = fault
+            .bulk_body("backend", "signed-host", "/isolated", Some("delete"))
+            .unwrap();
+        for (backend, host, root, query) in [
+            ("other", "signed-host", "/isolated", Some("delete")),
+            ("backend", "other", "/isolated", Some("delete")),
+            ("backend", "signed-host", "/other", Some("delete")),
+            ("backend", "signed-host", "/isolated/", Some("delete")),
+            ("backend", "signed-host", "/isolated", Some("delete&delete")),
+            ("backend", "signed-host", "/isolated", Some("delete=")),
+        ] {
+            assert!(fault.bulk_body(backend, host, root, query).is_none());
+        }
+        let multi = String::from_utf8(expected.clone())
+            .unwrap()
+            .replace("</Delete>", "<Object><Key>neighbor</Key></Object></Delete>")
+            .into_bytes();
+        let neighbor = String::from_utf8(expected.clone())
+            .unwrap()
+            .replace("</Key>", "-neighbor</Key>")
+            .into_bytes();
+        let version = String::from_utf8(expected.clone())
+            .unwrap()
+            .replace("</Object>", "<VersionId>v1</VersionId></Object>")
+            .into_bytes();
+        for original in [
+            expected.clone(),
+            multi,
+            neighbor,
+            version,
+            b"<Delete>&ambiguous;</Delete>".to_vec(),
+        ] {
+            // A mismatching frame includes unread bytes past the first mismatch.
+            let frames: Vec<Result<bytes::Bytes, std::io::Error>> = original
+                .chunks(7)
+                .map(|part| Ok(bytes::Bytes::copy_from_slice(part)))
+                .collect();
+            let request = Request::new(Body::from_stream(futures_util::stream::iter(frames)));
+            let (restored, matched) = compare_bulk_body(request, &expected).await;
+            assert_eq!(matched, original == expected);
+            assert_eq!(
+                axum::body::to_bytes(restored.into_body(), usize::MAX)
+                    .await
+                    .unwrap()
+                    .as_ref(),
+                original.as_slice()
+            );
+        }
+
         assert!(fault.rejects("backend", "signed-host", &path, None));
         for query in ["uploadId=abc", "versionId=abc", "delete", ""] {
             assert!(!fault.rejects("backend", "signed-host", &path, Some(query)));
