@@ -162,6 +162,7 @@ impl ArchiveStore {
             readiness_path,
             readiness_deadline: Duration::from_millis(config.s3_timeouts.readiness_millis.into()),
             readiness_metrics: Arc::default(),
+            write_observations: Arc::default(),
         })
     }
 }

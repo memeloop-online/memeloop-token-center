@@ -29,8 +29,14 @@ impl ArchiveStore {
                 "archive CAS objects are immutable".into(),
             ));
         }
-        let (store, location) = self.resolve(location)?;
-        store.put(&location, PutPayload::from_bytes(data)).await?;
+        let (store, path) = self.resolve(location)?;
+        let mut observation = self.write_context(location).start(
+            super::write_observation::Operation::Put,
+            Some(data.len() as u64),
+        );
+        let result = store.put(&path, PutPayload::from_bytes(data)).await;
+        observation.result(&result);
+        result?;
         Ok(())
     }
 
