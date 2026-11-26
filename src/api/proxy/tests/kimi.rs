@@ -55,7 +55,7 @@ async fn kimi_error_envelopes_preserve_original_bytes_and_safe_internal_classifi
         for (label, content_type, body, expected_reason) in &cases {
             let upstream = MockServer::start().await;
             Mock::given(method("POST"))
-                .respond_with(ResponseTemplate::new(403).set_body_raw(body.clone(), *content_type))
+                .respond_with(ResponseTemplate::new(403).set_body_raw(body.clone(), content_type))
                 .expect(1)
                 .mount(&upstream)
                 .await;

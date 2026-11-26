@@ -1237,7 +1237,7 @@ impl Database {
         transaction: &mut Transaction<'_, Any>,
         identity: &HistoryIdentity,
     ) -> Result<Value, HistoryError> {
-        HistoryRead::Connection(&mut **transaction)
+        HistoryRead::Connection(transaction)
             .analysis_fact(identity)
             .await
     }
@@ -1247,7 +1247,7 @@ impl Database {
         identity: &HistoryIdentity,
         payload: &Value,
     ) -> Result<Option<HistoryStatistics>, HistoryError> {
-        HistoryRead::Connection(&mut **transaction)
+        HistoryRead::Connection(transaction)
             .statistics(identity, payload)
             .await
     }

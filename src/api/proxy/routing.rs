@@ -141,8 +141,8 @@ pub(super) fn plan_proxy_route(
     let is_kimi = route.driver == crate::oauth::managed::kimi::PROVIDER_DRIVER;
     let native_kimi_chat = is_kimi && kimi::reuses_chat_workspace(protocol, request_json);
     let component_adapter = provider.component_adapter.is_some();
-    let direct_http = (passthrough_responses || native_kimi_chat)
-        && (responses_via_chat_dialect.is_none() || native_kimi_chat)
+    let direct_http = (native_kimi_chat
+        || (passthrough_responses && responses_via_chat_dialect.is_none()))
         && !responses_via_anthropic
         && !matches!(protocol, Protocol::OpenAiResponsesCompact)
         && !crate::api::new_api_transport::has_compaction_trigger(request_json)
