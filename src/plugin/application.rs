@@ -416,6 +416,17 @@ impl ApplicationPlugins {
         revision: i64,
         reason: &str,
     ) -> Result<ApplicationPluginSnapshot, AppError> {
+        self.load_with_database(id, revision, reason, &self.db)
+            .await
+    }
+
+    async fn load_with_database(
+        &self,
+        id: &str,
+        revision: i64,
+        reason: &str,
+        database: &Database,
+    ) -> Result<ApplicationPluginSnapshot, AppError> {
         validate_inventory_id(id)?;
         self.refresh_inventory().await?;
         let entry = self
@@ -425,7 +436,8 @@ impl ApplicationPlugins {
             .get(id)
             .cloned()
             .ok_or(AppError::Forbidden)?;
-        self.load_entry(id, entry, revision, reason).await
+        self.load_entry_with_database(id, entry, revision, reason, database)
+            .await
     }
 
     async fn load_entry(
@@ -435,6 +447,20 @@ impl ApplicationPlugins {
         revision: i64,
         reason: &str,
     ) -> Result<ApplicationPluginSnapshot, AppError> {
+        self.load_entry_with_database(id, entry, revision, reason, &self.db)
+            .await
+    }
+
+    async fn load_entry_with_database(
+        &self,
+        id: &str,
+        entry: PreinstalledInventory,
+        revision: i64,
+        reason: &str,
+        database: &Database,
+    ) -> Result<ApplicationPluginSnapshot, AppError> {
+        // Keep the cached executable bound to its original authority. Only
+        // this load's stored-configuration validation uses the scoped handle.
         let db = self.db.clone();
         let permit =
             tokio::time::timeout(ADMISSION_WAIT, COMPILATION_PERMITS.clone().acquire_owned())
@@ -473,7 +499,9 @@ impl ApplicationPlugins {
             .map_err(|_| AppError::capacity_error("plugin_compilation_capacity"))?
             .map_err(|_| AppError::internal("application_load_entry_5"))??;
         let contract_digest = contract_digest(&runtime)?;
-        runtime.validate_stored_configurations().await?;
+        runtime
+            .validate_stored_configurations_with_database(database)
+            .await?;
         let identity_digest = super::plugin_configuration_schema_digest(&json!({
             "manifests": runtime.manifests(), "identities": runtime.package_identities()
         }))?;
@@ -647,6 +675,40 @@ impl ApplicationPlugins {
         }
     }
 
+    /// Automatic OAuth pins the actual published receipt using its existing
+    /// persistence handle. Share the same authority/cache and all validation;
+    /// never rebind the authority or publish a fallback snapshot globally.
+    pub(crate) async fn pin_for_oauth(
+        self: &Arc<Self>,
+        database: &Database,
+    ) -> Result<Option<Arc<ApplicationPluginSnapshot>>, AppError> {
+        let head = database.optional_application_plugin_head().await?;
+        let snapshot = match &head {
+            Some(head) => Some(
+                self.pin_revision_with_database(head.clone(), database)
+                    .await?,
+            ),
+            None => {
+                let had_snapshot = self
+                    .current
+                    .read()
+                    .map_err(|_| AppError::internal("oauth_plugin_snapshot_lock"))?
+                    .snapshot
+                    .is_some();
+                if had_snapshot || !database.application_plugin_history(None).await?.is_empty() {
+                    return Err(AppError::Forbidden);
+                }
+                None
+            }
+        };
+        if database.optional_application_plugin_head().await? != head {
+            return Err(AppError::Conflict(
+                "plugin head changed during OAuth pin".into(),
+            ));
+        }
+        Ok(snapshot)
+    }
+
     pub fn current_snapshot(&self) -> Result<Option<Arc<ApplicationPluginSnapshot>>, AppError> {
         let current = self
             .current
@@ -764,6 +826,14 @@ impl ApplicationPlugins {
         self: &Arc<Self>,
         head: ApplicationRevision,
     ) -> Result<Arc<ApplicationPluginSnapshot>, AppError> {
+        self.pin_revision_with_database(head, &self.db).await
+    }
+
+    async fn pin_revision_with_database(
+        self: &Arc<Self>,
+        head: ApplicationRevision,
+        database: &Database,
+    ) -> Result<Arc<ApplicationPluginSnapshot>, AppError> {
         #[cfg(test)]
         if let Some(waiting) = self.snapshot_cache_waiting.lock().unwrap().take() {
             let _ = waiting.send(());
@@ -798,7 +868,7 @@ impl ApplicationPlugins {
         if !metadata.is_dir() || metadata.file_type().is_symlink() {
             return Err(AppError::Forbidden);
         }
-        tokio::time::timeout(PIN_DEADLINE, self.pin_head(head))
+        tokio::time::timeout(PIN_DEADLINE, self.pin_head(head, database))
             .await
             .map_err(|_| AppError::capacity_error("plugin_pin_timeout"))?
     }
@@ -806,6 +876,7 @@ impl ApplicationPlugins {
     async fn pin_head(
         self: &Arc<Self>,
         head: ApplicationRevision,
+        database: &Database,
     ) -> Result<Arc<ApplicationPluginSnapshot>, AppError> {
         loop {
             let flight = {
@@ -831,12 +902,18 @@ impl ApplicationPlugins {
                     cache.in_flight = Some(flight.clone());
                     let authority = self.clone();
                     let receipt = head.clone();
+                    let database = database.clone();
                     // The manager owns the operation and cache publication, not
                     // the first request. Dropping any/all waiters loses no result.
                     tokio::spawn(async move {
                         let loaded = tokio::time::timeout(PIN_DEADLINE, async {
                             let snapshot = authority
-                                .load(&receipt.inventory_id, receipt.revision, &receipt.reason)
+                                .load_with_database(
+                                    &receipt.inventory_id,
+                                    receipt.revision,
+                                    &receipt.reason,
+                                    &database,
+                                )
                                 .await?;
                             validate_receipt(&snapshot.receipt, &receipt)?;
                             Ok::<_, AppError>(Arc::new(snapshot))
@@ -936,3 +1013,6 @@ fn validate_operation(expected: i64, key: &str) -> Result<(), AppError> {
 mod hot_snapshot_tests;
 #[cfg(test)]
 mod tests;
+
+#[cfg(test)]
+mod oauth_background_tests;
