@@ -166,7 +166,8 @@ jobs:
           cap_args=[arg for cap in drop_caps for arg in ['--cap-drop',cap]]
           for suffix,args in [('help',['--help']),('plugin-runtime',['verify-plugin-runtime'])]:
               cid='e9f-'+suffix
-              ctr('containers','create','--snapshotter','overlayfs','--read-only','--user','10001:10001',*cap_args,image,cid,'/usr/local/bin/memeloop-token-center',*args)
+              temp_args=['--mount','type=tmpfs,src=tmpfs,dst=/tmp,options=rw:nosuid:nodev:noexec:mode=1777:size=16m'] if suffix=='plugin-runtime' else []
+              ctr('containers','create','--snapshotter','overlayfs','--read-only','--user','10001:10001',*temp_args,*cap_args,image,cid,'/usr/local/bin/memeloop-token-center',*args)
               info=json.loads(ctr('containers','info',cid))
               if info['Image']!=image:raise SystemExit('container image binding mismatch')
               snap=json.loads(ctr('snapshots','--snapshotter','overlayfs','info',info['SnapshotKey']))
@@ -174,6 +175,9 @@ jobs:
               spec=info['Spec']
               if not spec['process'].get('noNewPrivileges') or any(spec['process'].get('capabilities',{}).values()):raise SystemExit('container capability/privilege isolation mismatch')
               if not spec['root']['readonly'] or spec['process']['user']['uid']!=10001 or not any(n['type']=='network' and not n.get('path') for n in spec['linux']['namespaces']):raise SystemExit('container isolation mismatch')
+              temporary=[m for m in spec['mounts'] if m['destination']=='/tmp']
+              if suffix=='plugin-runtime' and (len(temporary)!=1 or temporary[0]['type']!='tmpfs' or temporary[0]['source']!='tmpfs' or not {'rw','nosuid','nodev','noexec','mode=1777','size=16m'}.issubset(set(temporary[0]['options']))):raise SystemExit('private bounded temporary mount mismatch')
+              if suffix=='help' and temporary:raise SystemExit('help runtime changed temporary mounts')
               (root/(suffix+'-container.json')).write_text(json.dumps(info,indent=2))
               output=ctr('tasks','start',cid)
               (root/(suffix+'.txt')).write_bytes(output)
