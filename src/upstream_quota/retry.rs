@@ -153,19 +153,11 @@ impl<'a> ReadSession<'a> {
         {
             return;
         }
-        if let Some(state) = self.state
-            && let Err(error) = state
-                .db
-                .observe_rejected_oauth_generation(
-                    context.account_id,
-                    context.credential_generation,
-                )
-                .await
-        {
-            tracing::warn!(upstream_account_id = %context.account_id,
-                credential_generation = context.credential_generation,
-                error_category = error.diagnostic_category(),
-                "supplier OAuth rejection evidence could not be recorded");
+        if let Some(state) = self.state {
+            state
+                .upstream_quota
+                .oauth_rejections
+                .submit(context.account_id, context.credential_generation);
         }
     }
 
@@ -716,6 +708,7 @@ mod tests {
                     bearer,
                 )
                 .await;
+            state.upstream_quota.oauth_rejections.flush(&state).await;
             assert!(
                 !state
                     .db
@@ -736,6 +729,7 @@ mod tests {
         let observe =
             || session.observe_bearer_rejection(context, http::StatusCode::UNAUTHORIZED, true);
         tokio::join!(observe(), observe(), observe());
+        state.upstream_quota.oauth_rejections.flush(&state).await;
         assert_eq!(
             state
                 .db
@@ -766,6 +760,7 @@ mod tests {
             .await
             .unwrap();
         observe().await;
+        state.upstream_quota.oauth_rejections.flush(&state).await;
         assert!(
             !state
                 .db
@@ -792,6 +787,7 @@ mod tests {
                 true,
             )
             .await;
+        state.upstream_quota.oauth_rejections.flush(&state).await;
         assert!(
             !state
                 .db
@@ -819,6 +815,7 @@ mod tests {
                 true,
             )
             .await;
+        state.upstream_quota.oauth_rejections.flush(&state).await;
         assert_eq!(
             state
                 .db
@@ -844,6 +841,7 @@ mod tests {
                 true,
             )
             .await;
+        state.upstream_quota.oauth_rejections.flush(&state).await;
         assert!(
             state
                 .db

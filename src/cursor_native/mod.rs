@@ -82,7 +82,7 @@ async fn unary_with_rejection(
         &client,
         &format!("{BACKEND}{}", method.path()),
         access_token,
-        rejection.map(|(id, generation)| (&state.db, id, generation)),
+        rejection.map(|(id, generation)| (state, id, generation)),
     )
     .await
 }
@@ -100,7 +100,7 @@ async fn send_with_rejection(
     client: &reqwest::Client,
     url: &str,
     access_token: &str,
-    rejection: Option<(&crate::db::Database, uuid::Uuid, i64)>,
+    rejection: Option<(&AppState, uuid::Uuid, i64)>,
 ) -> Result<Vec<u8>, &'static str> {
     let mut authorization =
         reqwest::header::HeaderValue::from_str(&format!("Bearer {access_token}"))
@@ -124,13 +124,12 @@ async fn send_with_rejection(
         .map_err(|_| "connection_failed")?;
     let status = response.status();
     if status == reqwest::StatusCode::UNAUTHORIZED
-        && let Some((db, account_id, generation)) = rejection
-        && let Err(error) = db
-            .observe_rejected_oauth_generation(account_id, generation)
-            .await
+        && let Some((state, account_id, generation)) = rejection
     {
-        tracing::warn!(upstream_account_id = %account_id, credential_generation = generation,
-            error_category = error.diagnostic_category(), "supplier OAuth rejection evidence could not be recorded");
+        state
+            .upstream_quota
+            .oauth_rejections
+            .submit(account_id, generation);
     }
     if status.is_redirection() {
         return Err("redirect_rejected");
@@ -229,11 +228,12 @@ mod tests {
                     &client,
                     &format!("{}/{status}", server.uri()),
                     "fixture-token",
-                    evidence.map(|(id, generation)| (&state.db, id, generation))
+                    evidence.map(|(id, generation)| (&state, id, generation))
                 )
                 .await,
                 Err("authentication_failed")
             );
+            state.upstream_quota.oauth_rejections.flush(&state).await;
             assert!(
                 !state
                     .db
@@ -243,16 +243,48 @@ mod tests {
             );
         }
         let evidence = quota_rejection(account.id, 1, QuotaReadTrigger::BackgroundRecovery);
-        assert_eq!(
-            send_with_rejection(
-                &client,
-                &format!("{}/401", server.uri()),
-                "fixture-token",
-                evidence.map(|(id, generation)| (&state.db, id, generation))
-            )
-            .await,
-            Err("authentication_failed")
+        let mut blocked = state.db.begin_write_transaction().await.unwrap();
+        sqlx::query("UPDATE upstream_oauth_rejected_generations SET observed_at=observed_at")
+            .execute(&mut *blocked)
+            .await
+            .unwrap();
+        // The consumer is paused/SQL is locked: raw supplier rejection still
+        // returns immediately, and duplicate same-generation signals coalesce.
+        for _ in 0..3 {
+            assert_eq!(
+                tokio::time::timeout(
+                    std::time::Duration::from_secs(1),
+                    send_with_rejection(
+                        &client,
+                        &format!("{}/401", server.uri()),
+                        "fixture-token",
+                        evidence.map(|(id, generation)| (&state, id, generation))
+                    )
+                )
+                .await
+                .expect("supplier 401 must not wait for evidence SQL"),
+                Err("authentication_failed")
+            );
+        }
+        state.upstream_quota.oauth_rejections.flush(&state).await;
+        assert!(
+            !state
+                .db
+                .has_rejected_oauth_generation(account.id, 1)
+                .await
+                .unwrap()
         );
+        blocked.rollback().await.unwrap();
+        state.upstream_quota.oauth_rejections.flush(&state).await;
+        assert_eq!(
+            state
+                .db
+                .list_managed_oauth_refresh_candidates(crate::db::unix_millis(), 20)
+                .await
+                .unwrap(),
+            vec![(account.id, 1)]
+        );
+        state.upstream_quota.oauth_rejections.flush(&state).await;
         assert!(
             state
                 .db

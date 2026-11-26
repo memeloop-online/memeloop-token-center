@@ -38,14 +38,10 @@ pub(super) async fn observe(
     {
         return;
     }
-    if let Err(error) = state
-        .db
-        .observe_rejected_oauth_generation(account_id, generation)
-        .await
-    {
-        tracing::warn!(upstream_account_id = %account_id, credential_generation = generation,
-            error_category = error.diagnostic_category(), "supplier OAuth rejection evidence could not be recorded");
-    }
+    state
+        .upstream_quota
+        .oauth_rejections
+        .submit(account_id, generation);
 }
 
 #[cfg(test)]
@@ -103,6 +99,7 @@ mod tests {
                 bearer,
             )
             .await;
+            state.upstream_quota.oauth_rejections.flush(&state).await;
             assert!(
                 !state
                     .db
@@ -123,6 +120,7 @@ mod tests {
                 observe(&state, account.id, 1, StatusCode::UNAUTHORIZED, true),
             )
             .await;
+        state.upstream_quota.oauth_rejections.flush(&state).await;
         assert!(
             !state
                 .db
@@ -131,6 +129,7 @@ mod tests {
                 .unwrap()
         );
         observe(&state, account.id, 1, StatusCode::UNAUTHORIZED, true).await;
+        state.upstream_quota.oauth_rejections.flush(&state).await;
         assert_eq!(
             state
                 .db
@@ -150,6 +149,7 @@ mod tests {
             .await
             .unwrap();
         observe(&state, account.id, 1, StatusCode::UNAUTHORIZED, true).await;
+        state.upstream_quota.oauth_rejections.flush(&state).await;
         assert!(
             !state
                 .db

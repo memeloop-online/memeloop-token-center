@@ -1543,22 +1543,53 @@ impl Database {
         account_id: Uuid,
         generation: i64,
     ) -> Result<(), AppError> {
-        sqlx::query("INSERT INTO upstream_oauth_rejected_generations (upstream_account_id, credential_generation, observed_at) SELECT a.id, a.credential_generation, $3 FROM upstream_accounts a JOIN upstream_credentials c ON c.upstream_account_id=a.id AND c.generation=a.credential_generation WHERE a.id=$1 AND a.credential_generation=$2 AND a.status='active' AND a.auth_kind='oauth' AND a.oauth_session_id IS NOT NULL AND a.oauth_refresh_url IS NOT NULL AND c.revoked_at IS NULL ON CONFLICT (upstream_account_id) DO UPDATE SET credential_generation=excluded.credential_generation, observed_at=excluded.observed_at, verification_started_at=NULL WHERE upstream_oauth_rejected_generations.credential_generation < excluded.credential_generation")
+        sqlx::query("INSERT INTO upstream_oauth_rejected_generations (upstream_account_id, credential_generation, observed_at) SELECT a.id, a.credential_generation, $3 FROM upstream_accounts a JOIN upstream_credentials c ON c.upstream_account_id=a.id AND c.generation=a.credential_generation WHERE a.id=$1 AND a.credential_generation=$2 AND a.status='active' AND a.auth_kind='oauth' AND a.oauth_session_id IS NOT NULL AND a.oauth_refresh_url IS NOT NULL AND c.revoked_at IS NULL ON CONFLICT (upstream_account_id) DO UPDATE SET credential_generation=excluded.credential_generation, observed_at=excluded.observed_at, verification_started_at=NULL, verification_finished_at=NULL, verification_error_code=NULL WHERE upstream_oauth_rejected_generations.credential_generation < excluded.credential_generation")
             .bind(account_id.to_string()).bind(generation).bind(unix_millis())
             .execute(&self.pool).await?;
         Ok(())
     }
 
-    /// Consume only the readback permission, never the rejection history or
-    /// refresh lease. Concurrent/replayed worker completions cannot reread twice.
+    /// The durable evidence is also the verification outbox. Selection runs in
+    /// its own worker role and never delays another account's OAuth exchange.
+    pub(crate) async fn list_rejected_oauth_verifications(
+        &self,
+        now: i64,
+        limit: i64,
+    ) -> Result<Vec<(Uuid, i64)>, AppError> {
+        let rows = sqlx::query("SELECT r.upstream_account_id, r.credential_generation FROM upstream_oauth_rejected_generations r JOIN upstream_accounts a ON a.id=r.upstream_account_id WHERE a.status='active' AND a.credential_generation>r.credential_generation AND r.verification_finished_at IS NULL AND (r.verification_started_at IS NULL OR r.verification_started_at <= $1) ORDER BY r.observed_at, r.upstream_account_id LIMIT $2")
+            .bind(now.saturating_sub(120_000)).bind(limit).fetch_all(&self.pool).await?;
+        rows.into_iter()
+            .map(|row| {
+                Ok((
+                    parse_uuid(row.try_get("upstream_account_id")?)?,
+                    row.try_get("credential_generation")?,
+                ))
+            })
+            .collect()
+    }
+
     pub(crate) async fn claim_rejected_oauth_verification(
         &self,
         account_id: Uuid,
         rejected_generation: i64,
+        started: i64,
     ) -> Result<bool, AppError> {
-        Ok(sqlx::query("UPDATE upstream_oauth_rejected_generations SET verification_started_at=$3 WHERE upstream_account_id=$1 AND credential_generation=$2 AND verification_started_at IS NULL AND EXISTS (SELECT 1 FROM upstream_accounts a WHERE a.id=$1 AND a.status='active' AND a.credential_generation>$2)")
-            .bind(account_id.to_string()).bind(rejected_generation).bind(unix_millis())
+        Ok(sqlx::query("UPDATE upstream_oauth_rejected_generations SET verification_started_at=$3 WHERE upstream_account_id=$1 AND credential_generation=$2 AND verification_finished_at IS NULL AND (verification_started_at IS NULL OR verification_started_at<=$4) AND EXISTS (SELECT 1 FROM upstream_accounts a WHERE a.id=$1 AND a.status='active' AND a.credential_generation>$2)")
+            .bind(account_id.to_string()).bind(rejected_generation).bind(started).bind(started.saturating_sub(120_000))
             .execute(&self.pool).await?.rows_affected() == 1)
+    }
+
+    pub(crate) async fn finish_rejected_oauth_verification(
+        &self,
+        account_id: Uuid,
+        rejected_generation: i64,
+        started: i64,
+        error: Option<&str>,
+    ) -> Result<(), AppError> {
+        sqlx::query("UPDATE upstream_oauth_rejected_generations SET verification_finished_at=$4, verification_error_code=$5 WHERE upstream_account_id=$1 AND credential_generation=$2 AND verification_started_at=$3 AND verification_finished_at IS NULL")
+            .bind(account_id.to_string()).bind(rejected_generation).bind(started).bind(unix_millis()).bind(error)
+            .execute(&self.pool).await?;
+        Ok(())
     }
 
     #[cfg(test)]

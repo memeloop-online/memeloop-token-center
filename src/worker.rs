@@ -105,43 +105,6 @@ async fn refresh_expiring_oauth(
     }
 }
 
-/// One worker claim and one readback. The readback is verification, not a new
-/// source of renewal evidence; a separate business read can report a new 401.
-async fn refresh_selected_oauth(
-    state: &AppState,
-    account_id: Uuid,
-    generation: i64,
-    blocking: &BlockingTasks,
-) -> Result<(), AppError> {
-    refresh_expiring_oauth(state, account_id, generation, blocking).await?;
-    if state
-        .db
-        .claim_rejected_oauth_verification(account_id, generation)
-        .await?
-    {
-        let (account, credential) = state
-            .db
-            .upstream_account_with_credential(account_id, state.config.key_pepper.as_bytes())
-            .await?;
-        if account.status == "active"
-            && account.credential_generation > generation
-            && let Some(tenant) = account.tenant_external_id.as_deref()
-        {
-            state
-                .upstream_quota
-                .read_fresh(
-                    state,
-                    &account,
-                    &credential,
-                    tenant,
-                    crate::upstream_quota::QuotaReadTrigger::PostRenewalVerification,
-                )
-                .await;
-        }
-    }
-    Ok(())
-}
-
 pub async fn run(state: AppState) {
     let (shutdown_sender, shutdown) = watch::channel(false);
     run_until_shutdown(state, shutdown).await;
@@ -313,6 +276,25 @@ pub(crate) async fn run_until_shutdown_with_reaper_period(
             }
         }};
     }
+    periodic!(
+        "oauth_rejection_delivery",
+        Duration::from_secs(1),
+        async |state: &AppState, _shutdown: &watch::Receiver<bool>| {
+            state.upstream_quota.oauth_rejections.flush(state).await;
+        }
+    );
+    periodic!(
+        "oauth_quota_verification",
+        Duration::from_secs(5),
+        async |state: &AppState, _shutdown: &watch::Receiver<bool>| {
+            if let Err(error) = crate::upstream_quota::oauth_recovery::verify_batch(state).await {
+                tracing::warn!(
+                    error_category = error.diagnostic_category(),
+                    "OAuth quota verification scan failed"
+                );
+            }
+        }
+    );
     periodic!(
         "maintenance",
         MAINTENANCE_INTERVAL,
@@ -652,7 +634,7 @@ pub(crate) async fn run_until_shutdown_with_reaper_period(
                             break;
                         }
                         if let Err(error) =
-                            refresh_selected_oauth(state, account_id, generation, &oauth_blocking)
+                            refresh_expiring_oauth(state, account_id, generation, &oauth_blocking)
                                 .await
                         {
                             tracing::warn!(%error, %account_id, "worker failed to refresh managed OAuth credential");
@@ -1855,6 +1837,7 @@ mod tests {
                 .is_empty()
         );
         read(crate::upstream_quota::QuotaReadTrigger::BackgroundRecovery).await;
+        state.upstream_quota.oauth_rejections.flush(&state).await;
         assert_eq!(
             state
                 .db
@@ -1863,9 +1846,111 @@ mod tests {
                 .unwrap(),
             vec![(account.id, 1)]
         );
-        refresh_selected_oauth(&state, account.id, 1, &BlockingTasks::new())
+        refresh_expiring_oauth(&state, account.id, 1, &BlockingTasks::new())
             .await
             .unwrap();
+        // A process lost after claiming a read leaves a reclaimable read-only lease.
+        let abandoned = crate::db::unix_millis() - 120_001;
+        assert!(
+            state
+                .db
+                .claim_rejected_oauth_verification(account.id, 1, abandoned)
+                .await
+                .unwrap()
+        );
+        // A's verification waits for quota admission while B's natural expiry
+        // still completes its real mock refresh on the original renewal lane.
+        let paused = state.upstream_quota.pause_reads_for_test().await;
+        let verify_state = state.clone();
+        let verification = tokio::spawn(async move {
+            crate::upstream_quota::oauth_recovery::verify_batch(&verify_state)
+                .await
+                .unwrap();
+        });
+        Mock::given(method("POST"))
+            .and(path("/refresh-b"))
+            .respond_with(
+                ResponseTemplate::new(200).set_body_json(json!({"accessToken":"fresh-b"})),
+            )
+            .expect(1)
+            .mount(&server)
+            .await;
+        Mock::given(path("/v1/models"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({"data":[]})))
+            .mount(&server)
+            .await;
+        let next = state
+            .db
+            .create_upstream_account(
+                CreateUpstreamAccountInput {
+                    tenant_external_id: "oauth-rejection-cycle".into(),
+                    name: "naturally-expiring".into(),
+                    driver: "http-json".into(),
+                    config: json!({"base_url":server.uri()}),
+                    credential: UpstreamCredential::OAuth {
+                        access_token: "old-b".into(),
+                        refresh_token: Some("fixture-refresh-b".into()),
+                        expires_at: Some(crate::db::unix_millis() - 1),
+                        header: "authorization".into(),
+                        prefix: "Bearer ".into(),
+                        adapter_state: None,
+                        proxy_url: None,
+                        proxy_network_scope: None,
+                    },
+                    oauth_session_id: Some(Uuid::now_v7()),
+                    oauth_driver: Some("cursor".into()),
+                    oauth_refresh_url: Some(format!("{}/refresh-b", server.uri())),
+                },
+                state.config.key_pepper.as_bytes(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            state
+                .db
+                .list_managed_oauth_refresh_candidates(crate::db::unix_millis(), 20)
+                .await
+                .unwrap(),
+            vec![(next.id, 1)]
+        );
+        tokio::time::timeout(
+            Duration::from_secs(10),
+            refresh_expiring_oauth(&state, next.id, 1, &BlockingTasks::new()),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        assert_eq!(
+            state
+                .db
+                .upstream_account_with_credential(next.id, state.config.key_pepper.as_bytes())
+                .await
+                .unwrap()
+                .0
+                .credential_generation,
+            2
+        );
+        assert!(
+            !verification.is_finished(),
+            "B renewed while A's quota read remained paused"
+        );
+        drop(paused);
+        verification.await.unwrap();
+        state.upstream_quota.oauth_rejections.flush(&state).await;
+        // A late finisher cannot overwrite the reclaimed verification result.
+        state
+            .db
+            .finish_rejected_oauth_verification(account.id, 1, abandoned, None)
+            .await
+            .unwrap();
+        assert!(
+            state
+                .db
+                .list_rejected_oauth_verifications(crate::db::unix_millis(), 20)
+                .await
+                .unwrap()
+                .is_empty()
+        );
         assert_eq!(
             state
                 .db
@@ -1899,12 +1984,16 @@ mod tests {
                 .is_empty()
         );
         // A replayed completion retains the same claim and cannot reread again.
-        refresh_selected_oauth(&state, account.id, 1, &BlockingTasks::new())
+        refresh_expiring_oauth(&state, account.id, 1, &BlockingTasks::new())
+            .await
+            .unwrap();
+        crate::upstream_quota::oauth_recovery::verify_batch(&state)
             .await
             .unwrap();
         // An independent user read can report new evidence without refreshing
         // inline. No second refresh is dispatched by this test or by readback.
         read(crate::upstream_quota::QuotaReadTrigger::Manual).await;
+        state.upstream_quota.oauth_rejections.flush(&state).await;
         assert_eq!(
             state
                 .db

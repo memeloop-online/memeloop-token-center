@@ -3,6 +3,7 @@ mod antigravity;
 mod cursor;
 mod kimi;
 mod normalize;
+pub(crate) mod oauth_recovery;
 pub(crate) mod observations;
 mod proxy;
 #[cfg(test)]
@@ -574,6 +575,7 @@ struct Entry {
 }
 
 pub(crate) struct QuotaCache {
+    pub(crate) oauth_rejections: oauth_recovery::Rejections,
     entries: Mutex<HashMap<CacheKey, Arc<Entry>>>,
     permits: Semaphore,
 }
@@ -581,6 +583,7 @@ pub(crate) struct QuotaCache {
 impl Default for QuotaCache {
     fn default() -> Self {
         Self {
+            oauth_rejections: oauth_recovery::Rejections::default(),
             entries: Mutex::new(HashMap::new()),
             permits: Semaphore::new(4),
         }
@@ -588,6 +591,11 @@ impl Default for QuotaCache {
 }
 
 impl QuotaCache {
+    #[cfg(test)]
+    pub(crate) async fn pause_reads_for_test(&self) -> tokio::sync::SemaphorePermit<'_> {
+        self.permits.acquire_many(4).await.unwrap()
+    }
+
     pub(crate) async fn read(
         &self,
         state: &AppState,
