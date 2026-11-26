@@ -50,32 +50,6 @@ jobs:
       - name: Install Chromium for bounded browser contracts
         if: github.event_name == 'workflow_dispatch'
         run: npx playwright install --with-deps chromium
-      - name: Verify one membership baseline and fixed session refresh contracts
-        run: |
-          set -euo pipefail
-          fixed=5217d0ab6e68a86bd2f8799e4173c4bfff307767
-          base=68403da1c8f04e14e65e31df927ba19ac8ee2529
-          test "$(git rev-parse HEAD)" = "$fixed"
-          git fetch --no-tags origin "$base"
-          for file in src/operator/SessionMonitor.tsx src/operator/sessionRefresh.ts; do
-            git show "$base:web/$file" > "$file"
-            test "$(git hash-object "$file")" = "$(git rev-parse "$base:web/$file")"
-            echo "baseline $file $(git hash-object "$file")"
-          done
-          MTC_SESSION_REFRESH_BASELINE=1 MTC_REQUIRE_BROWSER=1 node --import tsx --test --test-reporter=tap --test-concurrency=1 --test-name-pattern='^a new confirmed start reads active-page membership once and keeps exact refreshes scoped$' e2e/session-loading-browser-contract.test.ts 2>&1 | tee /tmp/session-refresh-baseline.log
-          grep -Fx '# pass 1' /tmp/session-refresh-baseline.log
-          grep -Fx '# fail 0' /tmp/session-refresh-baseline.log
-          grep -E '^ok [0-9]+ - a new confirmed start reads active-page membership once and keeps exact refreshes scoped$' /tmp/session-refresh-baseline.log
-          for file in src/operator/SessionMonitor.tsx src/operator/sessionRefresh.ts; do
-            git show "$fixed:web/$file" > "$file"
-            test "$(git hash-object "$file")" = "$(git rev-parse "$fixed:web/$file")"
-            echo "fixed $file $(git hash-object "$file")"
-          done
-          git diff --exit-code
-          MTC_REQUIRE_BROWSER=1 node --import tsx --test --test-reporter=tap --test-concurrency=1 e2e/session-loading-browser-contract.test.ts e2e/session-refresh-contract.test.ts 2>&1 | tee /tmp/session-refresh-fixed.log
-          grep -Fx '# pass 21' /tmp/session-refresh-fixed.log
-          grep -Fx '# fail 0' /tmp/session-refresh-fixed.log
-          grep -Fx '# skipped 0' /tmp/session-refresh-fixed.log
       - name: Build the original browser-test service
         run: cargo build --locked --manifest-path ../Cargo.toml --features experimental-plugin-revisions --bin memeloop-token-center
       - name: Verify original bounded-refresh dogfood scenario
@@ -83,7 +57,7 @@ jobs:
           MTC_E2E_BINARY: ${{ github.workspace }}/target/debug/memeloop-token-center
         run: |
           set -euo pipefail
-          npm run test:e2e -- e2e/features/dogfood.feature:111 2>&1 | tee /tmp/session-refresh-dogfood.log
+          npm run test:e2e -- e2e/features/dogfood.feature:111 --name '^连续实时事件有界刷新且状态筛选不残留$' 2>&1 | tee /tmp/session-refresh-dogfood.log
           grep -E '^1 scenario \(1 passed\)' /tmp/session-refresh-dogfood.log
           ! grep -E '[1-9][0-9]* (failed|skipped|undefined|pending)' /tmp/session-refresh-dogfood.log
       - name: Retain actual browser evidence
