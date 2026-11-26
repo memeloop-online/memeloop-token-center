@@ -244,7 +244,7 @@ jobs:
             sleep 2
           done
           exit 1
-      - name: Verify final H2 and shared recovery proxy consumers
+      - name: Verify reviewed request singleflight and original resource contracts
         env:
           MTC_RUSTFS_TEST_ENDPOINT: http://127.0.0.1:19000
           MTC_RUSTFS_TEST_BUCKET: conversation-contract-test
@@ -252,23 +252,25 @@ jobs:
           MTC_RUSTFS_TEST_SECRET_KEY: synthetic-test-only-secret-707
         run: |
           set -euo pipefail
-          test "$(git rev-parse HEAD)" = "6daae61a7425d206af637b9bd2a7f5e69287eeb6"
+          test "$(git rev-parse HEAD)" = "f1f925998f93ae5e2a1ac4dd4d4ab35c38fb82d1"
           git rev-parse HEAD
-          mkdir -p /tmp/pr1041-fixture-evidence
-          cargo test --locked --lib api::proxy::tests::codex_http2_failure_safety -- --nocapture 2>&1 | tee /tmp/pr1041-fixture-evidence/h2.log
-          grep -F '11 passed; 0 failed' /tmp/pr1041-fixture-evidence/h2.log
-          cargo test --locked --lib json_source::carrier_cancel_tests::cancellation_drops_a_pending_object_read_and_releases_the_source -- --exact --nocapture 2>&1 | tee /tmp/pr1041-fixture-evidence/cancel.log
-          grep -F '1 passed; 0 failed' /tmp/pr1041-fixture-evidence/cancel.log
-          cargo test --locked --lib gateway_body::carrier::small_put_tests -- --ignored --nocapture 2>&1 | tee /tmp/pr1041-fixture-evidence/small-put.log
-          grep -F '5 passed; 0 failed' /tmp/pr1041-fixture-evidence/small-put.log
-          cargo test --locked --lib gateway_body::carrier::resource_wakeup_tests::actual_put_is_not_cancelled_when_ram_wakes_and_lost_ack_keeps_source -- --ignored --exact --nocapture 2>&1 | tee /tmp/pr1041-fixture-evidence/resource.log
-          grep -F '1 passed; 0 failed' /tmp/pr1041-fixture-evidence/resource.log
-      - name: Retain the shared fixture consumer evidence
+          mkdir -p /tmp/request-singleflight-evidence
+          cargo test --locked --lib gateway_body::carrier::resource_wakeup_tests::first_request_segment_waits_for_retained_credit_despite_free_global_ram -- --exact --nocapture 2>&1 | tee /tmp/request-singleflight-evidence/contract-1.log
+          grep -F '1 passed; 0 failed' /tmp/request-singleflight-evidence/contract-1.log
+          cargo test --locked --lib gateway_body::carrier::resource_wakeup_tests::request_capture_eof_does_not_join_owned_put_when_retained_credit_wakes -- --ignored --exact --nocapture 2>&1 | tee /tmp/request-singleflight-evidence/contract-2.log
+          grep -F '1 passed; 0 failed' /tmp/request-singleflight-evidence/contract-2.log
+          cargo test --locked --lib gateway_body::carrier::resource_wakeup_tests::actual_put_is_not_cancelled_when_ram_wakes_and_lost_ack_keeps_source -- --ignored --exact --nocapture 2>&1 | tee /tmp/request-singleflight-evidence/contract-3.log
+          grep -F '1 passed; 0 failed' /tmp/request-singleflight-evidence/contract-3.log
+          cargo test --locked --lib gateway_body::carrier::resource_wakeup_tests::credited_long_response_preserves_opportunistic_spill_above_source_capacity -- --ignored --exact --nocapture 2>&1 | tee /tmp/request-singleflight-evidence/contract-4.log
+          grep -F '1 passed; 0 failed' /tmp/request-singleflight-evidence/contract-4.log
+          cargo test --locked --lib gateway_body::carrier::resource_wakeup_tests::request_without_archive_preserves_capture_above_retained_window -- --exact --nocapture 2>&1 | tee /tmp/request-singleflight-evidence/contract-5.log
+          grep -F '1 passed; 0 failed' /tmp/request-singleflight-evidence/contract-5.log
+      - name: Retain request singleflight evidence
         if: always()
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
         with:
-          name: pr1041-fixture-6daae
-          path: /tmp/pr1041-fixture-evidence/
+          name: request-singleflight-f1f925
+          path: /tmp/request-singleflight-evidence/
           if-no-files-found: warn
           retention-days: 7
 
