@@ -2114,6 +2114,8 @@ async fn semantic_coverage_committed_recovery_contract(database_url: String) {
             "SELECT p.projected_at, p.lease_owner, o.leaf_node_hash FROM conversation_projection_outbox p JOIN conversation_observations o ON o.request_id=p.request_id WHERE p.request_id=$1"
         ).bind(fixture.request_id.to_string()).fetch_one(&db.pool).await.unwrap();
         assert_eq!(before.1, "semantic-coverage-v2");
+        assert_eq!(db.delete_durably_retired_conversation_outbox(100, i64::MAX).await.unwrap(), 0,
+            "expiry cannot discard an unconsumed coverage obligation");
         let snapshot: String = sqlx::query_scalar(
             "SELECT semantic_snapshot_json FROM conversation_projection_outbox WHERE request_id=$1",
         )
@@ -2377,6 +2379,13 @@ async fn semantic_coverage_committed_recovery_contract(database_url: String) {
                 .await
                 .unwrap()
         );
+        let authority_before = fixture.state.archive.semantic_archive_authority(
+            fixture.key.tenant_id, fixture.request_id, &before.2).await.unwrap().unwrap();
+        assert_eq!(db.delete_durably_retired_conversation_outbox(100, i64::MAX).await.unwrap(), 1);
+        let authority_after = fixture.state.archive.semantic_archive_authority(
+            fixture.key.tenant_id, fixture.request_id, &before.2).await.unwrap().unwrap();
+        assert_eq!(authority_before.publication.revision, authority_after.publication.revision);
+        assert_eq!(authority_before.semantic_head.node_hash, authority_after.semantic_head.node_hash);
     }
 }
 
