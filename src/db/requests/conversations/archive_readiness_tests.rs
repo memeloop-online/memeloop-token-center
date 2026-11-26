@@ -2043,7 +2043,17 @@ async fn terminal_archive_order_contract(database_url: String) {
             .bind(fixture.identity.reservation_id.to_string()).bind(fixture.request_id.to_string())
             .fetch_one(&fixture.state.db.pool).await.unwrap();
         assert_eq!(effects.get::<i64, _>("settlements"), 1);
-        assert_eq!(effects.get::<i64, _>("finishes"), 1);
+        // This fixture invokes deferred financial completion directly, without
+        // an operational receipt. Only that receipt publishes `finished`.
+        let operational_receipts: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM proxy_operational_terminals WHERE request_id = $1",
+        )
+        .bind(fixture.request_id.to_string())
+        .fetch_one(&fixture.state.db.pool)
+        .await
+        .unwrap();
+        assert_eq!(operational_receipts, 0);
+        assert_eq!(effects.get::<i64, _>("finishes"), 0);
 
         // A delayed source completion must not allocate an event cursor after
         // the financial terminal has closed its request owner.
