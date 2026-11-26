@@ -4,6 +4,33 @@ const storageKeys: Record<RememberedCredentialKind, string> = {
   operator: 'mtc.operator.service-credential.v1',
   self: 'mtc.self.client-credential.v1',
 };
+export const operatorCredentialStorageKey = storageKeys.operator;
+// This random, non-secret identity marks a remembered login, never its credential.
+export const operatorLoginCycleStorageKey = 'mtc.operator.login-cycle.v1';
+
+export function readOperatorLoginCycle(storage = browserStorage()): string | undefined {
+  try { return storage?.getItem(operatorLoginCycleStorageKey) || undefined; } catch { return undefined; }
+}
+
+export function isOperatorLoginCycleCurrent(cycle: string): boolean {
+  return Boolean(cycle) && readOperatorLoginCycle() === cycle;
+}
+
+export function ensureOperatorLoginCycle(storage = browserStorage()): string | undefined {
+  if (!storage) return undefined;
+  try {
+    const existing = readOperatorLoginCycle(storage);
+    if (existing) return existing;
+    const cycle = crypto.randomUUID();
+    storage.setItem(operatorLoginCycleStorageKey, cycle);
+    return cycle;
+  } catch { return undefined; }
+}
+
+export function clearOperatorLoginCycle(storage = browserStorage()): void {
+  try { storage?.removeItem(operatorLoginCycleStorageKey); } catch { /* Storage can be unavailable. */ }
+}
+
 const operatorTenantStorageKey = 'mtc.operator.tenant.v1';
 
 function browserStorage(): Storage | undefined {
@@ -29,6 +56,7 @@ export function rememberCredential(kind: RememberedCredentialKind, credential: s
   const value = credential.trim();
   if (!value) return;
   try {
+    if (kind === 'operator' && readRememberedCredential(kind, storage) !== value) clearOperatorLoginCycle(storage);
     storage.setItem(storageKeys[kind], value);
   } catch {
     // A blocked or full browser store must not prevent an explicit login.
@@ -38,6 +66,7 @@ export function rememberCredential(kind: RememberedCredentialKind, credential: s
 export function clearRememberedCredential(kind: RememberedCredentialKind, storage = browserStorage()): void {
   if (!storage) return;
   try {
+    if (kind === 'operator') clearOperatorLoginCycle(storage);
     storage.removeItem(storageKeys[kind]);
   } catch {
     // Clearing in-memory state still signs this page out when storage is blocked.

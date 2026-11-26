@@ -2,6 +2,11 @@ import { useEffect, useReducer, useRef } from 'react';
 import { ApiError, api, apiDiagnosticMessage } from '../../api';
 import {
   clearRememberedCredential,
+  clearOperatorLoginCycle,
+  ensureOperatorLoginCycle,
+  readOperatorLoginCycle,
+  operatorLoginCycleStorageKey,
+  operatorCredentialStorageKey,
   readRememberedCredential,
   readRememberedOperatorTenant,
   rememberCredential,
@@ -26,6 +31,7 @@ type ScopeStatus =
 interface ScopeState {
   credential: string;
   validated: boolean;
+  loginCycle?: string;
   credentialInput: string;
   tenant: string;
   tenants: TenantView[];
@@ -35,7 +41,7 @@ interface ScopeState {
 type ScopeAction =
   | { type: 'credential-input'; value: string }
   | { type: 'authenticate'; candidate: string }
-  | { type: 'authenticated'; credential: string; tenants: TenantView[]; tenant: string }
+  | { type: 'authenticated'; credential: string; tenants: TenantView[]; tenant: string; loginCycle?: string }
   | { type: 'tenants-refreshed'; tenants: TenantView[]; tenant: string }
   // reject: the active identity itself is revoked, clear it. denied: the
   // validated identity got a definitive permission answer on the baseline
@@ -70,6 +76,7 @@ function reducer(state: ScopeState, action: ScopeAction): ScopeState {
       return {
         credential: action.credential,
         validated: true,
+        loginCycle: action.loginCycle,
         credentialInput: state.credentialInput.trim() === action.credential ? '' : state.credentialInput,
         tenants: action.tenants,
         tenant: action.tenant,
@@ -81,7 +88,7 @@ function reducer(state: ScopeState, action: ScopeAction): ScopeState {
       // selection alone never does.
       return { ...state, tenants: action.tenants, tenant: action.tenant, status: { kind: 'ready' } };
     case 'authentication-failed':
-      if (action.outcome === 'denied') return { ...state, validated: false, status: { kind: 'failed', message: action.message } };
+      if (action.outcome === 'denied') return { ...state, validated: false, loginCycle: undefined, status: { kind: 'failed', message: action.message } };
       if (action.outcome === 'session-kept') return { ...state, status: { kind: 'failed', message: action.message } };
       return { credential: '', validated: false, credentialInput: state.credentialInput, tenant: '', tenants: [], status: { kind: 'failed', message: action.message } };
     case 'authentication-unavailable':
@@ -118,21 +125,24 @@ export function useOperatorScope() {
     if (!candidate) return;
     const request = ++sequence.current;
     const before = stateRef.current;
+    const rememberedBefore = readRememberedCredential('operator');
+    const cycleBefore = readOperatorLoginCycle();
     dispatch({ type: 'authenticate', candidate });
     try {
       // Tenant discovery is the only authentication-phase request. Page data
       // stays unmounted until its route is selected, so a singleton credential
       // never performs an accidental all-tenant query.
       const tenants = await api<TenantView[]>('/internal/v1/tenants', candidate);
-      if (request !== sequence.current) return;
+      if (request !== sequence.current || readRememberedCredential('operator') !== rememberedBefore || readOperatorLoginCycle() !== cycleBefore) return;
       // Honor the tenant the user selected while this read was in flight;
       // the snapshot from the request start must not roll their choice back.
       const tenant = tenantForCredential(tenants, stateRef.current.tenant || before.tenant);
       rememberCredential('operator', candidate);
       rememberOperatorTenant(tenant);
-      dispatch({ type: 'authenticated', credential: candidate, tenants, tenant });
+      const loginCycle = readRememberedCredential('operator') === candidate ? ensureOperatorLoginCycle() : undefined;
+      dispatch({ type: 'authenticated', credential: candidate, tenants, tenant, loginCycle });
     } catch (reason) {
-      if (request !== sequence.current) return;
+      if (request !== sequence.current || readRememberedCredential('operator') !== rememberedBefore || readOperatorLoginCycle() !== cycleBefore) return;
       // A failing replacement candidate proves nothing about the active
       // identity: the validated session, its saved credential and its pages
       // stay; only the candidate's own failure is reported.
@@ -167,6 +177,7 @@ export function useOperatorScope() {
           return;
         }
         if (before.validated) {
+          clearOperatorLoginCycle();
           dispatch({ type: 'authentication-failed', message, outcome: 'denied' });
           return;
         }
@@ -189,6 +200,17 @@ export function useOperatorScope() {
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
 
+  useEffect(() => {
+    function revoked(event: StorageEvent) {
+      if (event.storageArea !== window.localStorage) return;
+      if (event.key !== null && event.key !== operatorLoginCycleStorageKey && event.key !== operatorCredentialStorageKey) return;
+      sequence.current += 1;
+      dispatch({ type: 'clear' });
+    }
+    window.addEventListener('storage', revoked);
+    return () => { sequence.current += 1; window.removeEventListener('storage', revoked); };
+  }, []);
+
   function clearCredential() {
     sequence.current += 1;
     clearRememberedCredential('operator');
@@ -199,20 +221,23 @@ export function useOperatorScope() {
     const credential = stateRef.current.credential;
     if (!credential || !stateRef.current.validated) return;
     const request = ++sequence.current;
+    const cycle = readOperatorLoginCycle();
+    const remembered = readRememberedCredential('operator');
     try {
       const tenants = await api<TenantView[]>('/internal/v1/tenants', credential);
-      if (request !== sequence.current || stateRef.current.credential !== credential) return;
+      if (request !== sequence.current || stateRef.current.credential !== credential || readOperatorLoginCycle() !== cycle || readRememberedCredential('operator') !== remembered) return;
       const tenant = tenantForCredential(tenants, stateRef.current.tenant);
       rememberOperatorTenant(tenant);
       dispatch({ type: 'tenants-refreshed', tenants, tenant });
     } catch (reason) {
-      if (request !== sequence.current || stateRef.current.credential !== credential) return;
+      if (request !== sequence.current || stateRef.current.credential !== credential || readOperatorLoginCycle() !== cycle || readRememberedCredential('operator') !== remembered) return;
       if (reason instanceof ApiError && reason.status === 401) {
         clearRememberedCredential('operator');
         dispatch({ type: 'authentication-failed', message: messageOf(reason, t('common.connectionFailed')), outcome: 'reject' });
         return;
       }
       if (reason instanceof ApiError && reason.status === 403) {
+        clearOperatorLoginCycle();
         dispatch({ type: 'authentication-failed', message: messageOf(reason, t('common.connectionFailed')), outcome: 'denied' });
         return;
       }
@@ -241,6 +266,8 @@ export function useOperatorScope() {
   return {
     ...state,
     activeCredential,
+    loginCycle: state.validated && state.status.kind === 'ready' && state.tenants.some((tenant) => tenant.external_id === state.tenant)
+      ? state.loginCycle : undefined,
     writeTenant,
     authenticating: state.status.kind === 'authenticating',
     error: state.status.kind === 'failed' ? state.status.message : '',
