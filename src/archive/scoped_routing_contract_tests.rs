@@ -20,7 +20,33 @@ async fn synthetic_scoped_response_route_preserves_binding_and_revert_reads() {
         .new_response_staging_key(Uuid::now_v7(), Some(a))
         .unwrap();
     assert!(old_primary.backend_identity.is_none());
+    let mut old_writer = archive
+        .start_writer(&format!("{}/body", old_primary.canonical_prefix()))
+        .await
+        .unwrap();
+    old_writer.write(Bytes::from_static(b"old ")).await.unwrap();
     archive.write_rules = rules.clone();
+    old_writer
+        .write(Bytes::from_static(b"primary"))
+        .await
+        .unwrap();
+    let old_staged = old_writer.finish_staged().await.unwrap();
+    let old_object = archive
+        .promote_staged_text_to_cas(tenant, &old_staged)
+        .await
+        .unwrap();
+    assert!(!old_object.object_locator.starts_with("stores/"));
+    assert_eq!(
+        archive.get(&old_staged.object_locator).await.unwrap(),
+        "old primary"
+    );
+    assert_eq!(
+        archive
+            .get_tenant_content(tenant, &old_object, 1024)
+            .await
+            .unwrap(),
+        "old primary"
+    );
     assert!(archive.resolve(&old_primary.canonical_prefix()).is_ok());
     assert!(old_primary.backend_identity.is_none());
     for (scope, qualified) in [
@@ -69,7 +95,10 @@ async fn synthetic_scoped_response_route_preserves_binding_and_revert_reads() {
         } else {
             &archive.training.as_ref().unwrap().store
         };
-        assert!(opposite.head(&physical).await.is_err());
+        assert!(matches!(
+            opposite.head(&physical).await,
+            Err(object_store::Error::NotFound { .. })
+        ));
         assert!(
             archive
                 .get_tenant_content(Uuid::now_v7(), &object, 1024)
@@ -77,6 +106,12 @@ async fn synthetic_scoped_response_route_preserves_binding_and_revert_reads() {
                 .is_err()
         );
     }
+    let mut duplicate: serde_json::Value = serde_json::from_str(&input).unwrap();
+    let rule = duplicate["rules"][0].clone();
+    duplicate["rules"].as_array_mut().unwrap().push(rule);
+    assert!(
+        routing::ArchiveWriteRules::parse(Some(&duplicate.to_string()), Some(&identity)).is_err()
+    );
     for invalid in [
         input.replace("response", "request"),
         input.replace(&identity, &"b".repeat(64)),

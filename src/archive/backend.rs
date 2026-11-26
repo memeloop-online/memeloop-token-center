@@ -45,6 +45,18 @@ impl ArchiveStore {
         archive
     }
 
+    #[cfg(test)]
+    pub(crate) fn set_response_write_rules_for_test(
+        &mut self,
+        input: Option<&str>,
+    ) -> Result<(), AppError> {
+        self.write_rules = super::routing::ArchiveWriteRules::parse(
+            input,
+            self.training.as_ref().map(|store| store.identity.as_str()),
+        )?;
+        Ok(())
+    }
+
     pub async fn from_config(config: &Config) -> Result<Self, AppError> {
         config
             .s3_timeouts
