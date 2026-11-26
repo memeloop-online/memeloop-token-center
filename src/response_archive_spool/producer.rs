@@ -592,6 +592,9 @@ impl CarrierCaptureInput {
 
     fn flush_offer(&mut self) -> Result<(), CaptureOfferError> {
         if let Some(offered) = self.pending.take() {
+            if let OfferedCaptureBytes::Coalesced(bytes) = &offered.bytes {
+                self.block_bytes = (bytes.capacity() * 2).min(super::CHUNK_BYTES);
+            }
             self.send_offer(offered)?;
         }
         Ok(())
@@ -606,7 +609,11 @@ impl CarrierCaptureInput {
         {
             // No allocation or capacity growth: this block was prepaid in full.
             pending.extend_from_slice(&bytes);
-            return Ok(());
+            return if pending.len() == pending.capacity() {
+                self.flush_offer()
+            } else {
+                Ok(())
+            };
         }
         if let Some(pending) = self.pending.as_ref()
             && matches!(pending.bytes, OfferedCaptureBytes::Original(_))
@@ -620,27 +627,24 @@ impl CarrierCaptureInput {
             // Copying can keep old and new allocations alive simultaneously.
             // Acquire the entire new block before allocating; the original
             // credit remains held until both copies have completed.
-            let credit = self.reserve_offer(capacity)?;
-            let previous = self.pending.take().unwrap();
-            let mut combined = Vec::with_capacity(capacity);
-            let OfferedCaptureBytes::Original(original) = &previous.bytes else {
-                unreachable!()
-            };
-            combined.extend_from_slice(original);
-            combined.extend_from_slice(&bytes);
-            drop(previous);
-            self.pending = Some(OfferedCaptureChunk {
-                bytes: OfferedCaptureBytes::Coalesced(combined),
-                credit,
-            });
-            return Ok(());
-        }
-        if let Some(OfferedCaptureChunk {
-            bytes: OfferedCaptureBytes::Coalesced(previous),
-            ..
-        }) = self.pending.as_ref()
-        {
-            self.block_bytes = (previous.capacity() * 2).min(super::CHUNK_BYTES);
+            if let Ok(credit) = self.reserve_offer(capacity) {
+                let previous = self.pending.take().unwrap();
+                let mut combined = Vec::with_capacity(capacity);
+                let OfferedCaptureBytes::Original(original) = &previous.bytes else {
+                    unreachable!()
+                };
+                combined.extend_from_slice(original);
+                combined.extend_from_slice(&bytes);
+                drop(previous);
+                let full = combined.len() == combined.capacity();
+                self.pending = Some(OfferedCaptureChunk {
+                    bytes: OfferedCaptureBytes::Coalesced(combined),
+                    credit,
+                });
+                return if full { self.flush_offer() } else { Ok(()) };
+            }
+            // Coalescing is optional. Keep accepting exact original fragments
+            // when the temporary old-plus-new copy would exceed credit.
         }
         self.flush_offer()?;
         let credit = self.reserve_offer(bytes.len())?;
@@ -1769,21 +1773,17 @@ mod tests {
     }
 
     #[test]
-    fn coalescing_reserves_old_and_full_new_allocations_before_copying() {
-        // First byte holds two 256-byte units including its metadata.
-        // The 4KiB destination needs 4352 more bytes while that source is live.
-        let (mut input, _receiver) = offered_input(4608);
+    fn coalescing_requires_full_copy_credit_but_falls_back_to_original_fragments() {
+        // A byte uses 512 bytes including metadata. The optional 4KiB
+        // destination needs another 4352 while the first allocation is live.
+        let (mut input, mut receiver) = offered_input(4608);
         input.offer(Bytes::from_static(b"a")).unwrap();
-        assert_eq!(input.budget.snapshot().0, 512);
-        assert!(matches!(
-            input.offer(Bytes::from_static(b"b")),
-            Err(CaptureOfferError::Capacity { .. })
-        ));
-        assert_eq!(input.pending.as_ref().unwrap().len(), 1);
-        assert_eq!(input.budget.snapshot().0, 512);
-        let budget = input.budget.clone();
-        drop(input);
-        assert_eq!(budget.snapshot().0, 0);
+        input.offer(Bytes::from_static(b"b")).unwrap();
+        assert_eq!(input.budget.snapshot().0, 1024);
+        input.flush_offer().unwrap();
+        assert_eq!(receiver.try_recv().unwrap().bytes, Bytes::from_static(b"a"));
+        assert_eq!(receiver.try_recv().unwrap().bytes, Bytes::from_static(b"b"));
+        assert_eq!(input.budget.snapshot().0, 0);
 
         let (mut input, _receiver) = offered_input(4864);
         input.offer(Bytes::from_static(b"a")).unwrap();
@@ -1793,6 +1793,20 @@ mod tests {
         let budget = input.budget.clone();
         drop(input);
         assert_eq!(budget.snapshot().0, 0);
+    }
+
+    #[test]
+    fn a_full_coalesced_block_is_queued_without_another_offer_or_eof() {
+        let (mut input, mut receiver) = offered_input(16384);
+        input.offer(Bytes::from(vec![b'a'; 2048])).unwrap();
+        input.offer(Bytes::from(vec![b'b'; 2048])).unwrap();
+        assert!(input.pending.is_none());
+        let chunk = receiver.try_recv().unwrap();
+        assert_eq!(chunk.bytes.len(), 4096);
+        assert_eq!(&chunk.bytes[..2048], &[b'a'; 2048]);
+        assert_eq!(&chunk.bytes[2048..], &[b'b'; 2048]);
+        drop(chunk);
+        assert_eq!(input.budget.snapshot().0, 0);
     }
 
     #[tokio::test]
