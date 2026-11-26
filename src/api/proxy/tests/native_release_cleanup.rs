@@ -143,14 +143,11 @@ async fn rustfs_native_publisher_release_reclaims_exact_nonzero_temporary() {
     let before = object_store.head(&temporary).await.unwrap();
     assert!(before.size > 0);
     assert!(
-        before
-            .e_tag
-            .as_deref()
-            .is_some_and(|value| !value.trim_matches('"').is_empty() && value != "null")
-            || before
-                .version
-                .as_deref()
-                .is_some_and(|value| !value.trim_matches('"').is_empty() && value != "null"),
+        before.e_tag.as_deref().is_some_and(
+            |value| !value.trim_matches('"').is_empty() && value.trim_matches('"') != "null"
+        ) || before.version.as_deref().is_some_and(
+            |value| !value.trim_matches('"').is_empty() && value.trim_matches('"') != "null"
+        ),
         "at least one stable physical object identity must be present"
     );
     assert!(
