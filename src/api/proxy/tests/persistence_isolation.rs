@@ -168,8 +168,11 @@ async fn pending_response_archive_begin_does_not_hold_first_byte_or_eof() {
     wait_for_request_settlement(&fixture, 1).await;
     // The complete source is real RAM while publication is intentionally paused.
     // EOF and financial settlement must not wait for that background owner.
-    assert!(fixture.state.proxy_memory_budget.snapshot().0 > 0);
+    assert_eq!(fixture.state.proxy_memory_budget.snapshot().0, 0);
     assert!(fixture.state.persistence.stream_memory.snapshot().0 > 0);
+    assert!(fixture.state.persistence.pending_archives_for_test() > 0);
+    let mut draining = Box::pin(fixture.state.persistence.drain());
+    assert!(futures_util::poll!(&mut draining).is_pending());
     assert!(
         fixture
             .state
@@ -203,7 +206,7 @@ async fn pending_response_archive_begin_does_not_hold_first_byte_or_eof() {
                         .unwrap(),
                     original
                 );
-                if fixture.state.proxy_memory_budget.snapshot().0 == 0 {
+                if fixture.state.persistence.stream_memory.snapshot().0 == 0 {
                     break;
                 }
             }
@@ -212,5 +215,7 @@ async fn pending_response_archive_begin_does_not_hold_first_byte_or_eof() {
     })
     .await
     .expect("confirmed publication must release capture RAM");
+    draining.await;
+    assert_eq!(fixture.state.persistence.pending_archives_for_test(), 0);
     upstream.verify().await;
 }

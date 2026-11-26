@@ -113,9 +113,13 @@ async fn buffered_http_200_sigterm_waits_for_durable_capture_before_exit() {
             .state
             .proxy_archive_stream_permits
             .available_permits(),
-        crate::PROXY_ARCHIVE_STREAM_CONCURRENCY - 1,
-        "HTTP 200 must already own its original response writer"
+        crate::PROXY_ARCHIVE_STREAM_CONCURRENCY,
+        "capture must not reserve upload workspace before publication"
     );
+
+    assert!(fixture.state.persistence.pending_archives_for_test() > 0);
+    let mut archive_draining = Box::pin(fixture.state.persistence.drain());
+    assert!(futures_util::poll!(&mut archive_draining).is_pending());
 
     // Retire every other shutdown owner first. Only buffered capture is left;
     // a missing persistence drain cannot hide behind another blocked task.
@@ -153,6 +157,16 @@ async fn buffered_http_200_sigterm_waits_for_durable_capture_before_exit() {
         .await
         .expect("durable capture must release shutdown")
         .unwrap();
+
+    archive_draining.await;
+    assert_eq!(fixture.state.persistence.pending_archives_for_test(), 0);
+    assert_eq!(
+        fixture
+            .state
+            .proxy_archive_stream_permits
+            .available_permits(),
+        crate::PROXY_ARCHIVE_STREAM_CONCURRENCY
+    );
 
     let receipt = sqlx::query(
         "SELECT p.state, p.receipt_id, p.receipt_digest, p.cost_micros, p.reservation_id, r.tenant_id, r.status_code, NULLIF(r.error_code, '') AS error_code, r.input_tokens, r.output_tokens FROM pending_proxy_settlements p JOIN request_records r ON r.id = p.request_id WHERE p.request_id = $1",
