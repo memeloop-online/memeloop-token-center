@@ -108,31 +108,37 @@ async fn stage165_prepare_reviewed_exact_fixture() {
     // Only this empty synthetic record receives the real bound source locators.
     assert_eq!(sqlx::query("UPDATE request_records SET request_object=$1,response_object=$2 WHERE id=$3 AND created_at=$4 AND tenant_id=$5 AND key_id=$6")
         .bind(&locators[0]).bind(&locators[1]).bind(fixture.request_id.to_string()).bind(created).bind(fixture.key.tenant_id.to_string()).bind(fixture.key.key_id.to_string()).execute(&db.pool).await.unwrap().rows_affected(),1);
-    // Let the original terminal projection acknowledge its empty semantic
-    // observation, then use the existing rebuild source rather than seeding ACKs.
-    let terminal_owner = Uuid::now_v7();
-    let terminal_tasks = db
-        .claim_conversation_projection_tasks(terminal_owner, 1)
-        .await
-        .unwrap();
-    assert_eq!(terminal_tasks.len(), 1);
-    assert_eq!(terminal_tasks[0].request_id, fixture.request_id);
-    assert!(
-        db.project_claimed_conversation_projection_task(terminal_owner, fixture.request_id)
-            .await
-            .unwrap()
-    );
-    let acknowledged:i64=sqlx::query_scalar("SELECT projected_at FROM conversation_projection_outbox WHERE request_id=$1 AND statistics_outcome IS DISTINCT FROM 'session_body'")
-        .bind(fixture.request_id.to_string()).fetch_one(&db.pool).await.unwrap();
-    assert_eq!(db.reopen_session_body_rebuilds(1).await.unwrap(), 1);
+    // This is a synthetic legacy starting state, not a production repair.
+    // Normalize only the never-prepared empty marker. ACK, lease timestamps,
+    // attempts and financial records are never manufactured or changed here.
+    let empty: String = sqlx::query_scalar(
+        "SELECT semantic_snapshot_json FROM conversation_projection_outbox WHERE request_id=$1",
+    )
+    .bind(fixture.request_id.to_string())
+    .fetch_one(&db.pool)
+    .await
+    .unwrap();
+    let empty_decoded: ConversationSemanticSnapshot = serde_json::from_str(&empty).unwrap();
+    assert!(empty_semantic_snapshot(&empty_decoded));
+    let initialized=sqlx::query("UPDATE conversation_projection_outbox SET semantic_snapshot_json=NULL,lease_owner=NULL WHERE request_id=$1 AND tenant_id=$2 AND key_id=$3 AND projected_at IS NULL AND attempts=0 AND semantic_snapshot_json=$4 AND semantic_payload_snapshot_json IS NULL AND lease_owner='terminal-v118' AND lease_expires_at=9223372036854775807 AND terminal_lease_owner IS NULL AND terminal_lease_expires_at IS NULL AND NOT EXISTS(SELECT 1 FROM conversation_observations WHERE request_id=$1)")
+        .bind(fixture.request_id.to_string()).bind(fixture.key.tenant_id.to_string()).bind(fixture.key.key_id.to_string()).bind(&empty).execute(&db.pool).await.unwrap().rows_affected();
+    assert_eq!(initialized, 1);
     let owner = Uuid::now_v7();
-    // Initial fixture eligibility is supplied by the shared normal claim path.
-    let tasks = db
-        .claim_conversation_projection_tasks(owner, 1)
+    assert!(
+        db.claim_exact_session_body_rebuild(
+            fixture.key.tenant_id,
+            fixture.key.key_id,
+            fixture.request_id,
+            None,
+            &locators[0],
+            &locators[1],
+            owner,
+            None,
+            None
+        )
         .await
-        .unwrap();
-    assert_eq!(tasks.len(), 1);
-    assert_eq!(tasks[0].request_id, fixture.request_id);
+        .unwrap()
+    );
     let body = crate::conversation::session_body_from_documents(&request_json, &response_json);
     let (atoms, nodes) = body.into_prefix();
     let media = body.media_locators(&atoms);
@@ -157,10 +163,10 @@ async fn stage165_prepare_reviewed_exact_fixture() {
     );
     let expiry: i64 = row.try_get("lease_expires_at").unwrap();
     let source = |index: usize, bytes: &[u8]| serde_json::json!({"locator":locators[index],"decoded_bytes":bytes.len(),"decoded_sha256":format!("{:x}",Sha256::digest(bytes))});
-    let plan = serde_json::json!({"format_version":1,"tenant_id":fixture.key.tenant_id,"key_id":fixture.key.key_id,"request_id":fixture.request_id,"expected_projected_at":acknowledged,"request":source(0,&request),"response":source(1,&response)});
+    let plan = serde_json::json!({"format_version":1,"tenant_id":fixture.key.tenant_id,"key_id":fixture.key.key_id,"request_id":fixture.request_id,"expected_projected_at":0,"request":source(0,&request),"response":source(1,&response)});
     let plan_bytes = serde_json::to_vec_pretty(&plan).unwrap();
     std::fs::write(output.join("plan.json"), &plan_bytes).unwrap();
-    let prior = serde_json::json!({"format_version":1,"identity":blake3::hash(&plan_bytes).to_hex().to_string(),"request_id":fixture.request_id,"claim_intent":true,"claimed":true,"lease_owner":owner,"canonical_rebuilt":false,"financial_replay":false,"fixture_only":true,"claim_method":"normal_conversation_projection_after_real_reopen","prepared_snapshot_sha256":format!("{:x}",Sha256::digest(snapshot.as_bytes())),"actual_lease_expires_at":expiry});
+    let prior = serde_json::json!({"format_version":1,"identity":blake3::hash(&plan_bytes).to_hex().to_string(),"request_id":fixture.request_id,"claim_intent":true,"claimed":true,"lease_owner":owner,"canonical_rebuilt":false,"financial_replay":false,"fixture_only":true,"synthetic_empty_marker_normalized":true,"empty_snapshot_before":empty,"claim_method":"real_initial_exact_claim_after_synthetic_empty_marker_normalization","prepared_snapshot_sha256":format!("{:x}",Sha256::digest(snapshot.as_bytes())),"actual_lease_expires_at":expiry});
     std::fs::write(
         output.join("prior.json"),
         serde_json::to_vec_pretty(&prior).unwrap(),
