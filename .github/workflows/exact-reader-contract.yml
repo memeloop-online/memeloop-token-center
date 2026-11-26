@@ -85,7 +85,20 @@ jobs:
           root=pathlib.Path(os.environ['RUNNER_TEMP'])/'native-smoke'; archive=root/'oci/service-e9f.oci.tar'
           evidence=json.loads((root/'oci/oci-identity.json').read_text())
           if evidence['source']!=os.environ['CANDIDATE_SHA'] or evidence['run']!=os.environ['SOURCE_RUN_ID'] or evidence['platform']!='linux/amd64':raise SystemExit('OCI source/run/platform mismatch')
-          def ctr(*args):return subprocess.check_output(['sudo','ctr','-n','e9f-smoke',*args])
+          def ctr(*args):
+              cmd=['sudo','ctr','-n','e9f-smoke',*args]
+              if args!=('tasks','start','e9f-plugin-runtime'):
+                  return subprocess.check_output(cmd)
+              result=subprocess.run(cmd,stdout=subprocess.PIPE,stderr=subprocess.PIPE)
+              if result.returncode:
+                  def safe(raw):
+                      value=raw[:16384].decode('utf-8',errors='replace')
+                      return ''.join(c for c in value if c in '\n\t' or ord(c)>=32 and ord(c)!=127)
+                  message='command='+json.dumps(cmd)+'\nexit_code='+str(result.returncode)+'\nstdout (first 16KiB):\n'+safe(result.stdout)+'\nstderr (first 16KiB):\n'+safe(result.stderr)
+                  (root/'native-command-failure.txt').write_text(message)
+                  print(message,flush=True)
+                  raise subprocess.CalledProcessError(result.returncode,cmd)
+              return result.stdout
           with tarfile.open(archive) as tar:
               members={m.name.removeprefix('./'):m for m in tar.getmembers() if m.isfile()}
               def read(name):return tar.extractfile(members[name]).read()
