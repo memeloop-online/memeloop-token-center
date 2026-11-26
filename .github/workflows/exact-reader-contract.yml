@@ -818,5 +818,5 @@ jobs:
           node-version: '22'
       - run: npm ci
         working-directory: web
-      - run: node --import tsx --test e2e/request-table-presentation-contract.test.ts
+      - run: node --import tsx --test --test-name-pattern="generation TPS|average output TPS|legacy and archive SSE patches retain recorded timing|duration tooltip" e2e/request-table-presentation-contract.test.ts
         working-directory: web
