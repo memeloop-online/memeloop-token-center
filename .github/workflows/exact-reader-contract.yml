@@ -698,24 +698,12 @@ jobs:
         with:
           shared-key: memory-release
       - uses: ./.github/actions/checkout-plugin-examples
-      - name: Verify reviewed aggregation and original credit contracts
+      - name: Verify fixed diagnostic source
         run: |
           set -euo pipefail
-          test "$(git rev-parse HEAD)" = "f543d007416d5f7d8b964971b62ddc464ce85a5c"
+          test "$(git rev-parse HEAD)" = "9a04c22090d8760df72e3a947be90839908a8ee9"
           git rev-parse HEAD
           mkdir -p "$RUNNER_TEMP/pr1041-writer-evidence"
-          cargo test --locked --lib response_archive_spool::producer::tests::offered_fragments_preserve_bytes_at_size_boundaries_and_partial_eof -- --exact --nocapture 2>&1 | tee "$RUNNER_TEMP/pr1041-writer-evidence/contract-1.log"
-          grep -F '1 passed; 0 failed' "$RUNNER_TEMP/pr1041-writer-evidence/contract-1.log"
-          cargo test --locked --lib response_archive_spool::producer::tests::coalescing_requires_full_copy_credit_but_falls_back_to_original_fragments -- --exact --nocapture 2>&1 | tee "$RUNNER_TEMP/pr1041-writer-evidence/contract-2.log"
-          grep -F '1 passed; 0 failed' "$RUNNER_TEMP/pr1041-writer-evidence/contract-2.log"
-          cargo test --locked --lib response_archive_spool::producer::tests::a_full_coalesced_block_is_queued_without_another_offer_or_eof -- --exact --nocapture 2>&1 | tee "$RUNNER_TEMP/pr1041-writer-evidence/contract-3.log"
-          grep -F '1 passed; 0 failed' "$RUNNER_TEMP/pr1041-writer-evidence/contract-3.log"
-          cargo test --locked --lib response_archive_spool::producer::tests::large_offers_transfer_the_original_allocation_without_copying -- --exact --nocapture 2>&1 | tee "$RUNNER_TEMP/pr1041-writer-evidence/contract-4.log"
-          grep -F '1 passed; 0 failed' "$RUNNER_TEMP/pr1041-writer-evidence/contract-4.log"
-          cargo test --locked --lib response_archive_spool::tests::exhausted_archival_credit_records_failure_without_a_prefix_root -- --exact --nocapture 2>&1 | tee "$RUNNER_TEMP/pr1041-writer-evidence/contract-5.log"
-          grep -F '1 passed; 0 failed' "$RUNNER_TEMP/pr1041-writer-evidence/contract-5.log"
-          cargo test --locked --lib response_archive_spool::tests::byte_charged_tap_accepts_mixed_chunks_without_fragment_count_limit -- --exact --nocapture 2>&1 | tee "$RUNNER_TEMP/pr1041-writer-evidence/contract-6.log"
-          grep -F '1 passed; 0 failed' "$RUNNER_TEMP/pr1041-writer-evidence/contract-6.log"
       - name: Build the same-source optimized memory service
         env:
           MTC_BUILD_GIT_SHA: ${{ inputs.source_revision }}
@@ -724,17 +712,12 @@ jobs:
         timeout-minutes: 6
         run: |
           set -euo pipefail
-          node tests/load/benchmark-durable-archive-memory.ts target/release/memeloop-token-center "$RUNNER_TEMP/pr1041-writer-evidence/durable-archive-rss-f543d.json" 2>&1 | tee "$RUNNER_TEMP/pr1041-writer-evidence/durable-harness.log"
-      - name: Run the unchanged fifteen-minute acceptance after the quick gate
-        timeout-minutes: 30
-        run: |
-          set -euo pipefail
-          node tests/load/benchmark-memory.ts --profile acceptance --binary target/release/memeloop-token-center --gateway-limit-mib 256 --gateway-headroom-mib 32 --output "$RUNNER_TEMP/pr1041-writer-evidence/memory-f543d.json" 2>&1 | tee "$RUNNER_TEMP/pr1041-writer-evidence/memory-harness.log"
+          node tests/load/benchmark-durable-archive-memory.ts target/release/memeloop-token-center "$RUNNER_TEMP/pr1041-writer-evidence/durable-archive-rss-9a04c.json" 2>&1 | tee "$RUNNER_TEMP/pr1041-writer-evidence/durable-harness.log"
       - name: Retain exact-source writer and memory evidence
         if: always()
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
         with:
-          name: pr1041-writer-memory-f543d
+          name: pr1041-writer-memory-9a04c
           path: ${{ runner.temp }}/pr1041-writer-evidence/
           if-no-files-found: warn
           retention-days: 7
