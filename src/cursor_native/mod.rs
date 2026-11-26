@@ -185,7 +185,7 @@ mod tests {
                     tenant_external_id: "cursor-rejection".into(),
                     name: "fixture".into(),
                     driver: "cursor".into(),
-                    config: serde_json::json!({}),
+                    config: serde_json::json!({"base_url":"https://cursor.example.test"}),
                     credential: UpstreamCredential::OAuth {
                         access_token: "fixture-token".into(),
                         refresh_token: Some("fixture-refresh".into()),

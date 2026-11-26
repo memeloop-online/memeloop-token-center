@@ -463,7 +463,7 @@ async fn postgres_request_admission_lost_commit_ack_never_dispatches_and_orphan_
         backend: DatabaseBackend::PostgreSql,
         terminal_projection_enabled: false,
         schema_track: std::sync::Arc::new(std::sync::OnceLock::from(
-            crate::db::capability::SchemaTrack::Linear165,
+            crate::db::capability::SchemaTrack::Linear166,
         )),
         gateway_persistence: isolated_gateway_persistence(&fixture.url, &fixture.schema),
         oauth_refresh_write_phase_seam: std::sync::Arc::new(tokio::sync::Mutex::new(None)),
@@ -855,7 +855,7 @@ impl PgFixture {
             backend: DatabaseBackend::PostgreSql,
             terminal_projection_enabled: false,
             schema_track: std::sync::Arc::new(std::sync::OnceLock::from(
-                crate::db::capability::SchemaTrack::Linear165,
+                crate::db::capability::SchemaTrack::Linear166,
             )),
             gateway_persistence: isolated_gateway_persistence(&url, &schema),
             oauth_refresh_write_phase_seam: std::sync::Arc::new(tokio::sync::Mutex::new(None)),
@@ -1036,7 +1036,7 @@ async fn postgres_seal_precedes_terminal_delivery_and_survives_producer_loss() {
         backend: DatabaseBackend::PostgreSql,
         terminal_projection_enabled: false,
         schema_track: std::sync::Arc::new(std::sync::OnceLock::from(
-            crate::db::capability::SchemaTrack::Linear165,
+            crate::db::capability::SchemaTrack::Linear166,
         )),
         gateway_persistence: isolated_gateway_persistence(&fixture.url, &fixture.schema),
         oauth_refresh_write_phase_seam: std::sync::Arc::new(tokio::sync::Mutex::new(None)),
@@ -1114,7 +1114,7 @@ async fn postgres_seal_cancelled_inside_commit_remains_recoverable_after_reconne
         backend: DatabaseBackend::PostgreSql,
         terminal_projection_enabled: false,
         schema_track: std::sync::Arc::new(std::sync::OnceLock::from(
-            crate::db::capability::SchemaTrack::Linear165,
+            crate::db::capability::SchemaTrack::Linear166,
         )),
         gateway_persistence: isolated_gateway_persistence(&fixture.url, &fixture.schema),
         oauth_refresh_write_phase_seam: std::sync::Arc::new(tokio::sync::Mutex::new(None)),
