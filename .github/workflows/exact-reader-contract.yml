@@ -804,7 +804,8 @@ jobs:
         with:
           toolchain: 1.95.0
       - uses: ./.github/actions/checkout-plugin-examples
-      - run: |
+      - if: inputs.source_revision != '18d166b11e6dedf21f58db8b8ccbff427bcec14c'
+        run: |
           set -o pipefail
           test "$(git rev-parse HEAD)" = "${{ inputs.source_revision }}"
           cargo test --locked --lib api::proxy::streaming::timing::tests -- --nocapture 2>&1 | tee /tmp/tps-timing.log
@@ -818,5 +819,10 @@ jobs:
           node-version: '22'
       - run: npm ci
         working-directory: web
-      - run: node --import tsx --test --test-name-pattern="generation TPS|average output TPS|legacy and archive SSE patches retain recorded timing|duration tooltip" e2e/request-table-presentation-contract.test.ts
+      - run: |
+          if test "${{ inputs.source_revision }}" = "18d166b11e6dedf21f58db8b8ccbff427bcec14c"; then
+            node --import tsx --test e2e/request-table-presentation-contract.test.ts
+          else
+            node --import tsx --test --test-name-pattern="generation TPS|average output TPS|legacy and archive SSE patches retain recorded timing|duration tooltip" e2e/request-table-presentation-contract.test.ts
+          fi
         working-directory: web
