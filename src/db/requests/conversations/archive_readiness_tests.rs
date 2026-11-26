@@ -1135,9 +1135,11 @@ impl Fixture {
         );
         let events: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM request_events WHERE request_id = $1 AND event_kind = 'projected'")
             .bind(self.request_id.to_string()).fetch_one(&self.state.db.pool).await.unwrap();
+        assert_eq!(events_before, 1, "terminal projection publishes one event");
         assert_eq!(
-            events, 1,
-            "fixture projected events before body={events_before}, after body={events}"
+            events - events_before,
+            1,
+            "one body completion and its idempotent replay publish exactly one additional event"
         );
     }
 }
