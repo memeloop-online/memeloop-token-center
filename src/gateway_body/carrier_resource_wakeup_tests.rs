@@ -445,3 +445,80 @@ async fn credited_spill_observation_distinguishes_workspace_pressure_from_put_ac
         assert_eq!(workspace.upload_workspace.snapshot().0, 0);
     }
 }
+
+#[tokio::test]
+#[ignore = "requires isolated RustFS fixture"]
+async fn credited_mixed_grains_replace_bytes_without_releasing_external_clones() {
+    for sizes in [[65_536usize, 417_792], [417_792, 65_536]] {
+        let (template, _, workspace) = real_fixture().await;
+        let archive = template.archive.clone().unwrap();
+        let staging = template.staging;
+        drop(template);
+        let memory = Arc::new(ProxyMemoryBudget::new_archive_source(4 * 1024 * 1024));
+        let mut expected = blake3::Hasher::new();
+        let mut length = 0usize;
+        let input = stream::iter(0..80).map({
+            let memory = memory.clone();
+            move |index| {
+                let size = sizes[index % 2];
+                let bytes = Bytes::from(vec![index as u8; size]);
+                expected.update(&bytes);
+                length += size;
+                let credit = memory
+                    .try_reserve_ingress_bytes(size)
+                    .expect("healthy mixed-grain ACKs reclaim source credit");
+                Ok::<_, std::io::Error>((bytes, Some(credit)))
+            }
+        });
+        let source = BodyCarrier::capture_owned(
+            input,
+            CarrierCapture::new(memory.clone(), Some(archive), staging)
+                .with_upload_workspace(workspace.clone()),
+        )
+        .await
+        .unwrap();
+        assert_eq!(source.len(), length as u64);
+        assert_eq!(source.digest(), expected.finalize().to_hex().as_str());
+        let ram: usize = source
+            .segments
+            .iter()
+            .map(|segment| match &*segment.lock().unwrap() {
+                Segment::Ram(bytes) => bytes.len(),
+                Segment::Object(_) => 0,
+            })
+            .sum();
+        assert!(ram <= memory.snapshot().3 + 417_792, "RAM={ram}");
+        let mut replay = source.open_stream();
+        let mut actual = blake3::Hasher::new();
+        while let Some(bytes) = replay.next().await {
+            actual.update(&bytes.unwrap());
+        }
+        assert_eq!(actual.finalize().to_hex().as_str(), source.digest());
+        drop(replay);
+        drop(source);
+        assert_eq!(memory.snapshot().0, 0);
+        assert_eq!(workspace.upload_workspace.snapshot().0, 0);
+    }
+
+    let (mut source, memory, workspace) = fixture().await;
+    Arc::get_mut(&mut source).unwrap().archive =
+        Some(real_archive_at(&std::env::var("MTC_RUSTFS_TEST_ENDPOINT").unwrap()).await);
+    let external = match &*source.segments[0].lock().unwrap() {
+        Segment::Ram(bytes) => bytes.clone(),
+        _ => unreachable!(),
+    };
+    let before = memory.snapshot().0;
+    assert_eq!(
+        source.offload_one_bytes(None).await.unwrap(),
+        Some(128 * 1024)
+    );
+    assert_eq!(
+        memory.snapshot().0,
+        before,
+        "ACK does not revoke external ownership"
+    );
+    drop(external);
+    assert_eq!(memory.snapshot().0, 0);
+    drop(source);
+    assert_eq!(workspace.upload_workspace.snapshot().0, 0);
+}
