@@ -1025,3 +1025,8 @@ mod tests;
 
 #[cfg(test)]
 mod oauth_background_tests;
+
+#[cfg(test)]
+mod oauth_fixture_contract;
+#[cfg(test)]
+mod oauth_stage_fixture;
