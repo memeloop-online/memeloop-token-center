@@ -334,6 +334,7 @@ async fn rewrite_session_body_observation_in_transaction(
 async fn rewrite_reopened_session_body_if_present(
     transaction: &mut Transaction<'_, Any>,
     request_id: Uuid,
+    prepared_paths: &prefix_storage::PreparedCandidatePaths,
 ) -> Result<(), ConversationContentError> {
     let row = sqlx::query(
         "SELECT tenant_id, statistics_outcome, COALESCE(semantic_payload_snapshot_json, semantic_snapshot_json) AS semantic_snapshot_json FROM conversation_projection_outbox WHERE request_id = $1",
@@ -363,7 +364,7 @@ async fn rewrite_reopened_session_body_if_present(
         &tenant_id,
         &request_id,
         &snapshot,
-        None,
+        Some(prepared_paths),
     )
     .await?;
     Ok(())
@@ -1338,7 +1339,9 @@ impl Database {
 
         let mut transaction = self.begin_write_transaction().await?;
         let result: Result<bool, ConversationContentError> = async {
-        lock_request_stats_projection_rebuild_in_transaction(&mut transaction).await?;
+        if !super::super::projection_lock::try_lock_request_stats_projection_rebuild_in_transaction(&mut transaction).await? {
+            return Err(ConversationContentError::ProjectionBusy);
+        }
         let now = unix_millis();
         let terminal = sqlx::query(
             "SELECT created_at, projected_at FROM terminal_projection_outbox WHERE request_id = $1",
@@ -1362,7 +1365,7 @@ impl Database {
             )
             .await?
         {
-            rewrite_reopened_session_body_if_present(&mut transaction, request_id).await?;
+            rewrite_reopened_session_body_if_present(&mut transaction, request_id, &prepared_paths).await?;
             let skipped = sqlx::query("UPDATE conversation_projection_outbox SET projected_at = $1, statistics_outcome = CASE WHEN statistics_outcome = 'session_body' THEN 'session_body' ELSE 'pruned' END, lease_owner = NULL, lease_expires_at = NULL, terminal_lease_owner = NULL, terminal_lease_expires_at = NULL WHERE request_id = $2 AND projected_at IS NULL AND COALESCE(terminal_lease_owner, lease_owner) = $3 AND COALESCE(terminal_lease_expires_at, lease_expires_at) > $1")
                 .bind(now).bind(request_id.to_string()).bind(lease_owner.to_string()).execute(&mut *transaction).await?;
             if skipped.rows_affected() == 1 {
@@ -1579,7 +1582,10 @@ impl Database {
                     sqlstate = retryable_sqlstate.unwrap_or("unclassified"),
                     "conversation projection transaction failed"
                 );
-                if rollback_confirmed && error.retry_after_confirmed_rollback() {
+                if rollback_confirmed && error.is_projection_busy() {
+                    self.defer_session_body_archive(lease_owner, request_id)
+                        .await?;
+                } else if rollback_confirmed && error.retry_after_confirmed_rollback() {
                     self.try_schedule_rolled_back_conversation_retry(request_id, lease_owner)
                         .await;
                 }

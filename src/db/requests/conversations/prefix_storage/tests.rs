@@ -688,11 +688,14 @@ async fn sqlite_prepared_prefix_reuses_only_verified_tenant_roots() {
 #[tokio::test]
 #[ignore = "requires CI PostgreSQL"]
 async fn postgres_prefix_preload_releases_projection_scope_before_graph_receive() {
-    prefix_preload_contract(false).await;
-    prefix_preload_contract(true).await;
+    prefix_preload_contract(false, false, false).await;
+    prefix_preload_contract(true, false, false).await;
+    prefix_preload_contract(false, true, false).await;
+    prefix_preload_contract(true, true, false).await;
+    prefix_preload_contract(false, false, true).await;
 }
 
-async fn prefix_preload_contract(change_roots: bool) {
+async fn prefix_preload_contract(change_roots: bool, identity_only: bool, pruned_reopened: bool) {
     let postgres = std::env::var("MTC_TEST_POSTGRES_URL").unwrap();
     let admin = sqlx::PgPool::connect(&postgres).await.unwrap();
     let schema = format!("prefix_preload_{}", Uuid::now_v7().simple());
@@ -764,13 +767,45 @@ async fn prefix_preload_contract(change_roots: bool) {
     .unwrap();
     sqlx::query("INSERT INTO conversation_projection_outbox(request_id,tenant_id,key_id,principal_id,request_json,hints_json,observed_at,semantic_snapshot_json,lease_owner,lease_expires_at) VALUES($1,$2,$3,$4,'{}',$5,$6,$7,$8,$9)")
         .bind(request.to_string()).bind(actor.tenant_id.to_string()).bind(actor.key_id.to_string()).bind(actor.principal_id.to_string()).bind(serde_json::to_string(&hints).unwrap()).bind(now+1).bind(&snapshot).bind(owner.to_string()).bind(now+60000).execute(&database.pool).await.unwrap();
+    if identity_only {
+        let key_snapshot = json!({"account_id":actor.account_id,"alias":actor.alias,
+            "currency":actor.currency,"credential_generation":actor.credential_generation,
+            "policy":actor.policy})
+        .to_string();
+        sqlx::query(
+            "UPDATE conversation_projection_outbox SET key_snapshot_json=$2 WHERE request_id=$1",
+        )
+        .bind(request.to_string())
+        .bind(key_snapshot)
+        .execute(&database.pool)
+        .await
+        .unwrap();
+    }
     if change_roots {
         sqlx::query("UPDATE conversation_projection_outbox SET attempts=1, lease_owner='terminal-v118', lease_expires_at=9223372036854775807, terminal_lease_owner=$2, terminal_lease_expires_at=$3 WHERE request_id=$1")
             .bind(request.to_string()).bind(owner.to_string()).bind(now+300000)
             .execute(&database.pool).await.unwrap();
     }
+    if pruned_reopened {
+        // Preserve a real non-empty historical observation and exercise the
+        // pruned terminal branch, not the ordinary observation insertion.
+        sqlx::query("UPDATE conversation_observations SET request_id=$1 WHERE request_id=$2")
+            .bind(request.to_string())
+            .bind(candidate.to_string())
+            .execute(&database.pool)
+            .await
+            .unwrap();
+        sqlx::query("UPDATE conversation_projection_outbox SET statistics_outcome='session_body' WHERE request_id=$1")
+            .bind(request.to_string()).execute(&database.pool).await.unwrap();
+        sqlx::query("INSERT INTO terminal_projection_outbox(request_id,reservation_id,tenant_id,key_id,account_id,created_at,completed_at,model,protocol,status_code,error_code,upstream_account_id,model_route_id,duration_ms,input_tokens,output_tokens,cached_input_tokens,cache_write_tokens,generation_units,billing_unit,service_tier,currency,cost_micros,usage_basis,session_id,response_object,projected_at) VALUES($1,$2,$3,$4,$5,$6,$6,'pruned-preload','openai',200,'','','',0,0,0,0,0,0,'token','default','USD',0,'unknown','','',1)")
+            .bind(request.to_string()).bind(Uuid::now_v7().to_string()).bind(actor.tenant_id.to_string())
+            .bind(actor.key_id.to_string()).bind(actor.account_id.to_string()).bind(now+1)
+            .execute(&database.pool).await.unwrap();
+        sqlx::query("INSERT INTO observability_prune_boundaries(scope,before_day,recorded_at) VALUES('global',$1,$2)")
+            .bind(now/86400000+1).bind(now).execute(&database.pool).await.unwrap();
+    }
     // A real recursive SELECT is suspended before its result is received.
-    sqlx::raw_sql("CREATE FUNCTION prefix_receive_gate() RETURNS BOOLEAN LANGUAGE plpgsql VOLATILE AS $$ BEGIN IF EXISTS (SELECT 1 FROM pg_locks WHERE pid=pg_backend_pid() AND relation='request_records'::regclass AND mode IN ('RowShareLock','RowExclusiveLock') AND granted) THEN RAISE EXCEPTION 'recursive prefix received under request scope lock'; END IF; PERFORM pg_advisory_xact_lock(91844,1); RETURN TRUE; END $$; ALTER TABLE context_nodes RENAME TO prefix_nodes; CREATE VIEW context_nodes AS SELECT * FROM prefix_nodes WHERE prefix_receive_gate()")
+    sqlx::raw_sql("CREATE FUNCTION prefix_receive_gate() RETURNS BOOLEAN LANGUAGE plpgsql VOLATILE AS $$ BEGIN IF EXISTS (SELECT 1 FROM pg_locks WHERE pid=pg_backend_pid() AND granted AND ((relation='request_records'::regclass AND mode IN ('RowShareLock','RowExclusiveLock')) OR (locktype='advisory' AND mode='ExclusiveLock' AND NOT (classid=91844 AND objid=1)))) THEN RAISE EXCEPTION 'recursive prefix received under projection or request scope lock'; END IF; PERFORM pg_advisory_xact_lock(91844,1); RETURN TRUE; END $$; ALTER TABLE context_nodes RENAME TO prefix_nodes; CREATE VIEW context_nodes AS SELECT * FROM prefix_nodes WHERE prefix_receive_gate()")
         .execute(&database.pool).await.unwrap();
     let mut blocker = database.pool.begin().await.unwrap();
     sqlx::query("SELECT pg_advisory_xact_lock(91844,1)")
@@ -779,9 +814,16 @@ async fn prefix_preload_contract(change_roots: bool) {
         .unwrap();
     let worker = database.clone();
     let task = tokio::spawn(async move {
-        worker
-            .project_claimed_conversation_projection_task(owner, request)
-            .await
+        if identity_only {
+            worker
+                .project_claimed_conversation_identity(owner, request)
+                .await
+                .map(|()| true)
+        } else {
+            worker
+                .project_claimed_conversation_projection_task(owner, request)
+                .await
+        }
     });
     tokio::time::timeout(std::time::Duration::from_secs(5), async {
         loop {
@@ -821,7 +863,7 @@ async fn prefix_preload_contract(change_roots: bool) {
         sqlx::query("UPDATE conversation_observations SET explicit_session_id=$2, created_at=$3 WHERE request_id=$1")
             .bind(changed_candidate.to_string()).bind(hints.session_id.as_deref().unwrap())
             .bind(now+1).execute(&mut *probe).await.unwrap();
-    } else {
+    } else if !pruned_reopened {
         sqlx::query("UPDATE conversation_projection_outbox SET lease_owner=$2 WHERE request_id=$1")
             .bind(request.to_string())
             .bind(replacement.to_string())
@@ -832,6 +874,41 @@ async fn prefix_preload_contract(change_roots: bool) {
     probe.commit().await.unwrap();
     blocker.rollback().await.unwrap();
     let result = task.await.unwrap();
+    if pruned_reopened {
+        assert!(
+            result.unwrap(),
+            "pruned reopened task must use the preloaded nonempty graph"
+        );
+        let row = sqlx::query("SELECT projected_at,statistics_outcome FROM conversation_projection_outbox WHERE request_id=$1")
+            .bind(request.to_string()).fetch_one(&database.pool).await.unwrap();
+        assert!(row.get::<Option<i64>, _>("projected_at").is_some());
+        assert_eq!(row.get::<String, _>("statistics_outcome"), "session_body");
+        let actual_leaf: String = sqlx::query_scalar(
+            "SELECT leaf_node_hash FROM conversation_observations WHERE request_id=$1",
+        )
+        .bind(request.to_string())
+        .fetch_one(&database.pool)
+        .await
+        .unwrap();
+        let expected: ConversationSemanticSnapshot = serde_json::from_str(&snapshot).unwrap();
+        assert_eq!(Some(actual_leaf), expected.leaf);
+        let terminal: (i64,i64,i64)=sqlx::query_as("SELECT projected_at,cost_micros,attempts FROM terminal_projection_outbox WHERE request_id=$1")
+            .bind(request.to_string()).fetch_one(&database.pool).await.unwrap();
+        assert_eq!(
+            terminal,
+            (1, 0, 0),
+            "canonical rebuild does not replay financial projection"
+        );
+        sqlx::raw_sql("DROP VIEW context_nodes; ALTER TABLE prefix_nodes RENAME TO context_nodes; DROP FUNCTION prefix_receive_gate()")
+            .execute(&database.pool).await.unwrap();
+        database.pool.close().await;
+        sqlx::query(sqlx::AssertSqlSafe(format!("DROP SCHEMA {schema} CASCADE")))
+            .execute(&admin)
+            .await
+            .unwrap();
+        admin.close().await;
+        return;
+    }
     if change_roots {
         assert!(matches!(result, Err(AppError::Conflict(_))));
         let row = sqlx::query("SELECT terminal_lease_owner, terminal_lease_expires_at, projected_at FROM conversation_projection_outbox WHERE request_id=$1")
@@ -867,11 +944,13 @@ async fn prefix_preload_contract(change_roots: bool) {
         let unchanged: Option<i64> = sqlx::query_scalar("SELECT terminal_lease_expires_at FROM conversation_projection_outbox WHERE request_id=$1")
             .bind(request.to_string()).fetch_one(&database.pool).await.unwrap();
         assert_eq!(held, unchanged, "old owner cannot shorten the new lease");
-    } else {
+    } else if !identity_only {
         assert!(
             !result.unwrap(),
             "a replaced lease cannot publish the prepared graph"
         );
+    } else {
+        result.unwrap(); // Missing fresh owner grants no authority to publish.
     }
     let count: i64 =
         sqlx::query_scalar("SELECT COUNT(*) FROM conversation_observations WHERE request_id=$1")
