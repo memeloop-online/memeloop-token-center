@@ -1644,7 +1644,7 @@ impl Database {
 
             // Preserve the owner CAS and post-lock guard ordering. A missing
             // locator returns no owner so deferred outbox replay still runs.
-            let claimed = self
+            let (claimed, locked_created_at) = self
                 .lock_request_terminal_owner(
                     &mut transaction,
                     input.request_id,
@@ -1669,8 +1669,13 @@ impl Database {
                     "request completed without matching settlement receipt".into(),
                 ));
             }
+            // PostgreSQL's locked locator also bounds the follow-up owner reads;
+            // SQLite retains the original predicate and write-lock behavior.
+            let owner_partition = locked_created_at
+                .map(|value| format!(" AND created_at={value}"))
+                .unwrap_or_default();
             if reap_orphan && claimed == 1 {
-                let expires_at: Option<i64> = sqlx::query_scalar("SELECT proxy_owner_expires_at FROM request_records WHERE id = $1 AND tenant_id = $2 AND key_id = $3 AND reservation_id = $4")
+                let expires_at: Option<i64> = sqlx::query_scalar(&format!("SELECT proxy_owner_expires_at FROM request_records WHERE id = $1 AND tenant_id = $2 AND key_id = $3 AND reservation_id = $4{owner_partition}")).persistent(false)
                     .bind(&request_id).bind(&tenant_id).bind(&key_id).bind(&reservation_id)
                     .fetch_one(&mut *transaction).await?;
                 let owner_now = self.request_owner_now(&mut transaction).await?;
@@ -1680,7 +1685,7 @@ impl Database {
                     ));
                 }
             }
-            if claimed == 1 && sqlx::query("SELECT 1 FROM request_records WHERE id = $1 AND key_id = $2 AND submission_started_at IS NOT NULL")
+            if claimed == 1 && sqlx::query(&format!("SELECT 1 FROM request_records WHERE id = $1 AND key_id = $2 AND submission_started_at IS NOT NULL{owner_partition}")).persistent(false)
                 .bind(&request_id).bind(&key_id).fetch_optional(&mut *transaction).await?.is_some() {
                 return Err(AppError::Conflict("submitted image requires authoritative image settlement or quarantine".into()));
             }

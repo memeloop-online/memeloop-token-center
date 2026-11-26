@@ -135,7 +135,7 @@ impl Database {
         }
         // Same private request row first as claim/finalizer. No completed_at
         // predicate: an exact operational receipt may arrive after accounting.
-        let owned = self
+        let (owned, _) = self
             .lock_request_terminal_owner(
                 &mut tx,
                 claim.request_id,

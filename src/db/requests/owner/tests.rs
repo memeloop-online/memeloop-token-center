@@ -40,6 +40,13 @@ impl Fixture {
         url.query_pairs_mut()
             .append_pair("application_name", &replica_name);
         let replica = Database::connect_with_max(url.as_str(), 6).await.unwrap();
+        for runtime in [&database, &replica] {
+            runtime
+                .verify_capabilities(crate::db::capability::CapabilityRole::Gateway)
+                .await
+                .unwrap()
+                .expect("migrated owner runtime must verify capabilities");
+        }
         let pepper = b"u02 ordinary owner regression pepper";
         let issued = database
             .create_key(
@@ -427,7 +434,8 @@ async fn postgres_terminal_owner_read_lock_rechecks_pending_without_update_side_
         sqlx::query_scalar::<_, i64>("SELECT COUNT(*) FROM terminal_owner_update_probe")
             .fetch_one(&mut *old)
             .await
-            .unwrap(),
+            .unwrap()
+            .0,
         1
     );
     let old_revision: i64 = sqlx::query_scalar("SELECT COALESCE(MAX(revision),0) FROM request_history_export WHERE source='native' AND request_id=$1").bind(owner.request_id.to_string()).fetch_one(&mut *old).await.unwrap();
@@ -464,7 +472,8 @@ async fn postgres_terminal_owner_read_lock_rechecks_pending_without_update_side_
                 true
             )
             .await
-            .unwrap(),
+            .unwrap()
+            .0,
         1
     );
     assert_eq!(
@@ -497,7 +506,8 @@ async fn postgres_terminal_owner_read_lock_rechecks_pending_without_update_side_
                 true,
             )
             .await
-            .unwrap();
+            .unwrap()
+            .0;
         tx.rollback().await.unwrap();
         result
     });
@@ -532,7 +542,8 @@ async fn postgres_terminal_owner_read_lock_rechecks_pending_without_update_side_
                 false
             )
             .await
-            .unwrap(),
+            .unwrap()
+            .0,
         1,
         "operational receipt may lock an already financially completed owner"
     );
@@ -543,5 +554,55 @@ async fn postgres_terminal_owner_read_lock_rechecks_pending_without_update_side_
         .bind(owner.reservation_id.to_string()).fetch_one(&fixture.database.pool).await.unwrap();
     assert_eq!(untouched.get::<String, _>("reservation_status"), "reserved");
     assert_eq!(untouched.get::<i64, _>("ledger_count"), 0);
+    fixture.close().await;
+}
+
+#[tokio::test]
+async fn postgres_terminal_completion_keeps_owner_reads_on_one_leaf_before_settlement() {
+    let fixture = Fixture::postgres()
+        .await
+        .expect("PostgreSQL contract requires MTC_TEST_POSTGRES_URL");
+    let (owner, reservation) = fixture.request().await;
+    for statement in [
+        "CREATE TABLE terminal_path_unrelated_old PARTITION OF request_records FOR VALUES FROM (-2000) TO (-1000)",
+        "CREATE TABLE terminal_path_unrelated_new PARTITION OF request_records FOR VALUES FROM (-1000) TO (0)",
+        "CREATE FUNCTION gate_terminal_settlement() RETURNS trigger LANGUAGE plpgsql AS $$ BEGIN IF NEW.status='settled' THEN PERFORM pg_advisory_xact_lock(1096,1); END IF; RETURN NEW; END $$",
+        "CREATE TRIGGER gate_terminal_settlement BEFORE UPDATE ON usage_reservations FOR EACH ROW EXECUTE FUNCTION gate_terminal_settlement()",
+    ] {
+        sqlx::query(statement)
+            .execute(&fixture.database.pool)
+            .await
+            .unwrap();
+    }
+    let mut gate = fixture.admin.begin().await.unwrap();
+    sqlx::query("SELECT pg_advisory_xact_lock(1096,1)")
+        .execute(&mut *gate)
+        .await
+        .unwrap();
+    let replica = fixture.replica.clone();
+    let terminal_owner = owner.clone();
+    let task = tokio::spawn(async move {
+        replica
+            .finish_proxy_request(terminal(&terminal_owner, &reservation, false))
+            .await
+    });
+    fixture.wait_for_replica_lock().await;
+    let footprints: Vec<i64> = sqlx::query_scalar("WITH leaves AS (SELECT relid FROM pg_partition_tree($1::regclass) WHERE isleaf), families AS (SELECT relid,relid AS owner_leaf FROM leaves UNION ALL SELECT i.indexrelid,l.relid FROM leaves l JOIN pg_index i ON i.indrelid=l.relid) SELECT COUNT(DISTINCT f.owner_leaf)::BIGINT FROM pg_stat_activity a JOIN pg_locks p ON p.pid=a.pid AND p.granted JOIN families f ON f.relid=p.relation WHERE a.application_name=$2 AND a.wait_event_type='Lock' GROUP BY a.pid")
+        .bind(format!("{}.request_records",fixture.schema)).bind(&fixture.replica_name)
+        .fetch_all(&fixture.admin).await.unwrap();
+    // Always release the blocker and await the real operation before asserting.
+    gate.rollback().await.unwrap();
+    let result = tokio::time::timeout(Duration::from_secs(10), task)
+        .await
+        .unwrap()
+        .unwrap()
+        .unwrap();
+    assert!(matches!(result, FinishProxyRequestResult::Finished { .. }));
+    assert_eq!(
+        footprints,
+        vec![1],
+        "formal terminal path must not reopen unrelated leaf/index families after its owner lock"
+    );
+    fixture.assert_once(&owner, 200, 12).await;
     fixture.close().await;
 }

@@ -29,7 +29,7 @@ impl Database {
         reservation_id: Uuid,
         created_at: Option<i64>,
         pending_only: bool,
-    ) -> Result<u64, AppError> {
+    ) -> Result<(u64, Option<i64>), AppError> {
         let pending = if pending_only {
             " AND completed_at IS NULL"
         } else {
@@ -42,14 +42,15 @@ impl Database {
             let sql = format!(
                 "UPDATE request_records SET completed_at = completed_at WHERE id=$1 AND tenant_id=$2 AND key_id=$3 AND reservation_id=$4{partition}{pending}"
             );
-            return Ok(sqlx::query(&sql)
+            let affected = sqlx::query(&sql)
                 .bind(request_id.to_string())
                 .bind(tenant_id.to_string())
                 .bind(key_id.to_string())
                 .bind(reservation_id.to_string())
                 .execute(&mut **tx)
                 .await?
-                .rows_affected());
+                .rows_affected();
+            return Ok((affected, created_at));
         }
         let created_at = match created_at {
             Some(value) => value,
@@ -58,10 +59,10 @@ impl Database {
                     .authoritative_request_locator_in_transaction(tx, request_id, tenant_id)
                     .await?
                 else {
-                    return Ok(0);
+                    return Ok((0, None));
                 };
                 if locator.key_id != key_id {
-                    return Ok(0);
+                    return Ok((0, None));
                 }
                 locator.created_at
             }
@@ -71,17 +72,16 @@ impl Database {
         let sql = format!(
             "SELECT 1 FROM request_records WHERE id=$1 AND tenant_id=$2 AND key_id=$3 AND reservation_id=$4 AND created_at={created_at}{pending} FOR UPDATE"
         );
-        Ok(u64::from(
-            sqlx::query(&sql)
-                .persistent(false)
-                .bind(request_id.to_string())
-                .bind(tenant_id.to_string())
-                .bind(key_id.to_string())
-                .bind(reservation_id.to_string())
-                .fetch_optional(&mut **tx)
-                .await?
-                .is_some(),
-        ))
+        let matched = sqlx::query(&sql)
+            .persistent(false)
+            .bind(request_id.to_string())
+            .bind(tenant_id.to_string())
+            .bind(key_id.to_string())
+            .bind(reservation_id.to_string())
+            .fetch_optional(&mut **tx)
+            .await?
+            .is_some();
+        Ok((u64::from(matched), Some(created_at)))
     }
 
     pub(crate) async fn proxy_request_owner_finished(
