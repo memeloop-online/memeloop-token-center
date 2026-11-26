@@ -696,23 +696,52 @@ export async function run(binary: string, output: string): Promise<boolean> {
         const evidence: Record<string, any> = { request_id: result.requestId, usage_entries: row?.usage_entries, sides: [] };
         report.phases.at(-1).archive_originals = evidence;
         assert(row && row.usage_entries === 1, "chunked reference request must settle exactly once");
+        const failures: string[] = [];
         for (const [side, plan] of [["request", requestPlan], ["response", responsePlan]] as const) {
           const root = join(archive, "tenants", String(row.tenant_id), "raw", "v1", result.requestId, `${side}.json`);
           const sideEvidence: Record<string, any> = { side, root_exists: existsSync(root), failed: existsSync(`${root}.failed`) };
           evidence.sides.push(sideEvidence);
-          assert(sideEvidence.root_exists && !sideEvidence.failed, `${side} must own a complete original root without a failure marker`);
-          assert(statSync(root).size <= 4096, `${side} root metadata must remain bounded`);
-          const reference = JSON.parse(readFileSync(root, "utf8"));
-          sideEvidence.source_bytes = reference.size_bytes;
-          sideEvidence.root_digest = reference.blake3_digest;
-          assert(reference.size_bytes === plan.bytes && typeof reference.blake3_digest === "string" && /^[a-f0-9]{64}$/.test(reference.blake3_digest), `${side} root must identify the complete original`);
-          assert(reference.object_locator === row[`${side}_object`], `${side} relational binding must identify this exact root`);
-          const replay = await apiRequest(base, "GET", `/internal/v1/requests/${result.requestId}/archive/${side}`, token);
-          sideEvidence.status = replay.status;
-          sideEvidence.bytes = replay.body.length;
-          sideEvidence.sha256 = createHash("sha256").update(replay.body).digest("hex");
-          assert(replay.status === 200 && replay.body.length === plan.bytes && sideEvidence.sha256 === planHash(plan), `${side} backend replay must reproduce every original byte`);
+          try {
+            assert(sideEvidence.root_exists && !sideEvidence.failed, `${side} must own a complete original root without a failure marker`);
+            assert(statSync(root).size <= 4096, `${side} root metadata must remain bounded`);
+            const reference = JSON.parse(readFileSync(root, "utf8"));
+            sideEvidence.source_bytes = reference.size_bytes;
+            sideEvidence.root_digest = reference.blake3_digest;
+            assert(reference.size_bytes === plan.bytes && typeof reference.blake3_digest === "string" && /^[a-f0-9]{64}$/.test(reference.blake3_digest), `${side} root must identify the complete original`);
+            sideEvidence.sql_binding = reference.object_locator === row[`${side}_object`] ? "exact_cas" : "unverified";
+            if (sideEvidence.sql_binding !== "exact_cas" && side === "request") {
+              // The completed spool receipt binds the SQL source to this exact
+              // request. The public read below independently verifies root content.
+              const receipt = reader.prepare(`SELECT s.body_byte_count, s.body_blake3, a.backend_identity
+                FROM request_records r JOIN request_archive_spools s
+                  ON s.request_id = r.id AND s.tenant_id = r.tenant_id AND s.reservation_id = r.reservation_id
+                JOIN archive_staging_attempts a ON a.attempt_id = r.id
+                  AND a.owner_kind = 'proxy_request' AND a.owner_id = r.id AND a.purpose = 'request'
+                  AND a.writer_owner = 'gateway-source' AND a.writer_token = r.id
+                  AND a.state IN ('cleanup_pending', 'cleaned')
+                  AND a.lease_owner IS NULL AND a.lease_token IS NULL AND a.lease_expires_at IS NULL
+                WHERE r.id = ? AND s.state = 'bound' AND s.bound_locator = r.request_object
+                  AND a.intent_digest = s.body_blake3`).get(result.requestId);
+              const sourceKey = `staging/proxy/${result.requestId}/request/${result.requestId}/body.json`;
+              const sourceLocator = receipt?.backend_identity === null ? sourceKey
+                : typeof receipt?.backend_identity === "string" ? `stores/staging/${receipt.backend_identity}/${sourceKey}` : undefined;
+              if (sourceLocator === row.request_object && receipt?.body_byte_count === plan.bytes
+                && receipt.body_blake3 === reference.blake3_digest) {
+                sideEvidence.sql_binding = "bound_source_receipt";
+              }
+            }
+            const replay = await apiRequest(base, "GET", `/internal/v1/requests/${result.requestId}/archive/${side}`, token);
+            sideEvidence.status = replay.status;
+            sideEvidence.bytes = replay.body.length;
+            sideEvidence.sha256 = createHash("sha256").update(replay.body).digest("hex");
+            assert(replay.status === 200 && replay.body.length === plan.bytes && sideEvidence.sha256 === planHash(plan), `${side} backend replay must reproduce every original byte`);
+            assert(sideEvidence.sql_binding !== "unverified", `${side} relational binding equivalence is unverified`);
+          } catch (error) {
+            sideEvidence.error = String(error);
+            failures.push(String(error));
+          }
         }
+        assert(failures.length === 0, failures.join("; "));
       } finally { reader.close(); }
       const completed = await drain();
       assert(completed.successful_request_archive_gaps === 0 && completed.successful_response_archive_gaps === 0, "reference workload must retain both originals without an archive gap");

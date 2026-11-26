@@ -1078,7 +1078,10 @@ impl ResponseArchiveProducer {
                         retained_bytes,
                         retained_limit_bytes,
                     ) = self.capture.budget.snapshot();
+                    let (workspace_used_bytes, workspace_limit_bytes, _, _) =
+                        self.persistence.upload_workspace.snapshot();
                     tracing::warn!(request_id = %self.identity.request_id, requested_bytes,
+                        workspace_used_bytes, workspace_limit_bytes,
                         source_used_bytes, source_limit_bytes, retained_bytes, retained_limit_bytes,
                         pending_bytes = self.capture.pending.as_ref().map_or(0, OfferedCaptureChunk::len),
                         "response archive ingress credit unavailable");
