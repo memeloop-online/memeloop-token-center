@@ -48,6 +48,23 @@ async fn native_kimi_buffered_usage_with_route(output_tokens: i64, route: Option
             .archive
             .set_response_write_rules_for_test(Some(&rules))
             .unwrap();
+        // Match AppState initialization: all database readers share the same
+        // backend registry as the writer, including qualified test locators.
+        fixture.state.db = fixture
+            .state
+            .db
+            .clone()
+            .with_archive(fixture.state.archive.clone());
+        fixture.state.persistence_db = fixture
+            .state
+            .persistence_db
+            .clone()
+            .with_archive(fixture.state.archive.clone());
+        fixture.state.routing_persistence_db = fixture
+            .state
+            .routing_persistence_db
+            .clone()
+            .with_archive(fixture.state.archive.clone());
     }
     let price = fixture
         .state
