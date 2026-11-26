@@ -38,12 +38,21 @@ pub(crate) fn utc_day_add(day: UtcDay, days: i64) -> Option<UtcDay> {
 
 pub(crate) fn format_utc_day(day: UtcDay, compact: bool) -> Option<String> {
     let pattern = if compact {
-        "[year][month][day]"
+        "[year sign:automatic][month][day]"
     } else {
-        "[year]-[month]-[day]"
+        "[year sign:automatic]-[month]-[day]"
     };
     let description = ::time::format_description::parse(pattern).ok()?;
     day.format(&description).ok()
+}
+
+// Match the prior chrono NaiveDate range, even with time's large-dates feature.
+pub(crate) fn format_legacy_stats_day(epoch_day: i64) -> Option<String> {
+    let day = utc_day_from_millis(epoch_day.checked_mul(86_400_000)?)?;
+    if !(-262_143..=262_142).contains(&day.year()) {
+        return None;
+    }
+    format_utc_day(day, false)
 }
 
 #[cfg(test)]
@@ -70,6 +79,32 @@ mod tests {
         assert!(utc_day_add(::time::Date::MAX, 1).is_none());
         assert!(utc_day_add(::time::Date::MIN, -1).is_none());
         assert!(utc_day_from_millis(i64::MAX).is_none());
+    }
+
+    #[test]
+    fn legacy_stats_dates_preserve_extended_years_and_original_limits() {
+        for (year, month, day, expected) in [
+            (10_000, ::time::Month::January, 1, "+10000-01-01"),
+            (-10_000, ::time::Month::January, 1, "-10000-01-01"),
+            (-262_143, ::time::Month::January, 1, "-262143-01-01"),
+            (262_142, ::time::Month::December, 31, "+262142-12-31"),
+        ] {
+            let date = ::time::Date::from_calendar_date(year, month, day).unwrap();
+            let bucket = utc_midnight_millis(date).unwrap().div_euclid(86_400_000);
+            assert_eq!(format_legacy_stats_day(bucket).as_deref(), Some(expected));
+        }
+        let min = ::time::Date::from_calendar_date(-262_143, ::time::Month::January, 1).unwrap();
+        let max = ::time::Date::from_calendar_date(262_142, ::time::Month::December, 31).unwrap();
+        assert!(
+            format_legacy_stats_day(utc_midnight_millis(min).unwrap().div_euclid(86_400_000) - 1)
+                .is_none()
+        );
+        assert!(
+            format_legacy_stats_day(utc_midnight_millis(max).unwrap().div_euclid(86_400_000) + 1)
+                .is_none()
+        );
+        assert!(format_legacy_stats_day(i64::MAX).is_none());
+        assert!(format_legacy_stats_day(i64::MIN).is_none());
     }
 
     #[test]
