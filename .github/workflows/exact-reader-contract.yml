@@ -189,6 +189,10 @@ jobs:
     runs-on: ubuntu-24.04
     timeout-minutes: 45
     env:
+      CARGO_BUILD_JOBS: "2"
+      CARGO_INCREMENTAL: "0"
+      CARGO_PROFILE_DEV_DEBUG: "0"
+      CARGO_PROFILE_TEST_DEBUG: "0"
       MTC_TEST_POSTGRES_URL: postgres://token_center:token_center@127.0.0.1:5432/memeloop_token_center_test
     services:
       postgres:
@@ -207,7 +211,7 @@ jobs:
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
         with:
-          ref: ${{ inputs.source_revision || '2de3a917b1d57ee861026e6af4b489f5bdc89bba' }}
+          ref: ${{ inputs.source_revision }}
           persist-credentials: false
       - name: Record checked-out source
         run: git rev-parse HEAD
@@ -234,20 +238,34 @@ jobs:
             sleep 2
           done
           exit 1
-      - name: Verify staging identity, routing and real RustFS
+      - name: Verify final H2 and shared recovery proxy consumers
         env:
           MTC_RUSTFS_TEST_ENDPOINT: http://127.0.0.1:19000
           MTC_RUSTFS_TEST_BUCKET: conversation-contract-test
           MTC_RUSTFS_TEST_ACCESS_KEY: rustfs-test-fixture
           MTC_RUSTFS_TEST_SECRET_KEY: synthetic-test-only-secret-707
         run: |
-          set -o pipefail
-          cargo test --locked --lib db::archive_staging::backend_tests 2>&1 | tee /tmp/staging-db.log
-          grep -F '2 passed; 0 failed' /tmp/staging-db.log
-          cargo test --locked --lib archive::routing_tests 2>&1 | tee /tmp/staging-routing.log
-          grep -F '6 passed; 0 failed' /tmp/staging-routing.log
-          cargo test --locked --lib training_cas_real_s3_configuration_and_reader -- --ignored 2>&1 | tee /tmp/staging-rustfs.log
-          grep -F '1 passed; 0 failed' /tmp/staging-rustfs.log
+          set -euo pipefail
+          test "$(git rev-parse HEAD)" = "6daae61a7425d206af637b9bd2a7f5e69287eeb6"
+          git rev-parse HEAD
+          mkdir -p /tmp/pr1041-fixture-evidence
+          cargo test --locked --lib api::proxy::tests::codex_http2_failure_safety -- --nocapture 2>&1 | tee /tmp/pr1041-fixture-evidence/h2.log
+          grep -F '11 passed; 0 failed' /tmp/pr1041-fixture-evidence/h2.log
+          cargo test --locked --lib json_source::carrier_cancel_tests::cancellation_drops_a_pending_object_read_and_releases_the_source -- --exact --nocapture 2>&1 | tee /tmp/pr1041-fixture-evidence/cancel.log
+          grep -F '1 passed; 0 failed' /tmp/pr1041-fixture-evidence/cancel.log
+          cargo test --locked --lib gateway_body::carrier::small_put_tests -- --ignored --nocapture 2>&1 | tee /tmp/pr1041-fixture-evidence/small-put.log
+          grep -F '5 passed; 0 failed' /tmp/pr1041-fixture-evidence/small-put.log
+          cargo test --locked --lib gateway_body::carrier::resource_wakeup_tests::actual_put_is_not_cancelled_when_ram_wakes_and_lost_ack_keeps_source -- --ignored --exact --nocapture 2>&1 | tee /tmp/pr1041-fixture-evidence/resource.log
+          grep -F '1 passed; 0 failed' /tmp/pr1041-fixture-evidence/resource.log
+      - name: Retain the shared fixture consumer evidence
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        with:
+          name: pr1041-fixture-6daae
+          path: /tmp/pr1041-fixture-evidence/
+          if-no-files-found: warn
+          retention-days: 7
+
   next-release-contract:
     if: inputs.contract == 'next-release'
     runs-on: ubuntu-24.04
