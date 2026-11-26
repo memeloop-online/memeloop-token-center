@@ -161,11 +161,11 @@ pub(super) async fn run_contract(
     *authority.compile_gate.lock().unwrap() = Some((entered, released));
     let ordinary_authority = authority.clone();
     let ordinary = tokio::spawn(Box::pin(async move { ordinary_authority.pin().await }));
+    resources.tasks.push(ordinary.abort_handle());
     tokio::time::timeout(Duration::from_secs(10), entering)
         .await
         .unwrap()
         .unwrap();
-    resources.tasks.push(ordinary.abort_handle());
     let first_flight = authority.snapshots.lock().await.in_flight.clone().unwrap();
     let (joined, joining) = tokio::sync::oneshot::channel();
     *authority.snapshot_flight_joined.lock().unwrap() = Some(joined);
