@@ -49,8 +49,13 @@ impl CarrierCapture {
         persistence: Arc<crate::api::proxy::persistence::Persistence>,
     ) -> Self {
         // Only an archive-capable source can release its own retained window
-        // through spill. Preserve the original no-archive capture semantics.
-        self.background_spill = self.archive.as_ref().map(|_| persistence);
+        // through spill. Preserve the original no-archive and sub-quantum
+        // retained-window capture semantics.
+        self.background_spill = self
+            .archive
+            .as_ref()
+            .filter(|_| self.memory.snapshot().3 != 0)
+            .map(|_| persistence);
         self
     }
 

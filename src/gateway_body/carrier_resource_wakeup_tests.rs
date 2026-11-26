@@ -569,3 +569,42 @@ async fn request_without_archive_preserves_capture_above_retained_window() {
     drop(source);
     assert_eq!(memory.snapshot().0, 0);
 }
+
+#[tokio::test]
+async fn sub_quantum_retained_window_preserves_existing_archive_spill() {
+    let memory = Arc::new(ProxyMemoryBudget::new(128 * 1024));
+    assert_eq!(memory.snapshot().3, 0);
+    let persistence = Arc::new(Persistence::default());
+    let staging = ArchiveStagingKey::new(
+        crate::archive_staging::ArchiveStagingOwner::ProxyRequest(uuid::Uuid::now_v7()),
+        crate::archive_staging::ArchiveStagingPurpose::Request,
+        uuid::Uuid::now_v7(),
+    )
+    .unwrap();
+    let expected = vec![b's'; 192 * 1024];
+    let source = BodyCarrier::capture_owned(
+        stream::iter([Ok::<_, std::io::Error>((
+            Bytes::from(expected.clone()),
+            None,
+        ))]),
+        CarrierCapture::new(
+            memory.clone(),
+            Some(ArchiveStore::single_put_memory_transport_for_test()),
+            staging,
+        )
+        .with_background_spill(persistence.clone()),
+    )
+    .await
+    .unwrap();
+    let mut input = source.open_stream();
+    let mut actual = Vec::new();
+    while let Some(chunk) = input.next().await {
+        actual.extend_from_slice(&chunk.unwrap());
+    }
+    drop(input);
+    assert_eq!(actual, expected);
+    assert_eq!(source.digest(), blake3::hash(&expected).to_hex().as_str());
+    assert_eq!(persistence.pending_archives_for_test(), 0);
+    drop(source);
+    assert_eq!(memory.snapshot().0, 0);
+}
