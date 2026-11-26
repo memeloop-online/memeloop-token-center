@@ -190,7 +190,7 @@ async fn preflight() -> GuardResult<Target> {
     if other_sessions != 0 {
         return Err("another application is connected to fixture database".into());
     }
-    let occupied:bool=sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM upstream_accounts UNION ALL SELECT 1 FROM application_plugin_head UNION ALL SELECT 1 FROM application_plugin_revisions UNION ALL SELECT 1 FROM application_plugin_operations UNION ALL SELECT 1 FROM plugin_configurations UNION ALL SELECT 1 FROM tenants WHERE external_id <> 'default' UNION ALL SELECT 1 FROM tenant_lifecycle_audit)")
+    let occupied:bool=sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM key_records UNION ALL SELECT 1 FROM principals UNION ALL SELECT 1 FROM credit_accounts UNION ALL SELECT 1 FROM model_routes UNION ALL SELECT 1 FROM request_records UNION ALL SELECT 1 FROM generation_jobs UNION ALL SELECT 1 FROM conversation_clusters UNION ALL SELECT 1 FROM semantic_atoms UNION ALL SELECT 1 FROM context_nodes UNION ALL SELECT 1 FROM upstream_accounts UNION ALL SELECT 1 FROM application_plugin_candidates UNION ALL SELECT 1 FROM application_plugin_head UNION ALL SELECT 1 FROM application_plugin_revisions UNION ALL SELECT 1 FROM application_plugin_operations UNION ALL SELECT 1 FROM plugin_configurations UNION ALL SELECT 1 FROM tenants WHERE external_id <> 'default' UNION ALL SELECT 1 FROM tenant_lifecycle_audit)")
         .fetch_one(&mut guard).await?;
     if occupied {
         return Err("nonempty target or prior attempt; automatic replay forbidden".into());
