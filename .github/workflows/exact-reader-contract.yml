@@ -701,7 +701,7 @@ jobs:
       - name: Verify fixed diagnostic source
         run: |
           set -euo pipefail
-          test "$(git rev-parse HEAD)" = "9a04c22090d8760df72e3a947be90839908a8ee9"
+          test "$(git rev-parse HEAD)" = "02aee00a88b8eb11c128d0e04edd2f50664a7fe8"
           git rev-parse HEAD
           mkdir -p "$RUNNER_TEMP/pr1041-writer-evidence"
       - name: Build the same-source optimized memory service
@@ -712,12 +712,12 @@ jobs:
         timeout-minutes: 6
         run: |
           set -euo pipefail
-          node tests/load/benchmark-durable-archive-memory.ts target/release/memeloop-token-center "$RUNNER_TEMP/pr1041-writer-evidence/durable-archive-rss-9a04c.json" 2>&1 | tee "$RUNNER_TEMP/pr1041-writer-evidence/durable-harness.log"
+          node tests/load/benchmark-durable-archive-memory.ts target/release/memeloop-token-center "$RUNNER_TEMP/pr1041-writer-evidence/durable-archive-rss-02aee.json" 2>&1 | tee "$RUNNER_TEMP/pr1041-writer-evidence/durable-harness.log"
       - name: Retain exact-source writer and memory evidence
         if: always()
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
         with:
-          name: pr1041-writer-memory-9a04c
+          name: pr1041-writer-memory-02aee
           path: ${{ runner.temp }}/pr1041-writer-evidence/
           if-no-files-found: warn
           retention-days: 7
