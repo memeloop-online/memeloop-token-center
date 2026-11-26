@@ -51,7 +51,10 @@ async fn oauth_rejection_delivery_crosses_gateway_control_and_worker_process_rol
     ));
     let tenant = "oauth-role-fixture";
     let mut ids = Vec::new();
-    for (name, driver) in [("gateway", "http-json"), ("control", "antigravity")] {
+    for (name, driver) in [
+        ("gateway", "http-json"),
+        ("control", crate::provider::antigravity::DRIVER),
+    ] {
         Mock::given(method("POST"))
             .and(path(format!("/refresh-{name}")))
             .respond_with(

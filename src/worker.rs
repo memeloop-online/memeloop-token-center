@@ -1834,7 +1834,7 @@ mod tests {
             .await;
         let account = state.db.create_upstream_account(CreateUpstreamAccountInput {
             tenant_external_id: "oauth-rejection-cycle".into(), name: "fixture".into(),
-            driver: "antigravity".into(), config: json!({"base_url":server.uri(), "control_url":server.uri(), "project_id":"fixture-project"}),
+            driver: crate::provider::antigravity::DRIVER.into(), config: json!({"base_url":server.uri(), "control_url":server.uri(), "project_id":"fixture-project"}),
             credential: UpstreamCredential::OAuth {
                 access_token: "old-access".into(), refresh_token: Some("fixture-refresh".into()),
                 expires_at: Some(crate::db::unix_millis() + 86_400_000), header: "authorization".into(),
