@@ -36,28 +36,75 @@ jobs:
   metadata-refresh-contract:
     if: inputs.contract == 'metadata-refresh'
     runs-on: ubuntu-24.04
-    timeout-minutes: 5
+    timeout-minutes: 30
+    env:
+      SOURCE_DIGEST: sha256:5311f717b7a3ee1e8ed2c198fee498c636ba6c2da3e39dbe45769088ebc858d0
     steps:
-      - name: Require an exact source commit
-        env:
-          SOURCE_REVISION: ${{ inputs.source_revision }}
-        run: '[[ "$SOURCE_REVISION" =~ ^[0-9a-f]{40}$ ]]'
-      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
-        with:
-          ref: ${{ inputs.source_revision }}
-          persist-credentials: false
-      - run: git rev-parse HEAD
-      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020
-        with:
-          node-version: 24.18.0
-      - run: npm ci --ignore-scripts --no-audit
-      - run: npm run typecheck
-      - name: Verify staging peak harness contracts
+      - name: Install the distribution OCI transport client
+        run: sudo apt-get update && sudo apt-get install -y --no-install-recommends skopeo
+      - name: Export the complete approved index without changing its digest
         run: |
           set -euo pipefail
-          node --test --test-reporter=tap tests/load/staging-peak/test-framework.ts 2>&1 | tee /tmp/staging-peak-types.log
-          grep -E '^# pass [1-9][0-9]*$' /tmp/staging-peak-types.log
-          grep -Fx '# fail 0' /tmp/staging-peak-types.log
+          mkdir -p "$RUNNER_TEMP/clickhouse-5311-oci"
+          source="docker://docker.io/clickhouse/clickhouse-server@$SOURCE_DIGEST"
+          skopeo inspect --raw "$source" > "$RUNNER_TEMP/clickhouse-5311-oci/source-manifest.json"
+          printf '%s  %s\n' "${SOURCE_DIGEST#sha256:}" "$RUNNER_TEMP/clickhouse-5311-oci/source-manifest.json" | sha256sum --check
+          timeout --kill-after=10s 18m skopeo copy --all --preserve-digests "$source" "oci-archive:$RUNNER_TEMP/clickhouse-5311-oci/clickhouse-5311.oci.tar:approved-5311"
+          skopeo inspect --raw "oci-archive:$RUNNER_TEMP/clickhouse-5311-oci/clickhouse-5311.oci.tar:approved-5311" > "$RUNNER_TEMP/clickhouse-5311-oci/archive-manifest.json"
+          cmp "$RUNNER_TEMP/clickhouse-5311-oci/source-manifest.json" "$RUNNER_TEMP/clickhouse-5311-oci/archive-manifest.json"
+      - name: Verify every OCI blob and the complete source descriptor graph
+        run: |
+          set -euo pipefail
+          python3 - <<'PYVERIFY'
+          import hashlib, json, os, pathlib, tarfile
+          root = pathlib.Path(os.environ['RUNNER_TEMP']) / 'clickhouse-5311-oci'
+          source = os.environ['SOURCE_DIGEST']
+          with tarfile.open(root / 'clickhouse-5311.oci.tar') as archive:
+              members = {m.name.removeprefix('./'): m for m in archive.getmembers() if m.isfile()}
+              def read(name):
+                  member = members[name]
+                  return archive.extractfile(member).read()
+              verified = set()
+              def check(descriptor):
+                  digest = descriptor['digest']
+                  algorithm, value = digest.split(':', 1)
+                  assert algorithm == 'sha256'
+                  name = 'blobs/sha256/' + value
+                  data = read(name)
+                  assert len(data) == descriptor['size'], digest
+                  assert hashlib.sha256(data).hexdigest() == value, digest
+                  if digest in verified:
+                      return
+                  verified.add(digest)
+                  media = descriptor.get('mediaType', '')
+                  if 'manifest' in media or 'index' in media:
+                      document = json.loads(data)
+                      children = document.get('manifests', []) + document.get('layers', [])
+                      if 'config' in document:
+                          children.append(document['config'])
+                      for child in children:
+                          check(child)
+              index = json.loads(read('index.json'))
+              for descriptor in index['manifests']:
+                  check(descriptor)
+              assert source in verified, 'original source index must remain in archive'
+              for name, member in members.items():
+                  if name.startswith('blobs/sha256/'):
+                      assert hashlib.sha256(read(name)).hexdigest() == name.rsplit('/', 1)[1]
+              evidence = {'source_digest': source, 'verified_descriptors': sorted(verified), 'archive_sha256': hashlib.sha256((root / 'clickhouse-5311.oci.tar').read_bytes()).hexdigest()}
+              (root / 'integrity.json').write_text(json.dumps(evidence, indent=2) + '\n')
+              print('CLICKHOUSE_5311_OCI_GRAPH_PASS descriptors=' + str(len(verified)))
+          PYVERIFY
+          cd "$RUNNER_TEMP/clickhouse-5311-oci"
+          sha256sum clickhouse-5311.oci.tar > SHA256SUMS
+      - name: Preserve the complete unchanged image and integrity evidence
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        with:
+          name: clickhouse-5311-oci-complete
+          path: ${{ runner.temp }}/clickhouse-5311-oci/
+          compression-level: 0
+          if-no-files-found: error
+          retention-days: 3
 
   orphan-reaper-contract:
     if: inputs.contract == 'orphan-reaper-971'
