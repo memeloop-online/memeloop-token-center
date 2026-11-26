@@ -10,6 +10,7 @@ use memeloop_token_center::{
 use rust_decimal::Decimal;
 use serde_json::json;
 use sqlx::{Connection, Row};
+use std::net::IpAddr;
 use std::{fs::OpenOptions, io::Write, os::unix::fs::OpenOptionsExt, time::Duration};
 use uuid::Uuid;
 
@@ -31,6 +32,17 @@ async fn seed() -> Result<()> {
     let cluster_path = pin(option_env!("MTC_SEED_CLUSTER_IDENTITY_PATH"))?;
     let namespace = pin(option_env!("MTC_SEED_NAMESPACE"))?;
     let namespace_uid = pin(option_env!("MTC_SEED_NAMESPACE_UID"))?;
+    let pg_host = pin(option_env!("MTC_SEED_PG_HOST"))?;
+    let pg_port: u16 = pin(option_env!("MTC_SEED_PG_PORT"))?.parse()?;
+    let pg_service_uid = pin(option_env!("MTC_SEED_PG_SERVICE_UID"))?;
+    // Only a same-namespace Service's short DNS name is accepted, never an arbitrary host.
+    if pg_host.is_empty()
+        || !pg_host
+            .bytes()
+            .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'-')
+    {
+        return Err("invalid PostgreSQL service pin".into());
+    }
     let mock_url = url::Url::parse(mock)?;
     if mock_url.scheme() != "http"
         || !mock_url.username().is_empty()
@@ -76,19 +88,107 @@ async fn seed() -> Result<()> {
             return Err("live Stage identity mismatch".into());
         }
     }
+    let pg_service: serde_json::Value = client
+        .get(format!(
+            "https://kubernetes.default.svc/api/v1/namespaces/{namespace}/services/{pg_host}"
+        ))
+        .bearer_auth(token.trim())
+        .send()
+        .await?
+        .error_for_status()?
+        .json()
+        .await?;
+    if pg_service.pointer("/metadata/uid").and_then(|v| v.as_str()) != Some(pg_service_uid)
+        || pg_service.pointer("/spec/type").and_then(|v| v.as_str()) == Some("ExternalName")
+        || !pg_service
+            .pointer("/spec/ports")
+            .and_then(|v| v.as_array())
+            .is_some_and(|ports| {
+                ports.iter().any(|p| {
+                    p["port"].as_u64() == Some(u64::from(pg_port))
+                        && p["protocol"].as_str() == Some("TCP")
+                })
+            })
+    {
+        return Err("live PostgreSQL Service mismatch".into());
+    }
+    let endpoints: serde_json::Value = client
+        .get(format!(
+            "https://kubernetes.default.svc/api/v1/namespaces/{namespace}/endpoints/{pg_host}"
+        ))
+        .bearer_auth(token.trim())
+        .send()
+        .await?
+        .error_for_status()?
+        .json()
+        .await?;
     let database_url = std::env::var("DATABASE_URL")?;
+    let parsed = url::Url::parse(&database_url)?;
+    if !matches!(parsed.scheme(), "postgres" | "postgresql")
+        || parsed.host_str() != Some(pg_host)
+        || parsed.port().unwrap_or(5432) != pg_port
+        || parsed.path() != format!("/{database}")
+        || parsed.username() != role
+        || parsed.fragment().is_some()
+        || parsed.query_pairs().any(|(name, value)| {
+            name != "sslmode"
+                || !matches!(
+                    value.as_ref(),
+                    "disable" | "allow" | "prefer" | "require" | "verify-ca" | "verify-full"
+                )
+        })
+        || [
+            "PGHOST",
+            "PGHOSTADDR",
+            "PGPORT",
+            "PGDATABASE",
+            "PGUSER",
+            "PGOPTIONS",
+            "PGSERVICE",
+            "PGSERVICEFILE",
+        ]
+        .iter()
+        .any(|name| std::env::var_os(name).is_some())
+    {
+        return Err("database URL differs from pinned Service or has connection overrides".into());
+    }
     let pepper = std::env::var("KEY_PEPPER")?;
     if pepper.is_empty() {
         return Err("missing credential sealing material".into());
     }
     let mut guard = sqlx::PgConnection::connect(&database_url).await?;
-    let identity = sqlx::query("SELECT current_database() AS db, current_user AS role, (SELECT MAX(version) FROM schema_migrations) AS version")
+    let identity = sqlx::query("SELECT current_database() AS db, current_user AS role, host(inet_server_addr()) AS server_addr, inet_server_port() AS server_port, (SELECT MAX(version) FROM schema_migrations) AS version")
         .fetch_one(&mut guard).await?;
     if identity.try_get::<String, _>("db")? != database
         || identity.try_get::<String, _>("role")? != role
         || identity.try_get::<i64, _>("version")? != 166
     {
         return Err("database identity or schema mismatch".into());
+    }
+    let server_addr: IpAddr = identity.try_get::<String, _>("server_addr")?.parse()?;
+    let server_port: i32 = identity.try_get("server_port")?;
+    let endpoint_matches = endpoints
+        .get("subsets")
+        .and_then(|v| v.as_array())
+        .is_some_and(|subsets| {
+            subsets.iter().any(|subset| {
+                subset["addresses"].as_array().is_some_and(|addresses| {
+                    addresses.iter().any(|address| {
+                        address["ip"]
+                            .as_str()
+                            .and_then(|ip| ip.parse::<IpAddr>().ok())
+                            == Some(server_addr)
+                    })
+                }) && subset["ports"].as_array().is_some_and(|ports| {
+                    ports.iter().any(|port| {
+                        port["port"].as_i64() == Some(i64::from(server_port))
+                            && port["protocol"].as_str() == Some("TCP")
+                    })
+                })
+            })
+        });
+    if !endpoint_matches {
+        return Err("connected PostgreSQL server is not a ready Stage Service endpoint".into());
     }
     let locked: bool =
         sqlx::query_scalar("SELECT pg_try_advisory_lock(hashtext('managed-oauth-fixture'), 166)")
@@ -108,6 +208,7 @@ async fn seed() -> Result<()> {
         .create_new(true)
         .mode(0o600)
         .open(OUTPUT)?;
+    ensure_fixture_price(&mut guard).await?;
     let mut ids = Vec::new();
     for (name, driver) in [("gateway", "http-json"), ("control", "google-antigravity")] {
         let account = db.create_upstream_account(CreateUpstreamAccountInput {
@@ -123,8 +224,6 @@ async fn seed() -> Result<()> {
         }, pepper.as_bytes()).await?;
         ids.push(account.id);
     }
-    db.upsert_model_price("fixture-model", "USD", Decimal::ZERO, Decimal::ZERO)
-        .await?;
     let key = db
         .create_key(
             CreateKeyInput {
@@ -187,6 +286,37 @@ async fn seed() -> Result<()> {
         "fixture ready: gateway={} control={}; credentials in private RAM output",
         ids[0], ids[1]
     );
+    Ok(())
+}
+// Insert-only provisioning: conflicting prices survive unchanged, including concurrent writers.
+// Both inserts roll back together if either existing row has different monetary values.
+async fn ensure_fixture_price(connection: &mut sqlx::PgConnection) -> Result<()> {
+    let mut tx = connection.begin().await?;
+    let now = memeloop_token_center::db::unix_millis();
+    sqlx::query("INSERT INTO model_prices (id, model, currency, input_micros_per_million, output_micros_per_million, source, updated_at) VALUES ($1, 'fixture-model', 'USD', 0, 0, 'manual', $2) ON CONFLICT(model, currency) DO NOTHING")
+        .bind(Uuid::now_v7().to_string()).bind(now).execute(&mut *tx).await?;
+    let base = sqlx::query("SELECT input_micros_per_million, output_micros_per_million FROM model_prices WHERE model='fixture-model' AND currency='USD' FOR UPDATE")
+        .fetch_one(&mut *tx).await?;
+    if base.try_get::<i64, _>("input_micros_per_million")? != 0
+        || base.try_get::<i64, _>("output_micros_per_million")? != 0
+    {
+        return Err("existing fixture price differs; unchanged".into());
+    }
+    sqlx::query("INSERT INTO model_price_tiers (id, model, currency, service_tier, input_micros_per_million, cached_input_micros_per_million, cache_write_micros_per_million, output_micros_per_million, source, updated_at, cache_price_estimated) VALUES ($1, 'fixture-model', 'USD', 'default', 0, 0, 0, 0, 'manual', $2, 1) ON CONFLICT(model, currency, service_tier) DO NOTHING")
+        .bind(Uuid::now_v7().to_string()).bind(now).execute(&mut *tx).await?;
+    let tier = sqlx::query("SELECT input_micros_per_million, cached_input_micros_per_million, cache_write_micros_per_million, output_micros_per_million FROM model_price_tiers WHERE model='fixture-model' AND currency='USD' AND service_tier='default' FOR UPDATE")
+        .fetch_one(&mut *tx).await?;
+    for column in [
+        "input_micros_per_million",
+        "cached_input_micros_per_million",
+        "cache_write_micros_per_million",
+        "output_micros_per_million",
+    ] {
+        if tier.try_get::<i64, _>(column)? != 0 {
+            return Err("existing fixture tier differs; unchanged".into());
+        }
+    }
+    tx.commit().await?;
     Ok(())
 }
 #[tokio::main]
