@@ -189,13 +189,10 @@ async fn derived_source_can_spill_its_parent_after_workspace_wakes() {
     assert_eq!(workspace.upload_workspace.snapshot().0, 0);
 }
 
-#[path = "../../tests/support/recovery_object_proxy.rs"]
-mod recovery_proxy;
-
 #[tokio::test]
 #[ignore = "requires isolated RustFS fixture"]
 async fn actual_put_is_not_cancelled_when_ram_wakes_and_lost_ack_keeps_source() {
-    use recovery_proxy::RecoveryObjectProxy;
+    use crate::recovery_object_proxy::RecoveryObjectProxy;
     for lose_ack in [false, true] {
         let proxy =
             RecoveryObjectProxy::start(&std::env::var("MTC_RUSTFS_TEST_ENDPOINT").unwrap()).await;

@@ -622,13 +622,9 @@ fn write(out: &mut impl Write, bytes: &[u8]) -> Result<()> {
 }
 
 #[cfg(test)]
-#[path = "../tests/support/recovery_object_proxy.rs"]
-mod cancellation_recovery_proxy;
-
-#[cfg(test)]
 mod carrier_cancel_tests {
-    use super::cancellation_recovery_proxy as recovery_proxy;
     use super::*;
+    use crate::recovery_object_proxy as recovery_proxy;
     use crate::{
         archive::ArchiveStore,
         archive_staging::*,
