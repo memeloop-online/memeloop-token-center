@@ -392,16 +392,24 @@ impl BodyCarrier {
             if let Some(credit) = credit {
                 let mut retained = source.memory.try_reserve_carrier_retained(chunk.len());
                 if retained.is_none() {
-                    // Preserve the existing response tap's opportunistic spill:
-                    // credited streams can exceed source RAM over their lifetime.
-                    spill_observation.begin(chunk.len());
-                    let result = source.offload_one_bytes(None).await;
-                    spill_observation.finish(&result);
-                    if matches!(result, Ok(Some(_))) {
-                        // The completed spill has dropped its local RAM owner.
-                        // Reuse only available retained credit; global credit
-                        // stays attached to this input allocation throughout.
+                    // Replace only pre-existing RAM, with a fixed finite budget.
+                    // ACKed payload is not necessarily freed global credit: a
+                    // reader or SDK clone may still own the original allocation.
+                    let old_segments = source.segments.len();
+                    let mut converted = 0usize;
+                    for _ in 0..old_segments {
+                        spill_observation.begin(chunk.len());
+                        let result = source.offload_one_bytes(None).await;
+                        spill_observation.finish(&result);
+                        let Ok(Some(bytes)) = result else { break };
+                        if bytes == 0 {
+                            break;
+                        }
+                        converted = converted.saturating_add(bytes);
                         retained = source.memory.try_reserve_carrier_retained(chunk.len());
+                        if retained.is_some() || converted >= chunk.len() {
+                            break;
+                        }
                     }
                 }
                 let length = chunk.len();
