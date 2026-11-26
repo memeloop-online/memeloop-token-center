@@ -128,3 +128,6 @@ impl Default for ReadinessCache {
 mod compressed_tests;
 #[cfg(test)]
 mod tests;
+
+#[cfg(test)]
+mod scoped_routing_contract_tests;
