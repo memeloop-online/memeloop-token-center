@@ -805,7 +805,7 @@ async fn prefix_preload_contract(change_roots: bool, identity_only: bool, pruned
             .bind(now/86400000+1).bind(now).execute(&database.pool).await.unwrap();
     }
     // A real recursive SELECT is suspended before its result is received.
-    sqlx::raw_sql("CREATE FUNCTION prefix_receive_gate() RETURNS BOOLEAN LANGUAGE plpgsql VOLATILE AS $$ BEGIN IF EXISTS (SELECT 1 FROM pg_locks WHERE pid=pg_backend_pid() AND relation='request_records'::regclass AND mode IN ('RowShareLock','RowExclusiveLock') AND granted) THEN RAISE EXCEPTION 'recursive prefix received under request scope lock'; END IF; PERFORM pg_advisory_xact_lock(91844,1); RETURN TRUE; END $$; ALTER TABLE context_nodes RENAME TO prefix_nodes; CREATE VIEW context_nodes AS SELECT * FROM prefix_nodes WHERE prefix_receive_gate()")
+    sqlx::raw_sql("CREATE FUNCTION prefix_receive_gate() RETURNS BOOLEAN LANGUAGE plpgsql VOLATILE AS $$ BEGIN IF EXISTS (SELECT 1 FROM pg_locks WHERE pid=pg_backend_pid() AND granted AND ((relation='request_records'::regclass AND mode IN ('RowShareLock','RowExclusiveLock')) OR (locktype='advisory' AND mode='ExclusiveLock' AND NOT (classid=91844 AND objid=1)))) THEN RAISE EXCEPTION 'recursive prefix received under projection or request scope lock'; END IF; PERFORM pg_advisory_xact_lock(91844,1); RETURN TRUE; END $$; ALTER TABLE context_nodes RENAME TO prefix_nodes; CREATE VIEW context_nodes AS SELECT * FROM prefix_nodes WHERE prefix_receive_gate()")
         .execute(&database.pool).await.unwrap();
     let mut blocker = database.pool.begin().await.unwrap();
     sqlx::query("SELECT pg_advisory_xact_lock(91844,1)")
