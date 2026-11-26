@@ -41,37 +41,37 @@ jobs:
       contents: read
       actions: read
     env:
-      SOURCE_DIGEST: sha256:4111f13e873276f7c089d6d2e5c2447f0fee40122652e96af08143deef1ac8ab
+      SOURCE_DIGEST: sha256:647918cc5aa8827f14238dcf2c4a349877db2f375d2c1012752953941dd22816
     steps:
       - name: Install the distribution OCI transport client
         run: sudo apt-get update && sudo apt-get install -y --no-install-recommends skopeo
       - name: Export the complete approved index without changing its digest
         run: |
           set -euo pipefail
-          mkdir -p "$RUNNER_TEMP/service-4111f13e-oci"
+          mkdir -p "$RUNNER_TEMP/service-647918cc-oci"
           source="docker://ghcr.io/memeloop-online/memeloop-token-center@$SOURCE_DIGEST"
-          skopeo inspect --raw "$source" > "$RUNNER_TEMP/service-4111f13e-oci/source-manifest.json"
-          printf '%s  %s\n' "${SOURCE_DIGEST#sha256:}" "$RUNNER_TEMP/service-4111f13e-oci/source-manifest.json" | sha256sum --check
-          timeout --kill-after=10s 18m skopeo copy --all --preserve-digests "$source" "oci-archive:$RUNNER_TEMP/service-4111f13e-oci/service-4111f13e.oci.tar:approved-4111f13e"
-          skopeo inspect --raw "oci-archive:$RUNNER_TEMP/service-4111f13e-oci/service-4111f13e.oci.tar:approved-4111f13e" > "$RUNNER_TEMP/service-4111f13e-oci/archive-manifest.json"
-          cmp "$RUNNER_TEMP/service-4111f13e-oci/source-manifest.json" "$RUNNER_TEMP/service-4111f13e-oci/archive-manifest.json"
+          skopeo inspect --raw "$source" > "$RUNNER_TEMP/service-647918cc-oci/source-manifest.json"
+          printf '%s  %s\n' "${SOURCE_DIGEST#sha256:}" "$RUNNER_TEMP/service-647918cc-oci/source-manifest.json" | sha256sum --check
+          timeout --kill-after=10s 18m skopeo copy --all --preserve-digests "$source" "oci-archive:$RUNNER_TEMP/service-647918cc-oci/service-647918cc.oci.tar:approved-647918cc"
+          skopeo inspect --raw "oci-archive:$RUNNER_TEMP/service-647918cc-oci/service-647918cc.oci.tar:approved-647918cc" > "$RUNNER_TEMP/service-647918cc-oci/archive-manifest.json"
+          cmp "$RUNNER_TEMP/service-647918cc-oci/source-manifest.json" "$RUNNER_TEMP/service-647918cc-oci/archive-manifest.json"
       - name: Preserve the original signed release provenance
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
           set -euo pipefail
-          root="$RUNNER_TEMP/service-4111f13e-oci"
-          gh api repos/memeloop-online/memeloop-token-center/actions/artifacts/15111140125/zip > "$RUNNER_TEMP/signed-release-manifest.zip"
+          root="$RUNNER_TEMP/service-647918cc-oci"
+          gh api repos/memeloop-online/memeloop-token-center/actions/artifacts/15116442856/zip > "$RUNNER_TEMP/signed-release-manifest.zip"
           unzip -q "$RUNNER_TEMP/signed-release-manifest.zip" -d "$root/signed-release-manifest"
-          printf '%s\n' '{"verification_run":"https://github.com/memeloop-online/memeloop-token-center/actions/runs/45804768264","manifest_artifact":15111140125,"source_revision":"18b26f4eab070415bf3c1b417ce59c89dcaf604f","service_digest":"sha256:4111f13e873276f7c089d6d2e5c2447f0fee40122652e96af08143deef1ac8ab"}' > "$root/signed-release-source.json"
+          printf '%s\n' '{"verification_run":"https://github.com/memeloop-online/memeloop-token-center/actions/runs/45814945200","manifest_artifact":15116442856,"source_revision":"0f8d132d4fd6079d903d4a1a57d484585c3b342c","service_digest":"sha256:647918cc5aa8827f14238dcf2c4a349877db2f375d2c1012752953941dd22816"}' > "$root/signed-release-source.json"
       - name: Verify every OCI blob and the complete source descriptor graph
         run: |
           set -euo pipefail
           python3 - <<'PYVERIFY'
           import hashlib, json, os, pathlib, tarfile
-          root = pathlib.Path(os.environ['RUNNER_TEMP']) / 'service-4111f13e-oci'
+          root = pathlib.Path(os.environ['RUNNER_TEMP']) / 'service-647918cc-oci'
           source = os.environ['SOURCE_DIGEST']
-          with tarfile.open(root / 'service-4111f13e.oci.tar') as archive:
+          with tarfile.open(root / 'service-647918cc.oci.tar') as archive:
               members = {m.name.removeprefix('./'): m for m in archive.getmembers() if m.isfile()}
               def read(name):
                   member = members[name]
@@ -103,17 +103,17 @@ jobs:
               for name, member in members.items():
                   if name.startswith('blobs/sha256/'):
                       assert hashlib.sha256(read(name)).hexdigest() == name.rsplit('/', 1)[1]
-              evidence = {'source_digest': source, 'verified_descriptors': sorted(verified), 'archive_sha256': hashlib.sha256((root / 'service-4111f13e.oci.tar').read_bytes()).hexdigest()}
+              evidence = {'source_digest': source, 'verified_descriptors': sorted(verified), 'archive_sha256': hashlib.sha256((root / 'service-647918cc.oci.tar').read_bytes()).hexdigest()}
               (root / 'integrity.json').write_text(json.dumps(evidence, indent=2) + '\n')
-              print('SERVICE_4111F13E_OCI_GRAPH_PASS descriptors=' + str(len(verified)))
+              print('SERVICE_647918CC_OCI_GRAPH_PASS descriptors=' + str(len(verified)))
           PYVERIFY
-          cd "$RUNNER_TEMP/service-4111f13e-oci"
-          sha256sum service-4111f13e.oci.tar > SHA256SUMS
+          cd "$RUNNER_TEMP/service-647918cc-oci"
+          sha256sum service-647918cc.oci.tar > SHA256SUMS
       - name: Preserve the complete unchanged image and integrity evidence
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
         with:
-          name: service-4111f13e-oci-complete
-          path: ${{ runner.temp }}/service-4111f13e-oci/
+          name: service-647918cc-oci-complete
+          path: ${{ runner.temp }}/service-647918cc-oci/
           compression-level: 0
           if-no-files-found: error
           retention-days: 3
