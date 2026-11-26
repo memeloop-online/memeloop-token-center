@@ -9,6 +9,16 @@ use sha2::{Digest, Sha256};
 async fn rustfs_native_publisher_release_reclaims_exact_nonzero_temporary() {
     let endpoint = std::env::var("MTC_RUSTFS_TEST_ENDPOINT").unwrap();
     let bucket = std::env::var("MTC_RUSTFS_TEST_BUCKET").unwrap();
+    let run = std::env::var("GITHUB_RUN_ID").expect("GHA run-owned fixture only");
+    let attempt = std::env::var("GITHUB_RUN_ATTEMPT").expect("GHA run-owned fixture only");
+    assert_eq!(bucket, format!("native-release-{run}-{attempt}"));
+    let parsed_endpoint = reqwest::Url::parse(&endpoint).unwrap();
+    assert_eq!(parsed_endpoint.scheme(), "http");
+    assert_eq!(parsed_endpoint.host_str(), Some("127.0.0.1"));
+    assert!(
+        parsed_endpoint.port().is_some(),
+        "dedicated local RustFS container required"
+    );
     let proxy = crate::recovery_object_proxy::RecoveryObjectProxy::start(&endpoint).await;
     let delete_fault = proxy.fail_one_response_carrier_delete_after_put(&bucket);
     let upstream = MockServer::start().await;
@@ -21,8 +31,7 @@ async fn rustfs_native_publisher_release_reclaims_exact_nonzero_temporary() {
         .expect(1)
         .mount(&upstream)
         .await;
-    let mut fixture = response_usage_fixture("native-exact-release", &upstream, 256).await;
-    let mut config = (*fixture.state.config).clone();
+    let mut config = Config::for_test("sqlite::memory:".into());
     config.archive_backend = ArchiveBackend::S3;
     config.s3_endpoint = Some(proxy.endpoint().to_owned());
     config.s3_bucket = Some(bucket.clone());
@@ -30,24 +39,22 @@ async fn rustfs_native_publisher_release_reclaims_exact_nonzero_temporary() {
     config.s3_secret_key = Some(std::env::var("MTC_RUSTFS_TEST_SECRET_KEY").unwrap());
     config.s3_region = "us-east-1".into();
     config.s3_allow_http = true;
-    fixture.state.archive = crate::archive::ArchiveStore::from_config(&config)
-        .await
-        .unwrap();
-    fixture.state.db = fixture
-        .state
-        .db
-        .clone()
-        .with_archive(fixture.state.archive.clone());
-    fixture.state.persistence_db = fixture
-        .state
-        .persistence_db
-        .clone()
-        .with_archive(fixture.state.archive.clone());
-    fixture.state.routing_persistence_db = fixture
-        .state
-        .routing_persistence_db
-        .clone()
-        .with_archive(fixture.state.archive.clone());
+    let fixture = response_usage_fixture_with_archive_config(
+        "native-exact-release",
+        upstream.uri(),
+        256,
+        Some("openai-chat-usage-only"),
+        "http-json",
+        "gpt-5.6-sol",
+        (
+            ResponseUsageFixtureOptions {
+                extra_upstream_config: json!({}),
+                credential: UpstreamCredential::None,
+            },
+            Some(config.clone()),
+        ),
+    )
+    .await;
     let object_store = AmazonS3Builder::new()
         .with_endpoint(proxy.endpoint())
         .with_bucket_name(&bucket)
@@ -136,6 +143,17 @@ async fn rustfs_native_publisher_release_reclaims_exact_nonzero_temporary() {
     let before = object_store.head(&temporary).await.unwrap();
     assert!(before.size > 0);
     assert!(
+        before
+            .e_tag
+            .as_deref()
+            .is_some_and(|value| !value.trim_matches('"').is_empty() && value != "null")
+            || before
+                .version
+                .as_deref()
+                .is_some_and(|value| !value.trim_matches('"').is_empty() && value != "null"),
+        "at least one stable physical object identity must be present"
+    );
+    assert!(
         delete_fault.rejected() > 0,
         "normal inline release must actually attempt cleanup"
     );
@@ -183,6 +201,14 @@ async fn rustfs_native_publisher_release_reclaims_exact_nonzero_temporary() {
             .await
             .unwrap(),
         release_bytes
+    );
+    println!(
+        "native_release_before {}",
+        json!({
+            "request_id": request_id, "object_key": object_key, "encoded_bytes": before.size,
+            "etag": before.e_tag, "version": before.version, "release": release,
+            "request_sha256": format!("{request_sha:x}"), "response_sha256": format!("{response_sha:x}")
+        })
     );
     let neighbor = format!("{}/neighbor-proof", object_key.rsplit_once('/').unwrap().0);
     archive

@@ -899,6 +899,28 @@ async fn response_usage_fixture_with_uri_contract_driver_model_config_and_creden
     public_model: &str,
     options: ResponseUsageFixtureOptions,
 ) -> CodexRouteFixture {
+    response_usage_fixture_with_archive_config(
+        label,
+        upstream_uri,
+        input_token_overhead_ceiling,
+        stream_usage_contract,
+        driver,
+        public_model,
+        (options, None),
+    )
+    .await
+}
+
+async fn response_usage_fixture_with_archive_config(
+    label: &str,
+    upstream_uri: String,
+    input_token_overhead_ceiling: i64,
+    stream_usage_contract: Option<&str>,
+    driver: &str,
+    public_model: &str,
+    options: (ResponseUsageFixtureOptions, Option<Config>),
+) -> CodexRouteFixture {
+    let (options, archive_config) = options;
     let directory = tempfile::tempdir().unwrap();
     let archive_path = directory.path().join("archive");
     let database_url = crate::db::Database::sqlite_database_url(&format!(
@@ -908,9 +930,14 @@ async fn response_usage_fixture_with_uri_contract_driver_model_config_and_creden
             .join(format!("compatibility-{label}.db"))
             .display()
     ));
-    let mut config = Config::for_test(database_url.clone());
-    config.archive_backend = ArchiveBackend::Filesystem;
-    config.archive_path = Some(archive_path.display().to_string());
+    let mut config = archive_config.unwrap_or_else(|| {
+        let mut config = Config::for_test(database_url.clone());
+        config.archive_backend = ArchiveBackend::Filesystem;
+        config.archive_path = Some(archive_path.display().to_string());
+        config
+    });
+    config.database_url = database_url.clone();
+    // Archive, SQL readers and durable journals bind the same store once.
     let state = AppState::initialize(config).await.unwrap();
     let tenant = format!("compatibility-route-{label}");
     let model = public_model.to_owned();
