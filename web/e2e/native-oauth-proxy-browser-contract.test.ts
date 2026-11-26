@@ -1,4 +1,5 @@
 import assert from 'node:assert/strict';
+import { credentialProxySelection } from './fixtures/transport-proxy-entities.js';
 import { editProviderAccount } from './support/provider-account-navigation.js';
 import { mkdir } from 'node:fs/promises';
 import { fileURLToPath } from 'node:url';
@@ -40,7 +41,7 @@ test('native OAuth creates with the chosen proxy, preserves direct choice, and r
       }
       if (path === '/internal/v1/provider-types') return route.fulfill({ json: profiles.map(value => ({ ...value, protocols: ['openai'], modalities: ['text'], config_schema: value.config_schema ?? { type: 'object', properties: { base_url: { type: 'string' } } }, credential_schema: { type: 'object', properties: { type: { const: 'oauth' } } }, oauth_adapter: { api_version: 'oauth-adapter-v1', flow_kind: value.flow_kind, login_url: 'https://login.example.invalid', poll_url: 'https://poll.example.invalid', refresh_url: 'https://refresh.example.invalid' } })) });
       if (path === '/internal/v1/upstreams') return route.fulfill({ json: reauthorize ? [account] : [] });
-      if (path.endsWith('/transport-proxy')) return route.fulfill({ json: { account_id: account.id, credential_generation: 2, updated_at: 3, proxy_url: 'socks5h://10.0.0.8:1080' } });
+      if (path === `/internal/v1/upstreams/${account.id}/transport-proxy`) return route.fulfill({ json: { account_id: account.id, credential_generation: account.credential_generation, updated_at: account.updated_at, proxy_url: 'socks5h://10.0.0.8:1080', selection: credentialProxySelection(account) } });
       return route.fulfill({ json: [] });
     });
     await page.goto(fixtureUrl);

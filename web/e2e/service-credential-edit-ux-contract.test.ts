@@ -1,11 +1,11 @@
 import assert from 'node:assert/strict';
-import { existsSync, mkdirSync } from 'node:fs';
-import { readdir } from 'node:fs/promises';
+import { mkdirSync } from 'node:fs';
 import { join } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import test, { type TestContext } from 'node:test';
 
 import { chromium } from 'playwright';
+import { localChromiumExecutable } from './support/browser-executable.js';
 import { createIsolatedFixtureServer } from './support/isolated-vite-server.js';
 
 declare global {
@@ -29,19 +29,6 @@ declare global {
       revokedObjectUrls: string[];
     };
   }
-}
-
-async function localChromiumExecutable() {
-  const defaultExecutable = chromium.executablePath();
-  if (existsSync(defaultExecutable)) return defaultExecutable;
-  const workspaceUserCache = fileURLToPath(new URL('../../../../.cache/ms-playwright', import.meta.url));
-  const installations = await readdir(workspaceUserCache, { withFileTypes: true }).catch(() => []);
-  for (const installation of installations) {
-    if (!installation.isDirectory() || !installation.name.startsWith('chromium-')) continue;
-    const executable = join(workspaceUserCache, installation.name, 'chrome-linux64', 'chrome');
-    if (existsSync(executable)) return executable;
-  }
-  return undefined;
 }
 
 async function editFixturePage(context: TestContext, query: string) {

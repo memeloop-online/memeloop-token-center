@@ -433,8 +433,11 @@ export function NetworkProxyPolicyWorkspace({ token, tenant, accounts, accountsS
   const [groups, setGroups] = useState<TransportProxyGroup[]>([]);
   const [strategies, setStrategies] = useState<NetworkProxyStrategy[]>([]);
   const [accountId, setAccountId] = useState(() => eligibleAccounts.find(account => account.id === initialAccountId)?.id ?? '');
-  const [selection, setSelection] = useState<NetworkProxySelection>();
-  const [effective, setEffective] = useState<AccountProxyConnection>();
+  const [snapshot, setSnapshot] = useState<
+    { kind: 'read'; connection: AccountProxyConnection } | { kind: 'saved'; selection: NetworkProxySelection }
+  >();
+  const effective = snapshot?.kind === 'read' ? snapshot.connection : undefined;
+  const selection = snapshot?.kind === 'saved' ? snapshot.selection : effective?.selection;
   const [draft, setDraft] = useState<PolicyDraft>(emptyPolicyDraft);
   const [dirty, setDirty] = useState(false);
   const [ready, setReady] = useState(false);
@@ -520,40 +523,37 @@ export function NetworkProxyPolicyWorkspace({ token, tenant, accounts, accountsS
   }, [dirty]);
 
   function clearRestrictedState() {
-    setProxies([]); setGroups([]); setStrategies([]); setEffective(undefined); setSelection(undefined); setDraft(emptyPolicyDraft()); setDirty(false); setAccountId('');
+    setProxies([]); setGroups([]); setStrategies([]); setSnapshot(undefined); setDraft(emptyPolicyDraft()); setDirty(false); setAccountId('');
   }
 
-  async function readEffective(id: string) {
+  async function readAccount(id: string) {
     if (!id) return undefined;
     const connection = await request<AccountProxyConnection>(`/internal/v1/upstreams/${encodeURIComponent(id)}/transport-proxy${query}`);
-    if (connection.account_id !== id) throw new Error(copy.errors.load);
+    const policy = connection.selection;
+    if (connection.account_id !== id || policy?.account_id !== id || policy.tenant_external_id !== tenant
+      || typeof policy.desired?.mode !== 'string') throw new Error(copy.errors.load);
+    if (connection.credential_generation !== policy.credential_generation || connection.updated_at !== policy.account_updated_at) {
+      throw new Error(copy.errors.selectionConflict);
+    }
     return connection;
-  }
-
-  async function readSelection(id: string): Promise<NetworkProxySelection | undefined> {
-    if (!id) return undefined;
-    const selection = await request<NetworkProxySelection>(`${networkProxySelectionPath(id)}${query}`);
-    if (selection.account_id !== id || !selection.desired || typeof selection.desired.mode !== 'string') throw new Error(copy.errors.load);
-    return selection;
   }
 
   async function refresh() {
     if (locked.current) return;
     locked.current = true;
     const revision = ++readRevision.current;
-    setBusy(true); setReady(false); setError(''); setMessage(''); setSelection(undefined); setEffective(undefined); setDirty(false);
+    setBusy(true); setReady(false); setError(''); setMessage(''); setSnapshot(undefined); setDirty(false);
     try {
-      const [proxyList, groupList, strategyList] = await Promise.all([
+      const [proxyList, groupList, strategyList, current] = await Promise.all([
         request<{ items: NetworkProxy[] }>(`${networkProxiesPath}${query}`),
         request<{ items: TransportProxyGroup[] }>(`${transportProxyGroupsPath}${query}`),
         request<{ items: NetworkProxyStrategy[] }>(`${networkProxyStrategiesPath}${query}`),
+        readAccount(accountId),
       ]);
       if (![proxyList.items, groupList.items, strategyList.items].every(Array.isArray)) throw new Error(copy.errors.load);
-      const [current, currentEffective] = await Promise.all([readSelection(accountId), readEffective(accountId)]);
       if (!alive.current || revision !== readRevision.current) return;
-      if (current && currentEffective && current.credential_generation !== currentEffective.credential_generation) throw new Error(copy.errors.selectionConflict);
       setProxies(proxyList.items); setGroups(groupList.items); setStrategies(strategyList.items);
-      setEffective(currentEffective); setSelection(current); setDraft(current ? policyDraft(current, strategyList.items) : emptyPolicyDraft());
+      setSnapshot(current && { kind: 'read', connection: current }); setDraft(current ? policyDraft(current.selection, strategyList.items) : emptyPolicyDraft());
       setReady(true);
       if (failureKind === 'unknown') setMessage(copy.refreshedUnknown);
       setFailureKind(undefined);
@@ -569,12 +569,11 @@ export function NetworkProxyPolicyWorkspace({ token, tenant, accounts, accountsS
     if (locked.current || dirty && !await confirm(copy.switchAccountDraft)) return;
     locked.current = true;
     const revision = ++readRevision.current;
-    setAccountId(id); setSelection(undefined); setEffective(undefined); setDraft(emptyPolicyDraft()); setDirty(false); setBusy(true); setError(''); setMessage('');
+    setAccountId(id); setSnapshot(undefined); setDraft(emptyPolicyDraft()); setDirty(false); setBusy(true); setError(''); setMessage('');
     try {
-      const [current, currentEffective] = await Promise.all([readSelection(id), readEffective(id)]);
+      const current = await readAccount(id);
       if (!alive.current || revision !== readRevision.current) return;
-      if (current && currentEffective && current.credential_generation !== currentEffective.credential_generation) throw new Error(copy.errors.selectionConflict);
-      setEffective(currentEffective); setSelection(current); setDraft(current ? policyDraft(current, strategies) : emptyPolicyDraft()); setReady(true);
+      setSnapshot(current && { kind: 'read', connection: current }); setDraft(current ? policyDraft(current.selection, strategies) : emptyPolicyDraft()); setReady(true);
     } catch (reason) {
       if (alive.current && revision === readRevision.current) {
         setError(networkProxyError(reason, locale, 'read')); setReady(false);
@@ -631,12 +630,27 @@ export function NetworkProxyPolicyWorkspace({ token, tenant, accounts, accountsS
     try {
       const saved = await request<NetworkProxySelection>(networkProxySelectionPath(selection.account_id), { method: 'PUT', body: JSON.stringify(body) });
       if (!alive.current) return;
-      setSelection(saved); setEffective(undefined); setDraft(policyDraft(saved, strategies)); setDirty(false); setMessage(copy.policySaved);
-      try { const current = await readEffective(saved.account_id); if (current?.credential_generation !== saved.credential_generation) throw new Error(); if (alive.current) setEffective(current); }
-      catch { if (alive.current) setError(copy.accountRefreshFailed); }
+      setSnapshot({ kind: 'saved', selection: saved }); setDraft(policyDraft(saved, strategies)); setDirty(false); setMessage(copy.policySaved);
+      try {
+        const current = await readAccount(saved.account_id);
+        if (!current || current.credential_generation !== saved.credential_generation
+          || current.selection.selection_version !== saved.selection_version
+          || current.selection.binding_version !== saved.binding_version) throw new Error();
+        if (alive.current) {
+          setSnapshot({ kind: 'read', connection: current });
+          setDraft(policyDraft(current.selection, strategies));
+        }
+      } catch (reason) {
+        if (alive.current) {
+          if (transportProxyFailureKind(reason) === 'denied') {
+            clearRestrictedState(); setReady(false); setFailureKind('denied');
+            setError(networkProxyError(reason, locale, 'read'));
+          } else setError(copy.accountRefreshFailed);
+        }
+      }
       if (!alive.current) return;
       onPolicySaved?.(saved);
-      void onChanged().catch(() => { if (alive.current) setError(copy.accountRefreshFailed); });
+      void onChanged().catch(() => { if (alive.current) setError(current => current || copy.accountRefreshFailed); });
     } catch (reason) {
       if (alive.current) {
         const kind = transportProxyFailureKind(reason);

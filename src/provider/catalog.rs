@@ -333,6 +333,41 @@ impl RequestCompatibility {
             && ((self.responses_via_chat_v1 && self.responses_via_chat_dialect.is_some())
                 || self.responses_via_anthropic_messages_v1)
     }
+
+    pub(crate) fn allows_codex_multi_agent_v2(&self, config: &Value) -> bool {
+        self.supports_codex_multi_agent_v2()
+            && (!self.responses_transport_configurable
+                || matches!(
+                    Self::responses_transport(config),
+                    "native_responses" | "chat_completions"
+                ))
+    }
+
+    fn responses_transport(config: &Value) -> &str {
+        config
+            .get("responses_transport")
+            .and_then(Value::as_str)
+            .unwrap_or("native_responses")
+    }
+
+    fn supports_responses_via_chat_v1(&self) -> bool {
+        self.third_party && self.responses_via_chat_v1 && self.responses_via_chat_dialect.is_some()
+    }
+
+    pub(crate) fn responses_via_chat_dialect(
+        &self,
+        config: &Value,
+    ) -> Option<ResponsesViaChatDialect> {
+        self.responses_via_chat_dialect.filter(|_| {
+            self.supports_responses_via_chat_v1()
+                && (!self.responses_transport_configurable
+                    || Self::responses_transport(config) == "chat_completions")
+        })
+    }
+
+    pub(crate) fn supports_responses_via_anthropic_messages_v1(&self) -> bool {
+        self.third_party && self.responses_via_anthropic_messages_v1
+    }
 }
 
 /// Normalize public connector aliases before provider lookup, persistence, or
@@ -1061,31 +1096,17 @@ impl ProviderCatalog {
 
     pub fn supports_codex_multi_agent_v2(&self, driver: &str, config: &Value) -> bool {
         self.get(driver).is_some_and(|provider| {
-            let compatibility = &provider.request_compatibility;
-            if !compatibility.supports_codex_multi_agent_v2() {
-                false
-            } else if compatibility.responses_transport_configurable {
-                matches!(
-                    config
-                        .get("responses_transport")
-                        .and_then(Value::as_str)
-                        .unwrap_or("native_responses"),
-                    "native_responses" | "chat_completions"
-                )
-            } else {
-                true
-            }
+            provider
+                .request_compatibility
+                .allows_codex_multi_agent_v2(config)
         })
     }
 
     pub fn supports_responses_via_chat_v1(&self, driver: &str) -> bool {
         self.get(driver).is_some_and(|provider| {
-            provider.request_compatibility.third_party
-                && provider.request_compatibility.responses_via_chat_v1
-                && provider
-                    .request_compatibility
-                    .responses_via_chat_dialect
-                    .is_some()
+            provider
+                .request_compatibility
+                .supports_responses_via_chat_v1()
         })
     }
 
@@ -1095,34 +1116,17 @@ impl ProviderCatalog {
         config: &Value,
     ) -> Option<ResponsesViaChatDialect> {
         self.get(driver).and_then(|provider| {
-            let compatibility = &provider.request_compatibility;
-            if compatibility.third_party
-                && compatibility.responses_via_chat_v1
-                && compatibility.responses_via_chat_dialect.is_some()
-            {
-                if compatibility.responses_transport_configurable
-                    && config
-                        .get("responses_transport")
-                        .and_then(Value::as_str)
-                        .unwrap_or("native_responses")
-                        != "chat_completions"
-                {
-                    None
-                } else {
-                    compatibility.responses_via_chat_dialect
-                }
-            } else {
-                None
-            }
+            provider
+                .request_compatibility
+                .responses_via_chat_dialect(config)
         })
     }
 
     pub fn supports_responses_via_anthropic_messages_v1(&self, driver: &str) -> bool {
         self.get(driver).is_some_and(|provider| {
-            provider.request_compatibility.third_party
-                && provider
-                    .request_compatibility
-                    .responses_via_anthropic_messages_v1
+            provider
+                .request_compatibility
+                .supports_responses_via_anthropic_messages_v1()
         })
     }
 
@@ -1138,7 +1142,7 @@ impl ProviderCatalog {
                 let compatibility = &provider.request_compatibility;
                 compatibility.supports_codex_multi_agent_v2()
                     && (!compatibility.responses_transport_configurable
-                        || self.responses_via_chat_dialect(driver, config).is_some())
+                        || compatibility.responses_via_chat_dialect(config).is_some())
             })
     }
 

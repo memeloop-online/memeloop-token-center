@@ -170,16 +170,27 @@ pub(super) fn redact_account(
     state: &AppState,
     account: &mut UpstreamAccountView,
 ) -> Result<(), AppError> {
-    if let Some(config) = account.config.as_object_mut() {
+    account.driver = crate::provider::canonicalize_provider_driver(&account.driver).to_owned();
+    redact_provider_config(state, &account.driver, &mut account.config)
+}
+
+pub(super) fn redact_provider_config(
+    state: &AppState,
+    driver: &str,
+    config: &mut Value,
+) -> Result<(), AppError> {
+    if let Some(config) = config.as_object_mut() {
         config.remove(crate::db::transport_proxy_management::CONFIG_KEY);
     }
-    account.driver = crate::provider::canonicalize_provider_driver(&account.driver).to_owned();
-    let Some(provider) = state.providers.get(&account.driver) else {
+    let Some(provider) = state
+        .providers
+        .get(crate::provider::canonicalize_provider_driver(driver))
+    else {
         // An unavailable plugin cannot supply trustworthy annotations.
-        account.config = Value::Object(Map::new());
+        *config = Value::Object(Map::new());
         return Ok(());
     };
-    redact(&provider.config_schema, &mut account.config)
+    redact(&provider.config_schema, config)
 }
 
 pub(super) fn public_account(

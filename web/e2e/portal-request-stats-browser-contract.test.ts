@@ -1,9 +1,9 @@
 import assert from 'node:assert/strict';
-import { existsSync } from 'node:fs';
 import { mkdir } from 'node:fs/promises';
 import { fileURLToPath } from 'node:url';
 import test from 'node:test';
 import { chromium } from 'playwright';
+import { hasDefaultChromium } from './support/browser-executable.js';
 import { createServer } from 'vite';
 
 const upstreamId = '019f0000-0000-7000-8000-000000000052';
@@ -13,11 +13,8 @@ const summary = (count: number) => ({ total_requests: count, successful_requests
   cache_usage: { reported_read_tokens: count === 7 ? 0 : count * 4, reported_requests: count, known_read_tokens: count === 7 ? 0 : count * 4, known_input_tokens: count * 10, eligible_requests: count, unknown_requests: 0, hit_rate: count ? count === 7 ? 0 : 0.4 : null },
 });
 
-test('Portal request statistics use filtered API buckets, localized trends, and readable historical tooltips', { timeout: 60_000 }, async () => {
-  if (!existsSync(chromium.executablePath())) {
-    if (process.env.MTC_REQUIRE_BROWSER === '1') throw new Error('Chromium required');
-    return test.skip('Chromium required');
-  }
+test('Portal request statistics use filtered API buckets, localized trends, and readable historical tooltips', { timeout: 60_000 }, async (context) => {
+  if (!hasDefaultChromium(context)) return;
   const root = fileURLToPath(new URL('..', import.meta.url));
   const artifacts = `${root}/e2e-artifacts/ui-system/portal-request-stats`;
   await mkdir(artifacts, { recursive: true });

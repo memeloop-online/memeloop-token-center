@@ -15,10 +15,10 @@ async fn server_shutdown_joins_proxy_drain_before_stopping_worker() {
     let process = tokio::spawn(serve_with_worker_shutdown(
         listener,
         axum::Router::new(),
+        ServerLimits::default(),
         async { stopped.await.unwrap() },
         Some(worker),
-        Some(worker_stop),
-        None,
+        (Some(worker_stop), None),
         async {
             draining.send(()).unwrap();
             released.await.unwrap();

@@ -439,7 +439,7 @@ export function requestCompletedAt(request: RequestView): number | null {
 
 const recordedInFlightStages = ['upstream_response_headers', 'upstream_response_body', 'response_delivery'] as const;
 
-function recordedInFlightStage(request: RequestView): typeof recordedInFlightStages[number] | null {
+export function recordedInFlightStage(request: Pick<RequestView, 'in_flight_stage'>): typeof recordedInFlightStages[number] | null {
   const stage = request.in_flight_stage;
   return stage && (recordedInFlightStages as readonly string[]).includes(stage) ? stage : null;
 }

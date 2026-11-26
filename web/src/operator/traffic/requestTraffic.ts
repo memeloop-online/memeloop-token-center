@@ -1,5 +1,5 @@
 import type { RequestEvent, RequestListCursor, RequestListResponse, RequestView, TypedFilterAst } from '../../types.js';
-import { requestOutcome } from '../../requestStatusPresentation.js';
+import { recordedInFlightStage, requestOutcome } from '../../requestStatusPresentation.js';
 import { nonCachedRequestInput, requestDisplayedCost, requestUsageIsActual } from '../../requestTablePresentation.js';
 
 export const emptyTypedFilterAst: TypedFilterAst = { logical_operator: 'and', conditions: [] };
@@ -310,7 +310,9 @@ export function requestViewFromEvent(event: RequestEvent, previous?: RequestView
     archive_state: mergeArchiveState(previous?.archive_state, event),
     session_context: mergeSessionContext(previous?.session_context, event),
   };
-  const inFlightStage = observedValue(event.in_flight_stage, previous?.in_flight_stage, authoritative);
+  const eventStage = event.in_flight_stage;
+  const normalizedStage = eventStage == null ? eventStage : recordedInFlightStage(event) ?? undefined;
+  const inFlightStage = observedValue(normalizedStage, previous?.in_flight_stage == null ? previous?.in_flight_stage : recordedInFlightStage(previous) ?? undefined, authoritative && eventStage == null);
   if (inFlightStage !== undefined) request.in_flight_stage = inFlightStage;
   if (event.operational_terminal !== undefined) request.operational_terminal = event.operational_terminal;
   const supplierError = observedValue(event.supplier_error, previous?.supplier_error, authoritative);

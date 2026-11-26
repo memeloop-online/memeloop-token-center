@@ -1,11 +1,10 @@
 import assert from 'node:assert/strict';
-import { existsSync } from 'node:fs';
-import { readFile, readdir } from 'node:fs/promises';
-import { join } from 'node:path';
+import { readFile } from 'node:fs/promises';
 import { fileURLToPath } from 'node:url';
 import test from 'node:test';
 
 import { chromium } from 'playwright';
+import { localChromiumExecutable } from './support/browser-executable.js';
 import { createIsolatedFixtureServer } from './support/isolated-vite-server.js';
 
 declare global {
@@ -30,19 +29,6 @@ declare global {
     };
     createdServiceCredentialBody?: string;
   }
-}
-
-async function localChromiumExecutable() {
-  const defaultExecutable = chromium.executablePath();
-  if (existsSync(defaultExecutable)) return defaultExecutable;
-  const workspaceUserCache = fileURLToPath(new URL('../../../../.cache/ms-playwright', import.meta.url));
-  const installations = await readdir(workspaceUserCache, { withFileTypes: true }).catch(() => []);
-  for (const installation of installations) {
-    if (!installation.isDirectory() || !installation.name.startsWith('chromium-')) continue;
-    const executable = join(workspaceUserCache, installation.name, 'chrome-linux64', 'chrome');
-    if (existsSync(executable)) return executable;
-  }
-  return undefined;
 }
 
 test('service credential scopes match the runtime capability set', async () => {

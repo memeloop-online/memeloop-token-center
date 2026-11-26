@@ -104,7 +104,7 @@ pub(crate) async fn prepare_route_for_protocol(
     Err(AppError::upstream("candidates_are_unavailable"))
 }
 
-pub(crate) async fn admit(
+pub(crate) fn admit(
     state: &AppState,
     tenant_id: Uuid,
     request_id: Uuid,
@@ -125,4 +125,40 @@ pub(crate) async fn admit(
         UpstreamAttemptAdmission::Observed,
         None,
     ))
+}
+
+/// HTTP health evidence shared by paid media handlers. Callers still own
+/// rejection delivery, body classification, and their durable submission fence.
+pub(crate) fn media_rejection_terminal(
+    status: reqwest::StatusCode,
+) -> Option<crate::api::MediaAttemptTerminal> {
+    use crate::{
+        api::MediaAttemptTerminal, db::UpstreamFailureKind, metrics::UpstreamHealthReason,
+    };
+
+    let kind = if matches!(
+        status,
+        reqwest::StatusCode::UNAUTHORIZED | reqwest::StatusCode::FORBIDDEN
+    ) {
+        UpstreamFailureKind::Authentication
+    } else if status.is_server_error() {
+        UpstreamFailureKind::Unavailable
+    } else {
+        return None;
+    };
+    Some(MediaAttemptTerminal::Failed {
+        kind,
+        reason: UpstreamHealthReason::Unavailable,
+        failure_stage: "upstream_response",
+    })
+}
+
+pub(crate) fn media_rate_limit_terminal(
+    kind: crate::db::UpstreamFailureKind,
+) -> crate::api::MediaAttemptTerminal {
+    crate::api::MediaAttemptTerminal::Failed {
+        kind,
+        reason: crate::metrics::UpstreamHealthReason::RateLimited,
+        failure_stage: "upstream_response",
+    }
 }

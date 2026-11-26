@@ -624,6 +624,7 @@ fn write(out: &mut impl Write, bytes: &[u8]) -> Result<()> {
 #[cfg(test)]
 mod carrier_cancel_tests {
     use super::*;
+    use crate::recovery_object_proxy as recovery_proxy;
     use crate::{
         archive::ArchiveStore,
         archive_staging::*,
@@ -635,7 +636,28 @@ mod carrier_cancel_tests {
 
     #[tokio::test]
     async fn cancellation_drops_a_pending_object_read_and_releases_the_source() {
-        let (archive, store) = ArchiveStore::memory_for_test().with_read_delay_for_test();
+        // InMemory retains uploaded Bytes and their ingress credit. Use an
+        // independent object-store allocation so this tests reader cancellation.
+        let mut config = crate::config::Config::for_test("sqlite::memory:".into());
+        let proxy = if let Ok(endpoint) = std::env::var("MTC_RUSTFS_TEST_ENDPOINT") {
+            Some(recovery_proxy::RecoveryObjectProxy::start(&endpoint).await)
+        } else {
+            None
+        };
+        if let Some(proxy) = &proxy {
+            config.archive_backend = crate::config::ArchiveBackend::S3;
+            config.s3_endpoint = Some(proxy.endpoint().to_owned());
+            config.s3_bucket = Some(std::env::var("MTC_RUSTFS_TEST_BUCKET").unwrap());
+            config.s3_access_key = Some(std::env::var("MTC_RUSTFS_TEST_ACCESS_KEY").unwrap());
+            config.s3_secret_key = Some(std::env::var("MTC_RUSTFS_TEST_SECRET_KEY").unwrap());
+            config.s3_allow_http = true;
+        }
+        let archive = if proxy.is_some() {
+            ArchiveStore::from_config(&config).await.unwrap()
+        } else {
+            ArchiveStore::single_put_memory_transport_for_test()
+        };
+        let (archive, store) = archive.with_read_delay_for_test();
         let memory = Arc::new(ProxyMemoryBudget::new(256 * 1024));
         let id = uuid::Uuid::new_v4();
         let key = ArchiveStagingKey::new(
@@ -655,7 +677,17 @@ mod carrier_cancel_tests {
         body.seal_to_objects().await.unwrap();
         assert_eq!(memory.snapshot().0, 0);
         let source = Arc::downgrade(&body);
-        store.config_mut(|config| config.wait_get_per_call = std::time::Duration::from_secs(60));
+        let get_gate = proxy.as_ref().map(|proxy| {
+            proxy.gate_get_response_prefix(&format!(
+                "/{}/{}/carrier-",
+                config.s3_bucket.as_ref().unwrap(),
+                key.canonical_prefix()
+            ))
+        });
+        if proxy.is_none() {
+            store
+                .config_mut(|config| config.wait_get_per_call = std::time::Duration::from_secs(60));
+        }
         let cancelled = Arc::new(AtomicBool::new(false));
         let wake = Arc::new(tokio::sync::Notify::new());
         let worker_cancelled = cancelled.clone();
@@ -672,6 +704,11 @@ mod carrier_cancel_tests {
             .unwrap();
             scanner.peek()
         });
+        if let Some(gate) = &get_gate {
+            tokio::time::timeout(std::time::Duration::from_secs(10), gate.entered())
+                .await
+                .unwrap();
+        }
         // The genuine object GET is delayed; no provider bytes have arrived.
         assert!(
             tokio::time::timeout(std::time::Duration::from_millis(100), &mut worker)
@@ -687,6 +724,9 @@ mod carrier_cancel_tests {
                 .unwrap()
                 .is_err()
         );
+        if let Some(gate) = get_gate {
+            gate.release();
+        }
         assert!(source.upgrade().is_none());
         assert_eq!(memory.snapshot().0, 0);
         store.config_mut(|config| config.wait_get_per_call = std::time::Duration::ZERO);

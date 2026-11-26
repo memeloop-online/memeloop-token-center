@@ -85,11 +85,12 @@ test('hostile or unrecorded terminal cause codes never reach operators and never
   assert.equal(requestFailureCause({ ...request, status_code: 503, error_code: 'database_pool_exhausted' }, 'en'), 'The database connection pool timed out');
   assert.equal(requestErrorCopy('proxy_memory_capacity', 'en'), 'The retained request partition was full');
   const unmapped = requestErrorCopy('plugin_future_code_v9', 'en');
-  assert.match(unmapped, /plugin_future_code_v9/);
-  assert.match(unmapped, /no finer mapped sentence/);
+  assert.equal(unmapped, 'An unrecognized error code was recorded');
+  assert.doesNotMatch(unmapped, /plugin_future_code_v9/);
   assert.equal(requestErrorCopy('Bearer secret-token', 'zh-CN'), '请求失败');
-  assert.match(requestStatusCopy({ ...request, status_code: 503, error_code: 'plugin_future_code_v9' }, 'zh-CN').hint, /plugin_future_code_v9/);
-  assert.match(requestStatusCopy({ ...request, status_code: 503, error_code: 'plugin_future_code_v9' }, 'zh-CN').hint, /没有更细的对应说明/);
+  const unknownCopy = requestStatusCopy({ ...request, status_code: 503, error_code: 'plugin_future_code_v9' }, 'zh-CN');
+  assert.match(unknownCopy.hint, /记录了未识别的错误码/);
+  assert.doesNotMatch(unknownCopy.hint, /plugin_future_code_v9/);
   const staged = { ...request, status_code: 502, error_code: 'upstream_connection', failure_diagnostic: { stage: null, source: 'upstream' as const, reason: 'upstream_read_timeout' } };
   assert.equal(requestFailureCause(staged, 'en'), 'The upstream connection failed. Reading the upstream response timed out');
   assert.equal(requestFailureCause(staged, 'zh-CN'), '上游连接失败。读取上游响应超时');
@@ -120,6 +121,10 @@ test('terminal cause survives SSE reconciliation and legacy events never erase r
   assert.equal(requestViewFromEvent({ ...started, in_flight_stage: 'upstream_response_body' }, waitingRow)?.in_flight_stage, 'upstream_response_body');
   assert.equal(requestViewFromEvent({ ...started, in_flight_stage: 'response_delivery' }, waitingRow)?.in_flight_stage, 'response_delivery');
   assert.equal(requestViewFromEvent({ ...started, in_flight_stage: 'delivery_prepared' as never }, waitingRow)?.in_flight_stage, 'upstream_response_headers', 'a delivery contract marker is not an in-flight stage');
+  const reading = requestViewFromEvent({ ...started, event_at: 3001, in_flight_stage: 'upstream_response_body' }, waitingRow)!;
+  const invalidStage = requestViewFromEvent({ ...started, event_at: 3002, in_flight_stage: 'delivery_prepared' as never }, reading)!;
+  assert.equal(invalidStage.in_flight_stage, 'upstream_response_body');
+  assert.equal(requestStatusCopy(invalidStage, 'en').label, requestStatusCopy(reading, 'en').label);
   const merged = mergeLiveRequestEvents([restRow], new Map([[restRow.request_id, archive]]), true);
   assert.equal(merged[0]?.terminal_cause_code, 'upstream_read_timeout');
 });

@@ -1,3 +1,4 @@
+use super::generation_quarantine::{DetailQuery, ListQuery, actor, idempotency_hash};
 use crate::{
     AppState,
     db::{
@@ -14,24 +15,7 @@ use axum::{
 use serde::Deserialize;
 use uuid::Uuid;
 
-#[derive(Deserialize)]
-#[serde(deny_unknown_fields)]
-pub(super) struct ListQuery {
-    tenant_external_id: String,
-    #[serde(default = "default_limit")]
-    limit: i64,
-    after_id: Option<Uuid>,
-}
-
-fn default_limit() -> i64 {
-    100
-}
-
-#[derive(Deserialize)]
-#[serde(deny_unknown_fields)]
-pub(super) struct DetailQuery {
-    tenant_external_id: String,
-}
+const IDEMPOTENCY_CONTEXT: &str = "image-generation-quarantine-idempotency-v1";
 
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -42,22 +26,6 @@ pub(super) struct ResolveRequest {
     confirmed_cost_micros: i64,
     currency: String,
     evidence_digest: String,
-}
-
-async fn actor(
-    headers: &HeaderMap,
-    state: &AppState,
-    tenant: &str,
-    scope: &str,
-) -> Result<(Uuid, i64), AppError> {
-    let service = super::require_service(headers, state, scope).await?;
-    if service.tenant_external_id.as_deref() != Some(tenant) {
-        return Err(AppError::Forbidden);
-    }
-    Ok((
-        service.service_id.ok_or(AppError::Forbidden)?,
-        service.credential_generation.ok_or(AppError::Forbidden)?,
-    ))
 }
 
 pub(super) async fn list_image_generation_quarantine(
@@ -105,33 +73,6 @@ pub(super) async fn get_image_generation_quarantine(
     ))
 }
 
-fn idempotency_hash(headers: &HeaderMap, pepper: &[u8]) -> Result<String, AppError> {
-    let mut values = headers.get_all("idempotency-key").iter();
-    let key = values
-        .next()
-        .and_then(|value| value.to_str().ok())
-        .filter(|value| {
-            !value.is_empty()
-                && value.len() <= 200
-                && value.bytes().all(|byte| byte.is_ascii_graphic())
-        })
-        .ok_or_else(|| {
-            AppError::BadRequest(
-                "exactly one visible ASCII Idempotency-Key of 1 to 200 characters is required"
-                    .into(),
-            )
-        })?;
-    if values.next().is_some() {
-        return Err(AppError::BadRequest(
-            "exactly one Idempotency-Key is required".into(),
-        ));
-    }
-    let hash_key = blake3::derive_key("image-generation-quarantine-idempotency-v1", pepper);
-    Ok(blake3::keyed_hash(&hash_key, key.as_bytes())
-        .to_hex()
-        .to_string())
-}
-
 pub(super) async fn resolve_image_generation_quarantine(
     State(state): State<AppState>,
     headers: HeaderMap,
@@ -145,7 +86,11 @@ pub(super) async fn resolve_image_generation_quarantine(
         "generations:reconcile",
     )
     .await?;
-    let idempotency_hash = idempotency_hash(&headers, state.config.key_pepper.as_bytes())?;
+    let idempotency_hash = idempotency_hash(
+        &headers,
+        state.config.key_pepper.as_bytes(),
+        IDEMPOTENCY_CONTEXT,
+    )?;
     Ok(Json(
         state
             .db
@@ -173,14 +118,17 @@ mod tests {
     #[test]
     fn reconciliation_key_is_single_bounded_visible_ascii_and_domain_separated() {
         let mut headers = HeaderMap::new();
-        assert!(idempotency_hash(&headers, b"pepper").is_err());
+        assert!(idempotency_hash(&headers, b"pepper", IDEMPOTENCY_CONTEXT).is_err());
         for invalid in ["", "two words", "\t", &"a".repeat(201)] {
             headers.insert("idempotency-key", HeaderValue::from_str(invalid).unwrap());
-            assert!(idempotency_hash(&headers, b"pepper").is_err());
+            assert!(idempotency_hash(&headers, b"pepper", IDEMPOTENCY_CONTEXT).is_err());
         }
         headers.insert("idempotency-key", HeaderValue::from_static("evidence-1"));
-        let hash = idempotency_hash(&headers, b"pepper").unwrap();
-        assert_eq!(hash, idempotency_hash(&headers, b"pepper").unwrap());
+        let hash = idempotency_hash(&headers, b"pepper", IDEMPOTENCY_CONTEXT).unwrap();
+        assert_eq!(
+            hash,
+            idempotency_hash(&headers, b"pepper", IDEMPOTENCY_CONTEXT).unwrap()
+        );
         let old_key = blake3::derive_key("generation-quarantine-idempotency-v1", b"pepper");
         assert_ne!(
             hash,
@@ -189,7 +137,7 @@ mod tests {
                 .to_string()
         );
         headers.append("idempotency-key", HeaderValue::from_static("second"));
-        assert!(idempotency_hash(&headers, b"pepper").is_err());
+        assert!(idempotency_hash(&headers, b"pepper", IDEMPOTENCY_CONTEXT).is_err());
     }
 
     #[test]

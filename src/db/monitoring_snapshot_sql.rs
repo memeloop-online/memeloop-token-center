@@ -1,4 +1,7 @@
-use super::{MonitoringGranularity, MonitoringScope};
+use super::{
+    MonitoringGranularity, MonitoringScope,
+    window_metrics::{MonitoringFact, metric_sums},
+};
 
 pub(super) const TOP_UPSTREAM_MODEL_LIMIT: usize = 10;
 pub(super) const TERMINAL_OUTCOME_LIMIT: usize = 5;
@@ -18,10 +21,7 @@ pub(super) fn monitoring_snapshot_sql(
     scope: &MonitoringScope,
     granularity: MonitoringGranularity,
 ) -> String {
-    let (table, bucket_column, _bucket_millis) = match granularity {
-        MonitoringGranularity::Hour => ("usage_analysis_hourly", "hour_bucket", 3_600_000),
-        MonitoringGranularity::Day => ("usage_analysis_daily", "day_bucket", 86_400_000),
-    };
+    let (table, bucket_column) = granularity.rollup();
     let (rollup_predicate, fact_predicate, left_from, left_to, right_from, right_to) = match scope {
         MonitoringScope::Tenant(_) => (
             format!("a.tenant_id = $1 AND a.{bucket_column} >= $2 AND a.{bucket_column} < $3"),
@@ -53,10 +53,25 @@ pub(super) fn monitoring_snapshot_sql(
              FROM {table} a
             WHERE {rollup_predicate}"#,
     );
-    let left_requests = request_fact_sql(left_from, left_to, fact_predicate);
-    let left_generations = generation_fact_sql(left_from, left_to, fact_predicate);
-    let right_requests = request_fact_sql(right_from, right_to, fact_predicate);
-    let right_generations = generation_fact_sql(right_from, right_to, fact_predicate);
+    let left_requests = fact_sql(MonitoringFact::Request, left_from, left_to, fact_predicate);
+    let left_generations = fact_sql(
+        MonitoringFact::Generation,
+        left_from,
+        left_to,
+        fact_predicate,
+    );
+    let right_requests = fact_sql(
+        MonitoringFact::Request,
+        right_from,
+        right_to,
+        fact_predicate,
+    );
+    let right_generations = fact_sql(
+        MonitoringFact::Generation,
+        right_from,
+        right_to,
+        fact_predicate,
+    );
     format!(
         r#"WITH source AS MATERIALIZED (
     {rollup}
@@ -321,91 +336,23 @@ fn selected_values(row_count: usize, columns_per_row: usize) -> Option<String> {
     Some(rows.join(", "))
 }
 
-fn request_fact_sql(from_parameter: &str, to_parameter: &str, scope_predicate: &str) -> String {
+fn fact_sql(
+    fact: MonitoringFact,
+    from_parameter: &str,
+    to_parameter: &str,
+    scope_predicate: &str,
+) -> String {
+    let table = fact.table();
+    let metrics = fact.metrics_projection();
     format!(
         r#"SELECT f.upstream_account_id, f.model, f.status_class, f.currency,
-                  CAST(1 AS BIGINT) AS requests,
-                  CASE
-                      WHEN f.input_tokens >= f.cached_input_tokens + f.cache_write_tokens
-                          THEN f.input_tokens - f.cached_input_tokens - f.cache_write_tokens
-                      ELSE 0
-                  END AS input_tokens,
-                  f.output_tokens, f.cached_input_tokens, f.cache_write_tokens,
-                  CAST(1 AS BIGINT) AS duration_count, f.duration_ms AS duration_sum_ms,
-                  CASE WHEN f.duration_ms <= 10 THEN 1 ELSE 0 END AS duration_bucket_0,
-                  CASE WHEN f.duration_ms > 10 AND f.duration_ms <= 50 THEN 1 ELSE 0 END AS duration_bucket_1,
-                  CASE WHEN f.duration_ms > 50 AND f.duration_ms <= 100 THEN 1 ELSE 0 END AS duration_bucket_2,
-                  CASE WHEN f.duration_ms > 100 AND f.duration_ms <= 250 THEN 1 ELSE 0 END AS duration_bucket_3,
-                  CASE WHEN f.duration_ms > 250 AND f.duration_ms <= 500 THEN 1 ELSE 0 END AS duration_bucket_4,
-                  CASE WHEN f.duration_ms > 500 AND f.duration_ms <= 1000 THEN 1 ELSE 0 END AS duration_bucket_5,
-                  CASE WHEN f.duration_ms > 1000 AND f.duration_ms <= 2500 THEN 1 ELSE 0 END AS duration_bucket_6,
-                  CASE WHEN f.duration_ms > 2500 AND f.duration_ms <= 5000 THEN 1 ELSE 0 END AS duration_bucket_7,
-                  CASE WHEN f.duration_ms > 5000 AND f.duration_ms <= 10000 THEN 1 ELSE 0 END AS duration_bucket_8,
-                  CASE WHEN f.duration_ms > 10000 AND f.duration_ms <= 30000 THEN 1 ELSE 0 END AS duration_bucket_9,
-                  CASE WHEN f.duration_ms > 30000 AND f.duration_ms <= 60000 THEN 1 ELSE 0 END AS duration_bucket_10,
-                  CASE WHEN f.duration_ms > 60000 THEN 1 ELSE 0 END AS duration_bucket_11,
-                  f.cost_micros
-             FROM request_stats_facts f
+                  {metrics}
+             FROM {table} f
             WHERE {from_parameter} <= {to_parameter}
               AND f.created_at >= {from_parameter}
               AND f.created_at <= {to_parameter}
               AND {scope_predicate}"#,
     )
-}
-
-fn generation_fact_sql(from_parameter: &str, to_parameter: &str, scope_predicate: &str) -> String {
-    format!(
-        r#"SELECT f.upstream_account_id, f.model, f.status_class, f.currency,
-                  CAST(1 AS BIGINT) AS requests,
-                  CAST(0 AS BIGINT) AS input_tokens,
-                  CAST(0 AS BIGINT) AS output_tokens,
-                  CAST(0 AS BIGINT) AS cached_input_tokens,
-                  CAST(0 AS BIGINT) AS cache_write_tokens,
-                  CAST(1 AS BIGINT) AS duration_count, f.duration_ms AS duration_sum_ms,
-                  CASE WHEN f.duration_ms <= 10 THEN 1 ELSE 0 END AS duration_bucket_0,
-                  CASE WHEN f.duration_ms > 10 AND f.duration_ms <= 50 THEN 1 ELSE 0 END AS duration_bucket_1,
-                  CASE WHEN f.duration_ms > 50 AND f.duration_ms <= 100 THEN 1 ELSE 0 END AS duration_bucket_2,
-                  CASE WHEN f.duration_ms > 100 AND f.duration_ms <= 250 THEN 1 ELSE 0 END AS duration_bucket_3,
-                  CASE WHEN f.duration_ms > 250 AND f.duration_ms <= 500 THEN 1 ELSE 0 END AS duration_bucket_4,
-                  CASE WHEN f.duration_ms > 500 AND f.duration_ms <= 1000 THEN 1 ELSE 0 END AS duration_bucket_5,
-                  CASE WHEN f.duration_ms > 1000 AND f.duration_ms <= 2500 THEN 1 ELSE 0 END AS duration_bucket_6,
-                  CASE WHEN f.duration_ms > 2500 AND f.duration_ms <= 5000 THEN 1 ELSE 0 END AS duration_bucket_7,
-                  CASE WHEN f.duration_ms > 5000 AND f.duration_ms <= 10000 THEN 1 ELSE 0 END AS duration_bucket_8,
-                  CASE WHEN f.duration_ms > 10000 AND f.duration_ms <= 30000 THEN 1 ELSE 0 END AS duration_bucket_9,
-                  CASE WHEN f.duration_ms > 30000 AND f.duration_ms <= 60000 THEN 1 ELSE 0 END AS duration_bucket_10,
-                  CASE WHEN f.duration_ms > 60000 THEN 1 ELSE 0 END AS duration_bucket_11,
-                  f.cost_micros
-             FROM generation_stats_facts f
-            WHERE {from_parameter} <= {to_parameter}
-              AND f.created_at >= {from_parameter}
-              AND f.created_at <= {to_parameter}
-              AND {scope_predicate}"#,
-    )
-}
-
-fn metric_sums() -> &'static str {
-    r#"CAST(COALESCE(SUM(requests), 0) AS BIGINT) AS requests,
-       CAST(COALESCE(SUM(CASE WHEN status_class = 'success' THEN requests ELSE 0 END), 0) AS BIGINT) AS successful_requests,
-       CAST(COALESCE(SUM(CASE WHEN status_class = 'failure' THEN requests ELSE 0 END), 0) AS BIGINT) AS failed_requests,
-       CAST(COALESCE(SUM(input_tokens), 0) AS BIGINT) AS input_tokens,
-       CAST(COALESCE(SUM(output_tokens), 0) AS BIGINT) AS output_tokens,
-       CAST(COALESCE(SUM(cached_input_tokens), 0) AS BIGINT) AS cached_input_tokens,
-       CAST(COALESCE(SUM(cache_write_tokens), 0) AS BIGINT) AS cache_write_tokens,
-       CAST(COALESCE(SUM(duration_count), 0) AS BIGINT) AS duration_count,
-       CAST(COALESCE(SUM(duration_sum_ms), 0) AS BIGINT) AS duration_sum_ms,
-       CAST(COALESCE(SUM(duration_bucket_0), 0) AS BIGINT) AS duration_bucket_0,
-       CAST(COALESCE(SUM(duration_bucket_1), 0) AS BIGINT) AS duration_bucket_1,
-       CAST(COALESCE(SUM(duration_bucket_2), 0) AS BIGINT) AS duration_bucket_2,
-       CAST(COALESCE(SUM(duration_bucket_3), 0) AS BIGINT) AS duration_bucket_3,
-       CAST(COALESCE(SUM(duration_bucket_4), 0) AS BIGINT) AS duration_bucket_4,
-       CAST(COALESCE(SUM(duration_bucket_5), 0) AS BIGINT) AS duration_bucket_5,
-       CAST(COALESCE(SUM(duration_bucket_6), 0) AS BIGINT) AS duration_bucket_6,
-       CAST(COALESCE(SUM(duration_bucket_7), 0) AS BIGINT) AS duration_bucket_7,
-       CAST(COALESCE(SUM(duration_bucket_8), 0) AS BIGINT) AS duration_bucket_8,
-       CAST(COALESCE(SUM(duration_bucket_9), 0) AS BIGINT) AS duration_bucket_9,
-       CAST(COALESCE(SUM(duration_bucket_10), 0) AS BIGINT) AS duration_bucket_10,
-       CAST(COALESCE(SUM(duration_bucket_11), 0) AS BIGINT) AS duration_bucket_11,
-       CAST(COALESCE(SUM(cost_micros), 0) AS BIGINT) AS cost_micros"#
 }
 
 #[cfg(test)]

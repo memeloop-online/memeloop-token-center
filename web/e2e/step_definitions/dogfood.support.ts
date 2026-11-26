@@ -66,6 +66,14 @@ export async function assertOperatorTenantScope(
   return pickerExpectation === 'visible' ? tenantPicker : undefined;
 }
 
+export function serviceCredentialInput(scope: Page | Locator): Locator {
+  return scope.getByRole('textbox', { name: /^(服务凭据|Service credential)$/, exact: true });
+}
+
+export function clientCredentialInput(scope: Page | Locator): Locator {
+  return scope.getByLabel(/^(客户端凭据|Client credential)$/, { exact: true });
+}
+
 /** A restored credential owns the form until its tenant discovery commits.
  * An explicit connection must begin after that transition, otherwise the
  * successful restoration can correctly clear the matching draft we just filled.
@@ -89,7 +97,7 @@ export async function connectOperator(
   // replacement-credential form. Target the form instead of its translated
   // submit label so both entry points exercise the same user flow.
   const accessForm = operatorCredentialEntryForm(page);
-  const credentialInput = accessForm.locator('input[type="password"]');
+  const credentialInput = serviceCredentialInput(accessForm);
   await credentialInput.waitFor({ state: 'visible' });
   await credentialInput.fill(expectedCredential);
   await assertValue(credentialInput, expectedCredential);

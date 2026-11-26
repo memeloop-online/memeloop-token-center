@@ -88,6 +88,14 @@ fn route_temporary_memory(
     })
 }
 
+fn forward_native_request(route: &ResolvedUpstream, request: &Value) -> Value {
+    let mut forwarded = request.clone();
+    if let Some(model) = forwarded.get_mut("model") {
+        *model = Value::String(route.upstream_model.clone());
+    }
+    forwarded
+}
+
 pub(super) fn plan_proxy_route(
     input: ProxyRoutePlanInput<'_>,
 ) -> Result<PlannedProxyRoute, AppError> {
@@ -106,48 +114,40 @@ pub(super) fn plan_proxy_route(
         route,
         preparation_now,
     } = input;
-    if !state.providers.is_public(&route.driver) {
-        return Err(AppError::upstream("provider_driver_is_not_loaded"));
-    }
+    let provider = state
+        .providers
+        .get(&route.driver)
+        .ok_or_else(|| AppError::upstream("provider_driver_is_not_loaded"))?;
+    let compatibility = &provider.request_compatibility;
     route.credential.validate(preparation_now)?;
     let is_codex = codex_transport::is_driver(&route.driver);
     if is_codex {
         codex::validate_route(&route, protocol)?;
     }
-    let responses_via_chat_dialect = state
-        .providers
-        .responses_via_chat_dialect(&route.driver, &route.config);
+    let responses_via_chat_dialect = compatibility.responses_via_chat_dialect(&route.config);
     let http_json = crate::provider::is_openai_compatible_http_driver(&route.driver);
     let new_api = crate::provider::is_new_api_driver(&route.driver);
     let passthrough_responses = http_json || new_api;
-    let multi_agent_responses =
-        matches!(protocol, Protocol::OpenAiResponses) && codex_multi_agent_v2_request;
+    let responses_protocol = matches!(protocol, Protocol::OpenAiResponses);
+    let multi_agent_responses = responses_protocol && codex_multi_agent_v2_request;
     // Kimi still rewrites MultiAgent into Chat. http-json and New API keep
     // native Responses semantics; do not reuse the Kimi rewrite for them.
-    let bridge_multi_agent = matches!(protocol, Protocol::OpenAiResponses)
-        && codex_multi_agent_v2_request
-        && state
-            .providers
-            .supports_codex_multi_agent_v2(&route.driver, &route.config);
-    let responses_via_anthropic = matches!(protocol, Protocol::OpenAiResponses)
-        && state
-            .providers
-            .supports_responses_via_anthropic_messages_v1(&route.driver);
+    let bridge_multi_agent =
+        multi_agent_responses && compatibility.allows_codex_multi_agent_v2(&route.config);
+    let responses_via_anthropic =
+        responses_protocol && compatibility.supports_responses_via_anthropic_messages_v1();
     // Direct HTTP and clone-only native Kimi Chat use the third tree already
     // prepaid by admission. Histories requiring copied tool/reasoning repair,
     // dialect/component/compact transforms retain their separate workspace.
-    let native_kimi_chat = route.driver == crate::oauth::managed::kimi::PROVIDER_DRIVER
-        && kimi::reuses_chat_workspace(protocol, request_json);
-    let direct_http = (http_json || new_api || native_kimi_chat)
-        && !is_codex
-        && (responses_via_chat_dialect.is_none() || native_kimi_chat)
+    let is_kimi = route.driver == crate::oauth::managed::kimi::PROVIDER_DRIVER;
+    let native_kimi_chat = is_kimi && kimi::reuses_chat_workspace(protocol, request_json);
+    let component_adapter = provider.component_adapter.is_some();
+    let direct_http = (native_kimi_chat
+        || (passthrough_responses && responses_via_chat_dialect.is_none()))
         && !responses_via_anthropic
         && !matches!(protocol, Protocol::OpenAiResponsesCompact)
         && !crate::api::new_api_transport::has_compaction_trigger(request_json)
-        && state
-            .providers
-            .get(&route.driver)
-            .is_some_and(|provider| provider.component_adapter.is_none());
+        && !component_adapter;
     let request_bytes = crate::gateway_body::memory::json_encoded_length(request_json)?;
     let request_workspace = direct_http
         .then(|| request_memory.and_then(|memory| memory.borrow_route_workspace(request_bytes)))
@@ -164,7 +164,7 @@ pub(super) fn plan_proxy_route(
         let (forwarded, context) =
             anthropic::prepare_forwarded_request(&route, request_json, bridge_multi_agent)?;
         (forwarded, None, Some(context))
-    } else {
+    } else if responses_protocol && (is_kimi || responses_via_chat_dialect.is_some()) {
         let (forwarded, context) =
             crate::api::kimi_transport::responses_request::with_input_rejection_diagnostics(
                 request_id,
@@ -176,12 +176,17 @@ pub(super) fn plan_proxy_route(
                         protocol,
                         request_json,
                         bridge_multi_agent && responses_via_chat_dialect.is_some(),
-                        bridge_multi_agent && responses_via_chat_dialect.is_some(),
                         responses_via_chat_dialect,
                     )
                 },
             )?;
         (forwarded, context, None)
+    } else if is_kimi {
+        let (forwarded, _) =
+            kimi::prepare_forwarded_request(&route, protocol, request_json, false, None)?;
+        (forwarded, None, None)
+    } else {
+        (forward_native_request(&route, request_json), None, None)
     };
     let (compact_v2_bridge, wrap_compact_as_sse) = prepare_compact_bridge(
         &route,
@@ -255,11 +260,7 @@ pub(super) fn plan_proxy_route(
     };
     let upstream_stream =
         forwarded_json.get("stream").and_then(Value::as_bool) == Some(true) && !compact_v2_bridge;
-    let component_adapter = state
-        .providers
-        .get(&route.driver)
-        .and_then(|provider| provider.component_adapter.as_ref());
-    let component_context = if component_adapter.is_some() {
+    let component_context = if component_adapter {
         match forwarded_json.get("stream") {
             Some(Value::Bool(false)) | None => {}
             Some(Value::Bool(true)) => {
@@ -283,12 +284,6 @@ pub(super) fn plan_proxy_route(
     } else {
         None
     };
-    let codex_downstream_stream = codex_plan
-        .as_ref()
-        .is_some_and(|plan| plan.downstream_stream);
-    let codex_store_disabled =
-        codex_plan.is_some() && forwarded_json.get("store").and_then(Value::as_bool) == Some(false);
-    let codex_session_id = codex_plan.map(|plan| plan.session_id);
     let plugins = wire_shim_runtime(state);
     let wire_protocol = if responses_anthropic.is_some() {
         "anthropic"
@@ -307,7 +302,7 @@ pub(super) fn plan_proxy_route(
             config_json: "{}".to_owned(),
         },
     );
-    let wait_for_compaction = is_codex
+    let wait_for_compaction = codex_plan.is_some()
         && (matches!(protocol, Protocol::OpenAiResponsesCompact)
             || (matches!(protocol, Protocol::OpenAiResponses)
                 && crate::api::new_api_transport::has_compaction_trigger(request_json)));
@@ -319,9 +314,7 @@ pub(super) fn plan_proxy_route(
         output_token_ceiling,
         output_token_limit,
         upstream_stream,
-        codex_downstream_stream,
-        codex_store_disabled,
-        codex_session_id,
+        codex: codex_plan,
         component_context,
         responses_chat,
         upstream_path,
@@ -523,9 +516,7 @@ pub(super) async fn materialize_proxy_route(
         forwarded_body: Bytes::from(forwarded_body),
         component_input_bytes,
         upstream_stream: planned.upstream_stream,
-        codex_downstream_stream: planned.codex_downstream_stream,
-        codex_store_disabled: planned.codex_store_disabled,
-        codex_session_id: planned.codex_session_id,
+        codex: planned.codex,
         component_request,
         responses_chat: planned.responses_chat,
         upstream_path: planned.upstream_path,
@@ -552,12 +543,13 @@ pub(super) async fn send_proxy_route(
     if route.route.driver == crate::cursor_native::DRIVER {
         return Err(ProxySendError::CandidateUnavailable);
     }
-    if route.is_codex() {
+    if let Some(plan) = &route.codex {
         return codex::send_proxy_route(
             state,
             headers,
             request_id,
             route,
+            plan,
             candidate_rank,
             outbound_attempt,
         )
@@ -661,16 +653,7 @@ mod compact_bridge_tests {
             ("new-api", json!({}), true),
         ] {
             let route = route(driver, config);
-            let (mut forwarded, context) = kimi::prepare_forwarded_request(
-                &route,
-                Protocol::OpenAiResponses,
-                &request,
-                false,
-                false,
-                None,
-            )
-            .unwrap();
-            assert!(context.is_none());
+            let mut forwarded = forward_native_request(&route, &request);
             let (bridge, wrap_sse) = prepare_compact_bridge(
                 &route,
                 Protocol::OpenAiResponses,

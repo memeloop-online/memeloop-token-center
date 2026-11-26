@@ -17,6 +17,7 @@ import {
 import { requestEventFixture } from '../support/request-event-fixture.js';
 import type { DogfoodWorld } from '../support/world.js';
 import { appPreferenceControls, openAppRoute } from './app-route.support.js';
+import { clientCredentialInput } from './dogfood.support.js';
 import { defaultRequestRefreshInterval } from '../../src/operator/traffic/requestRefresh.js';
 
 interface SessionObservation {
@@ -109,10 +110,23 @@ async function visible(locator: Locator) {
 }
 
 async function noHorizontalOverflow(page: Page) {
-  const overflow = await page.evaluate(() => ({
-    document: document.documentElement.scrollWidth - document.documentElement.clientWidth,
-    body: document.body.scrollWidth - document.body.clientWidth,
-  }));
+  const overflow = await page.evaluate(() => {
+    const documentOverflow = document.documentElement.scrollWidth - document.documentElement.clientWidth;
+    const bodyOverflow = document.body.scrollWidth - document.body.clientWidth;
+    const viewport = document.documentElement.clientWidth;
+    const elements = documentOverflow <= 1 && bodyOverflow <= 1 ? [] : [...document.body.querySelectorAll<HTMLElement>('*')]
+      .flatMap(element => {
+        const rect = element.getBoundingClientRect();
+        if (rect.width === 0 || rect.height === 0 || (rect.right <= viewport + 1 && rect.left >= -1)) return [];
+        const style = getComputedStyle(element);
+        return [{
+          element: element.tagName.toLowerCase(), className: element.className, role: element.getAttribute('role'),
+          left: rect.left, right: rect.right, width: rect.width, clientWidth: element.clientWidth, scrollWidth: element.scrollWidth,
+          display: style.display, minWidth: style.minWidth, maxWidth: style.maxWidth, whiteSpace: style.whiteSpace, overflowX: style.overflowX,
+        }];
+      }).sort((left, right) => right.right - left.right).slice(0, 24);
+    return { document: documentOverflow, body: bodyOverflow, viewport, elements };
+  });
   assert.ok(overflow.document <= 1 && overflow.body <= 1, `horizontal overflow: ${JSON.stringify(overflow)}`);
 }
 
@@ -454,7 +468,7 @@ Then('实际轮换后的新凭据保留旧会话历史而旧凭据和其他身�
   // End the browser session before rotating its key through the service API.
   // The old-key rejection below remains a separate, explicit HTTP assertion.
   await page.getByRole('button', { name: '清空凭据', exact: true }).click();
-  await visible(page.locator('input[type="password"]'));
+  await visible(clientCredentialInput(page));
   const rotated = await requestJson<{ key: string }>(`/internal/v1/keys/${seed.clientKeyId}/rotate`, {
     method: 'POST',
     credential: seed.serviceCredential,
@@ -483,7 +497,7 @@ Then('实际轮换后的新凭据保留旧会话历史而旧凭据和其他身�
   assert.equal(forbiddenDetail.status, 404);
 
   seed.clientCredential = rotated.key;
-  await page.locator('input[type="password"]').fill(rotated.key);
+  await clientCredentialInput(page).fill(rotated.key);
   await page.getByRole('button', { name: '进入', exact: true }).click();
   await openAppRoute(page, 'portal', 'sessions');
   await visible(page.locator('.self-sessions .session-card').first());

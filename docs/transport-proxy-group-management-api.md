@@ -251,7 +251,9 @@ CAS 冲突、绑定原子性及墓碑、禁止 DIRECT、后台配置生效与旧
 顺序、地址和原来的探测禁用状态；冲突整体回滚。旧分组探测配置编辑通过同一事务
 同步成员实体；仅将现有实体加入分组不会禁用该实体的独立探测。
 
-`GET/PUT /internal/v1/upstreams/{account_id}/transport-proxy-selection` 管理互斥策略：
+读取 `GET /internal/v1/upstreams/{account_id}/transport-proxy`，从同一响应的
+`selection` 取得策略、应用状态和写入版本。
+`PUT /internal/v1/upstreams/{account_id}/transport-proxy-selection` 更新互斥策略：
 
 - `manual`：提供 `proxy_id`，无需建组，健康变化不会更换出口。
 - `auto`：提供 `group_id`、`expected_group_version` 和可选 `config`。后台综合独立

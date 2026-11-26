@@ -55,6 +55,7 @@ mod http_settings;
 mod image_generation_quarantine;
 mod kimi_transport;
 mod limits;
+mod media_body;
 mod model_picker;
 mod model_routes;
 mod monitoring_snapshot;

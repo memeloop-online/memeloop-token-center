@@ -102,7 +102,6 @@ impl StreamState {
 fn transformed_body(
     mut upstream: UpstreamByteStream,
     context: responses_via_anthropic::Context,
-    success: bool,
     diagnostic: crate::api::proxy_diagnostics::Context,
 ) -> UpstreamByteStream {
     Box::pin(futures_util::stream::once(async move {
@@ -120,11 +119,7 @@ fn transformed_body(
             }
             let value =
                 crate::api::sse::parse_unique_json(&body).map_err(|_| "anthropic_json_invalid")?;
-            let translated = if success {
-                responses_via_anthropic::buffered(&context, &value)?
-            } else {
-                responses_via_anthropic::error_body(&value)?
-            };
+            let translated = responses_via_anthropic::buffered(&context, &value)?;
             serde_json::to_vec(&translated)
                 .map(Bytes::from)
                 .map_err(|_| "event_serialization")
@@ -135,7 +130,7 @@ fn transformed_body(
                 phase = "responses_anthropic_translation",
                 request_id = %diagnostic.request_id,
                 request_elapsed_ms = diagnostic.elapsed_millis_at(std::time::Instant::now()),
-                stage = if success { "buffered" } else { "error" },
+                stage = "buffered",
                 error_kind = reason,
                 "Responses-via-Anthropic translation failed"
             );
@@ -150,8 +145,12 @@ pub(in crate::api::proxy) fn translate(
     streaming: bool,
     sse_framing_limits: crate::provider::SseFramingLimits,
 ) -> Result<UpstreamResponse, ProxySendError> {
+    let response = response.into();
+    if !response.status().is_success() {
+        return Ok(response);
+    }
     let diagnostic = crate::api::proxy_diagnostics::Context::current();
-    let mut parts = response.into().into_parts();
+    let mut parts = response.into_parts();
     if parts
         .headers
         .get_all(header::CONTENT_ENCODING)
@@ -162,7 +161,6 @@ pub(in crate::api::proxy) fn translate(
             "upstream_invalid_content_encoding",
         ));
     }
-    let success = parts.status.is_success();
     let media_type = parts
         .headers
         .get(header::CONTENT_TYPE)
@@ -170,12 +168,12 @@ pub(in crate::api::proxy) fn translate(
         .and_then(|value| value.split(';').next())
         .unwrap_or("")
         .trim();
-    if success && streaming && !media_type.eq_ignore_ascii_case("text/event-stream") {
+    if streaming && !media_type.eq_ignore_ascii_case("text/event-stream") {
         return Err(ProxySendError::AmbiguousResponse(
             "upstream_invalid_response",
         ));
     }
-    if (!streaming || !success)
+    if !streaming
         && !media_type.eq_ignore_ascii_case("application/json")
         && !media_type.ends_with("+json")
     {
@@ -186,7 +184,7 @@ pub(in crate::api::proxy) fn translate(
     parts.headers.remove(header::CONTENT_LENGTH);
     parts.headers.remove(header::CONTENT_ENCODING);
     parts.content_length = None;
-    let translated = if success && streaming {
+    let translated = if streaming {
         StreamState {
             upstream: parts.stream,
             framer: BoundedSseFramer::with_limits(sse_framing_limits),
@@ -197,11 +195,11 @@ pub(in crate::api::proxy) fn translate(
         }
         .into_stream()
     } else {
-        transformed_body(parts.stream, context, success, diagnostic)
+        transformed_body(parts.stream, context, diagnostic)
     };
     parts.headers.insert(
         header::CONTENT_TYPE,
-        HeaderValue::from_static(if success && streaming {
+        HeaderValue::from_static(if streaming {
             "text/event-stream"
         } else {
             "application/json"

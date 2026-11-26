@@ -15,14 +15,14 @@ async fn discarded_attempts_retain_distinct_originals_without_overwriting_final_
         reservation_id: Uuid::now_v7(),
     };
     let final_body = Bytes::from_static(b"data: final supplier response\n\n");
-    for ordinal in 1..=3 {
-        let body = if ordinal == 3 {
+    for (ordinal, subattempt, byte) in [(1, 0, 1), (1, 1, 2), (2, 0, 3)] {
+        let body = if ordinal == 2 {
             final_body.clone()
         } else {
-            Bytes::from(vec![ordinal as u8; 256 * 1024])
+            Bytes::from(vec![byte; 256 * 1024])
         };
         let response = UpstreamResponse::Prefetched {
-            status: if ordinal == 3 {
+            status: if ordinal == 2 {
                 StatusCode::OK
             } else {
                 StatusCode::TOO_MANY_REQUESTS
@@ -37,13 +37,14 @@ async fn discarded_attempts_retain_distinct_originals_without_overwriting_final_
                     .collect::<Vec<_>>(),
             )),
         };
-        if ordinal == 3 {
+        if ordinal == 2 {
             drop(response.with_original_archive_capture(&state, identity));
         } else {
             drop(response.with_discarded_attempt_capture(
                 &state,
                 identity,
                 crate::archive::RawResponseAttempt {
+                    subattempt,
                     outbound_attempt: ordinal,
                     upstream_account_id: Uuid::now_v7(),
                     model_route_id: Uuid::now_v7(),
@@ -55,15 +56,23 @@ async fn discarded_attempts_retain_distinct_originals_without_overwriting_final_
     tokio::time::timeout(Duration::from_secs(10), state.drain_proxy_tasks())
         .await
         .unwrap();
-    for ordinal in 1..=2 {
-        let capture = state
-            .archive
-            .response_attempt(identity.tenant_id, identity.request_id, ordinal)
-            .await
-            .unwrap()
-            .unwrap();
-        assert_eq!(capture.attempt.outbound_attempt, ordinal);
-        let expected = vec![ordinal as u8; 256 * 1024];
+    for (subattempt, byte) in [(0, 1), (1, 2)] {
+        let capture = if subattempt == 0 {
+            state
+                .archive
+                .response_attempt(identity.tenant_id, identity.request_id, 1)
+                .await
+        } else {
+            state
+                .archive
+                .response_subattempt(identity.tenant_id, identity.request_id, 1, subattempt)
+                .await
+        }
+        .unwrap()
+        .unwrap();
+        assert_eq!(capture.attempt.outbound_attempt, 1);
+        assert_eq!(capture.attempt.subattempt, subattempt);
+        let expected = vec![byte; 256 * 1024];
         assert_eq!(capture.response.size_bytes, expected.len() as u64);
         assert_eq!(
             capture.response.blake3_digest,
@@ -514,7 +523,7 @@ async fn encoded_buffered_upstream_is_rejected_once_without_replay() {
 }
 
 #[tokio::test]
-async fn original_rejection_is_archived_without_leaking_it_into_the_delivered_error() {
+async fn original_http_rejection_is_delivered_and_archived_byte_for_byte() {
     let upstream = MockServer::start().await;
     let original = br#"{ "error": { "message": "private-original-provider-text", "opaque": {"tool_call_id":"call-1"} } }"#;
     Mock::given(method("POST"))
@@ -530,7 +539,7 @@ async fn original_rejection_is_archived_without_leaking_it_into_the_delivered_er
     let delivered = to_bytes(response.into_body(), MAX_PROXY_RESPONSE_BODY)
         .await
         .unwrap();
-    assert!(!String::from_utf8_lossy(&delivered).contains("private-original-provider-text"));
+    assert_eq!(delivered.as_ref(), original.as_slice());
     let pool = sqlx::AnyPool::connect(&fixture.database_url).await.unwrap();
     tokio::time::timeout(Duration::from_secs(5), async {
         loop {
@@ -563,7 +572,7 @@ async fn original_rejection_is_archived_without_leaking_it_into_the_delivered_er
         }
     })
     .await
-    .expect("safe delivery must not replace the original archive");
+    .expect("delivery must not replace the original archive");
     pool.close().await;
     upstream.verify().await;
 }

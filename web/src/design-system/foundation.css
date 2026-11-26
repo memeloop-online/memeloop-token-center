@@ -33,7 +33,10 @@
   font-size: var(--fontSizeBase400);
   font-weight: var(--fontWeightSemibold);
 }
-.mtc-form-fields { display: grid; gap: var(--mtc-space-field); min-width: 0; }
+.mtc-form-fields { display: grid; grid-template-columns: minmax(0, 1fr); gap: var(--mtc-space-field); min-width: 0; }
+.mtc-form-fields > .fui-Field,
+.mtc-form-fields .fui-Select,
+.mtc-form-fields .fui-Select__select { min-width: 0; max-width: 100%; }
 .mtc-secondary-text { color: var(--colorNeutralForeground2); margin: 0 0 16px; }
 .mtc-fluent-root .mtc-detail-trigger {
   color: inherit;

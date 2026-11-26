@@ -90,6 +90,12 @@ impl Persistence {
         ArchiveActivity(self.clone())
     }
 
+    /// Active archive responsibilities, including admission, writer and failure handoff.
+    /// Overlapping responsibilities are not distinct requests or upload permits.
+    pub(crate) fn archive_activity_count(&self) -> usize {
+        usize::try_from(self.archives.load(Ordering::Acquire)).unwrap_or(usize::MAX)
+    }
+
     pub(crate) fn record_capacity_gap(&self) {
         self.rejected.fetch_add(1, Ordering::Relaxed);
     }

@@ -15,7 +15,7 @@ MTC 为客户端提供模型请求接口和凭证范围内的自助查询接口�
 ## 版本与错误
 
 - 响应携带 `X-MTC-API-Version: v1`，用于识别 API 版本。
-- 错误返回 JSON 和标准 HTTP 状态码，不包含供应商凭证材料。
+- 网关生成的错误使用 JSON，不包含供应商凭证。公网文本代理转发最终的供应商 HTTP 拒绝响应时，保留供应商状态码与原始正文。正文可能为空或不是 JSON；供应商 JSON 也无需遵循网关错误格式。这条规则不适用于网关自己的错误或 SSE 已开始后的流内错误。
 - 新字段和新接口可以在 v1 内增量加入；移除已有字段或行为需要公开的废弃窗口。
 
 ## 重试与分页
@@ -33,6 +33,5 @@ MTC 通过 `POST /v1/messages` 和 `POST /v1/messages/count_tokens` 提供 Anthr
 - `anthropic-version`、`anthropic-beta`、其他 `anthropic-*` 请求头，以及 `x-claude-code-*` 会话和代理标识会传递给 Anthropic 格式上游。请求字段保持开放，工具、思考、缓存和上下文管理等新能力可与对应 beta 能力一起传递。
 - 流式 Messages 响应以 `text/event-stream` 持续转发，心跳使用 Anthropic 的 `event: ping` 与 `{"type":"ping"}` 数据格式。Ping 是传输控制事件。`retry-after`、`retry-after-ms`、`x-should-retry` 和 `anthropic-ratelimit-*` 响应头会返回给客户端，用于重试和额度展示。
 - `GET /v1/models` 支持 Anthropic 网关模型发现：`limit` 可取 1 至 1000，并可携带一个 `before_id` 或 `after_id` 游标。响应使用 Anthropic 列表结构，仅列出当前 MTC 客户端凭据拥有有效 Anthropic 路由的模型。
-- Anthropic 格式上游返回错误时，MTC 会将状态码、响应体和重试/额度响应头返回给客户端；审计记录保留请求终态事实，不保存上游错误响应体。
 
 当选中的上游支持该端点时，可使用 `/v1/messages/count_tokens`。各服务商的协议转换由对应 provider adapter 提供，核心网关保持 Anthropic Messages 信封结构。

@@ -1,10 +1,9 @@
 import assert from 'node:assert/strict';
-import { existsSync } from 'node:fs';
-import { readFile, readdir } from 'node:fs/promises';
-import { join } from 'node:path';
+import { readFile } from 'node:fs/promises';
 import { fileURLToPath } from 'node:url';
 import test from 'node:test';
 import { chromium } from 'playwright';
+import { localChromiumExecutable } from './support/browser-executable.js';
 import { createServer } from 'vite';
 
 // The contract typecheck intentionally excludes TSX browser fixtures.
@@ -30,13 +29,7 @@ test('all destructive confirmation entry points use the scoped application dialo
 });
 
 test('confirmation dialog is themed, keyboard-safe, single-flight and scope fenced', { timeout: 30_000 }, async (context) => {
-  let executablePath = chromium.executablePath();
-  if (!existsSync(executablePath)) {
-    const cache = fileURLToPath(new URL('../../../../.cache/ms-playwright', import.meta.url));
-    const entries = await readdir(cache, { withFileTypes: true }).catch(() => []);
-    executablePath = entries.filter((entry) => entry.isDirectory() && entry.name.startsWith('chromium-'))
-      .map((entry) => join(cache, entry.name, 'chrome-linux64', 'chrome')).find(existsSync) ?? '';
-  }
+  const executablePath = await localChromiumExecutable();
   if (!executablePath) {
     if (process.env.MTC_REQUIRE_BROWSER === '1') throw new Error('Chromium is required for confirmation dialog acceptance');
     context.skip('Chromium is not installed');

@@ -21,10 +21,10 @@ pub use reconcile::{
     GenerationQuarantineResolution, GenerationQuarantineView, ResolveGenerationQuarantine,
 };
 pub use synchronous::{
-    AttachSynchronousImageRequestObject, FinishSynchronousImageRequest,
-    FinishSynchronousImageResult, GenerationJobIdempotency, ImageGenerationQuarantineResolution,
-    ImageGenerationQuarantineView, ResolveImageGenerationQuarantine, StartSynchronousImageRequest,
-    StartSynchronousImageResult, SynchronousImageIdempotencyClaim,
+    FinishSynchronousImageRequest, FinishSynchronousImageResult, GenerationJobIdempotency,
+    ImageGenerationQuarantineResolution, ImageGenerationQuarantineView,
+    ResolveImageGenerationQuarantine, StartSynchronousImageRequest, StartSynchronousImageResult,
+    SynchronousImageIdempotencyClaim,
 };
 
 pub(super) async fn cleanup_archive_staging_attempt_in_transaction(

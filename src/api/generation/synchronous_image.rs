@@ -1,10 +1,9 @@
+use futures_util::TryStreamExt;
+
 use super::super::*;
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(in crate::api) enum ImageResponseReadError {
-    Transport,
-    TooLarge,
-}
+pub(in crate::api) use super::super::media_body::MediaBodyReadError as ImageResponseReadError;
+use super::super::media_body::collect_bounded;
 
 pub(in crate::api) fn scoped_upstream_image_idempotency(
     pepper: &[u8],
@@ -154,92 +153,36 @@ pub(super) enum SynchronousImageUpstreamRequest {
     Codex(reqwest::RequestBuilder),
 }
 
-enum SynchronousImageUpstreamResponse {
-    Reqwest(reqwest::Response),
-    Codex(reqwest::Response),
+enum ImageUpstreamTransport {
+    Reqwest,
+    Codex,
 }
 
-impl SynchronousImageUpstreamResponse {
-    fn status(&self) -> StatusCode {
+impl ImageUpstreamTransport {
+    fn is_connect(&self, error: &reqwest::Error) -> bool {
         match self {
-            Self::Reqwest(response) => response.status(),
-            Self::Codex(response) => response.status(),
+            Self::Reqwest => error.is_connect(),
+            Self::Codex => crate::simple_http::classify_transport(error).pre_delivery(),
         }
     }
 
-    fn bytes_stream(
+    fn rejection_response(
         self,
-    ) -> std::pin::Pin<
-        Box<dyn futures_util::Stream<Item = Result<Bytes, ImageResponseReadError>> + Send>,
-    > {
+        response: reqwest::Response,
+    ) -> crate::api::proxy::upstream_response::UpstreamResponse {
+        use crate::api::proxy::upstream_response::UpstreamResponse;
         match self {
-            Self::Reqwest(response) => Box::pin(response.bytes_stream().map(|chunk| {
-                chunk.map_err(|error| {
-                    tracing::warn!(
-                        is_timeout = error.is_timeout(),
-                        is_connect = error.is_connect(),
-                        "synchronous image upstream response stream failed"
-                    );
-                    ImageResponseReadError::Transport
-                })
-            })),
-            Self::Codex(response) => Box::pin(response.bytes_stream().map(|chunk| {
-                chunk.map_err(|error| {
-                    tracing::warn!(
-                        is_timeout = error.is_timeout(),
-                        is_connect = error.is_connect(),
-                        "native Codex image response stream failed"
-                    );
-                    ImageResponseReadError::Transport
-                })
-            })),
-        }
-    }
-
-    async fn classify_rate_limit(self) -> crate::db::UpstreamFailureKind {
-        match self {
-            Self::Reqwest(response) => crate::api::classify_media_rate_limit(response).await,
-            Self::Codex(response) => {
-                crate::api::proxy::classify_codex_media_rate_limit(response).await
-            }
-        }
-    }
-}
-
-enum SynchronousImageSendError {
-    Reqwest(reqwest::Error),
-    Codex(reqwest::Error),
-}
-
-impl SynchronousImageSendError {
-    fn is_connect(&self) -> bool {
-        match self {
-            Self::Reqwest(error) => error.is_connect(),
-            Self::Codex(error) => crate::simple_http::classify_transport(error).pre_delivery(),
-        }
-    }
-
-    fn is_timeout(&self) -> bool {
-        match self {
-            Self::Reqwest(error) => error.is_timeout(),
-            Self::Codex(error) => error.is_timeout(),
+            Self::Reqwest => UpstreamResponse::Reqwest(response),
+            Self::Codex => UpstreamResponse::Codex(response),
         }
     }
 }
 
 impl SynchronousImageUpstreamRequest {
-    async fn send(self) -> Result<SynchronousImageUpstreamResponse, SynchronousImageSendError> {
+    fn into_parts(self) -> (reqwest::RequestBuilder, ImageUpstreamTransport) {
         match self {
-            Self::Reqwest(request) => request
-                .send()
-                .await
-                .map(SynchronousImageUpstreamResponse::Reqwest)
-                .map_err(SynchronousImageSendError::Reqwest),
-            Self::Codex(request) => request
-                .send()
-                .await
-                .map(SynchronousImageUpstreamResponse::Codex)
-                .map_err(SynchronousImageSendError::Codex),
+            Self::Reqwest(request) => (request, ImageUpstreamTransport::Reqwest),
+            Self::Codex(request) => (request, ImageUpstreamTransport::Codex),
         }
     }
 }
@@ -338,7 +281,7 @@ fn image_submission_state_unavailable(request_id: Uuid) -> Response {
         .expect("static submission-state headers")
 }
 
-async fn quarantine_image_request(context: &SyncImageRequest<'_>) -> Response {
+async fn quarantine_image_request(context: &SyncImageRequest<'_>) -> (Response, bool) {
     if let Err(error) = context
         .state
         .db
@@ -355,40 +298,43 @@ async fn quarantine_image_request(context: &SyncImageRequest<'_>) -> Response {
         // reconciliation action whose durable publication was not confirmed.
         tracing::warn!(request_id=%context.request_id, error_category=error.diagnostic_category(),
             "image uncertainty publication unavailable; this recovery attempt will not release or resubmit without authoritative verification");
-        return image_submission_state_unavailable(context.request_id);
+        return (
+            image_submission_state_unavailable(context.request_id),
+            false,
+        );
     }
-    uncertain_image_response(context.request_id, Some(true))
+    (
+        uncertain_image_response(context.request_id, Some(true)),
+        true,
+    )
 }
 
 pub(super) async fn execute_synchronous_image_request(
     context: &SyncImageRequest<'_>,
-    _request_body: Bytes,
-    _staged_request_object: &str,
     route: &crate::provider::ResolvedUpstream,
     request: SynchronousImageUpstreamRequest,
     response_format: ImageResponseFormat,
 ) -> Result<Response, AppError> {
     let state = context.state;
     let request_id = context.request_id;
-    if !renew_image_request_claim(context).await? {
-        return Ok(replayed_image_failure(request_id, "idempotency_claim_lost"));
-    }
     // The route lifecycle permit was acquired before the request body was read
     // and remains held by the authentication middleware through this handler.
     if !renew_image_request_claim(context).await? {
         return Ok(replayed_image_failure(request_id, "idempotency_claim_lost"));
     }
-    let mut attempt =
-        match crate::generation::group_routing::admit(state, context.tenant_id, request_id, route)
-            .await
-        {
-            Ok(attempt) => attempt,
-            Err(error) => {
-                // No request has been sent: ordinary terminal cleanup is safe.
-                let _ = fail_image_request(context, "upstream_unavailable").await?;
-                return Err(error);
-            }
-        };
+    let mut attempt = match crate::generation::group_routing::admit(
+        state,
+        context.tenant_id,
+        request_id,
+        route,
+    ) {
+        Ok(attempt) => attempt,
+        Err(error) => {
+            // No request has been sent: ordinary terminal cleanup is safe.
+            let _ = fail_image_request(context, "upstream_unavailable").await?;
+            return Err(error);
+        }
+    };
     // Archival/admission may have waited since preparation. Recheck expiry
     // before arming, while a local credential failure is still non-dispatched.
     // Preparation already attached the credential. Revalidate its lifetime,
@@ -415,6 +361,7 @@ pub(super) async fn execute_synchronous_image_request(
         .arm_state
         .store(ARM_CONFIRMED, std::sync::atomic::Ordering::Release);
     let _upstream_activity = state.metrics.active_upstream(&route.driver, "image");
+    let (request, transport) = request.into_parts();
     let upstream_result = request.send().await;
     state.metrics.observe_upstream(
         &route.driver,
@@ -428,13 +375,14 @@ pub(super) async fn execute_synchronous_image_request(
     let upstream = match upstream_result {
         Ok(response) => response,
         Err(error) => {
+            let is_connect = transport.is_connect(&error);
             tracing::warn!(
                 request_id = %request_id,
                 is_timeout = error.is_timeout(),
-                is_connect = error.is_connect(),
+                is_connect,
                 "synchronous image upstream request failed"
             );
-            let terminal = if error.is_connect() {
+            let terminal = if is_connect {
                 crate::api::MediaAttemptTerminal::Failed {
                     kind: crate::db::UpstreamFailureKind::Connection,
                     reason: crate::metrics::UpstreamHealthReason::Connection,
@@ -457,64 +405,39 @@ pub(super) async fn execute_synchronous_image_request(
             .confirmed_rejection
             .store(true, std::sync::atomic::Ordering::Release);
     }
-    if upstream_status == StatusCode::TOO_MANY_REQUESTS {
-        let kind = upstream.classify_rate_limit().await;
-        attempt
-            .complete(crate::api::MediaAttemptTerminal::Failed {
-                kind,
-                reason: crate::metrics::UpstreamHealthReason::RateLimited,
-                failure_stage: "upstream_response",
-            })
-            .await;
-        return fail_image_request(context, "upstream_http_429").await;
-    }
-    let failure = if matches!(
-        upstream_status,
-        StatusCode::UNAUTHORIZED | StatusCode::FORBIDDEN
-    ) {
-        Some((
-            crate::db::UpstreamFailureKind::Authentication,
-            crate::metrics::UpstreamHealthReason::Unavailable,
-        ))
-    } else if upstream_status.is_server_error() {
-        Some((
-            crate::db::UpstreamFailureKind::Unavailable,
-            crate::metrics::UpstreamHealthReason::Unavailable,
-        ))
-    } else {
-        None
-    };
-    if let Some((kind, reason)) = failure {
-        attempt
-            .complete(crate::api::MediaAttemptTerminal::Failed {
-                kind,
-                reason,
-                failure_stage: "upstream_response",
-            })
-            .await;
-    }
     if !upstream_status.is_success() {
-        let response = match upstream {
-            SynchronousImageUpstreamResponse::Reqwest(response)
-            | SynchronousImageUpstreamResponse::Codex(response) => response,
-        };
-        let response = crate::api::proxy::upstream_response::UpstreamResponse::from(response)
-            .with_original_archive_capture(
-                context.state,
-                crate::db::ArchiveSpoolIdentity {
-                    request_id: context.request_id,
-                    tenant_id: context.tenant_id,
-                    reservation_id: context.reservation.id,
-                },
-            );
-        let rejection = crate::api::proxy::upstream_error::read_rejection(response).await;
-        let error_code = rejection.reason().map_or_else(
-            || format!("upstream_http_{}", upstream_status.as_u16()),
-            |reason| reason.code().to_owned(),
-        );
-        let response = fail_image_request(context, &error_code).await?;
-        return crate::api::proxy::upstream_error::with_media_rejection(response, rejection.body)
-            .await;
+        let headers =
+            crate::api::proxy::upstream_error::forwarded_http_error_headers(upstream.headers());
+        // This route retains metadata only. The quota classifier returns its
+        // prefetched bytes ahead of the unread supplier stream.
+        let mut response = transport.rejection_response(upstream);
+        if upstream_status == StatusCode::TOO_MANY_REQUESTS {
+            let (prefetched, kind) = crate::api::proxy::classify_image_rate_limit(response).await;
+            response = prefetched;
+            attempt
+                .complete(crate::generation::group_routing::media_rate_limit_terminal(
+                    kind,
+                ))
+                .await;
+        } else if let Some(terminal) =
+            crate::generation::group_routing::media_rejection_terminal(upstream_status)
+        {
+            attempt.complete(terminal).await;
+        }
+        let error_code = format!("upstream_http_{}", upstream_status.as_u16());
+        let (terminal, owns_delivery) = finish_image_failure(context, &error_code).await?;
+        if !owns_delivery {
+            return Ok(terminal);
+        }
+        let mut downstream = Response::new(Body::from_stream(response.bytes_stream()));
+        *downstream.status_mut() = upstream_status;
+        *downstream.headers_mut() = headers;
+        if let Some(request_id) = terminal.headers().get(REQUEST_ID_HEADER) {
+            downstream
+                .headers_mut()
+                .insert(REQUEST_ID_HEADER, request_id.clone());
+        }
+        return Ok(downstream);
     }
     let response_bytes = match read_synchronous_image_response_bounded(upstream).await {
         Ok(bytes) => bytes,
@@ -611,27 +534,17 @@ where
     }
 }
 
-#[cfg(test)]
-pub(in crate::api) async fn read_image_response_bounded(
+pub(in crate::api) async fn read_synchronous_image_response_bounded(
     response: reqwest::Response,
 ) -> Result<Bytes, ImageResponseReadError> {
-    read_synchronous_image_response_bounded(SynchronousImageUpstreamResponse::Reqwest(response))
-        .await
-}
-
-async fn read_synchronous_image_response_bounded(
-    response: SynchronousImageUpstreamResponse,
-) -> Result<Bytes, ImageResponseReadError> {
-    let mut body = Vec::new();
-    let mut stream = response.bytes_stream();
-    while let Some(chunk) = stream.next().await {
-        let chunk = chunk?;
-        if body.len().saturating_add(chunk.len()) > MAX_IMAGE_RESPONSE {
-            return Err(ImageResponseReadError::TooLarge);
-        }
-        body.extend_from_slice(&chunk);
-    }
-    Ok(Bytes::from(body))
+    let stream = response.bytes_stream().inspect_err(|error| {
+        tracing::warn!(
+            is_timeout = error.is_timeout(),
+            is_connect = error.is_connect(),
+            "synchronous image upstream response stream failed"
+        );
+    });
+    collect_bounded(stream, MAX_IMAGE_RESPONSE).await
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -686,14 +599,17 @@ pub(super) async fn fail_image_request(
     context: &SyncImageRequest<'_>,
     error_code: &str,
 ) -> Result<Response, AppError> {
-    fail_image_request_with_staging(context, error_code, None).await
+    finish_image_failure(context, error_code)
+        .await
+        .map(|(response, _)| response)
 }
 
-async fn fail_image_request_with_staging(
+// The boolean grants delivery only when this attempt recorded the failure or
+// confirmed its own quarantine. A replay must keep its full response.
+async fn finish_image_failure(
     context: &SyncImageRequest<'_>,
     error_code: &str,
-    result_lease: Option<&crate::archive_staging::ArchiveStagingWriteLease>,
-) -> Result<Response, AppError> {
+) -> Result<(Response, bool), AppError> {
     if submission_may_have_started(context).await?
         && !context
             .confirmed_rejection
@@ -710,25 +626,12 @@ async fn fail_image_request_with_staging(
                 .invalid_response
                 .store(true, std::sync::atomic::Ordering::Release);
         }
-        // An unusable result never becomes a published asset. Hand its owned
-        // staging attempt to durable cleanup without deleting bytes here or
-        // interpreting this local cleanup as permission to refund/resubmit.
-        if let Some(lease) = result_lease
-            && let Err(error) = context
-                .state
-                .db
-                .abandon_archive_staging_attempt(lease)
-                .await
-        {
-            tracing::warn!(request_id=%context.request_id, error_category=error.diagnostic_category(),
-                "uncertain image result cleanup publication failed; lease expiry retains recovery");
-        }
         return Ok(quarantine_image_request(context).await);
     }
     let state = context.state;
     let request_id = context.request_id;
     let response_object = format!("gap://{request_id}/response");
-    let (response, cleanup_staging) = match commit_synchronous_image_terminal(
+    match commit_synchronous_image_terminal(
         context,
         502,
         0,
@@ -736,23 +639,18 @@ async fn fail_image_request_with_staging(
         Some(error_code),
         &response_object,
         &[],
-        result_lease,
+        None,
     )
     .await?
     {
         FinishSynchronousImageResult::Finished { .. } => {
-            (replayed_image_failure(request_id, error_code), false)
+            Ok((replayed_image_failure(request_id, error_code), true))
         }
-        FinishSynchronousImageResult::Replay(replay) => {
-            let cleanup = matches!(&replay, SynchronousImageIdempotencyClaim::Failed { .. });
-            (
-                image_idempotency_replay_response(state, replay).await?,
-                cleanup,
-            )
-        }
-    };
-    let _ = cleanup_staging;
-    Ok(response)
+        FinishSynchronousImageResult::Replay(replay) => Ok((
+            image_idempotency_replay_response(state, replay).await?,
+            false,
+        )),
+    }
 }
 
 async fn finish_openai_image_response(
@@ -773,10 +671,10 @@ async fn finish_openai_image_response(
         context.expected_image_count,
     ) {
         Ok(parsed) => parsed,
-        Err(super::openai_image_response::OpenAiImageParseError::InvalidJson) => {
+        Err(super::image_payload::ImageParseError::InvalidJson) => {
             return fail_image_request(context, "upstream_image_invalid_json").await;
         }
-        Err(super::openai_image_response::OpenAiImageParseError::InvalidPayload) => {
+        Err(super::image_payload::ImageParseError::InvalidPayload) => {
             return fail_image_request(context, "upstream_image_invalid_payload").await;
         }
     };
@@ -847,34 +745,15 @@ async fn finish_openai_image_response(
     } else {
         crate::generation::seal_provider_asset_reference(&provider_assets)?
     };
-    match commit_synchronous_image_terminal(
+    settle_and_deliver_image(
         context,
-        i64::from(upstream_status.as_u16()),
-        0,
-        billed_units,
-        None,
+        upstream_status,
         &response_object,
-        &[],
-        None,
+        response_segments,
+        response_len,
+        "synchronous_image_finish_openai_image_response_1",
     )
-    .await?
-    {
-        FinishSynchronousImageResult::Finished { .. } => {}
-        FinishSynchronousImageResult::Replay(replay) => {
-            return image_idempotency_replay_response(state, replay).await;
-        }
-    }
-    Response::builder()
-        .status(upstream_status)
-        .header(header::CONTENT_TYPE, "application/json")
-        .header(header::CONTENT_LENGTH, response_len)
-        .header(REQUEST_ID_HEADER, request_id.to_string())
-        .body(Body::from_stream(futures_util::stream::iter(
-            response_segments
-                .into_iter()
-                .map(Ok::<_, std::convert::Infallible>),
-        )))
-        .map_err(|_| AppError::internal("synchronous_image_finish_openai_image_response_1"))
+    .await
 }
 
 #[cfg(test)]
@@ -1096,8 +975,6 @@ async fn finish_responses_tool_image(
     bytes: Bytes,
     response_format: ImageResponseFormat,
 ) -> Result<Response, AppError> {
-    let state = context.state;
-    let request_id = context.request_id;
     let billed_units = context.billed_units;
     if !upstream_status.is_success() {
         let error_code = format!("upstream_http_{}", upstream_status.as_u16());
@@ -1108,10 +985,10 @@ async fn finish_responses_tool_image(
         _ => super::responses_tool_image::parse_responses_tool_image(&bytes),
     } {
         Ok(parsed) => parsed,
-        Err(super::responses_tool_image::ResponsesToolImageParseError::InvalidJson) => {
+        Err(super::image_payload::ImageParseError::InvalidJson) => {
             return fail_image_request(context, "upstream_image_invalid_json").await;
         }
-        Err(super::responses_tool_image::ResponsesToolImageParseError::InvalidPayload) => {
+        Err(super::image_payload::ImageParseError::InvalidPayload) => {
             return fail_image_request(context, "upstream_image_invalid_payload").await;
         }
     };
@@ -1129,13 +1006,32 @@ async fn finish_responses_tool_image(
         "result_count": 1,
         "billed_units": billed_units
     }))?;
+    settle_and_deliver_image(
+        context,
+        StatusCode::OK,
+        &response_object,
+        response_segments,
+        response_len,
+        "synchronous_image_finish_responses_tool_image_1",
+    )
+    .await
+}
+
+async fn settle_and_deliver_image(
+    context: &SyncImageRequest<'_>,
+    status: StatusCode,
+    response_object: &str,
+    segments: impl IntoIterator<Item = Bytes, IntoIter: Send + 'static> + Send,
+    response_len: usize,
+    response_error: &'static str,
+) -> Result<Response, AppError> {
     match commit_synchronous_image_terminal(
         context,
-        200,
+        i64::from(status.as_u16()),
         0,
-        billed_units,
+        context.billed_units,
         None,
-        &response_object,
+        response_object,
         &[],
         None,
     )
@@ -1143,25 +1039,23 @@ async fn finish_responses_tool_image(
     {
         FinishSynchronousImageResult::Finished { .. } => {}
         FinishSynchronousImageResult::Replay(replay) => {
-            return image_idempotency_replay_response(state, replay).await;
+            return image_idempotency_replay_response(context.state, replay).await;
         }
     }
     Response::builder()
-        .status(StatusCode::OK)
+        .status(status)
         .header(header::CONTENT_TYPE, "application/json")
         .header(header::CONTENT_LENGTH, response_len)
-        .header(REQUEST_ID_HEADER, request_id.to_string())
+        .header(REQUEST_ID_HEADER, context.request_id.to_string())
         .body(Body::from_stream(futures_util::stream::iter(
-            response_segments
-                .into_iter()
-                .map(Ok::<_, std::convert::Infallible>),
+            segments.into_iter().map(Ok::<_, std::convert::Infallible>),
         )))
-        .map_err(|_| AppError::internal("synchronous_image_finish_responses_tool_image_1"))
+        .map_err(|_| AppError::internal(response_error))
 }
 
 fn build_responses_tool_image_segments(
     bytes: Bytes,
-    parsed: super::responses_tool_image::ParsedResponsesToolImage,
+    parsed: super::image_payload::ParsedSingleImage,
     created: i64,
 ) -> Result<([Bytes; 3], usize), AppError> {
     let prefix = Bytes::from(format!(

@@ -52,6 +52,18 @@ app.kubernetes.io/managed-by: {{ .Release.Service }}
   value: {{ .Values.config.databaseMaxConnections | quote }}
 - name: MTC_DATABASE_AUX_POOL_MAX_CONNECTIONS
   value: {{ .Values.config.databaseAuxPoolMaxConnections | quote }}
+{{- if hasKey .Values.config "maxTcpConnections" }}
+- name: MTC_MAX_TCP_CONNECTIONS
+  value: {{ printf "%d" (int64 .Values.config.maxTcpConnections) | quote }}
+{{- end }}
+{{- if hasKey .Values.config "maxTcpConnectionsPerIp" }}
+- name: MTC_MAX_TCP_CONNECTIONS_PER_IP
+  value: {{ printf "%d" (int64 .Values.config.maxTcpConnectionsPerIp) | quote }}
+{{- end }}
+{{- if hasKey .Values.config "maxHttp2ConcurrentStreams" }}
+- name: MTC_MAX_HTTP2_CONCURRENT_STREAMS
+  value: {{ printf "%d" (int64 .Values.config.maxHttp2ConcurrentStreams) | quote }}
+{{- end }}
 - name: MTC_PROXY_MEMORY_BUDGET_BYTES
   value: {{ printf "%d" (int64 .Values.config.proxyMemoryBudgetBytes) | quote }}
 - name: MTC_GATEWAY_BODY_READ_CONCURRENCY

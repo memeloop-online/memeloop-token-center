@@ -199,6 +199,7 @@ pub(super) async fn prometheus_metrics(
         responses_request_spools: request_spool.active_files,
         responses_request_spool_used_bytes: request_spool.used_bytes,
         proxy_lifecycles: state.proxy_lifecycles.active(),
+        archive_activities: state.persistence.archive_activity_count(),
         proxy_archive_streams: crate::PROXY_ARCHIVE_STREAM_CONCURRENCY
             .saturating_sub(state.proxy_archive_stream_permits.available_permits()),
         plugin_cache_entries: plugin.cache_entries,

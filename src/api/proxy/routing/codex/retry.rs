@@ -1,7 +1,6 @@
 use crate::metrics::{CodexBadRequestClassification, CodexBadRequestRetry, Metrics};
 
 use super::super::super::codex_transport;
-use super::super::ProxySendError;
 
 /// Typed state for the one replay which Codex's non-persistent request
 /// contract permits. `Retried` is terminal for replay decisions, so no caller
@@ -15,7 +14,7 @@ pub(super) enum CodexRetryState {
 #[derive(Debug)]
 pub(super) enum AttemptControl {
     RetrySameAccount,
-    Return(ProxySendError),
+    Return,
 }
 
 impl CodexRetryState {
@@ -27,22 +26,6 @@ impl CodexRetryState {
         &mut self,
         disposition: codex_transport::BadRequestDisposition,
     ) -> AttemptControl {
-        let error = match disposition {
-            codex_transport::BadRequestDisposition::DefiniteRejection(reason) => {
-                ProxySendError::CodexRejection(crate::api::proxy::upstream_error::safe_error_body(
-                    serde_json::json!({"error":{"code":reason.code(),"message":reason.message()}})
-                        .to_string()
-                        .as_bytes(),
-                ))
-            }
-            codex_transport::BadRequestDisposition::DefiniteTransient => {
-                ProxySendError::RetryableCodexBadRequest
-            }
-            codex_transport::BadRequestDisposition::DefiniteOrdinary
-            | codex_transport::BadRequestDisposition::Unclassifiable(_) => {
-                ProxySendError::CodexBadRequest
-            }
-        };
         let replay_permitted = matches!(
             self,
             Self::Initial {
@@ -54,7 +37,7 @@ impl CodexRetryState {
             *self = Self::Retried;
             AttemptControl::RetrySameAccount
         } else {
-            AttemptControl::Return(error)
+            AttemptControl::Return
         }
     }
 
@@ -182,7 +165,7 @@ mod tests {
         assert_eq!(retry.outcome(), CodexRetryOutcome::Retried);
         assert!(matches!(
             retry.after_bad_request(codex_transport::BadRequestDisposition::DefiniteOrdinary),
-            AttemptControl::Return(ProxySendError::CodexBadRequest)
+            AttemptControl::Return
         ));
     }
 
@@ -191,7 +174,7 @@ mod tests {
         let mut retry = CodexRetryState::new(true);
         assert!(matches!(
             retry.after_bad_request(codex_transport::BadRequestDisposition::DefiniteOrdinary),
-            AttemptControl::Return(ProxySendError::CodexBadRequest)
+            AttemptControl::Return
         ));
         assert_eq!(retry.outcome(), CodexRetryOutcome::NotRetried);
     }
@@ -203,7 +186,7 @@ mod tests {
             retry.after_bad_request(codex_transport::BadRequestDisposition::Unclassifiable(
                 codex_transport::BadRequestUnclassifiableReason::InvalidJson,
             )),
-            AttemptControl::Return(ProxySendError::CodexBadRequest)
+            AttemptControl::Return
         ));
         assert_eq!(retry.outcome(), CodexRetryOutcome::NotRetried);
     }
@@ -213,7 +196,7 @@ mod tests {
         let mut retry = CodexRetryState::new(false);
         assert!(matches!(
             retry.after_bad_request(codex_transport::BadRequestDisposition::DefiniteTransient),
-            AttemptControl::Return(ProxySendError::RetryableCodexBadRequest)
+            AttemptControl::Return
         ));
         assert_eq!(retry.outcome(), CodexRetryOutcome::NotRetried);
     }

@@ -13,6 +13,7 @@ mod oauth;
 mod oauth_authorization_code;
 mod oauth_claude;
 mod oauth_copilot;
+mod oauth_device;
 #[cfg(test)]
 mod oauth_device_worker_tests;
 mod oauth_kimi;

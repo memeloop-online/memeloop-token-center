@@ -1494,7 +1494,7 @@ pub(super) fn histogram_p95_is_capped(duration_count: i64, buckets: &[i64; 12]) 
             < target
 }
 
-fn approximate_p95(duration_count: i64, buckets: &[i64; 12]) -> Option<i64> {
+pub(super) fn approximate_p95(duration_count: i64, buckets: &[i64; 12]) -> Option<i64> {
     if duration_count <= 0 {
         return None;
     }

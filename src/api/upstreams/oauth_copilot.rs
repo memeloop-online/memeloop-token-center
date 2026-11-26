@@ -1,9 +1,10 @@
 use super::super::*;
 use super::{
-    accounts::{
-        validate_provider_config_schema, validate_provider_schema, validate_upstream_destination,
+    accounts::validate_upstream_destination,
+    oauth_device::{
+        DeviceIdentity, DeviceProvider, PollDeviceOAuthRequest, ReadyDeviceLogin,
+        StartDeviceOAuthRequest, finish_device_login, pending,
     },
-    oauth::reauthorization_target,
 };
 use crate::oauth::copilot;
 
@@ -42,74 +43,16 @@ pub(crate) fn trigger_copilot_remint_on_auth_failure(
     });
 }
 
-#[derive(Debug, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub(in crate::api) struct StartCopilotOAuthRequest {
-    #[serde(default = "default_tenant")]
-    tenant_external_id: String,
-    account_name: String,
-    #[serde(default)]
-    upstream_account_id: Option<Uuid>,
-    #[serde(default)]
-    proxy_url: Option<String>,
-}
-
 pub(in crate::api) async fn start_copilot_oauth(
     State(state): State<AppState>,
     headers: HeaderMap,
-    Json(body): Json<StartCopilotOAuthRequest>,
+    Json(mut body): Json<StartDeviceOAuthRequest>,
 ) -> Result<impl IntoResponse, AppError> {
     let service = require_service(&headers, &state, "oauth:write").await?;
     let state = state.pin_application_plugins().await?;
-    require_service_tenant(&service, &body.tenant_external_id)?;
-    if body.upstream_account_id.is_some() && body.proxy_url.is_some() {
-        return Err(AppError::BadRequest(
-            "reauthorization cannot change the transport proxy; use the transport-proxy endpoint"
-                .into(),
-        ));
-    }
-    if let Some(proxy_url) = body.proxy_url.as_deref() {
-        require_global_service(&service)?;
-        crate::provider::validate_oauth_remote_dns_proxy_url(
-            proxy_url,
-            state.config.allow_oauth_loopback,
-        )?;
-    }
-    let provider_config = if let Some(account_id) = body.upstream_account_id {
-        state
-            .db
-            .upstream_account_for_reauthorization(account_id, &body.tenant_external_id)
-            .await?
-            .config
-    } else {
-        json!({"base_url": copilot::BASE_URL, "network_scope": "public"})
-    };
-    validate_provider_config_schema(&state, copilot::PROVIDER_DRIVER, &provider_config)?;
-    let reauthorize = reauthorization_target(
-        &state,
-        body.upstream_account_id,
-        &body.tenant_external_id,
-        &body.account_name,
-        copilot::PROVIDER_DRIVER,
-        &provider_config,
-        copilot::OAUTH_DRIVER,
-    )
-    .await?;
-    let session_proxy_url = if let Some(target) = reauthorize.as_ref() {
-        state
-            .db
-            .upstream_oauth_reauthorization_proxy_snapshot(
-                target.account_id,
-                &body.tenant_external_id,
-                target.expected_updated_at,
-                target.expected_credential_generation,
-                copilot::OAUTH_DRIVER,
-                state.config.key_pepper.as_bytes(),
-            )
-            .await?
-    } else {
-        body.proxy_url
-    };
+    let (provider_config, reauthorize, session_proxy_url) = DeviceProvider::Copilot
+        .prepare_start(&state, &service, &mut body)
+        .await?;
     if let Some(proxy_url) = session_proxy_url.as_deref() {
         crate::provider::validate_oauth_remote_dns_proxy_url(
             proxy_url,
@@ -138,16 +81,10 @@ pub(in crate::api) async fn start_copilot_oauth(
     ))
 }
 
-#[derive(Debug, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub(in crate::api) struct PollCopilotOAuthRequest {
-    session_token: String,
-}
-
 pub(in crate::api) async fn poll_copilot_oauth(
     State(state): State<AppState>,
     headers: HeaderMap,
-    Json(body): Json<PollCopilotOAuthRequest>,
+    Json(body): Json<PollDeviceOAuthRequest>,
 ) -> Result<Response, AppError> {
     let service = require_service(&headers, &state, "oauth:write").await?;
     let state = state.pin_application_plugins().await?;
@@ -167,120 +104,31 @@ pub(in crate::api) async fn poll_copilot_oauth(
     {
         copilot::CopilotDevicePollResult::Pending {
             retry_after_seconds,
-        } => Ok((
-            StatusCode::ACCEPTED,
-            Json(json!({
-                "status": "pending",
-                "retry_after_seconds": retry_after_seconds
-            })),
-        )
-            .into_response()),
+        } => Ok(pending(retry_after_seconds)),
         copilot::CopilotDevicePollResult::Consumed {
             account_id,
             tenant_external_id,
         } => {
-            require_service_tenant(&service, &tenant_external_id)?;
-            let account = state
-                .db
-                .upstream_account_for_reauthorization(account_id, &tenant_external_id)
-                .await?;
-            Ok((
-                StatusCode::OK,
-                Json(super::config_secrets::public_account(&state, account)?),
-            )
-                .into_response())
+            DeviceProvider::Copilot
+                .consumed(&state, &service, account_id, &tenant_external_id)
+                .await
         }
         copilot::CopilotDevicePollResult::Ready { lease_owner, login } => {
-            finish_copilot_login(&state, &service, lease_owner, *login).await
+            finish_device_login(
+                &state,
+                &service,
+                lease_owner,
+                ReadyDeviceLogin {
+                    session_id: login.session_id,
+                    tenant_external_id: login.tenant_external_id,
+                    account_name: login.account_name,
+                    provider_config: login.provider_config,
+                    credential: login.credential,
+                    reauthorize: login.reauthorize,
+                    identity: DeviceIdentity::Copilot(login.stable_account_id),
+                },
+            )
+            .await
         }
     }
-}
-
-async fn finish_copilot_login(
-    state: &AppState,
-    service: &AuthenticatedService,
-    lease_owner: Uuid,
-    ready: copilot::ReadyCopilotDeviceLogin,
-) -> Result<Response, AppError> {
-    require_service_tenant(service, &ready.tenant_external_id)?;
-    validate_provider_schema(
-        state,
-        copilot::PROVIDER_DRIVER,
-        &ready.provider_config,
-        &ready.credential,
-    )?;
-    validate_upstream_destination(
-        copilot::PROVIDER_DRIVER,
-        &ready.provider_config,
-        service,
-        state,
-    )
-    .await?;
-    let reauthorizing = ready.reauthorize.is_some();
-    let account = match ready.reauthorize {
-        Some(target) => {
-            let current = state
-                .db
-                .upstream_oauth_identity_credential(
-                    target.account_id,
-                    state.config.key_pepper.as_bytes(),
-                )
-                .await?;
-            if copilot::copilot_account_id(&current)? != ready.stable_account_id {
-                return Err(AppError::Conflict(
-                    "reauthorization must use the same GitHub account".into(),
-                ));
-            }
-            state
-                .db
-                .reauthorize_upstream_account(
-                    target.account_id,
-                    ReauthorizeUpstreamAccountInput {
-                        tenant_external_id: ready.tenant_external_id,
-                        expected_updated_at: target.expected_updated_at,
-                        expected_credential_generation: target.expected_credential_generation,
-                        driver: copilot::PROVIDER_DRIVER.to_owned(),
-                        oauth_session_id: ready.session_id,
-                        oauth_driver: copilot::OAUTH_DRIVER.to_owned(),
-                        oauth_refresh_url: Some(copilot::TOKEN_ENDPOINT.to_owned()),
-                        provider_config: Some(ready.provider_config),
-                        credential: ready.credential,
-                    },
-                    state.config.key_pepper.as_bytes(),
-                )
-                .await?
-        }
-        None => {
-            state
-                .db
-                .create_upstream_account(
-                    CreateUpstreamAccountInput {
-                        tenant_external_id: ready.tenant_external_id,
-                        name: ready.account_name,
-                        driver: copilot::PROVIDER_DRIVER.to_owned(),
-                        config: ready.provider_config,
-                        credential: ready.credential,
-                        oauth_session_id: Some(ready.session_id),
-                        oauth_driver: Some(copilot::OAUTH_DRIVER.to_owned()),
-                        oauth_refresh_url: Some(copilot::TOKEN_ENDPOINT.to_owned()),
-                    },
-                    state.config.key_pepper.as_bytes(),
-                )
-                .await?
-        }
-    };
-    state
-        .db
-        .finish_oauth_login_session(ready.session_id, lease_owner, account.id, unix_millis())
-        .await?;
-    super::trigger_upstream_model_sync(state.clone(), account.id);
-    Ok((
-        if reauthorizing {
-            StatusCode::OK
-        } else {
-            StatusCode::CREATED
-        },
-        Json(super::config_secrets::public_account(state, account)?),
-    )
-        .into_response())
 }

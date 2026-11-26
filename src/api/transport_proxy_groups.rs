@@ -63,7 +63,19 @@ pub(super) async fn transport_group_headers(request: Request, next: Next) -> Res
         || path.starts_with("/internal/v1/transport-proxy-groups/")
         || (path.starts_with("/internal/v1/upstreams/")
             && path.ends_with("/transport-proxy-group"));
-    let response = next.run(request).await;
+    let proxy_settings_read = request.method() == axum::http::Method::GET
+        && path
+            .strip_prefix("/internal/v1/upstreams/")
+            .and_then(|rest| rest.split_once('/'))
+            .is_some_and(|(_, endpoint)| endpoint == "transport-proxy");
+    let mut response = next.run(request).await;
+    if proxy_settings_read {
+        response.headers_mut().insert(
+            header::CACHE_CONTROL,
+            HeaderValue::from_static("private, no-store"),
+        );
+        return response;
+    }
     if managed {
         transport_group_response(response).await
     } else {

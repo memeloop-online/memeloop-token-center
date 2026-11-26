@@ -1,16 +1,14 @@
 import assert from 'node:assert/strict';
-import { existsSync, mkdirSync } from 'node:fs';
+import { mkdirSync } from 'node:fs';
 import { fileURLToPath } from 'node:url';
 import test from 'node:test';
 import { chromium } from 'playwright';
+import { hasDefaultChromium } from './support/browser-executable.js';
 import { createServer } from 'vite';
 import type {} from './fixtures/session-tasks-state.js';
 
-test('session tasks: CAS rename protects concurrent names, relations manage, rollup scopes switch', { timeout: 60_000 }, async () => {
-  if (!existsSync(chromium.executablePath())) {
-    if (process.env.MTC_REQUIRE_BROWSER === '1') throw new Error('Chromium required');
-    return test.skip('Chromium required');
-  }
+test('session tasks: CAS rename protects concurrent names, relations manage, rollup scopes switch', { timeout: 60_000 }, async (context) => {
+  if (!hasDefaultChromium(context)) return;
   const server = await createServer({ root: fileURLToPath(new URL('..', import.meta.url)), configFile: false, logLevel: 'silent', server: { host: '127.0.0.1', port: 0 } });
   await server.listen();
   const address = server.httpServer?.address();

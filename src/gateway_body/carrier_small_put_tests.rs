@@ -1,9 +1,7 @@
 //! Real S3 operation/identity contracts; only synthetic fixture bytes are used.
 use super::*;
 use crate::archive_staging::{ArchiveStagingOwner, ArchiveStagingPurpose};
-#[path = "../../tests/support/recovery_object_proxy.rs"]
-mod recovery_proxy;
-use recovery_proxy::RecoveryObjectProxy;
+use crate::recovery_object_proxy::RecoveryObjectProxy;
 
 fn key() -> ArchiveStagingKey {
     ArchiveStagingKey::new(

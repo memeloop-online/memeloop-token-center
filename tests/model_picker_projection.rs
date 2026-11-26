@@ -550,6 +550,24 @@ async fn exercise_database_projection(state: &AppState, label: &str, database_ur
     assert_eq!(case_variants.len(), 2);
     assert_eq!(case_variants[0].value, "Case-Variant");
     assert_eq!(case_variants[1].value, "case-variant");
+
+    let mut after_uppercase_variant = projection_filter(
+        &fixture,
+        ModelPickerSelectionKind::Model,
+        "case-variant",
+        &[],
+        &public_provider_ids,
+    );
+    after_uppercase_variant.after_sort_label = "case-variant";
+    after_uppercase_variant.after_identity = "Case-Variant";
+    after_uppercase_variant.limit = 1;
+    let next_page = state
+        .db
+        .model_picker_projection(after_uppercase_variant)
+        .await
+        .expect("case-variant cursor continuation");
+    assert_eq!(next_page.len(), 1);
+    assert_eq!(next_page[0].value, "case-variant");
 }
 
 #[tokio::test]

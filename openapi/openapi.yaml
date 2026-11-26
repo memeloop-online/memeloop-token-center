@@ -73,7 +73,7 @@ paths:
   /internal/v1/transport-proxies/{proxy_id}/observations: {"get":{"tags":["Upstream providers"],"operationId":"getNetworkProxyObservations","security":[{"serviceBearer":[]}],"x-required-scope":"requests:read","parameters":[{"name":"proxy_id","in":"path","required":true,"schema":{"type":"string","format":"uuid"}},{"$ref":"#/components/parameters/RequiredTenant"},{"name":"start","in":"query","required":true,"schema":{"type":"integer","format":"int64"}},{"name":"end","in":"query","required":true,"schema":{"type":"integer","format":"int64"}}],"responses":{"200":{"description":"Private, no-store. Background application and observations are asynchronous.","headers":{"Cache-Control":{"schema":{"type":"string","const":"private, no-store"}}},"content":{"application/json":{"schema":{"type":"object"}}}},"400":{"$ref":"#/components/responses/InvalidRequest"},"401":{"$ref":"#/components/responses/Unauthorized"},"403":{"$ref":"#/components/responses/Forbidden"},"404":{"$ref":"#/components/responses/NotFound"},"409":{"description":"Configuration or selection version conflict."}}}}
   /internal/v1/transport-proxies/{proxy_id}/probe: {"post":{"tags":["Upstream providers"],"operationId":"probeNetworkProxy","security":[{"serviceBearer":[]}],"x-required-scope":"providers:write","parameters":[{"name":"proxy_id","in":"path","required":true,"schema":{"type":"string","format":"uuid"}}],"requestBody":{"required":true,"content":{"application/json":{"schema":{"type":"object","additionalProperties":false,"required":["tenant_external_id","expected_version"],"properties":{"tenant_external_id":{"type":"string"},"expected_version":{"type":"integer","minimum":1}}}}}},"responses":{"202":{"description":"Private, no-store. Background application and observations are asynchronous.","headers":{"Cache-Control":{"schema":{"type":"string","const":"private, no-store"}}},"content":{"application/json":{"schema":{"type":"object"}}}},"400":{"$ref":"#/components/responses/InvalidRequest"},"401":{"$ref":"#/components/responses/Unauthorized"},"403":{"$ref":"#/components/responses/Forbidden"},"404":{"$ref":"#/components/responses/NotFound"},"409":{"description":"Configuration or selection version conflict."}}}}
   /internal/v1/transport-proxy-strategies: {"get":{"tags":["Upstream providers"],"operationId":"listNetworkProxyStrategies","security":[{"serviceBearer":[]}],"x-required-scope":"providers:write","parameters":[{"$ref":"#/components/parameters/RequiredTenant"}],"responses":{"200":{"description":"Private, no-store. Background application and observations are asynchronous.","headers":{"Cache-Control":{"schema":{"type":"string","const":"private, no-store"}}},"content":{"application/json":{"schema":{"type":"object"}}}},"400":{"$ref":"#/components/responses/InvalidRequest"},"401":{"$ref":"#/components/responses/Unauthorized"},"403":{"$ref":"#/components/responses/Forbidden"},"404":{"$ref":"#/components/responses/NotFound"},"409":{"description":"Configuration or selection version conflict."}}}}
-  /internal/v1/upstreams/{account_id}/transport-proxy-selection: {"get":{"tags":["Upstream providers"],"operationId":"getNetworkProxySelection","security":[{"serviceBearer":[]}],"x-required-scope":"providers:write","parameters":[{"name":"account_id","in":"path","required":true,"schema":{"type":"string","format":"uuid"}},{"$ref":"#/components/parameters/RequiredTenant"}],"responses":{"200":{"description":"Private, no-store. Background application and observations are asynchronous.","headers":{"Cache-Control":{"schema":{"type":"string","const":"private, no-store"}}},"content":{"application/json":{"schema":{"type":"object"}}}},"400":{"$ref":"#/components/responses/InvalidRequest"},"401":{"$ref":"#/components/responses/Unauthorized"},"403":{"$ref":"#/components/responses/Forbidden"},"404":{"$ref":"#/components/responses/NotFound"},"409":{"description":"Configuration or selection version conflict."}}},"put":{"tags":["Upstream providers"],"operationId":"updateNetworkProxySelection","security":[{"serviceBearer":[]}],"x-required-scope":"providers:write","parameters":[{"name":"account_id","in":"path","required":true,"schema":{"type":"string","format":"uuid"}}],"requestBody":{"required":true,"content":{"application/json":{"schema":{"type":"object","additionalProperties":false,"required":["tenant_external_id","expected_selection_version","expected_binding_version","expected_credential_generation","expected_updated_at","mode"],"properties":{"tenant_external_id":{"type":"string"},"mode":{"type":"string","enum":["manual","auto","plugin"]},"plugin_id":{"type":"string"},"plugin_version":{"type":"string"},"expected_selection_version":{"type":"integer"},"expected_binding_version":{"type":"integer"},"expected_credential_generation":{"type":"integer"},"expected_updated_at":{"type":"integer"},"expected_group_version":{"type":"integer"},"proxy_id":{"type":"string","format":"uuid"},"group_id":{"type":"string","format":"uuid"},"config":{"type":"object"}}}}}},"responses":{"202":{"description":"Private, no-store. Background application and observations are asynchronous.","headers":{"Cache-Control":{"schema":{"type":"string","const":"private, no-store"}}},"content":{"application/json":{"schema":{"type":"object"}}}},"400":{"$ref":"#/components/responses/InvalidRequest"},"401":{"$ref":"#/components/responses/Unauthorized"},"403":{"$ref":"#/components/responses/Forbidden"},"404":{"$ref":"#/components/responses/NotFound"},"409":{"description":"Configuration or selection version conflict."}}}}
+  /internal/v1/upstreams/{account_id}/transport-proxy-selection: {"put":{"tags":["Upstream providers"],"operationId":"updateNetworkProxySelection","security":[{"serviceBearer":[]}],"x-required-scope":"providers:write","parameters":[{"name":"account_id","in":"path","required":true,"schema":{"type":"string","format":"uuid"}}],"requestBody":{"required":true,"content":{"application/json":{"schema":{"type":"object","additionalProperties":false,"required":["tenant_external_id","expected_selection_version","expected_binding_version","expected_credential_generation","expected_updated_at","mode"],"properties":{"tenant_external_id":{"type":"string"},"mode":{"type":"string","enum":["manual","auto","plugin"]},"plugin_id":{"type":"string"},"plugin_version":{"type":"string"},"expected_selection_version":{"type":"integer"},"expected_binding_version":{"type":"integer"},"expected_credential_generation":{"type":"integer"},"expected_updated_at":{"type":"integer"},"expected_group_version":{"type":"integer"},"proxy_id":{"type":"string","format":"uuid"},"group_id":{"type":"string","format":"uuid"},"config":{"type":"object"}}}}}},"responses":{"202":{"description":"Private, no-store. Background application and observations are asynchronous.","headers":{"Cache-Control":{"schema":{"type":"string","const":"private, no-store"}}},"content":{"application/json":{"schema":{"$ref":"#/components/schemas/NetworkProxySelection"}}}},"400":{"$ref":"#/components/responses/InvalidRequest"},"401":{"$ref":"#/components/responses/Unauthorized"},"403":{"$ref":"#/components/responses/Forbidden"},"404":{"$ref":"#/components/responses/NotFound"},"409":{"description":"Configuration or selection version conflict."}}},"get":{"tags":["Upstream providers"],"operationId":"getNetworkProxySelection","security":[{"serviceBearer":[]}],"x-required-scope":"providers:write","parameters":[{"name":"account_id","in":"path","required":true,"schema":{"type":"string","format":"uuid"}},{"$ref":"#/components/parameters/RequiredTenant"}],"responses":{"200":{"description":"Private, no-store. Background application and observations are asynchronous.","headers":{"Cache-Control":{"schema":{"type":"string","const":"private, no-store"}}},"content":{"application/json":{"schema":{"type":"object"}}}},"400":{"$ref":"#/components/responses/InvalidRequest"},"401":{"$ref":"#/components/responses/Unauthorized"},"403":{"$ref":"#/components/responses/Forbidden"},"404":{"$ref":"#/components/responses/NotFound"},"409":{"description":"Configuration or selection version conflict."}}}}
   /internal/v1/transport-proxies: {"get":{"tags":["Upstream providers"],"operationId":"listNetworkProxies","summary":"list Network Proxies","security":[{"serviceBearer":[]}],"x-required-scope":"providers:write","parameters":[{"$ref":"#/components/parameters/RequiredTenant"}],"responses":{"200":{"description":"Private, no-store. Proxy credentials are never returned.","headers":{"Cache-Control":{"schema":{"type":"string","const":"private, no-store"}}},"content":{"application/json":{"schema":{"type":"object"}}}},"400":{"$ref":"#/components/responses/InvalidRequest"},"401":{"$ref":"#/components/responses/Unauthorized"},"403":{"$ref":"#/components/responses/Forbidden"},"404":{"$ref":"#/components/responses/NotFound"},"409":{"description":"Version conflict, duplicate name, or referenced proxy."}}},"post":{"tags":["Upstream providers"],"operationId":"createNetworkProxy","summary":"create Network Proxy","security":[{"serviceBearer":[]}],"x-required-scope":"providers:write","parameters":[],"requestBody":{"required":true,"content":{"application/json":{"schema":{"type":"object","additionalProperties":false,"required":["tenant_external_id","name","proxy_url"],"properties":{"tenant_external_id":{"type":"string"},"name":{"type":"string","minLength":1,"maxLength":64},"proxy_url":{"type":"string","writeOnly":true},"probe":{"type":"object","additionalProperties":false,"required":["enabled","target_url","interval_ms","attempts"],"properties":{"enabled":{"type":"boolean"},"target_url":{"type":"string","format":"uri","maxLength":2048},"interval_ms":{"type":"integer","minimum":10000,"maximum":3600000},"attempts":{"type":"integer","minimum":1,"maximum":8}}}}}}}},"responses":{"201":{"description":"Private, no-store. Proxy credentials are never returned.","headers":{"Cache-Control":{"schema":{"type":"string","const":"private, no-store"}}},"content":{"application/json":{"schema":{"type":"object"}}}},"400":{"$ref":"#/components/responses/InvalidRequest"},"401":{"$ref":"#/components/responses/Unauthorized"},"403":{"$ref":"#/components/responses/Forbidden"},"404":{"$ref":"#/components/responses/NotFound"},"409":{"description":"Version conflict, duplicate name, or referenced proxy."}}}}
   /internal/v1/transport-proxies/{proxy_id}: {"get":{"tags":["Upstream providers"],"operationId":"getNetworkProxy","summary":"get Network Proxy","security":[{"serviceBearer":[]}],"x-required-scope":"providers:write","parameters":[{"name":"proxy_id","in":"path","required":true,"schema":{"type":"string","format":"uuid"}},{"$ref":"#/components/parameters/RequiredTenant"}],"responses":{"200":{"description":"Private, no-store. Proxy credentials are never returned.","headers":{"Cache-Control":{"schema":{"type":"string","const":"private, no-store"}}},"content":{"application/json":{"schema":{"type":"object"}}}},"400":{"$ref":"#/components/responses/InvalidRequest"},"401":{"$ref":"#/components/responses/Unauthorized"},"403":{"$ref":"#/components/responses/Forbidden"},"404":{"$ref":"#/components/responses/NotFound"},"409":{"description":"Version conflict, duplicate name, or referenced proxy."}}},"put":{"tags":["Upstream providers"],"operationId":"updateNetworkProxy","summary":"update Network Proxy","security":[{"serviceBearer":[]}],"x-required-scope":"providers:write","parameters":[{"name":"proxy_id","in":"path","required":true,"schema":{"type":"string","format":"uuid"}}],"requestBody":{"required":true,"content":{"application/json":{"schema":{"type":"object","additionalProperties":false,"required":["tenant_external_id","expected_version","name"],"properties":{"tenant_external_id":{"type":"string"},"expected_version":{"type":"integer","minimum":1},"name":{"type":"string"},"proxy_url":{"type":"string","writeOnly":true},"probe":{"type":"object","additionalProperties":false,"required":["enabled","target_url","interval_ms","attempts"],"properties":{"enabled":{"type":"boolean"},"target_url":{"type":"string","format":"uri","maxLength":2048},"interval_ms":{"type":"integer","minimum":10000,"maximum":3600000},"attempts":{"type":"integer","minimum":1,"maximum":8}}}}}}}},"responses":{"200":{"description":"Private, no-store. Proxy credentials are never returned.","headers":{"Cache-Control":{"schema":{"type":"string","const":"private, no-store"}}},"content":{"application/json":{"schema":{"type":"object"}}}},"400":{"$ref":"#/components/responses/InvalidRequest"},"401":{"$ref":"#/components/responses/Unauthorized"},"403":{"$ref":"#/components/responses/Forbidden"},"404":{"$ref":"#/components/responses/NotFound"},"409":{"description":"Version conflict, duplicate name, or referenced proxy."}}},"delete":{"tags":["Upstream providers"],"operationId":"deleteNetworkProxy","summary":"delete Network Proxy","security":[{"serviceBearer":[]}],"x-required-scope":"providers:write","parameters":[{"name":"proxy_id","in":"path","required":true,"schema":{"type":"string","format":"uuid"}}],"requestBody":{"required":true,"content":{"application/json":{"schema":{"type":"object","additionalProperties":false,"required":["tenant_external_id","expected_version"],"properties":{"tenant_external_id":{"type":"string"},"expected_version":{"type":"integer","minimum":1}}}}}},"responses":{"204":{"description":"Private, no-store. Proxy credentials are never returned.","headers":{"Cache-Control":{"schema":{"type":"string","const":"private, no-store"}}}},"400":{"$ref":"#/components/responses/InvalidRequest"},"401":{"$ref":"#/components/responses/Unauthorized"},"403":{"$ref":"#/components/responses/Forbidden"},"404":{"$ref":"#/components/responses/NotFound"},"409":{"description":"Version conflict, duplicate name, or referenced proxy."}}}}
   /healthz:
@@ -2906,7 +2906,8 @@ paths:
         proxies and verifies the explicitly selected tenant owns the account.
         Returns effective policy-backed proxy settings and account CAS revisions,
         including proxy username and password where configured. Never returns
-        API keys, OAuth access/refresh tokens, adapter state or configuration.
+        API keys, OAuth access/refresh tokens, adapter state or provider account
+        configuration. The selection includes transport proxy strategy configuration.
         Works for supported OAuth and API-key proxy credentials. An unconfigured
         proxy is null. Ordinary account lists remain sanitized. No upstream
         connection, probe, refresh or mutation is performed.
@@ -2924,7 +2925,7 @@ paths:
               schema:
                 type: object
                 additionalProperties: false
-                required: [account_id, proxy_url, proxy_network_scope, updated_at, credential_generation, supported, source, proxy_id, group_id, selected_member_id, configuration_state]
+                required: [account_id, proxy_url, proxy_network_scope, updated_at, credential_generation, supported, source, proxy_id, group_id, selected_member_id, configuration_state, selection]
                 properties:
                   account_id: { type: string, format: uuid }
                   proxy_url: { type: [string, 'null'] }
@@ -2936,6 +2937,7 @@ paths:
                   proxy_id: {"type":["string","null"],"format":"uuid"}
                   group_id: {"type":["string","null"],"format":"uuid"}
                   selected_member_id: {"type":["string","null"],"format":"uuid"}
+                  selection: { $ref: '#/components/schemas/NetworkProxySelection' }
                   configuration_state: {"type":"string","enum":["credential","applied","pending"]}
         '400': { $ref: '#/components/responses/InvalidRequest' }
         '401': { $ref: '#/components/responses/Unauthorized' }
@@ -7619,12 +7621,13 @@ paths:
             schema: { $ref: '#/components/schemas/OpenAIChatRequest' }
       responses:
         '200': { $ref: '#/components/responses/ProxySuccess' }
-        '400': { $ref: '#/components/responses/InvalidRequest' }
-        '401': { $ref: '#/components/responses/Unauthorized' }
-        '403': { $ref: '#/components/responses/Forbidden' }
-        '424': { $ref: '#/components/responses/UnpricedModel' }
-        '429': { $ref: '#/components/responses/UsageRejected' }
-        '502': { $ref: '#/components/responses/UpstreamError' }
+        '400': { $ref: '#/components/responses/TextProxyErrorOrUpstreamRejection' }
+        '401': { $ref: '#/components/responses/TextProxyErrorOrUpstreamRejection' }
+        '403': { $ref: '#/components/responses/TextProxyErrorOrUpstreamRejection' }
+        '424': { $ref: '#/components/responses/TextProxyErrorOrUpstreamRejection' }
+        '429': { $ref: '#/components/responses/TextProxyErrorOrUpstreamRejection' }
+        '502': { $ref: '#/components/responses/TextProxyErrorOrUpstreamRejection' }
+        default: { $ref: '#/components/responses/TextProxyErrorOrUpstreamRejection' }
 
   /v1/responses:
     get:
@@ -7656,12 +7659,13 @@ paths:
             schema: { $ref: '#/components/schemas/OpenAIResponseRequest' }
       responses:
         '200': { $ref: '#/components/responses/ProxySuccess' }
-        '400': { $ref: '#/components/responses/InvalidRequest' }
-        '401': { $ref: '#/components/responses/Unauthorized' }
-        '403': { $ref: '#/components/responses/Forbidden' }
-        '424': { $ref: '#/components/responses/UnpricedModel' }
-        '429': { $ref: '#/components/responses/UsageRejected' }
-        '502': { $ref: '#/components/responses/UpstreamError' }
+        '400': { $ref: '#/components/responses/TextProxyErrorOrUpstreamRejection' }
+        '401': { $ref: '#/components/responses/TextProxyErrorOrUpstreamRejection' }
+        '403': { $ref: '#/components/responses/TextProxyErrorOrUpstreamRejection' }
+        '424': { $ref: '#/components/responses/TextProxyErrorOrUpstreamRejection' }
+        '429': { $ref: '#/components/responses/TextProxyErrorOrUpstreamRejection' }
+        '502': { $ref: '#/components/responses/TextProxyErrorOrUpstreamRejection' }
+        default: { $ref: '#/components/responses/TextProxyErrorOrUpstreamRejection' }
 
   /v1/responses/compact:
     post:
@@ -7680,12 +7684,13 @@ paths:
             schema: { $ref: '#/components/schemas/OpenAIResponseRequest' }
       responses:
         '200': { $ref: '#/components/responses/ProxySuccess' }
-        '400': { $ref: '#/components/responses/InvalidRequest' }
-        '401': { $ref: '#/components/responses/Unauthorized' }
-        '403': { $ref: '#/components/responses/Forbidden' }
-        '424': { $ref: '#/components/responses/UnpricedModel' }
-        '429': { $ref: '#/components/responses/UsageRejected' }
-        '502': { $ref: '#/components/responses/UpstreamError' }
+        '400': { $ref: '#/components/responses/TextProxyErrorOrUpstreamRejection' }
+        '401': { $ref: '#/components/responses/TextProxyErrorOrUpstreamRejection' }
+        '403': { $ref: '#/components/responses/TextProxyErrorOrUpstreamRejection' }
+        '424': { $ref: '#/components/responses/TextProxyErrorOrUpstreamRejection' }
+        '429': { $ref: '#/components/responses/TextProxyErrorOrUpstreamRejection' }
+        '502': { $ref: '#/components/responses/TextProxyErrorOrUpstreamRejection' }
+        default: { $ref: '#/components/responses/TextProxyErrorOrUpstreamRejection' }
 
   /v1/alpha/search:
     post:
@@ -7700,12 +7705,13 @@ paths:
             schema: { $ref: '#/components/schemas/OpenAIAlphaSearchRequest' }
       responses:
         '200': { $ref: '#/components/responses/ProxySuccess' }
-        '400': { $ref: '#/components/responses/InvalidRequest' }
-        '401': { $ref: '#/components/responses/Unauthorized' }
-        '403': { $ref: '#/components/responses/Forbidden' }
-        '424': { $ref: '#/components/responses/UnpricedModel' }
-        '429': { $ref: '#/components/responses/UsageRejected' }
-        '502': { $ref: '#/components/responses/UpstreamError' }
+        '400': { $ref: '#/components/responses/TextProxyErrorOrUpstreamRejection' }
+        '401': { $ref: '#/components/responses/TextProxyErrorOrUpstreamRejection' }
+        '403': { $ref: '#/components/responses/TextProxyErrorOrUpstreamRejection' }
+        '424': { $ref: '#/components/responses/TextProxyErrorOrUpstreamRejection' }
+        '429': { $ref: '#/components/responses/TextProxyErrorOrUpstreamRejection' }
+        '502': { $ref: '#/components/responses/TextProxyErrorOrUpstreamRejection' }
+        default: { $ref: '#/components/responses/TextProxyErrorOrUpstreamRejection' }
 
   /v1/embeddings:
     post:
@@ -7720,12 +7726,13 @@ paths:
             schema: { $ref: '#/components/schemas/OpenAIEmbeddingRequest' }
       responses:
         '200': { $ref: '#/components/responses/ProxySuccess' }
-        '400': { $ref: '#/components/responses/InvalidRequest' }
-        '401': { $ref: '#/components/responses/Unauthorized' }
-        '403': { $ref: '#/components/responses/Forbidden' }
-        '424': { $ref: '#/components/responses/UnpricedModel' }
-        '429': { $ref: '#/components/responses/UsageRejected' }
-        '502': { $ref: '#/components/responses/UpstreamError' }
+        '400': { $ref: '#/components/responses/TextProxyErrorOrUpstreamRejection' }
+        '401': { $ref: '#/components/responses/TextProxyErrorOrUpstreamRejection' }
+        '403': { $ref: '#/components/responses/TextProxyErrorOrUpstreamRejection' }
+        '424': { $ref: '#/components/responses/TextProxyErrorOrUpstreamRejection' }
+        '429': { $ref: '#/components/responses/TextProxyErrorOrUpstreamRejection' }
+        '502': { $ref: '#/components/responses/TextProxyErrorOrUpstreamRejection' }
+        default: { $ref: '#/components/responses/TextProxyErrorOrUpstreamRejection' }
 
   /v1/audio/transcriptions:
     post:
@@ -7806,12 +7813,13 @@ paths:
             schema: { $ref: '#/components/schemas/AnthropicMessageRequest' }
       responses:
         '200': { $ref: '#/components/responses/ProxySuccess' }
-        '400': { $ref: '#/components/responses/InvalidRequest' }
-        '401': { $ref: '#/components/responses/Unauthorized' }
-        '403': { $ref: '#/components/responses/Forbidden' }
-        '424': { $ref: '#/components/responses/UnpricedModel' }
-        '429': { $ref: '#/components/responses/UsageRejected' }
-        '502': { $ref: '#/components/responses/UpstreamError' }
+        '400': { $ref: '#/components/responses/TextProxyErrorOrUpstreamRejection' }
+        '401': { $ref: '#/components/responses/TextProxyErrorOrUpstreamRejection' }
+        '403': { $ref: '#/components/responses/TextProxyErrorOrUpstreamRejection' }
+        '424': { $ref: '#/components/responses/TextProxyErrorOrUpstreamRejection' }
+        '429': { $ref: '#/components/responses/TextProxyErrorOrUpstreamRejection' }
+        '502': { $ref: '#/components/responses/TextProxyErrorOrUpstreamRejection' }
+        default: { $ref: '#/components/responses/TextProxyErrorOrUpstreamRejection' }
 
   /v1/messages/count_tokens:
     post:
@@ -7836,12 +7844,13 @@ paths:
             schema: { $ref: '#/components/schemas/AnthropicMessageRequest' }
       responses:
         '200': { $ref: '#/components/responses/ProxySuccess' }
-        '400': { $ref: '#/components/responses/InvalidRequest' }
-        '401': { $ref: '#/components/responses/Unauthorized' }
-        '403': { $ref: '#/components/responses/Forbidden' }
-        '424': { $ref: '#/components/responses/UnpricedModel' }
-        '429': { $ref: '#/components/responses/UsageRejected' }
-        '502': { $ref: '#/components/responses/UpstreamError' }
+        '400': { $ref: '#/components/responses/TextProxyErrorOrUpstreamRejection' }
+        '401': { $ref: '#/components/responses/TextProxyErrorOrUpstreamRejection' }
+        '403': { $ref: '#/components/responses/TextProxyErrorOrUpstreamRejection' }
+        '424': { $ref: '#/components/responses/TextProxyErrorOrUpstreamRejection' }
+        '429': { $ref: '#/components/responses/TextProxyErrorOrUpstreamRejection' }
+        '502': { $ref: '#/components/responses/TextProxyErrorOrUpstreamRejection' }
+        default: { $ref: '#/components/responses/TextProxyErrorOrUpstreamRejection' }
 
   /v1/generations:
     post:
@@ -7925,6 +7934,13 @@ paths:
         `/self/v1/requests/{request_id}/assets/{asset_id}` URL. Authorized downloads stream
         from the validated provider origin with server-side credentials; media bytes, provider
         URLs, and internal references are not returned in request history or retained as assets.
+
+        On a new synchronous submission that receives an upstream HTTP rejection,
+        the client receives that status and the original response body, which may be
+        non-JSON. Token Center does not retain the rejection body. Repeating the same
+        payload and key after a recorded definitive rejection returns a local 502
+        with the original request ID and recorded error code, without another upstream
+        call or charge. That response does not reproduce the original upstream body.
       security: [{ clientBearer: [] }]
       x-idempotency-contract:
         namespace: stable-key-id
@@ -7960,13 +7976,17 @@ paths:
       responses:
         '200': { $ref: '#/components/responses/ImageSuccessOrGenerationReplay' }
         '202': { $ref: '#/components/responses/GenerationAccepted' }
-        '400': { $ref: '#/components/responses/InvalidRequest' }
-        '401': { $ref: '#/components/responses/Unauthorized' }
-        '403': { $ref: '#/components/responses/Forbidden' }
-        '409': { $ref: '#/components/responses/Conflict' }
-        '424': { $ref: '#/components/responses/UnpricedModel' }
-        '429': { $ref: '#/components/responses/UsageRejected' }
-        '502': { $ref: '#/components/responses/UpstreamError' }
+        '400': { $ref: '#/components/responses/ImageErrorOrUpstreamRejection' }
+        '401': { $ref: '#/components/responses/ImageErrorOrUpstreamRejection' }
+        '403': { $ref: '#/components/responses/ImageErrorOrUpstreamRejection' }
+        '409': { $ref: '#/components/responses/ImageErrorOrUpstreamRejection' }
+        '424': { $ref: '#/components/responses/ImageErrorOrUpstreamRejection' }
+        '429': { $ref: '#/components/responses/ImageErrorOrUpstreamRejection' }
+        '502': { $ref: '#/components/responses/ImageErrorOrUpstreamRejection' }
+        default:
+          description: Current synchronous upstream HTTP rejection with the original response body.
+          content:
+            '*/*': {}
 
   /internal/v1/sessions/{session_id}/requests/{request_id}/semantic-view:
     {"get": {"tags": ["Operator traffic"], "operationId": "getOperatorSessionSemanticView", "summary": "Read a verified semantic manifest page or anchored atom stream", "description": "Ownership is checked on every read. No published root returns explicit pending coverage. Revisions are lossless decimal u64 strings; continuations bind tenant, request, revision and instance. No raw fallback.", "security": [{"serviceBearer": []}], "parameters": [{"$ref": "#/components/parameters/ContextSessionId"}, {"$ref": "#/components/parameters/RequestIdPath"}, {"$ref": "#/components/parameters/TenantFilter"}, {"$ref": "#/components/parameters/ContextKeyId"}, {"name": "cursor", "in": "query", "required": false, "description": "Signed fixed-revision page continuation; mutually exclusive with atom_cursor.", "schema": {"type": "string", "maxLength": 16384}}, {"name": "atom_cursor", "in": "query", "required": false, "description": "Signed manifest-anchored instance capability; returns verified JSON atom stream.", "schema": {"type": "string", "maxLength": 16384}}], "responses": {"200": {"description": "Published or pending semantic page, or verified atom JSON stream selected by atom_cursor.", "content": {"application/json": {"schema": {"type": "object", "additionalProperties": true}}}}, "400": {"$ref": "#/components/responses/InvalidRequest"}, "401": {"$ref": "#/components/responses/Unauthorized"}, "404": {"$ref": "#/components/responses/NotFound"}, "409": {"description": "Publication revision changed or no longer has a bound semantic root."}, "403": {"$ref": "#/components/responses/Forbidden"}}, "x-required-scope": "requests:read"}}
@@ -8574,6 +8594,18 @@ components:
       content:
         application/json:
           schema: { $ref: '#/components/schemas/GenerationJob' }
+    TextProxyErrorOrUpstreamRejection:
+      description: A gateway-generated JSON error (see ErrorResponse and UsageLimitErrorResponse) or the final upstream HTTP rejection. For a relayed rejection, the provider status and response body are preserved; the body need not be JSON or follow the gateway error schema. This does not describe errors after a successful stream has begun.
+      content:
+        application/json:
+          schema: {}
+        '*/*': {}
+    ImageErrorOrUpstreamRejection:
+      description: A local API error (ErrorResponse JSON) or the original synchronous upstream rejection body at this status.
+      content:
+        application/json:
+          schema: {}
+        '*/*': {}
     ImageSuccessOrGenerationReplay:
       description: |
         Sanitized synchronous image response, exact completed synchronous replay, or an
@@ -8588,6 +8620,7 @@ components:
           schema: { type: object, additionalProperties: true }
 
   schemas:
+    NetworkProxySelection: {"type":"object","required":["configuration_revision","account_id","tenant_external_id","selection_version","binding_version","credential_generation","account_updated_at","desired"],"properties":{"configuration_revision":{"type":["integer","null"],"format":"int64"},"account_id":{"type":"string","format":"uuid"},"tenant_external_id":{"type":"string"},"selection_version":{"type":"integer","format":"int64"},"binding_version":{"type":"integer","format":"int64"},"credential_generation":{"type":"integer","format":"int64"},"account_updated_at":{"type":"integer","format":"int64"},"desired":{"type":"object","required":["mode","proxy_id","group_id","plugin_id","plugin_version","config"],"properties":{"mode":{"type":"string","enum":["credential","manual","auto","plugin"]},"proxy_id":{"type":["string","null"],"format":"uuid"},"group_id":{"type":["string","null"],"format":"uuid"},"plugin_id":{"type":["string","null"]},"plugin_version":{"type":["string","null"]},"config":{"type":"object","description":"Transport proxy strategy configuration. Does not contain provider account configuration."}}},"applied":{"type":"object","description":"Matching process-local runtime observations, or a pending marker. May be absent if runtime state cannot be read."}}}
     "PluginBackgroundActionGrant": {
       "type": "object",
       "additionalProperties": false,

@@ -34,6 +34,17 @@ export const legacySelection: NetworkProxySelection = {
   applied: { pending: false, scope: 'this_process' },
 };
 
+/** Fixture for an account without a saved network proxy policy. */
+export function credentialProxySelection(account: { id: string; tenant_external_id: string; credential_generation: number; updated_at: number }): NetworkProxySelection {
+  return {
+    ...legacySelection,
+    account_id: account.id,
+    tenant_external_id: account.tenant_external_id,
+    credential_generation: account.credential_generation,
+    account_updated_at: account.updated_at,
+  };
+}
+
 export function proxyObservations(proxy: NetworkProxy): NetworkProxyObservations {
   return {
     proxy_id: proxy.id, proxy_version: proxy.version, observed_at: 1_793_510_500_000,

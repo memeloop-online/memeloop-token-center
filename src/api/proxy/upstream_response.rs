@@ -31,31 +31,6 @@ pub(super) fn terminal_cause_from_stream_error(
     }
 }
 
-pub(super) async fn rejected_response_terminal_cause(
-    response: UpstreamResponse,
-) -> Option<crate::model::RequestTerminalCause> {
-    let mut stream = response.bytes_stream();
-    let observed = async {
-        let mut discarded_bytes = 0usize;
-        while let Some(chunk) = stream.next().await {
-            match chunk {
-                Err(error) => return terminal_cause_from_stream_error(error),
-                Ok(bytes) => {
-                    discarded_bytes = discarded_bytes.saturating_add(bytes.len());
-                    if discarded_bytes >= 64 * 1024 {
-                        return None;
-                    }
-                }
-            }
-        }
-        None
-    };
-    tokio::time::timeout(std::time::Duration::from_millis(100), observed)
-        .await
-        .ok()
-        .flatten()
-}
-
 // The delivery reader may reject an oversized/non-JSON error or stop after a
 // terminal event. Keep ownership of its original, deadline-bearing stream so
 // that dropping that reader cannot turn the retained original into a prefix.
@@ -288,12 +263,12 @@ fn frame_evidence(
     }
 }
 
-pub(super) struct UpstreamResponseParts {
-    pub(super) status: StatusCode,
-    pub(super) headers: HeaderMap,
-    pub(super) version: Version,
-    pub(super) content_length: Option<u64>,
-    pub(super) stream: UpstreamByteStream,
+pub(in crate::api) struct UpstreamResponseParts {
+    pub(in crate::api) status: StatusCode,
+    pub(in crate::api) headers: HeaderMap,
+    pub(in crate::api) version: Version,
+    pub(in crate::api) content_length: Option<u64>,
+    pub(in crate::api) stream: UpstreamByteStream,
     pub(super) validated_compact: Option<super::routing::ValidatedCompact>,
 }
 
@@ -378,7 +353,7 @@ impl UpstreamResponse {
         }
     }
 
-    pub(super) fn into_parts(self) -> UpstreamResponseParts {
+    pub(in crate::api) fn into_parts(self) -> UpstreamResponseParts {
         let status = self.status();
         let headers = self.headers().clone();
         let version = self.version();
@@ -668,27 +643,8 @@ mod tests {
         assert!(response.into_parts().validated_compact.is_none());
     }
 
-    #[tokio::test(start_paused = true)]
-    async fn diagnostic_observation_limits_do_not_invent_terminal_causes() {
-        let silent = UpstreamResponse::Prefetched {
-            status: StatusCode::BAD_GATEWAY,
-            headers: HeaderMap::new(),
-            version: Version::HTTP_2,
-            content_length: None,
-            stream: Box::pin(stream::pending()),
-        };
-        assert_eq!(rejected_response_terminal_cause(silent).await, None);
-        let bounded = UpstreamResponse::Prefetched {
-            status: StatusCode::BAD_GATEWAY,
-            headers: HeaderMap::new(),
-            version: Version::HTTP_2,
-            content_length: None,
-            stream: Box::pin(stream::iter([
-                Ok(Bytes::from(vec![b'x'; 64 * 1024])),
-                Err(UPSTREAM_HTTP2_RESET),
-            ])),
-        };
-        assert_eq!(rejected_response_terminal_cause(bounded).await, None);
+    #[test]
+    fn diagnostic_labels_do_not_invent_terminal_causes() {
         assert_eq!(terminal_cause_from_stream_error("http_502"), None);
         assert_eq!(
             terminal_cause_from_stream_error("Bearer untrusted-diagnostic"),

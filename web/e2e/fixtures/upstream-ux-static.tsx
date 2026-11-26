@@ -23,8 +23,10 @@ window.fetch = async (input, init) => {
   if (url.pathname === '/internal/v1/transport-proxies') return Response.json({ items: [1, 2].map(id => ({ id: `static-exit-${id}`, name: `Static exit ${id}`, version: 1, tenant_external_id: 'default', address: { scheme: 'socks5h', host: `100.64.0.${15 + id}`, port: 1080, remote_dns: true, has_auth: false }, probe: { enabled: false, target_url: 'https://example.invalid/', interval_ms: 60000, attempts: 1 }, active_health: { status: 'unknown', checked_at: null, latency_ms: null, scope: 'process' }, created_at: 1, updated_at: 1 })) });
   if (url.pathname === '/internal/v1/transport-proxy-groups') return Response.json({ items: [] });
   if (url.pathname === '/internal/v1/transport-proxy-strategies') return Response.json({ items: [{ id: 'manual', version: '1', schema: { type: 'object', properties: {} }, default: {} }] });
-  if (url.pathname === '/internal/v1/upstreams/mock-account/transport-proxy-selection') return Response.json({ configuration_revision: 0, account_id: 'mock-account', tenant_external_id: 'default', selection_version: 0, binding_version: 0, credential_generation: 1, account_updated_at: 1, desired: { mode: 'manual', proxy_id: 'static-exit-1', group_id: null, plugin_id: null, plugin_version: null, config: {} }, applied: { pending: false } });
-  if (url.pathname === '/internal/v1/upstreams/mock-account/transport-proxy') return Response.json({ account_id: 'mock-account', credential_generation: 1, updated_at: 1, source: 'manual', selected_member_id: 'static-exit-1', configuration_state: 'applied', proxy_url: 'socks5h://100.64.0.16:1080' });
+  if (url.pathname === '/internal/v1/upstreams/mock-account/transport-proxy') {
+    const selection = { configuration_revision: 0, account_id: 'mock-account', tenant_external_id: 'default', selection_version: 0, binding_version: 0, credential_generation: 1, account_updated_at: 1, desired: { mode: 'manual', proxy_id: 'static-exit-1', group_id: null, plugin_id: null, plugin_version: null, config: {} }, applied: { pending: false } };
+    return Response.json({ account_id: selection.account_id, credential_generation: selection.credential_generation, updated_at: selection.account_updated_at, source: 'manual', selected_member_id: selection.desired.proxy_id, configuration_state: 'applied', proxy_url: 'socks5h://100.64.0.16:1080', selection });
+  }
   throw new Error('Unexpected static acceptance read');
 };
 const snapshot: UpstreamQuotaSnapshot = {

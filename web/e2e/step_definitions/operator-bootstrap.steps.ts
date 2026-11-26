@@ -4,7 +4,7 @@ import type { Page, Request } from 'playwright';
 
 import { eventually } from '../support/runtime.js';
 import type { DogfoodWorld } from '../support/world.js';
-import { operatorCredentialEntryForm } from './dogfood.support.js';
+import { operatorCredentialEntryForm, serviceCredentialInput } from './dogfood.support.js';
 
 interface ObservedRequest {
   credential: string;
@@ -107,7 +107,7 @@ When('操作台依次验证单租户、多租户、租户发现失败和快速�
   });
 
   await this.open('/operator?view=system-settings', { theme: 'dark', locale: 'zh-CN' });
-  const credentialInput = page.locator('.operator-credential input[type="password"]');
+  const credentialInput = serviceCredentialInput(page.locator('.operator-credential'));
   // Connecting the first credential changes the localized submit label to
   // "replace credential". The form submit control is the stable user action
   // across both authentication states.
@@ -184,19 +184,19 @@ When('操作台依次验证单租户、多租户、租户发现失败和快速�
 
   // Reproduce the shared helper's same-scenario reload: remembered auth is
   // deliberately held in flight. Its form must not qualify for a new fill
-  // until that owner has committed, even though the password input is visible.
+  // until that owner has committed, even though the credential field is visible.
   restoredTenants = deferred();
   await page.evaluate(() => localStorage.setItem('mtc.operator.service-credential.v1', 'multi-credential'));
   const restoring = page.waitForRequest(request => new URL(request.url()).pathname === '/internal/v1/tenants'
     && request.headers().authorization === 'Bearer multi-credential');
   await this.open('/operator?view=system-settings', { theme: 'dark', locale: 'zh-CN' });
   await restoring;
-  await page.locator('form.operator-credential[aria-busy="true"] input[type="password"]').waitFor();
+  await serviceCredentialInput(page.locator('form.operator-credential[aria-busy="true"]')).waitFor();
   const entryForm = operatorCredentialEntryForm(page);
   assert.equal(await entryForm.isVisible(), false, 'a visible pending-restore form does not own a new explicit connection');
   restoredTenants.resolve();
   await entryForm.waitFor({ state: 'visible' });
-  const restoredInput = entryForm.locator('input[type="password"]');
+  const restoredInput = serviceCredentialInput(entryForm);
   await restoredInput.fill('multi-credential');
   assert.equal(await restoredInput.inputValue(), 'multi-credential');
   const explicitDiscovery = page.waitForResponse(response => new URL(response.url()).pathname === '/internal/v1/tenants'

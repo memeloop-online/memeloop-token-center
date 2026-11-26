@@ -63,11 +63,14 @@ const archives = new Map<string, RequestDetail>([
     { input: [{ type: 'function_call_output', call_id: 'fixture-weather-call', output: '{"precipitation_probability":70,"temperature_c":7}' }] },
     { output: [{ type: 'message', role: 'assistant', content: [{ type: 'output_text', text: 'Rain is likely. Pack a waterproof outer layer and allow extra travel time.' }] }] },
   )],
-  ['replay-r3', archive(requests[2]!, null, null, false)],
   ['replay-r4', {
-    ...archive(requests[3]!, { input: 'must not render for this session' }, { output: [] }),
+    ...archive(requests[3]!, { input: [{ type: 'message', role: 'user', content: [{ type: 'input_text', text: 'Foreign session message' }] }] }, { output: [] }),
     session_context: { session_id: 'different-session', association: 'confirmed', session_name: null, task_kind: null, agent_id: null, semantics_source: 'declared' },
   }],
+  ['replay-r3', new URLSearchParams(location.search).has('foreign-request') ? {
+    ...archive(requests[2]!, { input: [{ type: 'message', role: 'user', content: [{ type: 'input_text', text: 'Foreign request message' }] }] }, { output: [] }),
+    request_id: 'different-request',
+  } : archive(requests[2]!, null, null, false)],
 ]);
 
 const liveFixture = new URLSearchParams(location.search).has('live');

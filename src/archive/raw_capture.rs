@@ -9,6 +9,8 @@ use crate::error::AppError;
 #[serde(deny_unknown_fields)]
 pub struct RawResponseAttempt {
     pub outbound_attempt: usize,
+    #[serde(default, skip_serializing_if = "is_primary_subattempt")]
+    pub subattempt: u8,
     pub upstream_account_id: Uuid,
     pub model_route_id: Uuid,
     pub status_code: u16,
@@ -22,13 +24,25 @@ pub struct RawResponseAttemptCapture {
     pub response: CasArchiveObject,
 }
 
-fn attempt_root(tenant: Uuid, request: Uuid, ordinal: usize) -> Result<String, AppError> {
+fn is_primary_subattempt(subattempt: &u8) -> bool {
+    *subattempt == 0
+}
+
+fn attempt_root(
+    tenant: Uuid,
+    request: Uuid,
+    ordinal: usize,
+    subattempt: u8,
+) -> Result<String, AppError> {
     if ordinal == 0 {
         return Err(AppError::BadRequest("invalid outbound attempt".into()));
     }
-    Ok(format!(
-        "tenants/{tenant}/raw/v1/{request}/attempts/{ordinal}/response.json"
-    ))
+    let directory = format!("tenants/{tenant}/raw/v1/{request}/attempts/{ordinal}");
+    Ok(if subattempt == 0 {
+        format!("{directory}/response.json")
+    } else {
+        format!("{directory}/subattempts/{subattempt}/response.json")
+    })
 }
 
 fn root(tenant: Uuid, request: Uuid, side: &str) -> Result<String, AppError> {
@@ -316,7 +330,12 @@ impl ArchiveStore {
         object: &CasArchiveObject,
     ) -> Result<(), AppError> {
         self.verify_tenant_content(tenant, object).await?;
-        let key = attempt_root(tenant, request, attempt.outbound_attempt)?;
+        let key = attempt_root(
+            tenant,
+            request,
+            attempt.outbound_attempt,
+            attempt.subattempt,
+        )?;
         let capture = RawResponseAttemptCapture {
             format_version: 1,
             attempt,
@@ -339,7 +358,12 @@ impl ArchiveStore {
             Ok(_) => Ok(()),
             Err(object_store::Error::AlreadyExists { .. }) => {
                 if self
-                    .response_attempt(tenant, request, attempt.outbound_attempt)
+                    .response_subattempt(
+                        tenant,
+                        request,
+                        attempt.outbound_attempt,
+                        attempt.subattempt,
+                    )
                     .await?
                     .as_ref()
                     == Some(&capture)
@@ -359,7 +383,17 @@ impl ArchiveStore {
         request: Uuid,
         ordinal: usize,
     ) -> Result<Option<RawResponseAttemptCapture>, AppError> {
-        let key = attempt_root(tenant, request, ordinal)?;
+        self.response_subattempt(tenant, request, ordinal, 0).await
+    }
+
+    pub(crate) async fn response_subattempt(
+        &self,
+        tenant: Uuid,
+        request: Uuid,
+        ordinal: usize,
+        subattempt: u8,
+    ) -> Result<Option<RawResponseAttemptCapture>, AppError> {
+        let key = attempt_root(tenant, request, ordinal, subattempt)?;
         match self.inner.head(&archive_path(&key)?).await {
             Err(object_store::Error::NotFound { .. }) => return Ok(None),
             Err(error) => return Err(error.into()),
@@ -368,7 +402,10 @@ impl ArchiveStore {
         let encoded = self.get_bounded(&key, 4096).await?;
         let capture: RawResponseAttemptCapture = serde_json::from_slice(&encoded)
             .map_err(|_| AppError::storage("raw_attempt_reference_invalid"))?;
-        if capture.format_version != 1 || capture.attempt.outbound_attempt != ordinal {
+        if capture.format_version != 1
+            || capture.attempt.outbound_attempt != ordinal
+            || capture.attempt.subattempt != subattempt
+        {
             return Err(AppError::storage("raw_attempt_reference_invalid"));
         }
         capture.response.validate_tenant(tenant)?;
@@ -383,7 +420,12 @@ impl ArchiveStore {
     ) -> Result<(), AppError> {
         let key = format!(
             "{}.failed",
-            attempt_root(tenant, request, attempt.outbound_attempt)?
+            attempt_root(
+                tenant,
+                request,
+                attempt.outbound_attempt,
+                attempt.subattempt
+            )?
         );
         let encoded = serde_json::to_vec(&attempt)
             .map_err(|_| AppError::internal("raw_attempt_failure_encode"))?;
@@ -668,20 +710,6 @@ mod retirement_contracts {
             .retire_covered_raw_roots(&prepared.publication, &proof)
             .await
             .unwrap();
-        let inventory = archive
-            .inventory_retired_raw(&prepared.publication)
-            .await
-            .unwrap();
-        assert_eq!(inventory.len(), 2);
-        assert!(
-            inventory
-                .iter()
-                .all(|candidate| candidate.physical_bytes > 0)
-        );
-        let batch =
-            super::super::RawGcCandidateBatch::from_candidates(inventory, Vec::new()).unwrap();
-        assert_eq!(batch.candidates.len(), 2);
-        assert!(batch.unique_physical_bytes > 0);
         let authority = archive
             .semantic_archive_authority(tenant, request, &proof.node_hash)
             .await
@@ -781,6 +809,14 @@ mod retirement_contracts {
             ));
         }
         for (side, object) in [("request", input), ("response", response)] {
+            let fence = archive
+                .raw_retirement(tenant, request, side)
+                .await
+                .unwrap()
+                .expect("each retired root has a validated retirement receipt");
+            assert_eq!(fence.semantic_revision, prepared.publication.revision);
+            assert_eq!(fence.semantic_leaf, proof.node_hash);
+            assert_eq!(fence.source, object);
             assert!(
                 archive
                     .raw_capture_reference(tenant, request, side)
@@ -865,14 +901,13 @@ mod retirement_contracts {
                 .await
                 .is_err()
         );
-        assert!(
-            archive
-                .inventory_retired_raw(&prepared.publication)
-                .await
-                .unwrap()
-                .is_empty()
-        );
         for (side, expected) in [("request", input), ("response", response)] {
+            assert!(
+                !archive
+                    .raw_capture_is_retired(tenant, request, side)
+                    .await
+                    .unwrap()
+            );
             assert_eq!(
                 archive
                     .raw_capture_reference(tenant, request, side)

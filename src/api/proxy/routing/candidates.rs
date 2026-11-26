@@ -408,9 +408,7 @@ mod tests {
             forwarded_body: Bytes::from_static(b"{}"),
             component_input_bytes: 0,
             upstream_stream: false,
-            codex_downstream_stream: false,
-            codex_store_disabled: false,
-            codex_session_id: None,
+            codex: None,
             component_request: Some((
                 PreparedProviderRequest {
                     method: reqwest::Method::POST,

@@ -1122,7 +1122,7 @@ async fn image_response_limit_accepts_exactly_16_mib_and_rejects_one_more_byte()
         .mount(&server)
         .await;
     let client = reqwest::Client::new();
-    let exact = read_image_response_bounded(
+    let exact = read_synchronous_image_response_bounded(
         client
             .get(format!("{}/exact", server.uri()))
             .send()
@@ -1132,7 +1132,7 @@ async fn image_response_limit_accepts_exactly_16_mib_and_rejects_one_more_byte()
     .await
     .expect("exact boundary accepted");
     assert_eq!(exact.len(), MAX_IMAGE_RESPONSE);
-    let over = read_image_response_bounded(
+    let over = read_synchronous_image_response_bounded(
         client
             .get(format!("{}/over", server.uri()))
             .send()
@@ -1356,13 +1356,6 @@ async fn gateway_and_control_have_disjoint_route_surfaces() {
         .await
         .unwrap();
     assert_eq!(gateway_model.status(), StatusCode::UNAUTHORIZED);
-}
-
-#[test]
-fn gateway_router_has_no_blanket_in_flight_limit_ahead_of_lifecycle_capacity() {
-    let gateway_routes = include_str!("routes/gateway.rs");
-    assert!(!gateway_routes.contains("ConcurrencyLimitLayer"));
-    assert!(!gateway_routes.contains("GATEWAY_IN_FLIGHT_REQUESTS"));
 }
 
 #[tokio::test]

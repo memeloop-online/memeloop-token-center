@@ -1063,6 +1063,10 @@ async fn cancelled_producer_fences_a_begin_that_committed_late() {
         .await
         .expect("writer begin must commit before the deterministic pause")
         .unwrap();
+    assert_eq!(state.persistence.pending_archives_for_test(), 1);
+    assert_archive_activity_metric(&state, 1);
+    let mut draining = Box::pin(state.persistence.drain());
+    assert!(futures_util::poll!(&mut draining).is_pending());
     drop(producer);
     release.send(()).unwrap();
     tokio::time::timeout(std::time::Duration::from_secs(5), fence_entered)
@@ -1070,6 +1074,12 @@ async fn cancelled_producer_fences_a_begin_that_committed_late() {
         .unwrap()
         .unwrap();
     assert_eq!(fence_probe.calls(), 1);
+    assert_eq!(state.persistence.pending_archives_for_test(), 1);
+    assert_archive_activity_metric(&state, 1);
+    assert!(
+        futures_util::poll!(&mut draining).is_pending(),
+        "failure fence must remain an owned archive activity"
+    );
     release_fence.send(()).unwrap();
     tokio::time::timeout(std::time::Duration::from_secs(1), async {
         while !state
@@ -1099,6 +1109,11 @@ async fn cancelled_producer_fences_a_begin_that_committed_late() {
             .unwrap();
     assert_eq!(spools, 0);
     assert_eq!(fence_probe.calls(), 1);
+    tokio::time::timeout(std::time::Duration::from_secs(1), draining)
+        .await
+        .unwrap();
+    assert_eq!(state.persistence.pending_archives_for_test(), 0);
+    assert_archive_activity_metric(&state, 0);
 }
 
 #[tokio::test]
@@ -1134,21 +1149,24 @@ async fn cancelled_writer_returns_success_only_when_its_single_fence_succeeds() 
         assert_eq!(
             result.is_err(),
             fail_fence,
-            "cancellation is not a database error, but a failed fence is"
+            "cancellation succeeds only when the synchronous archive fence succeeds"
         );
         assert_eq!(probe.calls(), 1);
         if fail_fence {
+            // Restore storage to inspect the raw root. The background owner
+            // can now publish the failure marker independently of the writer.
+            assert!(archive_path.is_file());
             std::fs::remove_file(&archive_path).unwrap();
             std::fs::create_dir_all(&archive_path).unwrap();
+        } else {
+            assert!(
+                state
+                    .archive
+                    .raw_capture_failed(identity.tenant_id, identity.request_id, "response")
+                    .await
+                    .unwrap()
+            );
         }
-        assert_eq!(
-            state
-                .archive
-                .raw_capture_failed(identity.tenant_id, identity.request_id, "response")
-                .await
-                .unwrap(),
-            !fail_fence
-        );
         assert!(
             state
                 .archive
@@ -1196,6 +1214,13 @@ async fn terminal_tail_survives_observer_cancellation_without_waiting_for_databa
         .seal()
         .expect("terminal handoff must not wait for SQL");
     drop(settlement);
+    assert_eq!(state.persistence.pending_archives_for_test(), 1);
+    assert_archive_activity_metric(&state, 1);
+    let mut draining = Box::pin(state.persistence.drain());
+    assert!(
+        futures_util::poll!(&mut draining).is_pending(),
+        "EOF and cancelled observer cannot hide the unacknowledged writer"
+    );
     release.send(()).unwrap();
     let object = tokio::time::timeout(std::time::Duration::from_secs(1), async {
         loop {
@@ -1233,6 +1258,11 @@ async fn terminal_tail_survives_observer_cancellation_without_waiting_for_databa
             .await
             .unwrap();
     assert_eq!(spools, 0);
+    tokio::time::timeout(std::time::Duration::from_secs(1), draining)
+        .await
+        .unwrap();
+    assert_eq!(state.persistence.pending_archives_for_test(), 0);
+    assert_archive_activity_metric(&state, 0);
 }
 
 #[tokio::test]
@@ -1548,6 +1578,13 @@ async fn exhausted_archival_credit_records_failure_without_a_prefix_root() {
         .await
         .unwrap();
     assert!(!producer.try_offer(Bytes::from_static(b"not a complete original")));
+    assert!(!producer.try_offer(Bytes::from_static(b"a later fragment")));
+    assert!(
+        state
+            .persistence
+            .render()
+            .contains("memeloop_token_center_deferred_persistence_total{outcome=\"capacity\"} 1\n")
+    );
     drop(producer);
     tokio::time::timeout(std::time::Duration::from_secs(5), async {
         while !state
@@ -1760,4 +1797,15 @@ async fn concurrent_staging_keeps_large_segments_under_source_credit_without_wor
     }
     assert_eq!(state.persistence.stream_memory.snapshot().0, 0);
     assert_eq!(state.persistence.upload_workspace.snapshot().0, 0);
+}
+
+// Exercise the same fixed series as /metrics while a real writer/fence is gated.
+fn assert_archive_activity_metric(state: &AppState, expected: usize) {
+    let rendered = state.metrics.render(&crate::metrics::RuntimeMetrics {
+        archive_activities: state.persistence.archive_activity_count(),
+        ..Default::default()
+    });
+    assert!(rendered.contains(&format!(
+        "memeloop_token_center_background_work_items{{queue=\"archive_activities\",state=\"active\"}} {expected}\n"
+    )));
 }

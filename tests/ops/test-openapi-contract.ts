@@ -15,6 +15,37 @@ const repository = resolve(dirname(fileURLToPath(import.meta.url)), "../..");
 const originalDocument = parse(readFileSync(`${repository}/openapi/openapi.yaml`, "utf8")) as Obj;
 const cloneDocument = (): Obj => structuredClone(originalDocument) as Obj;
 
+test("route creation publishes the owned idempotency replay contract", () => {
+  const { paths, components } = originalDocument;
+  const create = paths["/internal/v1/model-routes"].post;
+  assert.ok(create.parameters.some((parameter: Obj) =>
+    parameter.$ref === "#/components/parameters/RouteCreateIdempotencyKey"));
+  const key = components.parameters.RouteCreateIdempotencyKey;
+  assert.equal(key.name, "Idempotency-Key");
+  assert.equal(key.in, "header");
+  assert.equal(key.required, false);
+  assert.equal(key.schema.type, "string");
+  assert.equal(key.schema.minLength, 1);
+  assert.equal(key.schema.maxLength, 200);
+
+  for (const [status, component, values] of [
+    ["201", "RouteCreateCreatedDisposition", ["created", "equivalent_unowned"]],
+    ["200", "RouteCreateReusedDisposition", ["reused"]],
+  ] as const) {
+    assert.equal(create.responses[status].headers["X-MTC-Route-Create-Disposition"].$ref,
+      `#/components/headers/${component}`);
+    assert.equal(components.headers[component].schema.type, "string");
+    assert.deepEqual(new Set(components.headers[component].schema.enum), new Set(values));
+  }
+  assert.equal(create.responses["409"].$ref, "#/components/responses/Conflict");
+
+  assert.equal(create.requestBody.content["application/json"].schema.$ref,
+    "#/components/schemas/CreateModelRouteRequest");
+  const enabled = components.schemas.CreateModelRouteRequest.properties.enabled;
+  assert.equal(enabled.type, "boolean");
+  assert.equal(enabled.default, true);
+});
+
 // Evaluate the JSON Schema keywords used by the health payload contract.
 // This validates values (including negative cases), not only document parity.
 function healthPayloadMatches(document: Obj, schema: Obj, value: any): boolean {
@@ -526,10 +557,37 @@ test("image quarantine reconciliation never implies successful delivery or a res
     { type: "null" },
   ]);
   for (const field of ["credential", "request_object", "prompt", "routing_snapshot", "submission_nonce", "source_image"]) assert.ok(!(field in metadata.properties));
-  const api = readFileSync(`${repository}/src/api/image_generation_quarantine.rs`, "utf8");
-  assert.match(api, /service\.tenant_external_id\.as_deref\(\) != Some\(tenant\)/);
-  assert.match(api, /service\.service_id\.ok_or\(AppError::Forbidden\)/);
-  assert.match(api, /image-generation-quarantine-idempotency-v1/);
+});
+
+test("both quarantine APIs enforce shared tenant authority and keep separate idempotency domains", () => {
+  const generation = readFileSync(`${repository}/src/api/generation_quarantine.rs`, "utf8");
+  const image = readFileSync(`${repository}/src/api/image_generation_quarantine.rs`, "utf8");
+  const functionBody = (source: string, name: string) => {
+    const match = source.match(new RegExp(`^pub\\(super\\) (?:async )?fn ${name}\\([\\s\\S]*?\\{\\n([\\s\\S]*?)^}`, "m"));
+    const body = match?.[1];
+    assert.ok(body !== undefined, `missing function ${name}`);
+    return body;
+  };
+  const actor = functionBody(generation, "actor");
+  assert.match(actor, /require_service\(headers,\s*state,\s*scope\)\.await\?/);
+  assert.match(actor, /if service\.tenant_external_id\.as_deref\(\) != Some\(tenant\)\s*\{\s*return Err\(AppError::Forbidden\);/);
+  assert.match(actor, /service\.service_id\.ok_or\(AppError::Forbidden\)\?/);
+  assert.match(actor, /service\.credential_generation\.ok_or\(AppError::Forbidden\)\?/);
+  assert.match(image, /use super::generation_quarantine::\{[^}]*\bactor\b[^}]*\bidempotency_hash\b[^}]*\};/);
+  assert.match(functionBody(generation, "idempotency_hash"), /blake3::derive_key\(context,\s*pepper\)/);
+  assert.match(image, /const IDEMPOTENCY_CONTEXT: &str = "image-generation-quarantine-idempotency-v1";/);
+  for (const [source, suffix, domain] of [
+    [generation, "generation_quarantine", '"generation-quarantine-idempotency-v1"'],
+    [image, "image_generation_quarantine", "IDEMPOTENCY_CONTEXT"],
+  ] as const) {
+    for (const operation of ["list", "get"]) {
+      assert.match(functionBody(source, `${operation}_${suffix}`), /^\s*actor\(\s*&headers,\s*&state,\s*&query\.tenant_external_id,\s*"generations:quarantine:read",?\s*\)\s*\.await\?;/);
+    }
+    const resolve = functionBody(source, `resolve_${suffix}`);
+    assert.match(resolve, /^\s*let \(actor_service_id, actor_credential_generation\) = actor\(\s*&headers,\s*&state,\s*&body\.tenant_external_id,\s*"generations:reconcile",?\s*\)\s*\.await\?;/);
+    assert.match(resolve, new RegExp(`idempotency_hash\\(\\s*&headers,\\s*state\\.config\\.key_pepper\\.as_bytes\\(\\),\\s*${domain},?\\s*\\)\\?`));
+    assert.match(resolve, /\bactor_service_id,\s*actor_credential_generation,\s*idempotency_hash: &idempotency_hash,/);
+  }
 });
 
 // Discovery embeds the generated JSON; keep it semantically equal to YAML.

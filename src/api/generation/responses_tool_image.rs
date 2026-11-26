@@ -1,4 +1,4 @@
-use std::{fmt, ops::Range};
+use std::fmt;
 
 use bytes::Bytes;
 use serde::{
@@ -7,8 +7,8 @@ use serde::{
 };
 use serde_json::value::RawValue;
 
-use super::super::{MAX_IMAGE_RESPONSE, MAX_REPORTED_TOKENS};
-use super::synchronous_image::is_valid_bounded_base64;
+use super::super::MAX_REPORTED_TOKENS;
+use super::image_payload::{ImageParseError, ParsedSingleImage, SingleImageScan};
 
 const MAX_JSON_DEPTH: usize = 128;
 
@@ -50,31 +50,6 @@ impl SanitizedImageUsage {
     }
 }
 
-pub(super) struct ParsedResponsesToolImage {
-    pub(super) image_range: Range<usize>,
-    pub(super) usage: Option<SanitizedImageUsage>,
-}
-
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub(super) enum ResponsesToolImageParseError {
-    InvalidJson,
-    InvalidPayload,
-}
-
-struct ImageScan<'input> {
-    image: Option<&'input str>,
-}
-
-impl<'input> ImageScan<'input> {
-    fn record(&mut self, image: &'input str) -> Result<(), ParseError> {
-        if self.image.is_some() || !is_valid_bounded_base64(image, MAX_IMAGE_RESPONSE) {
-            return Err(ParseError);
-        }
-        self.image = Some(image);
-        Ok(())
-    }
-}
-
 #[derive(Clone, Copy, Debug)]
 struct ParseError;
 
@@ -88,8 +63,8 @@ impl std::error::Error for ParseError {}
 
 pub(super) fn parse_responses_tool_image(
     bytes: &Bytes,
-) -> Result<ParsedResponsesToolImage, ResponsesToolImageParseError> {
-    let mut scan = ImageScan { image: None };
+) -> Result<ParsedSingleImage, ImageParseError> {
+    let mut scan = SingleImageScan::default();
     let mut deserializer = serde_json::Deserializer::from_slice(bytes);
     let usage = RootSeed { scan: &mut scan }
         .deserialize(&mut deserializer)
@@ -97,30 +72,12 @@ pub(super) fn parse_responses_tool_image(
             deserializer.end()?;
             Ok(usage)
         })
-        .map_err(|error| match error.classify() {
-            serde_json::error::Category::Syntax | serde_json::error::Category::Eof => {
-                ResponsesToolImageParseError::InvalidJson
-            }
-            serde_json::error::Category::Data | serde_json::error::Category::Io => {
-                ResponsesToolImageParseError::InvalidPayload
-            }
-        })?;
-    let image = scan
-        .image
-        .ok_or(ResponsesToolImageParseError::InvalidPayload)?;
-    let base = bytes.as_ptr() as usize;
-    let start = (image.as_ptr() as usize)
-        .checked_sub(base)
-        .filter(|start| start.saturating_add(image.len()) <= bytes.len())
-        .ok_or(ResponsesToolImageParseError::InvalidPayload)?;
-    Ok(ParsedResponsesToolImage {
-        image_range: start..start + image.len(),
-        usage,
-    })
+        .map_err(ImageParseError::from_json)?;
+    scan.finish(bytes, usage)
 }
 
 struct RootSeed<'state, 'input> {
-    scan: &'state mut ImageScan<'input>,
+    scan: &'state mut SingleImageScan<'input>,
 }
 
 impl<'input, 'state> DeserializeSeed<'input> for RootSeed<'state, 'input> {
@@ -135,7 +92,7 @@ impl<'input, 'state> DeserializeSeed<'input> for RootSeed<'state, 'input> {
 }
 
 struct RootVisitor<'state, 'input> {
-    scan: &'state mut ImageScan<'input>,
+    scan: &'state mut SingleImageScan<'input>,
 }
 
 impl<'input, 'state> Visitor<'input> for RootVisitor<'state, 'input> {
@@ -172,7 +129,7 @@ impl<'input, 'state> Visitor<'input> for RootVisitor<'state, 'input> {
 }
 
 struct ValueScanSeed<'state, 'input> {
-    scan: &'state mut ImageScan<'input>,
+    scan: &'state mut SingleImageScan<'input>,
     depth: usize,
 }
 
@@ -194,7 +151,7 @@ impl<'input, 'state> DeserializeSeed<'input> for ValueScanSeed<'state, 'input> {
 }
 
 struct ValueScanVisitor<'state, 'input> {
-    scan: &'state mut ImageScan<'input>,
+    scan: &'state mut SingleImageScan<'input>,
     depth: usize,
 }
 
@@ -270,7 +227,9 @@ impl<'input, 'state> Visitor<'input> for ValueScanVisitor<'state, 'input> {
         }
         if object_type == Some("image_generation_call") {
             let image = result.ok_or_else(|| serde::de::Error::custom(ParseError))?;
-            self.scan.record(image).map_err(serde::de::Error::custom)?;
+            self.scan
+                .record(image)
+                .map_err(|_| serde::de::Error::custom(ParseError))?;
         }
         Ok(None)
     }
@@ -441,7 +400,7 @@ mod tests {
         ] {
             assert_eq!(
                 parse_responses_tool_image(&response).err(),
-                Some(ResponsesToolImageParseError::InvalidJson)
+                Some(ImageParseError::InvalidJson)
             );
         }
     }
@@ -459,7 +418,7 @@ mod tests {
         );
         assert_eq!(
             parse_responses_tool_image(&response).err(),
-            Some(ResponsesToolImageParseError::InvalidPayload)
+            Some(ImageParseError::InvalidPayload)
         );
     }
 

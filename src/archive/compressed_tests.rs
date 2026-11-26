@@ -211,28 +211,35 @@ async fn tenant_cas_is_concurrent_replayable_and_plaintext_ranged() {
     let store = memory_store();
     let tenant_id = Uuid::now_v7();
     let body = Bytes::from("exact tenant text ".repeat(8_000));
-    let mut first = store
-        .start_compressed_writer("staging/test/cas-first")
-        .await
-        .unwrap();
-    first.write(body.clone()).await.unwrap();
-    let first = first.finish_staged().await.unwrap();
-    let mut second = store
-        .start_compressed_writer("staging/test/cas-second")
-        .await
-        .unwrap();
-    second.write(body.clone()).await.unwrap();
-    let second = second.finish_staged().await.unwrap();
+    let mut staged = Vec::new();
+    for path in [
+        "staging/test/cas-first",
+        "staging/test/cas-second",
+        "staging/test/cas-replay",
+    ] {
+        let mut writer = store.start_compressed_writer(path).await.unwrap();
+        writer.write(body.clone()).await.unwrap();
+        staged.push(writer.finish_staged().await.unwrap());
+    }
+    let [first, second, replay] = staged.as_slice() else {
+        unreachable!("three distinct staging keys")
+    };
 
     let (left, right) = tokio::join!(
-        store.promote_staged_text_to_cas(tenant_id, &first),
-        store.promote_staged_text_to_cas(tenant_id, &second),
+        store.promote_staged_text_to_cas(tenant_id, first),
+        store.promote_staged_text_to_cas(tenant_id, second),
     );
     let left = left.unwrap();
-    let right = right.unwrap();
-    assert_eq!(left, right);
+    assert_eq!(left, right.unwrap());
+    assert_eq!(
+        left,
+        store
+            .promote_staged_text_to_cas(tenant_id, replay)
+            .await
+            .unwrap()
+    );
     let other_tenant = store
-        .promote_staged_text_to_cas(Uuid::now_v7(), &first)
+        .promote_staged_text_to_cas(Uuid::now_v7(), first)
         .await
         .unwrap();
     assert_ne!(other_tenant.object_locator, left.object_locator);
@@ -253,8 +260,9 @@ async fn tenant_cas_is_concurrent_replayable_and_plaintext_ranged() {
         .unwrap()
         .concat();
     assert_eq!(ranged, body[selected.start as usize..selected.end as usize]);
-    assert_eq!(store.get(&first.object_locator).await.unwrap(), body);
-    assert_eq!(store.get(&second.object_locator).await.unwrap(), body);
+    for object in &staged {
+        assert_eq!(store.get(&object.object_locator).await.unwrap(), body);
+    }
     assert!(store.delete(&left.object_locator).await.is_err());
     assert!(
         store
@@ -298,40 +306,6 @@ async fn tenant_raw_cas_remains_plaintext_ranged_and_immutable() {
 }
 
 #[tokio::test]
-async fn cas_recovery_after_publish_before_database_commit_reuses_existing_object() {
-    let store = memory_store();
-    let tenant_id = Uuid::now_v7();
-    let body = Bytes::from_static(b"replay after the CAS create crash window");
-    let mut first = store
-        .start_compressed_writer("staging/test/crash-first")
-        .await
-        .unwrap();
-    first.write(body.clone()).await.unwrap();
-    let first = first.finish_staged().await.unwrap();
-    let published = store
-        .promote_staged_text_to_cas(tenant_id, &first)
-        .await
-        .unwrap();
-
-    // Simulate a process loss before the relational transaction published the
-    // locator. A new attempt has a new staging key but reaches the same CAS.
-    let mut retry = store
-        .start_compressed_writer("staging/test/crash-retry")
-        .await
-        .unwrap();
-    retry.write(body.clone()).await.unwrap();
-    let retry = retry.finish_staged().await.unwrap();
-    let recovered = store
-        .promote_staged_text_to_cas(tenant_id, &retry)
-        .await
-        .unwrap();
-    assert_eq!(recovered, published);
-    assert_eq!(store.get(&recovered.object_locator).await.unwrap(), body);
-    assert!(store.get(&first.object_locator).await.is_ok());
-    assert!(store.get(&retry.object_locator).await.is_ok());
-}
-
-#[tokio::test]
 async fn already_existing_cas_must_match_length_and_digest() {
     let store = memory_store();
     let mut writer = store
@@ -340,60 +314,36 @@ async fn already_existing_cas_must_match_length_and_digest() {
         .unwrap();
     writer.write(Bytes::from_static(b"expected")).await.unwrap();
     let staged = writer.finish_staged().await.unwrap();
-    let mut wrong_size = store
-        .start_compressed_writer("staging/test/wrong-size")
-        .await
-        .unwrap();
-    wrong_size
-        .write(Bytes::from_static(b"different"))
-        .await
-        .unwrap();
-    let wrong_size = wrong_size.finish_staged().await.unwrap();
-    let size_tenant = Uuid::now_v7();
-    let size_locator =
-        super::path::tenant_cas_location(size_tenant, &staged.blake3_digest, true).unwrap();
-    store
-        .inner
-        .copy(
-            &archive_path(&wrong_size.object_locator).unwrap(),
-            &archive_path(&size_locator).unwrap(),
-        )
-        .await
-        .unwrap();
-    assert!(
+    for (path, bytes) in [
+        ("staging/test/wrong-size", b"different".as_slice()),
+        ("staging/test/wrong-digest", b"wrong!!!".as_slice()),
+    ] {
+        let mut writer = store.start_compressed_writer(path).await.unwrap();
+        writer.write(Bytes::from_static(bytes)).await.unwrap();
+        let conflicting = writer.finish_staged().await.unwrap();
+        let tenant_id = Uuid::now_v7();
+        let locator =
+            super::path::tenant_cas_location(tenant_id, &staged.blake3_digest, true).unwrap();
         store
-            .promote_staged_text_to_cas(size_tenant, &staged)
+            .inner
+            .copy(
+                &archive_path(&conflicting.object_locator).unwrap(),
+                &archive_path(&locator).unwrap(),
+            )
             .await
-            .is_err()
+            .unwrap();
+        assert!(
+            store
+                .promote_staged_text_to_cas(tenant_id, &staged)
+                .await
+                .is_err(),
+            "{path}"
+        );
+    }
+    assert_eq!(
+        store.get(&staged.object_locator).await.unwrap(),
+        Bytes::from_static(b"expected")
     );
-
-    let mut wrong_digest = store
-        .start_compressed_writer("staging/test/wrong-digest")
-        .await
-        .unwrap();
-    wrong_digest
-        .write(Bytes::from_static(b"wrong!!!"))
-        .await
-        .unwrap();
-    let wrong_digest = wrong_digest.finish_staged().await.unwrap();
-    let digest_tenant = Uuid::now_v7();
-    let digest_locator =
-        super::path::tenant_cas_location(digest_tenant, &staged.blake3_digest, true).unwrap();
-    store
-        .inner
-        .copy(
-            &archive_path(&wrong_digest.object_locator).unwrap(),
-            &archive_path(&digest_locator).unwrap(),
-        )
-        .await
-        .unwrap();
-    assert!(
-        store
-            .promote_staged_text_to_cas(digest_tenant, &staged)
-            .await
-            .is_err()
-    );
-    assert!(store.get(&staged.object_locator).await.is_ok());
 }
 
 #[tokio::test]

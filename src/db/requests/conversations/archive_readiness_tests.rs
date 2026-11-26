@@ -6,6 +6,43 @@ use crate::{
     response_archive_spool::{self, BufferedArchive, BufferedArchivePurpose},
 };
 use bytes::Bytes;
+use std::future::Future;
+
+fn sqlite_database() -> (tempfile::TempDir, String) {
+    let directory = tempfile::tempdir().unwrap();
+    let url = format!(
+        "sqlite://{}?mode=rwc",
+        directory.path().join("test.db").display()
+    );
+    (directory, url)
+}
+
+async fn run_sqlite<F: Future<Output = ()>>(contract: impl FnOnce(String) -> F) {
+    let (_directory, url) = sqlite_database();
+    contract(url).await;
+}
+
+async fn postgres_database(required: Option<&str>) -> Option<PostgresTestDatabase> {
+    let url = match (std::env::var("MTC_TEST_POSTGRES_URL"), required) {
+        (Ok(url), _) => url,
+        (Err(error), Some(message)) => panic!("{message}: {error}"),
+        (Err(_), None) => return None,
+    };
+    // Projection advisory locks are database scoped. A private schema
+    // still shares contention with other PostgreSQL tests.
+    Some(PostgresTestDatabase::create(&url).await)
+}
+
+async fn run_postgres<F: Future<Output = ()>>(
+    required: Option<&str>,
+    contract: impl FnOnce(String) -> F,
+) {
+    let Some(database) = postgres_database(required).await else {
+        return;
+    };
+    contract(database.url().to_owned()).await;
+    database.cleanup().await;
+}
 
 #[path = "retention_tests.rs"]
 mod retention_tests;
@@ -199,28 +236,23 @@ async fn fair_projection_queue_contract(database_url: String) {
 
 #[tokio::test]
 async fn sqlite_projection_queue_fairness_and_source_retry_wake() {
-    let directory = tempfile::tempdir().unwrap();
-    fair_projection_queue_contract(format!(
-        "sqlite://{}?mode=rwc",
-        directory.path().join("fairness.db").display()
-    ))
-    .await;
+    run_sqlite(fair_projection_queue_contract).await;
 }
 
 #[tokio::test]
 async fn postgres_projection_queue_fairness_and_source_retry_wake() {
-    let database_url = std::env::var("MTC_TEST_POSTGRES_URL")
-        .expect("projection fairness PostgreSQL regression must not silently skip");
-    let isolated = PostgresTestDatabase::create(&database_url).await;
-    fair_projection_queue_contract(isolated.url().to_owned()).await;
-    isolated.cleanup().await;
+    run_postgres(
+        Some("projection fairness PostgreSQL regression must not silently skip"),
+        fair_projection_queue_contract,
+    )
+    .await;
 }
 
 #[tokio::test]
 async fn postgres_rebuild_replenishment_does_not_wait_for_another_worker() {
-    let database_url = std::env::var("MTC_TEST_POSTGRES_URL")
-        .expect("rebuild serialization regression requires PostgreSQL");
-    let isolated = PostgresTestDatabase::create(&database_url).await;
+    let isolated = postgres_database(Some("rebuild serialization regression requires PostgreSQL"))
+        .await
+        .unwrap();
     let fixture = Fixture::new(isolated.url().to_owned(), true).await;
     let mut owner = fixture.state.db.pool.begin().await.unwrap();
     sqlx::query("SELECT pg_advisory_xact_lock(82420261105)")
@@ -540,21 +572,16 @@ async fn declared_identity_before_body_contract(database_url: String) {
 
 #[tokio::test]
 async fn sqlite_declared_identity_is_readable_while_body_is_pending() {
-    let directory = tempfile::tempdir().unwrap();
-    declared_identity_before_body_contract(format!(
-        "sqlite://{}?mode=rwc",
-        directory.path().join("identity.db").display()
-    ))
-    .await;
+    run_sqlite(declared_identity_before_body_contract).await;
 }
 
 #[tokio::test]
 async fn postgres_declared_identity_is_readable_while_body_is_pending() {
-    let url =
-        std::env::var("MTC_TEST_POSTGRES_URL").expect("identity regression requires CI PostgreSQL");
-    let isolated = PostgresTestDatabase::create(&url).await;
-    declared_identity_before_body_contract(isolated.url().to_owned()).await;
-    isolated.cleanup().await;
+    run_postgres(
+        Some("identity regression requires CI PostgreSQL"),
+        declared_identity_before_body_contract,
+    )
+    .await;
 }
 
 async fn seed_identity_page_task(fixture: &Fixture, id: Uuid, session: Option<&str>, ready: bool) {
@@ -715,21 +742,16 @@ async fn identity_page_scheduler_contract(database_url: String) {
 
 #[tokio::test]
 async fn sqlite_identity_scheduler_bounds_pages_and_revisits_delayed_evidence() {
-    let directory = tempfile::tempdir().unwrap();
-    identity_page_scheduler_contract(format!(
-        "sqlite://{}?mode=rwc",
-        directory.path().join("identity-pages.db").display()
-    ))
-    .await;
+    run_sqlite(identity_page_scheduler_contract).await;
 }
 
 #[tokio::test]
 async fn postgres_identity_scheduler_bounds_pages_and_revisits_delayed_evidence() {
-    let url = std::env::var("MTC_TEST_POSTGRES_URL")
-        .expect("identity scheduler regression requires CI PostgreSQL");
-    let isolated = PostgresTestDatabase::create(&url).await;
-    identity_page_scheduler_contract(isolated.url().to_owned()).await;
-    isolated.cleanup().await;
+    run_postgres(
+        Some("identity scheduler regression requires CI PostgreSQL"),
+        identity_page_scheduler_contract,
+    )
+    .await;
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -1074,12 +1096,39 @@ impl Fixture {
         self.assert_completed_by(owner, assistant).await;
     }
 
+    async fn projected_event_ids(&self) -> Vec<String> {
+        sqlx::query_scalar("SELECT event_id FROM request_events WHERE request_id = $1 AND event_kind = 'projected' ORDER BY event_id")
+            .bind(self.request_id.to_string())
+            .fetch_all(&self.state.db.pool)
+            .await
+            .unwrap()
+    }
+
     async fn assert_completed_by(&self, owner: Uuid, assistant: bool) {
+        // Fixture setup has applied finance. It uses the same event kind as
+        // semantic projection, so distinguish the two at their commit boundary.
+        let financial_outcome: String = sqlx::query_scalar(
+            "SELECT statistics_outcome FROM terminal_projection_outbox WHERE request_id = $1 AND projected_at IS NOT NULL",
+        )
+        .bind(self.request_id.to_string())
+        .fetch_one(&self.state.db.pool)
+        .await
+        .unwrap();
+        assert_eq!(financial_outcome, "applied");
+        let financial_events = self.projected_event_ids().await;
+        assert_eq!(financial_events.len(), 1, "finance must publish once");
         assert!(
             crate::worker::archive_session_body(&self.state, owner, self.request_id)
                 .await
                 .unwrap()
         );
+        let completed_events = self.projected_event_ids().await;
+        assert_eq!(
+            completed_events.len(),
+            financial_events.len() + 1,
+            "semantic projection must publish one new event"
+        );
+        assert!(completed_events.contains(&financial_events[0]));
         assert!(
             !crate::worker::archive_session_body(&self.state, owner, self.request_id)
                 .await
@@ -1110,9 +1159,11 @@ impl Fixture {
             assistant,
             "{encoded}"
         );
-        let events: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM request_events WHERE request_id = $1 AND event_kind = 'projected'")
-            .bind(self.request_id.to_string()).fetch_one(&self.state.db.pool).await.unwrap();
-        assert_eq!(events, 1);
+        assert_eq!(
+            self.projected_event_ids().await,
+            completed_events,
+            "replaying semantic projection must preserve the event identities"
+        );
     }
 }
 
@@ -1241,23 +1292,16 @@ async fn pending_archive_wake_contract(database_url: String) {
 
 #[tokio::test]
 async fn sqlite_pending_archive_defer_preserves_bind_wakes_and_claim_ownership() {
-    let directory = tempfile::tempdir().unwrap();
-    pending_archive_wake_contract(format!(
-        "sqlite://{}?mode=rwc",
-        directory.path().join("pending-wake.db").display()
-    ))
-    .await;
+    run_sqlite(pending_archive_wake_contract).await;
 }
 
 #[tokio::test]
 async fn postgres_pending_archive_defer_preserves_bind_wakes_and_claim_ownership() {
-    let database_url = std::env::var("MTC_TEST_POSTGRES_URL")
-        .expect("pending archive wake PostgreSQL regression must not silently skip");
-    // Projection advisory locks are database scoped, so a private schema
-    // still shares contention with other PostgreSQL regression tests.
-    let isolated = PostgresTestDatabase::create(&database_url).await;
-    pending_archive_wake_contract(isolated.url().to_owned()).await;
-    isolated.cleanup().await;
+    run_postgres(
+        Some("pending archive wake PostgreSQL regression must not silently skip"),
+        pending_archive_wake_contract,
+    )
+    .await;
 }
 
 async fn readiness_contract(database_url: String) {
@@ -1301,25 +1345,13 @@ async fn readiness_contract(database_url: String) {
 
 #[tokio::test]
 async fn sqlite_session_body_waits_for_capture_and_both_uploads() {
-    let directory = tempfile::tempdir().unwrap();
-    readiness_contract(format!(
-        "sqlite://{}?mode=rwc",
-        directory.path().join("readiness.db").display()
-    ))
-    .await;
+    run_sqlite(readiness_contract).await;
 }
 
 #[tokio::test]
 async fn sqlite_final_archive_gap_keeps_request_turn() {
-    let directory = tempfile::tempdir().unwrap();
-    let fixture = Fixture::new(
-        format!(
-            "sqlite://{}?mode=rwc",
-            directory.path().join("gap.db").display()
-        ),
-        true,
-    )
-    .await;
+    let (_directory, url) = sqlite_database();
+    let fixture = Fixture::new(url, true).await;
     fixture.capture().await;
     // This fixture knows the original request. Persist those exact bytes;
     // the empty SQL outbox cannot stand in for a missing original.
@@ -1358,15 +1390,8 @@ async fn sqlite_final_archive_gap_keeps_request_turn() {
 
 #[tokio::test]
 async fn sqlite_missing_capture_never_becomes_final_from_elapsed_time() {
-    let directory = tempfile::tempdir().unwrap();
-    let fixture = Fixture::new(
-        format!(
-            "sqlite://{}?mode=rwc",
-            directory.path().join("missing.db").display()
-        ),
-        true,
-    )
-    .await;
+    let (_directory, url) = sqlite_database();
+    let fixture = Fixture::new(url, true).await;
     fixture.assert_deferred().await;
     sqlx::query("UPDATE request_records SET completed_at = $1 WHERE id = $2")
         .bind(unix_millis() - super::super::super::archive_spool::CAPTURE_TTL - 1)
@@ -1379,14 +1404,7 @@ async fn sqlite_missing_capture_never_becomes_final_from_elapsed_time() {
 
 #[tokio::test]
 async fn postgres_session_body_waits_for_capture_and_both_uploads() {
-    let Ok(database_url) = std::env::var("MTC_TEST_POSTGRES_URL") else {
-        return;
-    };
-    // Projection advisory locks are database scoped, so a private schema
-    // still shares contention with other PostgreSQL regression tests.
-    let isolated = PostgresTestDatabase::create(&database_url).await;
-    readiness_contract(isolated.url().to_owned()).await;
-    isolated.cleanup().await;
+    run_postgres(None, readiness_contract).await;
 }
 
 async fn source_contract(database_url: String) {
@@ -1942,13 +1960,7 @@ async fn lost_source_writer_contract(database_url: String) {
     assert_eq!(state, "gap", "a fenced writer cannot resurrect the source");
 }
 
-#[tokio::test]
-async fn sqlite_source_failed_state_write_retries_and_lost_writer_converges() {
-    let directory = tempfile::tempdir().unwrap();
-    let database_url = format!(
-        "sqlite://{}?mode=rwc",
-        directory.path().join("source-failures.db").display()
-    );
+async fn source_failure_contract(database_url: String) {
     failed_source_metadata_contract(database_url.clone()).await;
     expired_live_source_writer_contract(database_url.clone()).await;
     fenced_source_upload_contract(database_url.clone()).await;
@@ -1956,39 +1968,27 @@ async fn sqlite_source_failed_state_write_retries_and_lost_writer_converges() {
 }
 
 #[tokio::test]
-async fn postgres_source_failed_state_write_retries_and_lost_writer_converges() {
-    let database_url = std::env::var("MTC_TEST_POSTGRES_URL")
-        .expect("source R2 PostgreSQL regression must not silently skip");
-    // Projection advisory locks are database scoped, so a private schema
-    // still shares contention with other PostgreSQL regression tests.
-    let isolated = PostgresTestDatabase::create(&database_url).await;
-    failed_source_metadata_contract(isolated.url().to_owned()).await;
-    expired_live_source_writer_contract(isolated.url().to_owned()).await;
-    fenced_source_upload_contract(isolated.url().to_owned()).await;
-    lost_source_writer_contract(isolated.url().to_owned()).await;
-    isolated.cleanup().await;
+async fn sqlite_source_failed_state_write_retries_and_lost_writer_converges() {
+    run_sqlite(source_failure_contract).await;
 }
 
 #[tokio::test]
-async fn sqlite_source_identity_recovers_after_request_drop_and_missing_binding() {
-    let directory = tempfile::tempdir().unwrap();
-    source_contract(format!(
-        "sqlite://{}?mode=rwc",
-        directory.path().join("source-recovery.db").display()
-    ))
+async fn postgres_source_failed_state_write_retries_and_lost_writer_converges() {
+    run_postgres(
+        Some("source R2 PostgreSQL regression must not silently skip"),
+        source_failure_contract,
+    )
     .await;
 }
 
 #[tokio::test]
+async fn sqlite_source_identity_recovers_after_request_drop_and_missing_binding() {
+    run_sqlite(source_contract).await;
+}
+
+#[tokio::test]
 async fn postgres_source_identity_recovers_after_request_drop_and_missing_binding() {
-    let Ok(database_url) = std::env::var("MTC_TEST_POSTGRES_URL") else {
-        return;
-    };
-    // Projection advisory locks are database scoped, so a private schema
-    // still shares contention with other PostgreSQL regression tests.
-    let isolated = PostgresTestDatabase::create(&database_url).await;
-    source_contract(isolated.url().to_owned()).await;
-    isolated.cleanup().await;
+    run_postgres(None, source_contract).await;
 }
 
 fn archive_bodies() -> [(BufferedArchivePurpose, Bytes); 2] {
@@ -2046,7 +2046,17 @@ async fn terminal_archive_order_contract(database_url: String) {
             .bind(fixture.identity.reservation_id.to_string()).bind(fixture.request_id.to_string())
             .fetch_one(&fixture.state.db.pool).await.unwrap();
         assert_eq!(effects.get::<i64, _>("settlements"), 1);
-        assert_eq!(effects.get::<i64, _>("finishes"), 1);
+        // This fixture invokes deferred financial completion directly, without
+        // an operational receipt. Only that receipt publishes `finished`.
+        let operational_receipts: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM proxy_operational_terminals WHERE request_id = $1",
+        )
+        .bind(fixture.request_id.to_string())
+        .fetch_one(&fixture.state.db.pool)
+        .await
+        .unwrap();
+        assert_eq!(operational_receipts, 0);
+        assert_eq!(effects.get::<i64, _>("finishes"), 0);
 
         // A delayed source completion must not allocate an event cursor after
         // the financial terminal has closed its request owner.
@@ -2077,21 +2087,16 @@ async fn terminal_archive_order_contract(database_url: String) {
 
 #[tokio::test]
 async fn sqlite_archive_binding_and_financial_terminal_preserve_bodies_in_both_orders() {
-    let directory = tempfile::tempdir().unwrap();
-    terminal_archive_order_contract(format!(
-        "sqlite://{}?mode=rwc",
-        directory.path().join("terminal-order.db").display()
-    ))
-    .await;
+    run_sqlite(terminal_archive_order_contract).await;
 }
 
 #[tokio::test]
 async fn postgres_archive_binding_and_financial_terminal_preserve_bodies_in_both_orders() {
-    let database_url = std::env::var("MTC_TEST_POSTGRES_URL")
-        .expect("archive terminal ordering PostgreSQL regression requires its CI database");
-    let isolated = PostgresTestDatabase::create(&database_url).await;
-    terminal_archive_order_contract(isolated.url().to_owned()).await;
-    isolated.cleanup().await;
+    run_postgres(
+        Some("archive terminal ordering PostgreSQL regression requires its CI database"),
+        terminal_archive_order_contract,
+    )
+    .await;
 }
 
 async fn semantic_coverage_committed_recovery_contract(database_url: String) {
@@ -2393,21 +2398,16 @@ async fn semantic_coverage_committed_recovery_contract(database_url: String) {
 
 #[tokio::test]
 async fn sqlite_semantic_coverage_recovers_committed_projection_and_failed_put() {
-    let directory = tempfile::tempdir().unwrap();
-    semantic_coverage_committed_recovery_contract(format!(
-        "sqlite://{}?mode=rwc",
-        directory.path().join("coverage.db").display()
-    ))
-    .await;
+    run_sqlite(semantic_coverage_committed_recovery_contract).await;
 }
 
 #[tokio::test]
 async fn postgres_semantic_coverage_recovers_committed_projection_and_failed_put() {
-    let url = std::env::var("MTC_TEST_POSTGRES_URL")
-        .expect("semantic coverage recovery requires real PostgreSQL");
-    let isolated = PostgresTestDatabase::create(&url).await;
-    semantic_coverage_committed_recovery_contract(isolated.url().to_owned()).await;
-    isolated.cleanup().await;
+    run_postgres(
+        Some("semantic coverage recovery requires real PostgreSQL"),
+        semantic_coverage_committed_recovery_contract,
+    )
+    .await;
 }
 
 struct CoverageWorkerGuard {
@@ -2634,8 +2634,9 @@ async fn raw_read_lost_owner_returns_without_shutdown(database_url: String) {
 
 #[tokio::test]
 async fn postgres_coverage_read_does_not_block_body_worker() {
-    let url = std::env::var("MTC_TEST_POSTGRES_URL").expect("requires CI PostgreSQL");
-    let isolated = PostgresTestDatabase::create(&url).await;
+    let isolated = postgres_database(Some("requires CI PostgreSQL"))
+        .await
+        .unwrap();
     fair_projection_queue_contract(isolated.url().to_owned()).await;
     coverage_read_does_not_block_body_worker_contract(isolated.url().to_owned()).await;
     raw_read_does_not_block_next_claim_contract(isolated.url().to_owned()).await;
@@ -2645,21 +2646,16 @@ async fn postgres_coverage_read_does_not_block_body_worker() {
 
 #[tokio::test]
 async fn sqlite_admission_event_precedes_queued_archive_and_preserves_raw_body() {
-    let directory = tempfile::tempdir().unwrap();
-    queued_archive_event_contract(format!(
-        "sqlite://{}?mode=rwc",
-        directory.path().join("event-archive.db").display()
-    ))
-    .await;
+    run_sqlite(queued_archive_event_contract).await;
 }
 
 #[tokio::test]
 async fn postgres_admission_event_precedes_queued_archive_and_preserves_raw_body() {
-    let url = std::env::var("MTC_TEST_POSTGRES_URL")
-        .expect("PostgreSQL archive event contract requires its service");
-    let isolated = PostgresTestDatabase::create(&url).await;
-    queued_archive_event_contract(isolated.url().to_owned()).await;
-    isolated.cleanup().await;
+    run_postgres(
+        Some("PostgreSQL archive event contract requires its service"),
+        queued_archive_event_contract,
+    )
+    .await;
 }
 
 async fn queued_archive_event_contract(url: String) {
@@ -2751,13 +2747,9 @@ async fn queued_archive_event_contract(url: String) {
 
 #[tokio::test]
 async fn postgres_exact_legacy_body_rebuild_preserves_incomplete_and_financial_receipt() {
-    let _ = tracing_subscriber::fmt()
-        .with_max_level(tracing::Level::DEBUG)
-        .with_test_writer()
-        .try_init();
-    let database_url =
-        std::env::var("MTC_TEST_POSTGRES_URL").expect("exact recovery requires PostgreSQL");
-    let isolated = PostgresTestDatabase::create(&database_url).await;
+    let isolated = postgres_database(Some("exact recovery requires PostgreSQL"))
+        .await
+        .unwrap();
     let fixture = Fixture::new(isolated.url().to_owned(), false).await;
     let db = &fixture.state.db;
     let request =

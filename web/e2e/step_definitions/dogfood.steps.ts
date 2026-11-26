@@ -6,7 +6,7 @@ import { baseURL, eventually, model, requestJson, runtime, tenant } from '../sup
 import type { DogfoodWorld } from '../support/world.js';
 
 import { appPreferenceControls, openAppRoute, openUsageDimension } from './app-route.support.js';
-import { addTypedFilterCondition, applyUsageTypedFilter, assertAttribute, assertContains, assertCount, assertExactText, assertNoCount, assertNoHorizontalOverflow, assertNotContains, assertOperatorTenantScope, assertUsageTotalTokens, assertValue, assertVisible, catalogModelSearch, clearStrictUsageFilters, clearUsageFilters, connectOperator, credentialGroupObservations, emptyUsageFixture, groupedModel, localizationUsageFixture, metric, nextStrictUsageUrl, openCatalogModelPicker, openTypedFilterDialog, requireStrictUsageObservation, strictDimensionUsageFixture, strictUsageObservations, usageDimension, usageFilterBuilder, uuidPattern, type StrictUsageObservation } from './dogfood.support.js';
+import { addTypedFilterCondition, applyUsageTypedFilter, assertAttribute, assertContains, assertCount, assertExactText, assertNoCount, assertNoHorizontalOverflow, assertNotContains, assertOperatorTenantScope, assertUsageTotalTokens, assertValue, assertVisible, catalogModelSearch, clientCredentialInput, clearStrictUsageFilters, clearUsageFilters, connectOperator, credentialGroupObservations, emptyUsageFixture, groupedModel, localizationUsageFixture, metric, nextStrictUsageUrl, openCatalogModelPicker, openTypedFilterDialog, requireStrictUsageObservation, strictDimensionUsageFixture, strictUsageObservations, serviceCredentialInput, usageDimension, usageFilterBuilder, uuidPattern, type StrictUsageObservation } from './dogfood.support.js';
 
 Given('dogfood 服务已有隔离租户、统一上游、请求记录和多模态价格', function () {
   runtime.requireSeed();
@@ -16,40 +16,40 @@ When('管理员和下游用户验证凭据记忆与手动清空', async function
   const page = this.requirePage();
   const seed = runtime.requireSeed();
   await connectOperator(this, 'dark');
-  await assertValue(page.locator('.operator-credential input[type="password"]'), '');
+  await assertValue(serviceCredentialInput(page.locator('.operator-credential')), '');
   await assertVisible(page.getByRole('button', { name: '清空凭据', exact: true }));
   await page.reload();
-  await assertValue(page.locator('.operator-credential input[type="password"]'), '');
+  await assertValue(serviceCredentialInput(page.locator('.operator-credential')), '');
   await assertVisible(page.getByRole('button', { name: '清空凭据', exact: true }));
   await assertOperatorTenantScope(page, tenant, 'hidden');
 
   await this.open('/portal', { theme: 'light', locale: 'zh-CN', viewport: { width: 375, height: 812 } });
-  await page.getByPlaceholder('输入客户端凭据').fill(seed.clientCredential);
+  await clientCredentialInput(page).fill(seed.clientCredential);
   await page.getByRole('button', { name: '进入', exact: true }).click();
-  await assertNoCount(page.getByPlaceholder('输入客户端凭据'));
+  await assertNoCount(clientCredentialInput(page));
   await assertContains(page.locator('.console-context'), 'Browser E2E credential');
   await assertContains(page.locator('.console-context'), '已连接');
   await page.reload();
-  await assertNoCount(page.getByPlaceholder('输入客户端凭据'));
+  await assertNoCount(clientCredentialInput(page));
   await assertContains(page.locator('.console-context'), 'Browser E2E credential');
   await page.getByRole('button', { name: '清空凭据', exact: true }).click();
-  await assertValue(page.getByPlaceholder('输入客户端凭据'), '');
+  await assertValue(clientCredentialInput(page), '');
   await assertNoCount(page.locator('.console-context'));
   assert.deepEqual(await page.evaluate(() => ({
     operator: localStorage.getItem('mtc.operator.service-credential.v1'),
     self: localStorage.getItem('mtc.self.client-credential.v1'),
   })), { operator: seed.serviceCredential, self: null });
   await page.reload();
-  await assertValue(page.getByPlaceholder('输入客户端凭据'), '');
+  await assertValue(clientCredentialInput(page), '');
   await assertNoCount(page.locator('.console-context'));
 
   await this.open('/operator?view=system-settings', { theme: 'dark', locale: 'zh-CN' });
-  await assertValue(page.locator('.operator-credential input[type="password"]'), '');
+  await assertValue(serviceCredentialInput(page.locator('.operator-credential')), '');
   await assertOperatorTenantScope(page, tenant, 'hidden');
   await page.getByRole('button', { name: '清空凭据', exact: true }).click();
   await assertNoCount(page.locator('.console-context'));
   await page.reload();
-  await assertValue(page.locator('.operator-credential input[type="password"]'), '');
+  await assertValue(serviceCredentialInput(page.locator('.operator-credential')), '');
   await assertNoCount(page.locator('.console-context'));
   assert.deepEqual(await page.evaluate(() => ({
     operator: localStorage.getItem('mtc.operator.service-credential.v1'),

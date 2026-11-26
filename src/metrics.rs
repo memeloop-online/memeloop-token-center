@@ -944,6 +944,7 @@ pub struct RuntimeMetrics {
     pub responses_request_spool_used_bytes: usize,
     pub proxy_lifecycles: usize,
     pub proxy_archive_streams: usize,
+    pub archive_activities: usize,
     pub plugin_cache_entries: usize,
     pub plugin_cache_bytes: usize,
     pub loaded_plugins: usize,
@@ -1177,6 +1178,7 @@ fn render_runtime(output: &mut String, runtime: &RuntimeMetrics) {
         ("responses_request_spools", runtime.responses_request_spools),
         ("proxy_lifecycles", runtime.proxy_lifecycles),
         ("proxy_archive_streams", runtime.proxy_archive_streams),
+        ("archive_activities", runtime.archive_activities),
     ] {
         let _ = writeln!(
             output,
@@ -1795,10 +1797,12 @@ mod tests {
     #[test]
     fn request_spool_metrics_report_fixed_process_local_series() {
         let rendered = Metrics::default().render(&RuntimeMetrics {
+            archive_activities: 3,
             responses_request_spools: 2,
             responses_request_spool_used_bytes: 25_788_305,
             ..RuntimeMetrics::default()
         });
+        assert!(rendered.contains("memeloop_token_center_background_work_items{queue=\"archive_activities\",state=\"active\"} 3"));
         assert!(rendered.contains(
             "memeloop_token_center_background_work_items{queue=\"responses_request_spools\",state=\"active\"} 2"
         ));

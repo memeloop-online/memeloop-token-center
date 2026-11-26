@@ -139,6 +139,23 @@ async fn signed_claude_gateway_empty_recovery_finalize_matrix() {
             expected
         );
     }
+    let manifest: Value =
+        serde_json::from_slice(&std::fs::read(signed_package.join("plugin.json")).unwrap())
+            .unwrap();
+    let driver = crate::oauth::claude::PROVIDER_DRIVER;
+    assert_eq!(manifest["version"], "1.0.1");
+    assert_eq!(
+        manifest.pointer("/contributions/wire_shim/drivers"),
+        Some(&json!([driver]))
+    );
+    assert_eq!(
+        manifest.pointer("/contributions/wire_shim/protocols"),
+        Some(&json!(["anthropic"]))
+    );
+    assert!(
+        manifest.pointer("/contributions/providers").is_none(),
+        "the pinned artifact contributes a finalizer, not a provider driver"
+    );
     let provenance: Value = serde_json::from_slice(
         &std::fs::read(signed_package.join(".mtc-oci-install.json")).unwrap(),
     )
@@ -165,7 +182,7 @@ async fn signed_claude_gateway_empty_recovery_finalize_matrix() {
         upstream,
         0,
         None,
-        crate::oauth::claude::PROVIDER_DRIVER,
+        driver,
         "mtc-claude-wire-synthetic-v1",
         UpstreamCredential::OAuth {
             access_token: "synthetic-not-an-oauth-authorization".into(),
@@ -487,7 +504,7 @@ async fn signed_claude_gateway_empty_recovery_finalize_matrix() {
         std::fs::write(output, serde_json::to_vec_pretty(&json!({
             "environment":"GHA-only real Wasmtime and TCP gateway; not cluster acceptance",
             "artifact":"ghcr.io/memeloop-online/claude-code-wire@sha256:3e4160580005b15c9db1e3bd419df79ee65de1d86a8fe1d4ec5aac4c88fe5906",
-            "synthetic_only":true,"cases":evidence,"final_revision":3,"final_plugins":[]
+            "synthetic_only":true,"routed_provider_driver":driver,"plugin_role":"anthropic-wire-finalizer","cases":evidence,"final_revision":3,"final_plugins":[]
         })).unwrap()).unwrap();
     }
 }

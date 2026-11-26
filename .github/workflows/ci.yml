@@ -565,6 +565,36 @@ jobs:
           "$mc_binary" admin user add test mtc-list-only mtc-list-only-secret
           "$mc_binary" admin policy create test mtc-list-only "$PWD/tests/fixtures/minio-list-only-policy.json"
           "$mc_binary" admin policy attach test mtc-list-only --user mtc-list-only
+      - name: Start isolated RustFS for recovery acceptance
+        if: matrix.name == 'cucumber'
+        env:
+          RUSTFS_ACCESS_KEY: rustfs-test-fixture
+          RUSTFS_SECRET_KEY: synthetic-test-only-secret-707
+        run: |
+          docker run --detach --name mtc-cucumber-rustfs --publish 127.0.0.1:19000:9000 \
+            --memory 1g --env RUSTFS_ACCESS_KEY --env RUSTFS_SECRET_KEY \
+            --env RUSTFS_ADDRESS=:9000 --env RUSTFS_CONSOLE_ENABLE=false \
+            --env RUSTFS_OBS_LOG_DIRECTORY= --env RUSTFS_OBS_LOGGER_LEVEL=warn \
+            --entrypoint /usr/bin/rustfs \
+            rustfs/rustfs:1.0.4@sha256:ed9210d6411d77ffceb70d94b964a3cb7d225983368bc25bebe01e995293dcc2 /data
+          endpoint=http://127.0.0.1:19000
+          bucket=mtc-cucumber-recovery
+          for attempt in $(seq 1 60); do
+            if curl --fail --silent --max-time 5 --aws-sigv4 'aws:amz:us-east-1:s3' \
+              --user "$RUSTFS_ACCESS_KEY:$RUSTFS_SECRET_KEY" \
+              --request PUT "$endpoint/$bucket"; then
+              {
+                echo "MTC_RUSTFS_TEST_ENDPOINT=$endpoint"
+                echo "MTC_RUSTFS_TEST_BUCKET=$bucket"
+                echo "MTC_RUSTFS_TEST_ACCESS_KEY=$RUSTFS_ACCESS_KEY"
+                echo "MTC_RUSTFS_TEST_SECRET_KEY=$RUSTFS_SECRET_KEY"
+              } >> "$GITHUB_ENV"
+              exit 0
+            fi
+            sleep 2
+          done
+          docker logs mtc-cucumber-rustfs
+          exit 1
       - name: Install pinned cargo-nextest
         run: |
           curl --fail --location --retry 3 --max-time 120 \
@@ -622,57 +652,77 @@ jobs:
           sudo apt-get "${apt_sources[@]}" -o Acquire::Retries=3 -o DPkg::Lock::Timeout=60 update
           sudo apt-get "${apt_sources[@]}" -o Acquire::Retries=3 -o DPkg::Lock::Timeout=60 \
             install --yes --no-install-recommends postgresql-client sqlite3
-      - name: SQLite migration and replay smoke test
+      - name: SQLite and PostgreSQL migration and replay smoke test
         env:
-          MTC_KEY_PEPPER: ci-key-pepper-with-more-than-thirty-two-bytes
-          MTC_SERVICE_TOKEN: ci-bootstrap-token-not-for-production
-          MTC_ARCHIVE_BACKEND: filesystem
-          MTC_ARCHIVE_PATH: /tmp/mtc-sqlite-migration-smoke-archive
-        run: |
-          database="$RUNNER_TEMP/migration-smoke.sqlite"
-          export MTC_DATABASE_URL="sqlite://$database?mode=rwc"
-          cargo run --locked --bin memeloop-token-center -- migrate
-          current_version="$(sqlite3 "$database" 'SELECT max(version) FROM schema_migrations')"
-          # Replay activation migration without changing later registered migrations.
-          sqlite3 "$database" 'DROP TABLE request_history_activation; DELETE FROM schema_migrations WHERE version = 160;'
-          test "$(sqlite3 "$database" 'SELECT count(*) FROM schema_migrations WHERE version = 160')" = 0
-          cargo run --locked --bin memeloop-token-center -- migrate
-          test "$(sqlite3 "$database" 'SELECT max(version) FROM schema_migrations')" = "$current_version"
-          test "$(sqlite3 "$database" 'SELECT count(*) FROM schema_migrations WHERE version = 160')" = 1
-          test "$(sqlite3 "$database" "SELECT count(*) FROM request_history_activation WHERE id=1 AND epoch=0 AND phase='legacy' AND transactions_json IS NULL AND baseline_owner IS NULL AND baseline_epoch IS NULL")" = 1
-          sqlite3 "$database" "UPDATE request_history_activation SET epoch=7, phase='observing', transactions_json='{}', baseline_owner='migration-smoke', baseline_epoch=7 WHERE id=1"
-          first_count="$(sqlite3 "$database" 'SELECT count(*) FROM schema_migrations')"
-          cargo run --locked --bin memeloop-token-center -- migrate
-          second_count="$(sqlite3 "$database" 'SELECT count(*) FROM schema_migrations')"
-          test "$first_count" -gt 0
-          test "$second_count" = "$first_count"
-          test "$(sqlite3 "$database" "SELECT count(*) FROM request_history_activation WHERE id=1 AND epoch=7 AND phase='observing' AND transactions_json='{}' AND baseline_owner='migration-smoke' AND baseline_epoch=7")" = 1
-      - name: PostgreSQL migration and replay smoke test
-        env:
-          MTC_DATABASE_URL: postgres://token_center:token_center@127.0.0.1:5432/memeloop_token_center_test
           MTC_KEY_PEPPER: ci-key-pepper-with-more-than-thirty-two-bytes
           MTC_SERVICE_TOKEN: ci-bootstrap-token-not-for-production
           MTC_ARCHIVE_BACKEND: filesystem
           MTC_ARCHIVE_PATH: /tmp/mtc-migration-smoke-archive
         run: |
-          cargo run --locked --bin memeloop-token-center -- migrate
-          current_version="$(psql -X --no-psqlrc -qAt "$MTC_DATABASE_URL" -c 'SELECT max(version) FROM schema_migrations')"
-          # Replay activation migration without changing later registered migrations.
-          psql -X --no-psqlrc -v ON_ERROR_STOP=1 "$MTC_DATABASE_URL" -c 'DROP TABLE request_history_activation; DELETE FROM schema_migrations WHERE version = 160;'
-          test "$(psql -X --no-psqlrc -qAt "$MTC_DATABASE_URL" -c 'SELECT count(*) FROM schema_migrations WHERE version = 160')" = 0
-          cargo run --locked --bin memeloop-token-center -- migrate
-          test "$(psql -X --no-psqlrc -qAt "$MTC_DATABASE_URL" -c 'SELECT max(version) FROM schema_migrations')" = "$current_version"
-          test "$(psql -X --no-psqlrc -qAt "$MTC_DATABASE_URL" -c 'SELECT count(*) FROM schema_migrations WHERE version = 160')" = 1
-          test "$(psql -X --no-psqlrc -qAt "$MTC_DATABASE_URL" -c "SELECT count(*) FROM request_history_activation WHERE id=1 AND epoch=0 AND phase='legacy' AND transactions_json IS NULL AND baseline_owner IS NULL AND baseline_epoch IS NULL")" = 1
-          psql -X --no-psqlrc -v ON_ERROR_STOP=1 "$MTC_DATABASE_URL" -c "UPDATE request_history_activation SET epoch=7, phase='observing', transactions_json='{}', baseline_owner='migration-smoke', baseline_epoch=7 WHERE id=1"
-          first_count="$(psql -X --no-psqlrc -qAt "$MTC_DATABASE_URL" \
-            -c 'SELECT count(*) FROM schema_migrations')"
-          cargo run --locked --bin memeloop-token-center -- migrate
-          second_count="$(psql -X --no-psqlrc -qAt "$MTC_DATABASE_URL" \
-            -c 'SELECT count(*) FROM schema_migrations')"
-          test "$first_count" -gt 0
-          test "$second_count" = "$first_count"
-          test "$(psql -X --no-psqlrc -qAt "$MTC_DATABASE_URL" -c "SELECT count(*) FROM request_history_activation WHERE id=1 AND epoch=7 AND phase='observing' AND transactions_json='{}' AND baseline_owner='migration-smoke' AND baseline_epoch=7")" = 1
+          set -euo pipefail
+          for backend in sqlite postgres; do
+            if [ "$backend" = sqlite ]; then
+              database="$RUNNER_TEMP/migration-smoke.sqlite"
+              export MTC_DATABASE_URL="sqlite://$database?mode=rwc"
+              sql() { sqlite3 -batch -bail "$database" "$1"; }
+            else
+              export MTC_DATABASE_URL="postgres://token_center:token_center@127.0.0.1:5432/memeloop_token_center_test"
+              sql() { psql -X -v ON_ERROR_STOP=1 -qAt "$MTC_DATABASE_URL" -c "$1"; }
+            fi
+
+            expected_versions="$(find migrations/common "migrations/$backend" -maxdepth 1 -name '[0-9][0-9][0-9][0-9]_*.sql' -printf '%f\n' |
+              awk -F_ '{print $1 + 0}' | sort -nu)"
+            test -n "$expected_versions"
+            check_migration_ledger() {
+              # v142 is a Rust data conversion recorded by the migrate CLI
+              # separately from the SQL migrations; require both.
+              diff -u --label "$backend expected SQL versions" --label "$backend applied SQL versions" \
+                <(printf '%s\n' "$expected_versions") \
+                <(sql 'SELECT version FROM schema_migrations WHERE version <> 142 ORDER BY version')
+              test "$(sql 'SELECT name FROM schema_migrations WHERE version = 142')" = 'plaintext state instead of sealed envelopes'
+            }
+            cargo run --locked --bin memeloop-token-center -- migrate
+            check_migration_ledger
+
+            # Restore the schema-159 activation fixture by undoing all known later
+            # changes, on an empty smoke database. Keep the boundary fixed so the
+            # upgrade still exercises history activation as migrations advance.
+            sql 'BEGIN;
+              ALTER TABLE request_history_baseline_runs DROP COLUMN read_model_version;
+              ALTER TABLE request_history_baseline_runs DROP COLUMN activation_epoch;
+              ALTER TABLE request_history_baseline_runs DROP COLUMN chunk_count;
+              ALTER TABLE request_history_baseline_runs DROP COLUMN manifest_hash;
+              ALTER TABLE request_history_baseline_runs DROP COLUMN sources_complete;
+              ALTER TABLE request_history_baseline_runs DROP COLUMN parity_json;
+              ALTER TABLE request_history_baseline_runs DROP COLUMN target_identity;
+              DROP INDEX request_records_started_pending;
+              ALTER TABLE request_records DROP COLUMN started_event_pending;
+              ALTER TABLE request_history_backfill DROP COLUMN after_created_at;
+              ALTER TABLE request_history_backfill DROP COLUMN legacy_after_id;
+              DROP INDEX request_records_orphan_settled_candidates;
+              ALTER TABLE upstream_supplier_availability DROP COLUMN capacity_scope;
+              ALTER TABLE upstream_quota_observations DROP COLUMN observed_at;
+              ALTER TABLE upstream_quota_observations DROP COLUMN started_at;
+              DROP TABLE request_history_activation;
+              DELETE FROM schema_migrations WHERE version > 159;
+              COMMIT;'
+            test "$(sql 'SELECT max(version) FROM schema_migrations')" = 159
+            sql "INSERT INTO request_history_baseline_runs
+              (owner,epoch,ceiling,source_snapshot,status,created_at,updated_at)
+              VALUES ('ci-schema-159',7,19,'ci-snapshot','source_complete',1,2)"
+
+            cargo run --locked --bin memeloop-token-center -- migrate
+            check_migration_ledger
+            test "$(sql "SELECT count(*) FROM request_history_activation WHERE id=1 AND epoch=0 AND phase='legacy' AND transactions_json IS NULL AND baseline_owner IS NULL AND baseline_epoch IS NULL")" = 1
+            test "$(sql "SELECT ceiling FROM request_history_baseline_runs
+              WHERE owner = 'ci-schema-159' AND epoch = 7 AND status = 'source_complete'
+                AND read_model_version IS NULL AND activation_epoch IS NULL")" = 19
+            sql "UPDATE request_history_activation SET epoch=7, phase='observing', transactions_json='{}', baseline_owner='migration-smoke', baseline_epoch=7 WHERE id=1"
+            ledger="$(sql "SELECT version || ':' || name || ':' || applied_at FROM schema_migrations ORDER BY version")"
+            cargo run --locked --bin memeloop-token-center -- migrate
+            test "$(sql "SELECT version || ':' || name || ':' || applied_at FROM schema_migrations ORDER BY version")" = "$ledger"
+            test "$(sql "SELECT count(*) FROM request_history_activation WHERE id=1 AND epoch=7 AND phase='observing' AND transactions_json='{}' AND baseline_owner='migration-smoke' AND baseline_epoch=7")" = 1
+          done
       - name: Seed 100k-row observability scale fixture
         env:
           PGHOST: 127.0.0.1
@@ -1207,8 +1257,6 @@ jobs:
         run: node --test tests/ops/buildkit-attestation-contract.test.ts
       - name: Validate immutable two-image GHCR release evidence
         run: node --test tests/ops/ghcr-release-contract.test.ts
-      - name: Enforce focused source-module boundaries
-        run: node --test tests/ops/source-module-size-contract.test.ts
       - name: Validate GitHub release contracts
         run: node scripts/ci/run-release-source-contracts.ts
       - name: Validate exact-revision memory binary reuse

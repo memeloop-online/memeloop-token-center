@@ -326,8 +326,7 @@ fn model_picker_sql(backend: DatabaseBackend) -> &'static str {
 }
 
 fn uuid_list_json(values: &[Uuid]) -> Result<String, AppError> {
-    serde_json::to_string(&values.iter().map(Uuid::to_string).collect::<Vec<_>>())
-        .map_err(|_| AppError::internal("model_picker_uuid_list_json_1"))
+    serde_json::to_string(values).map_err(|_| AppError::internal("model_picker_uuid_list_json_1"))
 }
 
 fn escape_like(value: &str) -> String {
@@ -337,7 +336,28 @@ fn escape_like(value: &str) -> String {
         .replace('_', "\\_")
 }
 
-const MODEL_PICKER_POSTGRES_SQL: &str = r#"
+macro_rules! postgres_json_values {
+    ($parameter:literal) => {
+        concat!(
+            "SELECT elements.value FROM jsonb_array_elements_text(CAST(",
+            $parameter,
+            " AS jsonb)) AS elements(value)"
+        )
+    };
+}
+
+macro_rules! sqlite_json_values {
+    ($parameter:literal) => {
+        concat!("SELECT value FROM json_each(", $parameter, ")")
+    };
+}
+
+// Keep selection, pagination, and ordering in one query. The arguments supply
+// only column collation, the LIKE pattern, and JSON array expansion.
+macro_rules! model_picker_query {
+    ($collation:literal, $pattern:literal, $json_values:ident) => {
+        concat!(
+            r#"
 WITH direct_sources AS (
     SELECT direct.tenant_id, direct.model_route_id, direct.upstream_account_id, direct.upstream_model
       FROM model_route_upstream_accounts direct
@@ -376,34 +396,39 @@ WITH direct_sources AS (
       FROM configured_sources source
       JOIN tenants tenant ON tenant.id = source.tenant_id AND tenant.external_id = $1 AND tenant.status = 'active'
       JOIN upstream_accounts account ON account.tenant_id = source.tenant_id AND account.id = source.upstream_account_id
-     WHERE account.driver IN (
-         SELECT public_driver.value
-           FROM jsonb_array_elements_text(CAST($10 AS jsonb)) AS public_driver(value)
-     )
+     WHERE account.driver IN ("#,
+            $json_values!("$10"),
+            r#")
        AND ($11 = 0
-            OR account.id IN (SELECT selected.value FROM jsonb_array_elements_text(CAST($7 AS jsonb)) AS selected(value))
+            OR account.id IN ("#,
+            $json_values!("$7"),
+            r#")
             OR EXISTS (
                 SELECT 1 FROM upstream_account_provider_groups membership
                  WHERE membership.tenant_id = source.tenant_id
                    AND membership.upstream_account_id = account.id
-                   AND membership.provider_group_id IN (
-                       SELECT selected.value FROM jsonb_array_elements_text(CAST($8 AS jsonb)) AS selected(value)
-                   )
+                   AND membership.provider_group_id IN ("#,
+            $json_values!("$8"),
+            r#")
             ))
        AND NOT EXISTS (
            SELECT 1 FROM upstream_account_provider_groups membership
             WHERE membership.tenant_id = source.tenant_id
               AND membership.upstream_account_id = account.id
-              AND membership.provider_group_id IN (
-                  SELECT selected.value FROM jsonb_array_elements_text(CAST($9 AS jsonb)) AS selected(value)
-              )
+              AND membership.provider_group_id IN ("#,
+            $json_values!("$9"),
+            r#")
        )
 ), logical_items AS (
     SELECT DISTINCT
-           (CASE WHEN $2 = 'route' THEN route.id ELSE route.public_model END) COLLATE "C" AS item_identity,
+           (CASE WHEN $2 = 'route' THEN route.id ELSE route.public_model END)"#,
+            $collation,
+            r#" AS item_identity,
            CASE WHEN $2 = 'route' THEN route.id ELSE route.public_model END AS item_value,
            route.public_model AS item_label,
-           LOWER(route.public_model COLLATE "C") AS sort_label
+           LOWER(route.public_model"#,
+            $collation,
+            r#") AS sort_label
       FROM model_routes route
       JOIN selected_sources source
         ON source.tenant_id = route.tenant_id AND source.model_route_id = route.id
@@ -421,10 +446,26 @@ WITH direct_sources AS (
           WHERE route.enabled = 1 AND route.archived_at IS NULL
             AND (($2 = 'route' AND route.id = item.item_identity)
                  OR ($2 = 'model' AND route.public_model = item.item_identity))
-            AND (LOWER(route.public_model COLLATE "C") LIKE CAST($3 AS TEXT) COLLATE "C" ESCAPE '\'
-                 OR LOWER(source.upstream_model COLLATE "C") LIKE CAST($3 AS TEXT) COLLATE "C" ESCAPE '\'
-                 OR LOWER(account.name COLLATE "C") LIKE CAST($3 AS TEXT) COLLATE "C" ESCAPE '\'
-                 OR LOWER(account.driver COLLATE "C") LIKE CAST($3 AS TEXT) COLLATE "C" ESCAPE '\'
+            AND (LOWER(route.public_model"#,
+            $collation,
+            r#") LIKE "#,
+            $pattern,
+            r#" ESCAPE '\'
+                 OR LOWER(source.upstream_model"#,
+            $collation,
+            r#") LIKE "#,
+            $pattern,
+            r#" ESCAPE '\'
+                 OR LOWER(account.name"#,
+            $collation,
+            r#") LIKE "#,
+            $pattern,
+            r#" ESCAPE '\'
+                 OR LOWER(account.driver"#,
+            $collation,
+            r#") LIKE "#,
+            $pattern,
+            r#" ESCAPE '\'
                  OR EXISTS (
                      SELECT 1 FROM upstream_account_provider_groups membership
                      JOIN provider_groups provider_group
@@ -432,7 +473,11 @@ WITH direct_sources AS (
                       AND provider_group.id = membership.provider_group_id
                     WHERE membership.tenant_id = source.tenant_id
                       AND membership.upstream_account_id = account.id
-                      AND LOWER(provider_group.name COLLATE "C") LIKE CAST($3 AS TEXT) COLLATE "C" ESCAPE '\'
+                      AND LOWER(provider_group.name"#,
+            $collation,
+            r#") LIKE "#,
+            $pattern,
+            r#" ESCAPE '\'
                  ))
      )
 ), page AS MATERIALIZED (
@@ -516,181 +561,17 @@ SELECT source.*, provider_group.provider_group_id, provider_group.provider_group
    AND provider_group.provider_group_rank <= $14
  WHERE source.source_rank <= $13
  ORDER BY source.sort_label, source.item_identity, source.source_rank, provider_group.provider_group_rank
-"#;
+"#,
+        )
+    };
+}
 
-const MODEL_PICKER_SQLITE_SQL: &str = r#"
-WITH direct_sources AS (
-    SELECT direct.tenant_id, direct.model_route_id, direct.upstream_account_id, direct.upstream_model
-      FROM model_route_upstream_accounts direct
-), raw_sources AS (
-    SELECT direct.tenant_id, direct.model_route_id, direct.upstream_account_id, direct.upstream_model
-      FROM direct_sources direct
-    UNION
-    SELECT included.tenant_id, included.model_route_id, member.upstream_account_id, route.upstream_model
-      FROM model_route_included_provider_groups included
-      JOIN upstream_account_provider_groups member
-        ON member.tenant_id = included.tenant_id
-       AND member.provider_group_id = included.provider_group_id
-      JOIN model_routes route
-        ON route.tenant_id = included.tenant_id AND route.id = included.model_route_id
-     WHERE NOT EXISTS (
-         -- Keep SQLite and PostgreSQL precedence identical for historical rows.
-         SELECT 1 FROM direct_sources direct
-          WHERE direct.tenant_id = included.tenant_id
-            AND direct.model_route_id = included.model_route_id
-            AND direct.upstream_account_id = member.upstream_account_id
-     )
-), configured_sources AS (
-    SELECT raw.tenant_id, raw.model_route_id, raw.upstream_account_id, raw.upstream_model
-      FROM raw_sources raw
-     WHERE NOT EXISTS (
-         SELECT 1 FROM model_route_excluded_provider_groups excluded
-         JOIN upstream_account_provider_groups blocked
-           ON blocked.tenant_id = excluded.tenant_id
-          AND blocked.provider_group_id = excluded.provider_group_id
-        WHERE excluded.tenant_id = raw.tenant_id
-          AND excluded.model_route_id = raw.model_route_id
-          AND blocked.upstream_account_id = raw.upstream_account_id
-     )
-), selected_sources AS MATERIALIZED (
-    SELECT source.tenant_id, source.model_route_id, source.upstream_account_id, source.upstream_model
-      FROM configured_sources source
-      JOIN tenants tenant ON tenant.id = source.tenant_id AND tenant.external_id = $1 AND tenant.status = 'active'
-      JOIN upstream_accounts account ON account.tenant_id = source.tenant_id AND account.id = source.upstream_account_id
-     WHERE account.driver IN (SELECT value FROM json_each($10))
-       AND ($11 = 0
-            OR account.id IN (SELECT value FROM json_each($7))
-            OR EXISTS (
-                SELECT 1 FROM upstream_account_provider_groups membership
-                 WHERE membership.tenant_id = source.tenant_id
-                   AND membership.upstream_account_id = account.id
-                   AND membership.provider_group_id IN (SELECT value FROM json_each($8))
-            ))
-       AND NOT EXISTS (
-           SELECT 1 FROM upstream_account_provider_groups membership
-            WHERE membership.tenant_id = source.tenant_id
-              AND membership.upstream_account_id = account.id
-              AND membership.provider_group_id IN (SELECT value FROM json_each($9))
-       )
-), logical_items AS (
-    SELECT DISTINCT
-           CASE WHEN $2 = 'route' THEN route.id ELSE route.public_model END AS item_identity,
-           CASE WHEN $2 = 'route' THEN route.id ELSE route.public_model END AS item_value,
-           route.public_model AS item_label,
-           LOWER(route.public_model) AS sort_label
-      FROM model_routes route
-      JOIN selected_sources source
-        ON source.tenant_id = route.tenant_id AND source.model_route_id = route.id
-     WHERE route.enabled = 1 AND route.archived_at IS NULL
-), matching_items AS (
-    SELECT item.*
-      FROM logical_items item
-     WHERE EXISTS (
-         SELECT 1
-           FROM model_routes route
-           JOIN selected_sources source
-             ON source.tenant_id = route.tenant_id AND source.model_route_id = route.id
-           JOIN upstream_accounts account
-             ON account.tenant_id = source.tenant_id AND account.id = source.upstream_account_id
-          WHERE route.enabled = 1 AND route.archived_at IS NULL
-            AND (($2 = 'route' AND route.id = item.item_identity)
-                 OR ($2 = 'model' AND route.public_model = item.item_identity))
-            AND (LOWER(route.public_model) LIKE LOWER($3) ESCAPE '\'
-                 OR LOWER(source.upstream_model) LIKE LOWER($3) ESCAPE '\'
-                 OR LOWER(account.name) LIKE LOWER($3) ESCAPE '\'
-                 OR LOWER(account.driver) LIKE LOWER($3) ESCAPE '\'
-                 OR EXISTS (
-                     SELECT 1 FROM upstream_account_provider_groups membership
-                     JOIN provider_groups provider_group
-                       ON provider_group.tenant_id = membership.tenant_id
-                      AND provider_group.id = membership.provider_group_id
-                    WHERE membership.tenant_id = source.tenant_id
-                      AND membership.upstream_account_id = account.id
-                      AND LOWER(provider_group.name) LIKE LOWER($3) ESCAPE '\'
-                 ))
-     )
-), page AS MATERIALIZED (
-    SELECT * FROM matching_items
-     WHERE ($4 = '' OR sort_label > $4 OR (sort_label = $4 AND item_identity > $5))
-     ORDER BY sort_label, item_identity
-     LIMIT $6
-), ranked_sources AS MATERIALIZED (
-    SELECT page.item_identity, page.item_value, page.item_label, page.sort_label,
-           route.id AS route_id, route.protocol AS route_protocol, route.priority,
-           source.upstream_model, account.id AS account_id, account.name AS account_label,
-           account.driver AS provider_id, account.status AS account_status,
-           COUNT(*) OVER (PARTITION BY page.item_identity) AS source_count,
-           ROW_NUMBER() OVER (PARTITION BY page.item_identity ORDER BY route.priority, route.id, account.id) AS source_rank,
-           CASE WHEN EXISTS (
-               SELECT 1 FROM upstream_credentials credential
-                WHERE credential.upstream_account_id = account.id
-                  AND credential.generation = account.credential_generation
-                  AND credential.revoked_at IS NULL
-                  AND (credential.expires_at IS NULL OR credential.expires_at > $12)
-           ) THEN 1 ELSE 0 END AS credential_available,
-           CASE WHEN EXISTS (
-               SELECT 1 FROM model_route_eligible_upstream_accounts eligible
-                WHERE eligible.tenant_id = route.tenant_id
-                  AND eligible.model_route_id = route.id
-                  AND eligible.upstream_account_id = account.id
-                  AND eligible.upstream_model = source.upstream_model
-           ) THEN 1 ELSE 0 END AS route_candidate_eligible,
-           catalog.status AS catalog_state, catalog.last_attempt_at AS catalog_observed_at,
-           catalog.last_success_at AS catalog_last_success_at, catalog.expires_at AS catalog_expires_at,
-           catalog.last_error_code AS catalog_error_code,
-           CASE WHEN snapshot.id IS NOT NULL
-                     AND catalog.credential_generation = account.credential_generation
-                     AND snapshot.credential_generation = account.credential_generation
-                THEN 1 ELSE 0 END AS catalog_snapshot_current,
-           CASE WHEN snapshot.id IS NOT NULL
-                     AND catalog.credential_generation = account.credential_generation
-                     AND snapshot.credential_generation = account.credential_generation
-                     AND EXISTS (
-                         SELECT 1 FROM upstream_models model
-                          WHERE model.tenant_id = account.tenant_id
-                            AND model.upstream_account_id = account.id
-                            AND model.snapshot_id = snapshot.id
-                            AND model.model_id = source.upstream_model
-                            AND (model.protocol = 'any' OR model.protocol = route.protocol)
-                     ) THEN 1 ELSE 0 END AS catalog_model_listed,
-           probe.status AS probe_status,
-           probe.error_code AS probe_error_code,
-           probe.checked_at AS probe_checked_at
-      FROM page
-      JOIN model_routes route
-        ON route.enabled = 1 AND route.archived_at IS NULL
-       AND (($2 = 'route' AND route.id = page.item_identity)
-            OR ($2 = 'model' AND route.public_model = page.item_identity))
-      JOIN selected_sources source
-        ON source.tenant_id = route.tenant_id AND source.model_route_id = route.id
-      JOIN upstream_accounts account
-        ON account.tenant_id = source.tenant_id AND account.id = source.upstream_account_id
-      LEFT JOIN upstream_model_catalog_state catalog
-        ON catalog.tenant_id = account.tenant_id AND catalog.upstream_account_id = account.id
-      LEFT JOIN upstream_model_catalog_snapshots snapshot
-        ON snapshot.tenant_id = account.tenant_id
-       AND snapshot.upstream_account_id = account.id
-       AND snapshot.id = catalog.current_snapshot_id
-      LEFT JOIN upstream_service_probes probe ON probe.upstream_account_id = account.id
-), ranked_groups AS MATERIALIZED (
-    SELECT membership.upstream_account_id, provider_group.id AS provider_group_id,
-           provider_group.name AS provider_group_label,
-           COUNT(*) OVER (PARTITION BY membership.upstream_account_id) AS provider_group_count,
-           ROW_NUMBER() OVER (PARTITION BY membership.upstream_account_id ORDER BY provider_group.id) AS provider_group_rank
-      FROM upstream_account_provider_groups membership
-      JOIN provider_groups provider_group
-        ON provider_group.tenant_id = membership.tenant_id AND provider_group.id = membership.provider_group_id
-      JOIN tenants tenant ON tenant.id = membership.tenant_id AND tenant.external_id = $1
-)
-SELECT source.*, provider_group.provider_group_id, provider_group.provider_group_label,
-       COALESCE(provider_group.provider_group_count, 0) AS provider_group_count
-  FROM ranked_sources source
-  LEFT JOIN ranked_groups provider_group
-    ON provider_group.upstream_account_id = source.account_id
-   AND provider_group.provider_group_rank <= $14
- WHERE source.source_rank <= $13
- ORDER BY source.sort_label, source.item_identity, source.source_rank, provider_group.provider_group_rank
-"#;
+const MODEL_PICKER_POSTGRES_SQL: &str = model_picker_query!(
+    r#" COLLATE "C""#,
+    r#"CAST($3 AS TEXT) COLLATE "C""#,
+    postgres_json_values
+);
+const MODEL_PICKER_SQLITE_SQL: &str = model_picker_query!("", "LOWER($3)", sqlite_json_values);
 
 #[cfg(test)]
 mod tests {

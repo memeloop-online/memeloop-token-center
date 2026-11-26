@@ -25,12 +25,10 @@ pub(in crate::api) async fn classify_archived_media_rate_limit(
     kind
 }
 
-pub(in crate::api) async fn classify_codex_media_rate_limit(
-    response: reqwest::Response,
-) -> crate::db::UpstreamFailureKind {
-    let (response, kind) = routing::classify_rate_limit(UpstreamResponse::Codex(response)).await;
-    drop(response);
-    kind
+pub(in crate::api) async fn classify_image_rate_limit(
+    response: UpstreamResponse,
+) -> (UpstreamResponse, crate::db::UpstreamFailureKind) {
+    routing::classify_rate_limit(response).await
 }
 
 #[path = "codex_transport.rs"]
@@ -53,7 +51,7 @@ pub(crate) mod session_preferences;
 mod sse_capture;
 mod streaming;
 mod transport_protocol;
-pub(super) mod upstream_error;
+pub(in crate::api) mod upstream_error;
 pub(in crate::api) mod upstream_response;
 
 #[cfg(test)]
@@ -97,27 +95,6 @@ mod sse_delivery_tests;
 
 const PROXY_BODY_CHANNEL_CAPACITY: usize = 1;
 const MAX_INPUT_TOKEN_OVERHEAD_CEILING: i64 = 1_000_000;
-
-async fn read_safe_proxy_rejection(
-    upstream: UpstreamResponse,
-    protocol: Protocol,
-    responses_anthropic_route: bool,
-    driver: &str,
-) -> (Option<UpstreamResponse>, Option<upstream_error::Rejection>) {
-    let native_kimi = driver == crate::oauth::managed::kimi::PROVIDER_DRIVER
-        && matches!(protocol, Protocol::OpenAiChat | Protocol::OpenAiResponses);
-    if !upstream.status().is_success()
-        && !protocol.is_anthropic()
-        && !responses_anthropic_route
-        && (crate::provider::is_openai_compatible_http_driver(driver)
-            || native_kimi
-            || codex_transport::is_driver(driver))
-    {
-        (None, Some(upstream_error::read_rejection(upstream).await))
-    } else {
-        (Some(upstream), None)
-    }
-}
 
 fn validate_openai_chat_choice_count(request: &Value) -> Result<(), AppError> {
     if openai_chat_choice_count(request)? == 1 {
@@ -347,7 +324,7 @@ async fn next_sendable_proxy_route(
             );
             continue;
         }
-        if !codex_transport::is_driver(&planned.route.driver)
+        if !planned.is_codex()
             && refresh_route_snapshot(state, &mut planned.route).await?
                 != PreparedRouteReadiness::Ready
         {
@@ -1283,7 +1260,7 @@ async fn proxy_with_cancellation_guard(
     let primary = route_plan.primary_route();
     let upstream_account_id = Some(primary.account_id);
     let model_route_id = Some(primary.route_id);
-    let mut dispatch_permit = if codex_transport::is_driver(&primary.driver) {
+    let mut dispatch_permit = if route_plan.primary.is_codex() {
         match state
             .codex_clients
             .acquire_dispatch(primary, &state.metrics)
@@ -1300,7 +1277,7 @@ async fn proxy_with_cancellation_guard(
     } else {
         None
     };
-    let memory_wait = if codex_transport::is_driver(&primary.driver) {
+    let memory_wait = if route_plan.primary.is_codex() {
         crate::provider::CodexTransportPolicy::parse(primary.config.get("transport_policy"))
             .map_err(|_| AppError::BadRequest("invalid Codex transport policy".into()))?
             .memory_admission_wait_millis
@@ -1779,8 +1756,10 @@ async fn proxy_with_cancellation_guard(
         };
         let (result, model_rejected) = match result {
             Ok(mut result)
-                if !route_candidates.as_slice().is_empty()
-                    || !deferred_shared_probes.is_empty() =>
+                if !(route_candidates.as_slice().is_empty()
+                    && deferred_shared_probes.is_empty()
+                    || active_route.is_codex()
+                        && result.response.status() == StatusCode::BAD_REQUEST) =>
             {
                 let (response, rejected) =
                     upstream_error::inspect_model_rejection(result.response).await;
@@ -1924,6 +1903,7 @@ async fn proxy_with_cancellation_guard(
             drop(dispatch_permit.take());
             if let Ok(discarded) = result {
                 let attempt = crate::archive::RawResponseAttempt {
+                    subattempt: 0,
                     outbound_attempt,
                     upstream_account_id: active_route.route.account_id,
                     model_route_id: active_route.route.route_id,
@@ -1995,42 +1975,6 @@ async fn proxy_with_cancellation_guard(
                 return finish_unavailable(&buffered_request, "upstream_connection", last_dispatch)
                     .await;
             }
-            Err(ProxySendError::RetryableCodexBadRequest) => {
-                return finish_unavailable(&buffered_request, "upstream_rejected", last_dispatch)
-                    .await;
-            }
-            Err(error @ (ProxySendError::CodexBadRequest | ProxySendError::CodexRejection(_))) => {
-                buffered_request.original_response_capture = true;
-                let body = match error {
-                    ProxySendError::CodexRejection(body) => body,
-                    _ => upstream_error::fallback_body(),
-                };
-                let reason = serde_json::from_slice(&body)
-                    .ok()
-                    .as_ref()
-                    .and_then(crate::supplier_error::reason_from_value);
-                upstream_attempt
-                    .complete(UpstreamAttemptTerminal::Inconclusive)
-                    .await;
-                return finish_buffered_request_with_upstream_attribution_and_response_object(
-                    &buffered_request,
-                    StatusCode::BAD_REQUEST,
-                    body,
-                    "application/json",
-                    (
-                        TokenUsage::default(),
-                        crate::model::RequestUsageBasis::NotObserved,
-                    ),
-                    Some(reason.map_or("http_400", |reason| reason.code()).to_owned()),
-                    BufferedFinishPolicy {
-                        upstream_attribution: ProxyRequestUpstreamAttribution::KeepSelected,
-                        terminal_cause: Some(
-                            crate::model::RequestTerminalCause::UpstreamHttpStatus,
-                        ),
-                    },
-                )
-                .await;
-            }
             Err(ProxySendError::AmbiguousResponse(error_code)) => {
                 upstream_attempt
                     .complete(UpstreamAttemptTerminal::Inconclusive)
@@ -2088,13 +2032,6 @@ async fn proxy_with_cancellation_guard(
     // Capture before any delivery/validation branch can discard a supplier
     // response, including successful envelopes rejected by local boundaries.
     let upstream = buffered_request.capture_original_response(upstream).await;
-    let (upstream, rejection) = read_safe_proxy_rejection(
-        upstream,
-        protocol,
-        responses_anthropic_route,
-        &active_route.route.driver,
-    )
-    .await;
     drop(request_json);
     active_route.release_request_buffers();
     if let Some(conversation) = buffered_request.conversation.as_ref() {
@@ -2103,19 +2040,9 @@ async fn proxy_with_cancellation_guard(
         buffered_request.memory.release_unretained_json();
     }
     let is_codex_route = active_route.is_codex();
-    let codex_downstream_stream = active_route.codex_downstream_stream;
+    let buffer_codex_response = active_route.buffers_codex_response();
     let upstream_account_id = Some(active_route.route.account_id);
     let route_driver = Some(active_route.route.driver.as_str());
-    let response_headers = if protocol.is_anthropic() || responses_anthropic_route {
-        crate::api::anthropic::downstream_response_headers(
-            upstream
-                .as_ref()
-                .ok_or(AppError::internal("proxy_site_4"))?
-                .headers(),
-        )
-    } else {
-        HeaderMap::new()
-    };
     if !status.is_success() {
         crate::api::trigger_copilot_remint_on_auth_failure(
             &state,
@@ -2124,107 +2051,26 @@ async fn proxy_with_cancellation_guard(
             request_id,
             status,
         );
-        if protocol.is_anthropic() || responses_anthropic_route {
-            let upstream = upstream.ok_or(AppError::internal("proxy_site_5"))?;
-            let content_type = upstream
-                .headers()
-                .get(header::CONTENT_TYPE)
-                .and_then(|value| value.to_str().ok())
-                .unwrap_or("application/json")
-                .to_owned();
-            let body = buffered_carrier::read(
-                upstream,
-                MAX_PROXY_RESPONSE_BODY,
-                &buffered_request,
-                buffered_request.state,
-                false,
-            )
-            .await
-            .map(Bytes::from);
-            let mut result = match body {
-                Ok(body) => {
-                    finish_passthrough_error_response(
-                        &buffered_request,
-                        status,
-                        body,
-                        &content_type,
-                        (
-                            TokenUsage::default(),
-                            crate::model::RequestUsageBasis::NotObserved,
-                        ),
-                        Some(format!("http_{}", status.as_u16())),
-                    )
-                    .await
-                }
-                Err(error) => {
-                    finish_proxy_failure_with_cause(
-                        &buffered_request,
-                        error.code(),
-                        error.terminal_cause(),
-                    )
-                    .await
-                }
-            };
-            if let Ok(response) = result.as_mut() {
-                crate::api::anthropic::append_response_headers(
-                    response.headers_mut(),
-                    &response_headers,
-                );
-            }
-            upstream_attempt
-                .complete(if status.is_client_error() {
-                    UpstreamAttemptTerminal::Inconclusive
-                } else {
-                    UpstreamAttemptTerminal::invalid_response()
-                })
-                .await;
-            codex_retry.complete(CodexRetryTerminal::Failed);
-            return result;
-        }
-        let (body, terminal_cause) = if let Some(rejection) = rejection {
-            (rejection.body, rejection.terminal_cause)
-        } else {
-            let upstream = upstream.ok_or(AppError::internal("proxy_site_6"))?;
-            let terminal_cause = if status == StatusCode::BAD_GATEWAY {
-                upstream_response::rejected_response_terminal_cause(upstream)
-                    .await
-                    .or(Some(crate::model::RequestTerminalCause::UpstreamHttpStatus))
-            } else {
-                drop(upstream);
-                Some(crate::model::RequestTerminalCause::UpstreamHttpStatus)
-            };
-            (upstream_error::fallback_body(), terminal_cause)
-        };
-        let result = finish_buffered_request_with_upstream_attribution_and_response_object(
-            &buffered_request,
-            status,
-            body,
-            "application/json",
-            (
-                TokenUsage::default(),
-                crate::model::RequestUsageBasis::NotObserved,
-            ),
-            Some(format!("http_{}", status.as_u16())),
-            BufferedFinishPolicy {
-                upstream_attribution: ProxyRequestUpstreamAttribution::KeepSelected,
-                terminal_cause,
-            },
-        )
-        .await;
+        let result = finish_upstream_http_error(&buffered_request, upstream).await;
         upstream_attempt
             .complete(if status.is_client_error() {
-                // Ordinary caller-dependent 4xx responses are not evidence
-                // that a shared upstream account is unhealthy. Typed auth,
-                // rate-limit, and transient statuses were handled above.
+                // Typed auth, rate-limit and transient statuses were handled
+                // by routing; ordinary caller-dependent rejections are neutral.
                 UpstreamAttemptTerminal::Inconclusive
             } else {
                 UpstreamAttemptTerminal::invalid_response()
             })
             .await;
         codex_retry.complete(CodexRetryTerminal::Failed);
-        return result;
+        return result.map(|response| {
+            super::auth::hold_response_body_permit(response, (upstream_activity, dispatch_permit))
+        });
     }
-    let upstream = upstream.ok_or(AppError::internal("proxy_site_7"))?;
+    let response_headers = if protocol.is_anthropic() || responses_anthropic_route {
+        crate::api::anthropic::downstream_response_headers(upstream.headers())
+    } else {
+        HeaderMap::new()
+    };
     let validated_compact = upstream.validated_compact().is_some();
     let content_type = upstream.headers().get(header::CONTENT_TYPE).cloned();
     let is_sse = content_type
@@ -2232,8 +2078,8 @@ async fn proxy_with_cancellation_guard(
         .and_then(|value| value.to_str().ok())
         .and_then(|value| value.split(';').next())
         .is_some_and(|value| value.trim().eq_ignore_ascii_case("text/event-stream"));
-    let will_buffer_response = !validated_compact
-        && ((is_codex_route && !codex_downstream_stream) || (!is_sse && !strict_openai_chat_usage));
+    let will_buffer_response =
+        !validated_compact && (buffer_codex_response || (!is_sse && !strict_openai_chat_usage));
     if requested_native_stream
         && will_buffer_response
         && let Some(conversation) = buffered_request.conversation.as_ref()
@@ -2257,7 +2103,7 @@ async fn proxy_with_cancellation_guard(
         codex_retry.complete(CodexRetryTerminal::Failed);
         return result;
     }
-    if is_codex_route && !codex_downstream_stream && !validated_compact {
+    if buffer_codex_response && !validated_compact {
         let buffer_phase = proxy_diagnostics::Phase::account(
             diagnostic_context,
             "codex_buffered_response",
@@ -2721,8 +2567,8 @@ enum ConversationProjectionAdmission {
 
 struct ProxyConversationProjection<'a> {
     conversation: &'a ProxyConversation,
-    request_json: std::sync::Arc<Value>,
-    _memory: Option<crate::gateway_body::memory::ConversationProjectionPermit>,
+    request_json: Value,
+    permit: crate::gateway_body::memory::ConversationProjectionPermit,
 }
 
 impl ProxyConversation {
@@ -2890,8 +2736,8 @@ impl ProxyConversation {
             .map_err(|_| AppError::internal("proxy_project_2"))?;
         Ok(ProxyConversationProjection {
             conversation: self,
-            request_json: std::sync::Arc::new(request_json),
-            _memory: Some(projection_memory),
+            request_json,
+            permit: projection_memory,
         })
     }
 
@@ -2905,18 +2751,6 @@ impl ProxyConversation {
     }
 }
 
-impl<'a> ProxyConversationProjection<'a> {
-    fn input<'b>(&'b self, upstream_response_id: Option<&'b str>) -> ProxyConversationInput<'b> {
-        ProxyConversationInput {
-            key: &self.conversation.key,
-            request_json: &self.request_json,
-            hints: &self.conversation.hints,
-            client_name: self.conversation.client_name.as_deref(),
-            upstream_response_id,
-        }
-    }
-}
-
 async fn prepare_terminal_conversation(
     conversation: Option<ProxyConversation>,
     memory: std::sync::Arc<crate::gateway_body::memory::ProxyMemoryReservation>,
@@ -2927,13 +2761,18 @@ async fn prepare_terminal_conversation(
     let conversation = conversation?;
     match conversation.project(&memory, deadline).await {
         Ok(projection) => {
-            let conversation = crate::proxy_lifecycle::pending_terminal::OwnedConversation::capture(
-                projection.input(response_id.as_deref()),
-            );
+            let conversation =
+                crate::proxy_lifecycle::pending_terminal::OwnedConversation::capture_owned(
+                    &projection.conversation.key,
+                    projection.request_json,
+                    &projection.conversation.hints,
+                    projection.conversation.client_name.as_deref(),
+                    response_id,
+                );
             Some(
                 crate::proxy_lifecycle::pending_terminal::PreparedConversation {
                     conversation,
-                    retained: Box::new((projection._memory, memory)),
+                    retained: Box::new((projection.permit, memory)),
                 },
             )
         }
@@ -3062,7 +2901,7 @@ async fn execute_component_provider(
             .await;
         }
     };
-    let _upstream_activity = request
+    let upstream_activity = request
         .state
         .metrics
         .active_upstream(driver, "component_provider");
@@ -3173,24 +3012,25 @@ async fn execute_component_provider(
     let upstream = request.capture_original_response(upstream).await;
 
     IndependentProbeTarget::response(upstream_status);
-    if !upstream_status.is_success() && !upstream_status.is_redirection() {
-        if let Some(attempt) = upstream_attempt.as_mut() {
-            let terminal = if matches!(
-                upstream_status,
-                StatusCode::TOO_MANY_REQUESTS | StatusCode::FORBIDDEN
-            ) {
-                let observed_at = unix_millis();
-                let (response, kind, evidence) = routing::classify_supplier_quota(upstream).await;
-                if upstream_status == StatusCode::TOO_MANY_REQUESTS || evidence.exhausted {
-                    publish_supplier_quota(
-                        request.state,
-                        route,
-                        request.request_id,
-                        observed_at,
-                        evidence,
-                    );
-                }
-                drop(response);
+    if !upstream_status.is_success() {
+        let (upstream, terminal) = if matches!(
+            upstream_status,
+            StatusCode::TOO_MANY_REQUESTS | StatusCode::FORBIDDEN
+        ) && upstream_attempt.is_some()
+        {
+            let observed_at = unix_millis();
+            let (response, kind, evidence) = routing::classify_supplier_quota(upstream).await;
+            if upstream_status == StatusCode::TOO_MANY_REQUESTS || evidence.exhausted {
+                publish_supplier_quota(
+                    request.state,
+                    route,
+                    request.request_id,
+                    observed_at,
+                    evidence,
+                );
+            }
+            (
+                response,
                 UpstreamAttemptTerminal::Failed {
                     kind,
                     reason: if kind == crate::db::UpstreamFailureKind::Authentication {
@@ -3199,50 +3039,32 @@ async fn execute_component_provider(
                         UpstreamHealthReason::RateLimited
                     },
                     failure_stage: "upstream_response",
+                },
+            )
+        } else {
+            let terminal = if upstream_status == StatusCode::UNAUTHORIZED {
+                UpstreamAttemptTerminal::Failed {
+                    kind: crate::db::UpstreamFailureKind::Authentication,
+                    reason: UpstreamHealthReason::Unavailable,
+                    failure_stage: "upstream_response",
+                }
+            } else if upstream_status.is_server_error() {
+                UpstreamAttemptTerminal::Failed {
+                    kind: crate::db::UpstreamFailureKind::Unavailable,
+                    reason: UpstreamHealthReason::Unavailable,
+                    failure_stage: "upstream_response",
                 }
             } else {
-                drop(upstream);
-                if matches!(
-                    upstream_status,
-                    StatusCode::UNAUTHORIZED | StatusCode::FORBIDDEN
-                ) {
-                    UpstreamAttemptTerminal::Failed {
-                        kind: crate::db::UpstreamFailureKind::Authentication,
-                        reason: UpstreamHealthReason::Unavailable,
-                        failure_stage: "upstream_response",
-                    }
-                } else if upstream_status.is_server_error() {
-                    UpstreamAttemptTerminal::Failed {
-                        kind: crate::db::UpstreamFailureKind::Unavailable,
-                        reason: UpstreamHealthReason::Unavailable,
-                        failure_stage: "upstream_response",
-                    }
-                } else {
-                    UpstreamAttemptTerminal::Inconclusive
-                }
+                UpstreamAttemptTerminal::Inconclusive
             };
+            (upstream, terminal)
+        };
+        if let Some(attempt) = upstream_attempt.as_mut() {
             attempt.complete(terminal).await;
-        } else {
-            drop(upstream);
         }
-        return finish_buffered_request_with_upstream_attribution_and_response_object(
-            &request,
-            upstream_status,
-            Bytes::from_static(
-                b"{\"error\":{\"message\":\"component provider rejected the request\"}}",
-            ),
-            "application/json",
-            (
-                TokenUsage::default(),
-                crate::model::RequestUsageBasis::NotObserved,
-            ),
-            Some(format!("http_{}", upstream_status.as_u16())),
-            BufferedFinishPolicy {
-                upstream_attribution: ProxyRequestUpstreamAttribution::KeepSelected,
-                terminal_cause: Some(crate::model::RequestTerminalCause::UpstreamHttpStatus),
-            },
-        )
-        .await;
+        return finish_upstream_http_error(&request, upstream)
+            .await
+            .map(|response| super::auth::hold_response_body_permit(response, upstream_activity));
     }
     let mut upstream_headers = BTreeMap::new();
     for (name, value) in upstream.headers() {
@@ -3684,27 +3506,42 @@ async fn finish_buffered_request_with_upstream_attribution(
     .await
 }
 
-async fn finish_passthrough_error_response(
+/// Complete the local terminal record independently of the supplier's wire
+/// response. The bounded preview feeds only internal diagnostics; the same
+/// consumed chunks and unread tail are delivered without parsing or re-encoding.
+async fn finish_upstream_http_error(
     request: &BufferedRequest<'_>,
-    status: StatusCode,
-    body: Bytes,
-    content_type: &str,
-    usage: (TokenUsage, crate::model::RequestUsageBasis),
-    error_code: Option<String>,
+    upstream: UpstreamResponse,
 ) -> Result<Response, AppError> {
-    finish_buffered_request_with_upstream_attribution_and_response_object(
+    let status = upstream.status();
+    let headers = upstream_error::forwarded_http_error_headers(upstream.headers());
+    let (diagnostic, upstream) =
+        upstream_error::read_response_diagnostic_preserving(upstream).await;
+    let terminal = finish_buffered_request_with_upstream_attribution_and_response_object(
         request,
         status,
-        body,
-        content_type,
-        usage,
-        error_code,
+        diagnostic.body,
+        "application/json",
+        (
+            TokenUsage::default(),
+            crate::model::RequestUsageBasis::NotObserved,
+        ),
+        Some(format!("http_{}", status.as_u16())),
         BufferedFinishPolicy {
             upstream_attribution: ProxyRequestUpstreamAttribution::KeepSelected,
-            terminal_cause: Some(crate::model::RequestTerminalCause::UpstreamHttpStatus),
+            terminal_cause: diagnostic.terminal_cause,
         },
     )
-    .await
+    .await?;
+    let mut response = Response::new(Body::from_stream(upstream.bytes_stream()));
+    *response.status_mut() = status;
+    *response.headers_mut() = headers;
+    if let Some(request_id) = terminal.headers().get(REQUEST_ID_HEADER) {
+        response
+            .headers_mut()
+            .insert(REQUEST_ID_HEADER, request_id.clone());
+    }
+    Ok(response)
 }
 
 async fn finish_buffered_request_with_upstream_attribution_and_response_object(

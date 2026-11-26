@@ -9,9 +9,7 @@ pub(in crate::api::proxy) struct PreparedProxyRoute {
     // already include protocol rewrites larger than the original ingress.
     pub(super) component_input_bytes: usize,
     pub(in crate::api::proxy) upstream_stream: bool,
-    pub(in crate::api::proxy) codex_downstream_stream: bool,
-    pub(in crate::api::proxy) codex_store_disabled: bool,
-    pub(super) codex_session_id: Option<String>,
+    pub(super) codex: Option<codex_transport::PreparedCodexRequest>,
     pub(in crate::api::proxy) component_request: Option<(PreparedProviderRequest, RequestContext)>,
     pub(super) responses_chat: Option<crate::api::responses_via_chat::Context>,
     pub(super) upstream_path: &'static str,
@@ -28,9 +26,7 @@ pub(in crate::api::proxy) struct PlannedProxyRoute {
     pub(in crate::api::proxy) output_token_ceiling: i64,
     pub(in crate::api::proxy) output_token_limit: Option<i64>,
     pub(super) upstream_stream: bool,
-    pub(super) codex_downstream_stream: bool,
-    pub(super) codex_store_disabled: bool,
-    pub(super) codex_session_id: Option<String>,
+    pub(super) codex: Option<codex_transport::PreparedCodexRequest>,
     pub(super) component_context: Option<RequestContext>,
     pub(super) responses_chat: Option<crate::api::responses_via_chat::Context>,
     pub(super) upstream_path: &'static str,
@@ -43,6 +39,10 @@ pub(in crate::api::proxy) struct PlannedProxyRoute {
 }
 
 impl PlannedProxyRoute {
+    pub(in crate::api::proxy) fn is_codex(&self) -> bool {
+        self.codex.is_some()
+    }
+
     pub(in crate::api::proxy) fn is_component(&self) -> bool {
         self.component_context.is_some()
     }
@@ -66,7 +66,13 @@ impl PreparedProxyRoute {
     }
 
     pub(in crate::api::proxy) fn is_codex(&self) -> bool {
-        codex_transport::is_driver(&self.route.driver)
+        self.codex.is_some()
+    }
+
+    pub(in crate::api::proxy) fn buffers_codex_response(&self) -> bool {
+        self.codex
+            .as_ref()
+            .is_some_and(|plan| !plan.downstream_stream)
     }
 
     pub(in crate::api::proxy) fn is_responses_via_anthropic(&self) -> bool {
@@ -165,9 +171,6 @@ impl TransportFailureKind {
 #[derive(Debug, Eq, PartialEq)]
 pub(in crate::api::proxy) enum ProxySendError {
     RetryableConnection(&'static str),
-    RetryableCodexBadRequest,
-    CodexBadRequest,
-    CodexRejection(bytes::Bytes),
     CandidateUnavailable,
     AmbiguousResponse(&'static str),
     NonRetryableTransport(TransportFailureKind),
@@ -176,6 +179,7 @@ pub(in crate::api::proxy) enum ProxySendError {
 }
 
 pub(in crate::api::proxy) struct ProxyRouteResponse {
+    pub(in crate::api::proxy) codex_transient_bad_request: bool,
     pub(in crate::api::proxy) preoutput_quota: Option<(
         crate::db::UpstreamFailureKind,
         crate::db::SupplierQuotaEvidence,

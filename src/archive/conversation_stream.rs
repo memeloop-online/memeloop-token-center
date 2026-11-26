@@ -110,73 +110,15 @@ impl ArchiveStore {
         &self,
         tenant: Uuid,
         object: &CasArchiveObject,
-        require_complete: bool,
     ) -> Result<EventReferences, AppError> {
         let parsed: EventReferences = self.read_tenant_json_streamed(tenant, object).await?;
-        if parsed.event_id.is_empty()
-            || parsed.branch_id.is_empty()
-            || (require_complete && !parsed.gaps.is_empty())
-        {
+        if parsed.event_id.is_empty() || parsed.branch_id.is_empty() || !parsed.gaps.is_empty() {
             return Err(AppError::storage("conversation_training_export_incomplete"));
         }
         for media in &parsed.media {
             self.verify_tenant_content(tenant, &media.object).await?;
         }
         Ok(parsed)
-    }
-
-    pub(super) async fn validate_conversation_streaming(
-        &self,
-        manifest: &ConversationManifest,
-    ) -> Result<(), AppError> {
-        validate_manifest(manifest.tenant_id, manifest)?;
-        let mut cursor = manifest.head.clone();
-        let mut remaining = cursor.as_ref().map_or(0, |head| head.event_count);
-        let mut ids = std::collections::HashSet::new();
-        let mut parents = std::collections::HashSet::new();
-        let mut branch_parent_found = manifest.parent_event_id.is_none();
-        while let Some(head) = cursor {
-            if head.event_count != remaining {
-                return Err(AppError::storage("conversation_export_order_invalid"));
-            }
-            let node: PrefixNode = self
-                .get_conversation_json(manifest.tenant_id, &head.object, 4096)
-                .await?;
-            validate_node(manifest.tenant_id, &head, &node)?;
-            let event = self
-                .event_references(manifest.tenant_id, &node.event, false)
-                .await?;
-            if remaining == manifest.head.as_ref().map_or(0, |head| head.event_count)
-                && event.branch_id != manifest.branch_id
-            {
-                return Err(AppError::storage("conversation_export_branch_invalid"));
-            }
-            if manifest.parent_event_id.as_ref() == Some(&event.event_id)
-                && manifest.parent_branch_id.as_ref() == Some(&event.branch_id)
-            {
-                branch_parent_found = true;
-            }
-            parents.remove(&event.event_id);
-            if !ids.insert(event.event_id) {
-                return Err(AppError::storage("conversation_duplicate_event"));
-            }
-            if let Some(parent) = event.parent_event_id {
-                if ids.contains(&parent) {
-                    return Err(AppError::storage("conversation_parent_order_invalid"));
-                }
-                parents.insert(parent);
-            }
-            remaining -= 1;
-            cursor = node.parent;
-        }
-        if remaining != 0 || !parents.is_empty() || !branch_parent_found {
-            return Err(AppError::storage("conversation_ancestry_incomplete"));
-        }
-        for capture in &manifest.raw_captures {
-            self.verify_tenant_content(manifest.tenant_id, &capture.object)
-                .await?;
-        }
-        Ok(())
     }
 
     pub async fn stream_conversation_export(
@@ -229,7 +171,7 @@ impl ArchiveStore {
                     validate_node(state.tenant, &head, &node)?;
                     let event = state
                         .archive
-                        .event_references(state.tenant, &node.event, true)
+                        .event_references(state.tenant, &node.event)
                         .await?;
                     if state.remaining
                         == state

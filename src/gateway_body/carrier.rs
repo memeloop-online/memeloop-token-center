@@ -168,6 +168,9 @@ impl Drop for CarrierReadOwner {
 #[path = "carrier_spill.rs"]
 mod spill;
 use spill::{CaptureSpill, CompletedSpill, PreparedSpill};
+#[path = "carrier_spill_observation.rs"]
+mod spill_observation;
+use spill_observation::SpillObservation;
 
 impl BodyCarrier {
     fn read_owner(self: &Arc<Self>) -> CarrierReadOwner {
@@ -395,6 +398,11 @@ impl BodyCarrier {
             published: Mutex::new(None),
             readers: std::sync::atomic::AtomicUsize::new(0),
         };
+        let mut spill_observation = SpillObservation::new(
+            source.memory.clone(),
+            source.workspace.clone(),
+            source.staging,
+        );
         let mut hash = blake3::Hasher::new();
         let mut pending_spill: Option<CaptureSpill> = None;
         let mut spill_error = None;
@@ -428,16 +436,35 @@ impl BodyCarrier {
                 .ok_or_else(|| AppError::storage("carrier_length_overflow"))?;
             hash.update(&chunk);
             if let Some(credit) = credit {
-                let retained = source.memory.try_reserve_carrier_retained(chunk.len());
+                let mut retained = source.memory.try_reserve_carrier_retained(chunk.len());
                 if retained.is_none() {
-                    // Preserve the existing response tap's opportunistic spill:
-                    // credited streams can exceed source RAM over their lifetime.
-                    let _ = source.offload_one().await;
+                    // Replace only pre-existing RAM, with a fixed finite budget.
+                    // ACKed payload is not necessarily freed global credit: a
+                    // reader or SDK clone may still own the original allocation.
+                    let old_segments = source.segments.len();
+                    let mut converted = 0usize;
+                    for _ in 0..old_segments {
+                        spill_observation.begin(chunk.len());
+                        let result = source.offload_one_bytes(None).await;
+                        spill_observation.finish(&result);
+                        let Ok(Some(bytes)) = result else { break };
+                        if bytes == 0 {
+                            break;
+                        }
+                        converted = converted.saturating_add(bytes);
+                        retained = source.memory.try_reserve_carrier_retained(chunk.len());
+                        if retained.is_some() || converted >= chunk.len() {
+                            break;
+                        }
+                    }
                 }
+                let length = chunk.len();
                 let bytes = source.leased_bytes(chunk, credit, retained);
                 source.segments.push(Mutex::new(Segment::Ram(bytes)));
+                spill_observation.accepted(length);
                 continue;
             }
+            spill_observation.unobserved_segment_transition();
             let mut remaining = chunk;
             while !remaining.is_empty() {
                 // Bounded owned allocations prevent a small slice from pinning
@@ -513,6 +540,7 @@ impl BodyCarrier {
                 source.segments.push(Mutex::new(Segment::Ram(bytes)));
             }
         }
+        spill_observation.completed = true;
         source.digest = hash.finalize().to_hex().to_string();
         source.sealed_reference = match source.segments.as_slice() {
             [segment] => match &*segment.lock().unwrap() {
@@ -577,10 +605,22 @@ impl BodyCarrier {
         &self,
         prepaid: Option<Arc<crate::api::proxy::persistence::WorkspaceGuard>>,
     ) -> Result<bool, AppError> {
+        self.offload_one_bytes(prepaid)
+            .await
+            .map(|bytes| bytes.is_some())
+    }
+
+    async fn offload_one_bytes(
+        &self,
+        prepaid: Option<Arc<crate::api::proxy::persistence::WorkspaceGuard>>,
+    ) -> Result<Option<usize>, AppError> {
         let Some(attempt) = self.prepare_offload(prepaid).await? else {
-            return Ok(false);
+            return Ok(None);
         };
-        self.apply_spill(attempt.execute().await?)
+        let completed = attempt.execute().await?;
+        let bytes = completed.bytes.len();
+        self.apply_spill(completed)?;
+        Ok(Some(bytes))
     }
 
     async fn prepare_offload(

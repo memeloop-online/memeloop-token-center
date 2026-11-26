@@ -57,6 +57,14 @@ fn oauth_refresh_lifecycle_from_row(row: &sqlx::any::AnyRow) -> Result<(String, 
     Ok((driver.to_owned(), refresh_url.to_owned()))
 }
 
+pub(crate) struct OAuthReauthorizationSnapshot {
+    pub config: Value,
+    pub driver: String,
+    pub credential: Option<UpstreamCredential>,
+    // Admission must report config/schema errors before target mismatches.
+    pub target: Result<crate::oauth::OAuthReauthorizationTarget, AppError>,
+}
+
 impl Database {
     pub async fn reject_generic_oauth_ready(
         &self,
@@ -71,6 +79,93 @@ impl Database {
         }
         Ok(())
     }
+    /// A scoped snapshot ties admission, private config hydration and CAS to
+    /// the same account version. Fixed providers do not read the credential here.
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) async fn oauth_reauthorization_snapshot(
+        &self,
+        account_id: Uuid,
+        tenant_external_id: &str,
+        account_name: &str,
+        provider_driver: &str,
+        expected_oauth_driver: &str,
+        key_material: Option<&[u8]>,
+    ) -> Result<OAuthReauthorizationSnapshot, AppError> {
+        macro_rules! snapshot_sql {
+            ($credential:literal, $join:literal) => {
+                concat!(
+                    "SELECT a.name, a.driver, a.auth_kind, a.config_json, a.oauth_session_id, a.oauth_driver, a.oauth_refresh_url, a.updated_at, a.credential_generation",
+                    $credential,
+                    " FROM upstream_accounts a JOIN tenants t ON t.id = a.tenant_id ",
+                    $join,
+                    " WHERE a.id = $1 AND t.external_id = $2"
+                )
+            };
+        }
+        let statement = if key_material.is_some() {
+            snapshot_sql!(
+                ", c.credential_ciphertext",
+                "LEFT JOIN upstream_credentials c ON c.upstream_account_id = a.id AND c.generation = a.credential_generation AND a.auth_kind = 'oauth'"
+            )
+        } else {
+            snapshot_sql!("", "")
+        };
+        let row = sqlx::query(statement)
+            .bind(account_id.to_string())
+            .bind(tenant_external_id)
+            .fetch_optional(&self.pool)
+            .await?
+            .ok_or(AppError::Forbidden)?;
+        let config: Value = serde_json::from_str(&row.try_get::<String, _>("config_json")?)
+            .map_err(|_| AppError::internal("accounts_upstream_account_view_1"))?;
+        let driver: String = row.try_get("driver")?;
+        let credential = key_material
+            .map(|key| -> Result<UpstreamCredential, AppError> {
+                let ciphertext = row
+                    .try_get::<Option<String>, _>("credential_ciphertext")?
+                    .ok_or(AppError::NotFound)?;
+                open_credential(&ciphertext, key)
+            })
+            .transpose()?;
+        let target = (|| {
+            let auth_kind: String = row.try_get("auth_kind")?;
+            let oauth_session_id: Option<String> = row.try_get("oauth_session_id")?;
+            let oauth_driver: Option<String> = row.try_get("oauth_driver")?;
+            if oauth_driver.as_deref() == Some(crate::oauth::authorization_code::FLOW)
+                || !upstream_can_reauthorize(
+                    &driver,
+                    &auth_kind,
+                    oauth_session_id.as_deref(),
+                    oauth_driver.as_deref(),
+                )
+            {
+                return Err(AppError::BadRequest(
+                    "upstream account does not support interactive reauthorization".into(),
+                ));
+            }
+            let (existing_oauth_driver, _) = oauth_refresh_lifecycle_from_row(&row)?;
+            if row.try_get::<String, _>("name")? != account_name.trim()
+                || driver != provider_driver
+                || existing_oauth_driver != expected_oauth_driver
+            {
+                return Err(AppError::Conflict(
+                    "reauthorization must use the existing upstream name, driver, configuration, and OAuth lifecycle".into(),
+                ));
+            }
+            Ok(crate::oauth::OAuthReauthorizationTarget {
+                account_id,
+                expected_updated_at: row.try_get("updated_at")?,
+                expected_credential_generation: row.try_get("credential_generation")?,
+            })
+        })();
+        Ok(OAuthReauthorizationSnapshot {
+            config,
+            driver,
+            credential,
+            target,
+        })
+    }
+
     /// Reads only the current generation's transport proxy while starting an
     /// interactive reauthorization. A disconnected account deliberately keeps
     /// its revoked current credential as the stable-identity anchor, so this

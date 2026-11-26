@@ -34,17 +34,14 @@ impl<'a> Attempt<'a> {
         }
     }
 
-    pub(super) async fn admit(&mut self) -> Result<(), AppError> {
+    pub(super) fn admit(&mut self) -> Result<(), AppError> {
         if self.guard.is_none() {
-            self.guard = Some(
-                super::group_routing::admit(
-                    self.state,
-                    self.job.tenant_id,
-                    self.job.job_id,
-                    self.route,
-                )
-                .await?,
-            );
+            self.guard = Some(super::group_routing::admit(
+                self.state,
+                self.job.tenant_id,
+                self.job.job_id,
+                self.route,
+            )?);
         }
         Ok(())
     }
@@ -94,7 +91,7 @@ impl<'a> Attempt<'a> {
         }
         self.valid = false;
         self.terminal = MediaAttemptTerminal::Inconclusive;
-        self.admit().await
+        self.admit()
     }
 
     pub(super) async fn finish(mut self, result: Result<(), AppError>) -> Result<(), AppError> {
@@ -142,26 +139,11 @@ async fn classified_json(response: Response) -> (Result<Value, AppError>, MediaA
     let status = response.status();
     if status == reqwest::StatusCode::TOO_MANY_REQUESTS {
         let kind = crate::api::classify_media_rate_limit(response).await;
-        let terminal = MediaAttemptTerminal::Failed {
-            kind,
-            reason: UpstreamHealthReason::RateLimited,
-            failure_stage: "upstream_response",
-        };
+        let terminal = super::group_routing::media_rate_limit_terminal(kind);
         return (Ok(serde_json::json!({})), terminal);
     }
-    let mut terminal = match status.as_u16() {
-        401 | 403 => MediaAttemptTerminal::Failed {
-            kind: UpstreamFailureKind::Authentication,
-            reason: UpstreamHealthReason::Unavailable,
-            failure_stage: "upstream_response",
-        },
-        500..=599 => MediaAttemptTerminal::Failed {
-            kind: UpstreamFailureKind::Unavailable,
-            reason: UpstreamHealthReason::Unavailable,
-            failure_stage: "upstream_response",
-        },
-        _ => MediaAttemptTerminal::Inconclusive,
-    };
+    let mut terminal = super::group_routing::media_rejection_terminal(status)
+        .unwrap_or(MediaAttemptTerminal::Inconclusive);
     let parsed = bounded_json(response).await;
     if status.is_success() {
         terminal = MediaAttemptTerminal::invalid_response();

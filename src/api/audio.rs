@@ -1,7 +1,10 @@
 use axum::extract::{Extension, Multipart, multipart::MultipartRejection};
 use reqwest::multipart::{Form, Part};
 
-use super::*;
+use super::{
+    media_body::{MediaBodyReadError, collect_bounded},
+    *,
+};
 
 const AUDIO_PROTOCOL: &str = "openai-audio";
 const AUDIO_AUDIT_PROTOCOL: &str = "audio-transcription";
@@ -194,9 +197,7 @@ pub(super) async fn create_audio_transcription(
                 key.tenant_id,
                 request_id,
                 &route,
-            )
-            .await
-            {
+            ) {
                 Ok(attempt) => attempt,
                 Err(error) => {
                     super::proxy::persistence::record_capture_failure(&state, identity);
@@ -252,11 +253,9 @@ pub(super) async fn create_audio_transcription(
             if upstream_status == StatusCode::TOO_MANY_REQUESTS {
                 let kind = super::proxy::classify_archived_media_rate_limit(upstream).await;
                 attempt
-                    .complete(MediaAttemptTerminal::Failed {
+                    .complete(crate::generation::group_routing::media_rate_limit_terminal(
                         kind,
-                        reason: crate::metrics::UpstreamHealthReason::RateLimited,
-                        failure_stage: "upstream_response",
-                    })
+                    ))
                     .await;
                 finish_audio_failure(
                     &state,
@@ -271,24 +270,9 @@ pub(super) async fn create_audio_transcription(
                 return Err(AppError::upstream("audio_upstream_rate_limited"));
             }
             if !upstream_status.is_success() {
-                let terminal = if matches!(
-                    upstream_status,
-                    StatusCode::UNAUTHORIZED | StatusCode::FORBIDDEN
-                ) {
-                    MediaAttemptTerminal::Failed {
-                        kind: crate::db::UpstreamFailureKind::Authentication,
-                        reason: crate::metrics::UpstreamHealthReason::Unavailable,
-                        failure_stage: "upstream_response",
-                    }
-                } else if upstream_status.is_server_error() {
-                    MediaAttemptTerminal::Failed {
-                        kind: crate::db::UpstreamFailureKind::Unavailable,
-                        reason: crate::metrics::UpstreamHealthReason::Unavailable,
-                        failure_stage: "upstream_response",
-                    }
-                } else {
-                    MediaAttemptTerminal::Inconclusive
-                };
+                let terminal =
+                    crate::generation::group_routing::media_rejection_terminal(upstream_status)
+                        .unwrap_or(MediaAttemptTerminal::Inconclusive);
                 attempt.complete(terminal).await;
                 let rejection = crate::api::proxy::upstream_error::read_rejection(upstream).await;
                 let error_code = rejection
@@ -314,7 +298,16 @@ pub(super) async fn create_audio_transcription(
             let upstream_body = match read_audio_response_bounded(upstream).await {
                 Ok(body) => body,
                 Err(error) => {
-                    attempt.complete(error.terminal()).await;
+                    let (code, terminal) = match error {
+                        MediaBodyReadError::Transport => {
+                            ("audio_upstream_response_stream", audio_transport_failure())
+                        }
+                        MediaBodyReadError::TooLarge => (
+                            "audio_upstream_response_too_large",
+                            MediaAttemptTerminal::invalid_response(),
+                        ),
+                    };
+                    attempt.complete(terminal).await;
                     finish_audio_failure(
                         &state,
                         &reservation,
@@ -322,7 +315,7 @@ pub(super) async fn create_audio_transcription(
                         key.tenant_id,
                         audio,
                         started,
-                        error.code(),
+                        code,
                     )
                     .await?;
                     return Err(AppError::upstream_with(
@@ -684,28 +677,6 @@ fn upstream_form(
     Ok(form)
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum AudioResponseReadError {
-    TooLarge,
-    Transport,
-}
-
-impl AudioResponseReadError {
-    fn code(self) -> &'static str {
-        match self {
-            Self::TooLarge => "audio_upstream_response_too_large",
-            Self::Transport => "audio_upstream_response_stream",
-        }
-    }
-
-    fn terminal(self) -> MediaAttemptTerminal {
-        match self {
-            Self::Transport => audio_transport_failure(),
-            Self::TooLarge => MediaAttemptTerminal::invalid_response(),
-        }
-    }
-}
-
 fn audio_transport_failure() -> MediaAttemptTerminal {
     MediaAttemptTerminal::Failed {
         kind: crate::db::UpstreamFailureKind::Connection,
@@ -716,34 +687,14 @@ fn audio_transport_failure() -> MediaAttemptTerminal {
 
 async fn read_audio_response_bounded(
     response: super::proxy::upstream_response::UpstreamResponse,
-) -> Result<Bytes, AudioResponseReadError> {
+) -> Result<Bytes, MediaBodyReadError> {
     if response
         .content_length()
         .is_some_and(|length| length > MAX_AUDIO_RESPONSE_BODY as u64)
     {
-        return Err(AudioResponseReadError::TooLarge);
+        return Err(MediaBodyReadError::TooLarge);
     }
-    collect_audio_response_stream(response.bytes_stream()).await
-}
-
-async fn collect_audio_response_stream<S, E>(stream: S) -> Result<Bytes, AudioResponseReadError>
-where
-    S: futures_util::Stream<Item = Result<Bytes, E>>,
-{
-    futures_util::pin_mut!(stream);
-    let mut body = Vec::new();
-    loop {
-        let next = stream.next().await;
-        let Some(chunk) = next else {
-            break;
-        };
-        let chunk = chunk.map_err(|_| AudioResponseReadError::Transport)?;
-        if body.len().saturating_add(chunk.len()) > MAX_AUDIO_RESPONSE_BODY {
-            return Err(AudioResponseReadError::TooLarge);
-        }
-        body.extend_from_slice(&chunk);
-    }
-    Ok(Bytes::from(body))
+    collect_bounded(response.bytes_stream(), MAX_AUDIO_RESPONSE_BODY).await
 }
 
 fn normalize_audio_response(
@@ -775,7 +726,7 @@ fn normalize_audio_response(
         }
     }
     let duration = match object.get("duration") {
-        Some(value) => finite_non_negative(Some(value), "duration")?,
+        Some(value) => finite_non_negative(Some(value))?,
         None => measured_duration_seconds,
     };
     verbose.insert("duration".to_owned(), json!(duration));
@@ -791,8 +742,8 @@ fn normalize_audio_response(
             ));
         }
         for segment in upstream_segments {
-            let start = finite_non_negative(segment.get("start"), "start")?;
-            let end = finite_non_negative(segment.get("end"), "end")?;
+            let start = finite_non_negative(segment.get("start"))?;
+            let end = finite_non_negative(segment.get("end"))?;
             let text = segment
                 .get("text")
                 .and_then(Value::as_str)
@@ -867,8 +818,8 @@ fn normalize_audio_response(
                 .get("word")
                 .and_then(Value::as_str)
                 .ok_or_else(|| AppError::upstream("audio_upstream_word_text_is_missing"))?;
-            let start = finite_non_negative(word.get("start"), "word start")?;
-            let end = finite_non_negative(word.get("end"), "word end")?;
+            let start = finite_non_negative(word.get("start"))?;
+            let end = finite_non_negative(word.get("end"))?;
             if end < start {
                 return Err(AppError::upstream_with(
                     "upstream_unavailable",
@@ -882,7 +833,7 @@ fn normalize_audio_response(
     Ok(Value::Object(verbose))
 }
 
-fn finite_non_negative(value: Option<&Value>, _field: &str) -> Result<f64, AppError> {
+fn finite_non_negative(value: Option<&Value>) -> Result<f64, AppError> {
     value
         .and_then(Value::as_f64)
         .filter(|value| value.is_finite() && *value >= 0.0)
@@ -1045,7 +996,9 @@ mod tests {
             tokio::time::sleep(Duration::from_secs(11 * 60)).await;
             Ok::<_, std::io::Error>(Bytes::from_static(br#"{"text":"complete"}"#))
         });
-        let body = collect_audio_response_stream(stream).await.unwrap();
+        let body = collect_bounded(stream, MAX_AUDIO_RESPONSE_BODY)
+            .await
+            .unwrap();
         assert_eq!(body, br#"{"text":"complete"}"#[..]);
     }
 

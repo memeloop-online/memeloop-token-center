@@ -242,68 +242,7 @@ async fn ordinary_missing_metadata_delivers_and_settles_over_estimate_with_bound
 async fn ordinary_openai_wire_omits_unsolicited_limits_and_settles_above_4096_once() {
     for driver in ["http-json", "new-api"] {
         for chat in [false, true] {
-            let upstream = MockServer::start().await;
-            let fixture = fixture("ordinary-output", &upstream, driver).await;
-            let request = ordinary_request(&fixture, chat);
-            let expected_wire = request.clone();
-            Mock::given(method("POST"))
-                .and(path(if chat {
-                    "/v1/chat/completions"
-                } else {
-                    "/v1/responses"
-                }))
-                .and(move |request: &wiremock::Request| {
-                    request.body_json::<Value>().unwrap() == expected_wire
-                })
-                .respond_with(
-                    ResponseTemplate::new(200).set_body_json(ordinary_response(chat, 5000)),
-                )
-                .expect(1)
-                .mount(&upstream)
-                .await;
-            let response = send_ordinary(&fixture, chat, &request).await;
-            assert_eq!(response.status(), StatusCode::OK);
-            let delivered = to_bytes(response.into_body(), MAX_PROXY_RESPONSE_BODY)
-                .await
-                .unwrap();
-            assert_eq!(
-                serde_json::from_slice::<Value>(&delivered).unwrap(),
-                ordinary_response(chat, 5000)
-            );
-            wait_for_request_settlement(&fixture, 1).await;
-            let rows = fixture
-                .state
-                .db
-                .list_requests(fixture.key_id, 10)
-                .await
-                .unwrap();
-            assert_eq!(rows.len(), 1);
-            assert_eq!(rows[0].status_code, Some(200));
-            assert_eq!(rows[0].error_code, None);
-            assert_eq!((rows[0].input_tokens, rows[0].output_tokens), (3, 5000));
-            assert_eq!(
-                rows[0].cost.parse::<Decimal>().unwrap(),
-                Decimal::new(5003, 6)
-            );
-            assert_exactly_once_side_effects(
-                &fixture,
-                rows[0].request_id,
-                if chat {
-                    None
-                } else {
-                    Some("resp-usage-contract")
-                },
-            )
-            .await;
-            let pool = sqlx::AnyPool::connect(&fixture.database_url).await.unwrap();
-            let reserved: i64 =
-                sqlx::query_scalar("SELECT reserved_tokens FROM usage_reservations")
-                    .fetch_one(&pool)
-                    .await
-                    .unwrap();
-            assert!(reserved >= 65_536);
-            pool.close().await;
-            upstream.verify().await;
+            assert_ordinary_wire_and_settlement(driver, chat, None, 5_000).await;
         }
     }
 }
@@ -400,62 +339,97 @@ async fn ordinary_openai_preserves_explicit_wire_limits_and_settles_reported_usa
         (false, "max_output_tokens"),
     ] {
         for reported in [17, 18] {
-            let upstream = MockServer::start().await;
-            let fixture = fixture("ordinary-explicit-output", &upstream, "http-json").await;
-            let mut request = ordinary_request(&fixture, chat);
-            request[field] = json!(17);
-            let expected_wire = request.clone();
-            Mock::given(method("POST"))
-                .and(move |request: &wiremock::Request| {
-                    request.body_json::<Value>().unwrap() == expected_wire
-                })
-                .respond_with(
-                    ResponseTemplate::new(200).set_body_json(ordinary_response(chat, reported)),
-                )
-                .expect(1)
-                .mount(&upstream)
+            assert_ordinary_wire_and_settlement("http-json", chat, Some((field, 17)), reported)
                 .await;
-            let response = send_ordinary(&fixture, chat, &request).await;
-            assert_eq!(response.status(), StatusCode::OK);
-            let body = to_bytes(response.into_body(), MAX_PROXY_RESPONSE_BODY)
-                .await
-                .unwrap();
-            assert_eq!(
-                serde_json::from_slice::<Value>(&body).unwrap(),
-                ordinary_response(chat, reported)
-            );
-            wait_for_request_settlement(&fixture, 1).await;
-            let rows = fixture
-                .state
-                .db
-                .list_requests(fixture.key_id, 10)
-                .await
-                .unwrap();
-            assert_eq!(rows.len(), 1);
-            assert_eq!(rows[0].status_code, Some(200));
-            assert_eq!((rows[0].input_tokens, rows[0].output_tokens), (3, reported));
-            assert_eq!(
-                rows[0].usage_basis,
-                Some(crate::model::RequestUsageBasis::ProviderReported)
-            );
-            assert_eq!(
-                rows[0].cost.parse::<Decimal>().unwrap(),
-                Decimal::new(3 + reported, 6)
-            );
-            assert_eq!(rows[0].error_code, None);
-            assert_exactly_once_side_effects(
-                &fixture,
-                rows[0].request_id,
-                if chat {
-                    None
-                } else {
-                    Some("resp-usage-contract")
-                },
-            )
-            .await;
-            upstream.verify().await;
         }
     }
+}
+
+async fn assert_ordinary_wire_and_settlement(
+    driver: &str,
+    chat: bool,
+    limit: Option<(&str, i64)>,
+    reported: i64,
+) {
+    let upstream = MockServer::start().await;
+    let fixture = fixture("ordinary-wire", &upstream, driver).await;
+    let mut request = ordinary_request(&fixture, chat);
+    if let Some((field, value)) = limit {
+        request[field] = json!(value);
+    }
+    let expected_wire = request.clone();
+    let provider_response = ordinary_response(chat, reported);
+    Mock::given(method("POST"))
+        .and(path(if chat {
+            "/v1/chat/completions"
+        } else {
+            "/v1/responses"
+        }))
+        .and(move |request: &wiremock::Request| {
+            request.body_json::<Value>().unwrap() == expected_wire
+        })
+        .respond_with(ResponseTemplate::new(200).set_body_json(provider_response.clone()))
+        .expect(1)
+        .mount(&upstream)
+        .await;
+    let response = send_ordinary(&fixture, chat, &request).await;
+    assert_eq!(response.status(), StatusCode::OK);
+    let delivered = to_bytes(response.into_body(), MAX_PROXY_RESPONSE_BODY)
+        .await
+        .unwrap();
+    assert_eq!(
+        serde_json::from_slice::<Value>(&delivered).unwrap(),
+        provider_response
+    );
+    assert_openai_settlement(&fixture, chat, reported, limit.is_none()).await;
+    upstream.verify().await;
+}
+
+async fn assert_openai_settlement(
+    fixture: &CodexRouteFixture,
+    chat: bool,
+    reported: i64,
+    trusted_bound: bool,
+) {
+    wait_for_request_settlement(fixture, 1).await;
+    let rows = fixture
+        .state
+        .db
+        .list_requests(fixture.key_id, 10)
+        .await
+        .unwrap();
+    let [row] = rows.as_slice() else {
+        panic!("expected exactly one request record")
+    };
+    assert_eq!(
+        (row.status_code, row.error_code.as_deref()),
+        (Some(200), None)
+    );
+    assert_eq!((row.input_tokens, row.output_tokens), (3, reported));
+    assert_eq!(
+        row.cost.parse::<Decimal>().unwrap(),
+        Decimal::new(3 + reported, 6)
+    );
+    if trusted_bound {
+        let pool = sqlx::AnyPool::connect(&fixture.database_url).await.unwrap();
+        let reserved: i64 = sqlx::query_scalar("SELECT reserved_tokens FROM usage_reservations")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        assert!(reserved >= 65_536);
+        pool.close().await;
+    } else {
+        assert_eq!(
+            row.usage_basis,
+            Some(crate::model::RequestUsageBasis::ProviderReported)
+        );
+    }
+    assert_exactly_once_side_effects(
+        fixture,
+        row.request_id,
+        (!chat).then_some("resp-usage-contract"),
+    )
+    .await;
 }
 
 #[tokio::test]
@@ -541,96 +515,41 @@ async fn send(fixture: &CodexRouteFixture, limit: Option<i64>) -> Response {
 #[tokio::test]
 async fn passthrough_reserves_trusted_bound_and_settles_actual_usage_above_4096() {
     for driver in ["http-json", "new-api"] {
-        let upstream = MockServer::start().await;
-        let completed = completed_response_with_usage(3, 5_000);
-        let sse = format!(
-            "data: {{\"type\":\"response.created\",\"response\":{{\"id\":\"resp-usage-contract\"}}}}\n\n\
-             data: {{\"type\":\"response.completed\",\"response\":{completed}}}\n\n\
-             data: [DONE]\n\n"
-        );
-        Mock::given(method("POST"))
-            .and(path("/v1/responses"))
-            .and(|request: &wiremock::Request| {
-                let value: Value = serde_json::from_slice(&request.body).unwrap();
-                value.get("max_output_tokens").is_none()
-            })
-            .respond_with(ResponseTemplate::new(200).set_body_raw(sse, "text/event-stream"))
-            .expect(1)
-            .mount(&upstream)
-            .await;
-        let fixture = fixture(driver, &upstream, driver).await;
-        let response = send(&fixture, None).await;
-        assert_eq!(response.status(), StatusCode::OK);
-        let _body = to_bytes(response.into_body(), MAX_PROXY_RESPONSE_BODY)
-            .await
-            .unwrap();
-        wait_for_request_settlement(&fixture, 1).await;
-        let rows = fixture
-            .state
-            .db
-            .list_requests(fixture.key_id, 10)
-            .await
-            .unwrap();
-        assert_eq!(rows[0].status_code, Some(200));
-        assert_eq!(rows[0].error_code, None);
-        assert_eq!((rows[0].input_tokens, rows[0].output_tokens), (3, 5_000));
-        assert_eq!(
-            rows[0].cost.parse::<Decimal>().unwrap(),
-            Decimal::new(5003, 6)
-        );
-        assert_exactly_once_side_effects(&fixture, rows[0].request_id, Some("resp-usage-contract"))
-            .await;
-        let pool = sqlx::AnyPool::connect(&fixture.database_url).await.unwrap();
-        let reserved: i64 = sqlx::query_scalar("SELECT reserved_tokens FROM usage_reservations")
-            .fetch_one(&pool)
-            .await
-            .unwrap();
-        assert!(reserved >= 65_536);
-        pool.close().await;
-        upstream.verify().await;
+        assert_passthrough_settlement(driver, None).await;
     }
 }
 
 #[tokio::test]
 async fn passthrough_explicit_limit_is_forwarded_while_actual_usage_settles_once() {
+    assert_passthrough_settlement("http-json", Some(4096)).await;
+}
+
+async fn assert_passthrough_settlement(driver: &str, limit: Option<i64>) {
     let upstream = MockServer::start().await;
     let completed = completed_response_with_usage(3, 5_000);
+    let sse = format!(
+        "data: {{\"type\":\"response.created\",\"response\":{{\"id\":\"resp-usage-contract\"}}}}\n\n\
+         data: {{\"type\":\"response.completed\",\"response\":{completed}}}\n\n\
+         data: [DONE]\n\n"
+    );
     Mock::given(method("POST"))
         .and(path("/v1/responses"))
-        .and(body_partial_json(json!({"max_output_tokens": 4096})))
-        .respond_with(ResponseTemplate::new(200).set_body_raw(
-            format!(
-                "data: {{\"type\":\"response.created\",\"response\":{{\"id\":\"resp-usage-contract\"}}}}\n\n\
-                 data: {{\"type\":\"response.completed\",\"response\":{completed}}}\n\n\
-                 data: [DONE]\n\n"
-            ),
-            "text/event-stream",
-        ))
+        .and(move |request: &wiremock::Request| {
+            let body: Value = request.body_json().unwrap();
+            body.get("max_output_tokens").cloned() == limit.map(Value::from)
+        })
+        .respond_with(ResponseTemplate::new(200).set_body_raw(sse, "text/event-stream"))
         .expect(1)
         .mount(&upstream)
         .await;
-    let fixture = fixture("explicit-limit", &upstream, "http-json").await;
-    let response = send(&fixture, Some(4096)).await;
-    let _body = to_bytes(response.into_body(), MAX_PROXY_RESPONSE_BODY)
+    let fixture = fixture("passthrough-settlement", &upstream, driver).await;
+    let response = send(&fixture, limit).await;
+    assert_eq!(response.status(), StatusCode::OK);
+    let body = to_bytes(response.into_body(), MAX_PROXY_RESPONSE_BODY)
         .await
         .unwrap();
-    wait_for_request_settlement(&fixture, 1).await;
-    let rows = fixture
-        .state
-        .db
-        .list_requests(fixture.key_id, 10)
-        .await
-        .unwrap();
-    assert_eq!(rows.len(), 1);
-    assert_eq!(rows[0].status_code, Some(200));
-    assert_eq!(rows[0].error_code, None);
-    assert_eq!((rows[0].input_tokens, rows[0].output_tokens), (3, 5_000));
-    assert_eq!(
-        rows[0].cost.parse::<Decimal>().unwrap(),
-        Decimal::new(5003, 6)
-    );
-    assert_exactly_once_side_effects(&fixture, rows[0].request_id, Some("resp-usage-contract"))
-        .await;
+    assert!(String::from_utf8_lossy(&body).contains("resp-usage-contract"));
+    assert_openai_settlement(&fixture, false, 5_000, limit.is_none()).await;
     upstream.verify().await;
 }
 

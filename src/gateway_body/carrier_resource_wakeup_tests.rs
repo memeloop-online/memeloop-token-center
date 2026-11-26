@@ -26,17 +26,21 @@ async fn fixture() -> (Arc<BodyCarrier>, Arc<ProxyMemoryBudget>, Arc<Persistence
     (source, memory, workspace)
 }
 
-async fn real_fixture() -> (Arc<BodyCarrier>, Arc<ProxyMemoryBudget>, Arc<Persistence>) {
+async fn real_archive_at(endpoint: &str) -> ArchiveStore {
     let mut config = crate::config::Config::for_test("sqlite::memory:".into());
     config.archive_backend = crate::config::ArchiveBackend::S3;
-    config.s3_endpoint = Some(std::env::var("MTC_RUSTFS_TEST_ENDPOINT").unwrap());
+    config.s3_endpoint = Some(endpoint.to_owned());
     config.s3_bucket = Some(std::env::var("MTC_RUSTFS_TEST_BUCKET").unwrap());
     config.s3_access_key = Some(std::env::var("MTC_RUSTFS_TEST_ACCESS_KEY").unwrap());
     config.s3_secret_key = Some(std::env::var("MTC_RUSTFS_TEST_SECRET_KEY").unwrap());
     config.s3_allow_http = true;
+    ArchiveStore::from_config(&config).await.unwrap()
+}
+
+async fn real_fixture() -> (Arc<BodyCarrier>, Arc<ProxyMemoryBudget>, Arc<Persistence>) {
     let (mut source, memory, workspace) = fixture().await;
     Arc::get_mut(&mut source).unwrap().archive =
-        Some(ArchiveStore::from_config(&config).await.unwrap());
+        Some(real_archive_at(&std::env::var("MTC_RUSTFS_TEST_ENDPOINT").unwrap()).await);
     (source, memory, workspace)
 }
 
@@ -189,13 +193,10 @@ async fn derived_source_can_spill_its_parent_after_workspace_wakes() {
     assert_eq!(workspace.upload_workspace.snapshot().0, 0);
 }
 
-#[path = "../../tests/support/recovery_object_proxy.rs"]
-mod recovery_proxy;
-
 #[tokio::test]
 #[ignore = "requires isolated RustFS fixture"]
 async fn actual_put_is_not_cancelled_when_ram_wakes_and_lost_ack_keeps_source() {
-    use recovery_proxy::RecoveryObjectProxy;
+    use crate::recovery_object_proxy::RecoveryObjectProxy;
     for lose_ack in [false, true] {
         let proxy =
             RecoveryObjectProxy::start(&std::env::var("MTC_RUSTFS_TEST_ENDPOINT").unwrap()).await;
@@ -317,7 +318,19 @@ async fn credited_long_response_preserves_opportunistic_spill_above_source_capac
     .await
     .unwrap();
     assert_eq!(source.len(), 5 * 1024 * 1024);
-    assert!(peak.load(std::sync::atomic::Ordering::Relaxed) <= 4 * 1024 * 1024);
+    // Healthy equal-sized ACKs must reclaim the prior allocation rather
+    // than alternate retained and unretained RAM segments.
+    let retained_limit = memory.snapshot().3;
+    assert!(peak.load(std::sync::atomic::Ordering::Relaxed) <= retained_limit + 64 * 1024);
+    let ram_bytes: usize = source
+        .segments
+        .iter()
+        .map(|segment| match &*segment.lock().unwrap() {
+            Segment::Ram(bytes) => bytes.len(),
+            Segment::Object(_) => 0,
+        })
+        .sum();
+    assert!(ram_bytes <= retained_limit);
     assert!(
         source
             .segments
@@ -342,8 +355,189 @@ async fn credited_long_response_preserves_opportunistic_spill_above_source_capac
 
 #[tokio::test]
 #[ignore = "requires isolated RustFS fixture"]
+async fn credited_spill_observation_distinguishes_workspace_pressure_from_put_ack() {
+    for lose_ack in [false, true] {
+        let proxy = crate::recovery_object_proxy::RecoveryObjectProxy::start(
+            &std::env::var("MTC_RUSTFS_TEST_ENDPOINT").unwrap(),
+        )
+        .await;
+        let (mut source, memory, workspace) = fixture().await;
+        Arc::get_mut(&mut source).unwrap().archive = Some(real_archive_at(proxy.endpoint()).await);
+        let a = workspace
+            .multipart_workspace(WorkspaceRole::RequestRaw)
+            .await
+            .unwrap();
+        let b = workspace
+            .multipart_workspace(WorkspaceRole::RequestRaw)
+            .await
+            .unwrap();
+        let mut observation =
+            SpillObservation::new(memory.clone(), Some(workspace.clone()), source.staging);
+        observation.accepted(128 * 1024);
+        observation.begin(64 * 1024);
+        let result = source.offload_one_bytes(None).await;
+        assert!(matches!(
+            &result,
+            Err(AppError::Storage {
+                code: "carrier_workspace_unavailable",
+                ..
+            })
+        ));
+        observation.finish(&result);
+        assert_eq!(observation.workspace_rejections, 1);
+        assert_eq!(observation.ram_bytes, Some(128 * 1024));
+        assert_eq!(observation.offloaded_bytes, 0);
+        assert_eq!(
+            workspace.upload_workspace.snapshot().0,
+            workspace.upload_workspace.snapshot().1
+        );
+        drop(a);
+        let gate = proxy.gate_body_put();
+        proxy.lose_body_put_ack(lose_ack);
+        observation.begin(64 * 1024);
+        let write = tokio::spawn({
+            let source = source.clone();
+            async move { source.offload_one_bytes(None).await }
+        });
+        tokio::time::timeout(std::time::Duration::from_secs(5), gate.entered())
+            .await
+            .unwrap();
+        assert!(!write.is_finished());
+        assert_eq!(observation.successes, 0);
+        assert_eq!(observation.ram_bytes, Some(128 * 1024));
+        assert_eq!(
+            workspace.upload_workspace.snapshot().0,
+            workspace.upload_workspace.snapshot().1
+        );
+        gate.release();
+        let result = tokio::time::timeout(std::time::Duration::from_secs(20), write)
+            .await
+            .unwrap()
+            .unwrap();
+        observation.finish(&result);
+        if lose_ack {
+            assert!(result.is_err());
+            assert_eq!(observation.other_errors, 1);
+            assert_eq!(observation.offloaded_bytes, 0);
+            assert_eq!(observation.ram_bytes, Some(128 * 1024));
+        } else {
+            assert_eq!(result.unwrap(), Some(128 * 1024));
+            assert_eq!(observation.successes, 1);
+            assert_eq!(observation.offloaded_bytes, 128 * 1024);
+            assert_eq!(observation.ram_bytes, Some(0));
+            observation.begin(64 * 1024);
+            let result = source.offload_one_bytes(None).await;
+            observation.finish(&result);
+            assert_eq!(result.unwrap(), None);
+            assert_eq!(observation.no_ram, 1);
+        }
+        proxy.lose_body_put_ack(false);
+        drop(b);
+        let mut replay = source.open_stream();
+        let mut restored = Vec::new();
+        while let Some(chunk) = replay.next().await {
+            restored.extend_from_slice(&chunk.unwrap());
+        }
+        drop(replay);
+        assert_eq!(restored, vec![b'x'; 128 * 1024]);
+        drop(source);
+        assert_eq!(memory.snapshot().0, 0);
+        assert_eq!(workspace.upload_workspace.snapshot().0, 0);
+    }
+}
+
+#[tokio::test]
+#[ignore = "requires isolated RustFS fixture"]
+async fn credited_mixed_grains_replace_bytes_without_releasing_external_clones() {
+    for sizes in [[65_536usize, 417_792], [417_792, 65_536]] {
+        let (template, _, workspace) = real_fixture().await;
+        let archive = template.archive.clone().unwrap();
+        let staging = template.staging;
+        drop(template);
+        let memory = Arc::new(ProxyMemoryBudget::new_archive_source(4 * 1024 * 1024));
+        let mut expected = blake3::Hasher::new();
+        let mut length = 0usize;
+        // Fill retained with equal old segments before changing grain.
+        let schedule: Vec<usize> = (0..96)
+            .map(|index| {
+                if index < 16 {
+                    sizes[0]
+                } else {
+                    sizes[(index / 16) % 2]
+                }
+            })
+            .collect();
+        for (index, size) in schedule.iter().copied().enumerate() {
+            expected.update(&vec![index as u8; size]);
+            length += size;
+        }
+        let input = stream::iter(schedule.into_iter().enumerate()).map({
+            let memory = memory.clone();
+            move |(index, size)| {
+                let bytes = Bytes::from(vec![index as u8; size]);
+                let credit = memory
+                    .try_reserve_ingress_bytes(size)
+                    .expect("healthy mixed-grain ACKs reclaim source credit");
+                Ok::<_, std::io::Error>((bytes, Some(credit)))
+            }
+        });
+        let source = BodyCarrier::capture_owned(
+            input,
+            CarrierCapture::new(memory.clone(), Some(archive), staging)
+                .with_upload_workspace(workspace.clone()),
+        )
+        .await
+        .unwrap();
+        assert_eq!(source.len(), length as u64);
+        assert_eq!(source.digest(), expected.finalize().to_hex().as_str());
+        let ram: usize = source
+            .segments
+            .iter()
+            .map(|segment| match &*segment.lock().unwrap() {
+                Segment::Ram(bytes) => bytes.len(),
+                Segment::Object(_) => 0,
+            })
+            .sum();
+        assert!(ram <= memory.snapshot().3 + 417_792, "RAM={ram}");
+        let mut replay = source.open_stream();
+        let mut actual = blake3::Hasher::new();
+        while let Some(bytes) = replay.next().await {
+            actual.update(&bytes.unwrap());
+        }
+        assert_eq!(actual.finalize().to_hex().as_str(), source.digest());
+        drop(replay);
+        drop(source);
+        assert_eq!(memory.snapshot().0, 0);
+        assert_eq!(workspace.upload_workspace.snapshot().0, 0);
+    }
+
+    let (mut source, memory, workspace) = fixture().await;
+    Arc::get_mut(&mut source).unwrap().archive =
+        Some(real_archive_at(&std::env::var("MTC_RUSTFS_TEST_ENDPOINT").unwrap()).await);
+    let external = match &*source.segments[0].lock().unwrap() {
+        Segment::Ram(bytes) => bytes.clone(),
+        _ => unreachable!(),
+    };
+    let before = memory.snapshot().0;
+    assert_eq!(
+        source.offload_one_bytes(None).await.unwrap(),
+        Some(128 * 1024)
+    );
+    assert_eq!(
+        memory.snapshot().0,
+        before,
+        "ACK does not revoke external ownership"
+    );
+    drop(external);
+    assert_eq!(memory.snapshot().0, 0);
+    drop(source);
+    assert_eq!(workspace.upload_workspace.snapshot().0, 0);
+}
+
+#[tokio::test]
+#[ignore = "requires isolated RustFS fixture"]
 async fn request_capture_eof_does_not_join_owned_put_when_retained_credit_wakes() {
-    use recovery_proxy::RecoveryObjectProxy;
+    use crate::recovery_object_proxy::RecoveryObjectProxy;
     for (lose_ack, cancel_capture) in [(false, false), (true, false), (false, true)] {
         let proxy =
             RecoveryObjectProxy::start(&std::env::var("MTC_RUSTFS_TEST_ENDPOINT").unwrap()).await;

@@ -163,15 +163,29 @@ async fn contract(fixture: Fixture) {
         .await
         .unwrap();
     super::unknown_bridge::drain_terminal(&fixture).await;
-    let financial_event: (i64, String) = {
-        let row = sqlx::query("SELECT event_at, event_id FROM request_events WHERE request_id = $1 AND event_kind = 'projected' ORDER BY event_at DESC, event_id DESC LIMIT 1")
-            .bind(request_id.to_string()).fetch_one(&fixture.database.pool).await.unwrap();
-        (
-            row.try_get("event_at").unwrap(),
-            row.try_get("event_id").unwrap(),
-        )
-    };
-
+    let statistics_event = projected_events(&fixture, request_id).await;
+    assert_eq!(
+        statistics_event.len(),
+        1,
+        "statistics commit publishes once"
+    );
+    let statistics_event_id: String = statistics_event[0].get("event_id");
+    let statistics_cursor = (
+        statistics_event[0].get::<i64, _>("event_at"),
+        statistics_event_id.clone(),
+    );
+    let (projected_at, usage_basis, stats_outcome): (Option<i64>, String, String) = sqlx::query_as(
+        "SELECT projected_at, usage_basis, statistics_outcome FROM terminal_projection_outbox WHERE request_id = $1 AND tenant_id = $2 AND key_id = $3",
+    )
+    .bind(request_id.to_string())
+    .bind(fixture.key.tenant_id.to_string())
+    .bind(fixture.key.key_id.to_string())
+    .fetch_one(&fixture.database.pool)
+    .await
+    .unwrap();
+    assert!(projected_at.is_some());
+    assert_eq!(usage_basis, "not_observed");
+    assert_eq!(stats_outcome, "applied");
     let tasks = fixture
         .database
         .claim_conversation_projection_tasks(owner, 1)
@@ -195,6 +209,32 @@ async fn contract(fixture: Fixture) {
             .await
             .unwrap()
     );
+    let events = projected_events(&fixture, request_id).await;
+    assert_eq!(events.len(), 2, "semantic commit adds one event");
+    let event_ids: Vec<String> = events.iter().map(|row| row.get("event_id")).collect();
+    assert!(event_ids.contains(&statistics_event_id));
+    assert_ne!(event_ids[0], event_ids[1]);
+    let semantic_event = events
+        .iter()
+        .find(|row| row.get::<String, _>("event_id") != statistics_event_id)
+        .unwrap();
+    let semantic_cursor = (
+        semantic_event.get::<i64, _>("event_at"),
+        semantic_event.get::<String, _>("event_id"),
+    );
+    assert!(
+        semantic_cursor > statistics_cursor,
+        "semantic event must be visible after the statistics cursor"
+    );
+    assert_eq!(semantic_event.get::<i64, _>("status_code"), 429);
+    assert_eq!(
+        semantic_event.get::<i64, _>("duration_ms"),
+        terminal.duration_ms
+    );
+    assert_eq!(
+        semantic_event.get::<Option<String>, _>("error_code"),
+        terminal.error_code
+    );
     assert!(
         !fixture
             .database
@@ -202,27 +242,17 @@ async fn contract(fixture: Fixture) {
             .await
             .unwrap()
     );
-    let event = sqlx::query(
-        "SELECT status_code, duration_ms, error_code FROM request_events WHERE request_id = $1 AND event_kind = 'projected' AND (event_at > $2 OR (event_at = $2 AND event_id > $3))",
-    )
-    .bind(request_id.to_string())
-    .bind(financial_event.0)
-    .bind(&financial_event.1)
-    .fetch_all(&fixture.database.pool)
-    .await
-    .unwrap();
-    assert_eq!(event.len(), 1, "semantic replay must not duplicate events");
-    assert_eq!(event[0].try_get::<i64, _>("status_code").unwrap(), 429);
+    let replay_ids: Vec<String> = projected_events(&fixture, request_id)
+        .await
+        .iter()
+        .map(|row| row.get("event_id"))
+        .collect();
     assert_eq!(
-        event[0].try_get::<i64, _>("duration_ms").unwrap(),
-        terminal.duration_ms
-    );
-    assert_eq!(
-        event[0].try_get::<Option<String>, _>("error_code").unwrap(),
-        terminal.error_code
+        replay_ids, event_ids,
+        "replay must preserve both publications"
     );
     let row = sqlx::query(
-        "SELECT r.completed_at, r.conversation_cluster_id, p.state, p.unknown_reason FROM request_records r JOIN pending_proxy_settlements p ON p.request_id = r.id WHERE r.id = $1",
+        "SELECT r.completed_at, r.conversation_cluster_id, p.state, p.unknown_reason, x.projected_at AS semantic_completed, x.statistics_outcome AS semantic_outcome FROM request_records r JOIN pending_proxy_settlements p ON p.request_id = r.id JOIN conversation_projection_outbox x ON x.request_id = r.id AND x.tenant_id = r.tenant_id AND x.key_id = r.key_id WHERE r.id = $1",
     )
     .bind(request_id.to_string())
     .fetch_one(&fixture.database.pool)
@@ -238,6 +268,8 @@ async fn contract(fixture: Fixture) {
             .unwrap()
             .is_some()
     );
+    assert!(row.get::<Option<i64>, _>("semantic_completed").is_some());
+    assert_eq!(row.get::<String, _>("semantic_outcome"), "session_body");
     assert_eq!(row.try_get::<String, _>("state").unwrap(), "pending");
     assert_eq!(
         row.try_get::<String, _>("unknown_reason").unwrap(),
@@ -286,4 +318,21 @@ async fn contract(fixture: Fixture) {
         }
     }
     fixture.close().await;
+}
+
+async fn projected_events(fixture: &Fixture, request_id: Uuid) -> Vec<sqlx::any::AnyRow> {
+    let events = sqlx::query(
+        "SELECT event_id, event_at, tenant_id, key_id, status_code, duration_ms, error_code FROM request_events WHERE request_id = $1 AND event_kind = 'projected' ORDER BY event_id",
+    )
+    .bind(request_id.to_string())
+    .fetch_all(&fixture.database.pool)
+    .await
+    .unwrap();
+    let tenant = fixture.key.tenant_id.to_string();
+    let key = fixture.key.key_id.to_string();
+    for event in &events {
+        assert_eq!(event.get::<String, _>("tenant_id"), tenant);
+        assert_eq!(event.get::<String, _>("key_id"), key);
+    }
+    events
 }

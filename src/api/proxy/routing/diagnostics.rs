@@ -11,14 +11,6 @@ fn classification(status: Option<StatusCode>, error: Option<&ProxySendError>) ->
         (None, Some(ProxySendError::CredentialUnavailable | ProxySendError::Credential)) => {
             "local_credential"
         }
-        (
-            None,
-            Some(
-                ProxySendError::CodexBadRequest
-                | ProxySendError::RetryableCodexBadRequest
-                | ProxySendError::CodexRejection(_),
-            ),
-        ) => "upstream_rejected_request",
         _ => "inconsistent_evidence",
     }
 }

@@ -1,11 +1,7 @@
 use bytes::Bytes;
 use serde::Deserialize;
 
-use super::super::MAX_IMAGE_RESPONSE;
-use super::{
-    responses_tool_image::{ParsedResponsesToolImage, ResponsesToolImageParseError},
-    synchronous_image::is_valid_bounded_base64,
-};
+use super::image_payload::{ImageParseError, ParsedSingleImage, SingleImageScan};
 
 #[derive(Deserialize)]
 struct Envelope<'a> {
@@ -46,38 +42,20 @@ struct Inline<'a> {
 
 /// Borrows base64 directly from the bounded upstream body. The common response
 /// staging/settlement path streams this range without a decoded/re-encoded copy.
-pub(super) fn parse(
-    bytes: &Bytes,
-) -> Result<ParsedResponsesToolImage, ResponsesToolImageParseError> {
-    let envelope: Envelope<'_> = serde_json::from_slice(bytes).map_err(|error| {
-        if error.is_syntax() || error.is_eof() {
-            ResponsesToolImageParseError::InvalidJson
-        } else {
-            ResponsesToolImageParseError::InvalidPayload
-        }
-    })?;
-    let mut image = None;
+pub(super) fn parse(bytes: &Bytes) -> Result<ParsedSingleImage, ImageParseError> {
+    let envelope: Envelope<'_> =
+        serde_json::from_slice(bytes).map_err(ImageParseError::from_json)?;
+    let mut scan = SingleImageScan::default();
     for candidate in envelope.response.candidates {
         for part in candidate.content.parts {
             let Some(inline) = part.inline else { continue };
-            if image.is_some()
-                || !matches!(inline.mime, "image/png" | "image/jpeg" | "image/webp")
-                || !is_valid_bounded_base64(inline.data, MAX_IMAGE_RESPONSE)
-            {
-                return Err(ResponsesToolImageParseError::InvalidPayload);
+            if !crate::provider::antigravity::supports_image_mime(inline.mime) {
+                return Err(ImageParseError::InvalidPayload);
             }
-            image = Some(inline.data);
+            scan.record(inline.data)?;
         }
     }
-    let image = image.ok_or(ResponsesToolImageParseError::InvalidPayload)?;
-    let start = (image.as_ptr() as usize)
-        .checked_sub(bytes.as_ptr() as usize)
-        .filter(|start| start.saturating_add(image.len()) <= bytes.len())
-        .ok_or(ResponsesToolImageParseError::InvalidPayload)?;
-    Ok(ParsedResponsesToolImage {
-        image_range: start..start + image.len(),
-        usage: None,
-    })
+    scan.finish(bytes, None)
 }
 
 #[cfg(test)]

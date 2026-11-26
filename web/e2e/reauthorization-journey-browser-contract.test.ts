@@ -179,8 +179,11 @@ test('reauthorization saves its proxy in place, copies device codes, polls autom
           if (url.pathname === '/internal/v1/transport-proxies') return route.fulfill({ json: { items: [8, 9].map(id => ({ id: `exit-${id}`, name: `Fixture exit ${id}`, version: 1, tenant_external_id: account.tenant_external_id, address: { scheme: 'socks5h', host: `10.0.0.${id}`, port: 1080, remote_dns: true, has_auth: false }, probe: { enabled: false, target_url: 'https://example.invalid/', interval_ms: 60000, attempts: 1 }, active_health: { status: 'unknown', checked_at: null, latency_ms: null, scope: 'process' }, created_at: 1, updated_at: 1 })) } });
           if (url.pathname === '/internal/v1/transport-proxy-groups') return route.fulfill({ json: { items: [] } });
           if (url.pathname === '/internal/v1/transport-proxy-strategies') return route.fulfill({ json: { items: [{ id: 'manual', version: '1', schema: { type: 'object', properties: {} }, default: {} }] } });
-          if (url.pathname.endsWith('/transport-proxy-selection')) { assert.equal(url.searchParams.get('tenant_external_id'), account.tenant_external_id); return route.fulfill({ json: selection() }); }
-          if (url.pathname.endsWith('/transport-proxy')) return route.fulfill({ json: { account_id: account.id, credential_generation: account.credential_generation, updated_at: account.updated_at, proxy_url: proxy, selected_member_id: proxyId, source: 'manual', configuration_state: 'applied' } });
+          if (url.pathname === `/internal/v1/upstreams/${account.id}/transport-proxy`) {
+            assert.equal(url.searchParams.get('tenant_external_id'), account.tenant_external_id);
+            const snapshot = selection();
+            return route.fulfill({ json: { account_id: snapshot.account_id, credential_generation: snapshot.credential_generation, updated_at: snapshot.account_updated_at, proxy_url: proxy, selected_member_id: snapshot.desired.proxy_id, source: 'manual', configuration_state: 'applied', selection: snapshot } });
+          }
           return route.fulfill({ json: [] });
         }
         if (url.pathname === '/internal/v1/upstreams/quota/batch') return route.fulfill({ json: quotaBatchFixtureResponse(request.postDataJSON(), [{ id: account.id, tenant: account.tenant_external_id, driver: account.driver }]) });

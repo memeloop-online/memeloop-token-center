@@ -4,42 +4,34 @@ use super::accounts::{
     validate_upstream_destination_with_proxy,
 };
 
-pub(super) async fn reauthorization_target(
+pub(super) async fn fixed_oauth_start_config(
     state: &AppState,
     account_id: Option<Uuid>,
     tenant_external_id: &str,
     account_name: &str,
     provider_driver: &str,
-    provider_config: &Value,
     oauth_driver: &str,
-) -> Result<Option<OAuthReauthorizationTarget>, AppError> {
-    let Some(account_id) = account_id else {
-        return Ok(None);
-    };
-    let account = state
-        .db
-        .upstream_account_for_reauthorization(account_id, tenant_external_id)
-        .await?;
-    if !account.can_reauthorize {
-        return Err(AppError::BadRequest(
-            "upstream account does not support interactive reauthorization".into(),
-        ));
+    new_config: impl FnOnce() -> Value,
+) -> Result<(Value, Option<OAuthReauthorizationTarget>), AppError> {
+    if let Some(account_id) = account_id {
+        let snapshot = state
+            .db
+            .oauth_reauthorization_snapshot(
+                account_id,
+                tenant_external_id,
+                account_name,
+                provider_driver,
+                oauth_driver,
+                None,
+            )
+            .await?;
+        validate_provider_config_schema(state, provider_driver, &snapshot.config)?;
+        Ok((snapshot.config, Some(snapshot.target?)))
+    } else {
+        let config = new_config();
+        validate_provider_config_schema(state, provider_driver, &config)?;
+        Ok((config, None))
     }
-    let (existing_oauth_driver, _) = state.db.upstream_oauth_lifecycle(account_id).await?;
-    if account.name != account_name.trim()
-        || account.driver != provider_driver
-        || account.config != *provider_config
-        || existing_oauth_driver != oauth_driver
-    {
-        return Err(AppError::Conflict(
-            "reauthorization must use the existing upstream name, driver, configuration, and OAuth lifecycle".into(),
-        ));
-    }
-    Ok(Some(OAuthReauthorizationTarget {
-        account_id,
-        expected_updated_at: account.updated_at,
-        expected_credential_generation: account.credential_generation,
-    }))
 }
 
 /// Operator account responses omit schema-owned secrets. Reauthorization is
@@ -59,37 +51,32 @@ async fn reauthorization_target_from_public_config(
     let Some(account_id) = account_id else {
         return Ok(None);
     };
-    let mut account = state
+    let snapshot = state
         .db
-        .upstream_account_for_reauthorization(account_id, tenant_external_id)
+        .oauth_reauthorization_snapshot(
+            account_id,
+            tenant_external_id,
+            account_name,
+            provider_driver,
+            oauth_driver,
+            Some(state.config.key_pepper.as_bytes()),
+        )
         .await?;
-    let credential = state
-        .db
-        .upstream_oauth_identity_credential(account_id, state.config.key_pepper.as_bytes())
-        .await?;
-    account.config = credential.hydrate_provider_adapter_config(account.config)?;
-    let complete_config = account.config.clone();
-    // Preserve the existing fail-closed admission error for a legacy account
-    // whose current schema cannot safely participate in an OAuth lifecycle.
-    validate_provider_config_schema(state, &account.driver, &complete_config)?;
-    let mut public_account = account;
-    super::config_secrets::redact_account(state, &mut public_account)?;
-    if public_account.config != *provider_config {
+    let complete_config = snapshot
+        .credential
+        .ok_or(AppError::NotFound)?
+        .hydrate_provider_adapter_config(snapshot.config)?;
+    // Compare against the same public projection that the operator received.
+    validate_provider_config_schema(state, &snapshot.driver, &complete_config)?;
+    let mut public_config = complete_config.clone();
+    super::config_secrets::redact_provider_config(state, &snapshot.driver, &mut public_config)?;
+    if public_config != *provider_config {
         return Err(AppError::Conflict(
             "reauthorization must use the existing upstream name, driver, configuration, and OAuth lifecycle".into(),
         ));
     }
     *provider_config = complete_config;
-    reauthorization_target(
-        state,
-        Some(account_id),
-        tenant_external_id,
-        account_name,
-        provider_driver,
-        provider_config,
-        oauth_driver,
-    )
-    .await
+    Ok(Some(snapshot.target?))
 }
 
 #[derive(Deserialize)]

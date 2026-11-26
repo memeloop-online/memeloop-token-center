@@ -146,11 +146,13 @@ pub(super) fn validate_route(route: &ResolvedUpstream, protocol: Protocol) -> Re
     codex_transport::validate_route_config(&route.config)
 }
 
+#[allow(clippy::too_many_arguments)]
 pub(super) async fn send_proxy_route(
     state: &AppState,
     headers: &HeaderMap,
     request_id: Uuid,
     route: &PreparedProxyRoute,
+    plan: &codex_transport::PreparedCodexRequest,
     candidate_rank: usize,
     outbound_attempt: usize,
 ) -> Result<ProxyRouteResponse, ProxySendError> {
@@ -164,15 +166,12 @@ pub(super) async fn send_proxy_route(
     .await
     .map_err(|_| ProxySendError::CandidateUnavailable)?;
     let target_url = network::upstream_api_url(&outbound_base_url, codex_transport::RESPONSES_PATH);
-    let session_id = route
-        .codex_session_id
-        .as_deref()
-        .ok_or(ProxySendError::Credential)?;
+    let session_id = plan.session_id.as_str();
     // `prepare_request_with_id` has forced the exact outbound document to be
     // non-persistent. An HTTP 400 is still replayable only after a complete,
     // bounded, domain-level classification identifies known transient
     // semantics.
-    let mut retry = CodexRetryState::new(route.codex_store_disabled);
+    let mut retry = CodexRetryState::new(plan.store_disabled);
     let transport_policy = runtime_transport_policy(
         &route.route.config,
         state.config.upstream_health.shared_probe_attempts,
@@ -222,37 +221,55 @@ pub(super) async fn send_proxy_route(
                 return Err(error);
             }
         };
-        if response.status() == StatusCode::BAD_REQUEST {
-            // The classifier consumes only a bounded preview. Capture the wire
-            // before that read, so Drop drains any unread tail to its raw owner.
-            let response = match RESPONSE_ARCHIVE_IDENTITY.try_with(Clone::clone) {
-                Ok(identity) => response.with_original_archive_capture(state, identity),
-                Err(_) => response,
-            };
-            let (disposition, details) =
-                codex_transport::classify_bad_request_with_details(response, request_id).await;
+        let (response, codex_transient_bad_request) = if response.status()
+            == StatusCode::BAD_REQUEST
+        {
+            let archive_identity = RESPONSE_ARCHIVE_IDENTITY
+                .try_with(|identity| *identity)
+                .ok();
+            let (disposition, response) =
+                codex_transport::inspect_bad_request_response(response, request_id, |response| {
+                    if let Some(identity) = archive_identity {
+                        drop(response.with_original_archive_capture(state, identity));
+                    }
+                })
+                .await;
             observe_bad_request_disposition(&state.metrics, disposition);
-            match retry.after_bad_request(disposition) {
-                AttemptControl::RetrySameAccount => {
-                    // The immutable PreparedProxyRoute preserves the body,
-                    // identity, session, and `store: false` contract.
-                    state
-                        .metrics
-                        .observe_codex_bad_request_retry(CodexBadRequestRetry::Started);
-                    drop(upstream_activity);
-                    continue;
+            if matches!(
+                retry.after_bad_request(disposition),
+                AttemptControl::RetrySameAccount
+            ) {
+                // The immutable PreparedProxyRoute preserves body, identity,
+                // session, and the store: false contract.
+                state
+                    .metrics
+                    .observe_codex_bad_request_retry(CodexBadRequestRetry::Started);
+                if let Some(identity) = archive_identity {
+                    drop(response.with_discarded_attempt_capture(
+                        state,
+                        identity,
+                        crate::archive::RawResponseAttempt {
+                            outbound_attempt,
+                            subattempt: 1,
+                            upstream_account_id: route.route.account_id,
+                            model_route_id: route.route.route_id,
+                            status_code: StatusCode::BAD_REQUEST.as_u16(),
+                        },
+                    ));
                 }
-                AttemptControl::Return(error) => {
-                    retry
-                        .outcome()
-                        .observe_terminal(&state.metrics, CodexRetryTerminal::Failed);
-                    return Err(details.map_or(error, ProxySendError::CodexRejection));
-                }
+                continue;
             }
-        }
+            (
+                response,
+                disposition == codex_transport::BadRequestDisposition::DefiniteTransient,
+            )
+        } else {
+            (response, false)
+        };
         if !response.status().is_success() {
             return Ok(ProxyRouteResponse {
                 preoutput_quota: None,
+                codex_transient_bad_request,
                 egress_selection,
                 response,
                 upstream_activity,
@@ -281,6 +298,7 @@ pub(super) async fn send_proxy_route(
                 };
                 return Ok(ProxyRouteResponse {
                     preoutput_quota,
+                    codex_transient_bad_request: false,
                     egress_selection,
                     response,
                     upstream_activity,

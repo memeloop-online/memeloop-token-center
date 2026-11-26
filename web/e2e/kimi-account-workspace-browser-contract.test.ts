@@ -1,4 +1,5 @@
 import assert from 'node:assert/strict';
+import { credentialProxySelection } from './fixtures/transport-proxy-entities.js';
 import { mkdir } from 'node:fs/promises';
 import { join } from 'node:path';
 import { fileURLToPath } from 'node:url';
@@ -62,7 +63,11 @@ test('account recovery uses the production shell and workspace with contained Fl
       if (url.pathname.endsWith('/quota-reset/current')) return route.fulfill({ json: operation });
       if (url.pathname.endsWith('/models')) return route.fulfill({ json: { account_id: url.pathname.split('/')[4], credential_generation: 3, status: 'ready', models: [], disabled_models: [], last_attempt_at: now, last_success_at: now, expires_at: now + 3600_000, error_code: null } });
       if (url.pathname.endsWith('/health-probe-settings')) return route.fulfill({ json: { enabled: false, billing_key_id: null, interval_seconds: 3600, model: null, prompt: 'Reply OK.' } });
-      if (url.pathname.endsWith('/transport-proxy')) return route.fulfill({ json: { account_id: url.pathname.split('/')[4], credential_generation: 3, updated_at: 3, proxy_url: null } });
+      if (url.pathname.endsWith('/transport-proxy')) {
+        const account = accounts.find(account => url.pathname === `/internal/v1/upstreams/${account.id}/transport-proxy`);
+        assert.ok(account);
+        return route.fulfill({ json: { account_id: account.id, credential_generation: account.credential_generation, updated_at: account.updated_at, proxy_url: null, selection: credentialProxySelection(account) } });
+      }
       if (url.pathname.endsWith('/access')) return route.fulfill({ json: { can_manage: false } });
       if (url.pathname.includes('monitoring')) return route.fulfill({ json: { top_upstream_models: [] } });
       if (url.pathname.includes('availability')) return route.fulfill({ json: { tenant_external_id: 'fixture-a', accounts: [] } });
@@ -93,10 +98,16 @@ test('account recovery uses the production shell and workspace with contained Fl
         assert.match(await badge.innerText(), reason);
         assert.equal(await workspace.getByRole('button', { name: '重新登录', exact: true }).isVisible(), true);
         await badge.focus();
-        await page.getByRole('tooltip').filter({ hasText: reason }).waitFor();
-        assert.match(await page.getByRole('tooltip').innerText(), /自动续期已暂停/);
-        await badge.press('Tab');
-        await page.getByRole('tooltip').waitFor({ state: 'hidden' });
+        const renewalTooltip = page.getByRole('tooltip').filter({ hasText: reason });
+        await renewalTooltip.waitFor({ state: 'visible' });
+        const tooltipId = await renewalTooltip.getAttribute('id');
+        assert.ok(tooltipId && (await badge.getAttribute('aria-describedby'))?.split(/\s+/).includes(tooltipId),
+          'the renewal badge describes its own tooltip');
+        assert.match(await renewalTooltip.innerText(), /自动续期已暂停/);
+        await page.keyboard.press('Escape');
+        await page.locator(`[role="tooltip"][id=${JSON.stringify(tooltipId)}]`).waitFor({ state: 'hidden' });
+        assert.equal(await badge.evaluate(element => document.activeElement === element), true,
+          'dismissing the tooltip leaves focus on its badge');
         await page.screenshot({ path: join(artifacts, `kimi-workspace-${accountId}-${theme}-${width}.png`), fullPage: true });
       }
       const workspace = await manageProviderAccount(page, 'codex-recovery');

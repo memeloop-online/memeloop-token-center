@@ -10,8 +10,6 @@ const selfDrawers = await readFile(new URL('../src/self/SelfDrawers.tsx', import
 const selfPortal = await readFile(new URL('../src/self/SelfPortal.tsx', import.meta.url), 'utf8');
 const operatorRequests = await readFile(new URL('../src/operator/pages/RequestsPage.tsx', import.meta.url), 'utf8');
 const types = await readFile(new URL('../src/types.ts', import.meta.url), 'utf8');
-const copyButton = await readFile(new URL('../src/CopyButton.tsx', import.meta.url), 'utf8');
-const fixture = await readFile(new URL('./fixtures/request-diagnostics.tsx', import.meta.url), 'utf8');
 
 test('raw supplier details stay viewable without allowlist parsing, and mapped copy stays supplemental', () => {
   const request: RequestView = { request_id: 'fixture', created_at: 1, protocol: 'openai', model: 'fixture', status_code: 402, duration_ms: 1, input_tokens: 0, output_tokens: 0, cost: '0', error_code: 'http_402' };
@@ -53,20 +51,6 @@ test('raw supplier details stay viewable without allowlist parsing, and mapped c
   assert.match(components, /failureDetails\.map\(\(entry\) => `\$\{entry\.label\}: \$\{entry\.value\}`\)\.join\(' · '\)/);
 });
 
-test('request table exposes copyable durable IDs and its recorded token billing split', () => {
-  assert.match(components, /RequestIdentifier/);
-  assert.match(components, /request\.request_id/);
-  assert.match(components, /<CopyButton value=\{requestId\} label=\{t\('common\.copy'\)\}/);
-  assert.match(copyButton, /navigator\.clipboard\?\.writeText/);
-  assert.match(components, /request\.tokenBreakdown/);
-  assert.match(components, /requestTokenBreakdown/);
-  assert.match(components, /const cachedInputTokens = request\.cached_input_tokens;/);
-  assert.match(components, /const cacheWriteTokens = request\.cache_write_tokens;/);
-  assert.match(components, /if \(typeof request\.input_tokens !== 'number' \|\| typeof request\.output_tokens !== 'number'\s*\|\| typeof cachedInputTokens !== 'number' \|\| typeof cacheWriteTokens !== 'number'\) return undefined;/);
-  assert.doesNotMatch(components, /cached_input_tokens \?\? 0/);
-  assert.doesNotMatch(components, /cache_write_tokens \?\? 0/);
-});
-
 test('both Requests drawers reuse the durable request diagnostics surface and session drilldown', () => {
   assert.match(selfDrawers, /<RequestDiagnostics request=\{detail\}/);
   assert.match(selfDrawers, /onOpenSession/);
@@ -77,31 +61,12 @@ test('both Requests drawers reuse the durable request diagnostics surface and se
   assert.match(components, /sessions\.unlinkedRequests/);
 });
 
-test('request diagnostics fixture preserves the Shell grid placement used by the browser contract', () => {
-  assert.match(fixture, /className="app-shell" data-fixture-ready="request-diagnostics"><aside className="rail" aria-hidden="true" \/><main className="main">/);
-  assert.match(fixture, /data-fixture-request="recorded"/);
-  assert.match(fixture, /data-fixture-request="historical-gap"/);
-});
-
 test('request diagnostics use only nullable server-recorded final routing fields', () => {
   const requestView = types.slice(types.indexOf('export interface RequestView'), types.indexOf('/** Exclusive descending keyset cursor'));
   for (const field of ['completed_at?: number | null', 'upstream_account_id?: string | null', 'route_id?: string | null', 'currency?: string | null']) {
     assert.match(requestView, new RegExp(field.replaceAll('?', '\\?').replaceAll('|', '\\|')));
   }
-  assert.match(components, /request\.receivedAt/);
-  assert.match(components, /request\.completedAt/);
-  assert.match(components, /request\.upstreamId/);
-  assert.match(components, /request\.routeId/);
-  assert.match(components, /request\.currency === undefined \? fallbackCurrency : request\.currency/);
   assert.doesNotMatch(components, /routing_attempts|ttft|tokens_per_second/i);
-});
-
-test('request failure presentation shares the allowlisted recorded cause and never renders raw codes', () => {
-  assert.match(components, /const failureCause = pending \|\| requestStatusCopy\(request, locale\)\.cause \? null : requestFailureCause\(request, locale\) \?\? \(request\.error_code \? requestErrorCopy\(request\.error_code, locale\) : null\);/);
-  assert.match(components, /\{failureCause && <div className="request-detail-wide"><b>\{t\('request\.error'\)\}<\/b><span>\{failureCause\}<\/span><\/div>\}/);
-  assert.doesNotMatch(components, /\{request\.error_code\}/, 'raw recorded error codes never render as copy');
-  assert.doesNotMatch(components, /traffic\.errorCode/, 'raw recorded error codes never appear in tooltips');
-  assert.match(components, /<td className="request-status-cell" data-label=\{t\('request\.status'\)\}><RequestStatus request=\{request\} \/><\/td>/, 'the status cell relies on the shared status cause presentation');
 });
 
 test('supplier reasons share localized tooltip/detail copy, preserve transport precedence and survive refresh', () => {

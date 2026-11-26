@@ -24,7 +24,10 @@ export async function openAppRoute(
 ): Promise<void> {
   if (surface === 'operator' && route === 'generations') {
     await openAppRoute(page, 'operator', 'requests');
-    await page.locator('.traffic-heading-actions').getByRole('button', { name: /^(生成任务|Generation jobs)$/ }).click();
+    const activityTabs = page.getByRole('tablist', { name: /^(实时活动|Live activity)$/, exact: true });
+    const generations = activityTabs.getByRole('tab', { name: /^(生成任务|Generation jobs)$/, exact: true });
+    await generations.click();
+    assert.equal(await generations.getAttribute('aria-selected'), 'true');
     await page.locator('.operator-generations').waitFor();
     assert.equal(new URL(page.url()).searchParams.get('view'), 'generations');
     assert.equal(await page.locator('.app-navigation a[href="/operator?view=requests"]').getAttribute('aria-current'), 'page');

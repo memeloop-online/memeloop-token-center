@@ -1,11 +1,11 @@
 import assert from 'node:assert/strict';
-import { existsSync } from 'node:fs';
-import { mkdir, readdir, stat } from 'node:fs/promises';
+import { mkdir, stat } from 'node:fs/promises';
 import { join } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import test from 'node:test';
 
 import { chromium } from 'playwright';
+import { localChromiumExecutable } from './support/browser-executable.js';
 import { createServer } from 'vite';
 import { fixtureAssets } from './support/fixture-assets.js';
 import { metricArea } from '../src/operator/analyticsPresentation.js';
@@ -28,19 +28,6 @@ const artifactRoot = join(webRoot, 'e2e-artifacts', 'overview-trends');
 const screenshotWidths = [320, 390, 768, 1024, 1440, 1920, 2560] as const;
 const fixtureNow = Date.UTC(2026, 8, 8, 12, 0, 0);
 
-async function localChromiumExecutable() {
-  const defaultExecutable = chromium.executablePath();
-  if (existsSync(defaultExecutable)) return defaultExecutable;
-  const workspaceUserCache = fileURLToPath(new URL('../../../../.cache/ms-playwright', import.meta.url));
-  const installations = await readdir(workspaceUserCache, { withFileTypes: true }).catch(() => []);
-  for (const installation of installations) {
-    if (!installation.isDirectory() || !installation.name.startsWith('chromium-')) continue;
-    const executable = join(workspaceUserCache, installation.name, 'chrome-linux64', 'chrome');
-    if (existsSync(executable)) return executable;
-  }
-  return undefined;
-}
-
 async function nextPaint(page: import('playwright').Page) {
   await page.evaluate(() => new Promise<void>((resolve) => requestAnimationFrame(() => requestAnimationFrame(() => resolve()))));
 }
@@ -57,11 +44,11 @@ async function endpointCounts(page: import('playwright').Page, tenant: string) {
   }, tenant);
 }
 
-test('Overview keeps current sections visible through independent endpoint failure, late tenant data, and responsive trend charts', { timeout: 45_000 }, async () => {
+test('Overview keeps current sections visible through independent endpoint failure, late tenant data, and responsive trend charts', { timeout: 45_000 }, async (context) => {
   const executablePath = await localChromiumExecutable();
   if (!executablePath) {
     if (process.env.MTC_REQUIRE_BROWSER === '1') throw new Error('Chromium is required for the Overview browser gate');
-    return test.skip('a local Chromium runtime is required for Overview layout assertions');
+    return context.skip('a local Chromium runtime is required for Overview layout assertions');
   }
   const server = await createServer({ root: webRoot, configFile: false, plugins: [fixtureAssets()], logLevel: 'silent', server: { host: '127.0.0.1', port: 0, strictPort: false } });
   await server.listen();

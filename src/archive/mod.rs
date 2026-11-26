@@ -25,9 +25,6 @@ mod carrier_ownership;
 mod cas;
 mod compressed;
 mod conversation;
-mod conversation_capture;
-#[cfg(test)]
-mod conversation_capture_tests;
 mod conversation_stream;
 mod download;
 mod durable_roots;
@@ -38,13 +35,11 @@ mod path;
 mod quota_reset_receipts;
 mod raw_cache;
 mod raw_capture;
-mod raw_gc;
 mod raw_reader_authority;
 #[cfg(test)]
 mod single_put_test_transport;
 mod write_observation;
 pub(crate) use raw_capture::RawPublicationSettlement;
-pub use raw_gc::{RawGcCandidate, RawGcCandidateBatch};
 pub use raw_reader_authority::{CanonicalRawProof, RawReaderAuthority};
 #[cfg(test)]
 mod raw_capture_tests;
@@ -70,11 +65,9 @@ mod text;
 pub(crate) use carrier_ownership::CarrierObjectOwner;
 pub use cas::CasArchiveObject;
 pub use conversation::{
-    ConversationBodyReference, ConversationEvent, ConversationManifest, ConversationMedia,
-    ConversationPrefix, RawConversationCapture, RawConversationFormat,
+    ConversationBodyReference, ConversationManifest, ConversationMedia, ConversationPrefix,
+    RawConversationCapture, RawConversationFormat,
 };
-#[cfg(test)]
-pub use conversation::{ConversationExport, ConversationReadLimits};
 pub use download::ArchiveDownload;
 #[cfg(test)]
 use download::{validate_download_range, verified_download_stream};

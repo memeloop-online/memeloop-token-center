@@ -4,7 +4,7 @@
 import { spawn, spawnSync, type ChildProcess } from "node:child_process";
 import { createHash } from "node:crypto";
 import { once } from "node:events";
-import { accessSync, constants, mkdirSync, mkdtempSync, readFileSync, readdirSync, rmSync, writeFileSync } from "node:fs";
+import { accessSync, constants, existsSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, rmSync, statSync, writeFileSync } from "node:fs";
 import { createServer, request, type ClientRequest, type ServerResponse } from "node:http";
 import { tmpdir } from "node:os";
 import { dirname, join, resolve } from "node:path";
@@ -113,8 +113,17 @@ export function assertUnknownArchiveEvidence(row: Record<string, unknown>, archi
 
 export function assertUnknownSemanticEvidence(row: Record<string, unknown>, previous?: Record<string, unknown>): Record<string, unknown> {
   assert(row.observation_count === 1, "unknown must project exactly one conversation observation");
-  assert(row.projected_event_count === 1, "unknown must publish exactly one semantic projected event");
-  for (const field of ["projection_completed", "operational_completed"]) {
+  assert(row.stats_outcome === "applied" && row.projection_outcome === "session_body",
+    "unknown must retain separate statistics and semantic projection receipts");
+  // Both outboxes publish the same public event kind; the scoped ID set
+  // proves distinct publications without assuming commit order.
+  const projectedEventIds = typeof row.projected_event_ids === "string" ? row.projected_event_ids.split(",") : [];
+  assert(row.projected_event_count === 2 && projectedEventIds.length === 2
+    && projectedEventIds.every(Boolean) && new Set(projectedEventIds).size === 2,
+    "unknown must publish two distinct scoped projected events (statistics and semantics)");
+  if (previous) assert(JSON.stringify(projectedEventIds) === JSON.stringify(previous.projected_event_ids),
+    "projection replay must preserve event IDs");
+  for (const field of ["stats_projected_at", "projection_completed", "operational_completed"]) {
     assert(typeof row[field] === "number" && row[field] > 0, "semantic projection must commit with operational evidence");
     if (previous) assert(row[field] === previous[field], `semantic replay must preserve timestamp: ${field}`);
   }
@@ -124,19 +133,18 @@ export function assertUnknownSemanticEvidence(row: Record<string, unknown>, prev
     cluster_tenant_id: "tenant_id", cluster_principal_id: "principal_id",
     observation_cluster_id: "request_cluster_id",
     projection_tenant_id: "tenant_id", projection_key_id: "key_id", projection_principal_id: "principal_id",
-    projected_event_tenant_id: "tenant_id", projected_event_key_id: "key_id",
   })) {
     assert(typeof row[owner] === "string" && row[owner] !== "" && row[field] === row[owner], `semantic projection must retain exact ownership: ${field}`);
   }
   const evidence = Object.fromEntries([
     "request_id", "tenant_id", "key_id", "principal_id", "operational_receipt_id",
-    "observation_id", "observation_cluster_id", "projected_event_id",
+    "observation_id", "observation_cluster_id",
   ].map((field) => {
     assert(typeof row[field] === "string" && row[field] !== "", `semantic evidence missing: ${field}`);
     if (previous) assert(row[field] === previous[field], `semantic replay must preserve identity: ${field}`);
     return [field, row[field]];
   }));
-  return { ...evidence, observation_count: 1, projected_event_count: 1, projection_completed: row.projection_completed, operational_completed: row.operational_completed };
+  return { ...evidence, observation_count: 1, projected_event_count: projectedEventIds.length, projected_event_ids: projectedEventIds, stats_projected_at: row.stats_projected_at, projection_completed: row.projection_completed, operational_completed: row.operational_completed };
 }
 
 function pendingReceipt(directory: string, receiptId: string): PendingReceipt | undefined {
@@ -208,7 +216,8 @@ export function permitEvidence(metrics: string): Record<string, number> {
     retained_request_memory: 'memeloop_token_center_proxy_memory_bytes{pool="retained_request",measure="used"}',
     body_readers: 'memeloop_token_center_background_work_items{queue="gateway_body_reads",state="active"}',
     lifecycles: 'memeloop_token_center_background_work_items{queue="proxy_lifecycles",state="active"}',
-    archive_workers: 'memeloop_token_center_background_work_items{queue="proxy_archive_streams",state="active"}',
+    upload_permits_in_use: 'memeloop_token_center_background_work_items{queue="proxy_archive_streams",state="active"}',
+    archive_activities: 'memeloop_token_center_background_work_items{queue="archive_activities",state="active"}',
     deferred_jobs: 'memeloop_token_center_deferred_persistence_jobs',
     deferred_bytes: 'memeloop_token_center_deferred_persistence_bytes',
     deferred_stream_bytes: 'memeloop_token_center_deferred_stream_memory_bytes',
@@ -481,7 +490,7 @@ export async function run(binary: string, output: string): Promise<boolean> {
       MTC_ALLOW_OAUTH_LOOPBACK: "true", MTC_RUN_MIGRATIONS_ON_START: "false",
       MTC_PROXY_MEMORY_BUDGET_BYTES: String(256 * MIB),
       MTC_PRICING_MODELS_DEV_URL: `${mockUrl}/catalog`, MTC_PRICING_LITELLM_URL: `${mockUrl}/catalog`,
-      MTC_PRICING_OPENROUTER_URL: `${mockUrl}/catalog`, RUST_LOG: "warn",
+      MTC_PRICING_OPENROUTER_URL: `${mockUrl}/catalog`, RUST_LOG: "warn,memeloop_token_center::gateway_body::carrier::spill_observation=info",
     });
     const migration = spawnSync(binary, ["migrate"], { env, encoding: "utf8", timeout: 60_000 });
     writeFileSync(`${output}.migration.log`, `${migration.stdout ?? ""}${migration.stderr ?? ""}`);
@@ -524,6 +533,37 @@ export async function run(binary: string, output: string): Promise<boolean> {
     const drain = async (unknownRequestId?: string, previousSemantics?: Record<string, unknown>, archiveGapBaseline?: ArchiveGapBaseline): Promise<Record<string, unknown>> => {
       const reader = new DatabaseSync(database, { readOnly: true });
       reader.exec("PRAGMA busy_timeout = 1000");
+      const recordArchiveEvidence = (): void => {
+        try {
+          const selected = unknownRequestId !== undefined
+            ? reader.prepare("SELECT id, tenant_id, status_code, completed_at, request_object, response_object FROM request_records WHERE id = ?").all(unknownRequestId)
+            : reader.prepare("SELECT id, tenant_id, status_code, completed_at, request_object, response_object FROM request_records WHERE status_code = 200 AND (request_object LIKE 'gap:%' OR response_object IS NULL OR response_object LIKE 'gap:%') ORDER BY created_at LIMIT 33").all();
+          const records = selected.slice(0, 32);
+          const requests = records.map((record) => ({
+            request_id: record.id, status_code: record.status_code, completed_at: record.completed_at,
+            sides: ["request", "response"].map((side) => {
+              const root = join(archive, "tenants", String(record.tenant_id), "raw", "v1", String(record.id), `${side}.json`);
+              const exists = existsSync(root);
+              const rootBytes = exists ? statSync(root).size : null;
+              const reference = rootBytes !== null && rootBytes <= 4096 ? JSON.parse(readFileSync(root, "utf8")) : null;
+              const locator = record[`${side}_object`];
+              return { side, locator_present: typeof locator === "string", locator_is_gap: typeof locator === "string" && locator.startsWith("gap:"),
+                root_exists: exists, root_bytes: rootBytes,
+                root_digest: typeof reference?.blake3_digest === "string" ? reference.blake3_digest : null,
+                source_bytes: typeof reference?.size_bytes === "number" ? reference.size_bytes : null,
+                failed: existsSync(`${root}.failed`),
+                retired: existsSync(join(archive, "tenants", String(record.tenant_id), "semantic", "v2", "requests", String(record.id), `retired-${side}.json`)),
+              };
+            }),
+            spool: reader.prepare("SELECT state, chunk_count, byte_count, cipher_bytes FROM response_archive_spools WHERE request_id = ?").get(String(record.id)) ?? null,
+          }));
+          report.archive_drain_evidence = { selection: unknownRequestId !== undefined ? "exact_unknown_request" : "successful_archive_gaps",
+            unknown: records.length === 0, truncated: selected.length > 32, requests,
+          };
+        } catch (error) {
+          report.archive_drain_evidence_error = String(error);
+        }
+      };
       try {
         return await deadline((async () => {
           while (true) {
@@ -546,6 +586,7 @@ export async function run(binary: string, output: string): Promise<boolean> {
                   (SELECT COUNT(*) FROM request_events WHERE request_id = q.id AND event_kind = 'finished') AS event_count,
                   (SELECT COUNT(*) FROM request_stats_facts WHERE request_id = q.id) AS fact_count,
                   t.projected_at AS stats_projected_at, t.usage_basis AS stats_usage_basis,
+                  t.statistics_outcome AS stats_outcome,
                   f.tenant_id AS stats_tenant_id, f.key_id AS stats_key_id,
                   f.status_class AS stats_status_class, f.error_code AS stats_error_code,
                   f.cost_micros AS stats_cost_micros, f.input_tokens AS stats_input_tokens,
@@ -555,15 +596,16 @@ export async function run(binary: string, output: string): Promise<boolean> {
                   finished.tenant_id AS finished_tenant_id, finished.key_id AS finished_key_id,
                   (SELECT COUNT(*) FROM conversation_observations WHERE request_id = q.id) AS observation_count,
                   (SELECT COUNT(*) FROM request_events WHERE request_id = q.id AND event_kind = 'projected') AS projected_event_count,
+                  (SELECT group_concat(event_id, ',' ORDER BY event_id) FROM request_events
+                    WHERE request_id = q.id AND tenant_id = q.tenant_id AND key_id = q.key_id
+                      AND event_kind = 'projected') AS projected_event_ids,
                   k.principal_id, q.conversation_cluster_id AS request_cluster_id,
                   v.id AS observation_id, v.request_id AS observation_request_id,
                   v.key_id AS observation_key_id, v.cluster_id AS observation_cluster_id,
                   c.tenant_id AS cluster_tenant_id, c.principal_id AS cluster_principal_id,
                   x.tenant_id AS projection_tenant_id, x.key_id AS projection_key_id,
                   x.principal_id AS projection_principal_id, x.projected_at AS projection_completed,
-                  x.observed_at AS projection_observed_at,
-                  e.event_id AS projected_event_id, e.tenant_id AS projected_event_tenant_id,
-                  e.key_id AS projected_event_key_id
+                  x.observed_at AS projection_observed_at, x.statistics_outcome AS projection_outcome
                 FROM request_records q JOIN usage_reservations r ON r.id = q.reservation_id
                 JOIN key_records k ON k.id = q.key_id AND k.tenant_id = q.tenant_id
                 JOIN pending_proxy_settlements p ON p.request_id = q.id AND p.reservation_id = r.id
@@ -579,7 +621,6 @@ export async function run(binary: string, output: string): Promise<boolean> {
                 LEFT JOIN conversation_observations v ON v.request_id = q.id
                 LEFT JOIN conversation_clusters c ON c.id = v.cluster_id
                 LEFT JOIN conversation_projection_outbox x ON x.request_id = q.id
-                LEFT JOIN request_events e ON e.request_id = q.id AND e.event_kind = 'projected'
                 WHERE q.id = ?`).get(unknownRequestId);
               const receipt = typeof unknown?.operational_receipt_id === "string"
                 ? pendingReceipt(join(requestSpool, "pending-terminals-v1"), unknown.operational_receipt_id) : undefined;
@@ -629,6 +670,7 @@ export async function run(binary: string, output: string): Promise<boolean> {
                 const requestPersistence = requestPersistenceEvidence(metricsText);
                 const requestGaps = Number(successfulGaps?.request_gaps);
                 const responseGaps = Number(successfulGaps?.response_gaps);
+                recordArchiveEvidence();
                 if (archiveGapBaseline) {
                   assertArchiveReplayGapEvidence(requestGaps, responseGaps, requestPersistence, persistence, archiveGapBaseline);
                 } else {
@@ -641,7 +683,68 @@ export async function run(binary: string, output: string): Promise<boolean> {
             await delay(100);
           }
         })(), 30_000, "archive drain");
+      } catch (error) {
+        recordArchiveEvidence();
+        throw error;
       } finally { reader.close(); }
+    };
+    const verifyCompleteOriginals = async (result: Result, requestPlan: Plan, responsePlan: Plan): Promise<void> => {
+      assert(result.requestId, "complete original verification requires the delivered request id");
+      const reader = new DatabaseSync(database, { readOnly: true });
+      try {
+        const row = reader.prepare("SELECT tenant_id, request_object, response_object, (SELECT COUNT(*) FROM ledger_entries WHERE source = r.reservation_id AND kind = 'usage') AS usage_entries FROM request_records r WHERE id = ?").get(result.requestId);
+        const evidence: Record<string, any> = { request_id: result.requestId, usage_entries: row?.usage_entries, sides: [] };
+        report.phases.at(-1).archive_originals = evidence;
+        assert(row && row.usage_entries === 1, "chunked reference request must settle exactly once");
+        const failures: string[] = [];
+        for (const [side, plan] of [["request", requestPlan], ["response", responsePlan]] as const) {
+          const root = join(archive, "tenants", String(row.tenant_id), "raw", "v1", result.requestId, `${side}.json`);
+          const sideEvidence: Record<string, any> = { side, root_exists: existsSync(root), failed: existsSync(`${root}.failed`) };
+          evidence.sides.push(sideEvidence);
+          try {
+            assert(sideEvidence.root_exists && !sideEvidence.failed, `${side} must own a complete original root without a failure marker`);
+            assert(statSync(root).size <= 4096, `${side} root metadata must remain bounded`);
+            const reference = JSON.parse(readFileSync(root, "utf8"));
+            sideEvidence.source_bytes = reference.size_bytes;
+            sideEvidence.root_digest = reference.blake3_digest;
+            assert(reference.size_bytes === plan.bytes && typeof reference.blake3_digest === "string" && /^[a-f0-9]{64}$/.test(reference.blake3_digest), `${side} root must identify the complete original`);
+            sideEvidence.sql_binding = reference.object_locator === row[`${side}_object`] ? "exact_cas" : "unverified";
+            if (sideEvidence.sql_binding !== "exact_cas" && side === "request") {
+              // The completed spool receipt binds the SQL source to this exact
+              // request. The public read below independently verifies root content.
+              const receipt = reader.prepare(`SELECT s.body_byte_count, s.body_blake3, a.backend_identity
+                FROM request_records r JOIN request_archive_spools s
+                  ON s.request_id = r.id AND s.tenant_id = r.tenant_id AND s.reservation_id = r.reservation_id
+                JOIN archive_staging_attempts a ON a.attempt_id = r.id
+                  AND a.owner_kind = 'proxy_request' AND a.owner_id = r.id AND a.purpose = 'request'
+                  AND a.writer_owner = 'gateway-source' AND a.writer_token = r.id
+                  AND a.state IN ('cleanup_pending', 'cleaned')
+                  AND a.lease_owner IS NULL AND a.lease_token IS NULL AND a.lease_expires_at IS NULL
+                WHERE r.id = ? AND s.state = 'bound' AND s.bound_locator = r.request_object
+                  AND a.intent_digest = s.body_blake3`).get(result.requestId);
+              const sourceKey = `staging/proxy/${result.requestId}/request/${result.requestId}/body.json`;
+              const sourceLocator = receipt?.backend_identity === null ? sourceKey
+                : typeof receipt?.backend_identity === "string" ? `stores/staging/${receipt.backend_identity}/${sourceKey}` : undefined;
+              if (sourceLocator === row.request_object && receipt?.body_byte_count === plan.bytes
+                && receipt.body_blake3 === reference.blake3_digest) {
+                sideEvidence.sql_binding = "bound_source_receipt";
+              }
+            }
+            const replay = await apiRequest(base, "GET", `/internal/v1/requests/${result.requestId}/archive/${side}`, token);
+            sideEvidence.status = replay.status;
+            sideEvidence.bytes = replay.body.length;
+            sideEvidence.sha256 = createHash("sha256").update(replay.body).digest("hex");
+            assert(replay.status === 200 && replay.body.length === plan.bytes && sideEvidence.sha256 === planHash(plan), `${side} backend replay must reproduce every original byte`);
+            assert(sideEvidence.sql_binding !== "unverified", `${side} relational binding equivalence is unverified`);
+          } catch (error) {
+            sideEvidence.error = String(error);
+            failures.push(String(error));
+          }
+        }
+        assert(failures.length === 0, failures.join("; "));
+      } finally { reader.close(); }
+      const completed = await drain();
+      assert(completed.successful_request_archive_gaps === 0 && completed.successful_response_archive_gaps === 0, "reference workload must retain both originals without an archive gap");
     };
     const phase = async (name: string, operation: () => Promise<unknown>, expectUnknown = false): Promise<void> => {
       const callsBefore = upstreamCalls;
@@ -706,11 +809,14 @@ export async function run(binary: string, output: string): Promise<boolean> {
     });
     await phase("unknown-chunked-16MiB-input-and-64MiB-response", async () => {
       current = responsesOutputPlan(64 * MIB); chunkedResponse = true;
+      const callsBefore = upstreamCalls;
       const result = await send(base, key, responsesInputPlan(16 * MIB), { chunked: true }).result;
+      assert(upstreamCalls === callsBefore + 1, "chunked reference request must dispatch exactly once");
       assert(result.status === 200 && result.bytes === current.bytes && result.sha256 === planHash(current), "unknown-length request/response must complete exact bytes");
       chunkedResponse = false;
       return result;
     });
+    await verifyCompleteOriginals(report.phases.at(-1).result as Result, responsesInputPlan(16 * MIB), responsesOutputPlan(64 * MIB));
     await phase("64MiB-input-local-spool-complete", async () => {
       current = responsesOutputPlan(512);
       const before = upstreamCalls;

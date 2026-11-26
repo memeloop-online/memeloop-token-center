@@ -385,6 +385,7 @@ where
                 response
             };
             Ok(ProxyRouteResponse {
+                codex_transient_bad_request: false,
                 preoutput_quota,
                 egress_selection,
                 response,
@@ -1352,9 +1353,7 @@ mod tests {
             forwarded_body: Bytes::from_static(b"{}"),
             component_input_bytes: 0,
             upstream_stream: false,
-            codex_downstream_stream: false,
-            codex_store_disabled: false,
-            codex_session_id: None,
+            codex: None,
             component_request: None,
             responses_chat: None,
             upstream_path: "/v1/chat/completions",

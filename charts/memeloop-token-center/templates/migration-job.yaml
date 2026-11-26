@@ -1,3 +1,7 @@
+{{- $schemaGeneration := required "chart schema generation is required" (index .Chart.Annotations "memeloop.io/schema-generation") }}
+{{- if and .Values.migration.enabled (hasKey .Values.migration "schemaVersion") (ne (int .Values.migration.schemaVersion) (int $schemaGeneration)) }}
+{{- fail (printf "migration.schemaVersion must match chart schema generation %s" $schemaGeneration) }}
+{{- end }}
 {{- if .Values.migration.enabled }}
 apiVersion: batch/v1
 kind: Job
@@ -7,7 +11,7 @@ metadata:
     {{- include "memeloop-token-center.labels" . | nindent 4 }}
     app.kubernetes.io/component: migration
   annotations:
-    memeloop.io/schema-generation: {{ printf "v%d" (int .Values.migration.schemaVersion) | quote }}
+    memeloop.io/schema-generation: {{ printf "v%d" (int $schemaGeneration) | quote }}
     helm.sh/hook: pre-install,pre-upgrade
     helm.sh/hook-weight: "-5"
     helm.sh/hook-delete-policy: before-hook-creation,hook-succeeded

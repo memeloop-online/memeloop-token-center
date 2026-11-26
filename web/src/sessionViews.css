@@ -97,6 +97,7 @@
 .session-detail-region { min-width: 0; }
 .session-detail {
   display: grid;
+  grid-template-columns: minmax(0, 1fr);
   min-width: 0;
   gap: 18px;
   padding: 2px;

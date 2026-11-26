@@ -72,16 +72,18 @@ async fn supplier_explanation_reaches_client_and_archive_without_logging_request
     async {
         for (label, code) in [("safe-echo", "NoAvailablePlan"), ("unknown-echo", "private-header-fragment")] {
             let upstream = MockServer::start().await;
-            Mock::given(method("POST"))
-                .and(path("/v1/chat/completions"))
-                .respond_with(ResponseTemplate::new(402).set_body_json(json!({
+            let original = json!({
                     "error": {
                         "code": code,
                         "message": "private prompt/full-canary prompt/full private%20prompt%2Ffull-canary pr%69vate+prompt%2ffull-canary private-header/full-canary header/full private-header%2Ffull-canary",
                         "param": "private-header/full-canary"
                     },
                     "debug": "private prompt/full-canary"
-                })))
+                });
+            let wire = serde_json::to_vec(&original).unwrap();
+            Mock::given(method("POST"))
+                .and(path("/v1/chat/completions"))
+                .respond_with(ResponseTemplate::new(402).set_body_raw(wire.clone(), "application/json"))
                 .expect(1).mount(&upstream).await;
             let fixture = response_usage_fixture_with_uri(label, upstream.uri(), 0).await;
             let request_body = json!({
@@ -98,19 +100,15 @@ async fn supplier_explanation_reaches_client_and_archive_without_logging_request
                 .await.unwrap();
             assert_eq!(response.status(), StatusCode::PAYMENT_REQUIRED);
             let bytes = to_bytes(response.into_body(), MAX_PROXY_RESPONSE_BODY).await.unwrap();
-            let value: Value = serde_json::from_slice(&bytes).unwrap();
-            assert_eq!(value["error"]["mtc_provider_code"], code);
-            assert!(value["error"]["message"].as_str().unwrap().contains("private prompt/full-canary"));
+            assert_eq!(bytes.as_ref(), wire.as_slice());
             cancellation::assert_single_unknown_receipt(&fixture, 402, Some("http_402")).await;
             let records = fixture.state.db.list_requests(fixture.key_id, 10).await.unwrap();
-            let original = restored_rejection(&fixture, records[0].request_id).await;
-            let document: Value = serde_json::from_slice(&original).unwrap();
-            assert_eq!(document["error"]["code"], code);
-            assert!(String::from_utf8_lossy(&original).contains("private prompt/full-canary"));
+            let archived = restored_rejection(&fixture, records[0].request_id).await;
+            assert_eq!(archived, bytes);
             let refs = fixture.state.db.request_archive_refs(fixture.key_id, records[0].request_id).await.unwrap();
             assert!(!refs.response_object.as_deref().unwrap().starts_with("inline-json:"));
             let detail = crate::api::request_detail::request_detail(&fixture.state, refs).await;
-            assert_eq!(detail.response_body, document);
+            assert_eq!(detail.response_body, original);
             upstream.verify().await;
         }
     }.with_subscriber(dispatch).await;
@@ -189,7 +187,7 @@ async fn compatible_http_errors_classify_safe_reasons_and_preserve_financial_att
         Mock::given(method("POST"))
             .and(path("/v1/chat/completions"))
             .respond_with(ResponseTemplate::new(status).set_body_json(json!({
-                "error": { "message": message, "code": code, "debug": "must-not-retain" },
+                "error": { "message": message, "code": code, "api_key": "must-not-retain" },
                 "usage": { "prompt_tokens": 500, "completion_tokens": 100 }
             })))
             .expect(1)
@@ -210,21 +208,6 @@ async fn compatible_http_errors_classify_safe_reasons_and_preserve_financial_att
         let bytes = to_bytes(response.into_body(), MAX_PROXY_RESPONSE_BODY)
             .await
             .unwrap();
-        let delivered: Value = serde_json::from_slice(&bytes).unwrap();
-        assert_eq!(delivered["error"]["type"], "upstream_error");
-        assert_eq!(delivered["error"]["message"], message);
-        assert_eq!(delivered["error"]["mtc_provider_code"], code);
-        assert_eq!(delivered["error"]["mtc_provider_message"], message);
-        if let Some(reason) =
-            crate::supplier_error::SafeReason::from_supplier(Some(code), Some(message))
-        {
-            assert_eq!(delivered["error"]["code"], reason.client_code());
-            assert_eq!(delivered["error"]["mtc_safe_reason"], reason.code());
-        } else {
-            assert_eq!(delivered["error"]["code"], code);
-            assert!(delivered["error"].get("mtc_safe_reason").is_none());
-        }
-        assert!(delivered.get("usage").is_none());
         cancellation::assert_single_unknown_receipt(
             &fixture,
             i64::from(status),
@@ -253,10 +236,11 @@ async fn compatible_http_errors_classify_safe_reasons_and_preserve_financial_att
         assert_eq!(record.billing.cost, None);
         let stored = restored_rejection(&fixture, record.request_id).await;
         let original = json!({
-            "error": { "message": message, "code": code, "debug": "must-not-retain" },
+            "error": { "message": message, "code": code, "api_key": "must-not-retain" },
             "usage": { "prompt_tokens": 500, "completion_tokens": 100 }
         });
         assert_eq!(stored.as_ref(), serde_json::to_vec(&original).unwrap());
+        assert_eq!(bytes, stored);
         let refs = fixture
             .state
             .db
@@ -270,12 +254,21 @@ async fn compatible_http_errors_classify_safe_reasons_and_preserve_financial_att
                 .unwrap()
                 .starts_with("inline-json:")
         );
-        let projected = crate::supplier_error::supplier_error_from_inline_json(Some(&format!(
-            "inline-json:{}",
-            std::str::from_utf8(&bytes).unwrap()
-        )));
-        assert_eq!(record.supplier_error, projected);
-        assert_eq!(refs.view.supplier_error, projected);
+        let projected = record.supplier_error.as_ref();
+        if let Some(reason) =
+            crate::supplier_error::SafeReason::from_supplier(Some(code), Some(message))
+        {
+            assert_eq!(
+                projected.map(|summary| summary.code.as_str()),
+                Some(reason.code())
+            );
+        }
+        assert!(
+            !serde_json::to_string(&projected)
+                .unwrap()
+                .contains("must-not-retain")
+        );
+        assert_eq!(refs.view.supplier_error.as_ref(), projected);
         let download = crate::api::request_detail::request_archive_content_response(
             &fixture.state,
             &http::HeaderMap::new(),
@@ -290,7 +283,7 @@ async fn compatible_http_errors_classify_safe_reasons_and_preserve_financial_att
             .unwrap();
         assert_eq!(downloaded, stored);
         let detail = crate::api::request_detail::request_detail(&fixture.state, refs).await;
-        assert_eq!(detail.view.supplier_error, projected);
+        assert_eq!(detail.view.supplier_error.as_ref(), projected);
         assert_eq!(detail.response_body, original);
         assert!(detail.archive.response.complete);
         let pool = sqlx::AnyPool::connect(&fixture.database_url).await.unwrap();
@@ -369,28 +362,11 @@ async fn compatible_http_402_preserves_unclassified_details_without_inventing_pl
         )
         .await;
         assert_eq!(response.status(), StatusCode::PAYMENT_REQUIRED);
+        assert_eq!(response.headers()[header::CONTENT_TYPE], content_type);
         let bytes = to_bytes(response.into_body(), MAX_PROXY_RESPONSE_BODY)
             .await
             .unwrap();
-        let delivered: Value = serde_json::from_slice(&bytes).unwrap();
-        if body.is_empty() {
-            assert_eq!(bytes, upstream_error::fallback_body());
-        } else {
-            assert!(
-                delivered["error"]["message"]
-                    .as_str()
-                    .is_some_and(|message| !message.is_empty())
-            );
-            assert!(delivered["error"].get("mtc_safe_reason").is_none());
-            if label == "huge" {
-                assert!(
-                    delivered["error"]["message"]
-                        .as_str()
-                        .unwrap()
-                        .contains("truncated at 16384 bytes")
-                );
-            }
-        }
+        assert_eq!(bytes.as_ref(), body.as_slice(), "{label}");
         cancellation::assert_single_unknown_receipt(&fixture, 402, Some("http_402")).await;
         let records = fixture
             .state
@@ -407,7 +383,13 @@ async fn compatible_http_402_preserves_unclassified_details_without_inventing_pl
             .request_archive_refs(fixture.key_id, records[0].request_id)
             .await
             .unwrap();
-        assert!(refs.view.supplier_error.is_none());
+        assert!(
+            refs.view
+                .supplier_error
+                .as_ref()
+                .is_none_or(|summary| summary.category == "upstream"),
+            "{label} must not invent a classified failure"
+        );
         assert_eq!(
             restored_rejection(&fixture, records[0].request_id)
                 .await
@@ -419,7 +401,7 @@ async fn compatible_http_402_preserves_unclassified_details_without_inventing_pl
 }
 
 #[tokio::test]
-async fn compatible_http_stalled_json_rejects_before_supplier_body_or_release() {
+async fn compatible_http_rejection_keeps_status_when_the_supplier_body_is_truncated() {
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -459,12 +441,19 @@ async fn compatible_http_stalled_json_rejects_before_supplier_body_or_release() 
     .await
     .expect("a stalled error body must not wait for the transport timeout or supplier release");
     assert_eq!(response.status(), StatusCode::PAYMENT_REQUIRED);
-    let bytes = to_bytes(response.into_body(), MAX_PROXY_RESPONSE_BODY)
-        .await
-        .unwrap();
-    assert!(String::from_utf8_lossy(&bytes).contains("timed out reading upstream error body"));
+    let body = response.into_body();
     release.send(()).unwrap();
     server.await.unwrap();
+    let result = tokio::time::timeout(
+        Duration::from_secs(8),
+        to_bytes(body, MAX_PROXY_RESPONSE_BODY),
+    )
+    .await
+    .expect("a truncated upstream error body must terminate");
+    assert!(
+        result.is_err(),
+        "a premature EOF must not become a complete response"
+    );
     cancellation::assert_single_unknown_receipt(&fixture, 402, Some("http_402")).await;
     let records = fixture
         .state
@@ -482,7 +471,12 @@ async fn compatible_http_stalled_json_rejects_before_supplier_body_or_release() 
         .request_archive_refs(fixture.key_id, records[0].request_id)
         .await
         .unwrap();
-    assert!(refs.view.supplier_error.is_none());
+    assert!(
+        refs.view
+            .supplier_error
+            .as_ref()
+            .is_none_or(|summary| summary.category == "upstream")
+    );
     let key = fixture
         .state
         .db

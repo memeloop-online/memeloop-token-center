@@ -2,27 +2,30 @@
 //! All network operations share the account's explicit outbound proxy policy.
 use std::collections::BTreeMap;
 
-use base64::{Engine as _, engine::general_purpose::STANDARD};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use uuid::Uuid;
 
 use crate::{error::AppError, network, provider::UpstreamCredential};
 
-pub const DRIVER: &str = "google-antigravity";
-pub const BASE_URL: &str = "https://daily-cloudcode-pa.googleapis.com";
-pub const CONTROL_URL: &str = "https://cloudcode-pa.googleapis.com";
+pub(crate) const DRIVER: &str = "google-antigravity";
+const BASE_URL: &str = "https://daily-cloudcode-pa.googleapis.com";
+const CONTROL_URL: &str = "https://cloudcode-pa.googleapis.com";
 
-const IMAGE_LIMIT: usize = 32 * 1024 * 1024;
+pub(crate) const GENERATE_CONTENT_PATH: &str = "/v1internal:generateContent";
+
+pub(crate) fn supports_image_mime(mime: &str) -> bool {
+    matches!(mime, "image/png" | "image/jpeg" | "image/webp")
+}
 
 #[derive(Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
-pub struct Config {
+pub(crate) struct Config {
     pub base_url: String,
     pub control_url: String,
     pub project_id: String,
     #[serde(default)]
-    pub request_headers: BTreeMap<String, String>,
+    pub(crate) request_headers: BTreeMap<String, String>,
 }
 
 impl Default for Config {
@@ -37,11 +40,19 @@ impl Default for Config {
 }
 
 impl Config {
-    pub fn apply_headers(
+    pub(crate) fn apply_headers(
         &self,
         request: reqwest::RequestBuilder,
     ) -> Result<reqwest::RequestBuilder, AppError> {
         Ok(request.headers(self.validated_headers()?))
+    }
+
+    pub(crate) fn authorize_request(
+        &self,
+        credential: &UpstreamCredential,
+        request: reqwest::RequestBuilder,
+    ) -> Result<reqwest::RequestBuilder, AppError> {
+        self.apply_headers(credential.apply(request, crate::db::unix_millis())?)
     }
 
     fn validated_headers(&self) -> Result<reqwest::header::HeaderMap, AppError> {
@@ -73,7 +84,7 @@ impl Config {
         Ok(headers)
     }
 
-    pub fn validate(&self) -> Result<(), AppError> {
+    fn validate(&self) -> Result<(), AppError> {
         for endpoint in [&self.base_url, &self.control_url] {
             let url = url::Url::parse(endpoint)
                 .map_err(|_| AppError::BadRequest("invalid Antigravity API URL".into()))?;
@@ -93,7 +104,7 @@ impl Config {
         let _ = self.validated_headers()?;
         Ok(())
     }
-    pub fn from_account(value: &Value) -> Result<Self, AppError> {
+    pub(crate) fn from_account(value: &Value) -> Result<Self, AppError> {
         let mut config = Self::default();
         if let Some(base) = value.get("base_url").and_then(Value::as_str) {
             config.base_url = base.to_owned();
@@ -113,20 +124,9 @@ impl Config {
     }
 }
 
-/// Catalog names are labels, never a promise of entitlement or availability.
-/// Only exact IDs reported by the account's live catalog may be routed.
-pub fn model_display_name(id: &str) -> &str {
-    match id {
-        "gemini-2.5-flash-image" => "Nano Banana",
-        "gemini-3-pro-image" | "gemini-3-pro-image-preview" => "Nano Banana Pro",
-        "gemini-3.1-flash-image" | "gemini-3.1-flash-image-preview" => "Nano Banana 2",
-        _ => id,
-    }
-}
-
 /// Tenant-scoped writers may rename a managed account, not rebind its OAuth
 /// credential or inherit operator-only headers into a new destination.
-pub fn authorize_config_update(
+pub(crate) fn authorize_config_update(
     current: &Value,
     incoming: &Value,
     global_operator: bool,
@@ -158,7 +158,7 @@ pub fn authorize_config_update(
     Ok(())
 }
 
-pub struct NativeClient<'a> {
+pub(crate) struct NativeClient<'a> {
     pub http: &'a dyn crate::http_settings::HttpClientSource,
     pub credential: &'a UpstreamCredential,
     pub config: &'a Config,
@@ -177,10 +177,9 @@ impl NativeClient<'_> {
         )
         .await?;
         let request = http.post(endpoint).json(body);
-        let request = self.credential.apply(request, crate::db::unix_millis())?;
         let response = self
             .config
-            .apply_headers(request)?
+            .authorize_request(self.credential, request)?
             .send()
             .await
             .map_err(|_| AppError::upstream("antigravity_request_failed"))?;
@@ -201,7 +200,7 @@ impl NativeClient<'_> {
 
     /// Read the existing project only. Never enroll, accept terms, reset quota,
     /// synthesize a project ID or cross-fallback between consumer/enterprise tiers.
-    pub async fn discover_project(&self) -> Result<String, AppError> {
+    pub(crate) async fn discover_project(&self) -> Result<String, AppError> {
         let response = self
             .post(
                 &self.config.control_url,
@@ -226,7 +225,7 @@ impl NativeClient<'_> {
             })
     }
 
-    pub async fn list_models(&self) -> Result<Vec<String>, AppError> {
+    pub(crate) async fn list_models(&self) -> Result<Vec<String>, AppError> {
         self.validate_project()?;
         let response = self
             .post(
@@ -252,25 +251,6 @@ impl NativeClient<'_> {
             .collect())
     }
 
-    /// Exactly one paid operation; callers must establish their durable spend
-    /// fence before invoking this method and must not replay an ambiguous result.
-    pub async fn generate_image(
-        &self,
-        model: &str,
-        request: Value,
-    ) -> Result<ImageResponse, AppError> {
-        self.validate_project()?;
-        let payload = image_request(model, &self.config.project_id, request)?;
-        let response = self
-            .post(
-                &self.config.base_url,
-                "/v1internal:generateContent",
-                &payload,
-            )
-            .await?;
-        decode_images(&response)
-    }
-
     fn validate_project(&self) -> Result<(), AppError> {
         if self.config.project_id.trim().is_empty() || self.config.project_id.len() > 256 {
             return Err(AppError::BadRequest(
@@ -281,7 +261,7 @@ impl NativeClient<'_> {
     }
 }
 
-pub fn openai_image_request(
+pub(crate) fn openai_image_request(
     model: &str,
     project: &str,
     request: &Value,
@@ -321,7 +301,7 @@ pub fn openai_image_request(
             "Antigravity image generation requires n=1".into(),
         ));
     }
-    let mut generation_config = json!({});
+    let mut generation_config = json!({"responseModalities": ["TEXT", "IMAGE"]});
     if let Some(size) = request.get("size") {
         let size = size.as_str().ok_or_else(|| {
             AppError::BadRequest("Antigravity image size must be a string".into())
@@ -341,133 +321,22 @@ pub fn openai_image_request(
             generation_config["imageConfig"] = json!({"aspectRatio": ratio});
         }
     }
-    image_request(
-        model,
-        project,
-        json!({"contents": [{"role": "user", "parts": [{"text": prompt}]}], "generationConfig": generation_config}),
-    )
-}
-
-pub fn image_request(model: &str, project: &str, mut request: Value) -> Result<Value, AppError> {
     if !model.contains("image") || model.len() > 200 || project.trim().is_empty() {
         return Err(AppError::BadRequest(
             "an Antigravity image model and project are required".into(),
         ));
     }
-    let object = request
-        .as_object_mut()
-        .ok_or_else(|| AppError::BadRequest("Gemini image request must be an object".into()))?;
-    if object
-        .get("contents")
-        .and_then(Value::as_array)
-        .is_none_or(|contents| contents.is_empty())
-    {
-        return Err(AppError::BadRequest(
-            "Gemini image contents are required".into(),
-        ));
-    }
-    // Do not delete or weaken caller safety settings. Reject caller attempts
-    // to smuggle routing/credential authority inside the native request.
-    if object.keys().any(|key| {
-        !matches!(
-            key.as_str(),
-            "contents" | "generationConfig" | "safetySettings" | "systemInstruction"
-        )
-    }) {
-        return Err(AppError::BadRequest(
-            "unsupported Gemini image request field".into(),
-        ));
-    }
-    let config = object
-        .entry("generationConfig")
-        .or_insert_with(|| json!({}));
-    let config = config
-        .as_object_mut()
-        .ok_or_else(|| AppError::BadRequest("generationConfig must be an object".into()))?;
-    config.insert("responseModalities".into(), json!(["TEXT", "IMAGE"]));
     Ok(json!({
         "model": model,
         "project": project,
         "userAgent": "antigravity",
         "requestType": "image_gen",
         "requestId": format!("image_gen/{}/{}/12", crate::db::unix_millis(), Uuid::now_v7()),
-        "request": request,
+        "request": {
+            "contents": [{"role": "user", "parts": [{"text": prompt}]}],
+            "generationConfig": generation_config,
+        },
     }))
-}
-
-pub struct GeneratedImage {
-    pub mime_type: String,
-    pub bytes: Vec<u8>,
-}
-
-pub struct ImageResponse {
-    pub images: Vec<GeneratedImage>,
-    pub text: Vec<String>,
-    pub usage: Value,
-}
-
-pub fn decode_images(envelope: &Value) -> Result<ImageResponse, AppError> {
-    let response = envelope.get("response").unwrap_or(envelope);
-    let candidates = response
-        .get("candidates")
-        .and_then(Value::as_array)
-        .ok_or_else(|| AppError::upstream("antigravity_image_response_has_no_candidates"))?;
-    let mut result = ImageResponse {
-        images: vec![],
-        text: vec![],
-        usage: response
-            .get("usageMetadata")
-            .cloned()
-            .unwrap_or(Value::Null),
-    };
-    let mut total = 0usize;
-    for candidate in candidates {
-        if let Some(parts) = candidate
-            .pointer("/content/parts")
-            .and_then(Value::as_array)
-        {
-            for part in parts {
-                if let Some(text) = part.get("text").and_then(Value::as_str) {
-                    result.text.push(text.to_owned());
-                }
-                let Some(inline) = part.get("inlineData").or_else(|| part.get("inline_data"))
-                else {
-                    continue;
-                };
-                let mime = inline
-                    .get("mimeType")
-                    .or_else(|| inline.get("mime_type"))
-                    .and_then(Value::as_str)
-                    .filter(|mime| matches!(*mime, "image/png" | "image/jpeg" | "image/webp"))
-                    .ok_or_else(|| {
-                        AppError::upstream("antigravity_image_mime_type_is_unsupported")
-                    })?;
-                let data = inline
-                    .get("data")
-                    .and_then(Value::as_str)
-                    .filter(|data| data.len() <= IMAGE_LIMIT)
-                    .ok_or_else(|| AppError::upstream("antigravity_image_data_is_invalid"))?;
-                let bytes = STANDARD
-                    .decode(data)
-                    .map_err(|_| AppError::upstream("antigravity_image_encoding_is_invalid"))?;
-                total = total.saturating_add(bytes.len());
-                if bytes.is_empty() || total > IMAGE_LIMIT || result.images.len() >= 16 {
-                    return Err(AppError::upstream_with(
-                        "upstream_unavailable",
-                        crate::error::ErrorFacts::new().stage("antigravity_decode_images"),
-                    ));
-                }
-                result.images.push(GeneratedImage {
-                    mime_type: mime.into(),
-                    bytes,
-                });
-            }
-        }
-    }
-    if result.images.is_empty() {
-        return Err(AppError::upstream("antigravity_returned_no_image"));
-    }
-    Ok(result)
 }
 
 #[cfg(test)]
@@ -579,27 +448,8 @@ mod tests {
         }
     }
 
-    #[test]
-    fn image_wire_envelope_preserves_safety_and_rejects_routing_override() {
-        let request = image_request("gemini-3-pro-image", "project-fixture", json!({"contents": [{"parts": [{"text": "a tree"}]}], "safetySettings": [{"category": "example"}]})).unwrap();
-        assert_eq!(request["requestType"], "image_gen");
-        assert_eq!(
-            request["request"]["generationConfig"]["responseModalities"],
-            json!(["TEXT", "IMAGE"])
-        );
-        assert!(request["request"].get("safetySettings").is_some());
-        assert!(
-            image_request(
-                "gemini-3-pro-image",
-                "project-fixture",
-                json!({"contents": [{}], "project": "other"})
-            )
-            .is_err()
-        );
-    }
-
     #[tokio::test]
-    async fn native_catalog_and_image_use_google_wire_protocol() {
+    async fn native_catalog_uses_google_wire_protocol() {
         let server = MockServer::start().await;
         Mock::given(method("POST"))
             .and(path("/v1internal:fetchAvailableModels"))
@@ -611,9 +461,6 @@ mod tests {
             .expect(1)
             .mount(&server)
             .await;
-        Mock::given(method("POST")).and(path("/v1internal:generateContent"))
-            .respond_with(ResponseTemplate::new(200).set_body_json(json!({"response": {"candidates": [{"content": {"parts": [{"inlineData": {"mimeType": "image/png", "data": "aW1hZ2U="}}]}}], "usageMetadata": {"totalTokenCount": 7}}})))
-            .expect(1).mount(&server).await;
         let http = reqwest::Client::builder().no_proxy().build().unwrap();
         let credential = UpstreamCredential::OAuth {
             access_token: "fixture-access".into(),
@@ -641,14 +488,6 @@ mod tests {
             client.list_models().await.unwrap(),
             vec!["gemini-3-pro-image"]
         );
-        let response = client
-            .generate_image(
-                "gemini-3-pro-image",
-                json!({"contents": [{"parts": [{"text": "a tree"}]}]}),
-            )
-            .await
-            .unwrap();
-        assert_eq!(response.images[0].bytes, b"image");
     }
 
     #[tokio::test]

@@ -1,11 +1,9 @@
 import assert from 'node:assert/strict';
-import { existsSync } from 'node:fs';
-import { readdir } from 'node:fs/promises';
-import { join } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import test from 'node:test';
 
 import { chromium } from 'playwright';
+import { localChromiumExecutable } from './support/browser-executable.js';
 import { createServer } from 'vite';
 
 const webRoot = fileURLToPath(new URL('..', import.meta.url));
@@ -25,24 +23,11 @@ const exactValuesByLabel: Record<string, string> = {
   'Average TPS': '0.208333 TPS',
 };
 
-async function localChromiumExecutable() {
-  const defaultExecutable = chromium.executablePath();
-  if (existsSync(defaultExecutable)) return defaultExecutable;
-  const workspaceUserCache = fileURLToPath(new URL('../../../../.cache/ms-playwright', import.meta.url));
-  const installations = await readdir(workspaceUserCache, { withFileTypes: true }).catch(() => []);
-  for (const installation of installations) {
-    if (!installation.isDirectory() || !installation.name.startsWith('chromium-')) continue;
-    const executable = join(workspaceUserCache, installation.name, 'chrome-linux64', 'chrome');
-    if (existsSync(executable)) return executable;
-  }
-  return undefined;
-}
-
-test('UsageAnalysis renders the omitted TPS card as a dash with a note, never a fabricated number', { timeout: 30_000 }, async () => {
+test('UsageAnalysis renders the omitted TPS card as a dash with a note, never a fabricated number', { timeout: 30_000 }, async (context) => {
   const executablePath = await localChromiumExecutable();
   if (!executablePath) {
     if (process.env.MTC_REQUIRE_BROWSER === '1') throw new Error('Chromium is required for the usage numeric metric CI gate');
-    return test.skip('a local Chromium runtime is required for UsageAnalysis layout assertions');
+    return context.skip('a local Chromium runtime is required for UsageAnalysis layout assertions');
   }
   const server = await createServer({ root: webRoot, configFile: false, logLevel: 'silent', server: { host: '127.0.0.1', port: 0, strictPort: false } });
   await server.listen();
@@ -92,11 +77,11 @@ test('UsageAnalysis renders the omitted TPS card as a dash with a note, never a 
   }
 });
 
-test('UsageAnalysis keeps every rendered NumericMetric exact value on one readable line', { timeout: 30_000 }, async () => {
+test('UsageAnalysis keeps every rendered NumericMetric exact value on one readable line', { timeout: 30_000 }, async (context) => {
   const executablePath = await localChromiumExecutable();
   if (!executablePath) {
     if (process.env.MTC_REQUIRE_BROWSER === '1') throw new Error('Chromium is required for the usage numeric metric CI gate');
-    return test.skip('a local Chromium runtime is required for UsageAnalysis layout assertions');
+    return context.skip('a local Chromium runtime is required for UsageAnalysis layout assertions');
   }
   const server = await createServer({ root: webRoot, configFile: false, logLevel: 'silent', server: { host: '127.0.0.1', port: 0, strictPort: false } });
   await server.listen();

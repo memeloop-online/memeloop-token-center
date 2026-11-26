@@ -1,8 +1,8 @@
 import assert from 'node:assert/strict';
-import { existsSync } from 'node:fs';
 import { fileURLToPath } from 'node:url';
 import test from 'node:test';
 import { chromium, type Route } from 'playwright';
+import { hasDefaultChromium } from './support/browser-executable.js';
 import { createServer } from 'vite';
 
 const key = (alias: string, generation: number) => ({
@@ -16,11 +16,8 @@ const request = (request_id: string, created_at: number, model = request_id) => 
 });
 const firstPage = Array.from({ length: 50 }, (_, index) => request(`second-${String(index).padStart(2, '0')}`, 1_000 - index));
 
-test('self request polling is accessible, identity-safe, visibility-aware, and history-stable', { timeout: 45_000 }, async () => {
-  if (!existsSync(chromium.executablePath())) {
-    if (process.env.MTC_REQUIRE_BROWSER === '1') throw new Error('Chromium required');
-    return test.skip('Chromium required');
-  }
+test('self request polling is accessible, identity-safe, visibility-aware, and history-stable', { timeout: 45_000 }, async (context) => {
+  if (!hasDefaultChromium(context)) return;
   const server = await createServer({ root: fileURLToPath(new URL('..', import.meta.url)), configFile: false, logLevel: 'silent', server: { host: '127.0.0.1', port: 0 } });
   await server.listen();
   const address = server.httpServer?.address(); assert.ok(address && typeof address !== 'string');
@@ -119,11 +116,8 @@ test('self request polling is accessible, identity-safe, visibility-aware, and h
   } finally { await browser.close(); await server.close(); }
 });
 
-test('Portal and Operator refresh preferences stay isolated in both directions', { timeout: 20_000 }, async () => {
-  if (!existsSync(chromium.executablePath())) {
-    if (process.env.MTC_REQUIRE_BROWSER === '1') throw new Error('Chromium required');
-    return test.skip('Chromium required');
-  }
+test('Portal and Operator refresh preferences stay isolated in both directions', { timeout: 20_000 }, async (context) => {
+  if (!hasDefaultChromium(context)) return;
   const server = await createServer({ root: fileURLToPath(new URL('..', import.meta.url)), configFile: false, logLevel: 'silent', server: { host: '127.0.0.1', port: 0 } });
   await server.listen();
   const address = server.httpServer?.address(); assert.ok(address && typeof address !== 'string');

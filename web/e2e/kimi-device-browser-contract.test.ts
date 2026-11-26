@@ -1,4 +1,5 @@
 import assert from 'node:assert/strict';
+import { credentialProxySelection } from './fixtures/transport-proxy-entities.js';
 import { editProviderAccount, manageProviderAccount } from './support/provider-account-navigation.js';
 import { mkdir, writeFile } from 'node:fs/promises';
 import { fileURLToPath } from 'node:url';
@@ -85,7 +86,7 @@ test('Kimi display-name editing saves metadata alone and keeps unknown identity 
           assert.ok(isUpstreamModelCatalog(snapshot), 'the fixture uses the actual catalog response contract');
           return route.fulfill({ json: snapshot });
         }
-        if (url.pathname.endsWith('/transport-proxy')) return route.fulfill({ json: { account_id: account.id, proxy_url: 'socks5h://10.0.0.15:1080', supported: true, updated_at: account.updated_at, credential_generation: account.credential_generation } });
+        if (url.pathname === `/internal/v1/upstreams/${account.id}/transport-proxy`) return route.fulfill({ json: { account_id: account.id, proxy_url: 'socks5h://10.0.0.15:1080', supported: true, updated_at: account.updated_at, credential_generation: account.credential_generation, selection: credentialProxySelection(account) } });
         return route.fulfill({ json: [] });
       });
       await page.goto(`${origin}/e2e/fixtures/authorization-code.html?full-page&scope-controls&app-shell`);

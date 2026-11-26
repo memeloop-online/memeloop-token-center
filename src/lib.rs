@@ -54,6 +54,9 @@ mod plugin_runtime_companions;
 pub mod pricing;
 pub mod provider;
 mod proxy_lifecycle;
+#[cfg(test)]
+#[path = "../tests/support/recovery_object_proxy.rs"]
+mod recovery_object_proxy;
 mod request_event_stream;
 pub mod request_history;
 pub mod request_history_api;

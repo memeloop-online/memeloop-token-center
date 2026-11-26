@@ -1,9 +1,9 @@
 # Conversation object contract v1
 
-This topic wires conversation body writers and readers to the existing
-`ArchiveStore`. It is not safe to deploy over unmigrated rows: readers reject
-legacy plaintext instead of silently falling back. External migration,
-verification, cutover and source retirement are deployment gates.
+New conversation data uses the canonical session projection. The historical
+v1 prefix format below remains readable for sessions without a canonical leaf.
+The application no longer appends legacy prefix events or publishes legacy
+request roots.
 
 The long-lived archive retains exact raw JSON/SSE alongside conversation and
 media objects. Raw request cache eviction is separate; it must never target
@@ -29,28 +29,24 @@ object is an error, not an empty conversation or a database fallback.
 
 A `ConversationManifest` v1 is an immutable object containing tenant, session,
 branch, parent-branch/event identity, a prefix head, optional raw captures and
-explicit gaps. Store only its reference, ownership, revision and retention
-control metadata in CNPG. Do not put the manifest JSON or any event JSON there.
-Publishing a new revision requires the control-plane root's compare-and-swap;
-writing the immutable manifest alone does not publish it or confer access.
+explicit gaps. The historical request root names an immutable manifest by its
+CAS reference. Storing a manifest did not itself confer access.
 Authorization must establish tenant and stable-key/session ownership before
 passing a manifest reference to these storage methods.
 
 A prefix reference contains an immutable node reference and an exact event
 count. Each node contains version, parent prefix and event object reference.
-Extending a branch adds one event and one prefix node; identical extensions
-reuse their CAS objects. A fork reuses its complete ancestral prefix.
+Historically, a branch extension added one event and one prefix node, and
+a fork reused its ancestral prefix.
 There is no 1,024-event truncation, timestamp sorting or branch flattening.
 Every edge must decrease the count by exactly one and terminate at zero.
-Repeated event IDs and causal parents outside the preceding branch ancestry
-are rejected. Subagent branches preserve their explicit agent relationships;
-they are not concatenated into the main agent's dialogue.
-Parent-branch/event declarations must be paired and match an ancestral event;
-the final event must belong to the manifest branch.
+The v1 format records explicit agent relationships and paired parent-branch
+and parent-event declarations. The legacy reader verifies the branch on the
+head event and checks the prefix count at every step.
 
 ## Fidelity and media
 
-`ConversationEvent.document` is a `RawValue`: original JSON for that event,
+The legacy event’s `document` field contains its original JSON,
 including provider IDs, tool call IDs, arguments, opaque reasoning and unknown
 fields. Serialization preserves even whitespace, number spelling and fields
 that the old normalized UI projection strips. Origin, role, kind, event ID,
@@ -76,27 +72,15 @@ requires a reversible, documented replacement at the pointer; this first
 storage delta does not rewrite inline JSON. If bytes cannot be captured,
 record a gap and retain the source; do not assert a complete training export.
 
-`export_conversation` returns the manifest and every original event in prefix
-order with media references. It verifies raw captures still named by that
-manifest, media bytes and the entire prefix, and rejects empty exports and any
-declared gap.
-It is the lossless export substrate, not a provider-specific role projection
-or self-contained media tarball. An external exporter must package referenced
-binaries and digests. Role filtering, opaque-field removal, redaction and
-training-schema conversion produce separately versioned derived artifacts;
-they never replace the sole retained original.
-
-The HTTP training export streams NDJSON: a manifest record, event references
+For a session without a canonical leaf, HTTP training export resolves the
+historical request root and streams NDJSON: a manifest record, event references
 in descending ordinal order, then a verified end record. Consumers require
 that end record and EOF, restore ascending ordinal order per branch, and fetch
-the immutable event/media objects. Missing or corrupt objects terminate the
-stream without a success trailer. No total event or aggregate-byte limit is
-applied to this endpoint. Event verification skips opaque document strings
-through a bounded chunk reader instead of collecting whole conversations.
-Manifest publication similarly walks events without collecting their bodies.
-Application hot reads retain the existing bounded memory
-cache and otherwise read objects directly. The format does not add a DB body
-read, a new cache, a new storage backend or a DB archive wait on the frontend.
+the immutable event/media objects. The reader verifies the prefix, event,
+media and raw capture references and rejects empty exports or declared gaps.
+Missing or corrupt objects terminate the stream without a success trailer.
+No total event or aggregate-byte limit applies. The reader skips opaque event
+documents in bounded chunks without collecting whole conversations.
 
 ## Migration tool ABI and ownership
 
@@ -139,7 +123,8 @@ After the baseline, close the incremental watermark with a source-writer
 fence and drain. Verify every retained root, exact source/target logical
 counts, object hashes/sizes and real multi-branch agent/tool/media replay.
 Only then publish new roots and switch all readers/writers together.
-No indefinite dual write or read fallback is part of this contract.
+New writes use the canonical projection. The legacy read fallback covers
+existing v1 roots for sessions without a canonical leaf.
 
 Retirement includes old blobs, duplicate ciphertext spools, snapshot readers,
 `session-body-rebuild`, replay compatibility and old worker production paths.

@@ -40,27 +40,93 @@ pub(in crate::api) async fn classify_bad_request(
     response: UpstreamResponse,
     request_id: Uuid,
 ) -> BadRequestDisposition {
-    classify_bad_request_with_details(response, request_id)
+    inspect_bad_request_response(response, request_id, |_| {})
         .await
         .0
 }
 
-pub(in crate::api) async fn classify_bad_request_with_details(
+pub(in crate::api) async fn inspect_bad_request_response(
     response: UpstreamResponse,
     request_id: Uuid,
-) -> (BadRequestDisposition, Option<bytes::Bytes>) {
-    if response.status() == http::StatusCode::BAD_REQUEST
-        && !has_single_json_content_type(&response)
+    capture_on_cancel: impl FnOnce(UpstreamResponse) + Send,
+) -> (BadRequestDisposition, UpstreamResponse) {
+    use BadRequestUnclassifiableReason::*;
+
+    if response.status() != http::StatusCode::BAD_REQUEST
+        || !has_single_json_content_type(&response)
     {
         non_json::observe(&response, request_id);
-        let rejection = crate::api::proxy::upstream_error::read_rejection(response).await;
-        return (
-            BadRequestDisposition::Unclassifiable(BadRequestUnclassifiableReason::ContentType),
-            Some(rejection.body),
-        );
+        return (BadRequestDisposition::Unclassifiable(ContentType), response);
     }
-    let mut details = None;
-    let disposition = inspect_bad_request(response, request_id, &mut details).await;
+    if response
+        .content_length()
+        .is_some_and(|length| length > MAX_RETRYABLE_ERROR_BYTES as u64)
+    {
+        let disposition = BadRequestDisposition::Unclassifiable(TooLarge);
+        observe_classification(request_id, disposition);
+        return (disposition, response);
+    }
+
+    let mut parts = response.into_parts();
+    parts.stream = Box::pin(parts.stream.fuse());
+    let mut preview = BadRequestPreview {
+        body: Some((parts, Vec::new())),
+        capture_on_cancel: Some(capture_on_cancel),
+    };
+    let (parts, prefix) = preview.body.as_mut().expect("preview owns the response");
+    let disposition = match tokio::time::timeout(
+        MAX_RETRYABLE_ERROR_WAIT,
+        read_bounded_body(&mut parts.stream, prefix, parts.content_length),
+    )
+    .await
+    {
+        Ok(Ok(value)) if codex_transient_error(&value) => BadRequestDisposition::DefiniteTransient,
+        Ok(Ok(value)) => {
+            observe_ordinary_bad_request(request_id, &value);
+            crate::supplier_error::reason_from_value(&value).map_or(
+                BadRequestDisposition::DefiniteOrdinary,
+                BadRequestDisposition::DefiniteRejection,
+            )
+        }
+        Ok(Err(reason)) => BadRequestDisposition::Unclassifiable(reason),
+        Err(_) => BadRequestDisposition::Unclassifiable(TimedOut),
+    };
+    observe_classification(request_id, disposition);
+    (disposition, preview.take_response())
+}
+
+struct BadRequestPreview<F: FnOnce(UpstreamResponse)> {
+    body: Option<(
+        super::super::upstream_response::UpstreamResponseParts,
+        Vec<Result<bytes::Bytes, &'static str>>,
+    )>,
+    capture_on_cancel: Option<F>,
+}
+
+impl<F: FnOnce(UpstreamResponse)> BadRequestPreview<F> {
+    fn take_response(&mut self) -> UpstreamResponse {
+        let (parts, prefix) = self.body.take().expect("preview owns the response");
+        UpstreamResponse::Prefetched {
+            status: parts.status,
+            headers: parts.headers,
+            version: parts.version,
+            content_length: parts.content_length,
+            stream: Box::pin(futures_util::stream::iter(prefix).chain(parts.stream)),
+        }
+    }
+}
+
+impl<F: FnOnce(UpstreamResponse)> Drop for BadRequestPreview<F> {
+    fn drop(&mut self) {
+        if self.body.is_some()
+            && let Some(capture) = self.capture_on_cancel.take()
+        {
+            capture(self.take_response());
+        }
+    }
+}
+
+fn observe_classification(request_id: Uuid, disposition: BadRequestDisposition) {
     // Ordinary JSON errors already emit their bounded diagnostic below. All
     // other exits must also be attributable to the request, without recording
     // untrusted headers, error bodies, or transport error strings.
@@ -73,7 +139,6 @@ pub(in crate::api) async fn classify_bad_request_with_details(
             "Codex upstream rejected the request"
         );
     }
-    (disposition, details)
 }
 
 fn classification_diagnostic(
@@ -95,51 +160,6 @@ fn classification_diagnostic(
             },
         ),
     })
-}
-
-async fn inspect_bad_request(
-    response: UpstreamResponse,
-    request_id: Uuid,
-    details: &mut Option<bytes::Bytes>,
-) -> BadRequestDisposition {
-    if response.status() != http::StatusCode::BAD_REQUEST {
-        return BadRequestDisposition::Unclassifiable(BadRequestUnclassifiableReason::ContentType);
-    }
-    if !has_single_json_content_type(&response) {
-        return BadRequestDisposition::Unclassifiable(BadRequestUnclassifiableReason::ContentType);
-    }
-    if response
-        .content_length()
-        .is_some_and(|length| length > MAX_RETRYABLE_ERROR_BYTES as u64)
-    {
-        return BadRequestDisposition::Unclassifiable(BadRequestUnclassifiableReason::TooLarge);
-    }
-
-    match tokio::time::timeout(MAX_RETRYABLE_ERROR_WAIT, read_bounded_body(response)).await {
-        Ok(BoundedBadRequestBody::Value(value)) if codex_transient_error(&value) => {
-            BadRequestDisposition::DefiniteTransient
-        }
-        Ok(BoundedBadRequestBody::Value(value)) => {
-            observe_ordinary_bad_request(request_id, &value);
-            *details = Some(crate::api::proxy::upstream_error::safe_error_body(
-                value.to_string().as_bytes(),
-            ));
-            crate::supplier_error::reason_from_value(&value).map_or(
-                BadRequestDisposition::DefiniteOrdinary,
-                BadRequestDisposition::DefiniteRejection,
-            )
-        }
-        Ok(BoundedBadRequestBody::TooLarge) => {
-            BadRequestDisposition::Unclassifiable(BadRequestUnclassifiableReason::TooLarge)
-        }
-        Ok(BoundedBadRequestBody::ReadFailed) => {
-            BadRequestDisposition::Unclassifiable(BadRequestUnclassifiableReason::ReadFailed)
-        }
-        Ok(BoundedBadRequestBody::InvalidJson) => {
-            BadRequestDisposition::Unclassifiable(BadRequestUnclassifiableReason::InvalidJson)
-        }
-        Err(_) => BadRequestDisposition::Unclassifiable(BadRequestUnclassifiableReason::TimedOut),
-    }
 }
 
 #[derive(Debug, Eq, PartialEq)]
@@ -531,29 +551,40 @@ fn tool_rejection_reason(message: &str) -> Option<&'static str> {
     None
 }
 
-enum BoundedBadRequestBody {
-    Value(Value),
-    TooLarge,
-    ReadFailed,
-    InvalidJson,
-}
-
-async fn read_bounded_body(response: UpstreamResponse) -> BoundedBadRequestBody {
+async fn read_bounded_body(
+    stream: &mut super::super::upstream_response::UpstreamByteStream,
+    prefix: &mut Vec<Result<bytes::Bytes, &'static str>>,
+    content_length: Option<u64>,
+) -> Result<Value, BadRequestUnclassifiableReason> {
+    use BadRequestUnclassifiableReason::*;
     let mut body = Vec::new();
-    let mut stream = response.bytes_stream();
+    let mut polled = 0usize;
     while let Some(chunk) = stream.next().await {
-        let Ok(chunk) = chunk else {
-            return BoundedBadRequestBody::ReadFailed;
-        };
-        if chunk.len() > MAX_RETRYABLE_ERROR_BYTES.saturating_sub(body.len()) {
-            return BoundedBadRequestBody::TooLarge;
+        polled = polled.wrapping_add(1);
+        match chunk {
+            Ok(chunk) if chunk.len() <= MAX_RETRYABLE_ERROR_BYTES.saturating_sub(body.len()) => {
+                body.extend_from_slice(&chunk);
+                if !chunk.is_empty() {
+                    prefix.push(Ok(chunk));
+                }
+            }
+            Ok(chunk) => {
+                prefix.push(Ok(chunk));
+                return Err(TooLarge);
+            }
+            Err(error) => {
+                prefix.push(Err(error));
+                return Err(ReadFailed);
+            }
         }
-        body.extend_from_slice(&chunk);
+        if polled.is_multiple_of(64) {
+            tokio::task::yield_now().await;
+        }
     }
-    match serde_json::from_slice(&body) {
-        Ok(value) => BoundedBadRequestBody::Value(value),
-        Err(_) => BoundedBadRequestBody::InvalidJson,
+    if content_length.is_some_and(|length| length != body.len() as u64) {
+        return Err(ReadFailed);
     }
+    serde_json::from_slice(&body).map_err(|_| InvalidJson)
 }
 
 fn has_single_json_content_type(response: &UpstreamResponse) -> bool {
@@ -574,26 +605,7 @@ fn has_single_json_content_type(response: &UpstreamResponse) -> bool {
         })
 }
 
-#[cfg(test)]
 pub(super) fn codex_transient_error(value: &Value) -> bool {
-    let Some(error) = value.get("error").and_then(Value::as_object) else {
-        return false;
-    };
-    if error
-        .get("type")
-        .and_then(Value::as_str)
-        .is_some_and(is_explicit_transient_error_type)
-    {
-        return true;
-    }
-    error
-        .get("message")
-        .and_then(Value::as_str)
-        .is_some_and(is_known_high_demand_message)
-}
-
-#[cfg(not(test))]
-fn codex_transient_error(value: &Value) -> bool {
     let Some(error) = value.get("error").and_then(Value::as_object) else {
         return false;
     };
@@ -902,6 +914,84 @@ mod tests {
             assert_eq!(fields["upstream_diagnostic_read"], "not_attempted");
             assert_eq!(started.elapsed(), std::time::Duration::ZERO);
         }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn timed_out_preview_preserves_prefix_and_later_transport_error() {
+        use bytes::Bytes;
+        let mut headers = http::HeaderMap::new();
+        headers.insert(
+            header::CONTENT_TYPE,
+            http::HeaderValue::from_static("application/json"),
+        );
+        let prefix = Bytes::from_static(b"{\"error\":");
+        let (release, wait) = tokio::sync::oneshot::channel::<()>();
+        let response = UpstreamResponse::Prefetched {
+            status: http::StatusCode::BAD_REQUEST,
+            headers,
+            version: http::Version::HTTP_2,
+            content_length: None,
+            stream: Box::pin(futures_util::stream::iter([Ok(prefix.clone())]).chain(
+                futures_util::stream::once(async move {
+                    wait.await.unwrap();
+                    Err("upstream_stream_read_error")
+                }),
+            )),
+        };
+        let (disposition, response) = inspect_bad_request_response(response, Uuid::nil(), |_| {
+            panic!("a preview timeout returns ownership to the caller")
+        })
+        .await;
+        assert_eq!(
+            disposition,
+            BadRequestDisposition::Unclassifiable(BadRequestUnclassifiableReason::TimedOut)
+        );
+        release.send(()).unwrap();
+        let mut stream = response.bytes_stream();
+        assert_eq!(stream.next().await, Some(Ok(prefix)));
+        assert_eq!(stream.next().await, Some(Err("upstream_stream_read_error")));
+        assert!(stream.next().await.is_none());
+    }
+
+    #[tokio::test]
+    async fn cancelled_preview_transfers_the_prefix_and_unread_tail_to_its_owner() {
+        use bytes::Bytes;
+        let mut headers = http::HeaderMap::new();
+        headers.insert(
+            header::CONTENT_TYPE,
+            http::HeaderValue::from_static("application/json"),
+        );
+        let (release, wait) = tokio::sync::oneshot::channel::<()>();
+        let (capture, captured) = tokio::sync::oneshot::channel();
+        let prefix = Bytes::from_static(b"{\"error\":");
+        let tail = Bytes::from_static(b"\"original\"}");
+        let expected_tail = tail.clone();
+        let response = UpstreamResponse::Prefetched {
+            status: http::StatusCode::BAD_REQUEST,
+            headers,
+            version: http::Version::HTTP_2,
+            content_length: None,
+            stream: Box::pin(futures_util::stream::iter([Ok(prefix.clone())]).chain(
+                futures_util::stream::once(async move {
+                    wait.await.unwrap();
+                    Ok(tail)
+                }),
+            )),
+        };
+        let mut inspection = Box::pin(inspect_bad_request_response(
+            response,
+            Uuid::nil(),
+            |response| {
+                assert!(capture.send(response).is_ok());
+            },
+        ));
+        assert!(futures_util::poll!(&mut inspection).is_pending());
+        drop(inspection);
+        release.send(()).unwrap();
+        let mut stream = captured.await.unwrap().bytes_stream();
+        assert_eq!(stream.next().await, Some(Ok(prefix)));
+        assert_eq!(stream.next().await, Some(Ok(expected_tail)));
+        assert!(stream.next().await.is_none());
     }
 
     #[tokio::test(start_paused = true)]
