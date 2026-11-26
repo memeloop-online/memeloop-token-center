@@ -10,9 +10,11 @@ impl Database {
         if limit <= 0 {
             return Ok(0);
         }
-        let rows = sqlx::query("SELECT p.request_id,p.tenant_id,p.key_id,p.projected_at,p.semantic_snapshot_json,p.semantic_payload_snapshot_json,o.leaf_node_hash FROM conversation_projection_outbox p JOIN conversation_observations o ON o.request_id=p.request_id JOIN conversation_clusters c ON c.id=o.cluster_id AND c.tenant_id=p.tenant_id AND c.key_id=p.key_id WHERE p.projected_at IS NOT NULL AND p.projected_at<$1 AND p.statistics_outcome='session_body' AND p.lease_owner IS NULL AND p.lease_expires_at IS NULL AND p.terminal_lease_owner IS NULL AND p.terminal_lease_expires_at IS NULL AND o.leaf_node_hash IS NOT NULL ORDER BY p.projected_at,p.request_id LIMIT $2")
+        let rows = sqlx::query("SELECT p.request_id,p.tenant_id,p.key_id,p.projected_at,p.semantic_snapshot_json,p.semantic_payload_snapshot_json,o.leaf_node_hash FROM conversation_projection_outbox p JOIN conversation_observations o ON o.request_id=p.request_id JOIN conversation_clusters c ON c.id=o.cluster_id AND c.tenant_id=p.tenant_id AND c.key_id=p.key_id WHERE p.projected_at IS NOT NULL AND p.projected_at<$1 AND p.statistics_outcome='session_body' AND p.lease_owner IS NULL AND p.lease_expires_at IS NULL AND p.terminal_lease_owner IS NULL AND p.terminal_lease_expires_at IS NULL AND o.leaf_node_hash IS NOT NULL AND NOT EXISTS(SELECT 1 FROM request_archive_spools s WHERE s.request_id=p.request_id AND (s.state IN ('capturing','pending','uploading') OR s.lease_owner IS NOT NULL)) AND NOT EXISTS(SELECT 1 FROM response_archive_spools s WHERE s.request_id=p.request_id AND (s.state IN ('capturing','pending','uploading') OR s.lease_owner IS NOT NULL)) AND NOT EXISTS(SELECT 1 FROM archive_staging_attempts s WHERE s.owner_id=p.request_id AND s.state='writing') ORDER BY p.projected_at,p.request_id LIMIT $2")
             .bind(cutoff).bind(limit).fetch_all(&self.pool).await?;
-        let archive = self.body_archive()?;
+        let Ok(archive) = self.body_archive() else {
+            return Ok(0);
+        };
         let mut deleted = 0;
         // No SQL transaction or connection survives these object reads.
         for row in rows {
@@ -56,7 +58,7 @@ impl Database {
             }
             // Revalidate the exact completed generation and both lease families
             // after I/O. NULL alone never supplied the completion proof above.
-            deleted += sqlx::query("DELETE FROM conversation_projection_outbox WHERE request_id=$1 AND tenant_id=$2 AND key_id=$3 AND projected_at=$4 AND projected_at<$5 AND statistics_outcome='session_body' AND lease_owner IS NULL AND lease_expires_at IS NULL AND terminal_lease_owner IS NULL AND terminal_lease_expires_at IS NULL AND (semantic_snapshot_json=$6 OR (semantic_snapshot_json IS NULL AND $6 IS NULL)) AND (semantic_payload_snapshot_json=$7 OR (semantic_payload_snapshot_json IS NULL AND $7 IS NULL)) AND EXISTS(SELECT 1 FROM conversation_observations o JOIN conversation_clusters c ON c.id=o.cluster_id WHERE o.request_id=$1 AND o.leaf_node_hash=$8 AND c.tenant_id=$2 AND c.key_id=$3)")
+            deleted += sqlx::query("DELETE FROM conversation_projection_outbox WHERE request_id=$1 AND tenant_id=$2 AND key_id=$3 AND projected_at=$4 AND projected_at<$5 AND statistics_outcome='session_body' AND lease_owner IS NULL AND lease_expires_at IS NULL AND terminal_lease_owner IS NULL AND terminal_lease_expires_at IS NULL AND (semantic_snapshot_json=$6 OR (semantic_snapshot_json IS NULL AND $6 IS NULL)) AND (semantic_payload_snapshot_json=$7 OR (semantic_payload_snapshot_json IS NULL AND $7 IS NULL)) AND NOT EXISTS(SELECT 1 FROM request_archive_spools s WHERE s.request_id=$1 AND (s.state IN ('capturing','pending','uploading') OR s.lease_owner IS NOT NULL)) AND NOT EXISTS(SELECT 1 FROM response_archive_spools s WHERE s.request_id=$1 AND (s.state IN ('capturing','pending','uploading') OR s.lease_owner IS NOT NULL)) AND NOT EXISTS(SELECT 1 FROM archive_staging_attempts s WHERE s.owner_id=$1 AND s.state='writing') AND EXISTS(SELECT 1 FROM conversation_observations o JOIN conversation_clusters c ON c.id=o.cluster_id WHERE o.request_id=$1 AND o.leaf_node_hash=$8 AND c.tenant_id=$2 AND c.key_id=$3)")
                 .bind(&request).bind(&tenant).bind(&key).bind(projected).bind(cutoff)
                 .bind(snapshot).bind(payload).bind(&leaf).execute(&self.pool).await?.rows_affected();
         }
