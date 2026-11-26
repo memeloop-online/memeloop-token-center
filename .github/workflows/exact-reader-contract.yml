@@ -52,7 +52,7 @@ jobs:
           test "$(git rev-parse HEAD)" = 'd3de10b9279cb84711cb0c3987757cd550ffa00a'
           git rev-parse HEAD
           npm ci --ignore-scripts
-          node --test tests/ops/helm-packaging-contract.test.ts 2>&1 | tee /tmp/helm166.log
+          node --test --test-reporter=tap tests/ops/helm-packaging-contract.test.ts 2>&1 | tee /tmp/helm166.log
           grep -E '# pass [1-9][0-9]*' /tmp/helm166.log
           grep -F '# fail 0' /tmp/helm166.log
       - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
