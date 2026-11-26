@@ -153,7 +153,6 @@ pub(super) async fn send_proxy_route(
     route: &PreparedProxyRoute,
     candidate_rank: usize,
     outbound_attempt: usize,
-    h2_recovery_available: &mut bool,
 ) -> Result<ProxyRouteResponse, ProxySendError> {
     let outbound_base_url = codex_transport::outbound_base_url(&route.route.base_url);
     network::validate_codex_transport(
@@ -212,7 +211,6 @@ pub(super) async fn send_proxy_route(
                 transport_policy,
                 deadline,
             },
-            h2_recovery_available,
         )
         .await
         {
@@ -336,7 +334,6 @@ async fn send_codex_attempt(
     route: &PreparedProxyRoute,
     session_id: &str,
     context: CodexAttemptContext,
-    h2_recovery_available: &mut bool,
 ) -> Result<
     (
         UpstreamResponse,
@@ -418,7 +415,6 @@ async fn send_codex_attempt(
             selection.egress_snapshot(),
         ),
         context,
-        h2_recovery_available,
     )
     .await;
     phase.finish(
@@ -463,7 +459,6 @@ async fn send_codex_attempt_once(
         Option<crate::db::egress::SelectedEgress>,
     ),
     context: CodexAttemptContext,
-    h2_recovery_available: &mut bool,
 ) -> Result<
     (
         UpstreamResponse,
@@ -503,39 +498,37 @@ async fn send_codex_attempt_once(
     if state.plugins.codex_outbound_registered() {
         return Err(ProxySendError::CandidateUnavailable);
     }
-    loop {
-        let request = client.post(target_url).body(route.forwarded_body.clone());
-        let egress_path = if credential.proxy().is_some() {
-            CodexEgressPath::AccountProxy
-        } else {
-            CodexEgressPath::Direct
-        };
-        let credential_now = credential_application_now();
-        let request = codex_transport::apply_codex_wire_headers(
-            request,
-            headers,
-            &route.route.credential,
-            session_id,
-            credential_now,
-        )
-        .map_err(|_| credential_application_error(&route.route.credential, credential_now))?;
-        let (client, request) = request.build_split();
-        if let Ok(request) = &request {
-            send_diagnostics::observe(request, route, credential, &transport_identity, context);
-        }
-        let upstream_activity = state.metrics.active_upstream(&route.route.driver, "proxy");
-        let upstream_started = Instant::now();
-        let body_consumption = send_diagnostics::BodyConsumption::default();
-        let http2_evidence = send_diagnostics::Http2AttemptEvidence::capture(
-            &route.route,
-            transport_identity,
-            context,
-            matches!(egress_path, CodexEgressPath::AccountProxy),
-            body_consumption.clone(),
-        );
-        let mut egress = None;
-        let mut remote_reset = false;
-        let upstream_result = send_until_request_deadline(deadline.request, async {
+    let request = client.post(target_url).body(route.forwarded_body.clone());
+    let egress_path = if credential.proxy().is_some() {
+        CodexEgressPath::AccountProxy
+    } else {
+        CodexEgressPath::Direct
+    };
+    let credential_now = credential_application_now();
+    let request = codex_transport::apply_codex_wire_headers(
+        request,
+        headers,
+        &route.route.credential,
+        session_id,
+        credential_now,
+    )
+    .map_err(|_| credential_application_error(&route.route.credential, credential_now))?;
+    let (client, request) = request.build_split();
+    if let Ok(request) = &request {
+        send_diagnostics::observe(request, route, credential, &transport_identity, context);
+    }
+    let upstream_activity = state.metrics.active_upstream(&route.route.driver, "proxy");
+    let upstream_started = Instant::now();
+    let body_consumption = send_diagnostics::BodyConsumption::default();
+    let http2_evidence = send_diagnostics::Http2AttemptEvidence::capture(
+        &route.route,
+        transport_identity,
+        context,
+        matches!(egress_path, CodexEgressPath::AccountProxy),
+        body_consumption.clone(),
+    );
+    let mut egress = None;
+    let upstream_result = send_until_request_deadline(deadline.request, async {
         async {
             let mut request = request?;
             body_consumption.attach(&mut request);
@@ -555,8 +548,6 @@ async fn send_codex_attempt_once(
         }
         .await
         .map_err(|error| {
-            remote_reset = upstream_response::codex_http2_error(&error)
-                .is_some_and(|error| error.is_reset() && error.is_remote() && !error.is_library());
             http2_evidence.observe_error(&error, true);
             tracing::warn!(
                 %request_id,
@@ -591,49 +582,58 @@ async fn send_codex_attempt_once(
         })
     })
     .await;
-        record_codex_send_attempt_failure(&state.metrics, egress_path, &upstream_result);
-        state.metrics.observe_upstream(
-            &route.route.driver,
-            "proxy",
-            upstream_result.as_ref().ok().map(reqwest::Response::status),
-            upstream_started.elapsed(),
-        );
-        match upstream_result {
-            Ok(response) => {
-                let response = http2_evidence.observe_response(response);
-                let (response, egress_selection) = egress::observe_response(response, egress);
-                let response = match deadline.request {
-                    Some(request_deadline) => {
-                        response.with_body_timeouts(request_deadline, deadline.read_inactivity)
-                    }
-                    None => response,
-                };
-                return Ok((response, upstream_activity, egress_selection));
-            }
-            Err(_) if remote_reset && *h2_recovery_available => {
-                *h2_recovery_available = false;
-                tracing::warn!(
-                    %request_id,
-                    upstream_account_id = %route.route.account_id,
-                    candidate_rank = context.candidate_rank,
-                    outbound_attempt = context.outbound_attempt,
-                    recovery_attempt = 1,
-                    recovery_attempt_limit = 1,
-                    recovery_phase = "before_response_headers",
-                    accounting_scope = "original_logical_request_reservation",
-                    recovery_policy_source = "codex_native_pre_header_remote_reset_v1",
-                    transport_policy_source = context.transport_policy.source,
-                    transport_policy_version = context.transport_policy.version,
-                    failure_code = "upstream_transport_http2_reset",
-                    stage = "codex_h2_server_recovery",
-                    "recovering a remote HTTP/2 reset before response headers"
-                );
-                drop(egress);
-                drop(upstream_activity);
-                tokio::task::yield_now().await;
-            }
-            Err(error) => return Err(error),
+    record_codex_send_attempt_failure(&state.metrics, egress_path, &upstream_result);
+    state.metrics.observe_upstream(
+        &route.route.driver,
+        "proxy",
+        upstream_result.as_ref().ok().map(reqwest::Response::status),
+        upstream_started.elapsed(),
+    );
+    match upstream_result {
+        Ok(response) => {
+            let response = http2_evidence.observe_response(response);
+            let (response, egress_selection) = egress::observe_response(response, egress);
+            let response = match deadline.request {
+                Some(request_deadline) => {
+                    response.with_body_timeouts(request_deadline, deadline.read_inactivity)
+                }
+                None => response,
+            };
+            Ok((response, upstream_activity, egress_selection))
         }
+        Err(error) => Err(error),
+    }
+}
+
+/// Evidence belongs to this attempt before any response headers exist.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum CodexWireDelivery {
+    ConfirmedNotSent,
+    Unknown,
+}
+
+impl CodexWireDelivery {
+    fn can_replay(self) -> bool {
+        self == Self::ConfirmedNotSent
+    }
+}
+
+fn codex_wire_delivery(
+    error: &reqwest::Error,
+    body_polls: u64,
+    body_bytes: u64,
+) -> CodexWireDelivery {
+    // A native connect error establishes failure before HTTP dispatch. Body
+    // observation only disqualifies this proof; zero polls alone proves nothing.
+    if error.is_connect()
+        && body_polls == 0
+        && body_bytes == 0
+        && upstream_response::codex_http2_failure(error).is_none()
+        && !crate::simple_http::classify_transport(error).connection_reset
+    {
+        CodexWireDelivery::ConfirmedNotSent
+    } else {
+        CodexWireDelivery::Unknown
     }
 }
 
@@ -650,16 +650,8 @@ fn classify_codex_send_error(
         ProxySendError::NonRetryableTransport(kind)
     } else {
         let class = crate::simple_http::classify_transport(&error);
-        if class.pre_delivery() {
+        if codex_wire_delivery(&error, body_polls, body_bytes).can_replay() {
             return ProxySendError::RetryableConnection(class.stage());
-        }
-        // reqwest surfaces a `connect_timeout` expiry as a plain request timeout,
-        // not as a connect error, so `pre_delivery()` cannot see it. With zero
-        // body polls the request body never reached the wire, so the logical
-        // request was provably not delivered; replaying it on another candidate
-        // (or another sticky exit) cannot double-charge the upstream.
-        if class.timeout && body_polls == 0 && body_bytes == 0 {
-            return ProxySendError::RetryableConnection("connect_timeout");
         }
         // A send error after the request leaves the client is ambiguous and is
         // never replayed by this state machine.

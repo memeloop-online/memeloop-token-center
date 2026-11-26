@@ -210,16 +210,7 @@ async fn assert_terminal_failure(failure: Failure, label: &str) {
     tokio::time::sleep(Duration::from_millis(200)).await;
     let expected_attempts = if matches!(
         failure,
-        Failure::ResetThenTransientThenReset | Failure::ResetThenRateLimitThenReset
-    ) {
-        3
-    } else if matches!(
-        failure,
-        Failure::RejectedPriorReset
-            | Failure::RejectedFinalReset
-            | Failure::PreHeaderReset
-            | Failure::PreHeaderSilence
-            | Failure::PreHeaderRefusedReset
+        Failure::RejectedPriorReset | Failure::RejectedFinalReset
     ) {
         2
     } else {
@@ -228,7 +219,7 @@ async fn assert_terminal_failure(failure: Failure, label: &str) {
     assert_eq!(
         received.load(Ordering::SeqCst),
         expected_attempts,
-        "H2 recovery has one logical-request allowance across 400 retry and candidate failover"
+        "ambiguous H2 failure never creates another POST"
     );
     release.send(()).unwrap();
     server.await.unwrap();
@@ -247,13 +238,13 @@ async fn assert_terminal_failure(failure: Failure, label: &str) {
         | Failure::PreHeaderSilence
         | Failure::PreHeaderRefusedReset
         | Failure::ResetThenTransientThenReset
-        | Failure::ResetThenRateLimitThenReset => "upstream_transport_http2_reset",
+        | Failure::ResetThenRateLimitThenReset
+        | Failure::ResetThenSuccess => "upstream_transport_http2_reset",
         Failure::PostHeaderSilence => "upstream_http2_reset",
         Failure::RejectedReset
         | Failure::RejectedPlain
         | Failure::RejectedPriorReset
         | Failure::RejectedFinalReset => "http_502",
-        Failure::ResetThenSuccess => unreachable!(),
     };
     let expected_cause = match failure {
         Failure::RejectedReset | Failure::RejectedFinalReset => Some("upstream_http2_reset"),
@@ -269,23 +260,13 @@ async fn assert_terminal_failure(failure: Failure, label: &str) {
         .await
         .unwrap();
     assert_eq!(detail.view.terminal_cause_code.as_deref(), expected_cause);
-    let events = fixture
-        .state
-        .db
-        .all_request_events_after(0, None, 500)
-        .await
-        .unwrap();
-    assert!(
-        !events
-            .iter()
-            .any(|event| event.request_id == rows[0].request_id && event.event_kind == "finished")
-    );
+    // Recheck the shared operational-event/unknown-finance contract after
+    // the transport has fully stopped, including absence of duplicate work.
+    cancellation::assert_unknown_request(&fixture, rows[0].request_id, 0).await;
     assert_eq!(receipt["terminal_cause"].as_str(), expected_cause);
     let (expected_account, expected_route) = if matches!(
         failure,
-        Failure::RejectedPriorReset
-            | Failure::RejectedFinalReset
-            | Failure::ResetThenRateLimitThenReset
+        Failure::RejectedPriorReset | Failure::RejectedFinalReset
     ) {
         let pool = sqlx::AnyPool::connect(&fixture.database_url).await.unwrap();
         let route_id: String = sqlx::query_scalar(
@@ -306,12 +287,12 @@ async fn assert_terminal_failure(failure: Failure, label: &str) {
 }
 
 #[tokio::test]
-async fn pre_header_rst_stream_recovers_once_without_double_settlement() {
+async fn pre_header_rst_stream_is_not_replayed_or_double_settled() {
     assert_terminal_failure(Failure::PreHeaderReset, "h2-pre-header-rst").await;
 }
 
 #[tokio::test]
-async fn pre_header_refused_stream_recovers_once_without_double_settlement() {
+async fn pre_header_refused_stream_without_delivery_proof_is_not_replayed() {
     assert_terminal_failure(Failure::PreHeaderRefusedReset, "h2-pre-header-refused").await;
 }
 
@@ -334,87 +315,8 @@ async fn pre_header_reset_recovery_allowance_is_not_refreshed_by_candidate_failo
 }
 
 #[tokio::test]
-async fn pre_header_reset_then_success_settles_one_logical_request() {
-    for stream in [false, true] {
-        let fixture = codex_route_fixture(if stream {
-            "h2-recover-stream"
-        } else {
-            "h2-recover-buffered"
-        })
-        .await;
-        set_short_http2_deadline(&fixture).await;
-        fixture.state.codex_clients.install_test_client(
-            reqwest::Client::builder()
-                .http2_prior_knowledge()
-                .retry(reqwest::retry::never())
-                .no_proxy()
-                .build()
-                .unwrap(),
-        );
-        let (endpoint, received, release, server) =
-            http2_failure_upstream(Failure::ResetThenSuccess).await;
-        let response = send_codex_route_to_endpoint(
-            &fixture,
-            endpoint,
-            "/v1/responses",
-            json!({"model": fixture.model, "input": "recover", "stream": stream}),
-        )
-        .await;
-        assert_eq!(response.status(), StatusCode::OK);
-        let body = to_bytes(response.into_body(), MAX_PROXY_RESPONSE_BODY)
-            .await
-            .unwrap();
-        assert!(String::from_utf8_lossy(&body).contains("recovered"));
-        wait_for_request_settlement(&fixture, 1).await;
-        assert_eq!(received.load(Ordering::SeqCst), 2);
-        let rows = fixture
-            .state
-            .db
-            .list_requests(fixture.key_id, 10)
-            .await
-            .unwrap();
-        assert_eq!(rows.len(), 1);
-        assert_eq!(rows[0].status_code, Some(200));
-        fixture.state.routing_persistence.drain_for_test().await;
-        let attempts = fixture
-            .state
-            .db
-            .request_egress_attempts(rows[0].request_id)
-            .await
-            .unwrap();
-        assert_eq!(attempts.len(), 2);
-        assert_ne!(attempts[0].attempt_id, attempts[1].attempt_id);
-        assert!(attempts.iter().all(|attempt| attempt.completed));
-        assert!(attempts.iter().all(|attempt| {
-            attempt.upstream_account_id == fixture.upstream_account_id
-                && attempt.route_id == fixture.route_id
-                && attempt.selected.kind == "direct"
-                && attempt.request_payload_bytes.is_some()
-                && attempt.measurement_basis == "application_payload_estimate"
-        }));
-        let final_attempts: Vec<_> = attempts
-            .iter()
-            .filter(|attempt| attempt.final_response)
-            .collect();
-        assert_eq!(final_attempts.len(), 1);
-        assert_eq!(
-            final_attempts[0].response_payload_bytes,
-            Some(completed_codex_sse("recovered").len() as i64)
-        );
-        assert!(attempts.iter().any(|attempt| {
-            !attempt.final_response && attempt.response_payload_bytes.is_none()
-        }));
-        assert_exactly_once_side_effects_for(
-            &fixture,
-            rows[0].request_id,
-            Some("resp-codex"),
-            fixture.upstream_account_id,
-            fixture.route_id,
-        )
-        .await;
-        release.send(()).unwrap();
-        server.await.unwrap();
-    }
+async fn ambiguous_reset_does_not_probe_a_second_successful_post() {
+    assert_terminal_failure(Failure::ResetThenSuccess, "h2-reset-no-probe").await;
 }
 
 #[tokio::test]
