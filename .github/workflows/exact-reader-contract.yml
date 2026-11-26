@@ -61,19 +61,22 @@ jobs:
           toolchain: 1.95.0
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6
       - uses: ./.github/actions/checkout-plugin-examples
-      - name: Verify fixed OAuth existing-pool contracts
+      - name: Verify scoped response production library and exact contracts
         run: |
           set -euo pipefail
-          test "$(git rev-parse HEAD)" = '66916ed4c48bcfdbea3c7f603baa561809e44066'
+          test "$(git rev-parse HEAD)" = 'ea382e2ec92f7fe46b4be79b3a53bfbdd62bf73c'
           git rev-parse HEAD
-          mkdir -p /tmp/oauth-existing-pool-evidence
-          cargo test --locked --lib --all-features worker::oauth_role_tests::oauth_rejection_delivery_crosses_gateway_control_and_worker_process_roles -- --exact --nocapture 2>&1 | tee /tmp/oauth-existing-pool-evidence/3.log
-          grep -F '1 passed; 0 failed' /tmp/oauth-existing-pool-evidence/3.log
+          mkdir -p /tmp/pr1102-evidence
+          cargo check --locked --all-features --lib 2>&1 | tee /tmp/pr1102-evidence/check.log
+          cargo test --locked --all-features --lib archive::scoped_routing_contract_tests::synthetic_scoped_response_route_preserves_binding_and_revert_reads -- --exact --nocapture 2>&1 | tee /tmp/pr1102-evidence/scoped.log
+          grep -F '1 passed; 0 failed; 0 ignored;' /tmp/pr1102-evidence/scoped.log
+          cargo test --locked --all-features --lib api::proxy::tests::kimi::buffered_usage::authenticated_buffered_response_scope_reaches_archive_selector_and_sql_binding -- --exact --nocapture 2>&1 | tee /tmp/pr1102-evidence/binding.log
+          grep -F '1 passed; 0 failed; 0 ignored;' /tmp/pr1102-evidence/binding.log
       - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
         if: always()
         with:
-          name: oauth-role-66916
-          path: /tmp/oauth-existing-pool-evidence/
+          name: pr1102-scoped-response-ea382
+          path: /tmp/pr1102-evidence/
           if-no-files-found: warn
 
   orphan-reaper-contract:
