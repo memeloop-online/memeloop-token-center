@@ -50,7 +50,7 @@ jobs:
         run: |
           set -euo pipefail
           test "$(git rev-parse HEAD)" = da783be6ec83d277108a057217974d264f9abcd5
-          node --test tests/ops/image-e2e/object_proxy.test.ts 2>&1 | tee "$RUNNER_TEMP/image-proxy-unit.log"
+          node --test --test-reporter=tap tests/ops/image-e2e/object_proxy.test.ts 2>&1 | tee "$RUNNER_TEMP/image-proxy-unit.log"
           grep -Fx '# pass 5' "$RUNNER_TEMP/image-proxy-unit.log"
           grep -Fx '# fail 0' "$RUNNER_TEMP/image-proxy-unit.log"
           grep -Fx '# skipped 0' "$RUNNER_TEMP/image-proxy-unit.log"
