@@ -130,15 +130,28 @@ impl Database {
         if matches!(scope, HistoryScope::Key { .. }) {
             refs.view.credential_identity = None;
         }
-        if refs.view.request_id != snapshot.identity.request_id {
+        self.resolve_history_snapshot_archive(&snapshot.identity, refs)
+            .await
+    }
+
+    /// Scoped frozen imports retain their own authority even if their UUID
+    /// happens to match a native request. Native enrichment also requires the
+    /// exact persisted timestamp, not only the public request UUID.
+    pub(in crate::db) async fn resolve_history_snapshot_archive(
+        &self,
+        identity: &HistoryIdentity,
+        refs: RequestArchiveRefs,
+    ) -> Result<RequestArchiveRefs, AppError> {
+        if refs.view.request_id != identity.request_id {
             return Err(AppError::storage("history_archive_identity_mismatch"));
         }
-        self.resolve_history_raw_archive_roots(
-            snapshot.identity.tenant_id,
-            snapshot.identity.key_id,
-            refs,
-        )
-        .await
+        if identity.source != crate::request_history::HistorySource::Native.as_str()
+            || refs.view.created_at != identity.created_at
+        {
+            return Ok(refs);
+        }
+        self.resolve_history_raw_archive_roots(identity.tenant_id, identity.key_id, refs)
+            .await
     }
 
     pub(crate) async fn history_session_directory(

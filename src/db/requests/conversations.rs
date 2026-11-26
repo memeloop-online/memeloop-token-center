@@ -6,6 +6,7 @@ use super::super::*;
 mod identity_projection;
 pub(crate) mod prefix_storage;
 mod projection_retry;
+mod retention;
 mod semantic_payload;
 
 #[cfg(test)]
@@ -732,22 +733,7 @@ impl Database {
     /// 用 `request_id` 子查询 + `LIMIT` 分批，避免一次性大事务放大 WAL 与 IO。
     pub async fn delete_projected_conversation_outbox(&self, limit: i64) -> Result<u64, AppError> {
         let cutoff = unix_millis().saturating_sub(CONVERSATION_PROJECTION_RETENTION_MS);
-        let rows = sqlx::query(
-            "DELETE FROM conversation_projection_outbox
-             WHERE request_id IN (
-                 SELECT request_id
-                 FROM conversation_projection_outbox
-                 WHERE projected_at IS NOT NULL AND projected_at < $1
-                 ORDER BY projected_at ASC, request_id ASC
-                 LIMIT $2
-             )",
-        )
-        .bind(cutoff)
-        .bind(limit)
-        .execute(&self.pool)
-        .await?
-        .rows_affected();
-        Ok(rows)
+        self.delete_durably_retired_conversation_outbox(limit, cutoff).await
     }
 
     /// Claims a bounded batch of terminal conversation observations for one

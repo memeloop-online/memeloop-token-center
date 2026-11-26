@@ -7,6 +7,9 @@ use crate::{
 };
 use bytes::Bytes;
 
+#[path = "retention_tests.rs"]
+mod retention_tests;
+
 async fn fair_projection_queue_contract(database_url: String) {
     let fixture = Fixture::new(database_url, true).await;
     let db = &fixture.state.db;
@@ -2114,6 +2117,13 @@ async fn semantic_coverage_committed_recovery_contract(database_url: String) {
             "SELECT p.projected_at, p.lease_owner, o.leaf_node_hash FROM conversation_projection_outbox p JOIN conversation_observations o ON o.request_id=p.request_id WHERE p.request_id=$1"
         ).bind(fixture.request_id.to_string()).fetch_one(&db.pool).await.unwrap();
         assert_eq!(before.1, "semantic-coverage-v2");
+        assert_eq!(
+            db.delete_durably_retired_conversation_outbox(100, i64::MAX)
+                .await
+                .unwrap(),
+            0,
+            "expiry cannot discard an unconsumed coverage obligation"
+        );
         let snapshot: String = sqlx::query_scalar(
             "SELECT semantic_snapshot_json FROM conversation_projection_outbox WHERE request_id=$1",
         )
@@ -2377,6 +2387,7 @@ async fn semantic_coverage_committed_recovery_contract(database_url: String) {
                 .await
                 .unwrap()
         );
+        retention_tests::expired_outbox_contract(&fixture, &before.2, &frozen, &resolved, &other_locator).await;
     }
 }
 
