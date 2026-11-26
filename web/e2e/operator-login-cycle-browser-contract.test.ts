@@ -4,7 +4,18 @@ import test from 'node:test';
 import { chromium } from 'playwright';
 import { createServer } from 'vite';
 import { localChromiumExecutable } from './support/browser-executable.js';
-import type {} from './fixtures/operator-login-cycle.js';
+declare global {
+  interface Window {
+    loginCycleFixture: {
+      calls: number;
+      holdNext: boolean;
+      release: (status: number) => void;
+      replaceStorage: () => void;
+      invoke: (action: 'connect' | 'refresh' | 'revalidate' | 'replacement' | 'clear') => void;
+      state: { credential: string; validated: boolean; status: string; cycle?: string };
+    };
+  }
+}
 
 test('remembered login ownership fences delayed cross-tab events at request start, response and clear', { timeout: 120_000 }, async context => {
   const executablePath = await localChromiumExecutable();
@@ -16,6 +27,7 @@ test('remembered login ownership fences delayed cross-tab events at request star
   await server.listen();
   const address = server.httpServer?.address();
   assert.ok(address && typeof address !== 'string');
+  const fixturePort = address.port;
   const browser = await chromium.launch({ executablePath, headless: true });
   async function readyPage() {
     const page = await browser.newPage();
@@ -23,7 +35,7 @@ test('remembered login ownership fences delayed cross-tab events at request star
       localStorage.setItem('mtc.operator.service-credential.v1', 'synthetic-identity-A');
       localStorage.setItem('mtc.operator.login-cycle.v1', 'synthetic-cycle-A');
     });
-    await page.goto(`http://127.0.0.1:${address.port}/e2e/fixtures/operator-login-cycle.html`);
+    await page.goto(`http://127.0.0.1:${fixturePort}/e2e/fixtures/operator-login-cycle.html`);
     await page.waitForFunction(() => window.loginCycleFixture.state.status === 'ready');
     assert.equal(await page.evaluate(() => window.loginCycleFixture.state.cycle), 'synthetic-cycle-A');
     return page;
@@ -108,7 +120,7 @@ test('remembered login ownership fences delayed cross-tab events at request star
         return original.call(this, key, value);
       };
     });
-    await blocked.goto(`http://127.0.0.1:${address.port}/e2e/fixtures/operator-login-cycle.html`);
+    await blocked.goto(`http://127.0.0.1:${fixturePort}/e2e/fixtures/operator-login-cycle.html`);
     await blocked.waitForFunction(() => window.loginCycleFixture.state.status === 'disconnected');
     await blocked.evaluate(() => window.loginCycleFixture.invoke('connect'));
     await blocked.waitForFunction(() => window.loginCycleFixture.state.status === 'ready');
