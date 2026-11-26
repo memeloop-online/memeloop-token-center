@@ -2,7 +2,7 @@
 use super::*;
 
 async fn locked_request_children(fixture: &PgFixture, pid: i32, indexes: bool) -> Vec<String> {
-    sqlx::query_scalar("SELECT DISTINCT CAST(c.relname AS TEXT) AS relname FROM pg_locks l JOIN pg_class c ON c.oid=l.relation JOIN pg_namespace n ON n.oid=c.relnamespace WHERE l.pid=$1 AND l.granted AND n.nspname=$2 AND c.oid IN (SELECT relid FROM pg_partition_tree('request_records'::regclass) WHERE isleaf AND NOT $3 UNION ALL SELECT i.indexrelid FROM pg_index i JOIN pg_partition_tree('request_records'::regclass) p ON p.relid=i.indrelid WHERE p.isleaf AND $3) ORDER BY c.relname")
+    sqlx::query_scalar("SELECT DISTINCT CAST(owner.relname AS TEXT) AS relname FROM pg_locks l JOIN pg_class c ON c.oid=l.relation LEFT JOIN pg_index ix ON ix.indexrelid=c.oid JOIN pg_class owner ON owner.oid=COALESCE(ix.indrelid,c.oid) JOIN pg_namespace n ON n.oid=c.relnamespace WHERE l.pid=$1 AND l.granted AND n.nspname=$2 AND c.oid IN (SELECT relid FROM pg_partition_tree('request_records'::regclass) WHERE isleaf AND NOT $3 UNION ALL SELECT i.indexrelid FROM pg_index i JOIN pg_partition_tree('request_records'::regclass) p ON p.relid=i.indrelid WHERE p.isleaf AND $3) ORDER BY relname")
         .bind(pid).bind(&fixture.schema).bind(indexes).fetch_all(&fixture.db.pool).await.unwrap()
 }
 
@@ -12,14 +12,29 @@ async fn postgres_spool_candidate_prunes_unrelated_request_partition_locks() {
         BufferedArchivePurpose::Response,
         BufferedArchivePurpose::Request,
     ] {
-        verify_partition_claim(purpose).await;
+        for mode in ["force_custom_plan", "force_generic_plan"] {
+            verify_partition_claim(purpose, mode).await;
+        }
     }
 }
 
-async fn verify_partition_claim(purpose: BufferedArchivePurpose) {
-    let Some(fixture) = PgFixture::new().await else {
-        return;
-    };
+async fn verify_partition_claim(purpose: BufferedArchivePurpose, mode: &'static str) {
+    let mut fixture = PgFixture::new()
+        .await
+        .expect("real PostgreSQL fixture required");
+    fixture.db.pool = schema_pool_with_plan(&fixture.url, &fixture.schema, mode)
+        .await
+        .into();
+    let actual_mode: String = sqlx::query_scalar("SHOW plan_cache_mode")
+        .fetch_one(&fixture.db.pool)
+        .await
+        .unwrap();
+    assert_eq!(actual_mode, mode);
+    let actual_schema: String = sqlx::query_scalar("SELECT CAST(current_schema() AS TEXT)")
+        .fetch_one(&fixture.db.pool)
+        .await
+        .unwrap();
+    assert_eq!(actual_schema, fixture.schema);
     // DDL is committed before either measured transaction and visible to the
     // independent observer. The seeded request at time 1 remains in DEFAULT.
     sqlx::raw_sql("CREATE TABLE request_records_unrelated_early PARTITION OF request_records FOR VALUES FROM (-200) TO (-100); CREATE TABLE request_records_unrelated_late PARTITION OF request_records FOR VALUES FROM (100) TO (200);")
@@ -40,6 +55,8 @@ async fn verify_partition_claim(purpose: BufferedArchivePurpose) {
     .fetch_one(&fixture.db.pool)
     .await
     .unwrap();
+    // A deliberately broad id-only JOIN is the pruning control, not a
+    // reproduction of the former two-CTE claim state machine.
     let mut old = fixture.db.pool.begin().await.unwrap();
     let old_pid: i32 = sqlx::query_scalar("SELECT pg_backend_pid()")
         .fetch_one(&mut *old)
@@ -75,7 +92,7 @@ async fn verify_partition_claim(purpose: BufferedArchivePurpose) {
         .await
         .unwrap();
     let locks = locked_request_children(&fixture, pid, false).await;
-    assert!(!locks.is_empty());
+    assert_eq!(locks.len(), 1, "exactly one request leaf is planned");
     assert!(
         !locks
             .iter()
@@ -90,7 +107,7 @@ async fn verify_partition_claim(purpose: BufferedArchivePurpose) {
         "{indexes:?}"
     );
     eprintln!(
-        "SPOOL_PARTITION_LOCKS tables_old={} tables_new={} indexes_old={} indexes_new={}",
+        "SPOOL_PARTITION_LOCKS mode={mode} purpose={purpose:?} tables_old={} tables_new={} indexes_old={} indexes_new={}",
         old_locks.len(),
         locks.len(),
         old_indexes.len(),

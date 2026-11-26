@@ -786,6 +786,10 @@ struct PgFixture {
 }
 
 async fn schema_pool(url: &str, schema: &str) -> AnyPool {
+    schema_pool_with_plan(url, schema, "auto").await
+}
+
+async fn schema_pool_with_plan(url: &str, schema: &str, plan_mode: &'static str) -> AnyPool {
     let schema = schema.to_owned();
     AnyPoolOptions::new()
         .max_connections(5)
@@ -798,6 +802,10 @@ async fn schema_pool(url: &str, schema: &str) -> AnyPool {
                     .await?;
                 sqlx::query("SELECT set_config('application_name', $1, false)")
                     .bind(&schema)
+                    .execute(&mut *connection)
+                    .await?;
+                sqlx::query("SELECT set_config('plan_cache_mode', $1, false)")
+                    .bind(plan_mode)
                     .execute(&mut *connection)
                     .await?;
                 sqlx::query("SET statement_timeout = 10000")
