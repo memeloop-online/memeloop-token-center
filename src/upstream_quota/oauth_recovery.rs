@@ -16,6 +16,15 @@ const CAPACITY: usize = 1024;
 const BATCH: usize = 32;
 const WRITE_TIMEOUT: Duration = Duration::from_secs(2);
 
+/// Reuse the already-owned routing persistence pool for the whole automatic
+/// OAuth operation. Cloning AppState retains configuration, authorization and
+/// provider contracts; only its database handle changes. No pool is created.
+pub(crate) fn background_state(state: &AppState) -> AppState {
+    let mut background = state.clone();
+    background.db = state.routing_persistence_db.clone();
+    background
+}
+
 #[derive(Default)]
 pub(crate) struct Rejections {
     pending: Mutex<HashMap<Uuid, i64>>,
@@ -58,7 +67,7 @@ impl Rejections {
             .collect::<Vec<_>>();
         stream::iter(batch).for_each_concurrent(4, |(id, generation)| async move {
             match tokio::time::timeout(WRITE_TIMEOUT,
-                state.db.observe_rejected_oauth_generation(id, generation)).await {
+                state.routing_persistence_db.observe_rejected_oauth_generation(id, generation)).await {
                 Ok(Ok(())) => {
                     let mut pending = self.pending.lock().unwrap_or_else(|e| e.into_inner());
                     if pending.get(&id) == Some(&generation) { pending.remove(&id); }
@@ -75,6 +84,8 @@ impl Rejections {
 }
 
 pub(crate) async fn verify_batch(state: &AppState) -> Result<(), AppError> {
+    let background = background_state(state);
+    let state = &background;
     let candidates = state
         .db
         .list_rejected_oauth_verifications(crate::db::unix_millis(), 20)
