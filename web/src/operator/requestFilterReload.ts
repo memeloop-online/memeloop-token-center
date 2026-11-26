@@ -1,6 +1,6 @@
-import { isOperatorLoginCycleCurrent } from '../credentialStorage';
-import type { TypedFilterAst } from '../types';
-import { decodeTypedFilterAst } from './typedFilterContract';
+import { isOperatorLoginCycleCurrent } from '../credentialStorage.js';
+import type { TypedFilterAst } from '../types.js';
+import { decodeTypedFilterAst } from './typedFilterContract.js';
 
 const storageKey = 'mtc.operator.request-filter.reload.v1';
 export interface RequestFilterReload {
