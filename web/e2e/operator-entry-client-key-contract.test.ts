@@ -53,7 +53,7 @@ test('a 403 is a definitive denial, never an outage and never an active session'
   assert.match(scope, /if \(action\.outcome === 'denied'\) return \{ \.\.\.state, validated: false, loginCycle: undefined, status: \{ kind: 'failed', message: action\.message \} \};/);
   assert.match(scope, /reason\.status === 403\) \{\s*clearOperatorLoginCycle\(\);\s*dispatch\(\{ type: 'authentication-failed', message: messageOf\(reason, t\('common\.connectionFailed'\)\), outcome: 'denied' \}\);\s*return;\s*\}/);
   // An unproven candidate is dropped with its saved value, never promoted.
-  assert.match(scope, /if \(before\.validated\) \{\s*clearOperatorLoginCycle\(\);\s*dispatch\(\{ type: 'authentication-failed', message, outcome: 'denied' \}\);\s*return;\s*\}\s*clearRememberedCredential\('operator'\);\s*dispatch\(\{ type: 'authentication-failed', message, outcome: 'reject' \}\)/);
+  assert.match(scope, /if \(before\.validated\) \{\s*clearOperatorLoginCycle\(\);\s*dispatch\(\{ type: 'authentication-failed', message, outcome: 'denied' \}\);\s*return;\s*\}\s*if \(before\.remembered && before\.credential === candidate && ownsRememberedIdentity\(before\)\) clearRememberedCredential\('operator'\);\s*dispatch\(\{ type: 'authentication-failed', message, outcome: 'reject' \}\)/);
   assert.doesNotMatch(scope, /preserve:/);
 });
 
@@ -76,6 +76,7 @@ test('tenant selection never masquerades as recovery; only a successful read rec
 test('only a definitive 401 or 403, or an explicit user clear, removes the remembered credential', () => {
   const clearSites = [...scope.matchAll(/clearRememberedCredential\('operator'\)/g)].map((match) => match.index ?? 0);
   assert.equal(clearSites.length, 4, 'authenticate rejections, refresh rejection and the identity-guarded explicit clear control');
+  assert.equal([...scope.matchAll(/if \(before\.remembered && before\.credential === candidate && ownsRememberedIdentity\(before\)\) clearRememberedCredential/g)].length, 2, 'authentication rejections only clear the owned identity that was actually rejected');
   assert.match(scope, /if \(current\.credential && ownsRememberedIdentity\(current\)\) clearRememberedCredential\('operator'\)/);
   for (const at of clearSites) {
     const context = scope.slice(Math.max(0, at - 640), at);

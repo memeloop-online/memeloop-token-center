@@ -66,6 +66,27 @@ test('remembered login ownership fences delayed cross-tab events at request star
         await page.close();
       }
     }
+    for (const status of [401, 403]) {
+      const disconnected = await readyPage();
+      await disconnected.evaluate(() => {
+        window.loginCycleFixture.replaceStorage();
+        window.loginCycleFixture.invoke('clear');
+      });
+      await assertOtherIdentity(disconnected);
+      await disconnected.evaluate(() => {
+        window.loginCycleFixture.holdNext = true;
+        window.loginCycleFixture.invoke('replacement');
+      });
+      await disconnected.waitForFunction(() => window.loginCycleFixture.calls === 2);
+      await disconnected.evaluate(status => window.loginCycleFixture.release(status), status);
+      await disconnected.waitForFunction(() => window.loginCycleFixture.state.status === 'failed');
+      assert.deepEqual(await disconnected.evaluate(() => ({
+        credential: localStorage.getItem('mtc.operator.service-credential.v1'),
+        cycle: localStorage.getItem('mtc.operator.login-cycle.v1'),
+        validated: window.loginCycleFixture.state.validated,
+      })), { credential: 'synthetic-identity-B', cycle: 'synthetic-cycle-B', validated: false }, `disconnected candidate C/${status}: B remains owned by the other tab`);
+      await disconnected.close();
+    }
     const page = await readyPage();
     await page.evaluate(() => {
       window.loginCycleFixture.holdNext = true;

@@ -176,7 +176,7 @@ export function useOperatorScope() {
           dispatch({ type: 'authentication-failed', message, outcome: 'session-kept' });
           return;
         }
-        clearRememberedCredential('operator');
+        if (before.remembered && before.credential === candidate && ownsRememberedIdentity(before)) clearRememberedCredential('operator');
         dispatch({ type: 'authentication-failed', message, outcome: 'reject' });
         return;
       }
@@ -199,7 +199,7 @@ export function useOperatorScope() {
           dispatch({ type: 'authentication-failed', message, outcome: 'denied' });
           return;
         }
-        clearRememberedCredential('operator');
+        if (before.remembered && before.credential === candidate && ownsRememberedIdentity(before)) clearRememberedCredential('operator');
         dispatch({ type: 'authentication-failed', message, outcome: 'reject' });
         return;
       }
