@@ -254,6 +254,7 @@ async fn session_tasks_history_real_services_acceptance() {
         .unwrap()
         != 0
     {}
+    baseline.verify_surface_parity(db, &client).await.unwrap();
     baseline.finish(db).await.unwrap();
     db.history_resume_delivery(baseline_owner, epoch)
         .await
@@ -262,7 +263,7 @@ async fn session_tasks_history_real_services_acceptance() {
     crate::request_history::migration::verify(db, &client)
         .await
         .unwrap();
-    db.history_switch(true).await.unwrap();
+    db.history_switch_watermark(&client).await.unwrap();
     for (request, expected) in &cases {
         let (status, actual) = post(
             &app,
