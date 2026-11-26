@@ -534,7 +534,6 @@ pub(super) async fn send_proxy_route(
     route: &PreparedProxyRoute,
     candidate_rank: usize,
     outbound_attempt: usize,
-    h2_recovery_available: &mut bool,
 ) -> Result<ProxyRouteResponse, ProxySendError> {
     // Catalog/quota support does not implement Cursor's AgentService Run
     // conversation protocol. Never send its OAuth token and an OpenAI payload
@@ -552,7 +551,6 @@ pub(super) async fn send_proxy_route(
             plan,
             candidate_rank,
             outbound_attempt,
-            h2_recovery_available,
         )
         .await;
     }

@@ -30,7 +30,7 @@ impl Drop for StalledHttp2 {
 }
 
 impl StalledHttp2 {
-    async fn start(pre_header: bool, recover_first: bool) -> Self {
+    async fn start(pre_header: bool) -> Self {
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let endpoint = format!("http://{}", listener.local_addr().unwrap());
         let posts = Arc::new(AtomicUsize::new(0));
@@ -65,12 +65,7 @@ impl StalledHttp2 {
                                         assert_eq!(request.version(), http::Version::HTTP_2);
                                         assert_eq!(request.method(), http::Method::POST);
                                         assert_eq!(request.uri().path(), codex_transport::RESPONSES_PATH);
-                                        let attempt = count.fetch_add(1, Ordering::SeqCst);
-                                        if recover_first && attempt == 0 {
-                                            response.send_reset(http2::Reason::CANCEL);
-                                            held_requests.push(request);
-                                            continue;
-                                        }
+                                        count.fetch_add(1, Ordering::SeqCst);
                                         if pre_header {
                                             let reset_sender = reset_sender.clone();
                                             monitors.spawn(async move {
@@ -176,15 +171,13 @@ async fn single_dispatch_route(fixture: &CodexRouteFixture) -> ResolvedUpstream 
     }
 }
 
-async fn assert_network_cancellation(reset_stream: bool, pre_header: bool, recover_first: bool) {
-    let expected_posts = if recover_first { 2 } else { 1 };
-    let label = match (reset_stream, pre_header, recover_first) {
-        (true, _, true) => "h2-downstream-recovery-rst",
-        (false, _, true) => "h2-downstream-recovery-tcp-close",
-        (true, false, false) => "h2-downstream-rst",
-        (false, false, false) => "h2-downstream-tcp-close",
-        (true, true, false) => "h2-downstream-pre-header-rst",
-        (false, true, false) => "h2-downstream-pre-header-tcp-close",
+async fn assert_network_cancellation(reset_stream: bool, pre_header: bool) {
+    let expected_posts = 1;
+    let label = match (reset_stream, pre_header) {
+        (true, false) => "h2-downstream-rst",
+        (false, false) => "h2-downstream-tcp-close",
+        (true, true) => "h2-downstream-pre-header-rst",
+        (false, true) => "h2-downstream-pre-header-tcp-close",
     };
     let fixture = codex_route_fixture(label).await;
     let route = single_dispatch_route(&fixture).await;
@@ -195,7 +188,7 @@ async fn assert_network_cancellation(reset_stream: bool, pre_header: bool, recov
         )
         .unwrap(),
     );
-    let mut upstream = StalledHttp2::start(pre_header, recover_first).await;
+    let mut upstream = StalledHttp2::start(pre_header).await;
     let endpoint = upstream.endpoint.clone();
     let app = router_for_role(fixture.state.clone(), RuntimeRole::Gateway).layer(
         axum::middleware::from_fn(
@@ -393,17 +386,12 @@ async fn assert_network_cancellation(reset_stream: bool, pre_header: bool, recov
 
 #[tokio::test]
 async fn real_http2_downstream_reset_and_tcp_close_cancel_once_and_release_permits() {
-    for (reset_stream, pre_header, recover_first) in [
-        (true, false, false),
-        (false, false, false),
-        (true, true, false),
-        (false, true, false),
-        (true, true, true),
-        (false, true, true),
-    ] {
+    // Ambiguous pre-header upstream reset is covered by codex_wire_delivery;
+    // it ends the request rather than manufacturing another cancelable POST.
+    for (reset_stream, pre_header) in [(true, false), (false, false), (true, true), (false, true)] {
         tokio::time::timeout(
             Duration::from_secs(15),
-            assert_network_cancellation(reset_stream, pre_header, recover_first),
+            assert_network_cancellation(reset_stream, pre_header),
         )
         .await
         .expect("real HTTP/2 cancellation must not wait for a provider timeout");

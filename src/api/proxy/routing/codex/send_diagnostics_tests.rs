@@ -527,3 +527,66 @@ fn length_and_forbidden_header_observation_never_rewrites_or_rejects_request() {
     assert!(evidence.te_trailers_only);
     assert_eq!(evidence.request_protocol_policy, "explicit_http_2");
 }
+
+#[tokio::test]
+async fn wire_delivery_requires_connect_proof_and_unconsumed_attempt_body() {
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let endpoint = format!("http://{}", listener.local_addr().unwrap());
+    drop(listener);
+    let error = reqwest::Client::builder()
+        .no_proxy()
+        .build()
+        .unwrap()
+        .post(&endpoint)
+        .body("wire body")
+        .send()
+        .await
+        .unwrap_err();
+    assert_eq!(
+        codex_wire_delivery(&error, 0, 0),
+        CodexWireDelivery::ConfirmedNotSent
+    );
+    assert_eq!(
+        codex_wire_delivery(&error, 1, 0),
+        CodexWireDelivery::Unknown
+    );
+    assert_eq!(
+        codex_wire_delivery(&error, 0, 1),
+        CodexWireDelivery::Unknown
+    );
+    assert!(matches!(
+        classify_codex_send_error(error, 1, 0),
+        ProxySendError::NonRetryableTransport(_)
+    ));
+
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let endpoint = format!("http://{}", listener.local_addr().unwrap());
+    let (release, released) = tokio::sync::oneshot::channel();
+    let server = tokio::spawn(async move {
+        let (_socket, _) = listener.accept().await.unwrap();
+        let _ = released.await;
+    });
+    let error = reqwest::Client::builder()
+        .no_proxy()
+        .timeout(std::time::Duration::from_millis(100))
+        .build()
+        .unwrap()
+        .post(endpoint)
+        .body("wire body")
+        .send()
+        .await
+        .unwrap_err();
+    assert!(error.is_timeout());
+    assert!(!error.is_connect());
+    // Even a supplied zero observation cannot turn a request timeout into proof.
+    assert_eq!(
+        codex_wire_delivery(&error, 0, 0),
+        CodexWireDelivery::Unknown
+    );
+    assert!(matches!(
+        classify_codex_send_error(error, 0, 0),
+        ProxySendError::NonRetryableTransport(TransportFailureKind::Timeout)
+    ));
+    release.send(()).unwrap();
+    server.await.unwrap();
+}
