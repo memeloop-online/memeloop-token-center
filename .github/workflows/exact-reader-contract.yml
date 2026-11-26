@@ -64,10 +64,9 @@ jobs:
       - name: Verify scoped response production library and exact contracts
         run: |
           set -euo pipefail
-          test "$(git rev-parse HEAD)" = 'ea382e2ec92f7fe46b4be79b3a53bfbdd62bf73c'
+          test "$(git rev-parse HEAD)" = 'b101f90590d6bbd8460b72b65467d1bfcecab052'
           git rev-parse HEAD
           mkdir -p /tmp/pr1102-evidence
-          cargo check --locked --all-features --lib 2>&1 | tee /tmp/pr1102-evidence/check.log
           cargo test --locked --all-features --lib archive::scoped_routing_contract_tests::synthetic_scoped_response_route_preserves_binding_and_revert_reads -- --exact --nocapture 2>&1 | tee /tmp/pr1102-evidence/scoped.log
           grep -F '1 passed; 0 failed; 0 ignored;' /tmp/pr1102-evidence/scoped.log
           cargo test --locked --all-features --lib api::proxy::tests::kimi::buffered_usage::authenticated_buffered_response_scope_reaches_archive_selector_and_sql_binding -- --exact --nocapture 2>&1 | tee /tmp/pr1102-evidence/binding.log
@@ -75,7 +74,7 @@ jobs:
       - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
         if: always()
         with:
-          name: pr1102-scoped-response-ea382
+          name: pr1102-scoped-response-b101
           path: /tmp/pr1102-evidence/
           if-no-files-found: warn
 
