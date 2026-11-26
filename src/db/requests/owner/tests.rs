@@ -426,6 +426,10 @@ async fn postgres_terminal_owner_read_lock_rechecks_pending_without_update_side_
     };
     let before_revision = revision().await;
     let mut old = fixture.database.begin_write_transaction().await.unwrap();
+    let old_pid: i32 = sqlx::query_scalar("SELECT pg_backend_pid()")
+        .fetch_one(&mut *old)
+        .await
+        .unwrap();
     sqlx::query("UPDATE request_records SET completed_at=completed_at WHERE id=$1 AND tenant_id=$2 AND key_id=$3 AND reservation_id=$4 AND completed_at IS NULL")
         .bind(owner.request_id.to_string()).bind(owner.tenant_id.to_string())
         .bind(owner.key_id.to_string()).bind(owner.reservation_id.to_string())
@@ -443,6 +447,9 @@ async fn postgres_terminal_owner_read_lock_rechecks_pending_without_update_side_
         old_revision > before_revision,
         "the old UPDATE allocates a history revision"
     );
+    let old_leaf_families: i64 = sqlx::query_scalar("WITH leaves AS (SELECT relid FROM pg_partition_tree($2::regclass) WHERE isleaf), families AS (SELECT relid,relid AS owner_leaf FROM leaves UNION ALL SELECT i.indexrelid,l.relid FROM leaves l JOIN pg_index i ON i.indrelid=l.relid) SELECT COUNT(DISTINCT f.owner_leaf)::BIGINT FROM families f JOIN pg_locks p ON p.relation=f.relid WHERE p.pid=$1 AND p.granted")
+        .bind(old_pid).bind(format!("{}.request_records",fixture.schema)).fetch_one(&fixture.admin).await.unwrap();
+    assert!(old_leaf_families >= 3);
     old.rollback().await.unwrap();
 
     let mut first = fixture.database.begin_write_transaction().await.unwrap();
@@ -485,6 +492,11 @@ async fn postgres_terminal_owner_read_lock_rechecks_pending_without_update_side_
     let locks = sqlx::query("WITH leaves AS (SELECT relid FROM pg_partition_tree($2::regclass) WHERE isleaf), families AS (SELECT relid, relid AS owner_leaf FROM leaves UNION ALL SELECT i.indexrelid, l.relid FROM leaves l JOIN pg_index i ON i.indrelid=l.relid), granted AS (SELECT DISTINCT f.owner_leaf FROM families f JOIN pg_locks p ON p.relation=f.relid WHERE p.pid=$1 AND p.granted) SELECT COUNT(*)::BIGINT AS leaf_families FROM granted")
         .bind(pid).bind(format!("{}.request_records", fixture.schema))
         .fetch_one(&fixture.admin).await.unwrap();
+    println!(
+        "TERMINAL_OWNER_LOCK_FAMILIES old={} new={}",
+        old_leaf_families,
+        locks.get::<i64, _>("leaf_families")
+    );
     assert_eq!(
         locks.get::<i64, _>("leaf_families"),
         1,
