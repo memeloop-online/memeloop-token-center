@@ -2465,6 +2465,21 @@ async fn semantic_coverage_committed_recovery_contract(database_url: String) {
             fixture.key.tenant_id, fixture.request_id, &before.2).await.unwrap().unwrap();
         assert_eq!(authority_before.publication.revision, authority_after.publication.revision);
         assert_eq!(authority_before.semantic_head.node_hash, authority_after.semantic_head.node_hash);
+        let after_expiry = db.resolve_history_raw_archive_roots(
+            fixture.key.tenant_id,fixture.key.key_id,frozen.clone()).await.unwrap();
+        assert_eq!(serde_json::to_vec(&after_expiry).unwrap(),serde_json::to_vec(&resolved).unwrap(),
+            "history authority must survive expiry of its SQL recovery bridge");
+        assert_eq!(serde_json::to_vec(&frozen).unwrap(),immutable);
+        let unmatched_after_expiry = db.resolve_history_raw_archive_roots(
+            fixture.key.tenant_id,fixture.key.key_id,other_locator.clone()).await.unwrap();
+        assert_eq!(serde_json::to_vec(&unmatched_after_expiry).unwrap(),unmatched_bytes,
+            "retirement of source B never substitutes for frozen Bound A");
+        let manifest_after = fixture.state.archive.get_semantic_manifest_streamed(
+            fixture.key.tenant_id,&authority_after.publication.manifest).await.unwrap();
+        let sources_after=manifest_after.raw_sources.unwrap();
+        for source in [sources_after.request,sources_after.response.unwrap()] {
+            fixture.state.archive.verify_tenant_content(fixture.key.tenant_id,&source).await.unwrap();
+        }
         // Delete winning first leaves no stale ACK: the original enqueue owns
         // a fresh pending snapshot/lease, and a second replay keeps that task.
         replay_retention_enqueue(&fixture,observed_at).await;
