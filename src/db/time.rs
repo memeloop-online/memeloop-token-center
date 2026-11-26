@@ -13,10 +13,64 @@ pub fn unix_millis() -> i64 {
     system_time_to_millis(SystemTime::now()).expect("system clock milliseconds fit i64")
 }
 
+/// A UTC calendar day; never a database driver date parameter.
+pub type UtcDay = ::time::Date;
+
+pub(crate) fn utc_day_from_millis(millis: i64) -> Option<UtcDay> {
+    ::time::OffsetDateTime::from_unix_timestamp_nanos(i128::from(millis) * 1_000_000)
+        .ok()
+        .map(|value| value.date())
+}
+
+pub(crate) fn utc_midnight_millis(day: UtcDay) -> Option<i64> {
+    i64::try_from(
+        day.midnight()
+            .assume_utc()
+            .unix_timestamp_nanos()
+            .div_euclid(1_000_000),
+    )
+    .ok()
+}
+
+pub(crate) fn utc_day_add(day: UtcDay, days: i64) -> Option<UtcDay> {
+    day.checked_add(::time::Duration::seconds(days.checked_mul(86_400)?))
+}
+
+pub(crate) fn format_utc_day(day: UtcDay, compact: bool) -> Option<String> {
+    let pattern = if compact {
+        "[year][month][day]"
+    } else {
+        "[year]-[month]-[day]"
+    };
+    let description = ::time::format_description::parse(pattern).ok()?;
+    day.format(&description).ok()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use std::time::Duration;
+
+    #[test]
+    fn utc_days_preserve_negative_epoch_midnight_and_leap_boundaries() {
+        let day = utc_day_from_millis(-1).unwrap();
+        assert_eq!(format_utc_day(day, false).as_deref(), Some("1969-12-31"));
+        assert_eq!(utc_midnight_millis(day), Some(-86_400_000));
+        assert_eq!(utc_day_from_millis(0), utc_day_add(day, 1));
+        let leap = ::time::Date::from_calendar_date(2024, ::time::Month::February, 29).unwrap();
+        assert_eq!(format_utc_day(leap, true).as_deref(), Some("20240229"));
+        assert_eq!(
+            format_utc_day(utc_day_add(leap, 1).unwrap(), false).as_deref(),
+            Some("2024-03-01")
+        );
+        assert_eq!(
+            utc_day_from_millis(utc_midnight_millis(leap).unwrap()),
+            Some(leap)
+        );
+        assert!(utc_day_add(::time::Date::MAX, 1).is_none());
+        assert!(utc_day_add(::time::Date::MIN, -1).is_none());
+        assert!(utc_day_from_millis(i64::MAX).is_none());
+    }
 
     #[test]
     fn signed_milliseconds_floor_at_epoch_boundaries() {

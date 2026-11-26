@@ -26,7 +26,7 @@ pub struct PartitionMaintenanceReport {
 pub struct BlockedPartition {
     pub table: String,
     pub partition: String,
-    pub day: chrono::NaiveDate,
+    pub day: super::time::UtcDay,
 }
 
 pub(crate) struct Migration {
@@ -2089,26 +2089,15 @@ fn migration_error_category(error: &sqlx::Error) -> &'static str {
 pub(super) async fn maintain_postgres_partitions(
     connection: &mut AnyConnection,
 ) -> Result<PartitionMaintenanceReport, sqlx::Error> {
-    let today = Utc::now().date_naive();
+    let date_error = || sqlx::Error::Protocol("UTC partition date is not representable".into());
+    let today = super::time::utc_day_from_millis(unix_millis()).ok_or_else(date_error)?;
     let mut report = PartitionMaintenanceReport::default();
-    for offset in 0..=8_u64 {
-        let day = today
-            .checked_add_days(Days::new(offset))
-            .expect("partition date is representable");
-        let next_day = day
-            .checked_add_days(Days::new(1))
-            .expect("partition end date is representable");
-        let start = day
-            .and_hms_opt(0, 0, 0)
-            .expect("midnight is representable")
-            .and_utc()
-            .timestamp_millis();
-        let end = next_day
-            .and_hms_opt(0, 0, 0)
-            .expect("midnight is representable")
-            .and_utc()
-            .timestamp_millis();
-        let suffix = day.format("%Y%m%d");
+    for offset in 0..=8_i64 {
+        let day = super::time::utc_day_add(today, offset).ok_or_else(date_error)?;
+        let next_day = super::time::utc_day_add(day, 1).ok_or_else(date_error)?;
+        let start = super::time::utc_midnight_millis(day).ok_or_else(date_error)?;
+        let end = super::time::utc_midnight_millis(next_day).ok_or_else(date_error)?;
+        let suffix = super::time::format_utc_day(day, true).ok_or_else(date_error)?;
         for table in ["request_records", "request_events"] {
             let partition = format!("{table}_{suffix}");
             // 已存在的分区不再下发 DDL。CREATE TABLE ... PARTITION OF 需要对父表
@@ -2135,7 +2124,7 @@ pub(super) async fn maintain_postgres_partitions(
                 .execute(&mut *connection)
                 .await?;
             // SQL safety boundary: table is selected from the two literals above, suffix is a
-            // chrono-rendered YYYYMMDD date, and bounds are server-generated i64 timestamps.
+            // library-rendered YYYYMMDD date, and bounds are server-generated i64 timestamps.
             // No request, configuration, or plugin value can enter this DDL statement.
             match sqlx::query(sqlx::AssertSqlSafe(statement))
                 .execute(&mut *connection)
