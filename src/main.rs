@@ -421,18 +421,12 @@ async fn run() -> Result<(), &'static str> {
                                     let _ = state.refresh_application_plugins().await;
                                 }
                             };
-                            let ordinary = async {
-                                if role.runs_worker() {
-                                    worker::run_until_shutdown_with_oauth_stop(
-                                        state.clone(),
-                                        receiver,
-                                        oauth_receiver,
-                                    )
-                                    .await;
-                                } else {
-                                    let _ = receiver.changed().await;
-                                }
-                            };
+                            let ordinary = worker::run_for_role_until_shutdown(
+                                state.clone(),
+                                role,
+                                receiver,
+                                oauth_receiver,
+                            );
                             #[cfg(feature = "experimental-plugin-revisions")]
                             tokio::select! {
                                 _ = ordinary => {},

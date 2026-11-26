@@ -1916,7 +1916,7 @@ impl Database {
                 ));
             }
         } else {
-            self.install_schema_track(super::capability::SchemaTrack::Linear165)?;
+            self.install_schema_track(super::capability::SchemaTrack::Linear166)?;
         }
         Ok(())
     }

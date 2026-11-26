@@ -15,6 +15,8 @@ use crate::{
 
 #[cfg(test)]
 mod background_actions_tests;
+#[cfg(test)]
+mod oauth_role_tests;
 
 const MAINTENANCE_INTERVAL: Duration = Duration::from_secs(6 * 60 * 60);
 const ORPHANED_RESERVATION_REAPER_INTERVAL: Duration = Duration::from_secs(5 * 60);
@@ -176,8 +178,48 @@ pub async fn wait_for_server_shutdown(
     }
 }
 
-/// Each role owns one bounded, serial lane. Slow provider calls do not block
-/// projections, maintenance, or observing the server shutdown signal.
+/// Shared process lifecycle for gateway, control, worker and combined roles.
+/// Every producer drains its own bounded queue; only worker roles renew OAuth.
+pub async fn run_for_role_until_shutdown(
+    state: AppState,
+    role: crate::config::RuntimeRole,
+    shutdown: watch::Receiver<bool>,
+    oauth_shutdown: watch::Receiver<bool>,
+) {
+    let delivery = async {
+        run_periodic(Duration::from_secs(1), shutdown.clone(), || {
+            state.upstream_quota.oauth_rejections.flush(&state)
+        })
+        .await;
+        // Bounded best-effort drain before this process exits. An unpersisted
+        // observation may be rediscovered by a later natural request.
+        let _ = tokio::time::timeout(
+            Duration::from_secs(3),
+            state.upstream_quota.oauth_rejections.flush(&state),
+        )
+        .await;
+    };
+    let background = async {
+        if role.runs_worker() {
+            run_until_shutdown_with_oauth_stop(state.clone(), shutdown.clone(), oauth_shutdown)
+                .await;
+        } else {
+            let mut shutdown = shutdown.clone();
+            wait_for_shutdown(&mut shutdown).await;
+        }
+    };
+    tokio::pin!(background);
+    tokio::select! {
+        _ = &mut background => {
+            // Preserve worker failure propagation to serve while draining
+            // local observations without keeping a dead worker process alive.
+            let _ = tokio::time::timeout(Duration::from_secs(3),
+                state.upstream_quota.oauth_rejections.flush(&state)).await;
+        }
+        _ = delivery => background.await,
+    }
+}
+
 pub async fn run_until_shutdown(state: AppState, shutdown: watch::Receiver<bool>) {
     run_until_shutdown_with_oauth_stop(state, shutdown.clone(), shutdown).await;
 }
@@ -276,13 +318,6 @@ pub(crate) async fn run_until_shutdown_with_reaper_period(
             }
         }};
     }
-    periodic!(
-        "oauth_rejection_delivery",
-        Duration::from_secs(1),
-        async |state: &AppState, _shutdown: &watch::Receiver<bool>| {
-            state.upstream_quota.oauth_rejections.flush(state).await;
-        }
-    );
     periodic!(
         "oauth_quota_verification",
         Duration::from_secs(5),

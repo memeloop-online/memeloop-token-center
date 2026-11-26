@@ -23,6 +23,7 @@ pub enum SchemaTrack {
     Legacy163,
     Linear164,
     Linear165,
+    Linear166,
 }
 #[derive(Clone, Debug, Eq, PartialEq, Serialize)]
 pub struct ColumnContract {
@@ -77,7 +78,7 @@ pub fn manifest() -> CapabilityManifest {
             CapabilityRole::Maintenance,
         ]
         .into_iter()
-        .map(|role| (role, permissions::requirements(role)))
+        .map(|role| (role, permissions::requirements_at(role, 166)))
         .collect(),
         nodes: vec![
             CapabilityNode {
@@ -108,6 +109,32 @@ pub fn manifest() -> CapabilityManifest {
                 }],
             },
             history::baseline_receipt(),
+            CapabilityNode {
+                id: "oauth.rejected_generation.v1",
+                semantic_version: "1.0.0",
+                prerequisites: &["schema.legacy163.v1"],
+                migration_source_digest: blake3::hash(include_bytes!(
+                    "../../migrations/common/0166_oauth_rejected_generation.sql"
+                ))
+                .to_hex()
+                .to_string(),
+                columns: [
+                    ("upstream_account_id", "text", false),
+                    ("credential_generation", "bigint", false),
+                    ("observed_at", "bigint", false),
+                    ("verification_started_at", "bigint", true),
+                    ("verification_finished_at", "bigint", true),
+                    ("verification_error_code", "text", true),
+                ]
+                .into_iter()
+                .map(|(name, postgres_type, nullable)| ColumnContract {
+                    table: "upstream_oauth_rejected_generations",
+                    name,
+                    postgres_type,
+                    nullable,
+                })
+                .collect(),
+            },
         ],
     }
 }
