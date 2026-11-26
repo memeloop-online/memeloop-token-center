@@ -41,7 +41,7 @@ async fn seed() -> Result<()> {
         || !mock_url
             .host_str()
             .is_some_and(|s| s.ends_with("-oauth-fixture"))
-        || !cluster_path.starts_with("/api/v1/namespaces/")
+        || !(cluster_path.starts_with("/api/") || cluster_path.starts_with("/apis/"))
         || cluster_path.contains('?')
         || namespace.contains('/')
     {
