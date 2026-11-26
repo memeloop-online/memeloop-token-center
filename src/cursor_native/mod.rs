@@ -48,10 +48,18 @@ pub(crate) async fn quota_usage(
         state,
         credential,
         Method::CurrentPeriodUsage,
-        (trigger != crate::upstream_quota::QuotaReadTrigger::PostRenewalVerification)
-            .then_some((account.id, account.credential_generation)),
+        quota_rejection(account.id, account.credential_generation, trigger),
     )
     .await
+}
+
+fn quota_rejection(
+    account: uuid::Uuid,
+    generation: i64,
+    trigger: crate::upstream_quota::QuotaReadTrigger,
+) -> Option<(uuid::Uuid, i64)> {
+    (trigger != crate::upstream_quota::QuotaReadTrigger::PostRenewalVerification)
+        .then_some((account, generation))
 }
 
 async fn unary_with_rejection(
@@ -160,6 +168,99 @@ mod tests {
         Mock, MockServer, ResponseTemplate,
         matchers::{body_bytes, header, method, path},
     };
+
+    #[tokio::test]
+    async fn cursor_usage_rejection_distinguishes_verification_and_optional_reads() {
+        use crate::upstream_quota::QuotaReadTrigger;
+        let directory = tempfile::tempdir().unwrap();
+        let state = AppState::initialize(crate::config::Config::for_test(format!(
+            "sqlite://{}?mode=rwc",
+            directory.path().join("cursor-rejection.db").display()
+        )))
+        .await
+        .unwrap();
+        let account = state
+            .db
+            .create_upstream_account(
+                crate::db::CreateUpstreamAccountInput {
+                    tenant_external_id: "cursor-rejection".into(),
+                    name: "fixture".into(),
+                    driver: "cursor".into(),
+                    config: serde_json::json!({}),
+                    credential: UpstreamCredential::OAuth {
+                        access_token: "fixture-token".into(),
+                        refresh_token: Some("fixture-refresh".into()),
+                        expires_at: Some(crate::db::unix_millis() + 86_400_000),
+                        header: "authorization".into(),
+                        prefix: "Bearer ".into(),
+                        adapter_state: None,
+                        proxy_url: None,
+                        proxy_network_scope: None,
+                    },
+                    oauth_session_id: Some(uuid::Uuid::now_v7()),
+                    oauth_driver: Some("cursor".into()),
+                    oauth_refresh_url: Some("https://refresh.example.test".into()),
+                },
+                state.config.key_pepper.as_bytes(),
+            )
+            .await
+            .unwrap();
+        let server = MockServer::start().await;
+        for status in [401, 403] {
+            Mock::given(path(format!("/{status}")))
+                .respond_with(ResponseTemplate::new(status))
+                .mount(&server)
+                .await;
+        }
+        let client = crate::build_no_retry_http_client(None, &[]).unwrap();
+        for (status, evidence) in [
+            (
+                403,
+                quota_rejection(account.id, 1, QuotaReadTrigger::Manual),
+            ),
+            (
+                401,
+                quota_rejection(account.id, 1, QuotaReadTrigger::PostRenewalVerification),
+            ),
+            (401, None), // Optional plan/model RPCs never carry account evidence.
+        ] {
+            assert_eq!(
+                send_with_rejection(
+                    &client,
+                    &format!("{}/{status}", server.uri()),
+                    "fixture-token",
+                    evidence.map(|(id, generation)| (&state.db, id, generation))
+                )
+                .await,
+                Err("authentication_failed")
+            );
+            assert!(
+                !state
+                    .db
+                    .has_rejected_oauth_generation(account.id, 1)
+                    .await
+                    .unwrap()
+            );
+        }
+        let evidence = quota_rejection(account.id, 1, QuotaReadTrigger::BackgroundRecovery);
+        assert_eq!(
+            send_with_rejection(
+                &client,
+                &format!("{}/401", server.uri()),
+                "fixture-token",
+                evidence.map(|(id, generation)| (&state.db, id, generation))
+            )
+            .await,
+            Err("authentication_failed")
+        );
+        assert!(
+            state
+                .db
+                .has_rejected_oauth_generation(account.id, 1)
+                .await
+                .unwrap()
+        );
+    }
 
     #[tokio::test]
     async fn binary_unary_contract_and_redacted_errors() {

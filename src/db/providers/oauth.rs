@@ -889,8 +889,18 @@ impl Database {
         let mut tx = self
             .begin_upstream_oauth_write_transaction(account_id, OAuthRefreshWritePhase::Claim)
             .await?;
+        let replay = claim_credential_rotation(
+            &mut tx,
+            UPSTREAM_OAUTH_REFRESH_RESOURCE,
+            account_id,
+            idempotency_key,
+            &request_hash,
+            now,
+            expires_at,
+        )
+        .await?;
         if expected_generation.is_some() {
-            // Lock before replay/pending recovery too: a late signal must not
+            // Preserve idempotency → account lock order before replay recovery: a late signal must not
             // revive a disabled account through a saved refresh response.
             let select = match self.backend {
                 DatabaseBackend::PostgreSql => {
@@ -909,16 +919,6 @@ impl Database {
                 ));
             }
         }
-        let replay = claim_credential_rotation(
-            &mut tx,
-            UPSTREAM_OAUTH_REFRESH_RESOURCE,
-            account_id,
-            idempotency_key,
-            &request_hash,
-            now,
-            expires_at,
-        )
-        .await?;
         if let Some(replay) = replay {
             if replay.response_ciphertext.is_some() {
                 let view = open_rotation_replay(replay, now)?;
@@ -1004,11 +1004,6 @@ impl Database {
             ));
         }
         let generation: i64 = account.try_get("credential_generation")?;
-        if expected_generation.is_some() && account.try_get::<String, _>("status")? != "active" {
-            return Err(AppError::Conflict(
-                "OAuth account was disabled before automatic refresh".into(),
-            ));
-        }
         if expected_generation.is_some_and(|expected| expected != generation) {
             return Err(AppError::Conflict(
                 "OAuth credential changed after automatic refresh was scheduled".into(),
