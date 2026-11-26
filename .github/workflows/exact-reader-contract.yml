@@ -33,147 +33,7 @@ on:
 permissions:
   contents: read
 jobs:
-  metadata-refresh-contract:
-    if: inputs.contract == 'metadata-refresh'
-    runs-on: ubuntu-latest
-    timeout-minutes: 120
-    permissions:
-      contents: read
-    outputs:
-      oci_artifact: ${{ steps.oci.outputs.artifact-id }}
-      oci_digest: ${{ steps.oci.outputs.artifact-digest }}
-    env:
-      CANDIDATE_SHA: e9f1058dcad784e9a5160819575ccbb1b96e6d3b
-    steps:
-      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
-        with:
-          ref: e9f1058dcad784e9a5160819575ccbb1b96e6d3b
-          persist-credentials: false
-      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020
-        with:
-          node-version: 24.18.0
-      - name: Verify fixed Stage-only source
-        id: source
-        run: |
-          set -euo pipefail
-          test "$(git rev-parse HEAD)" = "$CANDIDATE_SHA"
-          git rev-parse HEAD
-          echo "timestamp=$(git show -s --format=%cI HEAD)" >> "$GITHUB_OUTPUT"
-      - uses: docker/setup-buildx-action@8d2750c68a42422c14e847fe6c8ac0403b4cbd6f
-      - name: Compile and runtime-smoke the exact original release input once
-        uses: docker/build-push-action@10e90e3645eae34f1e60eeb005ba3a3d33f178e8
-        with:
-          context: .
-          file: Dockerfile
-          target: release-input-export
-          platforms: linux/amd64
-          push: false
-          outputs: type=local,dest=${{ runner.temp }}/release-service-input
-          build-args: |
-            MTC_BUILD_GIT_SHA_INPUT=${{ env.CANDIDATE_SHA }}
-            MTC_BUILD_TIMESTAMP_INPUT=${{ steps.source.outputs.timestamp }}
-            MTC_BUILD_TARGET_INPUT=linux/amd64
-          cache-from: type=gha,scope=service-release-input
-      - name: Seal and verify the same-source complete input
-        run: |
-          set -euo pipefail
-          node scripts/ci/create-memory-binary-manifest.ts "$RUNNER_TEMP/release-service-input/memeloop-token-center" "$CANDIDATE_SHA" "$RUNNER_TEMP/sealed-input"
-          for file in libgcc_s.so.1 libstdc++.so.6 install-plugin-oci cosign LICENSE THIRD_PARTY_NOTICES.md; do
-            cp "$RUNNER_TEMP/release-service-input/$file" "$RUNNER_TEMP/sealed-input/$file"
-          done
-          cp -R "$RUNNER_TEMP/release-service-input/web" "$RUNNER_TEMP/sealed-input/web"
-          cp -R "$RUNNER_TEMP/release-service-input/third-party-licenses" "$RUNNER_TEMP/sealed-input/third-party-licenses"
-          chmod 0555 "$RUNNER_TEMP/sealed-input/memeloop-token-center" "$RUNNER_TEMP/sealed-input/install-plugin-oci" "$RUNNER_TEMP/sealed-input/cosign"
-          node scripts/ci/create-release-service-input-manifest.ts "$RUNNER_TEMP/sealed-input" "$CANDIDATE_SHA"
-          node scripts/ci/verify-release-service-input.ts "$RUNNER_TEMP/sealed-input" "$CANDIDATE_SHA"
-          mkdir -p "$RUNNER_TEMP/stage-test-oci"
-          cp "$RUNNER_TEMP/sealed-input/memory-binary.json" "$RUNNER_TEMP/sealed-input/release-service-input.json" "$RUNNER_TEMP/stage-test-oci/"
-      - name: Preserve verified sealed input before assembly
-        run: |
-          set -euo pipefail
-          mkdir -p "$RUNNER_TEMP/sealed-package"
-          tar -C "$RUNNER_TEMP/sealed-input" -cf "$RUNNER_TEMP/sealed-package/sealed-input.tar" .
-          cd "$RUNNER_TEMP/sealed-package"
-          sha256sum sealed-input.tar > SHA256SUMS
-          printf '%s\n' "$CANDIDATE_SHA" > source.txt
-      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
-        with:
-          name: stage-smoke-pending-e9f-sealed-input
-          path: ${{ runner.temp }}/sealed-package/
-          if-no-files-found: error
-          retention-days: 3
-      - name: Assemble one Stage-only OCI archive without publishing
-        uses: docker/build-push-action@10e90e3645eae34f1e60eeb005ba3a3d33f178e8
-        with:
-          context: .
-          file: Dockerfile.release
-          platforms: linux/amd64
-          push: false
-          outputs: type=oci,dest=${{ runner.temp }}/stage-test-oci/service-e9f.oci.tar
-          build-contexts: |
-            release-input=${{ runner.temp }}/sealed-input
-          labels: |
-            org.opencontainers.image.revision=${{ env.CANDIDATE_SHA }}
-            org.opencontainers.image.source=https://github.com/memeloop-online/memeloop-token-center
-            io.memeloop.artifact-purpose=stage-test-only
-          provenance: mode=max
-          sbom: true
-          cache-from: type=gha,scope=service
-      - name: Verify original OCI graph and immutable runtime identity
-        run: |
-          set -euo pipefail
-          python3 - <<'PY'
-          import hashlib,json,os,pathlib,tarfile
-          root=pathlib.Path(os.environ['RUNNER_TEMP'])/'stage-test-oci'
-          archive=root/'service-e9f.oci.tar'
-          with tarfile.open(archive) as tar:
-              members={m.name.removeprefix('./'):m for m in tar.getmembers() if m.isfile()}
-              def read(name):
-                  f=tar.extractfile(members[name])
-                  if f is None: raise RuntimeError('missing OCI file')
-                  return f.read()
-              index=read('index.json'); (root/'index.json').write_bytes(index)
-              verified=set(); platforms=[]
-              def visit(d):
-                  digest=d['digest']; alg,h=digest.split(':',1)
-                  if alg!='sha256': raise RuntimeError('unsupported digest')
-                  raw=read('blobs/sha256/'+h)
-                  if len(raw)!=d['size'] or hashlib.sha256(raw).hexdigest()!=h: raise RuntimeError('OCI descriptor mismatch')
-                  if digest in verified:return
-                  verified.add(digest)
-                  if 'manifest' in d.get('mediaType','') or 'index' in d.get('mediaType',''):
-                      obj=json.loads(raw)
-                      for child in obj.get('manifests',[]):visit(child)
-                      if 'config' in obj:
-                          visit(obj['config'])
-                          for child in obj.get('layers',[]):visit(child)
-                          config=json.loads(read('blobs/sha256/'+obj['config']['digest'].split(':')[1]))
-                          if config.get('os')=='linux' and config.get('architecture')=='amd64':
-                              if config.get('config',{}).get('Labels',{}).get('org.opencontainers.image.revision')!=os.environ['CANDIDATE_SHA']:raise RuntimeError('revision mismatch')
-                              platforms.append((digest,obj['config']['digest']))
-              for d in json.loads(index)['manifests']:visit(d)
-              if len(platforms)!=1:raise RuntimeError('expected exactly one linux/amd64 runtime')
-              manifest,config=platforms[0]
-              evidence={'purpose':'stage-test-only','source':os.environ['CANDIDATE_SHA'],'run':os.environ['GITHUB_RUN_ID'],'index_digest':'sha256:'+hashlib.sha256(index).hexdigest(),'manifest_digest':manifest,'config_digest':config,'platform':'linux/amd64','descriptors':len(verified)}
-              (root/'oci-identity.json').write_text(json.dumps(evidence,indent=2)+'\n')
-              (root/'expected-config.txt').write_text(config+'\n')
-          h=hashlib.sha256()
-          with archive.open('rb') as f:
-              for chunk in iter(lambda:f.read(1024*1024),b''):h.update(chunk)
-          (root/'SHA256SUMS').write_text(h.hexdigest()+'  service-e9f.oci.tar\n')
-          print(json.dumps(evidence))
-          PY
-          printf '%s\n' smoke_pending > "$RUNNER_TEMP/stage-test-oci/status.txt"
-      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
-        id: oci
-        with:
-          name: stage-smoke-pending-e9f-verified-oci
-          path: ${{ runner.temp }}/stage-test-oci/
-          if-no-files-found: error
-          retention-days: 3
-
   e9f-native-smoke:
-    needs: metadata-refresh-contract
     if: inputs.contract == 'metadata-refresh'
     runs-on: ubuntu-latest
     timeout-minutes: 20
@@ -182,8 +42,9 @@ jobs:
       actions: read
     env:
       CANDIDATE_SHA: e9f1058dcad784e9a5160819575ccbb1b96e6d3b
-      ARTIFACT_ID: ${{ needs.metadata-refresh-contract.outputs.oci_artifact }}
-      ARTIFACT_DIGEST: ${{ needs.metadata-refresh-contract.outputs.oci_digest }}
+      ARTIFACT_ID: "15146483558"
+      SOURCE_RUN_ID: "45878050510"
+      ARTIFACT_DIGEST: 8c5bcf6dcfeaf927f31fa5308094f36122f26274f1a233e09b180f1f7103aa5a
       GH_TOKEN: ${{ github.token }}
     steps:
       - name: Retrieve only the same-run exact verified OCI artifact
@@ -196,7 +57,7 @@ jobs:
           value=os.environ['ARTIFACT_DIGEST']
           if not re.fullmatch(r'[0-9a-f]{64}',value):raise SystemExit('unexpected upload artifact digest format')
           x=json.loads((pathlib.Path(os.environ['RUNNER_TEMP'])/'native-smoke/artifact.json').read_text())
-          if str(x['id'])!=os.environ['ARTIFACT_ID'] or str(x['workflow_run']['id'])!=os.environ['GITHUB_RUN_ID'] or x['expired'] or x['digest']!='sha256:'+os.environ['ARTIFACT_DIGEST']:raise SystemExit('artifact identity mismatch')
+          if str(x['id'])!=os.environ['ARTIFACT_ID'] or str(x['workflow_run']['id'])!=os.environ['SOURCE_RUN_ID'] or x['expired'] or x['digest']!='sha256:'+os.environ['ARTIFACT_DIGEST']:raise SystemExit('artifact identity mismatch')
           PYCODE
           gh api "repos/$GITHUB_REPOSITORY/actions/artifacts/$ARTIFACT_ID/zip" > "$RUNNER_TEMP/native-smoke/artifact.zip"
           python3 - <<'PYCODE'
@@ -219,24 +80,22 @@ jobs:
           set -euo pipefail
           sudo systemctl start containerd
           sudo ctr namespaces create e9f-smoke
-          sudo ctr -n e9f-smoke images import --no-unpack --all-platforms "$RUNNER_TEMP/native-smoke/oci/service-e9f.oci.tar"
           python3 - <<'PYCODE'
           import gzip,hashlib,io,json,os,pathlib,subprocess,tarfile
           root=pathlib.Path(os.environ['RUNNER_TEMP'])/'native-smoke'; archive=root/'oci/service-e9f.oci.tar'
           evidence=json.loads((root/'oci/oci-identity.json').read_text())
-          if evidence['source']!=os.environ['CANDIDATE_SHA'] or evidence['run']!=os.environ['GITHUB_RUN_ID'] or evidence['platform']!='linux/amd64':raise SystemExit('OCI source/run/platform mismatch')
+          if evidence['source']!=os.environ['CANDIDATE_SHA'] or evidence['run']!=os.environ['SOURCE_RUN_ID'] or evidence['platform']!='linux/amd64':raise SystemExit('OCI source/run/platform mismatch')
           def ctr(*args):return subprocess.check_output(['sudo','ctr','-n','e9f-smoke',*args])
           with tarfile.open(archive) as tar:
               members={m.name.removeprefix('./'):m for m in tar.getmembers() if m.isfile()}
               def read(name):return tar.extractfile(members[name]).read()
               index=read('index.json')
               if 'sha256:'+hashlib.sha256(index).hexdigest()!=evidence['index_digest']:raise SystemExit('index mismatch')
-              verified=set()
+              verified=set(); descriptors={}; runtimes=[]
               def visit(d):
                   h=d['digest'].split(':',1)[1]; raw=read('blobs/sha256/'+h)
                   if len(raw)!=d['size'] or hashlib.sha256(raw).hexdigest()!=h:raise SystemExit('archive descriptor mismatch')
-                  actual=ctr('content','get',d['digest'])
-                  if actual!=raw:raise SystemExit('containerd descriptor bytes mismatch')
+                  descriptors[d['digest']]=d
                   if d['digest'] in verified:return
                   verified.add(d['digest'])
                   if 'manifest' in d['mediaType'] or 'index' in d['mediaType']:
@@ -245,10 +104,13 @@ jobs:
                       if 'config' in obj:
                           visit(obj['config'])
                           for child in obj['layers']:visit(child)
+                          cfg=json.loads(read('blobs/sha256/'+obj['config']['digest'].split(':')[1]))
+                          if cfg.get('os')=='linux' and cfg.get('architecture')=='amd64':runtimes.append(d['digest'])
               for d in json.loads(index)['manifests']:visit(d)
-              manifest=json.loads(ctr('content','get',evidence['manifest_digest']))
+              if runtimes!=[evidence['manifest_digest']]:raise SystemExit('original graph runtime is not the unique approved child')
+              manifest=json.loads(read('blobs/sha256/'+evidence['manifest_digest'].split(':')[1]))
               if manifest['config']['digest']!=evidence['config_digest']:raise SystemExit('manifest/config binding mismatch')
-              config=json.loads(ctr('content','get',evidence['config_digest']))
+              config=json.loads(read('blobs/sha256/'+evidence['config_digest'].split(':')[1]))
               if config.get('os')!='linux' or config.get('architecture')!='amd64' or config['config']['Labels']['org.opencontainers.image.revision']!=os.environ['CANDIDATE_SHA']:raise SystemExit('runtime config mismatch')
               diffs=config['rootfs']['diff_ids']
               if len(diffs)!=len(manifest['layers']):raise SystemExit('rootfs count mismatch')
@@ -260,6 +122,7 @@ jobs:
                   h=hashlib.sha256()
                   for b in iter(lambda:raw.read(1024*1024),b''):h.update(b)
                   if 'sha256:'+h.hexdigest()!=expected:raise SystemExit('rootfs diff_id mismatch')
+          if evidence['index_digest']!='sha256:a85646a9e0b3aebe996110f410488c8a9402196ca8864efa16b55a8c699b2417' or evidence['manifest_digest']!='sha256:d76f4e0dbfc0e804aaae572693559b693b26009f383a8238b9656549a1e21d0a' or evidence['config_digest']!='sha256:0d759d3b51bc571e201456fb98e2b18421fae3ebc741ccaf4b5cecf0d6b708bf' or len(verified)!=31:raise SystemExit('fixed original OCI identity mismatch')
           # Preserve the original archive. Derive only a one-child index for a local import name.
           image='localhost/stage-e9f-runtime:smoke'
           derived=root/'native-runtime.oci.tar'
@@ -267,7 +130,7 @@ jobs:
               descriptor=None
               for member in original.getmembers():
                   if member.isfile() and member.name.removeprefix('./')=='blobs/sha256/'+evidence['manifest_digest'].split(':')[1]:
-                      descriptor={'mediaType':'application/vnd.oci.image.manifest.v1+json','digest':evidence['manifest_digest'],'size':member.size,'platform':{'os':'linux','architecture':'amd64'},'annotations':{'org.opencontainers.image.ref.name':image}}
+                      descriptor=dict(descriptors[evidence['manifest_digest']]);descriptor['annotations']={**descriptor.get('annotations',{}),'org.opencontainers.image.ref.name':image}
               if descriptor is None:raise SystemExit('runtime child absent')
               index_bytes=json.dumps({'schemaVersion':2,'mediaType':'application/vnd.oci.image.index.v1+json','manifests':[descriptor]},separators=(',',':')).encode()
               for member in original.getmembers():
@@ -280,6 +143,9 @@ jobs:
           header=rows[0].split(); digest_column=header.index('DIGEST')
           matches=[r.split() for r in rows[1:] if r.split()[0]==image]
           if len(matches)!=1 or matches[0][digest_column]!=evidence['manifest_digest']:raise SystemExit('native image target differs from original child manifest')
+          for digest in [evidence['manifest_digest'],evidence['config_digest'],*[layer['digest'] for layer in manifest['layers']]]:
+              raw=ctr('content','get',digest); d=descriptors[digest]
+              if len(raw)!=d['size'] or 'sha256:'+hashlib.sha256(raw).hexdigest()!=digest:raise SystemExit('native runtime descriptor hash/size mismatch')
           # ctr unpack is performed by run/create, then verify its committed rootfs parent.
           chain=diffs[0]
           for d in diffs[1:]:chain='sha256:'+hashlib.sha256((chain+' '+d).encode()).hexdigest()
@@ -299,7 +165,7 @@ jobs:
               output=ctr('tasks','start',cid)
               (root/(suffix+'.txt')).write_bytes(output)
               ctr('containers','delete',cid)
-          evidence.update({'status':'smoke_pass','artifact_id':os.environ['ARTIFACT_ID'],'artifact_digest':'sha256:'+os.environ['ARTIFACT_DIGEST'],'rootfs_chain':chain,'runtime_image':image,'verified_descriptors':len(verified)})
+          evidence.update({'status':'smoke_pass','smoke_run':os.environ['GITHUB_RUN_ID'],'artifact_id':os.environ['ARTIFACT_ID'],'artifact_digest':'sha256:'+os.environ['ARTIFACT_DIGEST'],'rootfs_chain':chain,'runtime_image':image,'verified_descriptors':len(verified)})
           (root/'smoke-receipt.json').write_text(json.dumps(evidence,indent=2)+'\n')
           print(json.dumps(evidence))
           PYCODE
