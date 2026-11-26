@@ -16,6 +16,8 @@ use crate::{
 #[cfg(test)]
 mod background_actions_tests;
 #[cfg(test)]
+mod oauth_refresh_cas_tests;
+#[cfg(test)]
 mod oauth_role_tests;
 
 const MAINTENANCE_INTERVAL: Duration = Duration::from_secs(6 * 60 * 60);
