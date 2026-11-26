@@ -23,7 +23,12 @@ async fn synthetic_scoped_response_route_preserves_binding_and_revert_reads() {
     archive.write_rules = rules.clone();
     assert!(archive.resolve(&old_primary.canonical_prefix()).is_ok());
     assert!(old_primary.backend_identity.is_none());
-    for (scope, qualified) in [(Some(a), true), (Some(b), false), (None, false)] {
+    for (scope, qualified) in [
+        (Some(a), true),
+        (Some(b), false),
+        (None, false),
+        (Some(trusted_scope(Uuid::now_v7(), a_key)), false),
+    ] {
         archive.write_rules = rules.clone();
         let selected = archive
             .new_response_staging_key(Uuid::now_v7(), scope)

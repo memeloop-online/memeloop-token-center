@@ -210,12 +210,6 @@ impl ArchiveStore {
 }
 
 impl TrustedArchiveWriteScope {
-    pub(super) fn synthetic(tenant: uuid::Uuid, key: uuid::Uuid) -> Self {
-        Self { tenant, key }
-    }
-}
-
-impl TrustedArchiveWriteScope {
     pub(crate) fn belongs_to(self, tenant: uuid::Uuid) -> bool {
         self.tenant == tenant
     }
