@@ -772,9 +772,30 @@ impl Fixture {
         admission: Option<crate::gateway_body::request_spool::RequestSpoolAdmission>,
         archive_before_terminal: ArchiveBeforeTerminal,
     ) -> Self {
-        let mut state = AppState::initialize(Config::for_test(database_url))
-            .await
-            .unwrap();
+        Self::new_with_runtime_config(
+            Config::for_test(database_url),
+            inline_request,
+            protocol,
+            admission,
+            archive_before_terminal,
+            false,
+        )
+        .await
+    }
+
+    async fn new_with_runtime_config(
+        config: Config,
+        inline_request: bool,
+        protocol: Option<&str>,
+        admission: Option<crate::gateway_body::request_spool::RequestSpoolAdmission>,
+        archive_before_terminal: ArchiveBeforeTerminal,
+        maintenance: bool,
+    ) -> Self {
+        let mut state = if maintenance {
+            AppState::initialize_for_maintenance(config).await.unwrap()
+        } else {
+            AppState::initialize(config).await.unwrap()
+        };
         if let Some(admission) = admission {
             state.responses_request_spool = admission;
         }
@@ -3314,3 +3335,6 @@ async fn postgres_exact_legacy_body_rebuild_preserves_incomplete_and_financial_r
 
 #[path = "rebuild_partition_tests.rs"]
 mod rebuild_partition_tests;
+
+#[path = "stage_exact_fixture.rs"]
+mod stage_exact_fixture;
