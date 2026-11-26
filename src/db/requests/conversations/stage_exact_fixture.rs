@@ -5,6 +5,16 @@ use sha2::{Digest, Sha256};
 #[tokio::test]
 #[ignore = "sole Stage owner supplies the isolated database, bucket and fixed synthetic inputs"]
 async fn stage165_prepare_reviewed_exact_fixture() {
+    prepare_stage165_fixture(false).await;
+}
+
+#[tokio::test]
+#[ignore = "sole Stage owner supplies the separate empty complete-fixture database and bucket"]
+async fn stage165_prepare_completed_reviewed_exact_fixture() {
+    prepare_stage165_fixture(true).await;
+}
+
+async fn prepare_stage165_fixture(completed: bool) {
     let directory = std::path::PathBuf::from(
         std::env::var("MTC_STAGE_EXACT_INPUT_DIR").expect("fixed Stage input directory"),
     );
@@ -17,12 +27,22 @@ async fn stage165_prepare_reviewed_exact_fixture() {
     let response = std::fs::read(directory.join("response.json")).unwrap();
     let request_json: serde_json::Value = serde_json::from_slice(&request).unwrap();
     let response_json: serde_json::Value = serde_json::from_slice(&response).unwrap();
-    assert_eq!(response_json["status"], "incomplete");
+    let (database_name, bucket_name, response_status) = if completed {
+        (
+            "mtc_exact_recovery_complete_20261126",
+            "mtc-exact-recovery-complete-20261126",
+            "completed",
+        )
+    } else {
+        (
+            "mtc_exact_recovery_20261126",
+            "mtc-exact-recovery-20261126",
+            "incomplete",
+        )
+    };
+    assert_eq!(response_json["status"], response_status);
     let mut config = Config::from_env().unwrap();
-    assert_eq!(
-        config.s3_bucket.as_deref(),
-        Some("mtc-exact-recovery-20261126")
-    );
+    assert_eq!(config.s3_bucket.as_deref(), Some(bucket_name));
     assert!(matches!(
         config.archive_backend,
         crate::config::ArchiveBackend::S3
@@ -37,7 +57,7 @@ async fn stage165_prepare_reviewed_exact_fixture() {
         .fetch_one(&check.pool)
         .await
         .unwrap();
-    assert_eq!(database, "mtc_exact_recovery_20261126");
+    assert_eq!(database, database_name);
     let schema: i64 = sqlx::query_scalar("SELECT MAX(version) FROM schema_migrations")
         .fetch_one(&check.pool)
         .await
@@ -157,6 +177,7 @@ async fn stage165_prepare_reviewed_exact_fixture() {
     let row = sqlx::query("SELECT projected_at,semantic_snapshot_json,lease_owner,lease_expires_at,terminal_lease_owner,terminal_lease_expires_at FROM conversation_projection_outbox WHERE request_id=$1 AND tenant_id=$2 AND key_id=$3")
         .bind(fixture.request_id.to_string()).bind(fixture.key.tenant_id.to_string()).bind(fixture.key.key_id.to_string()).fetch_one(&db.pool).await.unwrap();
     let snapshot: String = row.try_get("semantic_snapshot_json").unwrap();
+    std::fs::write(output.join("snapshot-before.json"), &snapshot).unwrap();
     assert!(
         row.try_get::<Option<i64>, _>("projected_at")
             .unwrap()
@@ -173,7 +194,7 @@ async fn stage165_prepare_reviewed_exact_fixture() {
     let plan = serde_json::json!({"format_version":1,"tenant_id":fixture.key.tenant_id,"key_id":fixture.key.key_id,"request_id":fixture.request_id,"expected_projected_at":0,"request":source(0,&request),"response":source(1,&response)});
     let plan_bytes = serde_json::to_vec_pretty(&plan).unwrap();
     std::fs::write(output.join("plan.json"), &plan_bytes).unwrap();
-    let prior = serde_json::json!({"format_version":1,"identity":blake3::hash(&plan_bytes).to_hex().to_string(),"request_id":fixture.request_id,"claim_intent":true,"claimed":true,"lease_owner":owner,"canonical_rebuilt":false,"financial_replay":false,"fixture_only":true,"fixture_run_uid":run_uid,"synthetic_empty_marker_normalized":true,"empty_snapshot_before":empty,"claim_method":"real_initial_exact_claim_after_synthetic_empty_marker_normalization","prepared_snapshot_sha256":format!("{:x}",Sha256::digest(snapshot.as_bytes())),"actual_lease_expires_at":expiry});
+    let prior = serde_json::json!({"format_version":1,"identity":blake3::hash(&plan_bytes).to_hex().to_string(),"request_id":fixture.request_id,"claim_intent":true,"claimed":true,"lease_owner":owner,"canonical_rebuilt":false,"financial_replay":false,"fixture_only":true,"fixture_run_uid":run_uid,"fixture_response_status":response_status,"synthetic_empty_marker_normalized":true,"empty_snapshot_before":empty,"claim_method":"real_initial_exact_claim_after_synthetic_empty_marker_normalization","prepared_snapshot_sha256":format!("{:x}",Sha256::digest(snapshot.as_bytes())),"actual_lease_expires_at":expiry});
     std::fs::write(
         output.join("prior.json"),
         serde_json::to_vec_pretty(&prior).unwrap(),
@@ -192,4 +213,76 @@ async fn stage165_prepare_reviewed_exact_fixture() {
     );
     // Do not shorten the real lease or run the writer. The operator waits for
     // DB time to pass expiry, then separately inspects and reviews the handover.
+}
+
+/// Read-only reconciliation of the already completed partial fixture. It uses
+/// the project's completion-receipt contract, not JSON formatting assumptions.
+#[tokio::test]
+#[ignore = "sole Stage owner supplies the original partial fixture inputs and isolated database"]
+async fn stage165_verify_prepared_snapshot_receipt() {
+    let directory = std::path::PathBuf::from(
+        std::env::var("MTC_STAGE_EXACT_INPUT_DIR").expect("original fixed Stage inputs"),
+    );
+    let prior: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(directory.join("prepared/prior.json")).unwrap())
+            .unwrap();
+    let plan_bytes = std::fs::read(directory.join("prepared/plan.json")).unwrap();
+    let plan: serde_json::Value = serde_json::from_slice(&plan_bytes).unwrap();
+    assert_eq!(
+        prior["identity"],
+        blake3::hash(&plan_bytes).to_hex().to_string()
+    );
+    let request: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(directory.join("request.json")).unwrap()).unwrap();
+    let response: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(directory.join("response.json")).unwrap()).unwrap();
+    assert_eq!(response["status"], "incomplete");
+    let body = crate::conversation::session_body_from_documents(&request, &response);
+    let (atoms, nodes) = body.into_prefix();
+    let expected = serde_json::to_string(&ConversationSemanticSnapshot {
+        leaf: nodes.last().map(|node| node.node_hash.clone()),
+        atom_hashes: bounded_atom_hashes(&atoms),
+        payload_digest: None,
+    })
+    .unwrap();
+    let expected_sha256 = format!("{:x}", Sha256::digest(expected.as_bytes()));
+    assert_eq!(prior["prepared_snapshot_sha256"], expected_sha256);
+    let config = Config::from_env().unwrap();
+    let db = Database::connect(&config.database_url).await.unwrap();
+    let mut read = db.pool.begin().await.unwrap();
+    sqlx::query("SET TRANSACTION READ ONLY")
+        .execute(&mut *read)
+        .await
+        .unwrap();
+    sqlx::query("SET LOCAL statement_timeout='3s'")
+        .execute(&mut *read)
+        .await
+        .unwrap();
+    let database: String = sqlx::query_scalar("SELECT current_database()::text")
+        .fetch_one(&mut *read)
+        .await
+        .unwrap();
+    assert_eq!(database, "mtc_exact_recovery_20261126");
+    let row = sqlx::query("SELECT projected_at,semantic_snapshot_json FROM conversation_projection_outbox WHERE request_id=$1 AND tenant_id=$2 AND key_id=$3")
+        .bind(plan["request_id"].as_str().unwrap())
+        .bind(plan["tenant_id"].as_str().unwrap())
+        .bind(plan["key_id"].as_str().unwrap())
+        .fetch_one(&mut *read).await.unwrap();
+    let acknowledged: Option<i64> = row.try_get("projected_at").unwrap();
+    let actual: String = row.try_get("semantic_snapshot_json").unwrap();
+    read.commit().await.unwrap();
+    assert!(
+        acknowledged.is_some(),
+        "completion receipts require a real ACK"
+    );
+    assert!(
+        super::super::semantic_payload::snapshot_matches(Some(&actual), Some(&expected), true,),
+        "current receipt does not match the original prepared semantic snapshot"
+    );
+    println!(
+        "stage_exact_snapshot_reconciled expected_sha256={} actual_sha256={}",
+        expected_sha256,
+        format!("{:x}", Sha256::digest(actual.as_bytes()))
+    );
+    db.close().await;
 }
