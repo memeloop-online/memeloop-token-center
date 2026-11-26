@@ -20,7 +20,7 @@ jobs:
         with:
           node-version: 24.18.0
       - run: node --test tests/load/staging-peak/test-framework.ts
-      - run: python3 -O tests/load/staging-peak/test_preflight.py
+      - run: node --test tests/load/staging-peak/test-preflight.ts
       - name: State evidence boundary
         run: echo 'Harness contracts only. Historical peak and TEST-cluster lifecycle qualification require measured baseline and a separate cluster run.' >> "$GITHUB_STEP_SUMMARY"
   package-harness:
