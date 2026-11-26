@@ -689,6 +689,12 @@ test('request read freshness advances only for successful current result reads',
     await page.locator('.traffic-heading-actions').getByRole('button', { name: 'Refresh', exact: true }).click();
     await page.waitForFunction(() => document.querySelector('[data-request-read-freshness] time')?.getAttribute('datetime') === new Date(2_000_000_010_000).toISOString());
     const refreshed = await freshness.getAttribute('datetime');
+    const beforeOlder = await page.evaluate(() => window.requestLifecycleFixture.queryCalls);
+    await page.evaluate(() => { Date.now = () => 2_000_000_015_000; });
+    await page.getByRole('button', { name: 'Load older requests', exact: true }).click();
+    await page.waitForFunction(baseline => window.requestLifecycleFixture.queryCalls > baseline
+      && document.querySelector('.request-page-surface')?.getAttribute('aria-busy') === 'false', beforeOlder);
+    assert.equal(await freshness.getAttribute('datetime'), refreshed, 'a successful historical page is not a first-page read');
     const row = page.locator('tbody tr').filter({ has: page.getByText('model-a', { exact: true }) });
     await row.locator('.table-action').click();
     await page.locator('.drawer').waitFor();
@@ -698,5 +704,18 @@ test('request read freshness advances only for successful current result reads',
     assert.equal(await freshness.getAttribute('datetime'), refreshed, 'failed refresh retains the last successful read');
     assert.equal(await row.count(), 1);
     assert.equal(await page.locator('.drawer').count(), 1, 'failed refresh preserves the selected detail');
+    await page.evaluate(() => window.requestLifecycleFixture.filter());
+    await page.waitForFunction(() => window.requestLifecycleFixture.queryHeld);
+    assert.equal(await freshness.count(), 0, 'a new pending filter cannot reuse the old filter read time');
+    await page.evaluate(() => window.requestLifecycleFixture.failQuery());
+    await page.getByRole('alert').filter({ hasText: 'HTTP 503' }).waitFor();
+    assert.equal(await freshness.count(), 0, 'a failed first read has no successful time for the new filter');
+    const filteredQueries = await page.evaluate(() => window.requestLifecycleFixture.queryCalls);
+    await page.evaluate(() => { Date.now = () => 2_000_000_030_000; window.requestLifecycleFixture.finish(); });
+    await page.getByRole('button', { name: 'Refresh filtered results', exact: true }).waitFor();
+    assert.equal(await freshness.count(), 0, 'SSE cannot establish the new filter first-page read time');
+    assert.equal(await page.evaluate(() => window.requestLifecycleFixture.queryCalls), filteredQueries);
+    await page.getByRole('button', { name: 'Refresh filtered results', exact: true }).click();
+    await page.waitForFunction(() => document.querySelector('[data-request-read-freshness] time')?.getAttribute('datetime') === new Date(2_000_000_030_000).toISOString());
   } finally { await browser.close(); await server.close(); }
 });
