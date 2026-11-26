@@ -77,7 +77,7 @@ export function observeSessionReadyRequests({
   const signal = AbortSignal.any([controller.signal, deadline]);
   const requestIds = new Set<string>();
   const readyEventIds = new Set<string>();
-  const readyKinds = new Map<string, Set<string>>();
+  const readyTerminals = new Map<string, Pick<RequestEvent, 'status_code' | 'error_code' | 'duration_ms'>>();
   let ready: SessionReadyRequests | undefined;
   let eventAt: number | undefined;
   let eventId: string | undefined;
@@ -123,6 +123,10 @@ export function observeSessionReadyRequests({
           ({ id, event: eventName, data: event }) => {
             assert.equal(id, event.event_id, 'request-event SSE id must match its durable event id');
             assert.equal(eventName, `request.${event.event_kind}`, 'request-event SSE name must match its event kind');
+            if (eventAt !== undefined && eventId !== undefined) {
+              assert.ok(event.event_at > eventAt || (event.event_at === eventAt && id > eventId),
+                `request-event cursor did not advance: ${eventAt}/${eventId} -> ${event.event_at}/${id}`);
+            }
             const isReady = event.key_id === keyId && event.model === requestModel
               && matchesReadySessionEvent(event, sessionName);
             if (!isReady) {
@@ -133,17 +137,28 @@ export function observeSessionReadyRequests({
             const eventSessionId = event.session_context?.session_id;
             assert.ok(eventSessionId, 'confirmed session-ready events must name their logical session');
             assert.ok(!readyEventIds.has(id), `request-event stream repeated ready event ${id}`);
-            const kinds = readyKinds.get(event.request_id) ?? new Set<string>();
-            assert.ok(!kinds.has(event.event_kind), `request-event stream repeated ${event.event_kind} for ready request ${event.request_id}`);
+            const terminal = {
+              status_code: event.status_code,
+              error_code: event.error_code,
+              duration_ms: event.duration_ms,
+            };
+            assert.ok(event.status_code === 200 || event.status_code === 429,
+              'session-ready event must retain the fixture response status');
+            const previousTerminal = readyTerminals.get(event.request_id);
+            if (previousTerminal) {
+              assert.deepEqual(terminal, previousTerminal,
+                'independent projection events must retain the same operational terminal');
+            }
+            readyTerminals.set(event.request_id, terminal);
             readyEventIds.add(id);
-            kinds.add(event.event_kind);
-            readyKinds.set(event.request_id, kinds);
             eventAt = event.event_at;
             eventId = id;
             // Deferred statistics and conversation projection each publish a
             // distinct committed event. Both can carry the same confirmed
             // session when the bounded event batch is enriched after replay.
-            // Count requests once while still rejecting duplicate publications.
+            // Count requests once; a public kind is not a producer revision.
+            // Durable event IDs and ordered cursors detect stream replay; each
+            // projector's exact ACK contract proves publication idempotence.
             if (requestIds.has(event.request_id)) return;
             requestIds.add(event.request_id);
             if (requestIds.size !== expected || settled) return;
