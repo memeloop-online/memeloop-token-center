@@ -35,6 +35,8 @@ import {
   type PluginNavigationSection,
 } from './pluginContributions';
 import type { PluginRouteKey } from '../app/routes';
+import { isOperatorLoginCycleCurrent } from '../credentialStorage';
+import { clearRequestFilterReload, readRequestFilterReload, rememberRequestFilterReload } from './requestFilterReload';
 
 const CredentialsPage = lazy(() => import('./pages/ManagementPages').then((module) => ({ default: module.CredentialsPage })));
 const PricingPage = lazy(() => import('./pages/ManagementPages').then((module) => ({ default: module.PricingPage })));
@@ -108,17 +110,40 @@ export function Operator({ route, onRouteChange, onPluginNavigation, navigationC
     };
   }
   const filterScope = `${credentialScope.current.generation}:${scope.tenant}`;
+  const [reloadSnapshot] = useState(readRequestFilterReload);
+  const reloadPending = useRef(true);
   const [requestFilters, setRequestFilters] = useState({ scope: filterScope, ast: emptyTypedFilterAst, revision: 0 });
-  if (requestFilters.scope !== filterScope) {
-    setRequestFilters({ scope: filterScope, ast: emptyTypedFilterAst, revision: requestFilters.revision + 1 });
+  let restoredFilters: TypedFilterAst | undefined;
+  if (reloadPending.current && scope.loginCycle && scope.validated && scope.status.kind === 'ready'
+    && scope.tenants.some(tenant => tenant.external_id === scope.tenant)) {
+    reloadPending.current = false;
+    if (reloadSnapshot?.cycle === scope.loginCycle && reloadSnapshot.tenant === scope.tenant
+      && isOperatorLoginCycleCurrent(scope.loginCycle)) restoredFilters = reloadSnapshot.ast;
+    else clearRequestFilterReload();
+  }
+  if (requestFilters.scope !== filterScope || restoredFilters) {
+    setRequestFilters({ scope: filterScope, ast: restoredFilters ?? emptyTypedFilterAst, revision: requestFilters.revision + 1 });
     setRequestFocus(undefined);
     setSessionFocus(undefined);
     setRequestDrilldown(undefined);
   }
   const activeRequestFilters = requestFilters.scope === filterScope ? requestFilters : { scope: filterScope, ast: emptyTypedFilterAst, revision: requestFilters.revision + 1 };
   function applyRequestFilters(ast: TypedFilterAst) {
+    clearRequestFilterReload();
     setRequestFilters(current => ({ scope: filterScope, ast, revision: current.revision + 1 }));
   }
+  useEffect(() => {
+    if (scope.status.kind === 'disconnected' || (!scope.validated && scope.status.kind === 'failed')) {
+      reloadPending.current = false;
+      clearRequestFilterReload();
+    }
+  }, [scope.status.kind, scope.validated]);
+  useEffect(() => {
+    if (scope.loginCycle && scope.validated && scope.status.kind === 'ready' && requestFilters.scope === filterScope
+      && scope.tenants.some(tenant => tenant.external_id === scope.tenant)) {
+      rememberRequestFilterReload({ cycle: scope.loginCycle, tenant: scope.tenant, ast: requestFilters.ast });
+    }
+  }, [scope.loginCycle, scope.validated, scope.status.kind, scope.tenant, scope.tenants, requestFilters, filterScope]);
   const activeRoute = route ?? internalRoute;
   const [pluginNavigationContext, setPluginNavigationContext] = useState<PluginNavigationContext>();
   const pluginContext = resolvePluginNavigationContext(pluginNavigationContext, activeRoute, credentialScope.current.generation, scope.tenant);
@@ -329,7 +354,7 @@ export function Operator({ route, onRouteChange, onPluginNavigation, navigationC
     {emptyTenantScope && <div className="console-context"><div><b>{t('operator.noTenants')}</b></div>{activeRoute !== 'tenants' && <Button appearance="secondary" onClick={() => void navigate('tenants')}>{t('tenants.create')}</Button>}</div>}
     {scope.activeCredential && (scope.tenants.length > 1 || activeRoute === 'credentials') && <div className="tenant-scope-switcher"><label className="tenant-picker"><span>{t('operator.tenant')}</span><select value={scope.tenant} onChange={(event) => {
       const tenant = event.target.value;
-      void guardedNavigation(() => { setProxyContext({}); scope.setTenant(tenant); });
+      void guardedNavigation(() => { clearRequestFilterReload(); reloadPending.current = false; setProxyContext({}); scope.setTenant(tenant); });
     }}>{scope.tenants.map((value) => <option key={value.external_id} value={value.external_id}>{tenantDisplayName(value.external_id, locale)}</option>)}</select></label></div>}
     {showNavigation && <nav className="tabs" role="tablist" aria-label={t('operator.sections')}>{navigation.map((item) => {
       const selected = activeRoute === item.route || activeRoute === 'service-credentials' && item.route === 'tenants' || activeRoute === 'generations' && item.route === 'requests';
