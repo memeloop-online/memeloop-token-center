@@ -517,8 +517,12 @@ async fn first_request_segment_waits_for_retained_credit_despite_free_global_ram
             Bytes::from_static(b"first"),
             None,
         ))]),
-        CarrierCapture::new(memory.clone(), None, staging)
-            .with_background_spill(persistence.clone()),
+        CarrierCapture::new(
+            memory.clone(),
+            Some(ArchiveStore::memory_for_test()),
+            staging,
+        )
+        .with_background_spill(persistence.clone()),
     ));
     assert!(futures_util::poll!(&mut capture).is_pending());
     assert_eq!(memory.snapshot().0, 128 * 1024);
@@ -527,6 +531,41 @@ async fn first_request_segment_waits_for_retained_credit_despite_free_global_ram
     let source = capture.await.unwrap();
     assert_eq!(source.len(), 5);
     assert_eq!(source.digest(), blake3::hash(b"first").to_hex().as_str());
+    drop(source);
+    assert_eq!(memory.snapshot().0, 0);
+}
+
+#[tokio::test(start_paused = true)]
+async fn request_without_archive_preserves_capture_above_retained_window() {
+    let memory = Arc::new(ProxyMemoryBudget::new(512 * 1024));
+    let persistence = Arc::new(Persistence::default());
+    let staging = ArchiveStagingKey::new(
+        crate::archive_staging::ArchiveStagingOwner::ProxyRequest(uuid::Uuid::now_v7()),
+        crate::archive_staging::ArchiveStagingPurpose::Request,
+        uuid::Uuid::now_v7(),
+    )
+    .unwrap();
+    let expected = vec![b'n'; 192 * 1024];
+    let source = BodyCarrier::capture_owned(
+        stream::iter([Ok::<_, std::io::Error>((
+            Bytes::from(expected.clone()),
+            None,
+        ))]),
+        CarrierCapture::new(memory.clone(), None, staging)
+            .with_background_spill(persistence.clone()),
+    )
+    .await
+    .unwrap();
+    assert_eq!(source.len(), expected.len() as u64);
+    let mut input = source.open_stream();
+    let mut actual = Vec::new();
+    while let Some(chunk) = input.next().await {
+        actual.extend_from_slice(&chunk.unwrap());
+    }
+    drop(input);
+    assert_eq!(actual, expected);
+    assert_eq!(source.digest(), blake3::hash(&expected).to_hex().as_str());
+    assert_eq!(persistence.pending_archives_for_test(), 0);
     drop(source);
     assert_eq!(memory.snapshot().0, 0);
 }
