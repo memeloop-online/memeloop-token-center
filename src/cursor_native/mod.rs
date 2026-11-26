@@ -42,9 +42,16 @@ pub(crate) async fn quota_usage(
     state: &AppState,
     credential: &UpstreamCredential,
     account: &crate::provider::UpstreamAccountView,
+    trigger: crate::upstream_quota::QuotaReadTrigger,
 ) -> Result<Vec<u8>, &'static str> {
-    unary_with_rejection(state, credential, Method::CurrentPeriodUsage,
-        Some((account.id, account.credential_generation))).await
+    unary_with_rejection(
+        state,
+        credential,
+        Method::CurrentPeriodUsage,
+        (trigger != crate::upstream_quota::QuotaReadTrigger::PostRenewalVerification)
+            .then_some((account.id, account.credential_generation)),
+    )
+    .await
 }
 
 async fn unary_with_rejection(
@@ -110,7 +117,9 @@ async fn send_with_rejection(
     let status = response.status();
     if status == reqwest::StatusCode::UNAUTHORIZED
         && let Some((db, account_id, generation)) = rejection
-        && let Err(error) = db.observe_rejected_oauth_generation(account_id, generation).await
+        && let Err(error) = db
+            .observe_rejected_oauth_generation(account_id, generation)
+            .await
     {
         tracing::warn!(upstream_account_id = %account_id, credential_generation = generation,
             error_category = error.diagnostic_category(), "supplier OAuth rejection evidence could not be recorded");

@@ -889,6 +889,26 @@ impl Database {
         let mut tx = self
             .begin_upstream_oauth_write_transaction(account_id, OAuthRefreshWritePhase::Claim)
             .await?;
+        if expected_generation.is_some() {
+            // Lock before replay/pending recovery too: a late signal must not
+            // revive a disabled account through a saved refresh response.
+            let select = match self.backend {
+                DatabaseBackend::PostgreSql => {
+                    "SELECT status FROM upstream_accounts WHERE id=$1 FOR UPDATE"
+                }
+                DatabaseBackend::Sqlite => "SELECT status FROM upstream_accounts WHERE id=$1",
+            };
+            let account = sqlx::query(select)
+                .bind(account_id.to_string())
+                .fetch_optional(&mut *tx)
+                .await?
+                .ok_or(AppError::NotFound)?;
+            if account.try_get::<String, _>("status")? != "active" {
+                return Err(AppError::Conflict(
+                    "OAuth account was disabled before automatic refresh".into(),
+                ));
+            }
+        }
         let replay = claim_credential_rotation(
             &mut tx,
             UPSTREAM_OAUTH_REFRESH_RESOURCE,
@@ -985,7 +1005,9 @@ impl Database {
         }
         let generation: i64 = account.try_get("credential_generation")?;
         if expected_generation.is_some() && account.try_get::<String, _>("status")? != "active" {
-            return Err(AppError::Conflict("OAuth account was disabled before automatic refresh".into()));
+            return Err(AppError::Conflict(
+                "OAuth account was disabled before automatic refresh".into(),
+            ));
         }
         if expected_generation.is_some_and(|expected| expected != generation) {
             return Err(AppError::Conflict(
@@ -1526,12 +1548,25 @@ impl Database {
         account_id: Uuid,
         generation: i64,
     ) -> Result<(), AppError> {
-        sqlx::query("INSERT INTO upstream_oauth_rejected_generations (upstream_account_id, credential_generation, observed_at) SELECT a.id, a.credential_generation, $3 FROM upstream_accounts a JOIN upstream_credentials c ON c.upstream_account_id=a.id AND c.generation=a.credential_generation WHERE a.id=$1 AND a.credential_generation=$2 AND a.status='active' AND a.auth_kind='oauth' AND a.oauth_session_id IS NOT NULL AND a.oauth_refresh_url IS NOT NULL AND c.revoked_at IS NULL ON CONFLICT (upstream_account_id) DO UPDATE SET credential_generation=excluded.credential_generation, observed_at=excluded.observed_at WHERE upstream_oauth_rejected_generations.credential_generation < excluded.credential_generation")
+        sqlx::query("INSERT INTO upstream_oauth_rejected_generations (upstream_account_id, credential_generation, observed_at) SELECT a.id, a.credential_generation, $3 FROM upstream_accounts a JOIN upstream_credentials c ON c.upstream_account_id=a.id AND c.generation=a.credential_generation WHERE a.id=$1 AND a.credential_generation=$2 AND a.status='active' AND a.auth_kind='oauth' AND a.oauth_session_id IS NOT NULL AND a.oauth_refresh_url IS NOT NULL AND c.revoked_at IS NULL ON CONFLICT (upstream_account_id) DO UPDATE SET credential_generation=excluded.credential_generation, observed_at=excluded.observed_at, verification_started_at=NULL WHERE upstream_oauth_rejected_generations.credential_generation < excluded.credential_generation")
             .bind(account_id.to_string()).bind(generation).bind(unix_millis())
             .execute(&self.pool).await?;
         Ok(())
     }
 
+    /// Consume only the readback permission, never the rejection history or
+    /// refresh lease. Concurrent/replayed worker completions cannot reread twice.
+    pub(crate) async fn claim_rejected_oauth_verification(
+        &self,
+        account_id: Uuid,
+        rejected_generation: i64,
+    ) -> Result<bool, AppError> {
+        Ok(sqlx::query("UPDATE upstream_oauth_rejected_generations SET verification_started_at=$3 WHERE upstream_account_id=$1 AND credential_generation=$2 AND verification_started_at IS NULL AND EXISTS (SELECT 1 FROM upstream_accounts a WHERE a.id=$1 AND a.status='active' AND a.credential_generation>$2)")
+            .bind(account_id.to_string()).bind(rejected_generation).bind(unix_millis())
+            .execute(&self.pool).await?.rows_affected() == 1)
+    }
+
+    #[cfg(test)]
     pub(crate) async fn has_rejected_oauth_generation(
         &self,
         account_id: Uuid,

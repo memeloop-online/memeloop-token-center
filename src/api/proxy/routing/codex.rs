@@ -542,7 +542,9 @@ async fn send_codex_attempt_once(
                 &http2_evidence,
             );
             IndependentProbeTarget::dispatched(&route.route);
+            let account_bearer = super::oauth_rejection::uses_account_bearer(request.headers(), &route.route.credential);
             let response = client.execute(request).await?;
+            super::oauth_rejection::observe(state, route.route.account_id, route.route.credential_generation, response.status(), account_bearer).await;
             IndependentProbeTarget::response(response.status());
             Ok::<_, reqwest::Error>(response)
         }

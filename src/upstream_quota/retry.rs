@@ -146,16 +146,21 @@ impl<'a> ReadSession<'a> {
         status: http::StatusCode,
         used_bearer: bool,
     ) {
-        if status != http::StatusCode::UNAUTHORIZED
+        if context.trigger == QuotaReadTrigger::PostRenewalVerification
+            || status != http::StatusCode::UNAUTHORIZED
             || !used_bearer
             || !matches!(context.endpoint_kind, "usage" | "antigravity_quota_summary")
         {
             return;
         }
         if let Some(state) = self.state
-            && let Err(error) = state.db.observe_rejected_oauth_generation(
-                context.account_id, context.credential_generation,
-            ).await
+            && let Err(error) = state
+                .db
+                .observe_rejected_oauth_generation(
+                    context.account_id,
+                    context.credential_generation,
+                )
+                .await
         {
             tracing::warn!(upstream_account_id = %context.account_id,
                 credential_generation = context.credential_generation,
@@ -658,46 +663,207 @@ mod tests {
     async fn only_primary_bearer_401_records_current_managed_generation() {
         let directory = tempfile::tempdir().unwrap();
         let state = AppState::initialize(crate::config::Config::for_test(format!(
-            "sqlite://{}?mode=rwc", directory.path().join("rejected-oauth.db").display()
-        ))).await.unwrap();
+            "sqlite://{}?mode=rwc",
+            directory.path().join("rejected-oauth.db").display()
+        )))
+        .await
+        .unwrap();
         let credential = UpstreamCredential::OAuth {
-            access_token: "fixture-access".into(), refresh_token: Some("fixture-refresh".into()),
-            expires_at: Some(unix_millis() + 86_400_000), header: "authorization".into(),
-            prefix: "Bearer ".into(), adapter_state: None, proxy_url: None, proxy_network_scope: None,
+            access_token: "fixture-access".into(),
+            refresh_token: Some("fixture-refresh".into()),
+            expires_at: Some(unix_millis() + 86_400_000),
+            header: "authorization".into(),
+            prefix: "Bearer ".into(),
+            adapter_state: None,
+            proxy_url: None,
+            proxy_network_scope: None,
         };
-        let account = state.db.create_upstream_account(crate::db::CreateUpstreamAccountInput {
-            tenant_external_id: "rejected-oauth".into(), name: "fixture".into(),
-            driver: "http-json".into(), config: json!({"base_url":"https://api.example.test"}),
-            credential: credential.clone(), oauth_session_id: Some(Uuid::now_v7()),
-            oauth_driver: Some("cursor".into()), oauth_refresh_url: Some("https://refresh.example.test".into()),
-        }, state.config.key_pepper.as_bytes()).await.unwrap();
+        let account = state
+            .db
+            .create_upstream_account(
+                crate::db::CreateUpstreamAccountInput {
+                    tenant_external_id: "rejected-oauth".into(),
+                    name: "fixture".into(),
+                    driver: "http-json".into(),
+                    config: json!({"base_url":"https://api.example.test"}),
+                    credential: credential.clone(),
+                    oauth_session_id: Some(Uuid::now_v7()),
+                    oauth_driver: Some("cursor".into()),
+                    oauth_refresh_url: Some("https://refresh.example.test".into()),
+                },
+                state.config.key_pepper.as_bytes(),
+            )
+            .await
+            .unwrap();
         let budget = policy();
-        let session = ReadSession::new(Some(&state), tokio::time::Instant::now() + budget.total, budget);
+        let session = ReadSession::new(
+            Some(&state),
+            tokio::time::Instant::now() + budget.total,
+            budget,
+        );
         for (endpoint, status, bearer) in [
-            ("usage", 403, true), ("usage", 429, true), ("usage", 503, true),
-            ("credits", 401, true), ("plan", 401, true), ("usage", 401, false),
+            ("usage", 403, true),
+            ("usage", 429, true),
+            ("usage", 503, true),
+            ("credits", 401, true),
+            ("plan", 401, true),
+            ("usage", 401, false),
         ] {
-            session.observe_bearer_rejection(
-                QuotaRequestContext::for_account(&account, endpoint, QuotaReadTrigger::Bulk),
-                http::StatusCode::from_u16(status).unwrap(), bearer,
-            ).await;
-            assert!(!state.db.has_rejected_oauth_generation(account.id, 1).await.unwrap());
+            session
+                .observe_bearer_rejection(
+                    QuotaRequestContext::for_account(&account, endpoint, QuotaReadTrigger::Bulk),
+                    http::StatusCode::from_u16(status).unwrap(),
+                    bearer,
+                )
+                .await;
+            assert!(
+                !state
+                    .db
+                    .has_rejected_oauth_generation(account.id, 1)
+                    .await
+                    .unwrap()
+            );
         }
-        assert!(state.db.list_managed_oauth_refresh_candidates(unix_millis(), 20).await.unwrap().is_empty());
+        assert!(
+            state
+                .db
+                .list_managed_oauth_refresh_candidates(unix_millis(), 20)
+                .await
+                .unwrap()
+                .is_empty()
+        );
         let context = QuotaRequestContext::for_account(&account, "usage", QuotaReadTrigger::Manual);
-        let observe = || session.observe_bearer_rejection(context, http::StatusCode::UNAUTHORIZED, true);
+        let observe =
+            || session.observe_bearer_rejection(context, http::StatusCode::UNAUTHORIZED, true);
         tokio::join!(observe(), observe(), observe());
-        assert_eq!(state.db.list_managed_oauth_refresh_candidates(unix_millis(), 20).await.unwrap(), vec![(account.id, 1)]);
+        assert_eq!(
+            state
+                .db
+                .list_managed_oauth_refresh_candidates(unix_millis(), 20)
+                .await
+                .unwrap(),
+            vec![(account.id, 1)]
+        );
         // Recording under read authority never performs a refresh or rotation.
-        assert_eq!(state.db.upstream_account_with_credential(account.id, state.config.key_pepper.as_bytes()).await.unwrap().0.credential_generation, 1);
-        let rotated = state.db.rotate_upstream_credential(account.id, credential, "fixture-rotation", state.config.key_pepper.as_bytes()).await.unwrap();
+        assert_eq!(
+            state
+                .db
+                .upstream_account_with_credential(account.id, state.config.key_pepper.as_bytes())
+                .await
+                .unwrap()
+                .0
+                .credential_generation,
+            1
+        );
+        let rotated = state
+            .db
+            .rotate_upstream_credential(
+                account.id,
+                credential,
+                "fixture-rotation",
+                state.config.key_pepper.as_bytes(),
+            )
+            .await
+            .unwrap();
         observe().await;
-        assert!(!state.db.has_rejected_oauth_generation(account.id, rotated.credential_generation).await.unwrap());
-        assert!(state.db.list_managed_oauth_refresh_candidates(unix_millis(), 20).await.unwrap().is_empty());
-        state.db.set_upstream_account_status(rotated.id, "rejected-oauth", "disabled", rotated.updated_at).await.unwrap();
-        session.observe_bearer_rejection(QuotaRequestContext::for_account(&rotated, "usage", QuotaReadTrigger::Manual), http::StatusCode::UNAUTHORIZED, true).await;
-        assert!(!state.db.has_rejected_oauth_generation(rotated.id, rotated.credential_generation).await.unwrap());
-        assert!(state.db.claim_upstream_oauth_refresh_for_generation(rotated.id, "disabled-worker", Some(rotated.credential_generation), state.config.key_pepper.as_bytes()).await.is_err());
+        assert!(
+            !state
+                .db
+                .has_rejected_oauth_generation(account.id, rotated.credential_generation)
+                .await
+                .unwrap()
+        );
+        assert!(
+            state
+                .db
+                .list_managed_oauth_refresh_candidates(unix_millis(), 20)
+                .await
+                .unwrap()
+                .is_empty()
+        );
+        session
+            .observe_bearer_rejection(
+                QuotaRequestContext::for_account(
+                    &rotated,
+                    "usage",
+                    QuotaReadTrigger::PostRenewalVerification,
+                ),
+                http::StatusCode::UNAUTHORIZED,
+                true,
+            )
+            .await;
+        assert!(
+            !state
+                .db
+                .has_rejected_oauth_generation(rotated.id, rotated.credential_generation)
+                .await
+                .unwrap()
+        );
+        assert!(
+            state
+                .db
+                .list_managed_oauth_refresh_candidates(unix_millis(), 20)
+                .await
+                .unwrap()
+                .is_empty()
+        );
+        // Normal publication is independent work and remains an evidence source.
+        session
+            .observe_bearer_rejection(
+                QuotaRequestContext::for_account(
+                    &rotated,
+                    "usage",
+                    QuotaReadTrigger::BackgroundRecovery,
+                ),
+                http::StatusCode::UNAUTHORIZED,
+                true,
+            )
+            .await;
+        assert_eq!(
+            state
+                .db
+                .list_managed_oauth_refresh_candidates(unix_millis(), 20)
+                .await
+                .unwrap(),
+            vec![(rotated.id, rotated.credential_generation)]
+        );
+        state
+            .db
+            .set_upstream_account_status(
+                rotated.id,
+                "rejected-oauth",
+                "disabled",
+                rotated.updated_at,
+            )
+            .await
+            .unwrap();
+        session
+            .observe_bearer_rejection(
+                QuotaRequestContext::for_account(&rotated, "usage", QuotaReadTrigger::Manual),
+                http::StatusCode::UNAUTHORIZED,
+                true,
+            )
+            .await;
+        assert!(
+            state
+                .db
+                .list_managed_oauth_refresh_candidates(unix_millis(), 20)
+                .await
+                .unwrap()
+                .is_empty()
+        );
+        assert!(
+            state
+                .db
+                .claim_upstream_oauth_refresh_for_generation(
+                    rotated.id,
+                    "disabled-worker",
+                    Some(rotated.credential_generation),
+                    state.config.key_pepper.as_bytes()
+                )
+                .await
+                .is_err()
+        );
     }
 
     #[tokio::test]

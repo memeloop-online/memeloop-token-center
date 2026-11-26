@@ -105,6 +105,43 @@ async fn refresh_expiring_oauth(
     }
 }
 
+/// One worker claim and one readback. The readback is verification, not a new
+/// source of renewal evidence; a separate business read can report a new 401.
+async fn refresh_selected_oauth(
+    state: &AppState,
+    account_id: Uuid,
+    generation: i64,
+    blocking: &BlockingTasks,
+) -> Result<(), AppError> {
+    refresh_expiring_oauth(state, account_id, generation, blocking).await?;
+    if state
+        .db
+        .claim_rejected_oauth_verification(account_id, generation)
+        .await?
+    {
+        let (account, credential) = state
+            .db
+            .upstream_account_with_credential(account_id, state.config.key_pepper.as_bytes())
+            .await?;
+        if account.status == "active"
+            && account.credential_generation > generation
+            && let Some(tenant) = account.tenant_external_id.as_deref()
+        {
+            state
+                .upstream_quota
+                .read_fresh(
+                    state,
+                    &account,
+                    &credential,
+                    tenant,
+                    crate::upstream_quota::QuotaReadTrigger::PostRenewalVerification,
+                )
+                .await;
+        }
+    }
+    Ok(())
+}
+
 pub async fn run(state: AppState) {
     let (shutdown_sender, shutdown) = watch::channel(false);
     run_until_shutdown(state, shutdown).await;
@@ -615,23 +652,10 @@ pub(crate) async fn run_until_shutdown_with_reaper_period(
                             break;
                         }
                         if let Err(error) =
-                            refresh_expiring_oauth(state, account_id, generation, &oauth_blocking)
+                            refresh_selected_oauth(state, account_id, generation, &oauth_blocking)
                                 .await
                         {
                             tracing::warn!(%error, %account_id, "worker failed to refresh managed OAuth credential");
-                        } else if state.db.has_rejected_oauth_generation(account_id, generation).await.unwrap_or(false) {
-                            // Reload the committed generation, never replay the rejected
-                            // credential or publish its stale quota observation.
-                            if let Ok((account, credential)) = state.db.upstream_account_with_credential(
-                                account_id, state.config.key_pepper.as_bytes(),
-                            ).await
-                                && account.status == "active"
-                                && account.credential_generation > generation
-                                && let Some(tenant) = account.tenant_external_id.as_deref()
-                            {
-                                state.upstream_quota.read_fresh(state, &account, &credential,
-                                    tenant, crate::upstream_quota::QuotaReadTrigger::BackgroundRecovery).await;
-                            }
                         }
                     }
                 }
@@ -1764,6 +1788,131 @@ mod tests {
             }
         }
         drop(stalled);
+        server.verify().await;
+    }
+
+    #[tokio::test]
+    async fn oauth_rejected_generation_renews_once_and_failed_readback_does_not_requeue() {
+        let directory = tempfile::tempdir().unwrap();
+        let state = AppState::initialize(Config::for_test(format!(
+            "sqlite://{}?mode=rwc",
+            directory.path().join("oauth-rejection-cycle.db").display()
+        )))
+        .await
+        .unwrap();
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/refresh"))
+            .respond_with(
+                ResponseTemplate::new(200).set_body_json(json!({"accessToken":"fresh-access"})),
+            )
+            .expect(1)
+            .mount(&server)
+            .await;
+        Mock::given(method("POST"))
+            .and(path("/v1internal:retrieveUserQuotaSummary"))
+            .respond_with(ResponseTemplate::new(401))
+            .expect(3)
+            .mount(&server)
+            .await;
+        let account = state.db.create_upstream_account(CreateUpstreamAccountInput {
+            tenant_external_id: "oauth-rejection-cycle".into(), name: "fixture".into(),
+            driver: "antigravity".into(), config: json!({"base_url":server.uri(), "control_url":server.uri(), "project_id":"fixture-project"}),
+            credential: UpstreamCredential::OAuth {
+                access_token: "old-access".into(), refresh_token: Some("fixture-refresh".into()),
+                expires_at: Some(crate::db::unix_millis() + 86_400_000), header: "authorization".into(),
+                prefix: "Bearer ".into(), adapter_state: None, proxy_url: None, proxy_network_scope: None,
+            }, oauth_session_id: Some(Uuid::now_v7()), oauth_driver: Some("cursor".into()),
+            oauth_refresh_url: Some(format!("{}/refresh", server.uri())),
+        }, state.config.key_pepper.as_bytes()).await.unwrap();
+        let read = async |trigger| {
+            let (account, credential) = state
+                .db
+                .upstream_account_with_credential(account.id, state.config.key_pepper.as_bytes())
+                .await
+                .unwrap();
+            let snapshot = state
+                .upstream_quota
+                .read_fresh(
+                    &state,
+                    &account,
+                    &credential,
+                    "oauth-rejection-cycle",
+                    trigger,
+                )
+                .await;
+            assert_eq!(
+                serde_json::to_value(snapshot).unwrap()["error_code"],
+                "quota_not_authorized"
+            );
+        };
+        assert!(
+            state
+                .db
+                .list_managed_oauth_refresh_candidates(crate::db::unix_millis(), 20)
+                .await
+                .unwrap()
+                .is_empty()
+        );
+        read(crate::upstream_quota::QuotaReadTrigger::BackgroundRecovery).await;
+        assert_eq!(
+            state
+                .db
+                .list_managed_oauth_refresh_candidates(crate::db::unix_millis(), 20)
+                .await
+                .unwrap(),
+            vec![(account.id, 1)]
+        );
+        refresh_selected_oauth(&state, account.id, 1, &BlockingTasks::new())
+            .await
+            .unwrap();
+        assert_eq!(
+            state
+                .db
+                .upstream_account_with_credential(account.id, state.config.key_pepper.as_bytes())
+                .await
+                .unwrap()
+                .0
+                .credential_generation,
+            2
+        );
+        assert!(
+            state
+                .db
+                .has_rejected_oauth_generation(account.id, 1)
+                .await
+                .unwrap()
+        );
+        assert!(
+            !state
+                .db
+                .has_rejected_oauth_generation(account.id, 2)
+                .await
+                .unwrap()
+        );
+        assert!(
+            state
+                .db
+                .list_managed_oauth_refresh_candidates(crate::db::unix_millis(), 20)
+                .await
+                .unwrap()
+                .is_empty()
+        );
+        // A replayed completion retains the same claim and cannot reread again.
+        refresh_selected_oauth(&state, account.id, 1, &BlockingTasks::new())
+            .await
+            .unwrap();
+        // An independent user read can report new evidence without refreshing
+        // inline. No second refresh is dispatched by this test or by readback.
+        read(crate::upstream_quota::QuotaReadTrigger::Manual).await;
+        assert_eq!(
+            state
+                .db
+                .list_managed_oauth_refresh_candidates(crate::db::unix_millis(), 20)
+                .await
+                .unwrap(),
+            vec![(account.id, 2)]
+        );
         server.verify().await;
     }
 

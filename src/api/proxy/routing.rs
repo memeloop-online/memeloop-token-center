@@ -16,6 +16,7 @@ mod component_workspace_tests;
 pub(super) mod kimi;
 #[cfg(test)]
 mod kimi_workspace_tests;
+mod oauth_rejection;
 pub(super) mod outcome;
 mod policy;
 mod probe;

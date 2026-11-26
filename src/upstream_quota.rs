@@ -51,6 +51,8 @@ pub(crate) enum QuotaReadTrigger {
     Manual,
     Bulk,
     BackgroundRecovery,
+    /// One read after worker renewal; its rejection must not renew again.
+    PostRenewalVerification,
     ResetWorkflow,
 }
 
@@ -60,6 +62,7 @@ impl QuotaReadTrigger {
             Self::Manual => "manual",
             Self::Bulk => "bulk",
             Self::BackgroundRecovery => "background_recovery",
+            Self::PostRenewalVerification => "post_renewal_verification",
             Self::ResetWorkflow => "reset_workflow",
         }
     }
@@ -788,7 +791,7 @@ impl QuotaCache {
                 "kimi-oauth" => {
                     kimi::read(state, account, credential, empty(None), trigger, &session).await
                 }
-                "cursor" => cursor::read(state, account, credential, empty(None)).await,
+                "cursor" => cursor::read(state, account, credential, empty(None), trigger).await,
                 _ => read_codex(state, account, credential, empty(None), trigger, &session).await,
             }
         })
@@ -912,8 +915,10 @@ async fn publish_operator_observation(
     snapshot: &QuotaSnapshot,
     trigger: QuotaReadTrigger,
 ) {
-    if trigger != QuotaReadTrigger::BackgroundRecovery
-        && let Some(observation) = observations::project(account, snapshot, unix_millis())
+    if !matches!(
+        trigger,
+        QuotaReadTrigger::BackgroundRecovery | QuotaReadTrigger::PostRenewalVerification
+    ) && let Some(observation) = observations::project(account, snapshot, unix_millis())
         && let Err(error) = state
             .db
             .publish_manual_quota_observation(&observation)
@@ -1255,12 +1260,18 @@ async fn get_codex_json_with_routes(
                     retry::Failure::transport(error)
                 }
             })?;
-            session.observe_bearer_rejection(
-                context, response.status(),
-                auth.credential_header == http::header::AUTHORIZATION
-                    && auth.credential_value.as_bytes().get(..7)
-                        .is_some_and(|prefix| prefix.eq_ignore_ascii_case(b"Bearer ")),
-            ).await;
+            session
+                .observe_bearer_rejection(
+                    context,
+                    response.status(),
+                    auth.credential_header == http::header::AUTHORIZATION
+                        && auth
+                            .credential_value
+                            .as_bytes()
+                            .get(..7)
+                            .is_some_and(|prefix| prefix.eq_ignore_ascii_case(b"Bearer ")),
+                )
+                .await;
             if let Some(failure) =
                 retry::Failure::status(response.status().as_u16(), response.headers())
             {

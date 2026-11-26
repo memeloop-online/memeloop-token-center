@@ -3,5 +3,6 @@
 CREATE TABLE upstream_oauth_rejected_generations (
     upstream_account_id TEXT PRIMARY KEY REFERENCES upstream_accounts(id) ON DELETE CASCADE,
     credential_generation BIGINT NOT NULL,
-    observed_at BIGINT NOT NULL
+    observed_at BIGINT NOT NULL,
+    verification_started_at BIGINT
 );
