@@ -390,13 +390,19 @@ impl BodyCarrier {
                 .ok_or_else(|| AppError::storage("carrier_length_overflow"))?;
             hash.update(&chunk);
             if let Some(credit) = credit {
-                let retained = source.memory.try_reserve_carrier_retained(chunk.len());
+                let mut retained = source.memory.try_reserve_carrier_retained(chunk.len());
                 if retained.is_none() {
                     // Preserve the existing response tap's opportunistic spill:
                     // credited streams can exceed source RAM over their lifetime.
                     spill_observation.begin(chunk.len());
                     let result = source.offload_one_bytes(None).await;
                     spill_observation.finish(&result);
+                    if matches!(result, Ok(Some(_))) {
+                        // The completed spill has dropped its local RAM owner.
+                        // Reuse only available retained credit; global credit
+                        // stays attached to this input allocation throughout.
+                        retained = source.memory.try_reserve_carrier_retained(chunk.len());
+                    }
                 }
                 let length = chunk.len();
                 let bytes = source.leased_bytes(chunk, credit, retained);
