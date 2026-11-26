@@ -701,7 +701,7 @@ jobs:
       - name: Verify fixed diagnostic source
         run: |
           set -euo pipefail
-          test "$(git rev-parse HEAD)" = "8adc4913bed77396ea219314a3ec762b6c587e0a"
+          test "$(git rev-parse HEAD)" = "9657a7bd7fbed9fce88c37fed165d2d8fa2bf2c9"
           git rev-parse HEAD
           mkdir -p "$RUNNER_TEMP/pr1041-writer-evidence"
       - name: Start isolated RustFS fixture
@@ -742,12 +742,12 @@ jobs:
         timeout-minutes: 6
         run: |
           set -euo pipefail
-          node tests/load/benchmark-durable-archive-memory.ts target/release/memeloop-token-center "$RUNNER_TEMP/pr1041-writer-evidence/durable-archive-rss-8adc4.json" 2>&1 | tee "$RUNNER_TEMP/pr1041-writer-evidence/durable-harness.log"
+          node tests/load/benchmark-durable-archive-memory.ts target/release/memeloop-token-center "$RUNNER_TEMP/pr1041-writer-evidence/durable-archive-rss-9657a.json" 2>&1 | tee "$RUNNER_TEMP/pr1041-writer-evidence/durable-harness.log"
       - name: Retain exact-source writer and memory evidence
         if: always()
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
         with:
-          name: pr1041-writer-memory-8adc4
+          name: pr1041-writer-memory-9657a
           path: ${{ runner.temp }}/pr1041-writer-evidence/
           if-no-files-found: warn
           retention-days: 7
