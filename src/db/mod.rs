@@ -55,6 +55,7 @@ mod archive_spool;
 mod archive_staging;
 mod gateway_persistence;
 mod request_connection;
+mod request_record_locator;
 mod request_pool;
 pub(crate) use archive_spool::ArchiveSpoolChunk;
 pub(crate) use archive_spool::{ArchiveSpoolIdentity, ArchiveSpoolTask};
