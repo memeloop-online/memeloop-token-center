@@ -1625,7 +1625,8 @@ impl Database {
                     "conversation projection transaction failed"
                 );
                 if rollback_confirmed && error.is_projection_busy() {
-                    self.defer_session_body_archive(lease_owner, request_id).await?;
+                    self.defer_session_body_archive(lease_owner, request_id)
+                        .await?;
                 } else if rollback_confirmed && error.retry_after_confirmed_rollback() {
                     self.try_schedule_rolled_back_conversation_retry(request_id, lease_owner)
                         .await;
