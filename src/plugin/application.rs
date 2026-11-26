@@ -98,6 +98,7 @@ pub struct RollbackApplicationPlugin {
 
 pub struct ApplicationPlugins {
     db: Database,
+    cold_configuration_db: Database,
     current: std::sync::RwLock<CurrentSnapshot>,
     baseline_provider_ids: std::collections::BTreeSet<String>,
     request_dependencies: tokio::sync::Mutex<Option<(ApplicationRevision, bool)>>,
@@ -120,6 +121,8 @@ pub struct ApplicationPlugins {
     compile_gate: std::sync::Mutex<Option<CompileGate>>,
     #[cfg(test)]
     snapshot_cache_waiting: std::sync::Mutex<Option<tokio::sync::oneshot::Sender<()>>>,
+    #[cfg(test)]
+    snapshot_flight_joined: std::sync::Mutex<Option<tokio::sync::oneshot::Sender<()>>>,
 }
 
 #[derive(Default)]
@@ -287,6 +290,7 @@ impl ApplicationPlugins {
             }
         }
         Ok(Self {
+            cold_configuration_db: db.clone(),
             db,
             current: std::sync::RwLock::new(CurrentSnapshot::default()),
             baseline_provider_ids: baseline
@@ -314,7 +318,17 @@ impl ApplicationPlugins {
             compile_gate: std::sync::Mutex::new(None),
             #[cfg(test)]
             snapshot_cache_waiting: std::sync::Mutex::new(None),
+            #[cfg(test)]
+            snapshot_flight_joined: std::sync::Mutex::new(None),
         })
+    }
+
+    /// Only shared revision-cache loads use this existing handle for stored
+    /// configuration validation. Authority reads, staging, installation and
+    /// the cached executable retain their original database binding.
+    pub(crate) fn with_cold_configuration_database(mut self, database: Database) -> Self {
+        self.cold_configuration_db = database;
+        self
     }
 
     /// The installer publishes a complete, host-owned inventory file by atomic
@@ -684,10 +698,7 @@ impl ApplicationPlugins {
     ) -> Result<Option<Arc<ApplicationPluginSnapshot>>, AppError> {
         let head = database.optional_application_plugin_head().await?;
         let snapshot = match &head {
-            Some(head) => Some(
-                self.pin_revision_with_database(head.clone(), database)
-                    .await?,
-            ),
+            Some(head) => Some(self.pin_revision(head.clone()).await?),
             None => {
                 let had_snapshot = self
                     .current
@@ -826,14 +837,6 @@ impl ApplicationPlugins {
         self: &Arc<Self>,
         head: ApplicationRevision,
     ) -> Result<Arc<ApplicationPluginSnapshot>, AppError> {
-        self.pin_revision_with_database(head, &self.db).await
-    }
-
-    async fn pin_revision_with_database(
-        self: &Arc<Self>,
-        head: ApplicationRevision,
-        database: &Database,
-    ) -> Result<Arc<ApplicationPluginSnapshot>, AppError> {
         #[cfg(test)]
         if let Some(waiting) = self.snapshot_cache_waiting.lock().unwrap().take() {
             let _ = waiting.send(());
@@ -868,7 +871,7 @@ impl ApplicationPlugins {
         if !metadata.is_dir() || metadata.file_type().is_symlink() {
             return Err(AppError::Forbidden);
         }
-        tokio::time::timeout(PIN_DEADLINE, self.pin_head(head, database))
+        tokio::time::timeout(PIN_DEADLINE, self.pin_head(head))
             .await
             .map_err(|_| AppError::capacity_error("plugin_pin_timeout"))?
     }
@@ -876,7 +879,6 @@ impl ApplicationPlugins {
     async fn pin_head(
         self: &Arc<Self>,
         head: ApplicationRevision,
-        database: &Database,
     ) -> Result<Arc<ApplicationPluginSnapshot>, AppError> {
         loop {
             let flight = {
@@ -892,6 +894,10 @@ impl ApplicationPlugins {
                     return Ok(snapshot.clone());
                 }
                 if let Some(flight) = &cache.in_flight {
+                    #[cfg(test)]
+                    if let Some(joined) = self.snapshot_flight_joined.lock().unwrap().take() {
+                        let _ = joined.send(());
+                    }
                     flight.clone()
                 } else {
                     let (result, receive) = tokio::sync::watch::channel(None);
@@ -902,7 +908,10 @@ impl ApplicationPlugins {
                     cache.in_flight = Some(flight.clone());
                     let authority = self.clone();
                     let receipt = head.clone();
-                    let database = database.clone();
+                    let database = self.cold_configuration_db.clone();
+                    // Every initiator uses the same existing persistence handle
+                    // for this flight's configuration read, including callers
+                    // that created the flight before automatic OAuth joined.
                     // The manager owns the operation and cache publication, not
                     // the first request. Dropping any/all waiters loses no result.
                     tokio::spawn(async move {
