@@ -688,6 +688,35 @@ export async function run(binary: string, output: string): Promise<boolean> {
         throw error;
       } finally { reader.close(); }
     };
+    const verifyCompleteOriginals = async (result: Result, requestPlan: Plan, responsePlan: Plan): Promise<void> => {
+      assert(result.requestId, "complete original verification requires the delivered request id");
+      const reader = new DatabaseSync(database, { readOnly: true });
+      try {
+        const row = reader.prepare("SELECT tenant_id, request_object, response_object, (SELECT COUNT(*) FROM ledger_entries WHERE source = r.reservation_id AND kind = 'usage') AS usage_entries FROM request_records r WHERE id = ?").get(result.requestId);
+        const evidence: Record<string, any> = { request_id: result.requestId, usage_entries: row?.usage_entries, sides: [] };
+        report.phases.at(-1).archive_originals = evidence;
+        assert(row && row.usage_entries === 1, "chunked reference request must settle exactly once");
+        for (const [side, plan] of [["request", requestPlan], ["response", responsePlan]] as const) {
+          const root = join(archive, "tenants", String(row.tenant_id), "raw", "v1", result.requestId, `${side}.json`);
+          const sideEvidence: Record<string, any> = { side, root_exists: existsSync(root), failed: existsSync(`${root}.failed`) };
+          evidence.sides.push(sideEvidence);
+          assert(sideEvidence.root_exists && !sideEvidence.failed, `${side} must own a complete original root without a failure marker`);
+          assert(statSync(root).size <= 4096, `${side} root metadata must remain bounded`);
+          const reference = JSON.parse(readFileSync(root, "utf8"));
+          sideEvidence.source_bytes = reference.size_bytes;
+          sideEvidence.root_digest = reference.blake3_digest;
+          assert(reference.size_bytes === plan.bytes && typeof reference.blake3_digest === "string" && /^[a-f0-9]{64}$/.test(reference.blake3_digest), `${side} root must identify the complete original`);
+          assert(reference.object_locator === row[`${side}_object`], `${side} relational binding must identify this exact root`);
+          const replay = await apiRequest(base, "GET", `/internal/v1/requests/${result.requestId}/archive/${side}`, token);
+          sideEvidence.status = replay.status;
+          sideEvidence.bytes = replay.body.length;
+          sideEvidence.sha256 = createHash("sha256").update(replay.body).digest("hex");
+          assert(replay.status === 200 && replay.body.length === plan.bytes && sideEvidence.sha256 === planHash(plan), `${side} backend replay must reproduce every original byte`);
+        }
+      } finally { reader.close(); }
+      const completed = await drain();
+      assert(completed.successful_request_archive_gaps === 0 && completed.successful_response_archive_gaps === 0, "reference workload must retain both originals without an archive gap");
+    };
     const phase = async (name: string, operation: () => Promise<unknown>, expectUnknown = false): Promise<void> => {
       const callsBefore = upstreamCalls;
       const from = report.samples.length;
@@ -751,11 +780,14 @@ export async function run(binary: string, output: string): Promise<boolean> {
     });
     await phase("unknown-chunked-16MiB-input-and-64MiB-response", async () => {
       current = responsesOutputPlan(64 * MIB); chunkedResponse = true;
+      const callsBefore = upstreamCalls;
       const result = await send(base, key, responsesInputPlan(16 * MIB), { chunked: true }).result;
+      assert(upstreamCalls === callsBefore + 1, "chunked reference request must dispatch exactly once");
       assert(result.status === 200 && result.bytes === current.bytes && result.sha256 === planHash(current), "unknown-length request/response must complete exact bytes");
       chunkedResponse = false;
       return result;
     });
+    await verifyCompleteOriginals(report.phases.at(-1).result as Result, responsesInputPlan(16 * MIB), responsesOutputPlan(64 * MIB));
     await phase("64MiB-input-local-spool-complete", async () => {
       current = responsesOutputPlan(512);
       const before = upstreamCalls;
