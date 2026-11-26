@@ -26,17 +26,21 @@ async fn fixture() -> (Arc<BodyCarrier>, Arc<ProxyMemoryBudget>, Arc<Persistence
     (source, memory, workspace)
 }
 
-async fn real_fixture() -> (Arc<BodyCarrier>, Arc<ProxyMemoryBudget>, Arc<Persistence>) {
+async fn real_archive_at(endpoint: &str) -> ArchiveStore {
     let mut config = crate::config::Config::for_test("sqlite::memory:".into());
     config.archive_backend = crate::config::ArchiveBackend::S3;
-    config.s3_endpoint = Some(std::env::var("MTC_RUSTFS_TEST_ENDPOINT").unwrap());
+    config.s3_endpoint = Some(endpoint.to_owned());
     config.s3_bucket = Some(std::env::var("MTC_RUSTFS_TEST_BUCKET").unwrap());
     config.s3_access_key = Some(std::env::var("MTC_RUSTFS_TEST_ACCESS_KEY").unwrap());
     config.s3_secret_key = Some(std::env::var("MTC_RUSTFS_TEST_SECRET_KEY").unwrap());
     config.s3_allow_http = true;
+    ArchiveStore::from_config(&config).await.unwrap()
+}
+
+async fn real_fixture() -> (Arc<BodyCarrier>, Arc<ProxyMemoryBudget>, Arc<Persistence>) {
     let (mut source, memory, workspace) = fixture().await;
     Arc::get_mut(&mut source).unwrap().archive =
-        Some(ArchiveStore::from_config(&config).await.unwrap());
+        Some(real_archive_at(&std::env::var("MTC_RUSTFS_TEST_ENDPOINT").unwrap()).await);
     (source, memory, workspace)
 }
 
@@ -607,4 +611,97 @@ async fn sub_quantum_retained_window_preserves_existing_archive_spill() {
     assert_eq!(persistence.pending_archives_for_test(), 0);
     drop(source);
     assert_eq!(memory.snapshot().0, 0);
+}
+
+#[tokio::test]
+#[ignore = "requires isolated RustFS fixture"]
+async fn credited_spill_observation_distinguishes_workspace_pressure_from_put_ack() {
+    for lose_ack in [false, true] {
+        let proxy = recovery_proxy::RecoveryObjectProxy::start(
+            &std::env::var("MTC_RUSTFS_TEST_ENDPOINT").unwrap(),
+        )
+        .await;
+        let (mut source, memory, workspace) = fixture().await;
+        Arc::get_mut(&mut source).unwrap().archive = Some(real_archive_at(proxy.endpoint()).await);
+        let a = workspace
+            .multipart_workspace(WorkspaceRole::RequestRaw)
+            .await
+            .unwrap();
+        let b = workspace
+            .multipart_workspace(WorkspaceRole::RequestRaw)
+            .await
+            .unwrap();
+        let mut observation =
+            SpillObservation::new(memory.clone(), Some(workspace.clone()), source.staging);
+        observation.accepted(128 * 1024);
+        observation.begin(64 * 1024);
+        let result = source.offload_one_bytes(None).await;
+        assert!(matches!(
+            &result,
+            Err(AppError::Storage {
+                code: "carrier_workspace_unavailable",
+                ..
+            })
+        ));
+        observation.finish(&result);
+        assert_eq!(observation.workspace_rejections, 1);
+        assert_eq!(observation.ram_bytes, Some(128 * 1024));
+        assert_eq!(observation.offloaded_bytes, 0);
+        assert_eq!(
+            workspace.upload_workspace.snapshot().0,
+            workspace.upload_workspace.snapshot().1
+        );
+        drop(a);
+        let gate = proxy.gate_body_put();
+        proxy.lose_body_put_ack(lose_ack);
+        observation.begin(64 * 1024);
+        let write = tokio::spawn({
+            let source = source.clone();
+            async move { source.offload_one_bytes(None).await }
+        });
+        tokio::time::timeout(std::time::Duration::from_secs(5), gate.entered())
+            .await
+            .unwrap();
+        assert!(!write.is_finished());
+        assert_eq!(observation.successes, 0);
+        assert_eq!(observation.ram_bytes, Some(128 * 1024));
+        assert_eq!(
+            workspace.upload_workspace.snapshot().0,
+            workspace.upload_workspace.snapshot().1
+        );
+        gate.release();
+        let result = tokio::time::timeout(std::time::Duration::from_secs(20), write)
+            .await
+            .unwrap()
+            .unwrap();
+        observation.finish(&result);
+        if lose_ack {
+            assert!(result.is_err());
+            assert_eq!(observation.other_errors, 1);
+            assert_eq!(observation.offloaded_bytes, 0);
+            assert_eq!(observation.ram_bytes, Some(128 * 1024));
+        } else {
+            assert_eq!(result.unwrap(), Some(128 * 1024));
+            assert_eq!(observation.successes, 1);
+            assert_eq!(observation.offloaded_bytes, 128 * 1024);
+            assert_eq!(observation.ram_bytes, Some(0));
+            observation.begin(64 * 1024);
+            let result = source.offload_one_bytes(None).await;
+            observation.finish(&result);
+            assert_eq!(result.unwrap(), None);
+            assert_eq!(observation.no_ram, 1);
+        }
+        proxy.lose_body_put_ack(false);
+        drop(b);
+        let mut replay = source.open_stream();
+        let mut restored = Vec::new();
+        while let Some(chunk) = replay.next().await {
+            restored.extend_from_slice(&chunk.unwrap());
+        }
+        drop(replay);
+        assert_eq!(restored, vec![b'x'; 128 * 1024]);
+        drop(source);
+        assert_eq!(memory.snapshot().0, 0);
+        assert_eq!(workspace.upload_workspace.snapshot().0, 0);
+    }
 }
