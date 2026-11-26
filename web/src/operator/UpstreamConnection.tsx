@@ -22,18 +22,8 @@ interface ProxyConnection {
 function ProxyValue({ value, onChange, disabled = false, id, invalid = false, describedBy, actions, required = false }: { value: string; onChange?: (value: string) => void; disabled?: boolean; id?: string; invalid?: boolean; describedBy?: string; actions?: ReactNode; required?: boolean }) {
   const { locale, t } = useI18n();
   const copy = providerConnectionCopy(locale);
-  const input = useRef<HTMLInputElement>(null);
-  const [visible, setVisible] = useState(true);
-  useLayoutEffect(() => { if (input.current) input.current.value = value; }, [value]);
-  useLayoutEffect(() => {
-    const hide = () => { if (input.current) input.current.type = 'password'; setVisible(false); };
-    window.addEventListener('blur', hide);
-    document.addEventListener('visibilitychange', hide);
-    return () => { window.removeEventListener('blur', hide); document.removeEventListener('visibilitychange', hide); };
-  }, []);
-  return <div className="provider-proxy-value" onKeyDown={event => { if (event.key === 'Escape' && visible) { setVisible(false); event.stopPropagation(); } }}>
-    <input ref={input} id={id} type={visible ? 'text' : 'password'} readOnly={!onChange} required={required} disabled={disabled} aria-invalid={invalid} aria-describedby={describedBy} aria-label={t('connection.proxyUrl')} autoComplete="off" spellCheck={false} onChange={event => onChange?.(event.target.value)} />
-    <Button type="button" appearance="secondary" disabled={disabled} aria-pressed={visible} onClick={() => setVisible(current => !current)}>{visible ? copy.hideProxy : copy.viewProxy}</Button>
+  return <div className="provider-proxy-value">
+    <SecretInput id={id} label={t('connection.proxyUrl')} value={value} readOnly={!onChange} required={required} disabled={disabled} aria-invalid={invalid} aria-describedby={describedBy} onChange={event => onChange?.(event.target.value)} />
     {value && !disabled && <CopyButton fluent value={value} label={copy.copyProxy} />}
     {actions}
   </div>;

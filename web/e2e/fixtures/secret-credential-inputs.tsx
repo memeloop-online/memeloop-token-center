@@ -68,6 +68,7 @@ function Fixture() {
       <p role="status" aria-label="Edit outcome">{editOutcome}</p>
     </section>
     <section className="panel" aria-label="Account proxy"><ProxyInput value={proxy} onChange={setProxy} /></section>
+    <section className="panel" aria-label="Legacy account proxy"><ProxyInput plaintext value={proxy} onChange={setProxy} /></section>
   </main>;
 }
 createRoot(document.getElementById('root')!).render(<I18nProvider><Fixture /></I18nProvider>);

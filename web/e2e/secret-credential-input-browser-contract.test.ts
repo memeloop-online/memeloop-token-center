@@ -79,6 +79,23 @@ test('create and rotate keep authorized values visible and editable across keybo
         assert.equal(await editSecret.locator('..').getByRole('button').count(), 0);
         await edit.locator('button[type=submit]').click();
         assert.equal(await edit.getByRole('status', { name: 'Edit outcome' }).textContent(), 'replaced');
+        const proxy = page.getByRole('region', { name: 'Account proxy', exact: true }).getByRole('textbox');
+        const legacyProxy = page.getByRole('region', { name: 'Legacy account proxy', exact: true }).getByRole('textbox');
+        const syntheticProxy = 'socks5h://10.0.0.10:1080';
+        await proxy.fill(syntheticProxy);
+        for (const field of [proxy, legacyProxy]) {
+          await field.focus();
+          await page.keyboard.press('Escape');
+          await page.evaluate(() => {
+            window.dispatchEvent(new Event('blur'));
+            document.dispatchEvent(new Event('visibilitychange'));
+          });
+          assert.equal(await field.getAttribute('type'), 'text', 'both proxy editors keep authorized configuration visible across focus changes');
+          assert.equal(await field.inputValue(), syntheticProxy);
+          assert.equal(await field.isEditable(), true);
+        }
+        await legacyProxy.fill('socks5h://10.0.0.11:1080');
+        assert.equal(await proxy.inputValue(), 'socks5h://10.0.0.11:1080', 'the legacy editor keeps ordinary value editing');
         assert.equal(await page.evaluate(() => document.documentElement.scrollWidth <= innerWidth), true);
         await page.screenshot({ path: `${artifacts}/${variant}-${locale}-${theme}-${width}.png`, fullPage: true, mask: [page.locator('input')] });
       }
