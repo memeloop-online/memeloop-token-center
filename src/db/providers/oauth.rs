@@ -1016,7 +1016,16 @@ impl Database {
         }
         if let Some(replay) = replay {
             if replay.response_ciphertext.is_some() {
-                let view = open_rotation_replay(replay, now)?;
+                let view: UpstreamAccountView = open_rotation_replay(replay, now)?;
+                // The durable response records the resulting generation, including
+                // legacy/worker receipts whose request hash has no generation field.
+                if expected_generation.is_some_and(|expected| {
+                    expected.checked_add(1) != Some(view.credential_generation)
+                }) {
+                    return Err(AppError::Conflict(
+                        "Idempotency-Key belongs to a different OAuth credential generation".into(),
+                    ));
+                }
                 tx.commit().await?;
                 return Ok(ClaimUpstreamOAuthRefreshResult::Replay(Box::new(view)));
             }
@@ -1032,6 +1041,12 @@ impl Database {
                     "OAuth refresh is already in progress for this Idempotency-Key".into(),
                 ));
             };
+            let pending_generation: i64 = pending.try_get("credential_generation")?;
+            if expected_generation.is_some_and(|expected| expected != pending_generation) {
+                return Err(AppError::Conflict(
+                    "Idempotency-Key belongs to a different OAuth credential generation".into(),
+                ));
+            }
             let pending_ciphertext: Option<String> =
                 pending.try_get("pending_credential_ciphertext")?;
             let Some(pending_ciphertext) = pending_ciphertext else {

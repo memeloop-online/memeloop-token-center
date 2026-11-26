@@ -7736,6 +7736,17 @@
           },
           {
             "$ref": "#/components/parameters/RequiredIdempotencyKey"
+          },
+          {
+            "name": "expected_credential_generation",
+            "in": "query",
+            "required": false,
+            "description": "Optional compare-and-swap guard for the original credential generation. Must occur once. Stale generations or reuse of an Idempotency-Key for another generation return 409 without a new exchange. Omission preserves manual refresh behavior. Capability must be verified from this OpenAPI contract; older servers may ignore unknown query parameters.",
+            "schema": {
+              "type": "integer",
+              "format": "int64",
+              "minimum": 1
+            }
           }
         ],
         "responses": {
@@ -7763,6 +7774,9 @@
           },
           "502": {
             "$ref": "#/components/responses/UpstreamError"
+          },
+          "409": {
+            "description": "Credential generation differs, the key belongs to another generation, or the original refresh is still in progress or has an unknown outcome."
           }
         }
       }
