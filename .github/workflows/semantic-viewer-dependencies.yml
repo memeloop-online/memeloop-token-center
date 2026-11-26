@@ -19,14 +19,14 @@ permissions:
 jobs:
   web:
     runs-on: ubuntu-24.04
-    timeout-minutes: 20
+    timeout-minutes: 60
     defaults:
       run:
         working-directory: web
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
         with:
-          ref: 31caf3aa305813587b88246dc77182315e06f4bb
+          ref: 291c684beb44e20034b470fc19be7f29cd6e36bf
           persist-credentials: false
       - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020
         with:
@@ -40,26 +40,52 @@ jobs:
           name: semantic-viewer-package-lock
           path: web/package-lock.json
           retention-days: 3
+      - uses: dtolnay/rust-toolchain@4360b52568e2003a75bf9bc1d59f33a8e3fc893c
+        with:
+          toolchain: 1.95.0
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6
       - run: npm ci --ignore-scripts --no-audit
       - run: npm run typecheck
       - run: npm run build
       - name: Install Chromium for bounded browser contracts
         if: github.event_name == 'workflow_dispatch'
         run: npx playwright install --with-deps chromium
-      - name: Verify fixed ID52 authenticated reload and typed-filter contracts
+      - name: Verify one membership baseline and fixed session refresh contracts
         run: |
           set -euo pipefail
-          test "$(git rev-parse HEAD)" = '31caf3aa305813587b88246dc77182315e06f4bb'
-          git rev-parse HEAD
-          MTC_REQUIRE_BROWSER=1 node --import tsx --test --test-reporter=tap --test-concurrency=1 --test-name-pattern='^(hard reload restores applied filters only after current login and tenant revalidation|Overview request actions open focused details and bucket drilldowns preserve the tenant-scoped filter)$' e2e/operator-overview-drilldown-browser-contract.test.ts 2>&1 | tee /tmp/id52-overview.log
-          grep -Fx '# pass 2' /tmp/id52-overview.log
-          grep -Fx '# fail 0' /tmp/id52-overview.log
-          grep -E '^ok [0-9]+ - hard reload restores applied filters only after current login and tenant revalidation$' /tmp/id52-overview.log
-          grep -E '^ok [0-9]+ - Overview request actions open focused details and bucket drilldowns preserve the tenant-scoped filter$' /tmp/id52-overview.log
-          MTC_REQUIRE_BROWSER=1 node --import tsx --test --test-reporter=tap --test-concurrency=1 e2e/typed-filter-builder-contract.test.ts e2e/operator-entry-client-key-contract.test.ts e2e/operator-login-cycle-browser-contract.test.ts 2>&1 | tee /tmp/id52-contracts.log
-          grep -Fx '# pass 20' /tmp/id52-contracts.log
-          grep -Fx '# fail 0' /tmp/id52-contracts.log
-          grep -Fx '# skipped 0' /tmp/id52-contracts.log
+          fixed=291c684beb44e20034b470fc19be7f29cd6e36bf
+          base=68403da1c8f04e14e65e31df927ba19ac8ee2529
+          test "$(git rev-parse HEAD)" = "$fixed"
+          git fetch --no-tags origin "$base"
+          for file in src/operator/SessionMonitor.tsx src/operator/sessionRefresh.ts; do
+            git show "$base:web/$file" > "$file"
+            test "$(git hash-object "$file")" = "$(git rev-parse "$base:web/$file")"
+            echo "baseline $file $(git hash-object "$file")"
+          done
+          MTC_SESSION_REFRESH_BASELINE=1 MTC_REQUIRE_BROWSER=1 node --import tsx --test --test-reporter=tap --test-concurrency=1 --test-name-pattern='^a new confirmed start reads active-page membership once and keeps exact refreshes scoped$' e2e/session-loading-browser-contract.test.ts 2>&1 | tee /tmp/session-refresh-baseline.log
+          grep -Fx '# pass 1' /tmp/session-refresh-baseline.log
+          grep -Fx '# fail 0' /tmp/session-refresh-baseline.log
+          grep -E '^ok [0-9]+ - a new confirmed start reads active-page membership once and keeps exact refreshes scoped$' /tmp/session-refresh-baseline.log
+          for file in src/operator/SessionMonitor.tsx src/operator/sessionRefresh.ts; do
+            git show "$fixed:web/$file" > "$file"
+            test "$(git hash-object "$file")" = "$(git rev-parse "$fixed:web/$file")"
+            echo "fixed $file $(git hash-object "$file")"
+          done
+          git diff --exit-code
+          MTC_REQUIRE_BROWSER=1 node --import tsx --test --test-reporter=tap --test-concurrency=1 e2e/session-loading-browser-contract.test.ts e2e/session-refresh-contract.test.ts 2>&1 | tee /tmp/session-refresh-fixed.log
+          grep -Fx '# pass 21' /tmp/session-refresh-fixed.log
+          grep -Fx '# fail 0' /tmp/session-refresh-fixed.log
+          grep -Fx '# skipped 0' /tmp/session-refresh-fixed.log
+      - name: Build the original browser-test service
+        run: cargo build --locked --manifest-path ../Cargo.toml --features experimental-plugin-revisions --bin memeloop-token-center
+      - name: Verify original bounded-refresh dogfood scenario
+        env:
+          MTC_E2E_BINARY: ${{ github.workspace }}/target/debug/memeloop-token-center
+        run: |
+          set -euo pipefail
+          npm run test:e2e -- e2e/features/dogfood.feature:111 2>&1 | tee /tmp/session-refresh-dogfood.log
+          grep -E '^1 scenario \(1 passed\)' /tmp/session-refresh-dogfood.log
+          ! grep -E '[1-9][0-9]* (failed|skipped|undefined|pending)' /tmp/session-refresh-dogfood.log
       - name: Retain actual browser evidence
         if: always() && github.event_name == 'workflow_dispatch'
         uses: actions/upload-artifact@65462800fd760344b1a7b4382951275a0abb4808
@@ -67,6 +93,6 @@ jobs:
           name: operator-ui-${{ inputs.contract }}-${{ inputs.source_revision }}
           path: |
             web/e2e-artifacts/
-            /tmp/id52-*.log
+            /tmp/session-refresh-*.log
           retention-days: 7
           if-no-files-found: warn
