@@ -35,57 +35,133 @@ permissions:
 jobs:
   metadata-refresh-contract:
     if: inputs.contract == 'metadata-refresh'
-    runs-on: ubuntu-24.04
-    timeout-minutes: 40
-    services:
-      postgres:
-        image: postgres:16-alpine
-        env:
-          POSTGRES_USER: token_center
-          POSTGRES_PASSWORD: token_center
-          POSTGRES_DB: token_center_test
-        ports: ['5432:5432']
-        options: --health-cmd "pg_isready -U token_center" --health-interval 5s --health-timeout 5s --health-retries 10
+    runs-on: ubuntu-latest
+    timeout-minutes: 120
+    permissions:
+      contents: read
     env:
-      CARGO_BUILD_JOBS: '2'
-      CARGO_INCREMENTAL: '0'
-      CARGO_PROFILE_TEST_DEBUG: '0'
-      MTC_TEST_POSTGRES_URL: postgres://token_center:token_center@127.0.0.1:5432/token_center_test
+      CANDIDATE_SHA: e9f1058dcad784e9a5160819575ccbb1b96e6d3b
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
         with:
-          ref: ${{ inputs.source_revision }}
+          ref: e9f1058dcad784e9a5160819575ccbb1b96e6d3b
           persist-credentials: false
-      - uses: dtolnay/rust-toolchain@4360b52568e2003a75bf9bc1d59f33a8e3fc893c
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020
         with:
-          toolchain: 1.95.0
-      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6
-      - uses: ./.github/actions/checkout-plugin-examples
-      - name: Verify fixed schema163 projection and cold OAuth contracts
+          node-version: 24.18.0
+      - name: Verify fixed Stage-only source
+        id: source
         run: |
           set -euo pipefail
-          test "$(git rev-parse HEAD)" = 'cc3a66ff9dfc482263f9a9afb04829097075d555'
+          test "$(git rev-parse HEAD)" = "$CANDIDATE_SHA"
           git rev-parse HEAD
-          mkdir -p /tmp/schema163-evidence
-          failures=0
-          if ! cargo test --locked --all-features --lib db::requests::conversations::prefix_storage::tests::postgres_prefix_preload_releases_projection_scope_before_graph_receive -- --exact --ignored --nocapture 2>&1 | tee /tmp/schema163-evidence/0.log; then failures=1; fi
-          if ! grep -F '1 passed; 0 failed; 0 ignored;' /tmp/schema163-evidence/0.log; then failures=1; fi
-          if ! cargo test --locked --all-features --lib db::requests::conversations::archive_readiness_tests::postgres_identity_projection_busy_yields_and_preserves_page_cursor -- --exact --nocapture 2>&1 | tee /tmp/schema163-evidence/1.log; then failures=1; fi
-          if ! grep -F '1 passed; 0 failed; 0 ignored;' /tmp/schema163-evidence/1.log; then failures=1; fi
-          if ! cargo test --locked --all-features --lib db::requests::conversations::archive_readiness_tests::postgres_declared_identity_is_readable_while_body_is_pending -- --exact --nocapture 2>&1 | tee /tmp/schema163-evidence/2.log; then failures=1; fi
-          if ! grep -F '1 passed; 0 failed; 0 ignored;' /tmp/schema163-evidence/2.log; then failures=1; fi
-          if ! cargo test --locked --all-features --lib db::requests::conversations::archive_readiness_tests::postgres_coverage_read_does_not_block_body_worker -- --exact --nocapture 2>&1 | tee /tmp/schema163-evidence/3.log; then failures=1; fi
-          if ! grep -F '1 passed; 0 failed; 0 ignored;' /tmp/schema163-evidence/3.log; then failures=1; fi
-          if ! cargo test --locked --all-features --lib plugin::application::oauth_background_tests::postgres_cold_oauth_authority_uses_existing_pool_and_preserves_shared_authority -- --exact --ignored --nocapture 2>&1 | tee /tmp/schema163-evidence/4.log; then failures=1; fi
-          if ! grep -F '1 passed; 0 failed; 0 ignored;' /tmp/schema163-evidence/4.log; then failures=1; fi
-          if ! grep -F 'schema_max=163, schema163_receipts=1' /tmp/schema163-evidence/4.log; then failures=1; fi
-          exit "$failures"
-      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
-        if: always()
+          echo "timestamp=$(git show -s --format=%cI HEAD)" >> "$GITHUB_OUTPUT"
+      - uses: docker/setup-buildx-action@8d2750c68a42422c14e847fe6c8ac0403b4cbd6f
+      - name: Compile and runtime-smoke the exact original release input once
+        uses: docker/build-push-action@10e90e3645eae34f1e60eeb005ba3a3d33f178e8
         with:
-          name: schema163-projection-oauth-cc3
-          path: /tmp/schema163-evidence/
-          if-no-files-found: warn
+          context: .
+          file: Dockerfile
+          target: release-input-export
+          platforms: linux/amd64
+          push: false
+          outputs: type=local,dest=${{ runner.temp }}/release-service-input
+          build-args: |
+            MTC_BUILD_GIT_SHA_INPUT=${{ env.CANDIDATE_SHA }}
+            MTC_BUILD_TIMESTAMP_INPUT=${{ steps.source.outputs.timestamp }}
+            MTC_BUILD_TARGET_INPUT=linux/amd64
+          cache-from: type=gha,scope=service-release-input
+      - name: Seal and verify the same-source complete input
+        run: |
+          set -euo pipefail
+          node scripts/ci/create-memory-binary-manifest.ts "$RUNNER_TEMP/release-service-input/memeloop-token-center" "$CANDIDATE_SHA" "$RUNNER_TEMP/sealed-input"
+          for file in libgcc_s.so.1 libstdc++.so.6 install-plugin-oci cosign LICENSE THIRD_PARTY_NOTICES.md; do
+            cp "$RUNNER_TEMP/release-service-input/$file" "$RUNNER_TEMP/sealed-input/$file"
+          done
+          cp -R "$RUNNER_TEMP/release-service-input/web" "$RUNNER_TEMP/sealed-input/web"
+          cp -R "$RUNNER_TEMP/release-service-input/third-party-licenses" "$RUNNER_TEMP/sealed-input/third-party-licenses"
+          chmod 0555 "$RUNNER_TEMP/sealed-input/memeloop-token-center" "$RUNNER_TEMP/sealed-input/install-plugin-oci" "$RUNNER_TEMP/sealed-input/cosign"
+          node scripts/ci/create-release-service-input-manifest.ts "$RUNNER_TEMP/sealed-input" "$CANDIDATE_SHA"
+          node scripts/ci/verify-release-service-input.ts "$RUNNER_TEMP/sealed-input" "$CANDIDATE_SHA"
+          mkdir -p "$RUNNER_TEMP/stage-test-oci"
+          cp "$RUNNER_TEMP/sealed-input/memory-binary.json" "$RUNNER_TEMP/sealed-input/release-service-input.json" "$RUNNER_TEMP/stage-test-oci/"
+      - name: Assemble one Stage-only OCI archive without publishing
+        uses: docker/build-push-action@10e90e3645eae34f1e60eeb005ba3a3d33f178e8
+        with:
+          context: .
+          file: Dockerfile.release
+          platforms: linux/amd64
+          push: false
+          outputs: type=oci,dest=${{ runner.temp }}/stage-test-oci/service-e9f.oci.tar
+          build-contexts: |
+            release-input=${{ runner.temp }}/sealed-input
+          labels: |
+            org.opencontainers.image.revision=${{ env.CANDIDATE_SHA }}
+            org.opencontainers.image.source=https://github.com/memeloop-online/memeloop-token-center
+            io.memeloop.artifact-purpose=stage-test-only
+          provenance: mode=max
+          sbom: true
+          cache-from: type=gha,scope=service
+      - name: Verify original OCI graph and immutable runtime identity
+        run: |
+          set -euo pipefail
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends skopeo
+          python3 - <<'PY'
+          import hashlib,json,os,pathlib,tarfile
+          root=pathlib.Path(os.environ['RUNNER_TEMP'])/'stage-test-oci'
+          archive=root/'service-e9f.oci.tar'
+          with tarfile.open(archive) as tar:
+              members={m.name.removeprefix('./'):m for m in tar.getmembers() if m.isfile()}
+              def read(name):
+                  f=tar.extractfile(members[name])
+                  if f is None: raise RuntimeError('missing OCI file')
+                  return f.read()
+              index=read('index.json'); (root/'index.json').write_bytes(index)
+              verified=set(); platforms=[]
+              def visit(d):
+                  digest=d['digest']; alg,h=digest.split(':',1)
+                  if alg!='sha256': raise RuntimeError('unsupported digest')
+                  raw=read('blobs/sha256/'+h)
+                  if len(raw)!=d['size'] or hashlib.sha256(raw).hexdigest()!=h: raise RuntimeError('OCI descriptor mismatch')
+                  if digest in verified:return
+                  verified.add(digest)
+                  if 'manifest' in d.get('mediaType','') or 'index' in d.get('mediaType',''):
+                      obj=json.loads(raw)
+                      for child in obj.get('manifests',[]):visit(child)
+                      if 'config' in obj:
+                          visit(obj['config'])
+                          for child in obj.get('layers',[]):visit(child)
+                          config=json.loads(read('blobs/sha256/'+obj['config']['digest'].split(':')[1]))
+                          if config.get('os')=='linux' and config.get('architecture')=='amd64':
+                              if config.get('config',{}).get('Labels',{}).get('org.opencontainers.image.revision')!=os.environ['CANDIDATE_SHA']:raise RuntimeError('revision mismatch')
+                              platforms.append((digest,obj['config']['digest']))
+              for d in json.loads(index)['manifests']:visit(d)
+              if len(platforms)!=1:raise RuntimeError('expected exactly one linux/amd64 runtime')
+              manifest,config=platforms[0]
+              evidence={'purpose':'stage-test-only','source':os.environ['CANDIDATE_SHA'],'run':os.environ['GITHUB_RUN_ID'],'index_digest':'sha256:'+hashlib.sha256(index).hexdigest(),'manifest_digest':manifest,'config_digest':config,'platform':'linux/amd64','descriptors':len(verified)}
+              (root/'oci-identity.json').write_text(json.dumps(evidence,indent=2)+'\n')
+              (root/'expected-config.txt').write_text(config+'\n')
+          h=hashlib.sha256()
+          with archive.open('rb') as f:
+              for chunk in iter(lambda:f.read(1024*1024),b''):h.update(chunk)
+          (root/'SHA256SUMS').write_text(h.hexdigest()+'  service-e9f.oci.tar\n')
+          print(json.dumps(evidence))
+          PY
+          skopeo copy --override-os linux --override-arch amd64 "oci-archive:$RUNNER_TEMP/stage-test-oci/service-e9f.oci.tar" docker-daemon:mtc-stage-e9f:local
+          expected=$(cat "$RUNNER_TEMP/stage-test-oci/expected-config.txt")
+          actual=$(docker image inspect mtc-stage-e9f:local --format '{{.Id}}')
+          test "$actual" = "$expected"
+          printf '%s\n' "$actual" > "$RUNNER_TEMP/stage-test-oci/loaded-image-id.txt"
+          docker run --rm --network none --read-only --cap-drop ALL --security-opt no-new-privileges --entrypoint /usr/local/bin/memeloop-token-center "$actual" --help > "$RUNNER_TEMP/stage-test-oci/help.txt"
+          docker run --rm --network none --read-only --cap-drop ALL --security-opt no-new-privileges --entrypoint /usr/local/bin/memeloop-token-center "$actual" verify-plugin-runtime > "$RUNNER_TEMP/stage-test-oci/plugin-runtime.txt"
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        if: success()
+        with:
+          name: stage-test-only-service-e9f
+          path: ${{ runner.temp }}/stage-test-oci/
+          if-no-files-found: error
+          retention-days: 3
 
   orphan-reaper-contract:
     if: inputs.contract == 'orphan-reaper-971'
