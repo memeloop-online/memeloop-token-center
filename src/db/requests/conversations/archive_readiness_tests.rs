@@ -2423,9 +2423,12 @@ async fn semantic_coverage_committed_recovery_contract(database_url: String) {
         }
         // Unknown old rows cannot starve a later proven row. Only metadata
         // pages are retained between ticks, not their original snapshot bytes.
+        let mut unknown_rows = Vec::new();
         for _ in 0..35 {
+            let unknown = Uuid::now_v7();
+            unknown_rows.push(unknown);
             sqlx::query("INSERT INTO conversation_projection_outbox(request_id,tenant_id,key_id,principal_id,request_json,hints_json,observed_at,key_snapshot_json,semantic_snapshot_json,projected_at,statistics_outcome) SELECT $1,tenant_id,key_id,principal_id,request_json,hints_json,observed_at,key_snapshot_json,$2,$3,statistics_outcome FROM conversation_projection_outbox WHERE request_id=$4")
-                .bind(Uuid::now_v7().to_string()).bind("x".repeat(16384)).bind(original.1-1).bind(fixture.request_id.to_string()).execute(&db.pool).await.unwrap();
+                .bind(unknown.to_string()).bind("x".repeat(16384)).bind(original.1-1).bind(fixture.request_id.to_string()).execute(&db.pool).await.unwrap();
         }
         let mut scan=(None,None);
         let mut removed=0;
@@ -2433,6 +2436,10 @@ async fn semantic_coverage_committed_recovery_contract(database_url: String) {
             removed+=db.delete_retired_outbox_page(10,i64::MAX,&mut scan).await.unwrap();
         }
         assert_eq!(removed,1,"metadata cursor must pass unknown heads and reach the proven row");
+        for unknown in unknown_rows {
+            sqlx::query("DELETE FROM conversation_projection_outbox WHERE request_id=$1")
+                .bind(unknown.to_string()).execute(&db.pool).await.unwrap();
+        }
         let authority_after = fixture.state.archive.semantic_archive_authority(
             fixture.key.tenant_id, fixture.request_id, &before.2).await.unwrap().unwrap();
         assert_eq!(authority_before.publication.revision, authority_after.publication.revision);
