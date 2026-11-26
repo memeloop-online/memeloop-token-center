@@ -14,29 +14,87 @@ impl Database {
         lease_owner: Uuid,
         request_id: Uuid,
     ) -> Result<(), AppError> {
-        let mut transaction = self.begin_write_transaction().await?;
-        lock_request_stats_projection_rebuild_in_transaction(&mut transaction).await?;
-        let sql = match self.backend {
-            DatabaseBackend::PostgreSql => {
-                "SELECT tenant_id, key_id, principal_id, hints_json, key_snapshot_json, client_name, upstream_response_id, observed_at FROM conversation_projection_outbox WHERE request_id = $1 AND projected_at IS NULL AND COALESCE(terminal_lease_owner, lease_owner) = $2 AND COALESCE(terminal_lease_expires_at, lease_expires_at) >= $3 FOR UPDATE"
-            }
-            DatabaseBackend::Sqlite => {
-                "SELECT tenant_id, key_id, principal_id, hints_json, key_snapshot_json, client_name, upstream_response_id, observed_at FROM conversation_projection_outbox WHERE request_id = $1 AND projected_at IS NULL AND COALESCE(terminal_lease_owner, lease_owner) = $2 AND COALESCE(terminal_lease_expires_at, lease_expires_at) >= $3"
-            }
-        };
-        let row = sqlx::query(sql)
+        let sql = "SELECT tenant_id, key_id, principal_id, hints_json, key_snapshot_json, client_name, upstream_response_id, observed_at FROM conversation_projection_outbox WHERE request_id = $1 AND projected_at IS NULL AND COALESCE(terminal_lease_owner, lease_owner) = $2 AND COALESCE(terminal_lease_expires_at, lease_expires_at) >= $3";
+        let Some(row) = sqlx::query(sql)
             .bind(request_id.to_string())
             .bind(lease_owner.to_string())
             .bind(unix_millis())
-            .fetch_optional(&mut *transaction)
-            .await?;
-        let Some(row) = row else {
+            .fetch_optional(&self.pool)
+            .await?
+        else {
             return Ok(());
         };
-        self.project_conversation_identity_row_in_transaction(&mut transaction, request_id, row)
+        let paths = self
+            .prepare_identity_candidate_paths(request_id, &row)
             .await?;
-        transaction.commit().await?;
-        Ok(())
+        let Some(paths) = paths else {
+            return Ok(());
+        };
+        let mut transaction = self.begin_write_transaction().await?;
+        let result: Result<(), ConversationContentError> = async {
+            if !super::super::super::projection_lock::try_lock_request_stats_projection_rebuild_in_transaction(&mut transaction).await? {
+                return Err(ConversationContentError::ProjectionBusy);
+            }
+            let lock = if matches!(self.backend, DatabaseBackend::PostgreSql) { " FOR UPDATE" } else { "" };
+            let row = sqlx::query(sqlx::AssertSqlSafe(format!("{sql}{lock}")))
+                .bind(request_id.to_string()).bind(lease_owner.to_string()).bind(unix_millis())
+                .fetch_optional(&mut *transaction).await?;
+            if let Some(row) = row {
+                self.project_conversation_identity_row_in_transaction(&mut transaction, request_id, row, &paths).await?;
+            }
+            Ok(())
+        }.await;
+        match result {
+            Ok(()) => {
+                transaction.commit().await?;
+                Ok(())
+            }
+            Err(error) => {
+                let rolled_back = transaction.rollback().await.is_ok();
+                if rolled_back && error.is_projection_busy() {
+                    self.defer_session_body_archive(lease_owner, request_id)
+                        .await?;
+                } else if rolled_back && error.retry_after_confirmed_rollback() {
+                    self.try_schedule_rolled_back_conversation_retry(request_id, lease_owner)
+                        .await;
+                }
+                Err(error.into())
+            }
+        }
+    }
+
+    async fn prepare_identity_candidate_paths(
+        &self,
+        request_id: Uuid,
+        row: &sqlx::any::AnyRow,
+    ) -> Result<Option<prefix_storage::PreparedCandidatePaths>, AppError> {
+        let hints: ConversationHints =
+            serde_json::from_str(&row.try_get::<String, _>("hints_json")?)
+                .map_err(|_| AppError::internal("conversation_identity_hints"))?;
+        if hints
+            .session_id
+            .as_deref()
+            .is_none_or(|value| value.trim().is_empty())
+        {
+            return Ok(None);
+        }
+        let tenant: String = row.try_get("tenant_id")?;
+        let mut read = self.pool.begin().await?;
+        let candidates = fetch_conversation_candidates(
+            &mut read,
+            &tenant,
+            &row.try_get::<String, _>("principal_id")?,
+            &row.try_get::<String, _>("key_id")?,
+            &hints,
+            row.try_get("observed_at")?,
+            &request_id.to_string(),
+        )
+        .await?;
+        let paths =
+            prefix_storage::PreparedCandidatePaths::load(&mut read, tenant, &candidates, None)
+                .await?;
+        read.commit().await?;
+        Ok(Some(paths))
     }
 
     /// The page boundary precedes all eligibility work. LIMIT on the old
@@ -97,7 +155,12 @@ impl Database {
         ids.extend(history);
         let mut seen = std::collections::HashSet::new();
         ids.retain(|id| seen.insert(id.clone()));
-        self.project_conversation_identity_ids(ids).await;
+        if !self.project_conversation_identity_ids(ids).await {
+            return Ok((
+                live_after.map(str::to_owned),
+                history_before.map(str::to_owned),
+            ));
+        }
         tracing::debug!(target: "mtc_identity_projection", stage = "batch_done",
             ?next_live, ?next_history, elapsed_ms = started.elapsed().as_millis() as u64,
             "conversation identity progress");
@@ -116,11 +179,13 @@ impl Database {
             .fetch_all(&self.pool)
             .await?;
         let next = ids.last().cloned();
-        self.project_conversation_identity_ids(ids).await;
+        if !self.project_conversation_identity_ids(ids).await {
+            return Ok(after.map(str::to_owned));
+        }
         Ok(next)
     }
 
-    async fn project_conversation_identity_ids(&self, ids: Vec<String>) {
+    async fn project_conversation_identity_ids(&self, ids: Vec<String>) -> bool {
         let eligible = "c.projected_at IS NULL AND c.key_snapshot_json IS NOT NULL
             AND t.projected_at IS NOT NULL AND t.tenant_id = c.tenant_id AND t.key_id = c.key_id
             AND NOT EXISTS (SELECT 1 FROM conversation_observations o WHERE o.request_id = c.request_id)
@@ -153,12 +218,18 @@ impl Database {
                 {
                     return Ok("undeclared_identity");
                 }
+                let Some(paths) = self.prepare_identity_candidate_paths(request_id, &row).await? else {
+                    return Ok("undeclared_identity");
+                };
                 tracing::debug!(target: "mtc_identity_projection", stage = "transaction_start",
                     %request_id, "conversation identity progress");
                 let mut transaction = self.begin_write_transaction().await?;
                 tracing::debug!(target: "mtc_identity_projection", stage = "stats_lock_start",
                     %request_id, "conversation identity progress");
-                lock_request_stats_projection_rebuild_in_transaction(&mut transaction).await?;
+                if !super::super::super::projection_lock::try_lock_request_stats_projection_rebuild_in_transaction(&mut transaction).await? {
+                    transaction.rollback().await?;
+                    return Ok("projection_busy");
+                }
                 tracing::debug!(target: "mtc_identity_projection", stage = "row_lock_start",
                     %request_id, "conversation identity progress");
                 let lock = match self.backend {
@@ -171,40 +242,52 @@ impl Database {
                     .bind(&id)
                     .fetch_optional(&mut *transaction)
                     .await?;
-                let mut outcome = "locked_or_eligibility_changed";
-                if let Some(row) = row {
+                let Some(row) = row else {
+                    transaction.rollback().await?;
+                    return Ok("projection_busy");
+                };
+                let outcome = "projection_checked";
+                {
                     tracing::debug!(target: "mtc_identity_projection", stage = "projection_start",
                         %request_id, "conversation identity progress");
-                    self.project_conversation_identity_row_in_transaction(
-                        &mut transaction,
-                        request_id,
-                        row,
-                    )
-                    .await?;
+                    if let Err(error) = self.project_conversation_identity_row_in_transaction(
+                        &mut transaction, request_id, row, &paths,
+                    ).await {
+                        transaction.rollback().await?;
+                        return Err(error);
+                    }
                     // The helper can legitimately skip after its final fences.
                     // Report a checked projection, not an unverified publication.
-                    outcome = "projection_checked";
                 }
                 tracing::debug!(target: "mtc_identity_projection", stage = "commit_start",
                     %request_id, "conversation identity progress");
                 transaction.commit().await?;
-                Ok::<&'static str, AppError>(outcome)
+                Ok::<&'static str, ConversationContentError>(outcome)
             }
             .await;
+            if matches!(result, Ok("projection_busy")) {
+                return false;
+            }
             match result {
                 Ok(outcome) => tracing::debug!(target: "mtc_identity_projection",
                     stage = "request_done", request_id = %id, outcome,
                     elapsed_ms = started.elapsed().as_millis() as u64,
                     "conversation identity progress"),
                 Err(error) => {
+                    let retry_without_advancing = error.retry_after_confirmed_rollback();
+                    let error = AppError::from(error);
                     tracing::debug!(target: "mtc_identity_projection", stage = "request_done",
                         request_id = %id, outcome = "error",
                         elapsed_ms = started.elapsed().as_millis() as u64,
                         "conversation identity progress");
                     tracing::error!(%error, request_id = %id, "declared conversation identity remains pending");
+                    if retry_without_advancing {
+                        return false;
+                    }
                 }
             }
         }
+        true
     }
 
     async fn project_conversation_identity_row_in_transaction(
@@ -212,7 +295,8 @@ impl Database {
         transaction: &mut Transaction<'_, Any>,
         request_id: Uuid,
         row: sqlx::any::AnyRow,
-    ) -> Result<(), AppError> {
+        prepared_paths: &prefix_storage::PreparedCandidatePaths,
+    ) -> Result<(), ConversationContentError> {
         if let Some(terminal) = sqlx::query(
             "SELECT created_at, projected_at FROM terminal_projection_outbox WHERE request_id = $1",
         )
@@ -271,7 +355,7 @@ impl Database {
         };
         let client_name: Option<String> = row.try_get("client_name")?;
         let response_id: Option<String> = row.try_get("upstream_response_id")?;
-        self.record_conversation_observation_with_snapshot_in_transaction(
+        self.record_conversation_observation_with_prepared_paths_in_transaction(
             transaction,
             ConversationObservationInput {
                 key: &key,
@@ -285,9 +369,9 @@ impl Database {
                 content_materialized: true,
             },
             None,
+            Some(prepared_paths),
         )
-        .await
-        .map_err(AppError::from)?;
+        .await?;
         Ok(())
     }
 }

@@ -2885,3 +2885,72 @@ async fn postgres_exact_legacy_body_rebuild_preserves_incomplete_and_financial_r
     );
     isolated.cleanup().await;
 }
+
+#[tokio::test]
+async fn postgres_identity_projection_busy_yields_and_preserves_page_cursor() {
+    let url = std::env::var("MTC_TEST_POSTGRES_URL").expect("requires CI PostgreSQL");
+    let isolated = PostgresTestDatabase::create(&url).await;
+    let fixture = Fixture::new(isolated.url().to_owned(), false).await;
+    let db = &fixture.state.db;
+    let request = Uuid::now_v7();
+    seed_identity_page_task(&fixture, request, Some("nonblocking-identity"), true).await;
+    let owner = Uuid::now_v7();
+    sqlx::query("UPDATE conversation_projection_outbox SET attempts=1,terminal_lease_owner=$2,terminal_lease_expires_at=$3 WHERE request_id=$1")
+        .bind(request.to_string()).bind(owner.to_string()).bind(unix_millis()+300000)
+        .execute(&db.pool).await.unwrap();
+    let mut blocker = db.pool.begin().await.unwrap();
+    lock_request_stats_projection_rebuild_in_transaction(&mut blocker)
+        .await
+        .unwrap();
+    let cursors = tokio::time::timeout(
+        std::time::Duration::from_secs(2),
+        db.project_declared_conversation_identity_pages(None, None, 32),
+    )
+    .await
+    .expect("busy projection must not wait on the writer gate")
+    .unwrap();
+    assert_eq!(
+        cursors,
+        (None, None),
+        "busy page cannot advance over this identity"
+    );
+    let claimed = tokio::time::timeout(
+        std::time::Duration::from_secs(2),
+        db.project_claimed_conversation_identity(owner, request),
+    )
+    .await
+    .expect("claimed identity must release its connection while the gate is busy");
+    assert!(matches!(claimed, Err(AppError::Conflict(_))));
+    let row = sqlx::query("SELECT projected_at,terminal_lease_owner,terminal_lease_expires_at,lease_owner,lease_expires_at FROM conversation_projection_outbox WHERE request_id=$1")
+        .bind(request.to_string()).fetch_one(&db.pool).await.unwrap();
+    assert!(row.get::<Option<i64>, _>("projected_at").is_none());
+    assert!(
+        row.get::<Option<String>, _>("terminal_lease_owner")
+            .is_none()
+    );
+    assert_eq!(row.get::<String, _>("lease_owner"), "terminal-v118");
+    assert_eq!(row.get::<i64, _>("lease_expires_at"), i64::MAX);
+    let observations: i64 =
+        sqlx::query_scalar("SELECT COUNT(*) FROM conversation_observations WHERE request_id=$1")
+            .bind(request.to_string())
+            .fetch_one(&db.pool)
+            .await
+            .unwrap();
+    assert_eq!(observations, 0, "busy is a retry obligation, never an ACK");
+    blocker.rollback().await.unwrap();
+    db.project_declared_conversation_identity_pages(None, None, 32)
+        .await
+        .unwrap();
+    let observations: i64 =
+        sqlx::query_scalar("SELECT COUNT(*) FROM conversation_observations WHERE request_id=$1")
+            .bind(request.to_string())
+            .fetch_one(&db.pool)
+            .await
+            .unwrap();
+    assert_eq!(
+        observations, 1,
+        "same page progresses after the gate is released"
+    );
+    fixture.state.db.pool.close().await;
+    isolated.cleanup().await;
+}

@@ -70,3 +70,15 @@ pub(crate) async fn lock_request_stats_projection_rebuild_in_transaction(
     }
     Ok(())
 }
+
+/// Background replacement writers yield instead of occupying a connection
+/// while an online writer owns the same authoritative projection gate.
+pub(crate) async fn try_lock_request_stats_projection_rebuild_in_transaction(
+    transaction: &mut Transaction<'_, Any>,
+) -> Result<bool, AppError> {
+    if transaction.as_mut().backend_name() == "PostgreSQL" {
+        return Ok(sqlx::query_scalar("SELECT pg_try_advisory_xact_lock(hashtextextended('memeloop-token-center:request-stats', 734627102948314))")
+            .fetch_one(&mut **transaction).await?);
+    }
+    Ok(true)
+}
