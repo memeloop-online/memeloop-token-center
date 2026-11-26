@@ -31,6 +31,7 @@ type ScopeStatus =
 interface ScopeState {
   credential: string;
   validated: boolean;
+  remembered: boolean;
   loginCycle?: string;
   credentialInput: string;
   tenant: string;
@@ -41,7 +42,7 @@ interface ScopeState {
 type ScopeAction =
   | { type: 'credential-input'; value: string }
   | { type: 'authenticate'; candidate: string }
-  | { type: 'authenticated'; credential: string; tenants: TenantView[]; tenant: string; loginCycle?: string }
+  | { type: 'authenticated'; credential: string; tenants: TenantView[]; tenant: string; loginCycle?: string; remembered: boolean }
   | { type: 'tenants-refreshed'; tenants: TenantView[]; tenant: string }
   // reject: the active identity itself is revoked, clear it. denied: the
   // validated identity got a definitive permission answer on the baseline
@@ -59,6 +60,8 @@ function initialState(): ScopeState {
   return {
     credential,
     validated: false,
+    remembered: Boolean(credential),
+    loginCycle: readOperatorLoginCycle(),
     credentialInput: '',
     tenant: readRememberedOperatorTenant(),
     tenants: [],
@@ -76,6 +79,7 @@ function reducer(state: ScopeState, action: ScopeAction): ScopeState {
       return {
         credential: action.credential,
         validated: true,
+        remembered: action.remembered,
         loginCycle: action.loginCycle,
         credentialInput: state.credentialInput.trim() === action.credential ? '' : state.credentialInput,
         tenants: action.tenants,
@@ -90,7 +94,7 @@ function reducer(state: ScopeState, action: ScopeAction): ScopeState {
     case 'authentication-failed':
       if (action.outcome === 'denied') return { ...state, validated: false, loginCycle: undefined, status: { kind: 'failed', message: action.message } };
       if (action.outcome === 'session-kept') return { ...state, status: { kind: 'failed', message: action.message } };
-      return { credential: '', validated: false, credentialInput: state.credentialInput, tenant: '', tenants: [], status: { kind: 'failed', message: action.message } };
+      return { credential: '', validated: false, remembered: false, credentialInput: state.credentialInput, tenant: '', tenants: [], status: { kind: 'failed', message: action.message } };
     case 'authentication-unavailable':
       return { ...state, status: { kind: 'unavailable', message: action.message, candidate: action.candidate } };
     case 'select-tenant':
@@ -99,7 +103,7 @@ function reducer(state: ScopeState, action: ScopeAction): ScopeState {
       // succeeds or the identity is cleared.
       return { ...state, tenant: action.tenant };
     case 'clear':
-      return { credential: '', validated: false, credentialInput: '', tenant: '', tenants: [], status: { kind: 'disconnected' } };
+      return { credential: '', validated: false, remembered: false, credentialInput: '', tenant: '', tenants: [], status: { kind: 'disconnected' } };
   }
 }
 
@@ -120,11 +124,22 @@ export function useOperatorScope() {
     return `${t('operator.serviceUnavailable')} · ${diagnostic}`;
   }
 
+  function ownsRememberedIdentity(identity: ScopeState): boolean {
+    return readRememberedCredential('operator') === (identity.remembered ? identity.credential : '')
+      && readOperatorLoginCycle() === identity.loginCycle;
+  }
+
+  function clearLocalIdentity() {
+    sequence.current += 1;
+    dispatch({ type: 'clear' });
+  }
+
   async function authenticate(rawCandidate: string) {
     const candidate = rawCandidate.trim();
     if (!candidate) return;
-    const request = ++sequence.current;
     const before = stateRef.current;
+    if (before.credential && !ownsRememberedIdentity(before)) { clearLocalIdentity(); return; }
+    const request = ++sequence.current;
     const rememberedBefore = readRememberedCredential('operator');
     const cycleBefore = readOperatorLoginCycle();
     dispatch({ type: 'authenticate', candidate });
@@ -133,16 +148,18 @@ export function useOperatorScope() {
       // stays unmounted until its route is selected, so a singleton credential
       // never performs an accidental all-tenant query.
       const tenants = await api<TenantView[]>('/internal/v1/tenants', candidate);
-      if (request !== sequence.current || readRememberedCredential('operator') !== rememberedBefore || readOperatorLoginCycle() !== cycleBefore) return;
+      if (request !== sequence.current) return;
+      if (readRememberedCredential('operator') !== rememberedBefore || readOperatorLoginCycle() !== cycleBefore) { clearLocalIdentity(); return; }
       // Honor the tenant the user selected while this read was in flight;
       // the snapshot from the request start must not roll their choice back.
       const tenant = tenantForCredential(tenants, stateRef.current.tenant || before.tenant);
       rememberCredential('operator', candidate);
       rememberOperatorTenant(tenant);
       const loginCycle = readRememberedCredential('operator') === candidate ? ensureOperatorLoginCycle() : undefined;
-      dispatch({ type: 'authenticated', credential: candidate, tenants, tenant, loginCycle });
+      dispatch({ type: 'authenticated', credential: candidate, tenants, tenant, loginCycle, remembered: readRememberedCredential('operator') === candidate });
     } catch (reason) {
-      if (request !== sequence.current || readRememberedCredential('operator') !== rememberedBefore || readOperatorLoginCycle() !== cycleBefore) return;
+      if (request !== sequence.current) return;
+      if (readRememberedCredential('operator') !== rememberedBefore || readOperatorLoginCycle() !== cycleBefore) { clearLocalIdentity(); return; }
       // A failing replacement candidate proves nothing about the active
       // identity: the validated session, its saved credential and its pages
       // stay; only the candidate's own failure is reported.
@@ -205,8 +222,7 @@ export function useOperatorScope() {
       if (event.storageArea !== window.localStorage) return;
       if (event.key !== null && event.key !== operatorLoginCycleStorageKey && event.key !== operatorCredentialStorageKey) return;
       const current = stateRef.current;
-      if (current.validated && readRememberedCredential('operator') === current.credential
-        && readOperatorLoginCycle() === current.loginCycle) return;
+      if (current.validated && ownsRememberedIdentity(current)) return;
       sequence.current += 1;
       dispatch({ type: 'clear' });
     }
@@ -216,24 +232,28 @@ export function useOperatorScope() {
 
   function clearCredential() {
     sequence.current += 1;
-    clearRememberedCredential('operator');
+    const current = stateRef.current;
+    if (current.credential && ownsRememberedIdentity(current)) clearRememberedCredential('operator');
     dispatch({ type: 'clear' });
   }
 
   async function refreshTenants() {
-    const credential = stateRef.current.credential;
-    if (!credential || !stateRef.current.validated) return;
+    const before = stateRef.current;
+    const credential = before.credential;
+    if (!credential || !before.validated) return;
+    if (!ownsRememberedIdentity(before)) { clearLocalIdentity(); return; }
     const request = ++sequence.current;
-    const cycle = readOperatorLoginCycle();
-    const remembered = readRememberedCredential('operator');
+
     try {
       const tenants = await api<TenantView[]>('/internal/v1/tenants', credential);
-      if (request !== sequence.current || stateRef.current.credential !== credential || readOperatorLoginCycle() !== cycle || readRememberedCredential('operator') !== remembered) return;
+      if (request !== sequence.current || stateRef.current.credential !== credential) return;
+      if (!ownsRememberedIdentity(before)) { clearLocalIdentity(); return; }
       const tenant = tenantForCredential(tenants, stateRef.current.tenant);
       rememberOperatorTenant(tenant);
       dispatch({ type: 'tenants-refreshed', tenants, tenant });
     } catch (reason) {
-      if (request !== sequence.current || stateRef.current.credential !== credential || readOperatorLoginCycle() !== cycle || readRememberedCredential('operator') !== remembered) return;
+      if (request !== sequence.current || stateRef.current.credential !== credential) return;
+      if (!ownsRememberedIdentity(before)) { clearLocalIdentity(); return; }
       if (reason instanceof ApiError && reason.status === 401) {
         clearRememberedCredential('operator');
         dispatch({ type: 'authentication-failed', message: messageOf(reason, t('common.connectionFailed')), outcome: 'reject' });
