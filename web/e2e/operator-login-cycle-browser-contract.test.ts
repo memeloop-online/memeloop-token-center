@@ -88,7 +88,7 @@ test('remembered login ownership fences delayed cross-tab events at request star
       };
     });
     await blocked.goto(`http://127.0.0.1:${address.port}/e2e/fixtures/operator-login-cycle.html`);
-    await blocked.waitForFunction(() => Boolean(window.loginCycleFixture));
+    await blocked.waitForFunction(() => window.loginCycleFixture.state.status === 'disconnected');
     await blocked.evaluate(() => window.loginCycleFixture.invoke('connect'));
     await blocked.waitForFunction(() => window.loginCycleFixture.state.status === 'ready');
     assert.equal(await blocked.evaluate(() => window.loginCycleFixture.state.cycle), undefined);

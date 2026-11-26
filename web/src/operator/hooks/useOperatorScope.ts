@@ -140,8 +140,9 @@ export function useOperatorScope() {
     const before = stateRef.current;
     if (before.credential && !ownsRememberedIdentity(before)) { clearLocalIdentity(); return; }
     const request = ++sequence.current;
-    const rememberedBefore = readRememberedCredential('operator');
-    const cycleBefore = readOperatorLoginCycle();
+    const rememberedBefore = before.credential
+      ? (before.remembered ? before.credential : '') : readRememberedCredential('operator');
+    const cycleBefore = before.credential ? before.loginCycle : readOperatorLoginCycle();
     dispatch({ type: 'authenticate', candidate });
     try {
       // Tenant discovery is the only authentication-phase request. Page data
