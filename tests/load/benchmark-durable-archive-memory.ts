@@ -490,7 +490,7 @@ export async function run(binary: string, output: string): Promise<boolean> {
       MTC_ALLOW_OAUTH_LOOPBACK: "true", MTC_RUN_MIGRATIONS_ON_START: "false",
       MTC_PROXY_MEMORY_BUDGET_BYTES: String(256 * MIB),
       MTC_PRICING_MODELS_DEV_URL: `${mockUrl}/catalog`, MTC_PRICING_LITELLM_URL: `${mockUrl}/catalog`,
-      MTC_PRICING_OPENROUTER_URL: `${mockUrl}/catalog`, RUST_LOG: "warn",
+      MTC_PRICING_OPENROUTER_URL: `${mockUrl}/catalog`, RUST_LOG: "warn,memeloop_token_center::gateway_body::carrier::spill_observation=info",
     });
     const migration = spawnSync(binary, ["migrate"], { env, encoding: "utf8", timeout: 60_000 });
     writeFileSync(`${output}.migration.log`, `${migration.stdout ?? ""}${migration.stderr ?? ""}`);
