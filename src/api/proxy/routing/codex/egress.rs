@@ -110,7 +110,7 @@ impl AttemptRecorder {
             upstream_account_id: route.account_id,
             credential_generation: route.credential_generation,
             transport_revision: route.transport_revision,
-            observed_at: chrono::Utc::now().timestamp_millis(),
+            observed_at: crate::db::unix_millis(),
             selected,
             transport: serde_json::json!({
                 "client_instance_id": identity.client_instance_id,
@@ -157,7 +157,7 @@ impl AttemptRecorder {
             upstream_account_id: route.account_id,
             credential_generation: route.credential_generation,
             transport_revision: route.transport_revision,
-            observed_at: chrono::Utc::now().timestamp_millis(),
+            observed_at: crate::db::unix_millis(),
             selected,
             transport: serde_json::json!({
                 "transport_family": "reqwest_no_retry",
