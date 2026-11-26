@@ -5,11 +5,17 @@ pub(crate) enum ConversationContentError {
     Application(AppError),
     Database(sqlx::Error),
     CandidatesChanged,
+    ProjectionBusy,
 }
 
 impl ConversationContentError {
     pub(super) fn retry_after_confirmed_rollback(&self) -> bool {
-        matches!(self, Self::CandidatesChanged) || self.retryable_sqlstate().is_some()
+        matches!(self, Self::CandidatesChanged | Self::ProjectionBusy)
+            || self.retryable_sqlstate().is_some()
+    }
+
+    pub(super) fn is_projection_busy(&self) -> bool {
+        matches!(self, Self::ProjectionBusy)
     }
 
     pub(super) fn retryable_sqlstate(&self) -> Option<&'static str> {
@@ -43,6 +49,9 @@ impl From<ConversationContentError> for AppError {
         match error {
             ConversationContentError::Application(error) => error,
             ConversationContentError::Database(error) => error.into(),
+            ConversationContentError::ProjectionBusy => {
+                AppError::Conflict("conversation projection writer busy".into())
+            }
             ConversationContentError::CandidatesChanged => AppError::Conflict(
                 "conversation candidates changed during prefix preparation".into(),
             ),
