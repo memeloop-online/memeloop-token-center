@@ -54,7 +54,8 @@ jobs:
           MTC_REQUIRE_BROWSER=1 node --import tsx --test --test-reporter=tap --test-concurrency=1 --test-name-pattern='^(create and rotate keep authorized values visible and editable across keyboard, mobile and schema variants|request read freshness advances only for successful current result reads)$' e2e/secret-credential-input-browser-contract.test.ts e2e/request-lifecycle-browser-contract.test.ts 2>&1 | tee /tmp/id43-80-browser.log
           grep -Fx '# pass 2' /tmp/id43-80-browser.log
           grep -Fx '# fail 0' /tmp/id43-80-browser.log
-          grep -Fx '# skipped 0' /tmp/id43-80-browser.log
+          grep -E '^ok [0-9]+ - create and rotate keep authorized values visible and editable across keyboard, mobile and schema variants$' /tmp/id43-80-browser.log
+          grep -E '^ok [0-9]+ - request read freshness advances only for successful current result reads$' /tmp/id43-80-browser.log
       - name: Retain actual browser evidence
         if: always() && github.event_name == 'workflow_dispatch'
         uses: actions/upload-artifact@65462800fd760344b1a7b4382951275a0abb4808
