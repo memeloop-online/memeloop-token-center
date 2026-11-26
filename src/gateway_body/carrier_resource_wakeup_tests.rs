@@ -389,7 +389,7 @@ async fn request_capture_eof_does_not_join_owned_put_when_retained_credit_wakes(
         assert_eq!(persistence.pending_archives_for_test(), 1);
         if cancel_capture {
             capture.abort();
-            assert!(capture.await.unwrap_err().is_cancelled());
+            assert!(matches!(capture.await, Err(error) if error.is_cancelled()));
             assert_eq!(persistence.pending_archives_for_test(), 1);
             assert_eq!(proxy.counts().get("body_put"), Some(&1));
             drop(outside);
