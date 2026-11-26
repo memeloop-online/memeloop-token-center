@@ -269,17 +269,9 @@ async fn assert_terminal_failure(failure: Failure, label: &str) {
         .await
         .unwrap();
     assert_eq!(detail.view.terminal_cause_code.as_deref(), expected_cause);
-    let events = fixture
-        .state
-        .db
-        .all_request_events_after(0, None, 500)
-        .await
-        .unwrap();
-    assert!(
-        !events
-            .iter()
-            .any(|event| event.request_id == rows[0].request_id && event.event_kind == "finished")
-    );
+    // Recheck the shared operational-event/unknown-finance contract after
+    // the transport has fully stopped, including absence of duplicate work.
+    cancellation::assert_unknown_request(&fixture, rows[0].request_id, 0).await;
     assert_eq!(receipt["terminal_cause"].as_str(), expected_cause);
     let (expected_account, expected_route) = if matches!(
         failure,
