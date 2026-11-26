@@ -357,7 +357,7 @@ async fn credited_long_response_preserves_opportunistic_spill_above_source_capac
 #[ignore = "requires isolated RustFS fixture"]
 async fn credited_spill_observation_distinguishes_workspace_pressure_from_put_ack() {
     for lose_ack in [false, true] {
-        let proxy = recovery_proxy::RecoveryObjectProxy::start(
+        let proxy = crate::recovery_object_proxy::RecoveryObjectProxy::start(
             &std::env::var("MTC_RUSTFS_TEST_ENDPOINT").unwrap(),
         )
         .await;
