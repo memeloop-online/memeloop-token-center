@@ -260,20 +260,22 @@ export function RequestsPage({ token, tenant, writeTenant = tenant, liveEvents, 
     loadAbort.current?.abort(); loadAbort.current = null;
     errorSource.current = undefined;
     loadingRef.current = false;
-    sequence.current += 1; setFilters(filters); setRequests([]); setDetail(undefined); setHasOlder(false); setLoading(false); setFilteredResultsStale(false); setError(''); setUpstreamError(''); setUpstreamDenied(false);
+    sequence.current += 1; setFilters(filters); setRequests([]); closeRequestDetail(); setHasOlder(false); setLoading(false); setFilteredResultsStale(false); setError(''); setUpstreamError(''); setUpstreamDenied(false);
     if (!token || !tenant) { setUpstreams([]); return () => { cancelOverflowRefresh(); loadAbort.current?.abort(); }; }
     const upstreamRequest = ++upstreamSequence.current;
     void api<UpstreamAccount[]>(`/internal/v1/upstreams${queryForTenant(tenant)}`, token)
       .then((values) => { if (upstreamRequest === upstreamSequence.current) { setUpstreams(values); setUpstreamError(''); setUpstreamDenied(false); } })
       .catch((reason) => { if (upstreamRequest === upstreamSequence.current) { setUpstreams([]); const denied = reason instanceof ApiError && reason.status === 403; setUpstreamDenied(denied); setUpstreamError(denied ? '' : apiDiagnosticMessage(reason, t('common.requestFailed'), diagnosticLabels)); } });
+    return () => { upstreamSequence.current += 1; };
+  }, [tenant, token, writeTenant]);
+
+  useEffect(() => {
     void load(filters);
     return () => { cancelOverflowRefresh(); loadAbort.current?.abort(); };
   }, [tenant, token, writeTenant, appliedFilters?.revision]);
 
   useEffect(() => {
-    selectedRequestId.current = undefined; refreshedTerminalEvent.current = undefined;
-    setSelectedRequest(undefined);
-    detailSequence.current += 1; detailAbort.current?.abort(); detailAbort.current = null; setDetail(undefined);
+    closeRequestDetail();
     return () => { detailSequence.current += 1; detailAbort.current?.abort(); };
   }, [tenant, token]);
 
@@ -405,6 +407,8 @@ export function RequestsPage({ token, tenant, writeTenant = tenant, liveEvents, 
   }
 
   function closeRequestDetail() {
+    pendingRequestReturn.current = undefined;
+    refreshedTerminalEvent.current = undefined;
     selectedRequestId.current = undefined;
     setSelectedRequest(undefined);
     detailSequence.current += 1;
@@ -425,11 +429,11 @@ export function RequestsPage({ token, tenant, writeTenant = tenant, liveEvents, 
   useEffect(() => {
     if (!requestFocus) return;
     if (requestFocus.restore) {
+      if (!requestFocus.restore.openDetail) closeRequestDetail();
       pendingRequestReturn.current = {
         route: 'requests', requestId: requestFocus.requestId,
         scrollY: requestFocus.restore.scrollY, openDetail: requestFocus.restore.openDetail,
       };
-      if (!requestFocus.restore.openDetail) closeRequestDetail();
     } else {
       pendingRequestReturn.current = undefined;
       void openRequestDetail(requestFocus.requestId);

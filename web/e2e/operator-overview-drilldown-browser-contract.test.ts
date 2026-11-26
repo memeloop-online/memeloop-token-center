@@ -81,6 +81,8 @@ test('Overview request actions open focused details and bucket drilldowns preser
     assert.equal((await page.evaluate(() => window.overviewDrilldownFixture.calls)).some((call) => call.includes('/internal/v1/requests/query')), true);
     const filteredBody = queryBodies.at(-1);
     const filteredCount = queryBodies.length;
+    const upstreamCalls = () => page.evaluate(() => window.overviewDrilldownFixture.calls.filter(call => call.startsWith('GET /internal/v1/upstreams')).length);
+    const upstreamBeforeTabs = await upstreamCalls();
     await page.evaluate(() => window.overviewDrilldownFixture.openOverview());
     await page.locator('.overview-trend-card').first().waitFor();
     await page.evaluate(() => window.overviewDrilldownFixture.openRequests());
@@ -90,6 +92,8 @@ test('Overview request actions open focused details and bucket drilldowns preser
     await page.getByRole('button', { name: 'Refresh', exact: true }).click();
     await page.waitForFunction(count => window.overviewDrilldownFixture.requestQueryBodies.length === count, filteredCount + 2);
     assert.deepEqual(await page.evaluate(() => window.overviewDrilldownFixture.requestQueryBodies.at(-1)), filteredBody);
+
+    assert.equal(await upstreamCalls(), upstreamBeforeTabs + 1, 'only remount reads upstreams; explicit refresh retains upstream observations');
 
     const tenantPicker = page.locator('.tenant-picker select');
     for (const failed of [false, true]) {
@@ -103,6 +107,10 @@ test('Overview request actions open focused details and bucket drilldowns preser
         ast: { logical_operator: 'and', conditions: [] },
       });
       await page.evaluate(value => window.overviewDrilldownFixture.releaseLateQuery(value), failed);
+      await page.evaluate(() => new Promise<void>(resolve => requestAnimationFrame(() => requestAnimationFrame(() => resolve()))));
+      assert.equal(await tenantPicker.inputValue(), 'second-tenant');
+      assert.equal(await page.getByText('stale-scope-row', { exact: true }).count(), 0);
+      assert.equal(await page.getByText('stale-scope-error', { exact: false }).count(), 0);
       await tenantPicker.selectOption('drilldown-tenant');
       await page.waitForFunction(count => window.overviewDrilldownFixture.requestQueryBodies.length === count, beforeSwitch + 2);
       assert.deepEqual(await page.evaluate(() => window.overviewDrilldownFixture.requestQueryBodies.at(-1)), {
@@ -229,6 +237,21 @@ test('Usage virtual credential buckets open scoped requests while real sessions 
       && document.activeElement?.textContent === 'Named Codex conversation');
     assert.ok(Math.abs((await page.evaluate(() => window.scrollY)) - requestScroll) <= 1);
     await page.screenshot({ path: join(evidence, 'request-session-return-desktop.png'), fullPage: true });
+    await page.goto(`http://127.0.0.1:${address.port}/e2e/fixtures/operator-overview-drilldown.html?request-session=1&filter-state=1`);
+    await page.getByRole('button', { name: 'Open details for drilled-model', exact: true }).click();
+    await page.getByRole('dialog', { name: 'drilled-model', exact: true }).waitFor();
+    await page.locator('.request-diagnostic-session').click();
+    await page.getByRole('button', { name: 'Back to originating request', exact: true }).waitFor();
+    await page.locator('.tenant-picker select').selectOption('second-tenant');
+    await page.locator('.session-detail').waitFor({ state: 'detached' });
+    assert.equal(await page.getByRole('button', { name: 'Back to originating request', exact: true }).count(), 0);
+    await page.evaluate(() => window.overviewDrilldownFixture.openRequests());
+    await page.waitForFunction(() => (window.overviewDrilldownFixture.requestQueryBodies.at(-1) as { tenant_external_id?: string })?.tenant_external_id === 'second-tenant');
+    assert.equal(await page.getByRole('dialog', { name: 'drilled-model', exact: true }).count(), 0);
+    assert.deepEqual((await page.evaluate(() => window.overviewDrilldownFixture.requestQueryBodies.at(-1))) as object, {
+      tenant_external_id: 'second-tenant', limit: 100, paged: true, ast: { logical_operator: 'and', conditions: [] },
+    });
+
 
     await page.goto(`http://127.0.0.1:${address.port}/e2e/fixtures/operator-overview-drilldown.html?request-session=1&initial-requests=1`);
     await page.getByRole('button', { name: 'Filter', exact: true }).click();

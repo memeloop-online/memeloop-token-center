@@ -111,6 +111,9 @@ export function Operator({ route, onRouteChange, onPluginNavigation, navigationC
   const [requestFilters, setRequestFilters] = useState({ scope: filterScope, ast: emptyTypedFilterAst, revision: 0 });
   if (requestFilters.scope !== filterScope) {
     setRequestFilters({ scope: filterScope, ast: emptyTypedFilterAst, revision: requestFilters.revision + 1 });
+    setRequestFocus(undefined);
+    setSessionFocus(undefined);
+    setRequestDrilldown(undefined);
   }
   const activeRequestFilters = requestFilters.scope === filterScope ? requestFilters : { scope: filterScope, ast: emptyTypedFilterAst, revision: requestFilters.revision + 1 };
   function applyRequestFilters(ast: TypedFilterAst) {
