@@ -4,14 +4,14 @@ import test from 'node:test';
 import {
   drainSessionEventIdentities, enqueueSessionEventIdentity, mergeIncrementalSessionSummaries,
   mergeSessionPage, sessionEventsRequireDetailRefresh, sessionEventTargetsSelection,
-  sessionSummaryTargets,
+  sessionSummaryTargets, sessionEventsStartNewActiveMember,
 } from '../src/operator/sessionRefresh.js';
 
 test('session monitor uses bounded summary reads and keeps manual refresh authoritative', async () => {
   const monitor = await readFile(new URL('../src/operator/SessionMonitor.tsx', import.meta.url), 'utf8');
   assert.match(monitor, /api<LogicalSessionSummaryBatchResponse>\('\/internal\/v1\/sessions\/summaries'/);
   assert.match(monitor, /method: 'POST'/);
-  assert.match(monitor, /if \(forceFullList \|\| targets\.requiresFullReload\)/,
+  assert.match(monitor, /if \(forceFullList \|\| targets\.requiresFullReload \|\| newActiveMember\)/,
     'overflow and unknown identities retain the full-list fallback');
   assert.match(monitor, /if \(merged\.requiresFullReload\)/,
     'first-page membership uncertainty retains the full-list fallback');
@@ -326,4 +326,25 @@ test('an unseen summary inside a loaded tail is inserted without invalidating it
   assert.deepEqual(merged.sessions.map((session) => session.session_id),
     ['session-a', 'session-b', 'session-c', 'session-new', 'session-d'],
     'the new row belongs before the loaded tail cursor and must not be silently skipped');
+});
+
+
+test('only a real new confirmed start can preselect active-page membership', () => {
+  const events = new Set<string>();
+  enqueueSessionEventIdentity(events, {
+    key_id: 'key-a', request_id: 'new-request', event_kind: 'started', status_code: null, archive_state: 'pending',
+    session_context: { association: 'confirmed', session_id: 'new-session' },
+  });
+  assert.equal(sessionEventsStartNewActiveMember(events, [], ''), true);
+  assert.equal(sessionEventsStartNewActiveMember(events, [], 'key-a'), true);
+  assert.equal(sessionEventsStartNewActiveMember(events, [], 'other-key'), false);
+  assert.equal(sessionEventsStartNewActiveMember(events, [{ key_id: 'key-a', session_id: 'new-session' }], ''), false);
+  for (const kind of ['projected', 'finished', 'archive_bound'] as const) {
+    const projected = new Set<string>();
+    enqueueSessionEventIdentity(projected, {
+      key_id: 'key-a', request_id: 'new-request', event_kind: kind, status_code: 200, archive_state: 'pending',
+      session_context: { association: 'confirmed', session_id: 'new-session' },
+    });
+    assert.equal(sessionEventsStartNewActiveMember(projected, [], ''), false, kind);
+  }
 });

@@ -10,6 +10,7 @@ declare global {
     sessionDetailReads: number;
     sessionListReads: number;
     sessionListAborts: number;
+    sessionReadTrace: Array<{ kind: 'list' | 'summary'; scope: Record<string, string | null> }>;
     unlinkedNavigations: Array<{ sessionId: string; keyId?: string }>;
     resolveSessionList: (status: boolean | number) => void;
     resolveSessionDetail: (status: boolean | number) => void;
@@ -345,5 +346,70 @@ test('a successful manual refresh confirms a cancelled selected-detail batch bef
     await settleRenderedRefresh(page, 4);
     assert.equal(await page.evaluate(() => window.sessionDetailReads), 2,
       'the unrelated event refreshes its tenant list only; it cannot replay the selected detail already confirmed manually');
+  } finally { await browser.close(); await server.close(); }
+});
+
+
+test('a new confirmed start reads active-page membership once and keeps exact refreshes scoped', { timeout: 45_000 }, async context => {
+  if (!hasDefaultChromium(context)) return;
+  const server = await createServer({ root: fileURLToPath(new URL('..', import.meta.url)), configFile: false, logLevel: 'silent', server: { host: '127.0.0.1', port: 0 } });
+  await server.listen();
+  const address = server.httpServer?.address();
+  assert.ok(address && typeof address !== 'string');
+  const browser = await chromium.launch({ headless: true });
+  try {
+    const page = await browser.newPage();
+    await page.addInitScript(() => localStorage.setItem('mtc-locale', 'en'));
+    await page.goto(`http://127.0.0.1:${address.port}/e2e/fixtures/session-loading.html?membership=1`);
+    await page.waitForFunction(() => window.sessionListReads === 1);
+    await page.evaluate(() => window.resolveSessionList(true));
+    await settleRenderedRefresh(page, 1);
+    await page.locator('.session-controls').getByLabel('Session state', { exact: true }).selectOption('active');
+    await page.getByRole('button', { name: 'Apply filters', exact: true }).click();
+    await page.waitForFunction(() => window.sessionListReads === 2);
+    await page.evaluate(() => window.resolveSessionList(true));
+    await settleRenderedRefresh(page, 2);
+    await page.evaluate(() => { window.sessionReadTrace = []; });
+    const baseline = process.env.MTC_SESSION_REFRESH_BASELINE === '1';
+    await page.getByRole('button', { name: 'Start new active session', exact: true }).click();
+    await page.waitForFunction(() => window.sessionListReads === 3);
+    await page.evaluate(() => window.resolveSessionList(true));
+    if (baseline) {
+      await page.waitForFunction(() => window.sessionListReads === 4);
+      await page.evaluate(() => window.resolveSessionList(true));
+    }
+    await page.getByRole('button', { name: 'Open New active session', exact: true }).waitFor();
+    const expected = baseline ? 4 : 3;
+    await settleRenderedRefresh(page, expected);
+    const scope = { tenant_external_id: 'default', state: 'active', key_id: null, q: null, model: null };
+    assert.deepEqual(await page.evaluate(() => window.sessionReadTrace), (baseline ? ['summary', 'list'] : ['list']).map(kind => ({ kind, scope })));
+    // An already loaded identity keeps the exact-summary lane.
+    await page.evaluate(() => { window.sessionReadTrace = []; });
+    await page.getByRole('button', { name: 'Start new active session', exact: true }).click();
+    await page.waitForFunction(expected => window.sessionListReads === expected, expected + 1);
+    await page.evaluate(() => window.resolveSessionList(true));
+    await settleRenderedRefresh(page, expected + 1);
+    assert.deepEqual(await page.evaluate(() => window.sessionReadTrace), [{ kind: 'summary', scope }]);
+    // Terminal membership still uses the same server-side active filter.
+    await page.evaluate(() => { window.sessionReadTrace = []; });
+    await page.getByRole('button', { name: 'Finish new active session', exact: true }).click();
+    await page.waitForFunction(expected => window.sessionListReads === expected, expected + 2);
+    await page.evaluate(() => window.resolveSessionList(true));
+    await settleRenderedRefresh(page, expected + 2);
+    assert.deepEqual(await page.evaluate(() => window.sessionReadTrace), [{ kind: 'list', scope }]);
+    assert.equal(await page.getByRole('button', { name: 'Open New active session', exact: true }).count(), 0);
+    // A qualified filter retains exact reads and an excluded start adds no row.
+    await page.locator('.session-controls').getByLabel('Model', { exact: true }).fill('unrelated-model');
+    await page.getByRole('button', { name: 'Apply filters', exact: true }).click();
+    await page.waitForFunction(expected => window.sessionListReads === expected, expected + 3);
+    await page.evaluate(() => window.resolveSessionList(true));
+    await settleRenderedRefresh(page, expected + 3);
+    await page.evaluate(() => { window.sessionReadTrace = []; });
+    await page.getByRole('button', { name: 'Start new active session', exact: true }).click();
+    await page.waitForFunction(expected => window.sessionListReads === expected, expected + 4);
+    await page.evaluate(() => window.resolveSessionList(true));
+    await settleRenderedRefresh(page, expected + 4);
+    assert.deepEqual(await page.evaluate(() => window.sessionReadTrace), [{ kind: 'summary', scope: { ...scope, model: 'unrelated-model' } }]);
+    assert.equal(await page.getByRole('button', { name: 'Open New active session', exact: true }).count(), 0);
   } finally { await browser.close(); await server.close(); }
 });

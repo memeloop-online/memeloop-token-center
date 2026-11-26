@@ -15,6 +15,7 @@ declare global {
     sessionDetailReads: number;
     sessionListReads: number;
     sessionListAborts: number;
+    sessionReadTrace: Array<{ kind: 'list' | 'summary'; scope: Record<string, string | null> }>;
     unlinkedNavigations: Array<{ sessionId: string; keyId?: string }>;
     resolveSessionList: (status: boolean | number) => void;
     resolveSessionDetail: (status: boolean | number) => void;
@@ -22,8 +23,11 @@ declare global {
 }
 window.sessionListReads = 0;
 window.sessionListAborts = 0;
+window.sessionReadTrace = [];
 window.sessionDetailReads = 0;
 window.unlinkedNavigations = [];
+const membershipMode = new URLSearchParams(location.search).has('membership');
+let membershipPhase: 'empty' | 'active' | 'terminal' = 'empty';
 const controlledDetail = new URLSearchParams(location.search).has('controlled-detail');
 const session: LogicalSessionSummary = {
   session_id: 'fixture-session', session_name: 'Retained session', task_kind: null,
@@ -106,6 +110,10 @@ window.fetch = async (input, init) => {
   }
   if (summaryBatch || url.includes('/sessions?')) {
     window.sessionListReads += 1;
+    const selected = summaryBatch ? JSON.parse(String(init?.body ?? '{}')) as Record<string, string> : Object.fromEntries(requestUrl.searchParams);
+    window.sessionReadTrace.push({ kind: summaryBatch ? 'summary' : 'list', scope: Object.fromEntries(
+      ['tenant_external_id', 'state', 'key_id', 'q', 'model'].map(key => [key, selected[key] ?? null]),
+    ) });
     return new Promise<Response>((resolve, reject) => {
       const signal = init?.signal;
       const abort = () => {
@@ -119,10 +127,16 @@ window.fetch = async (input, init) => {
         const identities = summaryBatch
           ? (JSON.parse(String(init?.body ?? '{}')) as { identities?: Array<{ key_id: string; session_id: string }> }).identities ?? []
           : undefined;
+        const candidates = membershipMode ? (membershipPhase === 'empty' ? [] : [{
+          ...session, session_id: 'new-active-session', session_name: 'New active session',
+          active_requests: membershipPhase === 'active' ? 1 : 0,
+          last_status: membershipPhase === 'active' ? 'active' : 'success',
+        }]).filter(candidate => (!selected.state || selected.state !== 'active' || candidate.active_requests > 0)
+          && (!selected.key_id || selected.key_id === candidate.key_id)
+          && (!selected.model || selected.model === candidate.model)) : [session, unlinkedSession];
         const summaries = identities
-          ? identities.flatMap((identity) => [session, unlinkedSession]
-            .filter((candidate) => candidate.key_id === identity.key_id && candidate.session_id === identity.session_id))
-          : [session, unlinkedSession];
+          ? identities.flatMap(identity => candidates.filter(candidate => candidate.key_id === identity.key_id && candidate.session_id === identity.session_id))
+          : candidates;
         resolve(new Response(JSON.stringify(status >= 200 && status < 300
           ? { generated_at: Date.now(), sessions: summaries, ...(identities ? {} : { next_cursor: null }) }
           : { error: { message: 'Fixture list unavailable' } }), { status }));
@@ -165,7 +179,7 @@ function Fixture() {
       key_id: keyId,
       request_id: requestId,
       event_kind: eventKind,
-      status_code: 200,
+      status_code: eventKind === 'started' ? null : 200,
       archive_state: archiveState,
       session_context: { association: 'confirmed', session_id: sessionId },
     });
@@ -176,6 +190,10 @@ function Fixture() {
     setRevision((value) => value + 1);
   };
   return <I18nProvider><MtcFluentProvider><main className="main">
+    {membershipMode && <>
+      <button onClick={() => { membershipPhase = 'active'; emit('fixture-key', 'new-active-session', 'new-active-request', 'started'); }}>Start new active session</button>
+      <button onClick={() => { membershipPhase = 'terminal'; emit('fixture-key', 'new-active-session', 'new-active-request', 'finished'); }}>Finish new active session</button>
+    </>}
     <button onClick={() => queue('fixture-key', 'fixture-session', 'queued-before-scope-change')}>Queue stale session event</button>
     <button onClick={() => emit('fixture-key', 'fixture-session')}>Simulate session event</button>
     <button onClick={() => emit('other-key', 'fixture-session')}>Simulate other credential event</button>
