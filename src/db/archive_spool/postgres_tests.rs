@@ -864,6 +864,11 @@ impl PgFixture {
                 .execute(&db.pool)
                 .await
                 .unwrap();
+            sqlx::query("INSERT INTO request_record_locators(id,tenant_id,key_id,created_at) SELECT id,tenant_id,key_id,created_at FROM request_records WHERE id=$1 AND created_at=1")
+                .bind(id.request_id.to_string())
+                .execute(&db.pool)
+                .await
+                .unwrap();
         }
         let gate = i64::from(u32::from_be_bytes(
             nonce.as_bytes()[0..4].try_into().unwrap(),
