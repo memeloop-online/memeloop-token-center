@@ -1064,6 +1064,7 @@ async fn cancelled_producer_fences_a_begin_that_committed_late() {
         .expect("writer begin must commit before the deterministic pause")
         .unwrap();
     assert_eq!(state.persistence.pending_archives_for_test(), 1);
+    assert_archive_activity_metric(&state, 1);
     let mut draining = Box::pin(state.persistence.drain());
     assert!(futures_util::poll!(&mut draining).is_pending());
     drop(producer);
@@ -1074,6 +1075,7 @@ async fn cancelled_producer_fences_a_begin_that_committed_late() {
         .unwrap();
     assert_eq!(fence_probe.calls(), 1);
     assert_eq!(state.persistence.pending_archives_for_test(), 1);
+    assert_archive_activity_metric(&state, 1);
     assert!(
         futures_util::poll!(&mut draining).is_pending(),
         "failure fence must remain an owned archive activity"
@@ -1111,6 +1113,7 @@ async fn cancelled_producer_fences_a_begin_that_committed_late() {
         .await
         .unwrap();
     assert_eq!(state.persistence.pending_archives_for_test(), 0);
+    assert_archive_activity_metric(&state, 0);
 }
 
 #[tokio::test]
@@ -1212,6 +1215,7 @@ async fn terminal_tail_survives_observer_cancellation_without_waiting_for_databa
         .expect("terminal handoff must not wait for SQL");
     drop(settlement);
     assert_eq!(state.persistence.pending_archives_for_test(), 1);
+    assert_archive_activity_metric(&state, 1);
     let mut draining = Box::pin(state.persistence.drain());
     assert!(
         futures_util::poll!(&mut draining).is_pending(),
@@ -1258,6 +1262,7 @@ async fn terminal_tail_survives_observer_cancellation_without_waiting_for_databa
         .await
         .unwrap();
     assert_eq!(state.persistence.pending_archives_for_test(), 0);
+    assert_archive_activity_metric(&state, 0);
 }
 
 #[tokio::test]
@@ -1785,4 +1790,15 @@ async fn concurrent_staging_keeps_large_segments_under_source_credit_without_wor
     }
     assert_eq!(state.persistence.stream_memory.snapshot().0, 0);
     assert_eq!(state.persistence.upload_workspace.snapshot().0, 0);
+}
+
+// Exercise the same fixed series as /metrics while a real writer/fence is gated.
+fn assert_archive_activity_metric(state: &AppState, expected: usize) {
+    let rendered = state.metrics.render(&crate::metrics::RuntimeMetrics {
+        archive_activities: state.persistence.archive_activity_count(),
+        ..Default::default()
+    });
+    assert!(rendered.contains(&format!(
+        "memeloop_token_center_background_work_items{{queue=\"archive_activities\",state=\"active\"}} {expected}\n"
+    )));
 }
