@@ -307,9 +307,19 @@ where
             request_body,
         );
         IndependentProbeTarget::dispatched(&route.route);
+        let account_bearer =
+            super::oauth_rejection::uses_account_bearer(request.headers(), &route.route.credential);
         let response = client.execute(request).await.inspect_err(|error| {
             observe_error(Some(error));
         })?;
+        super::oauth_rejection::observe(
+            state,
+            route.route.account_id,
+            route.route.credential_generation,
+            response.status(),
+            account_bearer,
+        )
+        .await;
         IndependentProbeTarget::response(response.status());
         Ok(response)
     }

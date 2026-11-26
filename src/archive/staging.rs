@@ -52,7 +52,12 @@ impl ArchiveStore {
     ) -> Result<(), AppError> {
         let locator = key.canonical_prefix();
         let (store, prefix) = self.resolve(&locator)?;
-        Self::delete_segment_prefix(store, prefix).await
+        let mut observation = self
+            .write_context(&locator)
+            .start(super::write_observation::Operation::Cleanup, None);
+        let result = Self::delete_segment_prefix(store, prefix).await;
+        observation.app_result(&result);
+        result
     }
 
     /// Deletes only the owned object, never other objects in the typed segment.
@@ -63,7 +68,12 @@ impl ArchiveStore {
     ) -> Result<(), AppError> {
         crate::archive_staging::validate_bound_locator(key, locator)?;
         let (store, path) = self.resolve(locator)?;
-        store.delete(&path).await?;
+        let mut observation = self
+            .write_context(locator)
+            .start(super::write_observation::Operation::Cleanup, None);
+        let result = store.delete(&path).await;
+        observation.result(&result);
+        result?;
         Ok(())
     }
 

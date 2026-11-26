@@ -26,7 +26,7 @@ import {
   summarizeVisibleRequests, typedFiltersActive, typedRequestQueryBody, visibleRequestMetricSeries,
 } from '../traffic/requestTraffic';
 
-export function RequestsPage({ token, tenant, writeTenant = tenant, liveEvents, streamRevision, streamState, streamError, onOpenSessions, onOpenSession, onOpenGenerations, requestFocus, onRequestFocusHandled, requestDrilldown, onRequestDrilldownHandled, requestRefresh, streamOverflowRevision = 0, onProtectRequests }: {
+export function RequestsPage({ token, tenant, writeTenant = tenant, liveEvents, streamRevision, streamState, streamError, onOpenSessions, onOpenSession, onOpenGenerations, requestFocus, onRequestFocusHandled, requestDrilldown, onRequestDrilldownHandled, appliedFilters, onApplyFilters, requestRefresh, streamOverflowRevision = 0, onProtectRequests }: {
   token: string;
   tenant: string;
   writeTenant?: string;
@@ -39,6 +39,8 @@ export function RequestsPage({ token, tenant, writeTenant = tenant, liveEvents, 
   onOpenGenerations?: () => void;
   requestFocus?: { requestId: string; revision: number; restore?: { scrollY: number; openDetail: boolean } };
   onRequestFocusHandled?: (revision: number) => void;
+  appliedFilters?: { ast: TypedFilterAst; revision: number };
+  onApplyFilters?: (ast: TypedFilterAst) => void;
   requestDrilldown?: { ast: TypedFilterAst; revision: number };
   onRequestDrilldownHandled?: (revision: number) => void;
   requestRefresh?: { intervalMs: number; paused: boolean; onIntervalChange: (value: number) => void };
@@ -51,7 +53,8 @@ export function RequestsPage({ token, tenant, writeTenant = tenant, liveEvents, 
   const [successfulRead, setSuccessfulRead] = useState<{ token: string; tenant: string; filters: TypedFilterAst; at: number }>();
   const [snapshotRevision, setSnapshotRevision] = useState(0);
   const [upstreams, setUpstreams] = useState<UpstreamAccount[]>([]);
-  const [filters, setFilters] = useState<TypedFilterAst>(emptyTypedFilterAst);
+  const [localFilters, setFilters] = useState<TypedFilterAst>(emptyTypedFilterAst);
+  const filters = appliedFilters?.ast ?? localFilters;
   const [loading, setLoading] = useState(false);
   const [hasOlder, setHasOlder] = useState(false);
   const [detailResult, setDetail] = useState<{ value: RequestDetail; token: string; tenant: string; requestId: string }>();
@@ -257,20 +260,22 @@ export function RequestsPage({ token, tenant, writeTenant = tenant, liveEvents, 
     loadAbort.current?.abort(); loadAbort.current = null;
     errorSource.current = undefined;
     loadingRef.current = false;
-    sequence.current += 1; setFilters(emptyTypedFilterAst); setRequests([]); setDetail(undefined); setHasOlder(false); setLoading(false); setFilteredResultsStale(false); setError(''); setUpstreamError(''); setUpstreamDenied(false);
+    sequence.current += 1; setFilters(filters); setRequests([]); closeRequestDetail(); setHasOlder(false); setLoading(false); setFilteredResultsStale(false); setError(''); setUpstreamError(''); setUpstreamDenied(false);
     if (!token || !tenant) { setUpstreams([]); return () => { cancelOverflowRefresh(); loadAbort.current?.abort(); }; }
     const upstreamRequest = ++upstreamSequence.current;
     void api<UpstreamAccount[]>(`/internal/v1/upstreams${queryForTenant(tenant)}`, token)
       .then((values) => { if (upstreamRequest === upstreamSequence.current) { setUpstreams(values); setUpstreamError(''); setUpstreamDenied(false); } })
       .catch((reason) => { if (upstreamRequest === upstreamSequence.current) { setUpstreams([]); const denied = reason instanceof ApiError && reason.status === 403; setUpstreamDenied(denied); setUpstreamError(denied ? '' : apiDiagnosticMessage(reason, t('common.requestFailed'), diagnosticLabels)); } });
-    void load(emptyTypedFilterAst);
-    return () => { cancelOverflowRefresh(); loadAbort.current?.abort(); };
+    return () => { upstreamSequence.current += 1; };
   }, [tenant, token, writeTenant]);
 
   useEffect(() => {
-    selectedRequestId.current = undefined; refreshedTerminalEvent.current = undefined;
-    setSelectedRequest(undefined);
-    detailSequence.current += 1; detailAbort.current?.abort(); detailAbort.current = null; setDetail(undefined);
+    void load(filters);
+    return () => { cancelOverflowRefresh(); loadAbort.current?.abort(); };
+  }, [tenant, token, writeTenant, appliedFilters?.revision]);
+
+  useEffect(() => {
+    closeRequestDetail();
     return () => { detailSequence.current += 1; detailAbort.current?.abort(); };
   }, [tenant, token]);
 
@@ -402,6 +407,8 @@ export function RequestsPage({ token, tenant, writeTenant = tenant, liveEvents, 
   }
 
   function closeRequestDetail() {
+    pendingRequestReturn.current = undefined;
+    refreshedTerminalEvent.current = undefined;
     selectedRequestId.current = undefined;
     setSelectedRequest(undefined);
     detailSequence.current += 1;
@@ -422,11 +429,11 @@ export function RequestsPage({ token, tenant, writeTenant = tenant, liveEvents, 
   useEffect(() => {
     if (!requestFocus) return;
     if (requestFocus.restore) {
+      if (!requestFocus.restore.openDetail) closeRequestDetail();
       pendingRequestReturn.current = {
         route: 'requests', requestId: requestFocus.requestId,
         scrollY: requestFocus.restore.scrollY, openDetail: requestFocus.restore.openDetail,
       };
-      if (!requestFocus.restore.openDetail) closeRequestDetail();
     } else {
       pendingRequestReturn.current = undefined;
       void openRequestDetail(requestFocus.requestId);
@@ -436,6 +443,7 @@ export function RequestsPage({ token, tenant, writeTenant = tenant, liveEvents, 
 
   useEffect(() => {
     if (!requestDrilldown) return;
+    if (appliedFilters) { onRequestDrilldownHandled?.(requestDrilldown.revision); return; }
     cancelOverflowRefresh();
     setFilters(requestDrilldown.ast);
     scope.current = { token, tenant, filters: requestDrilldown.ast };
@@ -469,8 +477,8 @@ export function RequestsPage({ token, tenant, writeTenant = tenant, liveEvents, 
     {streamError && <div className="notice error" role="alert">{t('request.streamSource')}: {streamError}</div>}
     <RequestsPanel requests={requests} upstreams={upstreams} filters={filters} loading={loading} hasOlder={hasOlder} streamState={streamState} token={token} tenant={tenant} filteredResultsStale={filteredResultsStale} requestRefresh={requestRefresh} refreshPaused={userPaused} onToggleRefreshPaused={() => setUserPaused((value) => !value)} historyLoaded={loadedHistoryIds.current.size > 0}
       lastSuccessfulRead={successfulRead?.token === token && successfulRead.tenant === tenant && successfulRead.filters === filters ? successfulRead.at : undefined}
-      onApply={(next) => { setFilters(next); scope.current = { token, tenant, filters: next }; void load(next); }}
-      onClear={() => { setFilters(emptyTypedFilterAst); scope.current = { token, tenant, filters: emptyTypedFilterAst }; void load(emptyTypedFilterAst); }}
+      onApply={(next) => { if (onApplyFilters) { onApplyFilters(next); return; } setFilters(next); scope.current = { token, tenant, filters: next }; void load(next); }}
+      onClear={() => { if (onApplyFilters) { onApplyFilters(emptyTypedFilterAst); return; } setFilters(emptyTypedFilterAst); scope.current = { token, tenant, filters: emptyTypedFilterAst }; void load(emptyTypedFilterAst); }}
       onLoadOlder={() => void load(filters, true)} onRefreshFilteredResults={() => void load(filters, false, true)} onReturnToLatest={() => void load(filters)} onSelect={selectRequest} onOpenSessions={onOpenSessions} onOpenSession={openSession} onOpenGenerations={onOpenGenerations} />
     {detail && <RequestDrawer token={token} tenant={tenant} detail={detail} upstreamName={upstreams.find((account) => account.id === detail.upstream_account_id)?.name} accountNames={new Map(upstreams.map(account => [account.id, account.name]))} onOpenSession={openSession} onRefresh={() => void load(filters, false, true)} refreshing={loading} refreshError={errorSource.current === 'load' || errorSource.current === 'refresh' ? error : undefined} onClose={closeRequestDetail} />}
   </PageLoadingRegion>;

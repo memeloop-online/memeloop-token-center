@@ -38,6 +38,7 @@ mod raw_capture;
 mod raw_reader_authority;
 #[cfg(test)]
 mod single_put_test_transport;
+mod write_observation;
 pub(crate) use raw_capture::RawPublicationSettlement;
 pub use raw_reader_authority::{CanonicalRawProof, RawReaderAuthority};
 #[cfg(test)]
@@ -95,6 +96,7 @@ pub struct ArchiveStore {
     readiness_path: object_store::path::Path,
     readiness_deadline: Duration,
     readiness_metrics: Arc<readiness::ReadinessMetrics>,
+    write_observations: Arc<write_observation::WriteObservations>,
 }
 
 struct ReadinessCache {

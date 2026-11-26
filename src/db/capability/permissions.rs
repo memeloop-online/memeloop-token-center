@@ -54,3 +54,20 @@ pub fn requirements(role: CapabilityRole) -> Vec<RelationOperations> {
         .map(|(table, operations)| RelationOperations { table, operations })
         .collect()
 }
+
+/// New relations are required only once their migration is registered.
+pub fn requirements_at(role: CapabilityRole, version: i64) -> Vec<RelationOperations> {
+    let mut rows = requirements(role);
+    if version >= 166
+        && matches!(
+            role,
+            CapabilityRole::Gateway | CapabilityRole::Control | CapabilityRole::Worker
+        )
+    {
+        rows.push(RelationOperations {
+            table: "upstream_oauth_rejected_generations",
+            operations: &["SELECT", "INSERT", "UPDATE"],
+        });
+    }
+    rows
+}

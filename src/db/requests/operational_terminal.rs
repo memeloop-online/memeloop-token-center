@@ -135,17 +135,18 @@ impl Database {
         }
         // Same private request row first as claim/finalizer. No completed_at
         // predicate: an exact operational receipt may arrive after accounting.
-        let owned = sqlx::query(
-            "UPDATE request_records SET completed_at = completed_at WHERE id = $1 AND created_at = $2 AND tenant_id = $3 AND key_id = $4 AND reservation_id = $5",
-        )
-        .bind(claim.request_id.to_string())
-        .bind(created_at)
-        .bind(claim.tenant_id.to_string())
-        .bind(claim.key_id.to_string())
-        .bind(claim.reservation_id.to_string())
-        .execute(&mut *tx)
-        .await?;
-        if owned.rows_affected() != 1 {
+        let (owned, _) = self
+            .lock_request_terminal_owner(
+                &mut tx,
+                claim.request_id,
+                claim.tenant_id,
+                claim.key_id,
+                claim.reservation_id,
+                Some(created_at),
+                false,
+            )
+            .await?;
+        if owned != 1 {
             return Err(conflict());
         }
         if require_expired {

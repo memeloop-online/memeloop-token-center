@@ -18,6 +18,72 @@ pub(crate) struct ProxyRequestOwner {
 }
 
 impl Database {
+    /// Acquire the existing owner CAS without creating a PostgreSQL UPDATE
+    /// event. SQLite keeps its first-statement write-lock semantics.
+    pub(super) async fn lock_request_terminal_owner(
+        &self,
+        tx: &mut Transaction<'_, Any>,
+        request_id: Uuid,
+        tenant_id: Uuid,
+        key_id: Uuid,
+        reservation_id: Uuid,
+        created_at: Option<i64>,
+        pending_only: bool,
+    ) -> Result<(u64, Option<i64>), AppError> {
+        let pending = if pending_only {
+            " AND completed_at IS NULL"
+        } else {
+            ""
+        };
+        if matches!(self.backend, DatabaseBackend::Sqlite) {
+            let partition = created_at
+                .map(|value| format!(" AND created_at={value}"))
+                .unwrap_or_default();
+            let sql = format!(
+                "UPDATE request_records SET completed_at = completed_at WHERE id=$1 AND tenant_id=$2 AND key_id=$3 AND reservation_id=$4{partition}{pending}"
+            );
+            let affected = sqlx::query(sqlx::AssertSqlSafe(sql))
+                .bind(request_id.to_string())
+                .bind(tenant_id.to_string())
+                .bind(key_id.to_string())
+                .bind(reservation_id.to_string())
+                .execute(&mut **tx)
+                .await?
+                .rows_affected();
+            return Ok((affected, created_at));
+        }
+        let created_at = match created_at {
+            Some(value) => value,
+            None => {
+                let Some(locator) = self
+                    .authoritative_request_locator_in_transaction(tx, request_id, tenant_id)
+                    .await?
+                else {
+                    return Ok((0, None));
+                };
+                if locator.key_id != key_id {
+                    return Ok((0, None));
+                }
+                locator.created_at
+            }
+        };
+        // Only the authoritative catalog integer is interpolated. An uncached
+        // statement prunes the leaf even under force_generic_plan.
+        let sql = format!(
+            "SELECT 1 FROM request_records WHERE id=$1 AND tenant_id=$2 AND key_id=$3 AND reservation_id=$4 AND created_at={created_at}{pending} FOR UPDATE"
+        );
+        let matched = sqlx::query(sqlx::AssertSqlSafe(sql))
+            .persistent(false)
+            .bind(request_id.to_string())
+            .bind(tenant_id.to_string())
+            .bind(key_id.to_string())
+            .bind(reservation_id.to_string())
+            .fetch_optional(&mut **tx)
+            .await?
+            .is_some();
+        Ok((u64::from(matched), Some(created_at)))
+    }
+
     pub(crate) async fn proxy_request_owner_finished(
         &self,
         owner: &ProxyRequestOwner,

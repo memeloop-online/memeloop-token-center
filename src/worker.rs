@@ -15,6 +15,8 @@ use crate::{
 
 #[cfg(test)]
 mod background_actions_tests;
+#[cfg(test)]
+mod oauth_role_tests;
 
 const MAINTENANCE_INTERVAL: Duration = Duration::from_secs(6 * 60 * 60);
 const ORPHANED_RESERVATION_REAPER_INTERVAL: Duration = Duration::from_secs(5 * 60);
@@ -176,8 +178,48 @@ pub async fn wait_for_server_shutdown(
     }
 }
 
-/// Each role owns one bounded, serial lane. Slow provider calls do not block
-/// projections, maintenance, or observing the server shutdown signal.
+/// Shared process lifecycle for gateway, control, worker and combined roles.
+/// Every producer drains its own bounded queue; only worker roles renew OAuth.
+pub async fn run_for_role_until_shutdown(
+    state: AppState,
+    role: crate::config::RuntimeRole,
+    shutdown: watch::Receiver<bool>,
+    oauth_shutdown: watch::Receiver<bool>,
+) {
+    let delivery = async {
+        run_periodic(Duration::from_secs(1), shutdown.clone(), || {
+            state.upstream_quota.oauth_rejections.flush(&state)
+        })
+        .await;
+        // Bounded best-effort drain before this process exits. An unpersisted
+        // observation may be rediscovered by a later natural request.
+        let _ = tokio::time::timeout(
+            Duration::from_secs(3),
+            state.upstream_quota.oauth_rejections.flush(&state),
+        )
+        .await;
+    };
+    let background = async {
+        if role.runs_worker() {
+            run_until_shutdown_with_oauth_stop(state.clone(), shutdown.clone(), oauth_shutdown)
+                .await;
+        } else {
+            let mut shutdown = shutdown.clone();
+            wait_for_shutdown(&mut shutdown).await;
+        }
+    };
+    tokio::pin!(background);
+    tokio::select! {
+        _ = &mut background => {
+            // Preserve worker failure propagation to serve while draining
+            // local observations without keeping a dead worker process alive.
+            let _ = tokio::time::timeout(Duration::from_secs(3),
+                state.upstream_quota.oauth_rejections.flush(&state)).await;
+        }
+        _ = delivery => background.await,
+    }
+}
+
 pub async fn run_until_shutdown(state: AppState, shutdown: watch::Receiver<bool>) {
     run_until_shutdown_with_oauth_stop(state, shutdown.clone(), shutdown).await;
 }
@@ -277,6 +319,18 @@ pub(crate) async fn run_until_shutdown_with_reaper_period(
         }};
     }
     periodic!(
+        "oauth_quota_verification",
+        Duration::from_secs(5),
+        async |state: &AppState, _shutdown: &watch::Receiver<bool>| {
+            if let Err(error) = crate::upstream_quota::oauth_recovery::verify_batch(state).await {
+                tracing::warn!(
+                    error_category = error.diagnostic_category(),
+                    "OAuth quota verification scan failed"
+                );
+            }
+        }
+    );
+    periodic!(
         "maintenance",
         MAINTENANCE_INTERVAL,
         async |state: &AppState, _shutdown: &watch::Receiver<bool>| {
@@ -359,6 +413,7 @@ pub(crate) async fn run_until_shutdown_with_reaper_period(
     );
     let orphan_reservation_scan = Mutex::new(crate::db::OrphanReservationScan::default());
     let expired_proxy_owner_scan = Mutex::new(crate::db::ExpiredProxyOwnerScan::default());
+    let conversation_retention_scan = Mutex::new((None, None));
     periodic!(
         "projection_outbox_cleanup",
         PROJECTION_OUTBOX_CLEANUP_INTERVAL,
@@ -366,7 +421,10 @@ pub(crate) async fn run_until_shutdown_with_reaper_period(
             let cleanup_deadline = tokio::time::Instant::now() + Duration::from_secs(10);
             let mut deleted_total = 0_u64;
             loop {
-                match state.db.delete_projected_conversation_outbox(2_000).await {
+                let mut scan = conversation_retention_scan.lock().unwrap().clone();
+                let result = state.db.delete_projected_conversation_outbox_page(2_000, &mut scan).await;
+                *conversation_retention_scan.lock().unwrap() = scan;
+                match result {
                     Ok(deleted) => {
                         deleted_total = deleted_total.saturating_add(deleted);
                         if deleted < 2_000 || tokio::time::Instant::now() >= cleanup_deadline {
@@ -1751,6 +1809,238 @@ mod tests {
             }
         }
         drop(stalled);
+        server.verify().await;
+    }
+
+    #[tokio::test]
+    async fn oauth_rejected_generation_renews_once_and_failed_readback_does_not_requeue() {
+        let directory = tempfile::tempdir().unwrap();
+        let state = AppState::initialize(Config::for_test(format!(
+            "sqlite://{}?mode=rwc",
+            directory.path().join("oauth-rejection-cycle.db").display()
+        )))
+        .await
+        .unwrap();
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/refresh"))
+            .respond_with(
+                ResponseTemplate::new(200).set_body_json(json!({"accessToken":"fresh-access"})),
+            )
+            .expect(1)
+            .mount(&server)
+            .await;
+        Mock::given(method("POST"))
+            .and(path("/v1internal:retrieveUserQuotaSummary"))
+            .respond_with(ResponseTemplate::new(401))
+            .expect(3)
+            .mount(&server)
+            .await;
+        let account = state.db.create_upstream_account(CreateUpstreamAccountInput {
+            tenant_external_id: "oauth-rejection-cycle".into(), name: "fixture".into(),
+            driver: crate::provider::antigravity::DRIVER.into(), config: json!({"base_url":server.uri(), "control_url":server.uri(), "project_id":"fixture-project"}),
+            credential: UpstreamCredential::OAuth {
+                access_token: "old-access".into(), refresh_token: Some("fixture-refresh".into()),
+                expires_at: Some(crate::db::unix_millis() + 86_400_000), header: "authorization".into(),
+                prefix: "Bearer ".into(), adapter_state: None, proxy_url: None, proxy_network_scope: None,
+            }, oauth_session_id: Some(Uuid::now_v7()), oauth_driver: Some("cursor".into()),
+            oauth_refresh_url: Some(format!("{}/refresh", server.uri())),
+        }, state.config.key_pepper.as_bytes()).await.unwrap();
+        let read = async |trigger| {
+            let (account, credential) = state
+                .db
+                .upstream_account_with_credential(account.id, state.config.key_pepper.as_bytes())
+                .await
+                .unwrap();
+            let snapshot = state
+                .upstream_quota
+                .read_fresh(
+                    &state,
+                    &account,
+                    &credential,
+                    "oauth-rejection-cycle",
+                    trigger,
+                )
+                .await;
+            assert_eq!(
+                serde_json::to_value(snapshot).unwrap()["error_code"],
+                "quota_not_authorized"
+            );
+        };
+        assert!(
+            state
+                .db
+                .list_managed_oauth_refresh_candidates(crate::db::unix_millis(), 20)
+                .await
+                .unwrap()
+                .is_empty()
+        );
+        read(crate::upstream_quota::QuotaReadTrigger::BackgroundRecovery).await;
+        state.upstream_quota.oauth_rejections.flush(&state).await;
+        assert_eq!(
+            state
+                .db
+                .list_managed_oauth_refresh_candidates(crate::db::unix_millis(), 20)
+                .await
+                .unwrap(),
+            vec![(account.id, 1)]
+        );
+        refresh_expiring_oauth(&state, account.id, 1, &BlockingTasks::new())
+            .await
+            .unwrap();
+        // A process lost after claiming a read leaves a reclaimable read-only lease.
+        let abandoned = crate::db::unix_millis() - 120_001;
+        assert!(
+            state
+                .db
+                .claim_rejected_oauth_verification(account.id, 1, abandoned)
+                .await
+                .unwrap()
+        );
+        // A's verification waits for quota admission while B's natural expiry
+        // still completes its real mock refresh on the original renewal lane.
+        let paused = state.upstream_quota.pause_reads_for_test().await;
+        let verify_state = state.clone();
+        let verification = tokio::spawn(async move {
+            crate::upstream_quota::oauth_recovery::verify_batch(&verify_state)
+                .await
+                .unwrap();
+        });
+        Mock::given(method("POST"))
+            .and(path("/refresh-b"))
+            .respond_with(
+                ResponseTemplate::new(200).set_body_json(json!({"accessToken":"fresh-b"})),
+            )
+            .expect(1)
+            .mount(&server)
+            .await;
+        Mock::given(path("/v1/models"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({"data":[]})))
+            .mount(&server)
+            .await;
+        let next = state
+            .db
+            .create_upstream_account(
+                CreateUpstreamAccountInput {
+                    tenant_external_id: "oauth-rejection-cycle".into(),
+                    name: "naturally-expiring".into(),
+                    driver: "http-json".into(),
+                    config: json!({"base_url":server.uri()}),
+                    credential: UpstreamCredential::OAuth {
+                        access_token: "old-b".into(),
+                        refresh_token: Some("fixture-refresh-b".into()),
+                        expires_at: Some(crate::db::unix_millis() - 1),
+                        header: "authorization".into(),
+                        prefix: "Bearer ".into(),
+                        adapter_state: None,
+                        proxy_url: None,
+                        proxy_network_scope: None,
+                    },
+                    oauth_session_id: Some(Uuid::now_v7()),
+                    oauth_driver: Some("cursor".into()),
+                    oauth_refresh_url: Some(format!("{}/refresh-b", server.uri())),
+                },
+                state.config.key_pepper.as_bytes(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            state
+                .db
+                .list_managed_oauth_refresh_candidates(crate::db::unix_millis(), 20)
+                .await
+                .unwrap(),
+            vec![(next.id, 1)]
+        );
+        tokio::time::timeout(
+            Duration::from_secs(10),
+            refresh_expiring_oauth(&state, next.id, 1, &BlockingTasks::new()),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        assert_eq!(
+            state
+                .db
+                .upstream_account_with_credential(next.id, state.config.key_pepper.as_bytes())
+                .await
+                .unwrap()
+                .0
+                .credential_generation,
+            2
+        );
+        assert!(
+            !verification.is_finished(),
+            "B renewed while A's quota read remained paused"
+        );
+        drop(paused);
+        verification.await.unwrap();
+        state.upstream_quota.oauth_rejections.flush(&state).await;
+        // A late finisher cannot overwrite the reclaimed verification result.
+        state
+            .db
+            .finish_rejected_oauth_verification(account.id, 1, abandoned, None)
+            .await
+            .unwrap();
+        assert!(
+            state
+                .db
+                .list_rejected_oauth_verifications(crate::db::unix_millis(), 20)
+                .await
+                .unwrap()
+                .is_empty()
+        );
+        assert_eq!(
+            state
+                .db
+                .upstream_account_with_credential(account.id, state.config.key_pepper.as_bytes())
+                .await
+                .unwrap()
+                .0
+                .credential_generation,
+            2
+        );
+        assert!(
+            state
+                .db
+                .has_rejected_oauth_generation(account.id, 1)
+                .await
+                .unwrap()
+        );
+        assert!(
+            !state
+                .db
+                .has_rejected_oauth_generation(account.id, 2)
+                .await
+                .unwrap()
+        );
+        assert!(
+            state
+                .db
+                .list_managed_oauth_refresh_candidates(crate::db::unix_millis(), 20)
+                .await
+                .unwrap()
+                .is_empty()
+        );
+        // A replayed completion retains the same claim and cannot reread again.
+        refresh_expiring_oauth(&state, account.id, 1, &BlockingTasks::new())
+            .await
+            .unwrap();
+        crate::upstream_quota::oauth_recovery::verify_batch(&state)
+            .await
+            .unwrap();
+        // An independent user read can report new evidence without refreshing
+        // inline. No second refresh is dispatched by this test or by readback.
+        read(crate::upstream_quota::QuotaReadTrigger::Manual).await;
+        state.upstream_quota.oauth_rejections.flush(&state).await;
+        assert_eq!(
+            state
+                .db
+                .list_managed_oauth_refresh_candidates(crate::db::unix_millis(), 20)
+                .await
+                .unwrap(),
+            vec![(account.id, 2)]
+        );
         server.verify().await;
     }
 

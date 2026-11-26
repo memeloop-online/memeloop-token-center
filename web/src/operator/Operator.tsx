@@ -1,3 +1,4 @@
+import { emptyTypedFilterAst } from './traffic/requestTraffic';
 import { Fragment, lazy, Suspense, useEffect, useMemo, useRef, useState, type KeyboardEvent, type ReactNode } from 'react';
 import { Shell } from '../components';
 import { useI18n } from '../i18n';
@@ -105,6 +106,18 @@ export function Operator({ route, onRouteChange, onPluginNavigation, navigationC
       credential: scope.activeCredential,
       generation: credentialScope.current.generation + 1,
     };
+  }
+  const filterScope = `${credentialScope.current.generation}:${scope.tenant}`;
+  const [requestFilters, setRequestFilters] = useState({ scope: filterScope, ast: emptyTypedFilterAst, revision: 0 });
+  if (requestFilters.scope !== filterScope) {
+    setRequestFilters({ scope: filterScope, ast: emptyTypedFilterAst, revision: requestFilters.revision + 1 });
+    setRequestFocus(undefined);
+    setSessionFocus(undefined);
+    setRequestDrilldown(undefined);
+  }
+  const activeRequestFilters = requestFilters.scope === filterScope ? requestFilters : { scope: filterScope, ast: emptyTypedFilterAst, revision: requestFilters.revision + 1 };
+  function applyRequestFilters(ast: TypedFilterAst) {
+    setRequestFilters(current => ({ scope: filterScope, ast, revision: current.revision + 1 }));
   }
   const activeRoute = route ?? internalRoute;
   const [pluginNavigationContext, setPluginNavigationContext] = useState<PluginNavigationContext>();
@@ -230,6 +243,7 @@ export function Operator({ route, onRouteChange, onPluginNavigation, navigationC
   }
 
   function queueRequestDrilldown(ast: TypedFilterAst) {
+    applyRequestFilters(ast);
     setRequestDrilldown({
       ast,
       revision: ++requestDrilldownRevision.current,
@@ -275,7 +289,7 @@ export function Operator({ route, onRouteChange, onPluginNavigation, navigationC
       switch (activeRoute) {
         case 'overview': page = <><OverviewPage {...pageProps} onNavigate={navigate} onRequestDrilldown={queueRequestDrilldown} onOpenUsageSession={openSession} onOpenRequest={openRequestById} onOpenSession={openSessionById} /><PluginOverviewCards cards={pluginRegistry.overviewCards} token={scope.activeCredential} tenant={scope.tenant} locale={locale} onNavigate={navigateFromPlugin} /></>; break;
         case 'requests':
-        case 'generations': page = <RequestWorkspace mode={activeRoute === 'generations' ? 'generations' : 'requests'} onModeChange={(mode) => navigate(mode)} {...pageProps} requestRefresh={requestRefresh} streamOverflowRevision={stream.overflowRevision} onProtectRequests={stream.protectRequests} liveEvents={stream.events.current} streamRevision={stream.revision} streamState={stream.state} streamError={stream.error} onOpenSessions={() => navigate('sessions')} onOpenSession={openSessionById} requestFocus={requestFocus} onRequestFocusHandled={(revision) => setRequestFocus((current) => current?.revision === revision ? undefined : current)} requestDrilldown={activeRequestDrilldown} onRequestDrilldownHandled={(revision) => setRequestDrilldown((current) => current?.revision === revision ? undefined : current)} />; break;
+        case 'generations': page = <RequestWorkspace mode={activeRoute === 'generations' ? 'generations' : 'requests'} onModeChange={(mode) => navigate(mode)} {...pageProps} requestRefresh={requestRefresh} streamOverflowRevision={stream.overflowRevision} onProtectRequests={stream.protectRequests} liveEvents={stream.events.current} streamRevision={stream.revision} streamState={stream.state} streamError={stream.error} onOpenSessions={() => navigate('sessions')} onOpenSession={openSessionById} requestFocus={requestFocus} onRequestFocusHandled={(revision) => setRequestFocus((current) => current?.revision === revision ? undefined : current)} appliedFilters={activeRequestFilters} onApplyFilters={applyRequestFilters} requestDrilldown={activeRequestDrilldown} onRequestDrilldownHandled={(revision) => setRequestDrilldown((current) => current?.revision === revision ? undefined : current)} />; break;
         case 'sessions': page = <SessionsPage {...pageProps} focus={sessionFocus} sessionEvents={stream.sessionEvents} streamState={stream.state} streamError={stream.error} requestRefresh={requestRefresh} onOpenRequests={() => navigate('requests')} onOpenUnlinkedRequests={openUnlinkedRequests} onReturnOrigin={returnFromSession} />; break;
         case 'usage': page = <UsagePage {...pageProps} onOpenSession={openSession} />; break;
         case 'providers': page = <ProvidersPage {...pageProps} renderResetSettings={(account, snapshot) => <PluginUpstreamAccountResetSettings contributions={pluginRegistry.upstreamAccountResetSettings} quotaSnapshot={snapshot} token={scope.activeCredential} accountId={account.id} accountName={account.name} provider={account.driver} tenant={account.tenant_external_id ?? scope.tenant} locale={locale} onNavigate={navigateFromPlugin} />} onOpenProxyGroups={openProxyGroups} onOpenRequest={openRequestById} onOpenPricing={(tenant) => {

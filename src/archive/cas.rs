@@ -39,7 +39,10 @@ impl ArchiveStore {
         let object_locator =
             self.new_cas_locator(path::tenant_cas_location(tenant_id, &blake3_digest, false)?)?;
         let (store, key) = self.resolve(&object_locator)?;
-        match store
+        let mut observation = self
+            .write_context(&object_locator)
+            .start(super::write_observation::Operation::Put, Some(size_bytes));
+        let result = store
             .put_opts(
                 &key,
                 PutPayload::from_bytes(data),
@@ -48,8 +51,9 @@ impl ArchiveStore {
                     ..Default::default()
                 },
             )
-            .await
-        {
+            .await;
+        observation.result(&result);
+        match result {
             Ok(_) | Err(object_store::Error::AlreadyExists { .. }) => {}
             Err(error) => return Err(error.into()),
         }
@@ -123,7 +127,13 @@ impl ArchiveStore {
             &staged.blake3_digest,
         )
         .await?;
-        match store.copy_if_not_exists(&source, &destination).await {
+        // Decoded size is not the encoded copy size, so leave bytes unknown.
+        let mut observation = self
+            .write_context(&locator)
+            .start(super::write_observation::Operation::Copy, None);
+        let result = store.copy_if_not_exists(&source, &destination).await;
+        observation.result(&result);
+        match result {
             Ok(()) | Err(object_store::Error::AlreadyExists { .. }) => {}
             Err(error) => return Err(error.into()),
         }

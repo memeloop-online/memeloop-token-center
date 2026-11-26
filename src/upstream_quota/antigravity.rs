@@ -83,6 +83,11 @@ async fn get_summary(
                 .send()
                 .await
                 .map_err(retry::Failure::reqwest)?;
+            session.observe_bearer_rejection(context, response.status(),
+                matches!(credential, UpstreamCredential::OAuth { header, prefix, .. }
+                    if header.eq_ignore_ascii_case("authorization") && prefix.eq_ignore_ascii_case("Bearer "))
+                    && !config.request_headers.keys().any(|name| name.eq_ignore_ascii_case("authorization")),
+            ).await;
             if let Some(failure) =
                 retry::Failure::status(response.status().as_u16(), response.headers())
             {

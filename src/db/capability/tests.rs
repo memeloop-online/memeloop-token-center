@@ -29,7 +29,7 @@ async fn postgres_capability_163_skips_hot_ddl_and_preserves_true_ledger() {
         .await
         .unwrap()
         .unwrap();
-    assert_eq!(modern.track, SchemaTrack::Linear165);
+    assert_eq!(modern.track, SchemaTrack::Linear166);
     for mutation in [
         "ALTER TABLE request_records ALTER COLUMN started_event_pending SET DEFAULT 2",
         "DROP INDEX request_records_started_pending",
@@ -49,7 +49,7 @@ async fn postgres_capability_163_skips_hot_ddl_and_preserves_true_ledger() {
         tx.rollback().await.unwrap();
     }
 
-    sqlx::raw_sql("ALTER TABLE request_history_baseline_runs DROP COLUMN read_model_version,DROP COLUMN activation_epoch,DROP COLUMN chunk_count,DROP COLUMN manifest_hash,DROP COLUMN sources_complete,DROP COLUMN parity_json,DROP COLUMN target_identity; DELETE FROM schema_migrations WHERE version=165;")
+    sqlx::raw_sql("DROP TABLE upstream_oauth_rejected_generations; DELETE FROM schema_migrations WHERE version=166; ALTER TABLE request_history_baseline_runs DROP COLUMN read_model_version,DROP COLUMN activation_epoch,DROP COLUMN chunk_count,DROP COLUMN manifest_hash,DROP COLUMN sources_complete,DROP COLUMN parity_json,DROP COLUMN target_identity; DELETE FROM schema_migrations WHERE version=165;")
         .execute(&db.pool).await.unwrap();
     let db = Database::connect_with_max(isolated.url(), 6).await.unwrap();
     assert_eq!(
@@ -128,7 +128,7 @@ async fn postgres_capability_163_skips_hot_ddl_and_preserves_true_ledger() {
             .unwrap()
             .unwrap()
             .track,
-        SchemaTrack::Linear165
+        SchemaTrack::Linear166
     );
 }
 
@@ -184,7 +184,7 @@ async fn postgres_capability_reader_permissions_do_not_authorize_gateway_writes(
         .execute(&db.pool)
         .await
         .unwrap();
-        let requirements = super::permissions::requirements(capability_role);
+        let requirements = super::permissions::requirements_at(capability_role, 166);
         for requirement in &requirements {
             let operations = requirement.operations.join(",");
             sqlx::query(sqlx::AssertSqlSafe(format!(

@@ -47,19 +47,23 @@ impl Database {
         let leaf: Option<String> = sqlx::query_scalar(
             "SELECT o.leaf_node_hash FROM conversation_observations o
              JOIN conversation_clusters c ON c.id=o.cluster_id
-             JOIN conversation_projection_outbox p ON p.request_id=o.request_id
-             WHERE c.tenant_id=$1 AND p.tenant_id=$1 AND o.key_id=$2
-               AND p.key_id=$2 AND o.request_id=$3 AND p.projected_at IS NOT NULL
-               AND p.statistics_outcome='session_body'",
+             JOIN request_record_locators l ON l.id=o.request_id
+               AND l.tenant_id=c.tenant_id AND l.key_id=o.key_id
+             WHERE c.tenant_id=$1 AND o.key_id=$2 AND o.request_id=$3
+               AND l.created_at=$4 AND o.leaf_node_hash IS NOT NULL",
         )
         .bind(tenant.to_string())
         .bind(key.to_string())
         .bind(request.to_string())
+        .bind(refs.view.created_at)
         .fetch_optional(&self.pool)
         .await?
         .flatten();
-        // Optional current authority can enrich a frozen read, but unavailable
-        // archival metadata cannot erase that already-authorized snapshot.
+        // The caller already authorized this native request/key identity.
+        // The durable observation is only a binding candidate: the published
+        // revision and both exact retirement sources below remain mandatory.
+        // A disposable outbox receipt is not a history read authority.
+        // Unavailable optional authority preserves the frozen snapshot.
         let Some(leaf) = leaf else {
             return Ok(refs);
         };

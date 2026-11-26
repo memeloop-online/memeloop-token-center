@@ -25,6 +25,7 @@ pub(crate) struct CarrierCapture {
     archive: Option<ArchiveStore>,
     staging: ArchiveStagingKey,
     parent: Option<Arc<BodyCarrier>>,
+    background_spill: Option<Arc<crate::api::proxy::persistence::Persistence>>,
 }
 
 impl CarrierCapture {
@@ -39,7 +40,23 @@ impl CarrierCapture {
             archive,
             staging,
             parent: None,
+            background_spill: None,
         }
+    }
+
+    pub(crate) fn with_background_spill(
+        mut self,
+        persistence: Arc<crate::api::proxy::persistence::Persistence>,
+    ) -> Self {
+        // Only an archive-capable source can release its own retained window
+        // through spill. Preserve the original no-archive and sub-quantum
+        // retained-window capture semantics.
+        self.background_spill = self
+            .archive
+            .as_ref()
+            .filter(|_| self.memory.snapshot().3 != 0)
+            .map(|_| persistence);
+        self
     }
 
     pub(crate) fn with_upload_workspace(
@@ -59,6 +76,7 @@ impl CarrierCapture {
             archive: source.archive.clone(),
             staging,
             parent: Some(source.clone()),
+            background_spill: None,
         }
     }
 }
@@ -89,7 +107,7 @@ pub(crate) struct BodyCarrier {
     archive: Option<ArchiveStore>,
     staging: ArchiveStagingKey,
     segments: Vec<Mutex<Segment>>,
-    offload: tokio::sync::Mutex<()>,
+    offload: Arc<tokio::sync::Mutex<()>>,
     sealed_reference: Option<StagedArchiveObject>,
     parent: Option<Arc<BodyCarrier>>,
     allocations: Mutex<Vec<Weak<Allocation>>>,
@@ -147,6 +165,9 @@ impl Drop for CarrierReadOwner {
     }
 }
 
+#[path = "carrier_spill.rs"]
+mod spill;
+use spill::{CaptureSpill, CompletedSpill, PreparedSpill};
 #[path = "carrier_spill_observation.rs"]
 mod spill_observation;
 use spill_observation::SpillObservation;
@@ -164,6 +185,10 @@ impl BodyCarrier {
         {
             return;
         }
+        // An owned spill still needs this exact generation until its ACK.
+        let Ok(_offload) = self.offload.try_lock() else {
+            return;
+        };
         for segment in &self.segments {
             let mut segment = segment.lock().unwrap();
             if matches!(&*segment, Segment::Ram(_)) {
@@ -195,7 +220,7 @@ impl BodyCarrier {
             archive: Some(archive),
             staging: self.staging,
             segments: vec![Mutex::new(Segment::Object(staged.clone()))],
-            offload: tokio::sync::Mutex::new(()),
+            offload: Arc::new(tokio::sync::Mutex::new(())),
             sealed_reference: Some(staged),
             parent: None,
             allocations: Mutex::new(Vec::new()),
@@ -268,7 +293,7 @@ impl BodyCarrier {
             archive: capture.archive,
             staging,
             segments: Vec::new(),
-            offload: tokio::sync::Mutex::new(()),
+            offload: Arc::new(tokio::sync::Mutex::new(())),
             sealed_reference: None,
             parent: capture.parent,
             allocations: Mutex::new(Vec::new()),
@@ -316,7 +341,7 @@ impl BodyCarrier {
             length: reference.size_bytes,
             digest: reference.blake3_digest.clone(),
             segments: vec![Mutex::new(Segment::Object(reference.clone()))],
-            offload: tokio::sync::Mutex::new(()),
+            offload: Arc::new(tokio::sync::Mutex::new(())),
             sealed_reference: Some(reference),
             parent: capture.parent,
             allocations: Mutex::new(Vec::new()),
@@ -350,6 +375,7 @@ impl BodyCarrier {
         S: Stream<Item = Result<(Bytes, Option<OwnedSemaphorePermit>), E>> + Send,
         E: Display,
     {
+        let background_spill = capture.background_spill;
         let parent = capture.parent;
         let staging = match &capture.archive {
             Some(archive) => archive.select_staging_key(capture.staging)?,
@@ -361,7 +387,7 @@ impl BodyCarrier {
             archive: capture.archive,
             staging,
             segments: Vec::new(),
-            offload: tokio::sync::Mutex::new(()),
+            offload: Arc::new(tokio::sync::Mutex::new(())),
             sealed_reference: None,
             parent: parent.clone(),
             allocations: Mutex::new(Vec::new()),
@@ -378,8 +404,28 @@ impl BodyCarrier {
             source.staging,
         );
         let mut hash = blake3::Hasher::new();
+        let mut pending_spill: Option<CaptureSpill> = None;
+        let mut spill_error = None;
         futures_util::pin_mut!(input);
-        while let Some(chunk) = input.next().await {
+        loop {
+            let next = if let Some(spill) = pending_spill.as_mut() {
+                tokio::select! {
+                    result = spill.completed() => {
+                        match result {
+                            Ok(completed) => { source.apply_spill(completed)?; }
+                            Err(error) => { spill::observe_failure(&error); spill_error = Some(error); }
+                        }
+                        pending_spill.take();
+                        continue;
+                    }
+                    chunk = input.next() => chunk,
+                }
+            } else {
+                input.next().await
+            };
+            let Some(chunk) = next else {
+                break;
+            };
             let (chunk, credit) = chunk.map_err(|_| AppError::storage("carrier_input_failed"))?;
             if chunk.is_empty() {
                 continue;
@@ -435,6 +481,45 @@ impl BodyCarrier {
                     {
                         break (lease, Some(retained));
                     }
+                    if let Some(persistence) = &background_spill {
+                        if pending_spill.is_none() {
+                            if spill_error.take().is_some() {
+                                tokio::select! {
+                                    credit = source.memory.reserve_carrier_ingress(part.len()) => {
+                                        let (allocation, retained) = credit?;
+                                        break (allocation, Some(retained));
+                                    }
+                                    () = tokio::time::sleep(retry) => {}
+                                }
+                                retry = (retry * 2).min(std::time::Duration::from_secs(300));
+                            }
+                            if let Some(attempt) = source.prepare_offload(None).await? {
+                                pending_spill = Some(CaptureSpill::start(attempt, persistence));
+                            } else {
+                                // No owned segment can release retained credit. Wait
+                                // for both original credit classes; global RAM alone
+                                // does not authorize another retained request segment.
+                                let (allocation, retained) =
+                                    source.memory.reserve_carrier_ingress(part.len()).await?;
+                                break (allocation, Some(retained));
+                            }
+                        }
+                        let spill = pending_spill.as_mut().expect("one owned spill");
+                        tokio::select! {
+                            result = spill.completed() => {
+                                match result {
+                                    Ok(completed) => { source.apply_spill(completed)?; }
+                                    Err(error) => { spill::observe_failure(&error); spill_error = Some(error); }
+                                }
+                                pending_spill.take();
+                            }
+                            credit = source.memory.reserve_carrier_ingress(part.len()) => {
+                                let (allocation, retained) = credit?;
+                                break (allocation, Some(retained));
+                            }
+                        }
+                        continue;
+                    }
                     match source.offload_one().await {
                         Ok(true) => continue,
                         Ok(false) => {
@@ -464,7 +549,13 @@ impl BodyCarrier {
             },
             _ => None,
         };
-        Ok(Arc::new(source))
+        let source = Arc::new(source);
+        if let Some(spill) = pending_spill {
+            // EOF is complete in RAM. The same submitted task applies its ACK
+            // later; neither forwarding nor EOF joins optional object I/O.
+            spill.handoff(source.clone());
+        }
+        Ok(source)
     }
 
     fn leased_bytes(
@@ -521,21 +612,30 @@ impl BodyCarrier {
 
     async fn offload_one_bytes(
         &self,
-        mut prepaid: Option<Arc<crate::api::proxy::persistence::WorkspaceGuard>>,
+        prepaid: Option<Arc<crate::api::proxy::persistence::WorkspaceGuard>>,
     ) -> Result<Option<usize>, AppError> {
-        let _owner = if prepaid.is_some() {
-            match self.offload.try_lock() {
-                Ok(owner) => owner,
-                Err(_) => {
-                    // Another exact spill owns the target. Return our envelope
-                    // before waiting for it; re-evaluate RAM/segments afterwards.
-                    drop(prepaid.take());
-                    drop(self.offload.lock().await);
-                    return Ok(None);
-                }
+        let Some(attempt) = self.prepare_offload(prepaid).await? else {
+            return Ok(None);
+        };
+        let completed = attempt.execute().await?;
+        let bytes = completed.bytes.len();
+        self.apply_spill(completed)?;
+        Ok(Some(bytes))
+    }
+
+    async fn prepare_offload(
+        &self,
+        mut prepaid: Option<Arc<crate::api::proxy::persistence::WorkspaceGuard>>,
+    ) -> Result<Option<PreparedSpill>, AppError> {
+        let _owner = match self.offload.clone().try_lock_owned() {
+            Ok(owner) => owner,
+            Err(_) => {
+                // A busy owner may be performing remote I/O. Release any
+                // unneeded envelope and let the caller race credit with the
+                // owner's readiness, without cancelling that actual write.
+                drop(prepaid.take());
+                return Err(AppError::storage("carrier_spill_in_progress"));
             }
-        } else {
-            self.offload.lock().await
         };
         let Some(archive) = &self.archive else {
             return Ok(None);
@@ -574,41 +674,32 @@ impl BodyCarrier {
             .lock()
             .unwrap()
             .push((owner.clone(), false));
-        archive.begin_carrier_object(&owner).await?;
-        let staged = if bytes.len() <= crate::archive::ARCHIVE_MULTIPART_PART_BYTES {
-            // One owned segment already fits the existing multipart envelope.
-            // A single PUT retains these exact Bytes until its ACK; uncertain
-            // completion leaves RAM and the active receipt with this carrier.
-            let payload = Bytes::from_owner(WorkspaceWrite {
-                bytes: bytes.clone(),
-                _workspace: workspace.map(|guard| guard as Arc<dyn Send + Sync>),
-            });
-            archive.put(&locator, payload).await?;
-            StagedArchiveObject {
-                object_locator: locator,
-                size_bytes: bytes.len() as u64,
-                blake3_digest: blake3::hash(&bytes).to_hex().to_string(),
-            }
-        } else {
-            let mut writer = archive.start_writer(&locator).await?;
-            if let Some(workspace) = workspace {
-                writer.retain_workspace(workspace);
-            }
-            if let Err(error) = writer.write(bytes.clone()).await {
-                let _ = writer.abort().await;
-                return Err(error);
-            }
-            let staged = writer.finish_staged().await?;
-            staged
-        };
-        if staged.size_bytes != bytes.len() as u64
-            || staged.blake3_digest != blake3::hash(&bytes).to_hex().as_str()
+        Ok(Some(PreparedSpill {
+            archive: archive.clone(),
+            index,
+            bytes,
+            owner,
+            locator,
+            workspace,
+            guard: _owner,
+        }))
+    }
+
+    fn apply_spill(&self, completed: CompletedSpill) -> Result<bool, AppError> {
+        let CompletedSpill {
+            index,
+            bytes,
+            owner,
+            staged,
+            _guard,
+        } = completed;
+        let mut slot = self.segments[index].lock().unwrap();
+        if !matches!(&*slot, Segment::Ram(current) if current.as_ptr() == bytes.as_ptr() && current.len() == bytes.len())
         {
-            return Err(AppError::storage("carrier_stage_identity_mismatch"));
+            return Err(AppError::storage("carrier_spill_generation_changed"));
         }
-        // Only a confirmed Complete response plus exact identity authorizes
-        // release cleanup. Unknown/cancelled completions retain their durable
-        // active receipt: HEAD absence cannot prove no late completion.
+        // Only the same segment generation plus confirmed complete bytes may
+        // replace RAM. Unknown outcomes retain the original active receipt.
         if let Some((_, settled)) = self
             .owned_objects
             .lock()
@@ -618,10 +709,11 @@ impl BodyCarrier {
         {
             *settled = true;
         }
-        // A complete object, not an UploadPart ACK, is now replayable. Only
-        // replacing this segment releases the unique RAM allocation lease.
-        *self.segments[index].lock().unwrap() = Segment::Object(staged);
-        Ok(Some(bytes.len()))
+        *slot = Segment::Object(staged);
+        drop(slot);
+        drop(_guard);
+        self.release_published_ram();
+        Ok(true)
     }
 
     // Never join the semaphore queue while this source can release its own
@@ -686,6 +778,15 @@ impl BodyCarrier {
         if matches!(
             error,
             AppError::Storage {
+                code: "carrier_spill_in_progress",
+                ..
+            }
+        ) {
+            return self.wait_for_spill_or_credit(target, bytes).await;
+        }
+        if matches!(
+            error,
+            AppError::Storage {
                 code: "carrier_workspace_unavailable",
                 ..
             }
@@ -710,6 +811,10 @@ impl BodyCarrier {
                             Ok(_) => Ok(None),
                             // The remote attempt has ended. Retain source and
                             // receipt while real I/O retry remains throttled.
+                            Err(AppError::Storage {
+                                code: "carrier_spill_in_progress",
+                                ..
+                            }) => self.wait_for_spill_or_credit(target, bytes).await,
                             Err(_) => self.memory_or_retry(bytes, retry).await,
                         }
                     }
@@ -717,6 +822,24 @@ impl BodyCarrier {
             }
         }
         self.memory_or_retry(bytes, retry).await
+    }
+
+    async fn wait_for_spill_or_credit(
+        &self,
+        target: &Self,
+        bytes: usize,
+    ) -> Result<Option<OwnedSemaphorePermit>, AppError> {
+        let memory = self.memory.reserve_carrier_bytes(bytes);
+        let ready = target.offload.clone().lock_owned();
+        tokio::pin!(memory, ready);
+        tokio::select! {
+            biased;
+            lease = &mut memory => lease.map(Some),
+            guard = &mut ready => {
+                drop(guard);
+                Ok(None)
+            }
+        }
     }
 
     async fn memory_or_retry(

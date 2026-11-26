@@ -3,6 +3,7 @@ mod antigravity;
 mod cursor;
 mod kimi;
 mod normalize;
+pub(crate) mod oauth_recovery;
 pub(crate) mod observations;
 mod proxy;
 #[cfg(test)]
@@ -51,6 +52,8 @@ pub(crate) enum QuotaReadTrigger {
     Manual,
     Bulk,
     BackgroundRecovery,
+    /// One read after worker renewal; its rejection must not renew again.
+    PostRenewalVerification,
     ResetWorkflow,
 }
 
@@ -60,6 +63,7 @@ impl QuotaReadTrigger {
             Self::Manual => "manual",
             Self::Bulk => "bulk",
             Self::BackgroundRecovery => "background_recovery",
+            Self::PostRenewalVerification => "post_renewal_verification",
             Self::ResetWorkflow => "reset_workflow",
         }
     }
@@ -571,6 +575,7 @@ struct Entry {
 }
 
 pub(crate) struct QuotaCache {
+    pub(crate) oauth_rejections: oauth_recovery::Rejections,
     entries: Mutex<HashMap<CacheKey, Arc<Entry>>>,
     permits: Semaphore,
 }
@@ -578,6 +583,7 @@ pub(crate) struct QuotaCache {
 impl Default for QuotaCache {
     fn default() -> Self {
         Self {
+            oauth_rejections: oauth_recovery::Rejections::default(),
             entries: Mutex::new(HashMap::new()),
             permits: Semaphore::new(4),
         }
@@ -585,6 +591,11 @@ impl Default for QuotaCache {
 }
 
 impl QuotaCache {
+    #[cfg(test)]
+    pub(crate) async fn pause_reads_for_test(&self) -> tokio::sync::SemaphorePermit<'_> {
+        self.permits.acquire_many(4).await.unwrap()
+    }
+
     pub(crate) async fn read(
         &self,
         state: &AppState,
@@ -788,7 +799,7 @@ impl QuotaCache {
                 "kimi-oauth" => {
                     kimi::read(state, account, credential, empty(None), trigger, &session).await
                 }
-                "cursor" => cursor::read(state, credential, empty(None)).await,
+                "cursor" => cursor::read(state, account, credential, empty(None), trigger).await,
                 _ => read_codex(state, account, credential, empty(None), trigger, &session).await,
             }
         })
@@ -912,8 +923,10 @@ async fn publish_operator_observation(
     snapshot: &QuotaSnapshot,
     trigger: QuotaReadTrigger,
 ) {
-    if trigger != QuotaReadTrigger::BackgroundRecovery
-        && let Some(observation) = observations::project(account, snapshot, unix_millis())
+    if !matches!(
+        trigger,
+        QuotaReadTrigger::BackgroundRecovery | QuotaReadTrigger::PostRenewalVerification
+    ) && let Some(observation) = observations::project(account, snapshot, unix_millis())
         && let Err(error) = state
             .db
             .publish_manual_quota_observation(&observation)
@@ -1255,6 +1268,18 @@ async fn get_codex_json_with_routes(
                     retry::Failure::transport(error)
                 }
             })?;
+            session
+                .observe_bearer_rejection(
+                    context,
+                    response.status(),
+                    auth.credential_header == http::header::AUTHORIZATION
+                        && auth
+                            .credential_value
+                            .as_bytes()
+                            .get(..7)
+                            .is_some_and(|prefix| prefix.eq_ignore_ascii_case(b"Bearer ")),
+                )
+                .await;
             if let Some(failure) =
                 retry::Failure::status(response.status().as_u16(), response.headers())
             {

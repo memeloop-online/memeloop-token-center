@@ -20,6 +20,9 @@ declare global {
       requestQueryBodies: unknown[];
       route: OperatorRouteKey;
       openOverview: () => void;
+      openRequests: () => void;
+      holdNextQuery: boolean;
+      releaseLateQuery: (failed: boolean) => void;
     };
   }
 }
@@ -35,7 +38,7 @@ const initialRequests = new URLSearchParams(location.search).has('initial-reques
 const sessionKey = '5dae9b5a-6bd0-54a7-ae14-fb5aa4f61650';
 const realSession = '00000000-0000-4000-8000-000000000002';
 
-window.overviewDrilldownFixture = { calls: [], requestQueryBodies: [], route: 'overview', openOverview: () => undefined };
+window.overviewDrilldownFixture = { calls: [], requestQueryBodies: [], route: 'overview', openOverview: () => undefined, openRequests: () => undefined, holdNextQuery: false, releaseLateQuery: () => undefined };
 
 function json(value: unknown, status = 200) {
   return new Response(JSON.stringify(value), { status, headers: { 'Content-Type': 'application/json' } });
@@ -98,7 +101,7 @@ globalThis.fetch = async (input: RequestInfo | URL, init?: RequestInit) => {
   if (url.pathname === '/internal/v1/request-events') return new Response(new ReadableStream({
     start(controller) { controller.enqueue(new TextEncoder().encode(': fixture connected\n\n')); },
   }), { headers: { 'Content-Type': 'text/event-stream' } });
-  if (url.pathname === '/internal/v1/tenants') return json([{ external_id: tenant }]);
+  if (url.pathname === '/internal/v1/tenants') return json([{ external_id: tenant }, ...(new URLSearchParams(location.search).has('filter-state') ? [{ external_id: 'second-tenant' }] : [])]);
   if (url.pathname === '/internal/v1/plugins') return json([]);
   if (url.pathname === '/internal/v1/usage-analysis/trends') return json(usageTrends);
   if (url.pathname === '/internal/v1/usage-analysis') return json(usageAnalysis);
@@ -159,6 +162,15 @@ globalThis.fetch = async (input: RequestInfo | URL, init?: RequestInit) => {
   if (url.pathname === '/internal/v1/requests/query' && method === 'POST') {
     const body = JSON.parse(String(init?.body ?? '{}'));
     window.overviewDrilldownFixture.requestQueryBodies.push(body);
+    if (window.overviewDrilldownFixture.holdNextQuery) {
+      window.overviewDrilldownFixture.holdNextQuery = false;
+      return new Promise<Response>(resolve => {
+        // Deliberately complete after abort to verify the consumer's scope fence.
+        window.overviewDrilldownFixture.releaseLateQuery = failed => resolve(failed
+          ? json({ error: { message: 'stale-scope-error' } }, 503)
+          : json({ requests: [{ ...drilledRequest, model: 'stale-scope-row' }], next_cursor: null }));
+      });
+    }
     const filtered = Array.isArray(body.ast?.conditions) && body.ast.conditions.length > 0;
     return json({ requests: filtered ? [drilledRequest] : [], next_cursor: null });
   }
@@ -167,6 +179,7 @@ globalThis.fetch = async (input: RequestInfo | URL, init?: RequestInit) => {
 
 function Fixture() {
   const [route, setRoute] = useState<OperatorRouteKey>(initialSessions ? 'sessions' : initialRequests ? 'requests' : usageSessions ? 'usage' : 'overview');
+  window.overviewDrilldownFixture.openRequests = () => setRoute('requests');
   window.overviewDrilldownFixture.openOverview = () => setRoute(usageSessions ? 'usage' : 'overview');
   useEffect(() => { window.overviewDrilldownFixture.route = route; }, [route]);
   return <>

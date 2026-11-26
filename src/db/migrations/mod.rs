@@ -882,6 +882,11 @@ pub(crate) const SQLITE_MIGRATIONS: &[Migration] = &[
         name: "history_watermark_proof",
         sql: include_str!("../../../migrations/common/0165_history_watermark_proof.sql"),
     },
+    Migration {
+        version: 166,
+        name: "oauth_rejected_generation",
+        sql: include_str!("../../../migrations/common/0166_oauth_rejected_generation.sql"),
+    },
 ];
 
 pub(crate) const POSTGRES_MIGRATIONS: &[Migration] = &[
@@ -1730,6 +1735,11 @@ pub(crate) const POSTGRES_MIGRATIONS: &[Migration] = &[
         name: "history_watermark_proof",
         sql: include_str!("../../../migrations/common/0165_history_watermark_proof.sql"),
     },
+    Migration {
+        version: 166,
+        name: "oauth_rejected_generation",
+        sql: include_str!("../../../migrations/common/0166_oauth_rejected_generation.sql"),
+    },
 ];
 
 pub(super) async fn validate_started_capability(
@@ -1906,7 +1916,7 @@ impl Database {
                 ));
             }
         } else {
-            self.install_schema_track(super::capability::SchemaTrack::Linear165)?;
+            self.install_schema_track(super::capability::SchemaTrack::Linear166)?;
         }
         Ok(())
     }

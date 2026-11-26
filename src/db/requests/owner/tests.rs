@@ -40,6 +40,13 @@ impl Fixture {
         url.query_pairs_mut()
             .append_pair("application_name", &replica_name);
         let replica = Database::connect_with_max(url.as_str(), 6).await.unwrap();
+        for runtime in [&database, &replica] {
+            runtime
+                .verify_capabilities(crate::db::capability::CapabilityRole::Gateway)
+                .await
+                .unwrap()
+                .expect("migrated owner runtime must verify capabilities");
+        }
         let pepper = b"u02 ordinary owner regression pepper";
         let issued = database
             .create_key(
@@ -385,5 +392,228 @@ async fn postgres_reaper_rechecks_renewal_under_lock_and_races_late_finish_once(
         };
         fixture.assert_once(&owner, status, cost).await;
     }
+    fixture.close().await;
+}
+
+#[tokio::test]
+async fn postgres_terminal_owner_read_lock_rechecks_pending_without_update_side_effects() {
+    let fixture = Fixture::postgres()
+        .await
+        .expect("PostgreSQL contract requires MTC_TEST_POSTGRES_URL");
+    let (owner, _reservation) = fixture.request().await;
+    fixture.database.history_start().await.unwrap();
+    for statement in [
+        "CREATE TABLE terminal_owner_unrelated_old PARTITION OF request_records FOR VALUES FROM (-2000) TO (-1000)",
+        "CREATE TABLE terminal_owner_unrelated_new PARTITION OF request_records FOR VALUES FROM (-1000) TO (0)",
+        "CREATE TABLE terminal_owner_update_probe (request_id TEXT NOT NULL)",
+        "CREATE FUNCTION terminal_owner_update_probe_fn() RETURNS trigger LANGUAGE plpgsql AS $$ BEGIN INSERT INTO terminal_owner_update_probe VALUES (NEW.id); RETURN NEW; END $$",
+        "CREATE TRIGGER terminal_owner_update_probe AFTER UPDATE ON request_records FOR EACH ROW EXECUTE FUNCTION terminal_owner_update_probe_fn()",
+    ] {
+        sqlx::query(statement)
+            .execute(&fixture.database.pool)
+            .await
+            .unwrap();
+    }
+    let probe_count = || async {
+        sqlx::query_scalar::<_, i64>("SELECT COUNT(*) FROM terminal_owner_update_probe")
+            .fetch_one(&fixture.database.pool)
+            .await
+            .unwrap()
+    };
+    let revision = || async {
+        sqlx::query_scalar::<_, i64>("SELECT COALESCE(MAX(revision),0) FROM request_history_export WHERE source='native' AND request_id=$1")
+            .bind(owner.request_id.to_string()).fetch_one(&fixture.database.pool).await.unwrap()
+    };
+    let before_revision = revision().await;
+    let mut old = fixture.database.begin_write_transaction().await.unwrap();
+    let old_pid: i32 = sqlx::query_scalar("SELECT pg_backend_pid()")
+        .fetch_one(&mut *old)
+        .await
+        .unwrap();
+    sqlx::query("UPDATE request_records SET completed_at=completed_at WHERE id=$1 AND tenant_id=$2 AND key_id=$3 AND reservation_id=$4 AND completed_at IS NULL")
+        .bind(owner.request_id.to_string()).bind(owner.tenant_id.to_string())
+        .bind(owner.key_id.to_string()).bind(owner.reservation_id.to_string())
+        .execute(&mut *old).await.unwrap();
+    assert_eq!(
+        sqlx::query_scalar::<_, i64>("SELECT COUNT(*) FROM terminal_owner_update_probe")
+            .fetch_one(&mut *old)
+            .await
+            .unwrap(),
+        1
+    );
+    let old_revision: i64 = sqlx::query_scalar("SELECT COALESCE(MAX(revision),0) FROM request_history_export WHERE source='native' AND request_id=$1").bind(owner.request_id.to_string()).fetch_one(&mut *old).await.unwrap();
+    assert!(
+        old_revision > before_revision,
+        "the old UPDATE allocates a history revision"
+    );
+    let old_leaf_families: i64 = sqlx::query_scalar("WITH leaves AS (SELECT relid FROM pg_partition_tree($2::regclass) WHERE isleaf), families AS (SELECT relid,relid AS owner_leaf FROM leaves UNION ALL SELECT i.indexrelid,l.relid FROM leaves l JOIN pg_index i ON i.indrelid=l.relid) SELECT COUNT(DISTINCT f.owner_leaf)::BIGINT FROM families f JOIN pg_locks p ON p.relation=f.relid WHERE p.pid=$1 AND p.granted")
+        .bind(old_pid).bind(format!("{}.request_records",fixture.schema)).fetch_one(&fixture.admin).await.unwrap();
+    assert!(old_leaf_families >= 3);
+    old.rollback().await.unwrap();
+
+    let mut first = fixture.database.begin_write_transaction().await.unwrap();
+    sqlx::query("SET LOCAL plan_cache_mode=force_generic_plan")
+        .execute(&mut *first)
+        .await
+        .unwrap();
+    let mode: String = sqlx::query_scalar("SHOW plan_cache_mode")
+        .fetch_one(&mut *first)
+        .await
+        .unwrap();
+    assert_eq!(mode, "force_generic_plan");
+    let pid: i32 = sqlx::query_scalar("SELECT pg_backend_pid()")
+        .fetch_one(&mut *first)
+        .await
+        .unwrap();
+    assert_eq!(
+        fixture
+            .database
+            .lock_request_terminal_owner(
+                &mut first,
+                owner.request_id,
+                owner.tenant_id,
+                owner.key_id,
+                owner.reservation_id,
+                None,
+                true
+            )
+            .await
+            .unwrap()
+            .0,
+        1
+    );
+    assert_eq!(
+        probe_count().await,
+        0,
+        "SELECT owner lock must not execute UPDATE triggers"
+    );
+    assert_eq!(revision().await, before_revision);
+    let locks = sqlx::query("WITH leaves AS (SELECT relid FROM pg_partition_tree($2::regclass) WHERE isleaf), families AS (SELECT relid, relid AS owner_leaf FROM leaves UNION ALL SELECT i.indexrelid, l.relid FROM leaves l JOIN pg_index i ON i.indrelid=l.relid), granted AS (SELECT DISTINCT f.owner_leaf FROM families f JOIN pg_locks p ON p.relation=f.relid WHERE p.pid=$1 AND p.granted) SELECT COUNT(*)::BIGINT AS leaf_families FROM granted")
+        .bind(pid).bind(format!("{}.request_records", fixture.schema))
+        .fetch_one(&fixture.admin).await.unwrap();
+    println!(
+        "TERMINAL_OWNER_LOCK_FAMILIES old={} new={}",
+        old_leaf_families,
+        locks.get::<i64, _>("leaf_families")
+    );
+    assert_eq!(
+        locks.get::<i64, _>("leaf_families"),
+        1,
+        "owner SELECT must prune unrelated leaf/index families"
+    );
+
+    let replica = fixture.replica.clone();
+    let waiting_owner = owner.clone();
+    let waiting = tokio::spawn(async move {
+        let mut tx = replica.begin_write_transaction().await.unwrap();
+        let result = replica
+            .lock_request_terminal_owner(
+                &mut tx,
+                waiting_owner.request_id,
+                waiting_owner.tenant_id,
+                waiting_owner.key_id,
+                waiting_owner.reservation_id,
+                None,
+                true,
+            )
+            .await
+            .unwrap()
+            .0;
+        tx.rollback().await.unwrap();
+        result
+    });
+    fixture.wait_for_replica_lock().await;
+    sqlx::query("UPDATE request_records SET completed_at=$1 WHERE id=$2")
+        .bind(unix_millis())
+        .bind(owner.request_id.to_string())
+        .execute(&mut *first)
+        .await
+        .unwrap();
+    first.commit().await.unwrap();
+    assert_eq!(
+        tokio::time::timeout(Duration::from_secs(5), waiting)
+            .await
+            .unwrap()
+            .unwrap(),
+        0,
+        "a waiting pending owner must recheck completed_at after the winner commits"
+    );
+    let after_update_revision = revision().await;
+    let mut operational = fixture.database.begin_write_transaction().await.unwrap();
+    assert_eq!(
+        fixture
+            .database
+            .lock_request_terminal_owner(
+                &mut operational,
+                owner.request_id,
+                owner.tenant_id,
+                owner.key_id,
+                owner.reservation_id,
+                None,
+                false
+            )
+            .await
+            .unwrap()
+            .0,
+        1,
+        "operational receipt may lock an already financially completed owner"
+    );
+    operational.rollback().await.unwrap();
+    assert_eq!(probe_count().await, 1);
+    assert_eq!(revision().await, after_update_revision);
+    let untouched = sqlx::query("SELECT (SELECT status FROM usage_reservations WHERE id=$1) AS reservation_status, (SELECT COUNT(*) FROM ledger_entries WHERE source=$1) AS ledger_count")
+        .bind(owner.reservation_id.to_string()).fetch_one(&fixture.database.pool).await.unwrap();
+    assert_eq!(untouched.get::<String, _>("reservation_status"), "reserved");
+    assert_eq!(untouched.get::<i64, _>("ledger_count"), 0);
+    fixture.close().await;
+}
+
+#[tokio::test]
+async fn postgres_terminal_completion_keeps_owner_reads_on_one_leaf_before_settlement() {
+    let fixture = Fixture::postgres()
+        .await
+        .expect("PostgreSQL contract requires MTC_TEST_POSTGRES_URL");
+    let (owner, reservation) = fixture.request().await;
+    for statement in [
+        "CREATE TABLE terminal_path_unrelated_old PARTITION OF request_records FOR VALUES FROM (-2000) TO (-1000)",
+        "CREATE TABLE terminal_path_unrelated_new PARTITION OF request_records FOR VALUES FROM (-1000) TO (0)",
+        "CREATE FUNCTION gate_terminal_settlement() RETURNS trigger LANGUAGE plpgsql AS $$ BEGIN IF NEW.status='settled' THEN PERFORM pg_advisory_xact_lock(1096,1); END IF; RETURN NEW; END $$",
+        "CREATE TRIGGER gate_terminal_settlement BEFORE UPDATE ON usage_reservations FOR EACH ROW EXECUTE FUNCTION gate_terminal_settlement()",
+    ] {
+        sqlx::query(statement)
+            .execute(&fixture.database.pool)
+            .await
+            .unwrap();
+    }
+    let mut gate = fixture.admin.begin().await.unwrap();
+    sqlx::query("SELECT pg_advisory_xact_lock(1096,1)")
+        .execute(&mut *gate)
+        .await
+        .unwrap();
+    let replica = fixture.replica.clone();
+    let terminal_owner = owner.clone();
+    let task = tokio::spawn(async move {
+        replica
+            .finish_proxy_request(terminal(&terminal_owner, &reservation, false))
+            .await
+    });
+    fixture.wait_for_replica_lock().await;
+    let footprints: Vec<i64> = sqlx::query_scalar("WITH leaves AS (SELECT relid FROM pg_partition_tree($1::regclass) WHERE isleaf), families AS (SELECT relid,relid AS owner_leaf FROM leaves UNION ALL SELECT i.indexrelid,l.relid FROM leaves l JOIN pg_index i ON i.indrelid=l.relid) SELECT COUNT(DISTINCT f.owner_leaf)::BIGINT FROM pg_stat_activity a JOIN pg_locks p ON p.pid=a.pid AND p.granted JOIN families f ON f.relid=p.relation WHERE a.application_name=$2 AND a.wait_event_type='Lock' GROUP BY a.pid")
+        .bind(format!("{}.request_records",fixture.schema)).bind(&fixture.replica_name)
+        .fetch_all(&fixture.admin).await.unwrap();
+    // Always release the blocker and await the real operation before asserting.
+    gate.rollback().await.unwrap();
+    let result = tokio::time::timeout(Duration::from_secs(10), task)
+        .await
+        .unwrap()
+        .unwrap()
+        .unwrap();
+    assert!(matches!(result, FinishProxyRequestResult::Finished { .. }));
+    assert_eq!(
+        footprints,
+        vec![1],
+        "formal terminal path must not reopen unrelated leaf/index families after its owner lock"
+    );
+    fixture.assert_once(&owner, 200, 12).await;
     fixture.close().await;
 }
