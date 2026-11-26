@@ -116,6 +116,8 @@ async fn assert_event_enrichment(database: &Database) {
         .await
         .unwrap();
     let pending_json = serde_json::to_value(&pending[0]).unwrap();
+    assert_eq!(pending_json["first_output_ms"], 5);
+    assert_eq!(pending_json["generation_duration_ms"], 15);
     assert_eq!(
         pending_json["session_context"]["captured"],
         expected_captured
@@ -247,6 +249,9 @@ async fn assert_event_enrichment(database: &Database) {
         serde_json::to_value(&frozen_view).unwrap()["session_context"]["captured"],
         expected_captured
     );
+    let timing_json = serde_json::to_value(&frozen_view).unwrap();
+    assert_eq!(timing_json["first_output_ms"], 5);
+    assert_eq!(timing_json["generation_duration_ms"], 15);
     capture.rollback().await.unwrap();
     let events = database
         .request_events_after(&external, now, None, 500)
