@@ -375,7 +375,7 @@ impl ArchiveStore {
     }
 
     pub fn readiness_metrics(&self) -> String {
-        self.readiness_metrics.render()
+        self.readiness_metrics.render() + &self.write_observations.render()
     }
 
     pub async fn readiness_check(&self) -> Result<(), AppError> {
@@ -832,6 +832,7 @@ mod tests {
             readiness_path: archive_path("readiness/unit-test.bin").expect("readiness path"),
             readiness_deadline: READINESS_DEADLINE,
             readiness_metrics: Arc::default(),
+            write_observations: Arc::default(),
         }
     }
 

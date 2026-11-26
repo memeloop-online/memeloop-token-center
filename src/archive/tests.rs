@@ -57,6 +57,7 @@ pub(super) fn memory_store() -> ArchiveStore {
         readiness_path: path::archive_path("readiness/archive-tests.bin").expect("readiness path"),
         readiness_deadline: Duration::from_secs(5),
         readiness_metrics: Arc::default(),
+        write_observations: Arc::default(),
     }
 }
 
@@ -80,6 +81,8 @@ fn test_writer(aborts: Arc<AtomicUsize>, fail_parts: bool) -> ArchiveWriter {
         compressed: false,
         compressed_pending: bytes::BytesMut::new(),
         workspace: None,
+        observation_context: memory_store().write_context("staging/test/response.bin"),
+        wire_bytes: 0,
     }
 }
 

@@ -26,6 +26,8 @@ pub struct ArchiveWriter {
     pub(super) compressed: bool,
     pub(super) compressed_pending: BytesMut,
     pub(super) workspace: Option<Arc<dyn Send + Sync>>,
+    pub(super) observation_context: super::write_observation::Context,
+    pub(super) wire_bytes: u64,
 }
 
 #[derive(Clone, Debug, serde::Deserialize, serde::Serialize)]
@@ -50,7 +52,12 @@ impl ArchiveStore {
         let (store, staging) = self.resolve(location)?;
         #[cfg(test)]
         super::multipart_test_gate::wait(location).await;
-        let upload = store.put_multipart(&staging).await?;
+        let observation_context = self.write_context(location);
+        let mut observation =
+            observation_context.start(super::write_observation::Operation::MultipartBegin, None);
+        let result = store.put_multipart(&staging).await;
+        observation.result(&result);
+        let upload = result?;
         Ok(ArchiveWriter {
             store: store.clone(),
             staging,
@@ -65,6 +72,8 @@ impl ArchiveStore {
             compressed: false,
             compressed_pending: BytesMut::new(),
             workspace: None,
+            observation_context,
+            wire_bytes: 0,
         })
     }
 
@@ -133,7 +142,13 @@ impl ArchiveWriter {
                 .await;
             if let Err(error) = capacity {
                 let inner = self.inner.take().expect("archive writer was open");
-                if inner.abort().await.is_err() {
+                let mut observation = self.observation_context.start(
+                    super::write_observation::Operation::MultipartAbort,
+                    Some(self.wire_bytes),
+                );
+                let result = inner.abort().await;
+                observation.result(&result);
+                if result.is_err() {
                     tracing::error!("failed to abort archive multipart upload after a write error");
                 }
                 return Err(error.into());
@@ -142,6 +157,7 @@ impl ArchiveWriter {
             // when handed one large Bytes. Bound each call to one part so the
             // capacity wait above remains a hard rather than advisory limit.
             let part = bytes.split_to(bytes.len().min(self.multipart_part_bytes));
+            self.wire_bytes = self.wire_bytes.saturating_add(part.len() as u64);
             self.inner
                 .as_mut()
                 .expect("archive writer was checked open")
@@ -154,7 +170,13 @@ impl ArchiveWriter {
                 .await;
             if let Err(error) = uploaded {
                 let inner = self.inner.take().expect("archive writer was open");
-                if inner.abort().await.is_err() {
+                let mut observation = self.observation_context.start(
+                    super::write_observation::Operation::MultipartAbort,
+                    Some(self.wire_bytes),
+                );
+                let result = inner.abort().await;
+                observation.result(&result);
+                if result.is_err() {
                     tracing::error!("failed to abort archive multipart upload after a write error");
                 }
                 return Err(error.into());
@@ -207,7 +229,13 @@ impl ArchiveWriter {
         let Some(inner) = self.inner.take() else {
             return Ok(());
         };
-        inner.abort().await?;
+        let mut observation = self.observation_context.start(
+            super::write_observation::Operation::MultipartAbort,
+            Some(self.wire_bytes),
+        );
+        let result = inner.abort().await;
+        observation.result(&result);
+        result?;
         Ok(())
     }
 
@@ -233,12 +261,24 @@ impl ArchiveWriter {
         // branch. Await it while we still own the writer so that failure can
         // also be explicitly aborted instead of being left to bucket cleanup.
         if let Err(error) = inner.wait_for_capacity(0).await {
-            if inner.abort().await.is_err() {
+            let mut observation = self.observation_context.start(
+                super::write_observation::Operation::MultipartAbort,
+                Some(self.wire_bytes),
+            );
+            let result = inner.abort().await;
+            observation.result(&result);
+            if result.is_err() {
                 tracing::error!("failed to abort archive multipart upload after a part failure");
             }
             return Err(error.into());
         }
-        inner.finish().await?;
+        let mut observation = self.observation_context.start(
+            super::write_observation::Operation::MultipartComplete,
+            Some(self.wire_bytes),
+        );
+        let result = inner.finish().await;
+        observation.result(&result);
+        result?;
         Ok(())
     }
 }
@@ -249,6 +289,10 @@ impl Drop for ArchiveWriter {
             return;
         };
         let workspace = self.workspace.take();
+        let mut observation = self.observation_context.start(
+            super::write_observation::Operation::MultipartAbort,
+            Some(self.wire_bytes),
+        );
         match tokio::runtime::Handle::try_current() {
             Ok(runtime) => {
                 // Drop cannot await network I/O. Detach a best-effort abort on
@@ -257,7 +301,9 @@ impl Drop for ArchiveWriter {
                 // remains mandatory for process crashes and runtime shutdown.
                 drop(runtime.spawn(async move {
                     let _workspace = workspace;
-                    if inner.abort().await.is_err() {
+                    let result = inner.abort().await;
+                    observation.result(&result);
+                    if result.is_err() {
                         tracing::error!("failed to abort dropped archive multipart upload");
                     }
                 }));
