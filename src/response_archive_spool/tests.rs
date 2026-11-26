@@ -1578,6 +1578,13 @@ async fn exhausted_archival_credit_records_failure_without_a_prefix_root() {
         .await
         .unwrap();
     assert!(!producer.try_offer(Bytes::from_static(b"not a complete original")));
+    assert!(!producer.try_offer(Bytes::from_static(b"a later fragment")));
+    assert!(
+        state
+            .persistence
+            .render()
+            .contains("memeloop_token_center_deferred_persistence_total{outcome=\"capacity\"} 1\n")
+    );
     drop(producer);
     tokio::time::timeout(std::time::Duration::from_secs(5), async {
         while !state

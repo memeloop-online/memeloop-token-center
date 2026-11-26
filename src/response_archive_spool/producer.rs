@@ -412,6 +412,7 @@ fn take_append_failure_for_test(state: &AppState) -> bool {
 
 pub(crate) struct ResponseArchiveProducer {
     identity: ArchiveSpoolIdentity,
+    persistence: Arc<crate::api::proxy::persistence::Persistence>,
     #[cfg(test)]
     state: AppState,
     capture: CarrierCaptureInput,
@@ -512,11 +513,38 @@ struct CaptureReceipt {
     )>,
 }
 
+enum OfferedCaptureBytes {
+    Original(Bytes),
+    Coalesced(Vec<u8>),
+}
+
+struct OfferedCaptureChunk {
+    bytes: OfferedCaptureBytes,
+    credit: tokio::sync::OwnedSemaphorePermit,
+}
+
+impl OfferedCaptureChunk {
+    fn len(&self) -> usize {
+        match &self.bytes {
+            OfferedCaptureBytes::Original(bytes) => bytes.len(),
+            OfferedCaptureBytes::Coalesced(bytes) => bytes.len(),
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug)]
+enum CaptureOfferError {
+    Capacity { requested_bytes: usize },
+    Closed,
+}
+
 struct CarrierCaptureInput {
     budget: Arc<crate::gateway_body::memory::ProxyMemoryBudget>,
     source: Option<tokio::sync::mpsc::UnboundedSender<CaptureChunk>>,
     progress: tokio::sync::watch::Sender<(u64, bool)>,
     length: u64,
+    pending: Option<OfferedCaptureChunk>,
+    block_bytes: usize,
     #[cfg(test)]
     write_pause: Option<(
         tokio::sync::oneshot::Sender<()>,
@@ -527,7 +555,110 @@ struct CarrierCaptureInput {
 }
 
 impl CarrierCaptureInput {
+    fn reserve_offer(
+        &self,
+        capacity: usize,
+    ) -> Result<tokio::sync::OwnedSemaphorePermit, CaptureOfferError> {
+        let charged = capacity
+            .checked_add(256)
+            .ok_or(CaptureOfferError::Capacity {
+                requested_bytes: capacity,
+            })?;
+        self.budget
+            .try_reserve_ingress_bytes(charged)
+            .ok_or(CaptureOfferError::Capacity {
+                requested_bytes: charged,
+            })
+    }
+
+    fn send_offer(&mut self, offered: OfferedCaptureChunk) -> Result<(), CaptureOfferError> {
+        let bytes = match offered.bytes {
+            OfferedCaptureBytes::Original(bytes) => bytes,
+            OfferedCaptureBytes::Coalesced(bytes) => Bytes::from(bytes),
+        };
+        let (acknowledged, _completion) = tokio::sync::oneshot::channel();
+        self.source
+            .as_ref()
+            .ok_or(CaptureOfferError::Closed)?
+            .send(CaptureChunk {
+                bytes,
+                credit: Some(offered.credit),
+                acknowledged,
+                #[cfg(test)]
+                pause: self.write_pause.take(),
+            })
+            .map_err(|_| CaptureOfferError::Closed)
+    }
+
+    fn flush_offer(&mut self) -> Result<(), CaptureOfferError> {
+        if let Some(offered) = self.pending.take() {
+            self.send_offer(offered)?;
+        }
+        Ok(())
+    }
+
+    fn offer(&mut self, bytes: Bytes) -> Result<(), CaptureOfferError> {
+        if let Some(OfferedCaptureChunk {
+            bytes: OfferedCaptureBytes::Coalesced(pending),
+            ..
+        }) = self.pending.as_mut()
+            && bytes.len() <= pending.capacity() - pending.len()
+        {
+            // No allocation or capacity growth: this block was prepaid in full.
+            pending.extend_from_slice(&bytes);
+            return Ok(());
+        }
+        if let Some(pending) = self.pending.as_ref()
+            && matches!(pending.bytes, OfferedCaptureBytes::Original(_))
+            && bytes.len() < super::CHUNK_BYTES
+            && pending.len() + bytes.len() <= super::CHUNK_BYTES
+        {
+            let capacity = self
+                .block_bytes
+                .max((pending.len() + bytes.len()).next_power_of_two())
+                .min(super::CHUNK_BYTES);
+            // Copying can keep old and new allocations alive simultaneously.
+            // Acquire the entire new block before allocating; the original
+            // credit remains held until both copies have completed.
+            let credit = self.reserve_offer(capacity)?;
+            let previous = self.pending.take().unwrap();
+            let mut combined = Vec::with_capacity(capacity);
+            let OfferedCaptureBytes::Original(original) = &previous.bytes else {
+                unreachable!()
+            };
+            combined.extend_from_slice(original);
+            combined.extend_from_slice(&bytes);
+            drop(previous);
+            self.pending = Some(OfferedCaptureChunk {
+                bytes: OfferedCaptureBytes::Coalesced(combined),
+                credit,
+            });
+            return Ok(());
+        }
+        if let Some(OfferedCaptureChunk {
+            bytes: OfferedCaptureBytes::Coalesced(previous),
+            ..
+        }) = self.pending.as_ref()
+        {
+            self.block_bytes = (previous.capacity() * 2).min(super::CHUNK_BYTES);
+        }
+        self.flush_offer()?;
+        let credit = self.reserve_offer(bytes.len())?;
+        let offered = OfferedCaptureChunk {
+            bytes: OfferedCaptureBytes::Original(bytes),
+            credit,
+        };
+        if offered.len() >= super::CHUNK_BYTES {
+            self.send_offer(offered)
+        } else {
+            self.pending = Some(offered);
+            Ok(())
+        }
+    }
+
     async fn append(&mut self, bytes: Bytes) -> std::io::Result<()> {
+        self.flush_offer()
+            .map_err(|_| std::io::Error::other("capture closed"))?;
         for offset in (0..bytes.len()).step_by(super::CHUNK_BYTES) {
             let end = (offset + super::CHUNK_BYTES).min(bytes.len());
             let (acknowledged, completion) = tokio::sync::oneshot::channel();
@@ -872,6 +1003,7 @@ impl ResponseArchiveProducer {
         );
         Self {
             identity,
+            persistence: state.persistence.clone(),
             #[cfg(test)]
             state: state.clone(),
             capture: CarrierCaptureInput {
@@ -883,6 +1015,8 @@ impl ResponseArchiveProducer {
                 source: Some(source),
                 progress,
                 length: 0,
+                pending: None,
+                block_bytes: 4096,
                 #[cfg(test)]
                 write_pause: None,
                 #[cfg(test)]
@@ -927,31 +1061,30 @@ impl ResponseArchiveProducer {
         if bytes.is_empty() {
             return self.active.load(Ordering::Acquire);
         }
-        // Account channel/receipt/allocation metadata as well as wire bytes.
-        let Some(charged) = bytes.len().checked_add(256) else {
-            self.abandon("capture_byte_budget_unavailable");
+        if !self.active.load(Ordering::Acquire) {
             return false;
-        };
-        let Some(credit) = self.capture.budget.try_reserve_ingress_bytes(charged) else {
-            self.abandon("capture_byte_budget_unavailable");
-            return false;
-        };
-        let (acknowledged, _completion) = tokio::sync::oneshot::channel();
+        }
         let length = bytes.len() as u64;
-        let chunk = CaptureChunk {
-            bytes,
-            credit: Some(credit),
-            acknowledged,
-            #[cfg(test)]
-            pause: self.capture.write_pause.take(),
-        };
-        let accepted = self
-            .capture
-            .source
-            .as_ref()
-            .is_some_and(|source| source.send(chunk).is_ok());
-        if !accepted {
-            self.abandon("capture_queue_unavailable");
+        if let Err(error) = self.capture.offer(bytes) {
+            match error {
+                CaptureOfferError::Capacity { requested_bytes } => {
+                    let (
+                        source_used_bytes,
+                        source_limit_bytes,
+                        retained_bytes,
+                        retained_limit_bytes,
+                    ) = self.capture.budget.snapshot();
+                    tracing::warn!(request_id = %self.identity.request_id, requested_bytes,
+                        source_used_bytes, source_limit_bytes, retained_bytes, retained_limit_bytes,
+                        pending_bytes = self.capture.pending.as_ref().map_or(0, OfferedCaptureChunk::len),
+                        "response archive ingress credit unavailable");
+                    if self.active.swap(false, Ordering::AcqRel) {
+                        self.persistence.record_capacity_gap();
+                    }
+                    self.abandon("capture_byte_budget_unavailable");
+                }
+                CaptureOfferError::Closed => self.abandon("capture_queue_unavailable"),
+            }
             return false;
         }
         self.capture.length = self.capture.length.saturating_add(length);
@@ -964,6 +1097,7 @@ impl ResponseArchiveProducer {
     fn abandon(&mut self, reason: &'static str) {
         tracing::warn!(request_id = %self.identity.request_id, phase = "response_spool_producer", outcome = reason, "response capture abandoned");
         self.active.store(false, Ordering::Release);
+        self.capture.pending.take();
         self.capture.source.take();
         self.capture
             .progress
@@ -997,6 +1131,10 @@ impl ResponseArchiveProducer {
     /// Capture EOF is not an ACK. The owned writer must still publish its CAS root.
     pub(crate) fn seal(mut self) -> Option<ResponseArchiveSettlement> {
         if !self.active.load(Ordering::Acquire) {
+            return None;
+        }
+        if self.capture.flush_offer().is_err() {
+            self.abandon("capture_queue_unavailable");
             return None;
         }
         // Publish EOF before closing an empty source: the receiver can wake
@@ -1564,6 +1702,112 @@ pub(super) async fn mark_gap_for_test(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn offered_input(
+        capacity: usize,
+    ) -> (
+        CarrierCaptureInput,
+        tokio::sync::mpsc::UnboundedReceiver<CaptureChunk>,
+    ) {
+        let budget = Arc::new(
+            crate::gateway_body::memory::ProxyMemoryBudget::new_archive_source(capacity as u64),
+        );
+        let (source, receiver) = tokio::sync::mpsc::unbounded_channel();
+        let (progress, _) = tokio::sync::watch::channel((0, false));
+        (
+            CarrierCaptureInput {
+                budget,
+                source: Some(source),
+                progress,
+                length: 0,
+                pending: None,
+                block_bytes: 4096,
+                write_pause: None,
+                owner: std::sync::Weak::new(),
+            },
+            receiver,
+        )
+    }
+
+    #[tokio::test]
+    async fn offered_fragments_preserve_bytes_at_size_boundaries_and_partial_eof() {
+        let expected = (0..super::super::CHUNK_BYTES * 2 + 73)
+            .map(|index| (index % 251) as u8)
+            .collect::<Vec<_>>();
+        for distribution in [
+            vec![1],
+            vec![1, 17, 1024, 8193],
+            vec![super::super::CHUNK_BYTES - 1, 1],
+            vec![super::super::CHUNK_BYTES, 1],
+        ] {
+            let (mut input, mut receiver) = offered_input(2 * 1024 * 1024);
+            let mut offset = 0;
+            let mut index = 0;
+            while offset < expected.len() {
+                let end = (offset + distribution[index % distribution.len()]).min(expected.len());
+                input
+                    .offer(Bytes::copy_from_slice(&expected[offset..end]))
+                    .unwrap();
+                offset = end;
+                index += 1;
+            }
+            input.flush_offer().unwrap();
+            input.source.take();
+            let mut actual = Vec::new();
+            let mut chunks = 0;
+            while let Some(chunk) = receiver.recv().await {
+                actual.extend_from_slice(&chunk.bytes);
+                chunks += 1;
+            }
+            assert_eq!(actual, expected);
+            assert!(
+                chunks < 100,
+                "wire fragments must not become one source object each"
+            );
+            assert_eq!(input.budget.snapshot().0, 0);
+        }
+    }
+
+    #[test]
+    fn coalescing_reserves_old_and_full_new_allocations_before_copying() {
+        // First byte holds two 256-byte units including its metadata.
+        // The 4KiB destination needs 4352 more bytes while that source is live.
+        let (mut input, _receiver) = offered_input(4608);
+        input.offer(Bytes::from_static(b"a")).unwrap();
+        assert_eq!(input.budget.snapshot().0, 512);
+        assert!(matches!(
+            input.offer(Bytes::from_static(b"b")),
+            Err(CaptureOfferError::Capacity { .. })
+        ));
+        assert_eq!(input.pending.as_ref().unwrap().len(), 1);
+        assert_eq!(input.budget.snapshot().0, 512);
+        let budget = input.budget.clone();
+        drop(input);
+        assert_eq!(budget.snapshot().0, 0);
+
+        let (mut input, _receiver) = offered_input(4864);
+        input.offer(Bytes::from_static(b"a")).unwrap();
+        input.offer(Bytes::from_static(b"b")).unwrap();
+        assert_eq!(input.pending.as_ref().unwrap().len(), 2);
+        assert_eq!(input.budget.snapshot().0, 4352);
+        let budget = input.budget.clone();
+        drop(input);
+        assert_eq!(budget.snapshot().0, 0);
+    }
+
+    #[tokio::test]
+    async fn large_offers_transfer_the_original_allocation_without_copying() {
+        let bytes = Bytes::from(vec![b'x'; super::super::CHUNK_BYTES]);
+        let address = bytes.as_ptr();
+        let (mut input, mut receiver) = offered_input(2 * super::super::CHUNK_BYTES);
+        input.offer(bytes).unwrap();
+        assert!(input.pending.is_none());
+        let chunk = receiver.recv().await.unwrap();
+        assert_eq!(chunk.bytes.as_ptr(), address);
+        assert!(input.budget.snapshot().0 > 0);
+        drop(chunk);
+        assert_eq!(input.budget.snapshot().0, 0);
+    }
 
     #[tokio::test(start_paused = true)]
     async fn unreached_preseal_registration_is_cleaned_on_timeout_failure_and_cancellation() {
