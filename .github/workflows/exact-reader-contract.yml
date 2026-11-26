@@ -217,7 +217,7 @@ jobs:
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
         with:
-          ref: ${{ inputs.source_revision }}
+          ref: 34e3c4a3e621834fdeb5d7b3868b85471d2069d0
           persist-credentials: false
       - name: Record checked-out source
         run: git rev-parse HEAD
@@ -237,42 +237,40 @@ jobs:
             --env RUSTFS_OBS_LOG_DIRECTORY= --env RUSTFS_OBS_LOGGER_LEVEL=warn \
             --entrypoint /usr/bin/rustfs \
             rustfs/rustfs:1.0.4@sha256:ed9210d6411d77ffceb70d94b964a3cb7d225983368bc25bebe01e995293dcc2 /data
+          set -euo pipefail
+          bucket="native-release-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}"
+          echo "MTC_RUSTFS_TEST_BUCKET=$bucket" >> "$GITHUB_ENV"
+          ready=false
           for attempt in $(seq 1 60); do
-            if curl --fail --silent --aws-sigv4 'aws:amz:us-east-1:s3' \
-              --user "$RUSTFS_ACCESS_KEY:$RUSTFS_SECRET_KEY" \
-              --request PUT http://127.0.0.1:19000/conversation-contract-test; then exit 0; fi
+            if curl -q --noproxy '*' --silent --output /dev/null http://127.0.0.1:19000/health; then ready=true; break; fi
             sleep 2
           done
-          exit 1
-      - name: Verify reviewed request singleflight and original resource contracts
+          test "$ready" = true
+          status=$(curl -q --noproxy '*' --silent --show-error --output /tmp/native-bucket-create.txt --write-out '%{http_code}' \
+            --aws-sigv4 'aws:amz:us-east-1:s3' --user "$RUSTFS_ACCESS_KEY:$RUSTFS_SECRET_KEY" \
+            --request PUT "http://127.0.0.1:19000/$bucket")
+          test "$status" = 200
+          printf 'Created new run-owned bucket HTTP%s\n' "$status"
+      - name: Verify reviewed exact nonzero native retirement
         env:
           MTC_RUSTFS_TEST_ENDPOINT: http://127.0.0.1:19000
-          MTC_RUSTFS_TEST_BUCKET: conversation-contract-test
           MTC_RUSTFS_TEST_ACCESS_KEY: rustfs-test-fixture
           MTC_RUSTFS_TEST_SECRET_KEY: synthetic-test-only-secret-707
         run: |
           set -euo pipefail
-          test "$(git rev-parse HEAD)" = "acd77f9c7d244aa6d8896cdce3ebacd2d9b39f42"
+          test "$(git rev-parse HEAD)" = "34e3c4a3e621834fdeb5d7b3868b85471d2069d0"
           git rev-parse HEAD
-          mkdir -p /tmp/request-singleflight-evidence
-          cargo test --locked --lib gateway_body::carrier::resource_wakeup_tests::first_request_segment_waits_for_retained_credit_despite_free_global_ram -- --exact --nocapture 2>&1 | tee /tmp/request-singleflight-evidence/contract-1.log
-          grep -F '1 passed; 0 failed' /tmp/request-singleflight-evidence/contract-1.log
-          cargo test --locked --lib gateway_body::carrier::resource_wakeup_tests::request_capture_eof_does_not_join_owned_put_when_retained_credit_wakes -- --ignored --exact --nocapture 2>&1 | tee /tmp/request-singleflight-evidence/contract-2.log
-          grep -F '1 passed; 0 failed' /tmp/request-singleflight-evidence/contract-2.log
-          cargo test --locked --lib gateway_body::carrier::resource_wakeup_tests::actual_put_is_not_cancelled_when_ram_wakes_and_lost_ack_keeps_source -- --ignored --exact --nocapture 2>&1 | tee /tmp/request-singleflight-evidence/contract-3.log
-          grep -F '1 passed; 0 failed' /tmp/request-singleflight-evidence/contract-3.log
-          cargo test --locked --lib gateway_body::carrier::resource_wakeup_tests::credited_long_response_preserves_opportunistic_spill_above_source_capacity -- --ignored --exact --nocapture 2>&1 | tee /tmp/request-singleflight-evidence/contract-4.log
-          grep -F '1 passed; 0 failed' /tmp/request-singleflight-evidence/contract-4.log
-          cargo test --locked --lib gateway_body::carrier::resource_wakeup_tests::request_without_archive_preserves_capture_above_retained_window -- --exact --nocapture 2>&1 | tee /tmp/request-singleflight-evidence/contract-5.log
-          grep -F '1 passed; 0 failed' /tmp/request-singleflight-evidence/contract-5.log
-          cargo test --locked --lib gateway_body::carrier::resource_wakeup_tests::sub_quantum_retained_window_preserves_existing_archive_spill -- --exact --nocapture 2>&1 | tee /tmp/request-singleflight-evidence/contract-6.log
-          grep -F '1 passed; 0 failed' /tmp/request-singleflight-evidence/contract-6.log
-      - name: Retain request singleflight evidence
+          mkdir -p /tmp/native-release-evidence
+          cargo test --locked --lib recovery_object_proxy::exact_delete_tests::exact_carrier_delete_fault_keeps_backend_host_query_and_neighbor_boundaries -- --exact --nocapture 2>&1 | tee /tmp/native-release-evidence/delete.log
+          grep -E '^test result: ok\. 1 passed; 0 failed; 0 ignored;' /tmp/native-release-evidence/delete.log
+          cargo test --locked --lib api::proxy::tests::native_release_cleanup::rustfs_native_publisher_release_reclaims_exact_nonzero_temporary -- --ignored --exact --nocapture 2>&1 | tee /tmp/native-release-evidence/native.log
+          grep -E '^test result: ok\. 1 passed; 0 failed; 0 ignored;' /tmp/native-release-evidence/native.log
+      - name: Retain exact nonzero native retirement evidence
         if: always()
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
         with:
-          name: request-singleflight-acd77
-          path: /tmp/request-singleflight-evidence/
+          name: native-release-34e3
+          path: /tmp/native-release-evidence/
           if-no-files-found: warn
           retention-days: 7
 
