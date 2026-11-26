@@ -23,6 +23,28 @@ use wiremock::{
 
 #[tokio::test]
 async fn oauth_rejection_delivery_crosses_gateway_control_and_worker_process_roles() {
+    let contract = three_role_contract();
+    eprintln!(
+        "three-role fixture future bytes={}",
+        std::mem::size_of_val(&contract)
+    );
+    Box::pin(contract).await;
+}
+
+// Keep the three independent role futures off the libtest thread's debug stack.
+// This changes fixture allocation only, not production runtime stack budgets.
+fn spawn_fixture_role(
+    state: AppState,
+    role: RuntimeRole,
+    shutdown: watch::Receiver<bool>,
+    oauth_shutdown: watch::Receiver<bool>,
+) -> tokio::task::JoinHandle<()> {
+    let task = run_for_role_until_shutdown(state, role, shutdown, oauth_shutdown);
+    eprintln!("role fixture future bytes={}", std::mem::size_of_val(&task));
+    tokio::spawn(Box::pin(task))
+}
+
+async fn three_role_contract() {
     let directory = tempfile::tempdir().unwrap();
     let server = MockServer::start().await;
     let mut config = Config::for_test(format!(
@@ -32,15 +54,22 @@ async fn oauth_rejection_delivery_crosses_gateway_control_and_worker_process_rol
     config.pricing_models_dev_url = format!("{}/prices", server.uri());
     config.pricing_litellm_url = format!("{}/prices", server.uri());
     config.pricing_openrouter_url = format!("{}/prices", server.uri());
-    let control = AppState::initialize_for_role(config.clone(), RuntimeRole::Control)
+    let control = Box::pin(AppState::initialize_for_role(
+        config.clone(),
+        RuntimeRole::Control,
+    ))
+    .await
+    .unwrap();
+    let gateway = Box::pin(AppState::initialize_for_role(
+        config.clone(),
+        RuntimeRole::Gateway,
+    ))
+    .await
+    .unwrap();
+    let worker = Box::pin(AppState::initialize_for_role(config, RuntimeRole::Worker))
         .await
         .unwrap();
-    let gateway = AppState::initialize_for_role(config.clone(), RuntimeRole::Gateway)
-        .await
-        .unwrap();
-    let worker = AppState::initialize_for_role(config, RuntimeRole::Worker)
-        .await
-        .unwrap();
+    eprintln!("three-role fixture initialization complete");
     assert!(!Arc::ptr_eq(
         &control.upstream_quota,
         &gateway.upstream_quota
@@ -164,23 +193,24 @@ async fn oauth_rejection_delivery_crosses_gateway_control_and_worker_process_rol
     let (stop, shutdown) = watch::channel(false);
     // Same role lifecycle as serve, with distinct process-local state. No test
     // calls flush and no gateway/control role runs the OAuth refresh worker.
-    let gateway_task = tokio::spawn(run_for_role_until_shutdown(
+    let gateway_task = spawn_fixture_role(
         gateway.clone(),
         RuntimeRole::Gateway,
         shutdown.clone(),
         shutdown.clone(),
-    ));
-    let control_task = tokio::spawn(run_for_role_until_shutdown(
+    );
+    let control_task = spawn_fixture_role(
         control.clone(),
         RuntimeRole::Control,
         shutdown.clone(),
         shutdown.clone(),
-    ));
+    );
     let response=tokio::time::timeout(Duration::from_secs(2),api::router_for_role(gateway,RuntimeRole::Gateway).oneshot(
         Request::post("/v1/chat/completions").header(header::AUTHORIZATION,format!("Bearer {}",key.key)).header(header::CONTENT_TYPE,"application/json")
             .body(Body::from(json!({"model":"fixture-model","max_tokens":64,"messages":[{"role":"user","content":"fixture"}]}).to_string())).unwrap()
     )).await.unwrap().unwrap();
     assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+    eprintln!("gateway bearer rejection delivered");
     let response = tokio::time::timeout(
         Duration::from_secs(2),
         api::router_for_role(control.clone(), RuntimeRole::Control).oneshot(
@@ -201,6 +231,7 @@ async fn oauth_rejection_delivery_crosses_gateway_control_and_worker_process_rol
         serde_json::from_slice(&to_bytes(response.into_body(), 1024 * 1024).await.unwrap())
             .unwrap();
     assert_eq!(body["error_code"], "quota_not_authorized");
+    eprintln!("control bearer rejection delivered");
     tokio::time::timeout(Duration::from_secs(5), async {
         loop {
             let candidates = worker
@@ -216,12 +247,12 @@ async fn oauth_rejection_delivery_crosses_gateway_control_and_worker_process_rol
     })
     .await
     .expect("both producer roles must publish without a manual flush");
-    let worker_task = tokio::spawn(run_for_role_until_shutdown(
+    let worker_task = spawn_fixture_role(
         worker.clone(),
         RuntimeRole::Worker,
         shutdown.clone(),
         shutdown,
-    ));
+    );
     tokio::time::timeout(Duration::from_secs(20), async {
         loop {
             let mut done = true;
