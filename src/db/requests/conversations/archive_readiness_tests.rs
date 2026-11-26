@@ -2384,7 +2384,7 @@ async fn semantic_coverage_committed_recovery_contract(database_url: String) {
         // The proof is deliberately paused before its original owner row
         // fence. A claim, a new source/revision, or a changed row generation
         // must invalidate deletion without losing its recovery obligation.
-        let original: (String, i64) = sqlx::query_as("SELECT COALESCE(semantic_snapshot_json,semantic_payload_snapshot_json),projected_at FROM conversation_projection_outbox WHERE request_id=$1")
+        let original: (String, i64) = sqlx::query_as("SELECT COALESCE(semantic_payload_snapshot_json,semantic_snapshot_json),projected_at FROM conversation_projection_outbox WHERE request_id=$1")
             .bind(fixture.request_id.to_string()).fetch_one(&db.pool).await.unwrap();
         for mutation in ["claim", "source_revision", "row_generation", "leaf"] {
             let gate = std::sync::Arc::new((tokio::sync::Notify::new(),tokio::sync::Notify::new()));
@@ -2399,7 +2399,7 @@ async fn semantic_coverage_committed_recovery_contract(database_url: String) {
                     "source_revision" => {
                         let mut changed: serde_json::Value=serde_json::from_str(&original.0).unwrap();
                         changed["semantic_coverage_pending"]["revision"]=serde_json::json!(authority_before.publication.revision+1);
-                        sqlx::query("UPDATE conversation_projection_outbox SET semantic_snapshot_json=$2 WHERE request_id=$1")
+                        sqlx::query("UPDATE conversation_projection_outbox SET semantic_snapshot_json=$2,semantic_payload_snapshot_json=NULL WHERE request_id=$1")
                             .bind(fixture.request_id.to_string()).bind(changed.to_string()).execute(&db.pool).await.unwrap();
                     }
                     "row_generation" => {
@@ -2416,7 +2416,7 @@ async fn semantic_coverage_committed_recovery_contract(database_url: String) {
             };
             let (deleted, ())=tokio::join!(deleting,change);
             assert_eq!(deleted.unwrap(),0,"changed {mutation} must retain the row");
-            sqlx::query("UPDATE conversation_projection_outbox SET semantic_snapshot_json=$2,projected_at=$3,lease_owner=NULL,lease_expires_at=NULL WHERE request_id=$1")
+            sqlx::query("UPDATE conversation_projection_outbox SET semantic_snapshot_json=$2,semantic_payload_snapshot_json=NULL,projected_at=$3,lease_owner=NULL,lease_expires_at=NULL WHERE request_id=$1")
                 .bind(fixture.request_id.to_string()).bind(&original.0).bind(original.1).execute(&db.pool).await.unwrap();
             sqlx::query("UPDATE conversation_observations SET leaf_node_hash=$2 WHERE request_id=$1")
                 .bind(fixture.request_id.to_string()).bind(&before.2).execute(&db.pool).await.unwrap();
