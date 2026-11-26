@@ -204,6 +204,9 @@ export function useOperatorScope() {
     function revoked(event: StorageEvent) {
       if (event.storageArea !== window.localStorage) return;
       if (event.key !== null && event.key !== operatorLoginCycleStorageKey && event.key !== operatorCredentialStorageKey) return;
+      const current = stateRef.current;
+      if (current.validated && readRememberedCredential('operator') === current.credential
+        && readOperatorLoginCycle() === current.loginCycle) return;
       sequence.current += 1;
       dispatch({ type: 'clear' });
     }
