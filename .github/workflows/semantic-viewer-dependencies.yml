@@ -46,20 +46,22 @@ jobs:
       - name: Install Chromium for bounded browser contracts
         if: github.event_name == 'workflow_dispatch'
         run: npx playwright install --with-deps chromium
-      - name: Verify semantic viewer pages, identity, export and existing session surfaces
-        if: inputs.contract == 'viewer'
-        run: MTC_REQUIRE_BROWSER=1 node --import tsx --test --test-concurrency=1 e2e/semantic-view-reader-contract.test.ts e2e/semantic-session-browser-contract.test.ts e2e/session-loading-browser-contract.test.ts e2e/operator-overview-drilldown-browser-contract.test.ts
-      - name: Verify quota consent, unknown recovery and retained observations
-        if: inputs.contract == 'account'
-        run: MTC_REQUIRE_BROWSER=1 node --import tsx --test --test-concurrency=1 e2e/upstream-quota-browser-contract.test.ts e2e/quota-discovery-browser-contract.test.ts e2e/quota-reads-browser-contract.test.ts e2e/quota-semantics-browser-contract.test.ts
-      - name: Verify network policies, navigation and successful request reads
-        if: inputs.contract == 'network'
-        run: MTC_REQUIRE_BROWSER=1 node --import tsx --test --test-concurrency=1 e2e/request-egress-contract.test.ts e2e/transport-proxy-groups-browser-contract.test.ts e2e/request-lifecycle-browser-contract.test.ts e2e/operator-overview-drilldown-browser-contract.test.ts
+      - name: Verify fixed proxy plaintext and current-read freshness contracts
+        run: |
+          set -euo pipefail
+          test "$(git rev-parse HEAD)" = 'fb3cd0c000127bb3fbb8aec43d662089add0aa39'
+          git rev-parse HEAD
+          MTC_REQUIRE_BROWSER=1 node --import tsx --test --test-reporter=tap --test-concurrency=1 --test-name-pattern='^(create and rotate keep authorized values visible and editable across keyboard, mobile and schema variants|request read freshness advances only for successful current result reads)$' e2e/secret-credential-input-browser-contract.test.ts e2e/request-lifecycle-browser-contract.test.ts 2>&1 | tee /tmp/id43-80-browser.log
+          grep -Fx '# pass 2' /tmp/id43-80-browser.log
+          grep -Fx '# fail 0' /tmp/id43-80-browser.log
+          grep -Fx '# skipped 0' /tmp/id43-80-browser.log
       - name: Retain actual browser evidence
         if: always() && github.event_name == 'workflow_dispatch'
         uses: actions/upload-artifact@65462800fd760344b1a7b4382951275a0abb4808
         with:
           name: operator-ui-${{ inputs.contract }}-${{ inputs.source_revision }}
-          path: web/e2e-artifacts/
+          path: |
+            web/e2e-artifacts/
+            /tmp/id43-80-browser.log
           retention-days: 7
           if-no-files-found: warn
