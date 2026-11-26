@@ -462,7 +462,12 @@ impl BodyCarrier {
                             if let Some(attempt) = source.prepare_offload(None).await? {
                                 pending_spill = Some(CaptureSpill::start(attempt, persistence));
                             } else {
-                                break (source.reserve_workspace(part.len()).await?, None);
+                                // No owned segment can release retained credit. Wait
+                                // for both original credit classes; global RAM alone
+                                // does not authorize another retained request segment.
+                                let (allocation, retained) =
+                                    source.memory.reserve_carrier_ingress(part.len()).await?;
+                                break (allocation, Some(retained));
                             }
                         }
                         let spill = pending_spill.as_mut().expect("one owned spill");
@@ -575,19 +580,15 @@ impl BodyCarrier {
         &self,
         mut prepaid: Option<Arc<crate::api::proxy::persistence::WorkspaceGuard>>,
     ) -> Result<Option<PreparedSpill>, AppError> {
-        let _owner = if prepaid.is_some() {
-            match self.offload.clone().try_lock_owned() {
-                Ok(owner) => owner,
-                Err(_) => {
-                    // Another exact spill owns the target. Return our envelope
-                    // before waiting for it; re-evaluate RAM/segments afterwards.
-                    drop(prepaid.take());
-                    drop(self.offload.clone().lock_owned().await);
-                    return Ok(None);
-                }
+        let _owner = match self.offload.clone().try_lock_owned() {
+            Ok(owner) => owner,
+            Err(_) => {
+                // A busy owner may be performing remote I/O. Release any
+                // unneeded envelope and let the caller race credit with the
+                // owner's readiness, without cancelling that actual write.
+                drop(prepaid.take());
+                return Err(AppError::storage("carrier_spill_in_progress"));
             }
-        } else {
-            self.offload.clone().lock_owned().await
         };
         let Some(archive) = &self.archive else {
             return Ok(None);
@@ -730,6 +731,15 @@ impl BodyCarrier {
         if matches!(
             error,
             AppError::Storage {
+                code: "carrier_spill_in_progress",
+                ..
+            }
+        ) {
+            return self.wait_for_spill_or_credit(target, bytes).await;
+        }
+        if matches!(
+            error,
+            AppError::Storage {
                 code: "carrier_workspace_unavailable",
                 ..
             }
@@ -754,6 +764,10 @@ impl BodyCarrier {
                             Ok(_) => Ok(None),
                             // The remote attempt has ended. Retain source and
                             // receipt while real I/O retry remains throttled.
+                            Err(AppError::Storage {
+                                code: "carrier_spill_in_progress",
+                                ..
+                            }) => self.wait_for_spill_or_credit(target, bytes).await,
                             Err(_) => self.memory_or_retry(bytes, retry).await,
                         }
                     }
@@ -761,6 +775,24 @@ impl BodyCarrier {
             }
         }
         self.memory_or_retry(bytes, retry).await
+    }
+
+    async fn wait_for_spill_or_credit(
+        &self,
+        target: &Self,
+        bytes: usize,
+    ) -> Result<Option<OwnedSemaphorePermit>, AppError> {
+        let memory = self.memory.reserve_carrier_bytes(bytes);
+        let ready = target.offload.clone().lock_owned();
+        tokio::pin!(memory, ready);
+        tokio::select! {
+            biased;
+            lease = &mut memory => lease.map(Some),
+            guard = &mut ready => {
+                drop(guard);
+                Ok(None)
+            }
+        }
     }
 
     async fn memory_or_retry(
