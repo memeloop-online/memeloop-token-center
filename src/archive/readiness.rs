@@ -833,6 +833,7 @@ mod tests {
             readiness_deadline: READINESS_DEADLINE,
             readiness_metrics: Arc::default(),
             write_observations: Arc::default(),
+            write_rules: Default::default(),
         }
     }
 

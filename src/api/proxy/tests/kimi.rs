@@ -105,6 +105,7 @@ async fn kimi_error_envelopes_preserve_original_bytes_and_safe_internal_classifi
                 .await
                 .unwrap();
             let mut request = BufferedRequest {
+                archive_write_scope: None,
                 session_preference: None,
                 state: &fixture.state,
                 reservation,

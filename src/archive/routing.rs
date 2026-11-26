@@ -121,3 +121,96 @@ impl ArchiveStore {
         })
     }
 }
+
+/// Authenticated authority for new raw response placement. Fields are private;
+/// request JSON and persisted staging purpose cannot manufacture this scope.
+#[derive(Clone, Copy)]
+pub(crate) struct TrustedArchiveWriteScope {
+    tenant: uuid::Uuid,
+    key: uuid::Uuid,
+}
+impl From<&crate::model::AuthenticatedKey> for TrustedArchiveWriteScope {
+    fn from(key: &crate::model::AuthenticatedKey) -> Self {
+        Self {
+            tenant: key.tenant_id,
+            key: key.key_id,
+        }
+    }
+}
+#[derive(Clone, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct ArchiveWriteRules {
+    version: u32,
+    rules: Vec<ArchiveWriteRule>,
+}
+#[derive(Clone, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ArchiveWriteRule {
+    tenant: uuid::Uuid,
+    key: uuid::Uuid,
+    purpose: String,
+    backend_identity: String,
+}
+impl Default for ArchiveWriteRules {
+    fn default() -> Self {
+        Self {
+            version: 1,
+            rules: Vec::new(),
+        }
+    }
+}
+impl ArchiveWriteRules {
+    pub(super) fn parse(input: Option<&str>, identity: Option<&str>) -> Result<Self, AppError> {
+        let rules: Self = match input {
+            Some(input) => serde_json::from_str(input)
+                .map_err(|_| AppError::storage("archive_write_rules_invalid"))?,
+            None => Self::default(),
+        };
+        if rules.version != 1 {
+            return Err(AppError::storage("archive_write_rules_version_invalid"));
+        }
+        let mut seen = std::collections::HashSet::new();
+        for rule in &rules.rules {
+            if rule.purpose != "response"
+                || Some(rule.backend_identity.as_str()) != identity
+                || !seen.insert((rule.tenant, rule.key))
+            {
+                return Err(AppError::storage("archive_write_rules_invalid"));
+            }
+        }
+        Ok(rules)
+    }
+}
+impl ArchiveStore {
+    /// Only a newly generated attempt may select a new backend. Existing NULL
+    /// bindings use select_staging_key/resolve under their original lifecycle.
+    pub(crate) fn new_response_staging_key(
+        &self,
+        owner: uuid::Uuid,
+        scope: Option<TrustedArchiveWriteScope>,
+    ) -> Result<crate::archive_staging::ArchiveStagingKey, AppError> {
+        let key = crate::archive_staging::ArchiveStagingKey::new(
+            crate::archive_staging::ArchiveStagingOwner::ProxyRequest(owner),
+            crate::archive_staging::ArchiveStagingPurpose::Response,
+            uuid::Uuid::now_v7(),
+        )?;
+        if let Some(scope) = scope {
+            if let Some(rule) = self
+                .write_rules
+                .rules
+                .iter()
+                .find(|r| r.tenant == scope.tenant && r.key == scope.key)
+            {
+                return self
+                    .select_staging_key(key.with_backend_identity(Some(&rule.backend_identity))?);
+            }
+        }
+        self.select_staging_key(key)
+    }
+}
+
+impl TrustedArchiveWriteScope {
+    pub(crate) fn belongs_to(self, tenant: uuid::Uuid) -> bool {
+        self.tenant == tenant
+    }
+}

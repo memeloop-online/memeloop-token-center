@@ -117,6 +117,7 @@ async fn stream_fixture(
         sse_framing_limits: crate::provider::SseFramingLimits::default(),
         response_headers: HeaderMap::new(),
         buffered_request: BufferedRequest {
+            archive_write_scope: None,
             session_preference: None,
             state: &fixture.state,
             reservation,

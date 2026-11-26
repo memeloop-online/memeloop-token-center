@@ -224,6 +224,8 @@ pub struct Config {
     pub training_cas_writes: bool,
     #[serde(default)]
     pub training_staging_writes: bool,
+    #[serde(default)]
+    pub archive_response_write_rules: Option<String>,
     pub upstream_openai_url: Option<String>,
     pub upstream_openai_key: Option<String>,
     pub upstream_anthropic_url: Option<String>,
@@ -525,6 +527,7 @@ impl Config {
             },
             training_cas_writes: env_bool("MTC_TRAINING_CAS_WRITES", false),
             training_staging_writes: env_bool("MTC_TRAINING_STAGING_WRITES", false),
+            archive_response_write_rules: env::var("MTC_ARCHIVE_RESPONSE_WRITE_RULES").ok(),
             upstream_openai_url: env::var("MTC_UPSTREAM_OPENAI_URL").ok(),
             upstream_openai_key: env::var("MTC_UPSTREAM_OPENAI_KEY").ok(),
             upstream_anthropic_url: env::var("MTC_UPSTREAM_ANTHROPIC_URL").ok(),
@@ -613,6 +616,7 @@ impl Config {
             training_s3: None,
             training_cas_writes: false,
             training_staging_writes: false,
+            archive_response_write_rules: None,
             upstream_openai_url: None,
             upstream_openai_key: None,
             upstream_anthropic_url: None,

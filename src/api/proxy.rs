@@ -1410,6 +1410,7 @@ async fn proxy_with_cancellation_guard(
     );
     drop(body);
     let mut buffered_request = BufferedRequest {
+        archive_write_scope: Some(crate::archive::TrustedArchiveWriteScope::from(&key)),
         session_preference: conversation.as_ref().and_then(|conversation| {
             Some(session_preferences::identity(
                 &key,
@@ -2784,6 +2785,7 @@ async fn prepare_terminal_conversation(
 }
 
 struct BufferedRequest<'a> {
+    archive_write_scope: Option<crate::archive::TrustedArchiveWriteScope>,
     session_preference: Option<[u8; 32]>,
     state: &'a AppState,
     reservation: crate::model::UsageReservation,
@@ -2808,7 +2810,11 @@ impl BufferedRequest<'_> {
             tenant_id: self.tenant_id,
             reservation_id: self.reservation.id,
         };
-        upstream.with_original_archive_capture(self.state, identity)
+        upstream.with_scoped_original_archive_capture(
+            self.state,
+            identity,
+            self.archive_write_scope,
+        )
     }
 }
 

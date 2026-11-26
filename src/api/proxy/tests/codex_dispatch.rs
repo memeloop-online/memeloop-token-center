@@ -347,6 +347,7 @@ async fn admitted_invalid_dispatch_policy_finishes_as_configuration_error_withou
         .await
         .unwrap();
     let request = BufferedRequest {
+        archive_write_scope: None,
         session_preference: None,
         state: &fixture.state,
         reservation,

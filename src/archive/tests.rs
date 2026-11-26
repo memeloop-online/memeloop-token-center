@@ -58,6 +58,7 @@ pub(super) fn memory_store() -> ArchiveStore {
         readiness_deadline: Duration::from_secs(5),
         readiness_metrics: Arc::default(),
         write_observations: Arc::default(),
+        write_rules: Default::default(),
     }
 }
 

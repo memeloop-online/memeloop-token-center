@@ -45,6 +45,7 @@ pub use raw_reader_authority::{CanonicalRawProof, RawReaderAuthority};
 mod raw_capture_tests;
 mod readiness;
 mod routing;
+pub(crate) use routing::TrustedArchiveWriteScope;
 #[cfg(test)]
 mod routing_tests;
 #[cfg(test)]
@@ -92,6 +93,7 @@ pub struct ArchiveStore {
     training: Option<routing::TrainingStore>,
     training_cas_writes: bool,
     training_staging_writes: bool,
+    write_rules: routing::ArchiveWriteRules,
     readiness: Arc<tokio::sync::Mutex<ReadinessCache>>,
     readiness_path: object_store::path::Path,
     readiness_deadline: Duration,
@@ -121,3 +123,6 @@ impl Default for ReadinessCache {
 mod compressed_tests;
 #[cfg(test)]
 mod tests;
+
+#[cfg(test)]
+mod scoped_routing_contract_tests;

@@ -419,19 +419,44 @@ impl UpstreamResponse {
         )
     }
 
+    pub(super) fn with_scoped_original_archive_capture(
+        self,
+        state: &crate::AppState,
+        identity: crate::db::ArchiveSpoolIdentity,
+        scope: Option<crate::archive::TrustedArchiveWriteScope>,
+    ) -> Self {
+        self.with_archive_target_scoped(
+            state,
+            identity,
+            crate::response_archive_spool::CaptureTarget::Response,
+            scope,
+        )
+    }
+
     fn with_archive_target(
         self,
         state: &crate::AppState,
         identity: crate::db::ArchiveSpoolIdentity,
         target: crate::response_archive_spool::CaptureTarget,
     ) -> Self {
+        self.with_archive_target_scoped(state, identity, target, None)
+    }
+
+    fn with_archive_target_scoped(
+        self,
+        state: &crate::AppState,
+        identity: crate::db::ArchiveSpoolIdentity,
+        target: crate::response_archive_spool::CaptureTarget,
+        scope: Option<crate::archive::TrustedArchiveWriteScope>,
+    ) -> Self {
         let parts = self.into_parts();
         // Register before returning headers. The waiting capture must remain
         // owned during shutdown even before it needs an upload envelope.
         let activity = state.persistence.register_archive();
-        let admission = crate::response_archive_spool::ResponseArchiveProducer::admit_target(
-            state, identity, target,
-        );
+        let admission =
+            crate::response_archive_spool::ResponseArchiveProducer::admit_target_with_scope(
+                state, identity, target, scope,
+            );
         Self::from_parts_stream(
             parts.status,
             parts.headers,

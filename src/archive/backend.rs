@@ -45,6 +45,18 @@ impl ArchiveStore {
         archive
     }
 
+    #[cfg(test)]
+    pub(crate) fn set_response_write_rules_for_test(
+        &mut self,
+        input: Option<&str>,
+    ) -> Result<(), AppError> {
+        self.write_rules = super::routing::ArchiveWriteRules::parse(
+            input,
+            self.training.as_ref().map(|store| store.identity.as_str()),
+        )?;
+        Ok(())
+    }
+
     pub async fn from_config(config: &Config) -> Result<Self, AppError> {
         config
             .s3_timeouts
@@ -152,12 +164,17 @@ impl ArchiveStore {
             return Err(AppError::storage("archive_training_backend_missing"));
         }
 
+        let write_rules = super::routing::ArchiveWriteRules::parse(
+            config.archive_response_write_rules.as_deref(),
+            training.as_ref().map(|s| s.identity.as_str()),
+        )?;
         let readiness_path = archive_path(&format!("readiness/{}.bin", uuid::Uuid::now_v7()))?;
         Ok(Self {
             inner,
             training,
             training_cas_writes: config.training_cas_writes,
             training_staging_writes: config.training_staging_writes,
+            write_rules,
             readiness: Arc::new(tokio::sync::Mutex::new(ReadinessCache::default())),
             readiness_path,
             readiness_deadline: Duration::from_millis(config.s3_timeouts.readiness_millis.into()),
