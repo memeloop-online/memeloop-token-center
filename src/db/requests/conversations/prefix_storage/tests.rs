@@ -688,11 +688,13 @@ async fn sqlite_prepared_prefix_reuses_only_verified_tenant_roots() {
 #[tokio::test]
 #[ignore = "requires CI PostgreSQL"]
 async fn postgres_prefix_preload_releases_projection_scope_before_graph_receive() {
-    prefix_preload_contract(false).await;
-    prefix_preload_contract(true).await;
+    prefix_preload_contract(false, false).await;
+    prefix_preload_contract(true, false).await;
+    prefix_preload_contract(false, true).await;
+    prefix_preload_contract(true, true).await;
 }
 
-async fn prefix_preload_contract(change_roots: bool) {
+async fn prefix_preload_contract(change_roots: bool, identity_only: bool) {
     let postgres = std::env::var("MTC_TEST_POSTGRES_URL").unwrap();
     let admin = sqlx::PgPool::connect(&postgres).await.unwrap();
     let schema = format!("prefix_preload_{}", Uuid::now_v7().simple());
@@ -764,6 +766,20 @@ async fn prefix_preload_contract(change_roots: bool) {
     .unwrap();
     sqlx::query("INSERT INTO conversation_projection_outbox(request_id,tenant_id,key_id,principal_id,request_json,hints_json,observed_at,semantic_snapshot_json,lease_owner,lease_expires_at) VALUES($1,$2,$3,$4,'{}',$5,$6,$7,$8,$9)")
         .bind(request.to_string()).bind(actor.tenant_id.to_string()).bind(actor.key_id.to_string()).bind(actor.principal_id.to_string()).bind(serde_json::to_string(&hints).unwrap()).bind(now+1).bind(&snapshot).bind(owner.to_string()).bind(now+60000).execute(&database.pool).await.unwrap();
+    if identity_only {
+        let key_snapshot = json!({"account_id":actor.account_id,"alias":actor.alias,
+            "currency":actor.currency,"credential_generation":actor.credential_generation,
+            "policy":actor.policy})
+        .to_string();
+        sqlx::query(
+            "UPDATE conversation_projection_outbox SET key_snapshot_json=$2 WHERE request_id=$1",
+        )
+        .bind(request.to_string())
+        .bind(key_snapshot)
+        .execute(&database.pool)
+        .await
+        .unwrap();
+    }
     if change_roots {
         sqlx::query("UPDATE conversation_projection_outbox SET attempts=1, lease_owner='terminal-v118', lease_expires_at=9223372036854775807, terminal_lease_owner=$2, terminal_lease_expires_at=$3 WHERE request_id=$1")
             .bind(request.to_string()).bind(owner.to_string()).bind(now+300000)
@@ -779,9 +795,16 @@ async fn prefix_preload_contract(change_roots: bool) {
         .unwrap();
     let worker = database.clone();
     let task = tokio::spawn(async move {
-        worker
-            .project_claimed_conversation_projection_task(owner, request)
-            .await
+        if identity_only {
+            worker
+                .project_claimed_conversation_identity(owner, request)
+                .await
+                .map(|()| true)
+        } else {
+            worker
+                .project_claimed_conversation_projection_task(owner, request)
+                .await
+        }
     });
     tokio::time::timeout(std::time::Duration::from_secs(5), async {
         loop {
@@ -867,11 +890,13 @@ async fn prefix_preload_contract(change_roots: bool) {
         let unchanged: Option<i64> = sqlx::query_scalar("SELECT terminal_lease_expires_at FROM conversation_projection_outbox WHERE request_id=$1")
             .bind(request.to_string()).fetch_one(&database.pool).await.unwrap();
         assert_eq!(held, unchanged, "old owner cannot shorten the new lease");
-    } else {
+    } else if !identity_only {
         assert!(
             !result.unwrap(),
             "a replaced lease cannot publish the prepared graph"
         );
+    } else {
+        result.unwrap(); // Missing fresh owner grants no authority to publish.
     }
     let count: i64 =
         sqlx::query_scalar("SELECT COUNT(*) FROM conversation_observations WHERE request_id=$1")
