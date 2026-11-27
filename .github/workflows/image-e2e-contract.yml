@@ -23,6 +23,11 @@ jobs:
       - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020
         with:
           node-version: 24.18.0
+      - name: Install trusted BLAKE3 fixture oracle
+        run: |
+          sudo apt-get update
+          sudo apt-get install --no-install-recommends -y b3sum
+          b3sum --version
       - name: Generate isolated credentials
         run: |
           service_token=$(openssl rand -hex 32)
@@ -72,15 +77,19 @@ jobs:
           docker logs --tail 40 image-e2e-service
           exit 1
       - name: Verify stream, request, usage, session and both archives
-        run: python3 tests/ops/image-e2e/verify.py
+        run: node tests/ops/image-e2e/verify.ts
       - name: Verify slow object publication preserves complete stream
         env:
           E2E_FAULT_MODE: slow
-        run: python3 tests/ops/image-e2e/verify.py
+        run: node tests/ops/image-e2e/verify.ts
       - name: Verify unavailable object publication preserves complete stream
         env:
           E2E_FAULT_MODE: fail
-        run: python3 tests/ops/image-e2e/verify.py
+        run: node tests/ops/image-e2e/verify.ts
+      - name: Verify durable retirement through exact receipts and formal session contents
+        env:
+          E2E_REQUIRE_RETIRED: both
+        run: node tests/ops/image-e2e/verify.ts
       - name: Safe diagnostics
         if: failure()
         run: docker ps -a --filter name=image-e2e --format '{{.Names}} {{.Status}}'
