@@ -279,7 +279,20 @@ impl ClickHouse {
                 phase = "request_started"
             );
         }
-        let response = self.execute(BoundQuery::new(sql), None).await?;
+        let response = match self.execute(BoundQuery::new(sql), None).await {
+            Err(HistoryError::Rejected { status, code }) if target.diagnostic() => {
+                tracing::warn!(
+                    operation = "history_initialization_probe",
+                    step,
+                    phase = "response_rejected",
+                    status,
+                    exception_code = code,
+                    "initialization probe request rejected"
+                );
+                return Err(HistoryError::Rejected { status, code });
+            }
+            result => result?,
+        };
         if target.diagnostic() {
             tracing::info!(
                 operation = "history_initialization_probe",
@@ -856,5 +869,94 @@ mod initialization_probe_tests {
             assert!(queries.iter().all(|query| !query.contains("DROP ")));
             server.abort();
         }
+    }
+}
+
+#[cfg(all(test, feature = "history-initialization-diagnostic"))]
+mod initialization_rejected_tests {
+    use super::*;
+    use std::sync::Mutex;
+
+    #[tokio::test]
+    async fn request_history_initialization_rejection_retains_step_and_safe_codes() {
+        #[derive(Clone)]
+        struct Output(Arc<Mutex<Vec<u8>>>);
+        impl std::io::Write for Output {
+            fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+                self.0.lock().unwrap().extend_from_slice(bytes);
+                Ok(bytes.len())
+            }
+            fn flush(&mut self) -> std::io::Result<()> {
+                Ok(())
+            }
+        }
+        let output = Output(Default::default());
+        let writer = output.clone();
+        let subscriber = tracing_subscriber::fmt()
+            .json()
+            .without_time()
+            .with_writer(move || writer.clone())
+            .finish();
+        let _guard = tracing::subscriber::set_default(subscriber);
+        let calls = Arc::new(Mutex::new(0));
+        let observed = calls.clone();
+        let service = axum::Router::new().route(
+            "/",
+            axum::routing::post(move || {
+                let observed = observed.clone();
+                async move {
+                    let mut calls = observed.lock().unwrap();
+                    let step = *calls;
+                    *calls += 1;
+                    if step == 2 {
+                        (
+                            axum::http::StatusCode::FORBIDDEN,
+                            [("X-ClickHouse-Exception-Code", "497")],
+                            "synthetic-secret-body-do-not-log",
+                        )
+                    } else {
+                        (
+                            axum::http::StatusCode::OK,
+                            [("X-ClickHouse-Exception-Code", "0")],
+                            "",
+                        )
+                    }
+                }
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let endpoint = format!("http://{}", listener.local_addr().unwrap());
+        let server = tokio::spawn(async move { axum::serve(listener, service).await.unwrap() });
+        let client = ClickHouse::new(
+            crate::http_settings::HttpClient::default(),
+            &endpoint,
+            "synthetic".into(),
+            "admin".into(),
+            "synthetic-secret-password".into(),
+        )
+        .unwrap();
+        assert!(matches!(
+            client.probe_initialization().await,
+            Err(HistoryError::Rejected {
+                status: 403,
+                code: Some(497)
+            })
+        ));
+        assert_eq!(*calls.lock().unwrap(), 3);
+        let bytes = output.0.lock().unwrap();
+        let text = std::str::from_utf8(&bytes).unwrap();
+        let rejection = text
+            .lines()
+            .filter_map(|line| serde_json::from_str::<Value>(line).ok())
+            .find(|value| value["fields"]["phase"] == "response_rejected")
+            .unwrap();
+        assert_eq!(rejection["fields"]["step"], 2);
+        assert_eq!(rejection["fields"]["status"], 403);
+        assert_eq!(rejection["fields"]["exception_code"], 497);
+        assert!(!text.contains("synthetic-secret"));
+        assert!(!text.contains(&endpoint));
+        assert!(!text.contains("ALTER TABLE"));
+        assert!(!text.contains("CREATE TABLE"));
+        server.abort();
     }
 }
