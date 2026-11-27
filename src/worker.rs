@@ -73,7 +73,14 @@ async fn refresh_expiring_oauth(
     generation: i64,
     blocking: &BlockingTasks,
 ) -> Result<(), AppError> {
-    let background = crate::upstream_quota::oauth_recovery::background_state(state);
+    let mut background = crate::upstream_quota::oauth_recovery::background_state(state);
+    #[cfg(feature = "experimental-plugin-revisions")]
+    if let Some(authority) = &background.application_plugins {
+        if let Some(snapshot) = authority.pin_for_oauth(&background.db).await? {
+            background = background.with_pinned_application_plugins(snapshot);
+        }
+        background.application_plugins_pinned = true;
+    }
     let state = &background;
     let recovery_key = state
         .db
@@ -130,6 +137,14 @@ async fn refresh_oauth_batch(
         }
     }
     Ok(())
+}
+
+#[cfg(test)]
+pub(crate) async fn run_oauth_batch_for_test(state: &AppState) {
+    let (_sender, shutdown) = watch::channel(false);
+    refresh_oauth_batch(state, &shutdown, &BlockingTasks::new())
+        .await
+        .unwrap();
 }
 
 pub async fn run(state: AppState) {
@@ -447,7 +462,10 @@ pub(crate) async fn run_until_shutdown_with_reaper_period(
             let mut deleted_total = 0_u64;
             loop {
                 let mut scan = conversation_retention_scan.lock().unwrap().clone();
-                let result = state.db.delete_projected_conversation_outbox_page(2_000, &mut scan).await;
+                let result = state
+                    .db
+                    .delete_projected_conversation_outbox_page(2_000, &mut scan)
+                    .await;
                 *conversation_retention_scan.lock().unwrap() = scan;
                 match result {
                     Ok(deleted) => {
