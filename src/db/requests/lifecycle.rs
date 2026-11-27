@@ -2866,8 +2866,8 @@ async fn record_request_finished_with_basis_and_metering_in_transaction(
         return Ok(false);
     };
     let created_at: i64 = locator.try_get("created_at")?;
-    let tenant_id: String = locator.try_get("tenant_id")?;
-    let key_id: String = locator.try_get("key_id")?;
+    let _tenant_id: String = locator.try_get("tenant_id")?;
+    let _key_id: String = locator.try_get("key_id")?;
     let billed_units = metered_usage
         .as_ref()
         .map(|usage| usage.billed_units)

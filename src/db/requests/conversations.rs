@@ -716,7 +716,6 @@ impl Database {
     ) -> Result<Vec<ConversationProjectionTask>, AppError> {
         let now = unix_millis();
         let expires_at = now.saturating_add(CONVERSATION_PROJECTION_LEASE_MILLIS);
-        let limit = limit;
         let mut transaction = self.begin_write_transaction().await?;
         let lock = match self.backend {
             DatabaseBackend::PostgreSql => " FOR UPDATE SKIP LOCKED",
@@ -1866,7 +1865,7 @@ impl Database {
             let candidate_branch: Option<String> = row.try_get("branch_id")?;
             let candidate_client: Option<String> = row.try_get("client_name")?;
             let candidate_leaf: Option<String> = row.try_get("leaf_node_hash")?;
-            let previous_hashes = prefix_storage::candidate_hashes(&row, &graph)?;
+            let previous_hashes = prefix_storage::candidate_hashes(&row, graph)?;
             let has_previous_semantic_atoms = !previous_hashes.is_empty();
             let is_prefix = candidate_leaf.as_deref().is_some_and(|candidate| {
                 if snapshot.is_some() {
@@ -2003,7 +2002,7 @@ impl Database {
                 candidate_selection = Some(ConversationSelection {
                     observation_id: row.try_get("id")?,
                     relation: RelationKind::Candidate,
-                    confidence: confidence,
+                    confidence,
                     direct_parent: false,
                     same_turn: false,
                     semantic_prefix: false,
