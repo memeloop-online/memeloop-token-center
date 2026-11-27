@@ -7,7 +7,7 @@ const utf8 = (bytes: Uint8Array) => new TextDecoder('utf-8', { fatal: true }).de
 const uuid = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/;
 const digest = /^[0-9a-f]{64}$/;
 export function preciseJson(text: string): Value {
-  return JSON.parse(text, (_key, value, context) => typeof value === 'number' && !Number.isSafeInteger(value) ? context.source : value);
+  return JSON.parse(text, (_key: string, value: any, context?: { source: string }) => typeof value === 'number' && !Number.isSafeInteger(value) ? context!.source : value);
 }
 export function blake3(bytes: Uint8Array): string {
   const result = spawnSync('b3sum', ['--no-names'], { input: bytes, encoding: 'utf8', timeout: 15_000, maxBuffer: 1024 });
@@ -54,7 +54,7 @@ export function fixtureIdentity(requestId: string, keyId: string): Value {
   // UUIDs validated before literal interpolation; read-only and exact identity, no payload columns.
   const sql = `BEGIN READ ONLY; SET LOCAL statement_timeout='3s'; SELECT json_build_object('tenant_id',r.tenant_id,'request_id',r.id,'key_id',r.key_id,'ledger_count',(SELECT count(*) FROM ledger_entries l WHERE l.source=r.reservation_id AND l.kind='usage'),'unsettled',(SELECT count(*) FROM conversation_projection_outbox o WHERE o.request_id=r.id AND o.tenant_id=r.tenant_id AND o.key_id=r.key_id AND (o.projected_at IS NULL OR (o.lease_owner IS NOT NULL AND o.lease_owner <> 'terminal-v118') OR o.terminal_lease_owner IS NOT NULL))) FROM request_records r WHERE r.id='${requestId}' AND r.key_id='${keyId}'; ROLLBACK;`;
   const lines = command('docker', ['exec', 'image-e2e-postgres', 'psql', '-XqAt', '-v', 'ON_ERROR_STOP=1', '-U', 'token_center', '-d', 'token_center_test', '-c', sql], 16_384).trim().split('\n');
-  assert.equal(lines.length, 1); const row = preciseJson(lines[0]); assert.equal(row.ledger_count, 1); assert.equal(row.unsettled, 0); return row;
+  assert.equal(lines.length, 1); const row = preciseJson(lines[0]!); assert.equal(row.ledger_count, 1); assert.equal(row.unsettled, 0); return row;
 }
 function exactMetadataBytes(key: string): Buffer {
   assert.equal(process.env.GITHUB_ACTIONS, 'true', 'metadata adapter is GHA-isolated only');

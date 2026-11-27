@@ -8,7 +8,7 @@ const fixture = await runImageContract({
   captured: (requestId) => writeFileSync('/tmp/session-e2e-request-id', requestId),
   messages: (nonce) => {
     const messages: Record<string, any>[] = [{ role: 'user', content: `synthetic image e2e ${nonce}` }, ...Array.from({ length: 66 }, (_, index) => ({ role: 'user', content: `page-marker-${nonce}-${index + 1}` }))];
-    messages[1].content = `large-body-${nonce}${'😀'.repeat(40000)}`;
+    messages[1]!.content = `large-body-${nonce}${'😀'.repeat(40000)}`;
     messages[33] = { role: 'user', content: [{ type: 'image_url', image_url: { url: 'data:image/png;base64,c3ludGhldGljLW1lZGlh' } }] };
     return messages;
   },

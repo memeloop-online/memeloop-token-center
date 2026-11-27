@@ -57,8 +57,8 @@ export function verifyStream(body: Buffer): void {
   const finish = parsed.flatMap((frame, index) => (frame.choices ?? []).some((choice: Value) => choice.finish_reason === 'stop') ? [index] : []);
   const usage = parsed.flatMap((frame, index) => frame.usage !== undefined && frame.usage !== null ? [index] : []);
   assert.equal(finish.length, 1); assert.equal(usage.length, 1);
-  assert(finish[0] < usage[0]); assert.equal(usage[0], parsed.length - 1);
-  assert.equal(parsed[usage[0]].usage.prompt_tokens, 2); assert.equal(parsed[usage[0]].usage.completion_tokens, 1);
+  assert(finish[0]! < usage[0]!); assert.equal(usage[0], parsed.length - 1);
+  assert.equal(parsed[usage[0]!]!.usage.prompt_tokens, 2); assert.equal(parsed[usage[0]!]!.usage.completion_tokens, 1);
   assert(parsed.slice(0, finish[0]).some((frame) => (frame.choices ?? []).some((choice: Value) => choice.delta?.content)));
 }
 export function verifyArchiveCopies(nonce: string, body: Buffer, archives: Record<'request' | 'response', Buffer>): void {
@@ -152,10 +152,10 @@ export async function runImageContract(options: { messages?: (nonce: string) => 
     const expected = messages.map((message) => { assert.equal(typeof message.content, 'string'); return { role: message.role, text: message.content }; });
     const assistant = decode(body).trim().split('\n\n').filter((frame) => frame.startsWith('data: ') && frame !== 'data: [DONE]').map((frame) => JSON.parse(frame.slice(6))).flatMap((frame) => frame.choices ?? []).map((choice) => choice.delta?.content ?? '').join('');
     expected.push({ role: 'assistant', text: assistant });
-    await verifyPublishedContents(http, key, matched[0], requestId, revision, expected);
+    await verifyPublishedContents(http, key, matched[0]!, requestId, revision, expected);
     fixtureIdentity(requestId, issued.key_id); // Recheck SQL ownership/one charge after the full user-facing read.
     evidence({ phase: 'retired_archive_verified', request_id: requestId, sides: retired, revision, dual_source_receipts: true, formal_content_exact: true, upstream_count: 1, ledger_count: 1 });
   }
   evidence({ request_id: requestId, session_status: sessionStatus, usage: record.usage, archive_complete: true });
-  return { http, nonce, key, requestId, sessionId: matched[0] };
+  return { http, nonce, key, requestId, sessionId: matched[0]! };
 }

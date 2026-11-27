@@ -30,7 +30,7 @@ test('shared archive oracle compares actual request identity and byte-exact resp
   const body = wire(frames), request = Buffer.from('{"input":"nonce-😀"}');
   verifyArchiveCopies('nonce-😀', body, { request, response: body });
   assert.throws(() => verifyArchiveCopies('different-identity', body, { request, response: body }));
-  const corrupted = Buffer.from(body); corrupted[0] ^= 1;
+  const corrupted = Buffer.from(body); corrupted[0] = corrupted[0]! ^ 1;
   assert.throws(() => verifyArchiveCopies('nonce-😀', body, { request, response: corrupted }));
   assert.notEqual(sha256(body), sha256(corrupted));
 });
