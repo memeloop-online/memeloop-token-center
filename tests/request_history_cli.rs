@@ -317,7 +317,7 @@ async fn request_history_cli_transport_probe_uses_bootstrap_admin_identity() {
     );
     let database = Database::connect(&database_url).await.unwrap();
     database.migrate().await.unwrap();
-    database.close().await;
+    drop(database);
     let archive_path = root.path().join("must-not-initialize-archive");
     let archive_check = archive_path.clone();
     let requests = Arc::new(Mutex::new(0));
