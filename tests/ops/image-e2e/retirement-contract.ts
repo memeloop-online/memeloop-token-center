@@ -61,7 +61,9 @@ function exactMetadataBytes(key: string): Buffer {
   assert(/^tenants\/[0-9a-f-]+\/(semantic\/v2\/requests\/[0-9a-f-]+\/(?:[0-9]+(?:-coverage)?|retired-(?:request|response))\.json|cas\/v1\/blake3\/[a-f0-9/]+)$/.test(key), 'unsupported metadata locator');
   const password = process.env.E2E_S3_PASSWORD; assert(password, 'isolated S3 fixture credential required');
   // Bypass only the fault proxy, never the configured store; no LIST/HEAD/body source reads.
-  return Buffer.from(command('curl', ['--silent', '--fail', '--max-time', '10', '--max-filesize', '262144', '--aws-sigv4', 'aws:amz:us-east-1:s3', '--user', `rustfs-test-fixture:${password}`, `http://127.0.0.1:19000/image-e2e/${key}`], 262_144), 'utf8');
+  const result = spawnSync('curl', ['--silent', '--fail', '--max-time', '10', '--max-filesize', '262144', '--aws-sigv4', 'aws:amz:us-east-1:s3', '--user', `rustfs-test-fixture:${password}`, `http://127.0.0.1:19000/image-e2e/${key}`], { timeout: 15_000, maxBuffer: 262_144 });
+  assert.equal(result.status, 0, 'isolated metadata download failed (output withheld)');
+  assert(Buffer.isBuffer(result.stdout)); return result.stdout;
 }
 export function exactFixtureMetadata(key: string): Value { return preciseJson(utf8(exactMetadataBytes(key))); }
 export function boundManifest(publication: Value, scope: Value): Value {
