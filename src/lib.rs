@@ -353,6 +353,7 @@ impl AppState {
                     )
                     .await
                     .map_err(plugin_initialization_error)?
+                    .with_cold_configuration_database(routing_persistence_db.clone())
                     .with_installation_policy_file(
                         config
                             .plugin_install_policy_file

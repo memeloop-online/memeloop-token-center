@@ -1158,6 +1158,19 @@ impl PluginRuntime {
                 "plugin_validate_stored_configurations_1",
             ))?
             .database;
+        self.validate_stored_configurations_with_database(database)
+            .await
+    }
+
+    /// Scoped validation uses the caller's existing handle without rebinding
+    /// the cached runtime's database or configuration authority.
+    pub(crate) async fn validate_stored_configurations_with_database(
+        &self,
+        database: &Database,
+    ) -> Result<(), AppError> {
+        if self.plugins.is_empty() {
+            return Ok(());
+        }
         database
             .visit_plugin_configurations(|stored| {
                 let Some(plugin) = self
