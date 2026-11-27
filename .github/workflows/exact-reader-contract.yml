@@ -71,7 +71,7 @@ jobs:
           python3 - <<'PYCODE'
           import hashlib,json,os,pathlib
           source=pathlib.Path('Dockerfile').read_bytes()
-          old=b'experimental-plugin-revisions,plugin-distribution,h2-attempt-binding'
+          old=b'experimental-plugin-revisions,plugin-distribution'
           if source.count(old)!=2:raise SystemExit('unexpected original release feature recipe')
           derived=source.replace(old,old+b',history-initialization-diagnostic')
           root=pathlib.Path(os.environ['RUNNER_TEMP'])
