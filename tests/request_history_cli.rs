@@ -307,3 +307,89 @@ async fn request_history_cli_export_page_reports_safe_materialization_failure_wi
     .unwrap();
     assert_eq!(retained, 1);
 }
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn request_history_cli_transport_probe_uses_bootstrap_admin_identity() {
+    let root = tempfile::tempdir().unwrap();
+    let database_url = format!(
+        "sqlite://{}?mode=rwc",
+        root.path().join("probe.db").display()
+    );
+    let database = Database::connect(&database_url).await.unwrap();
+    database.migrate().await.unwrap();
+    database.close().await;
+    let archive_path = root.path().join("must-not-initialize-archive");
+    let archive_check = archive_path.clone();
+    let requests = Arc::new(Mutex::new(0));
+    let observed = requests.clone();
+    let router = Router::new().route(
+        "/",
+        post(move |headers: axum::http::HeaderMap, body: Bytes| {
+            let observed = observed.clone();
+            async move {
+                assert_eq!(
+                    headers.get("authorization").unwrap(),
+                    "Basic YWRtaW46YWRtaW4tcGFzc3dvcmQ="
+                );
+                assert_eq!(headers.get("x-clickhouse-database").unwrap(), "synthetic");
+                assert_eq!(body.as_ref(), b"SELECT 1 AS ok FORMAT JSONEachRow");
+                *observed.lock().unwrap() += 1;
+                "{\"ok\":1}\n"
+            }
+        }),
+    );
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let endpoint = format!("http://{}", listener.local_addr().unwrap());
+    let server = tokio::spawn(async move {
+        axum::serve(listener, router).await.unwrap();
+    });
+    let output = tokio::task::spawn_blocking(move || {
+        Command::new(env!("CARGO_BIN_EXE_memeloop-token-center"))
+            .args(["request-history", "probe-transport"])
+            .env("MTC_KEY_PEPPER", "test-pepper-must-have-at-least-32-bytes")
+            .env("MTC_SERVICE_TOKEN", "s".repeat(32))
+            .env("MTC_DATABASE_URL", database_url)
+            .env("MTC_ARCHIVE_BACKEND", "filesystem")
+            .env("MTC_ARCHIVE_PATH", archive_path)
+            .env("MTC_REQUEST_HISTORY_URL", endpoint)
+            .env("MTC_REQUEST_HISTORY_DATABASE", "synthetic")
+            .env("MTC_REQUEST_HISTORY_ADMIN_USER", "admin")
+            .env("MTC_REQUEST_HISTORY_ADMIN_PASSWORD", "admin-password")
+            .env("MTC_REQUEST_HISTORY_WRITER_USER", "different-writer")
+            .env(
+                "MTC_REQUEST_HISTORY_WRITER_PASSWORD",
+                "different-writer-password",
+            )
+            .env("MTC_REQUEST_HISTORY_USER", "different-fallback")
+            .env(
+                "MTC_REQUEST_HISTORY_PASSWORD",
+                "different-fallback-password",
+            )
+            .output()
+            .unwrap()
+    })
+    .await
+    .unwrap();
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert_eq!(*requests.lock().unwrap(), 1);
+    assert!(!archive_check.exists());
+    let result = String::from_utf8_lossy(&output.stdout)
+        .lines()
+        .filter_map(|line| serde_json::from_str::<serde_json::Value>(line).ok())
+        .find(|value| value.get("transport_ready").is_some())
+        .unwrap();
+    assert_eq!(
+        result,
+        serde_json::json!({"transport_ready":true,"read_only":true})
+    );
+    for bytes in [&output.stdout, &output.stderr] {
+        let text = String::from_utf8_lossy(bytes);
+        assert!(!text.contains("admin-password"));
+        assert!(!text.contains("different-writer-password"));
+    }
+    server.abort();
+}

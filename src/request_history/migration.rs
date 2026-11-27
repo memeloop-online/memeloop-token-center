@@ -15,7 +15,7 @@ use crate::{
 #[derive(Debug, Subcommand)]
 pub enum HistoryCommand {
     Start,
-    /// Read-only fixed SELECT through the configured history WRITER transport.
+    /// Read-only fixed SELECT through the configured history bootstrap ADMIN transport.
     ProbeTransport,
     /// Verify a consistent source baseline; this does not authorize cutover.
     BaselineSource {
@@ -242,6 +242,7 @@ pub async fn command(config: &Config, command: HistoryCommand) -> Result<Value, 
     database.start_http_settings_refresh();
     let role = match command {
         HistoryCommand::Start
+        | HistoryCommand::ProbeTransport
         | HistoryCommand::Bootstrap
         | HistoryCommand::Activate
         | HistoryCommand::PrepareActivation
