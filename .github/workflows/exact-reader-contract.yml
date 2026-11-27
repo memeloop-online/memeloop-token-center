@@ -46,44 +46,82 @@ jobs:
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
         with:
-          ref: 67181e2730529677ea0f17a495d30db6a87637f9
+          ref: 6257c8830831c9f82c463c685edc33087299db35
           persist-credentials: false
+      - name: Verify immutable source
+        env:
+          EXPECTED_SOURCE: ${{ inputs.source_revision }}
+        run: |
+          set -euo pipefail
+          test "$EXPECTED_SOURCE" = 6257c8830831c9f82c463c685edc33087299db35
+          test "$(git rev-parse HEAD)" = "$EXPECTED_SOURCE"
+          git rev-parse HEAD
       - uses: dtolnay/rust-toolchain@4360b52568e2003a75bf9bc1d59f33a8e3fc893c
         with:
           toolchain: 1.95.0
           targets: wasm32-unknown-unknown
-      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020
-        with:
-          node-version: 24.18.0
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6
         with:
           shared-key: memory-release
       - uses: ./.github/actions/checkout-plugin-examples
-      - name: Verify three exact history transport contracts
+      - name: Start isolated RustFS fixture
+        env:
+          RUSTFS_ACCESS_KEY: rustfs-test-fixture
+          RUSTFS_SECRET_KEY: synthetic-test-only-secret-707
         run: |
           set -euo pipefail
-          test "${{ inputs.source_revision }}" = 67181e2730529677ea0f17a495d30db6a87637f9
-          test "$(git rev-parse HEAD)" = 67181e2730529677ea0f17a495d30db6a87637f9
-          git rev-parse HEAD
-          mkdir -p "$RUNNER_TEMP/history-transport"
-          failures=0
-          while IFS='|' read -r target selector; do
-            log="$RUNNER_TEMP/history-transport/${selector//::/_}.log"
-            args=(--lib)
-            if [ "$target" = cli ]; then args=(--test request_history_cli); fi
-            if ! cargo test --locked "${args[@]}" "$selector" -- --exact --nocapture 2>&1 | tee "$log"; then failures=1; fi
-            if ! grep -E '^test result: ok\. 1 passed; 0 failed; 0 ignored;' "$log"; then failures=1; fi
-          done <<'SELECTORS'
-          lib|request_history::clickhouse::transport_probe_tests::request_history_transport_diagnostic_excludes_dynamic_error_content
-          lib|request_history::clickhouse::transport_probe_tests::request_history_transport_probe_is_fixed_read_only_and_rejects_wrong_rows
-          cli|request_history_cli_transport_probe_uses_bootstrap_admin_identity
-          SELECTORS
-          exit "$failures"
+          mkdir -p /tmp/request-source6257-evidence
+          trap 'docker logs rustfs-contract > /tmp/request-source6257-evidence/rustfs.log 2>&1 || true' EXIT
+          docker run --detach --name rustfs-contract --publish 127.0.0.1:19000:9000 \
+            --memory 1g --cpus 2 --env RUSTFS_ACCESS_KEY --env RUSTFS_SECRET_KEY \
+            --env RUSTFS_ADDRESS=:9000 --env RUSTFS_CONSOLE_ENABLE=false \
+            --env RUSTFS_OBS_LOG_DIRECTORY= --env RUSTFS_OBS_LOGGER_LEVEL=warn \
+            --entrypoint /usr/bin/rustfs \
+            rustfs/rustfs:1.0.4@sha256:ed9210d6411d77ffceb70d94b964a3cb7d225983368bc25bebe01e995293dcc2 /data
+          set -euo pipefail
+          bucket="parse-object-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}"
+          echo "MTC_RUSTFS_TEST_BUCKET=$bucket" >> "$GITHUB_ENV"
+          ready=false
+          for attempt in $(seq 1 60); do
+            code=$(curl -q --noproxy '*' --silent --show-error --connect-timeout 2 --max-time 3 \
+              --aws-sigv4 'aws:amz:us-east-1:s3' --user "$RUSTFS_ACCESS_KEY:$RUSTFS_SECRET_KEY" \
+              --output /tmp/request-source6257-evidence/ready.xml --write-out '%{http_code}' http://127.0.0.1:19000/ || true)
+            printf 'signed readiness attempt=%s HTTP%s\n' "$attempt" "$code" | tee -a /tmp/request-source6257-evidence/setup.log
+            if test "$code" = 200; then ready=true; break; fi
+            sleep 2
+          done
+          test "$ready" = true
+          status=$(curl -q --noproxy '*' --silent --show-error --output /tmp/request-source6257-evidence/bucket-create.xml --write-out '%{http_code}' \
+            --aws-sigv4 'aws:amz:us-east-1:s3' --user "$RUSTFS_ACCESS_KEY:$RUSTFS_SECRET_KEY" \
+            --request PUT "http://127.0.0.1:19000/$bucket")
+          printf 'new bucket create HTTP%s\n' "$status" | tee -a /tmp/request-source6257-evidence/setup.log
+          python3 - <<'XMLCODE'
+          import pathlib,xml.etree.ElementTree as ET
+          p=pathlib.Path('/tmp/request-source6257-evidence/bucket-create.xml')
+          if p.stat().st_size:
+              root=ET.fromstring(p.read_bytes())
+              for node in root.iter():
+                  if node.tag.rsplit('}',1)[-1]=='Code':print('bucket_create_error_code='+str(node.text))
+          XMLCODE
+          test "$status" = 200
+          printf 'Created new run-owned bucket HTTP%s\n' "$status"
+      - name: Verify one real object-range short-source parse contract
+        env:
+          MTC_RUSTFS_TEST_ENDPOINT: http://127.0.0.1:19000
+          MTC_RUSTFS_TEST_ACCESS_KEY: rustfs-test-fixture
+          MTC_RUSTFS_TEST_SECRET_KEY: synthetic-test-only-secret-707
+        run: |
+          set -euo pipefail
+          cargo test --locked --lib api::proxy::request_source::tests::first_parse_object_range_wait_and_short_source_fail_before_dispatch -- --ignored --exact --nocapture 2>&1 | tee /tmp/request-source6257-evidence/exact.log
+          grep -E '^test result: ok\. 1 passed; 0 failed; 0 ignored;' /tmp/request-source6257-evidence/exact.log
+      - name: Collect local fixture logs
+        if: always()
+        run: docker logs rustfs-contract > /tmp/request-source6257-evidence/rustfs.log 2>&1 || true
       - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
         if: always()
         with:
-          name: history-transport-67181-three-exact
-          path: ${{ runner.temp }}/history-transport/
+          name: request-source6257-object-range-exact
+          path: /tmp/request-source6257-evidence/
           if-no-files-found: warn
           retention-days: 7
 
