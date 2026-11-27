@@ -692,7 +692,8 @@ impl Database {
     /// 用 `request_id` 子查询 + `LIMIT` 分批，避免一次性大事务放大 WAL 与 IO。
     pub async fn delete_projected_conversation_outbox(&self, limit: i64) -> Result<u64, AppError> {
         let cutoff = unix_millis().saturating_sub(CONVERSATION_PROJECTION_RETENTION_MS);
-        self.delete_durably_retired_conversation_outbox(limit, cutoff).await
+        self.delete_durably_retired_conversation_outbox(limit, cutoff)
+            .await
     }
 
     /// Claims a bounded batch of terminal conversation observations for one
