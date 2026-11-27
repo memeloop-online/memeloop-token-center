@@ -422,7 +422,10 @@ pub(crate) async fn run_until_shutdown_with_reaper_period(
             let mut deleted_total = 0_u64;
             loop {
                 let mut scan = conversation_retention_scan.lock().unwrap().clone();
-                let result = state.db.delete_projected_conversation_outbox_page(2_000, &mut scan).await;
+                let result = state
+                    .db
+                    .delete_projected_conversation_outbox_page(2_000, &mut scan)
+                    .await;
                 *conversation_retention_scan.lock().unwrap() = scan;
                 match result {
                     Ok(deleted) => {
