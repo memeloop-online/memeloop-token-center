@@ -43,11 +43,11 @@ jobs:
       oci_artifact: ${{ steps.oci.outputs.artifact-id }}
       oci_digest: ${{ steps.oci.outputs.artifact-digest }}
     env:
-      CANDIDATE_SHA: e9f1058dcad784e9a5160819575ccbb1b96e6d3b
+      CANDIDATE_SHA: 58f8288be9d57591611d28200978935bbee1e3c1
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
         with:
-          ref: e9f1058dcad784e9a5160819575ccbb1b96e6d3b
+          ref: 58f8288be9d57591611d28200978935bbee1e3c1
           persist-credentials: false
       - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020
         with:
@@ -98,7 +98,7 @@ jobs:
           printf '%s\n' "$CANDIDATE_SHA" > source.txt
       - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
         with:
-          name: stage-smoke-pending-e9f-sealed-input
+          name: stage-smoke-pending-joint58f-sealed-input
           path: ${{ runner.temp }}/sealed-package/
           if-no-files-found: error
           retention-days: 3
@@ -109,7 +109,7 @@ jobs:
           file: Dockerfile.release
           platforms: linux/amd64
           push: false
-          outputs: type=oci,dest=${{ runner.temp }}/stage-test-oci/service-e9f.oci.tar
+          outputs: type=oci,dest=${{ runner.temp }}/stage-test-oci/service-joint58f.oci.tar
           build-contexts: |
             release-input=${{ runner.temp }}/sealed-input
           labels: |
@@ -125,7 +125,7 @@ jobs:
           python3 - <<'PY'
           import hashlib,json,os,pathlib,tarfile
           root=pathlib.Path(os.environ['RUNNER_TEMP'])/'stage-test-oci'
-          archive=root/'service-e9f.oci.tar'
+          archive=root/'service-joint58f.oci.tar'
           with tarfile.open(archive) as tar:
               members={m.name.removeprefix('./'):m for m in tar.getmembers() if m.isfile()}
               def read(name):
@@ -160,19 +160,19 @@ jobs:
           h=hashlib.sha256()
           with archive.open('rb') as f:
               for chunk in iter(lambda:f.read(1024*1024),b''):h.update(chunk)
-          (root/'SHA256SUMS').write_text(h.hexdigest()+'  service-e9f.oci.tar\n')
+          (root/'SHA256SUMS').write_text(h.hexdigest()+'  service-joint58f.oci.tar\n')
           print(json.dumps(evidence))
           PY
           printf '%s\n' smoke_pending > "$RUNNER_TEMP/stage-test-oci/status.txt"
       - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
         id: oci
         with:
-          name: stage-smoke-pending-e9f-verified-oci
+          name: stage-smoke-pending-joint58f-verified-oci
           path: ${{ runner.temp }}/stage-test-oci/
           if-no-files-found: error
           retention-days: 3
 
-  e9f-native-smoke:
+  joint58f-native-smoke:
     needs: metadata-refresh-contract
     if: inputs.contract == 'metadata-refresh'
     runs-on: ubuntu-latest
@@ -181,8 +181,9 @@ jobs:
       contents: read
       actions: read
     env:
-      CANDIDATE_SHA: e9f1058dcad784e9a5160819575ccbb1b96e6d3b
+      CANDIDATE_SHA: 58f8288be9d57591611d28200978935bbee1e3c1
       ARTIFACT_ID: ${{ needs.metadata-refresh-contract.outputs.oci_artifact }}
+      SOURCE_RUN_ID: ${{ github.run_id }}
       ARTIFACT_DIGEST: ${{ needs.metadata-refresh-contract.outputs.oci_digest }}
       GH_TOKEN: ${{ github.token }}
     steps:
@@ -196,7 +197,7 @@ jobs:
           value=os.environ['ARTIFACT_DIGEST']
           if not re.fullmatch(r'[0-9a-f]{64}',value):raise SystemExit('unexpected upload artifact digest format')
           x=json.loads((pathlib.Path(os.environ['RUNNER_TEMP'])/'native-smoke/artifact.json').read_text())
-          if str(x['id'])!=os.environ['ARTIFACT_ID'] or str(x['workflow_run']['id'])!=os.environ['GITHUB_RUN_ID'] or x['expired'] or x['digest']!='sha256:'+os.environ['ARTIFACT_DIGEST']:raise SystemExit('artifact identity mismatch')
+          if str(x['id'])!=os.environ['ARTIFACT_ID'] or str(x['workflow_run']['id'])!=os.environ['SOURCE_RUN_ID'] or x['expired'] or x['digest']!='sha256:'+os.environ['ARTIFACT_DIGEST']:raise SystemExit('artifact identity mismatch')
           PYCODE
           gh api "repos/$GITHUB_REPOSITORY/actions/artifacts/$ARTIFACT_ID/zip" > "$RUNNER_TEMP/native-smoke/artifact.zip"
           python3 - <<'PYCODE'
@@ -218,25 +219,36 @@ jobs:
         run: |
           set -euo pipefail
           sudo systemctl start containerd
-          sudo ctr namespaces create e9f-smoke
-          sudo ctr -n e9f-smoke images import --no-unpack --all-platforms "$RUNNER_TEMP/native-smoke/oci/service-e9f.oci.tar"
+          sudo ctr namespaces create joint58f-smoke
           python3 - <<'PYCODE'
           import gzip,hashlib,io,json,os,pathlib,subprocess,tarfile
-          root=pathlib.Path(os.environ['RUNNER_TEMP'])/'native-smoke'; archive=root/'oci/service-e9f.oci.tar'
+          root=pathlib.Path(os.environ['RUNNER_TEMP'])/'native-smoke'; archive=root/'oci/service-joint58f.oci.tar'
           evidence=json.loads((root/'oci/oci-identity.json').read_text())
-          if evidence['source']!=os.environ['CANDIDATE_SHA'] or evidence['run']!=os.environ['GITHUB_RUN_ID'] or evidence['platform']!='linux/amd64':raise SystemExit('OCI source/run/platform mismatch')
-          def ctr(*args):return subprocess.check_output(['sudo','ctr','-n','e9f-smoke',*args])
+          if evidence['source']!=os.environ['CANDIDATE_SHA'] or evidence['run']!=os.environ['SOURCE_RUN_ID'] or evidence['platform']!='linux/amd64':raise SystemExit('OCI source/run/platform mismatch')
+          def ctr(*args):
+              cmd=['sudo','ctr','-n','joint58f-smoke',*args]
+              if args!=('tasks','start','joint58f-plugin-runtime'):
+                  return subprocess.check_output(cmd)
+              result=subprocess.run(cmd,stdout=subprocess.PIPE,stderr=subprocess.PIPE)
+              if result.returncode:
+                  def safe(raw):
+                      value=raw[:16384].decode('utf-8',errors='replace')
+                      return ''.join(c for c in value if c in '\n\t' or ord(c)>=32 and ord(c)!=127)
+                  message='command='+json.dumps(cmd)+'\nexit_code='+str(result.returncode)+'\nstdout (first 16KiB):\n'+safe(result.stdout)+'\nstderr (first 16KiB):\n'+safe(result.stderr)
+                  (root/'native-command-failure.txt').write_text(message)
+                  print(message,flush=True)
+                  raise subprocess.CalledProcessError(result.returncode,cmd)
+              return result.stdout
           with tarfile.open(archive) as tar:
               members={m.name.removeprefix('./'):m for m in tar.getmembers() if m.isfile()}
               def read(name):return tar.extractfile(members[name]).read()
               index=read('index.json')
               if 'sha256:'+hashlib.sha256(index).hexdigest()!=evidence['index_digest']:raise SystemExit('index mismatch')
-              verified=set()
+              verified=set(); descriptors={}; runtimes=[]
               def visit(d):
                   h=d['digest'].split(':',1)[1]; raw=read('blobs/sha256/'+h)
                   if len(raw)!=d['size'] or hashlib.sha256(raw).hexdigest()!=h:raise SystemExit('archive descriptor mismatch')
-                  actual=ctr('content','get',d['digest'])
-                  if actual!=raw:raise SystemExit('containerd descriptor bytes mismatch')
+                  descriptors[d['digest']]=d
                   if d['digest'] in verified:return
                   verified.add(d['digest'])
                   if 'manifest' in d['mediaType'] or 'index' in d['mediaType']:
@@ -245,10 +257,13 @@ jobs:
                       if 'config' in obj:
                           visit(obj['config'])
                           for child in obj['layers']:visit(child)
+                          cfg=json.loads(read('blobs/sha256/'+obj['config']['digest'].split(':')[1]))
+                          if cfg.get('os')=='linux' and cfg.get('architecture')=='amd64':runtimes.append(d['digest'])
               for d in json.loads(index)['manifests']:visit(d)
-              manifest=json.loads(ctr('content','get',evidence['manifest_digest']))
+              if runtimes!=[evidence['manifest_digest']]:raise SystemExit('original graph runtime is not the unique approved child')
+              manifest=json.loads(read('blobs/sha256/'+evidence['manifest_digest'].split(':')[1]))
               if manifest['config']['digest']!=evidence['config_digest']:raise SystemExit('manifest/config binding mismatch')
-              config=json.loads(ctr('content','get',evidence['config_digest']))
+              config=json.loads(read('blobs/sha256/'+evidence['config_digest'].split(':')[1]))
               if config.get('os')!='linux' or config.get('architecture')!='amd64' or config['config']['Labels']['org.opencontainers.image.revision']!=os.environ['CANDIDATE_SHA']:raise SystemExit('runtime config mismatch')
               diffs=config['rootfs']['diff_ids']
               if len(diffs)!=len(manifest['layers']):raise SystemExit('rootfs count mismatch')
@@ -260,14 +275,15 @@ jobs:
                   h=hashlib.sha256()
                   for b in iter(lambda:raw.read(1024*1024),b''):h.update(b)
                   if 'sha256:'+h.hexdigest()!=expected:raise SystemExit('rootfs diff_id mismatch')
+          if len(verified)!=evidence['descriptors']:raise SystemExit('same-run original OCI descriptor count mismatch')
           # Preserve the original archive. Derive only a one-child index for a local import name.
-          image='localhost/stage-e9f-runtime:smoke'
+          image='localhost/stage-joint58f-runtime:smoke'
           derived=root/'native-runtime.oci.tar'
           with tarfile.open(archive) as original, tarfile.open(derived,'w') as output:
               descriptor=None
               for member in original.getmembers():
                   if member.isfile() and member.name.removeprefix('./')=='blobs/sha256/'+evidence['manifest_digest'].split(':')[1]:
-                      descriptor={'mediaType':'application/vnd.oci.image.manifest.v1+json','digest':evidence['manifest_digest'],'size':member.size,'platform':{'os':'linux','architecture':'amd64'},'annotations':{'org.opencontainers.image.ref.name':image}}
+                      descriptor=dict(descriptors[evidence['manifest_digest']]);descriptor['annotations']={**descriptor.get('annotations',{}),'org.opencontainers.image.ref.name':image}
               if descriptor is None:raise SystemExit('runtime child absent')
               index_bytes=json.dumps({'schemaVersion':2,'mediaType':'application/vnd.oci.image.index.v1+json','manifests':[descriptor]},separators=(',',':')).encode()
               for member in original.getmembers():
@@ -280,14 +296,18 @@ jobs:
           header=rows[0].split(); digest_column=header.index('DIGEST')
           matches=[r.split() for r in rows[1:] if r.split()[0]==image]
           if len(matches)!=1 or matches[0][digest_column]!=evidence['manifest_digest']:raise SystemExit('native image target differs from original child manifest')
+          for digest in [evidence['manifest_digest'],evidence['config_digest'],*[layer['digest'] for layer in manifest['layers']]]:
+              raw=ctr('content','get',digest); d=descriptors[digest]
+              if len(raw)!=d['size'] or 'sha256:'+hashlib.sha256(raw).hexdigest()!=digest:raise SystemExit('native runtime descriptor hash/size mismatch')
           # ctr unpack is performed by run/create, then verify its committed rootfs parent.
           chain=diffs[0]
           for d in diffs[1:]:chain='sha256:'+hashlib.sha256((chain+' '+d).encode()).hexdigest()
           drop_caps=['CAP_CHOWN','CAP_DAC_OVERRIDE','CAP_FSETID','CAP_FOWNER','CAP_MKNOD','CAP_NET_RAW','CAP_SETGID','CAP_SETUID','CAP_SETFCAP','CAP_SETPCAP','CAP_NET_BIND_SERVICE','CAP_SYS_CHROOT','CAP_KILL','CAP_AUDIT_WRITE']
           cap_args=[arg for cap in drop_caps for arg in ['--cap-drop',cap]]
           for suffix,args in [('help',['--help']),('plugin-runtime',['verify-plugin-runtime'])]:
-              cid='e9f-'+suffix
-              ctr('containers','create','--snapshotter','overlayfs','--read-only','--user','10001:10001',*cap_args,image,cid,'/usr/local/bin/memeloop-token-center',*args)
+              cid='joint58f-'+suffix
+              temp_args=['--mount','type=tmpfs,src=tmpfs,dst=/tmp,options=rw:nosuid:nodev:noexec:mode=1777:size=16m'] if suffix=='plugin-runtime' else []
+              ctr('containers','create','--snapshotter','overlayfs','--read-only','--user','10001:10001',*temp_args,*cap_args,image,cid,'/usr/local/bin/memeloop-token-center',*args)
               info=json.loads(ctr('containers','info',cid))
               if info['Image']!=image:raise SystemExit('container image binding mismatch')
               snap=json.loads(ctr('snapshots','--snapshotter','overlayfs','info',info['SnapshotKey']))
@@ -295,18 +315,21 @@ jobs:
               spec=info['Spec']
               if not spec['process'].get('noNewPrivileges') or any(spec['process'].get('capabilities',{}).values()):raise SystemExit('container capability/privilege isolation mismatch')
               if not spec['root']['readonly'] or spec['process']['user']['uid']!=10001 or not any(n['type']=='network' and not n.get('path') for n in spec['linux']['namespaces']):raise SystemExit('container isolation mismatch')
+              temporary=[m for m in spec['mounts'] if m['destination']=='/tmp']
+              if suffix=='plugin-runtime' and (len(temporary)!=1 or temporary[0]['type']!='tmpfs' or temporary[0]['source']!='tmpfs' or not {'rw','nosuid','nodev','noexec','mode=1777','size=16m'}.issubset(set(temporary[0]['options']))):raise SystemExit('private bounded temporary mount mismatch')
+              if suffix=='help' and temporary:raise SystemExit('help runtime changed temporary mounts')
               (root/(suffix+'-container.json')).write_text(json.dumps(info,indent=2))
               output=ctr('tasks','start',cid)
               (root/(suffix+'.txt')).write_bytes(output)
               ctr('containers','delete',cid)
-          evidence.update({'status':'smoke_pass','artifact_id':os.environ['ARTIFACT_ID'],'artifact_digest':'sha256:'+os.environ['ARTIFACT_DIGEST'],'rootfs_chain':chain,'runtime_image':image,'verified_descriptors':len(verified)})
+          evidence.update({'status':'smoke_pass','smoke_run':os.environ['GITHUB_RUN_ID'],'artifact_id':os.environ['ARTIFACT_ID'],'artifact_digest':'sha256:'+os.environ['ARTIFACT_DIGEST'],'rootfs_chain':chain,'runtime_image':image,'verified_descriptors':len(verified)})
           (root/'smoke-receipt.json').write_text(json.dumps(evidence,indent=2)+'\n')
           print(json.dumps(evidence))
           PYCODE
       - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
         if: always()
         with:
-          name: stage-e9f-native-smoke-evidence
+          name: stage-joint58f-native-smoke-evidence
           path: |
             ${{ runner.temp }}/native-smoke/*.json
             ${{ runner.temp }}/native-smoke/*.txt
