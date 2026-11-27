@@ -86,6 +86,10 @@ jobs:
         env:
           E2E_FAULT_MODE: fail
         run: node tests/ops/image-e2e/verify.ts
+      - name: Verify durable retirement through exact receipts and formal session contents
+        env:
+          E2E_REQUIRE_RETIRED: both
+        run: node tests/ops/image-e2e/verify.ts
       - name: Safe diagnostics
         if: failure()
         run: docker ps -a --filter name=image-e2e --format '{{.Names}} {{.Status}}'

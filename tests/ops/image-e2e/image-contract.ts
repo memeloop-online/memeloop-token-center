@@ -64,9 +64,13 @@ export function verifyStream(body: Buffer): void {
 export function verifyArchiveCopies(nonce: string, body: Buffer, archives: Record<'request' | 'response', Buffer>): void {
   assert(archives.request.includes(Buffer.from(nonce))); assert.deepEqual(archives.response, body);
 }
+export function bothSidesRetired(record: Value): boolean {
+  return ['request', 'response'].every((side) => record.archive?.[side]?.complete === true && record.archive[side].reason === 'raw_retired_semantic_archive');
+}
 export const keyPolicy = { requests_per_minute: 60, tokens_per_minute: 100000, max_concurrency: 1, enforcement_mode: 'metered_unlimited', daily_budget: null, weekly_budget: null, lifetime_budget: null };
 
 export async function runImageContract(options: { messages?: (nonce: string) => Value[]; linkedSession?: boolean; captured?: (requestId: string) => void } = {}) {
+  const requireRetired = process.env.E2E_REQUIRE_RETIRED; assert(requireRetired === undefined || requireRetired === 'both');
   const service = process.env.E2E_SERVICE_TOKEN; assert(service, 'E2E_SERVICE_TOKEN required');
   const http = client('http://127.0.0.1:18080', service);
   const nonce = randomUUID().replaceAll('-', ''), tenant = `image-e2e-${nonce}`, model = `${tenant}-model`, session = `${tenant}-session`;
@@ -97,7 +101,7 @@ export async function runImageContract(options: { messages?: (nonce: string) => 
   for (let attempt = 0; attempt < 90; attempt++) {
     try {
       const candidate = object((await http.request(`/self/v1/requests/${requestId}`, 'GET', undefined, key)).raw);
-      if (candidate.archive_complete && candidate.completed_at && candidate.usage?.tokens) { record = candidate; break; }
+      if (candidate.archive_complete && candidate.completed_at && candidate.usage?.tokens && (!requireRetired || bothSidesRetired(candidate))) { record = candidate; break; }
     } catch (error) { if (!(error instanceof HttpFailure)) throw error; }
     await delay(2000);
   }
@@ -116,6 +120,7 @@ export async function runImageContract(options: { messages?: (nonce: string) => 
     assert.equal(result.status, 200); assert(result.raw.length); archives[side] = result.raw;
     evidence({ request_id: requestId, side, status: result.status, bytes: result.raw.length, sha256: sha256(result.raw) });
   }
+  if (requireRetired) assert.deepEqual(retired, ['request', 'response'], 'dedicated retired contract did not exercise both exact 409 responses');
   if (archives.request) assert.deepEqual(archives.request, Buffer.from(requestWire));
   if (archives.response) assert.deepEqual(archives.response, body);
   let matched: string[] = [], listing: Value = {}, sessionStatus = 0;

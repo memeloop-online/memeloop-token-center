@@ -2,7 +2,7 @@ import assert from 'node:assert/strict';
 import { createServer } from 'node:http';
 import { once } from 'node:events';
 import test from 'node:test';
-import { client, decode, errorFacts, HttpFailure, segment, sha256, verifyArchiveCopies, verifyStream } from './image-contract.ts';
+import { bothSidesRetired, client, decode, errorFacts, HttpFailure, segment, sha256, verifyArchiveCopies, verifyStream } from './image-contract.ts';
 
 const frames = [
   { choices: [{ delta: { content: 'synthetic' } }] },
@@ -62,6 +62,11 @@ test('shared HTTP client preserves authorization status errors and complete resp
 
 test('retired raw requires same identity side generation dual sources and complete manifest', async () => {
   const { blake3, preciseJson, verifyRetirementProof } = await import('./retirement-contract.ts');
+  const retiredSide = { complete: true, reason: 'raw_retired_semantic_archive' };
+  assert(bothSidesRetired({ archive: { request: retiredSide, response: retiredSide } }));
+  assert(!bothSidesRetired({ archive: { request: retiredSide, response: { complete: true } } }));
+  assert(!bothSidesRetired({ archive: { request: retiredSide, response: { ...retiredSide, complete: false } } }));
+
   const tenant = '11111111-1111-4111-8111-111111111111', request = '22222222-2222-4222-8222-222222222222';
   const hash = blake3(Buffer.alloc(32)), leaf = 'b'.repeat(64), revision = '18446744073709551614';
   assert.equal(preciseJson(`{"revision":${revision}}`).revision, revision);
