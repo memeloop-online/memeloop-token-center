@@ -920,6 +920,17 @@ impl BodyCarrier {
         self.sealed_reference.as_ref()
     }
 
+    #[cfg(test)]
+    pub(crate) fn object_segments_for_test(&self) -> Vec<StagedArchiveObject> {
+        self.segments
+            .iter()
+            .filter_map(|segment| match &*segment.lock().unwrap() {
+                Segment::Object(reference) => Some(reference.clone()),
+                Segment::Ram(_) => None,
+            })
+            .collect()
+    }
+
     pub(crate) fn open_stream(self: &Arc<Self>) -> CarrierStream {
         self.open_stream_inner(None, 64 * 1024)
     }

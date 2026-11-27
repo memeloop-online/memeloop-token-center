@@ -164,6 +164,107 @@ mod tests {
     use super::*;
     use crate::gateway_body::{memory::ProxyMemoryBudget, request_spool::RequestSpoolAdmission};
 
+    #[tokio::test]
+    #[ignore = "requires isolated RustFS fixture"]
+    async fn first_parse_object_range_wait_and_short_source_fail_before_dispatch() {
+        use crate::recovery_object_proxy::RecoveryObjectProxy;
+        let proxy = RecoveryObjectProxy::start(
+            &std::env::var("MTC_RUSTFS_TEST_ENDPOINT").expect("isolated RustFS endpoint"),
+        )
+        .await;
+        let mut config = crate::config::Config::for_test("sqlite::memory:".into());
+        config.archive_backend = crate::config::ArchiveBackend::S3;
+        config.s3_endpoint = Some(proxy.endpoint().into());
+        config.s3_bucket = Some(std::env::var("MTC_RUSTFS_TEST_BUCKET").unwrap());
+        config.s3_access_key = Some(std::env::var("MTC_RUSTFS_TEST_ACCESS_KEY").unwrap());
+        config.s3_secret_key = Some(std::env::var("MTC_RUSTFS_TEST_SECRET_KEY").unwrap());
+        config.s3_allow_http = true;
+        let archive = crate::archive::ArchiveStore::from_config(&config)
+            .await
+            .unwrap();
+        let budget = ProxyMemoryBudget::new(4 * 1024 * 1024);
+        let memory = budget.reservation();
+        let value = serde_json::json!({"model":"test", "input":"x".repeat(96 * 1024)});
+        let wire = Bytes::from(serde_json::to_vec(&value).unwrap());
+        let admission =
+            RequestSpoolAdmission::new(std::env::temp_dir()).with_archive(archive.clone());
+        let source = Arc::new(
+            admission
+                .capture_with_memory(
+                    axum::body::Body::from(wire.clone()),
+                    wire.len(),
+                    Some(wire.len()),
+                    Some(&memory),
+                    0,
+                    None,
+                )
+                .await
+                .unwrap(),
+        );
+        assert!(
+            source.upload_outcome().await,
+            "finish the original publisher before injecting a reader fault"
+        );
+        source.carrier().unwrap().seal_to_objects().await.unwrap();
+        let objects = source.carrier().unwrap().object_segments_for_test();
+        assert!(
+            !objects.is_empty(),
+            "the baseline must replay real Object segments"
+        );
+        let target = &objects[0];
+        let path = format!(
+            "/{}/{}",
+            config.s3_bucket.as_ref().unwrap(),
+            target.object_locator
+        );
+        let gate = proxy.gate_get(&path);
+        let parsing = tokio::spawn(parse(source.clone(), memory.clone()));
+        tokio::time::timeout(std::time::Duration::from_secs(10), gate.entered())
+            .await
+            .unwrap();
+        assert!(
+            !parsing.is_finished(),
+            "first parse waits on the exact object read"
+        );
+        // Only the isolated fixture's exact typed object is shortened. The
+        // production parser must preserve this as an IO failure, not dispatch.
+        archive
+            .put(&target.object_locator, Bytes::from_static(b"{"))
+            .await
+            .unwrap();
+        gate.release();
+        let error = tokio::time::timeout(std::time::Duration::from_secs(10), parsing)
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap_err();
+        assert!(matches!(
+            error,
+            AppError::Capacity {
+                code: "request_spool_read_failed",
+                ..
+            }
+        ));
+        assert!(proxy.counts().get("range_get").copied().unwrap_or(0) > 0);
+        // This is a parser-boundary reproduction, not an HTTP/ledger proof.
+        // Restore the independently known original segment before releasing
+        // its original owner; no cleanup or receipt is fabricated.
+        archive
+            .put(
+                &target.object_locator,
+                wire.slice(..target.size_bytes as usize),
+            )
+            .await
+            .unwrap();
+        let mut replay = source.open_stream().await.unwrap().stream;
+        let mut restored = Vec::new();
+        while let Some(chunk) = replay.next().await {
+            restored.extend_from_slice(&chunk.unwrap());
+        }
+        assert_eq!(restored, wire);
+        assert_eq!(blake3::hash(&restored), blake3::hash(&wire));
+    }
+
     async fn captured(body: Bytes) -> (crate::archive::ArchiveStore, Arc<RequestSpool>) {
         let archive = crate::archive::ArchiveStore::from_config(&crate::config::Config::for_test(
             "sqlite::memory:".into(),
