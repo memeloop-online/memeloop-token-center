@@ -17,6 +17,50 @@ pub struct ClickHouse {
     password: String,
 }
 
+#[derive(Clone, Copy)]
+enum InitializationTarget {
+    History,
+    #[cfg(feature = "history-initialization-diagnostic")]
+    Probe,
+}
+
+impl InitializationTarget {
+    fn table(self) -> &'static str {
+        match self {
+            Self::History => "request_history_v1",
+            #[cfg(feature = "history-initialization-diagnostic")]
+            Self::Probe => "request_history_initialization_probe_v1",
+        }
+    }
+
+    fn schema(self) -> Result<std::borrow::Cow<'static, str>, HistoryError> {
+        match self {
+            Self::History => Ok(std::borrow::Cow::Borrowed(super::SCHEMA)),
+            #[cfg(feature = "history-initialization-diagnostic")]
+            Self::Probe => {
+                let rest = super::SCHEMA
+                    .strip_prefix("CREATE TABLE IF NOT EXISTS request_history_v1\n")
+                    .filter(|rest| !rest.contains("request_history_v1"))
+                    .ok_or(HistoryError::Invalid(
+                        "initialization probe schema identifier",
+                    ))?;
+                Ok(std::borrow::Cow::Owned(format!(
+                    "CREATE TABLE IF NOT EXISTS {}\n{rest}",
+                    self.table()
+                )))
+            }
+        }
+    }
+
+    fn diagnostic(self) -> bool {
+        match self {
+            Self::History => false,
+            #[cfg(feature = "history-initialization-diagnostic")]
+            Self::Probe => true,
+        }
+    }
+}
+
 fn transport_unavailable(stage: &'static str, error: reqwest::Error) -> HistoryError {
     // Only static stages and reqwest classifications are safe to record: errors
     // may contain endpoint credentials, query text or response bodies.
@@ -186,21 +230,18 @@ impl ClickHouse {
     }
 
     pub async fn initialize(&self) -> Result<(), HistoryError> {
-        let response = self
-            .execute(BoundQuery::new(super::SCHEMA), None)
-            .await?
-            .bytes()
-            .await
-            .map_err(|error| transport_unavailable("initialize_response_body", error))?;
-        if !response.iter().all(u8::is_ascii_whitespace) {
-            tracing::warn!(
-                operation = "request_history_transport",
-                stage = "initialize_nonempty_response",
-                "request history transport unavailable"
-            );
-            return Err(HistoryError::Unavailable);
-        }
-        for column in [
+        self.initialize_target(InitializationTarget::History).await
+    }
+
+    #[cfg(feature = "history-initialization-diagnostic")]
+    pub(crate) async fn probe_initialization(&self) -> Result<(), HistoryError> {
+        self.initialize_target(InitializationTarget::Probe).await
+    }
+
+    async fn initialize_target(&self, target: InitializationTarget) -> Result<(), HistoryError> {
+        self.initialize_statement(target, 0, target.schema()?.as_ref())
+            .await?;
+        for (index, column) in [
             "stats_filter_cost_micros Nullable(Int64)",
             "stats_model String",
             "stats_protocol LowCardinality(String)",
@@ -208,26 +249,76 @@ impl ClickHouse {
             "stats_upstream_account_id Nullable(UUID)",
             "stats_route_id Nullable(UUID)",
             "stats_duration_ms Nullable(Int64)",
-        ] {
-            let response = self
-                .execute(
-                    BoundQuery::new(&format!(
-                        "ALTER TABLE request_history_v1 ADD COLUMN IF NOT EXISTS {column}"
-                    )),
-                    None,
-                )
-                .await?
-                .bytes()
-                .await
-                .map_err(|error| transport_unavailable("alter_response_body", error))?;
-            if !response.iter().all(u8::is_ascii_whitespace) {
-                tracing::warn!(
-                    operation = "request_history_transport",
-                    stage = "alter_nonempty_response",
-                    "request history transport unavailable"
-                );
-                return Err(HistoryError::Unavailable);
-            }
+        ]
+        .iter()
+        .enumerate()
+        {
+            self.initialize_statement(
+                target,
+                index + 1,
+                &format!(
+                    "ALTER TABLE {} ADD COLUMN IF NOT EXISTS {column}",
+                    target.table()
+                ),
+            )
+            .await?;
+        }
+        Ok(())
+    }
+
+    async fn initialize_statement(
+        &self,
+        target: InitializationTarget,
+        step: usize,
+        sql: &str,
+    ) -> Result<(), HistoryError> {
+        if target.diagnostic() {
+            tracing::info!(
+                operation = "history_initialization_probe",
+                step,
+                phase = "request_started"
+            );
+        }
+        let response = self.execute(BoundQuery::new(sql), None).await?;
+        if target.diagnostic() {
+            tracing::info!(
+                operation = "history_initialization_probe",
+                step,
+                phase = "response_headers",
+                status = response.status().as_u16()
+            );
+        }
+        let response = response.bytes().await.map_err(|error| {
+            transport_unavailable(
+                if step == 0 {
+                    "initialize_response_body"
+                } else {
+                    "alter_response_body"
+                },
+                error,
+            )
+        })?;
+        let whitespace = response.iter().all(u8::is_ascii_whitespace);
+        if target.diagnostic() {
+            tracing::info!(
+                operation = "history_initialization_probe",
+                step,
+                phase = "response_body",
+                response_bytes = response.len(),
+                whitespace
+            );
+        }
+        if !whitespace {
+            tracing::warn!(
+                operation = "request_history_transport",
+                stage = if step == 0 {
+                    "initialize_nonempty_response"
+                } else {
+                    "alter_nonempty_response"
+                },
+                "request history transport unavailable"
+            );
+            return Err(HistoryError::Unavailable);
         }
         Ok(())
     }
@@ -670,6 +761,99 @@ mod transport_probe_tests {
             )
             .unwrap();
             assert_eq!(client.probe_transport().await.is_ok(), valid);
+            server.abort();
+        }
+    }
+}
+
+#[cfg(all(test, feature = "history-initialization-diagnostic"))]
+mod initialization_probe_tests {
+    use super::*;
+    use std::sync::Mutex;
+
+    #[tokio::test]
+    async fn request_history_initialization_probe_preserves_sql_and_stops_on_failure() {
+        for (probe, fail_at, expected_count) in
+            [(false, None, 8), (true, None, 8), (true, Some(2), 3)]
+        {
+            let queries = Arc::new(Mutex::new(Vec::<String>::new()));
+            let captured = queries.clone();
+            let service = axum::Router::new().route(
+                "/",
+                axum::routing::post(move |headers: axum::http::HeaderMap, body: String| {
+                    let captured = captured.clone();
+                    async move {
+                        assert_eq!(
+                            headers.get("authorization").unwrap(),
+                            "Basic YWRtaW46YWRtaW4tcGFzc3dvcmQ="
+                        );
+                        let mut queries = captured.lock().unwrap();
+                        let step = queries.len();
+                        queries.push(body);
+                        if fail_at == Some(step) {
+                            "synthetic-nonempty-response"
+                        } else {
+                            " \n"
+                        }
+                    }
+                }),
+            );
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let endpoint = format!("http://{}", listener.local_addr().unwrap());
+            let server = tokio::spawn(async move { axum::serve(listener, service).await.unwrap() });
+            let client = ClickHouse::new(
+                crate::http_settings::HttpClient::default(),
+                &endpoint,
+                "synthetic".into(),
+                "admin".into(),
+                "admin-password".into(),
+            )
+            .unwrap();
+            let result = if probe {
+                client.probe_initialization().await
+            } else {
+                client.initialize().await
+            };
+            assert_eq!(result.is_ok(), fail_at.is_none());
+            if fail_at.is_some() {
+                assert!(matches!(result, Err(HistoryError::Unavailable)));
+            }
+            let queries = queries.lock().unwrap();
+            assert_eq!(queries.len(), expected_count);
+            let table = if probe {
+                "request_history_initialization_probe_v1"
+            } else {
+                "request_history_v1"
+            };
+            let expected_schema = if probe {
+                super::super::SCHEMA.replacen(
+                    "CREATE TABLE IF NOT EXISTS request_history_v1\n",
+                    "CREATE TABLE IF NOT EXISTS request_history_initialization_probe_v1\n",
+                    1,
+                )
+            } else {
+                super::super::SCHEMA.to_owned()
+            };
+            assert_eq!(queries[0], expected_schema);
+            for (step, column) in [
+                "stats_filter_cost_micros Nullable(Int64)",
+                "stats_model String",
+                "stats_protocol LowCardinality(String)",
+                "stats_error_code Nullable(String)",
+                "stats_upstream_account_id Nullable(UUID)",
+                "stats_route_id Nullable(UUID)",
+                "stats_duration_ms Nullable(Int64)",
+            ]
+            .iter()
+            .enumerate()
+            .take(expected_count - 1)
+            {
+                assert_eq!(
+                    queries[step + 1],
+                    format!("ALTER TABLE {table} ADD COLUMN IF NOT EXISTS {column}")
+                );
+            }
+            assert!(queries.iter().all(|query| !query.contains("DROP ")));
             server.abort();
         }
     }

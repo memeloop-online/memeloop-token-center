@@ -17,6 +17,9 @@ pub enum HistoryCommand {
     Start,
     /// Read-only fixed SELECT through the configured history bootstrap ADMIN transport.
     ProbeTransport,
+    /// Create only the fixed isolated initialization diagnostic table.
+    #[cfg(feature = "history-initialization-diagnostic")]
+    ProbeInitialization,
     /// Verify a consistent source baseline; this does not authorize cutover.
     BaselineSource {
         #[arg(long)]
@@ -241,6 +244,8 @@ pub async fn command(config: &Config, command: HistoryCommand) -> Result<Value, 
     database.refresh_http_settings().await?;
     database.start_http_settings_refresh();
     let role = match command {
+        #[cfg(feature = "history-initialization-diagnostic")]
+        HistoryCommand::ProbeInitialization => "ADMIN",
         HistoryCommand::Start
         | HistoryCommand::ProbeTransport
         | HistoryCommand::Bootstrap
@@ -258,6 +263,13 @@ pub async fn command(config: &Config, command: HistoryCommand) -> Result<Value, 
     )?
     .ok_or(HistoryError::Invalid("MTC_REQUEST_HISTORY_URL is required"))?;
     match command {
+        #[cfg(feature = "history-initialization-diagnostic")]
+        HistoryCommand::ProbeInitialization => {
+            client.probe_initialization().await?;
+            return Ok(
+                json!({"initialization_probe_completed":true,"table":"request_history_initialization_probe_v1","read_only":false}),
+            );
+        }
         HistoryCommand::ProbeTransport => {
             client.probe_transport().await?;
             return Ok(json!({"transport_ready":true,"read_only":true}));

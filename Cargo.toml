@@ -28,6 +28,7 @@ harness = false
 
 [features]
 experimental-plugin-revisions = []
+history-initialization-diagnostic = []
 default = []
 plugin-distribution = ["dep:oci-client"]
 

@@ -310,6 +310,16 @@ async fn request_history_cli_export_page_reports_safe_materialization_failure_wi
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn request_history_cli_transport_probe_uses_bootstrap_admin_identity() {
+    run_admin_probe("probe-transport", false).await;
+}
+
+#[cfg(feature = "history-initialization-diagnostic")]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn request_history_cli_initialization_probe_uses_bootstrap_admin_identity() {
+    run_admin_probe("probe-initialization", true).await;
+}
+
+async fn run_admin_probe(command: &'static str, initialization: bool) {
     let root = tempfile::tempdir().unwrap();
     let database_url = format!(
         "sqlite://{}?mode=rwc",
@@ -332,9 +342,15 @@ async fn request_history_cli_transport_probe_uses_bootstrap_admin_identity() {
                     "Basic YWRtaW46YWRtaW4tcGFzc3dvcmQ="
                 );
                 assert_eq!(headers.get("x-clickhouse-database").unwrap(), "synthetic");
-                assert_eq!(body.as_ref(), b"SELECT 1 AS ok FORMAT JSONEachRow");
+                if initialization {
+                    let sql = std::str::from_utf8(&body).unwrap();
+                    assert!(sql.starts_with("CREATE TABLE IF NOT EXISTS request_history_initialization_probe_v1\n") || sql.starts_with("ALTER TABLE request_history_initialization_probe_v1 ADD COLUMN IF NOT EXISTS "));
+                    assert!(!sql.contains("DROP "));
+                } else {
+                    assert_eq!(body.as_ref(), b"SELECT 1 AS ok FORMAT JSONEachRow");
+                }
                 *observed.lock().unwrap() += 1;
-                "{\"ok\":1}\n"
+                if initialization { "" } else { "{\"ok\":1}\n" }
             }
         }),
     );
@@ -345,7 +361,7 @@ async fn request_history_cli_transport_probe_uses_bootstrap_admin_identity() {
     });
     let output = tokio::task::spawn_blocking(move || {
         Command::new(env!("CARGO_BIN_EXE_memeloop-token-center"))
-            .args(["request-history", "probe-transport"])
+            .args(["request-history", command])
             .env("MTC_KEY_PEPPER", "test-pepper-must-have-at-least-32-bytes")
             .env("MTC_SERVICE_TOKEN", "s".repeat(32))
             .env("MTC_DATABASE_URL", database_url)
@@ -375,17 +391,30 @@ async fn request_history_cli_transport_probe_uses_bootstrap_admin_identity() {
         "{}",
         String::from_utf8_lossy(&output.stderr)
     );
-    assert_eq!(*requests.lock().unwrap(), 1);
+    assert_eq!(
+        *requests.lock().unwrap(),
+        if initialization { 8 } else { 1 }
+    );
     assert!(!archive_check.exists());
     let result = String::from_utf8_lossy(&output.stdout)
         .lines()
         .filter_map(|line| serde_json::from_str::<serde_json::Value>(line).ok())
-        .find(|value| value.get("transport_ready").is_some())
+        .find(|value| {
+            value
+                .get(if initialization {
+                    "initialization_probe_completed"
+                } else {
+                    "transport_ready"
+                })
+                .is_some()
+        })
         .unwrap();
-    assert_eq!(
-        result,
+    let expected = if initialization {
+        serde_json::json!({"initialization_probe_completed":true,"table":"request_history_initialization_probe_v1","read_only":false})
+    } else {
         serde_json::json!({"transport_ready":true,"read_only":true})
-    );
+    };
+    assert_eq!(result, expected);
     for bytes in [&output.stdout, &output.stderr] {
         let text = String::from_utf8_lossy(bytes);
         assert!(!text.contains("admin-password"));
