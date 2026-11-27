@@ -2,7 +2,7 @@ import assert from 'node:assert/strict';
 import { createServer } from 'node:http';
 import { once } from 'node:events';
 import test from 'node:test';
-import { client, decode, HttpFailure, segment, sha256, verifyArchiveCopies, verifyStream } from './image-contract.ts';
+import { client, decode, errorFacts, HttpFailure, segment, sha256, verifyArchiveCopies, verifyStream } from './image-contract.ts';
 
 const frames = [
   { choices: [{ delta: { content: 'synthetic' } }] },
@@ -55,5 +55,7 @@ test('shared HTTP client preserves authorization status errors and complete resp
     const http = client(`http://127.0.0.1:${address.port}`, 'synthetic-key');
     const response = await http.request('/ok'); assert(authorized); assert.equal(response.status, 200); assert.deepEqual(response.raw, body);
     for (const code of [403, 404, 409, 500]) await assert.rejects(http.request(`/${code}`), (error: unknown) => error instanceof HttpFailure && error.status === code);
+    assert.deepEqual(await errorFacts(new Response(JSON.stringify({ error: { code: 'archive_content_unavailable', reason: 'raw_retired_semantic_archive', message: 'secret must never be copied' } }))), { code: 'archive_content_unavailable', reason: 'raw_retired_semantic_archive' });
+    for (const payload of ['invalid-json', JSON.stringify({ error: { code: 'untrusted secret', reason: 'untrusted secret' } }), 'x'.repeat(4097)]) assert.deepEqual(await errorFacts(new Response(payload)), { code: 'unknown', reason: 'unknown' });
   } finally { server.closeAllConnections(); await new Promise<void>((resolve) => server.close(() => resolve())); }
 });

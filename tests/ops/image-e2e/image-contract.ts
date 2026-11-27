@@ -7,7 +7,9 @@ import { setTimeout as delay } from 'node:timers/promises';
 type Value = Record<string, any>;
 export class HttpFailure extends Error {
   readonly status: number;
-  constructor(status: number) { super(`fixture HTTP ${status}`); this.status = status; }
+  readonly code: string;
+  readonly reason: string;
+  constructor(status: number, facts = { code: 'unknown', reason: 'unknown' }) { super(`fixture HTTP ${status}`); this.status = status; this.code = facts.code; this.reason = facts.reason; }
 }
 export function sha256(bytes: string | Uint8Array): string { return createHash('sha256').update(bytes).digest('hex'); }
 export function decode(bytes: Uint8Array): string { return new TextDecoder('utf-8', { fatal: true }).decode(bytes); }
@@ -15,10 +17,30 @@ export function object(bytes: Uint8Array): Value { const value = JSON.parse(deco
 export function segment(value: string): string { return encodeURIComponent(value).replace(/[!'()*]/g, (char) => `%${char.charCodeAt(0).toString(16).toUpperCase()}`); }
 export function evidence(value: Value): void { console.log(JSON.stringify(value)); }
 
+// Only small, allowlisted error metadata may leave a synthetic API failure.
+export async function errorFacts(response: Response): Promise<{ code: string; reason: string }> {
+  const unknown = { code: 'unknown', reason: 'unknown' };
+  if (!response.body) return unknown;
+  const reader = response.body.getReader(); let length = 0; const chunks: Uint8Array[] = [];
+  try {
+    for (;;) {
+      const frame = await reader.read(); if (frame.done) break;
+      length += frame.value.byteLength;
+      if (length > 4096) { await reader.cancel(); return unknown; }
+      chunks.push(frame.value);
+    }
+    const value = object(Buffer.concat(chunks)).error;
+    const codes = new Set(['archive_content_unavailable']);
+    const reasons = new Set(['raw_retired_semantic_archive', 'archive_pending', 'archive_object_unavailable', 'archive_payload_invalid', 'media_body_not_archived_by_policy']);
+    return { code: codes.has(value?.code) ? value.code : 'unknown', reason: reasons.has(value?.reason) ? value.reason : 'unknown' };
+  } catch { return unknown; }
+  finally { reader.releaseLock(); }
+}
+
 export function client(base: string, serviceToken: string) {
   const request = async (path: string, method = 'GET', data?: Value, token = serviceToken, timeout = 40_000) => {
     const response = await fetch(base + path, { method, headers: { ...(token ? { authorization: `Bearer ${token}` } : {}), 'content-type': 'application/json', 'accept-encoding': 'identity' }, body: data === undefined ? undefined : JSON.stringify(data), signal: AbortSignal.timeout(timeout) });
-    if (!response.ok) { await response.body?.cancel(); throw new HttpFailure(response.status); }
+    if (!response.ok) throw new HttpFailure(response.status, await errorFacts(response));
     return { status: response.status, headers: response.headers, raw: Buffer.from(await response.arrayBuffer()) };
   };
   return { request, post: async (path: string, data: Value) => object((await request(path, 'POST', data)).raw) };
@@ -79,7 +101,12 @@ export async function runImageContract(options: { messages?: (nonce: string) => 
   assert.equal(record.usage.tokens.input_tokens, 2); assert.equal(record.usage.tokens.output_tokens, 1);
   const archives = {} as Record<'request' | 'response', Buffer>;
   for (const side of ['request', 'response'] as const) {
-    const result = await http.request(`/self/v1/requests/${requestId}/archive/${side}`, 'GET', undefined, key);
+    let result;
+    try { result = await http.request(`/self/v1/requests/${requestId}/archive/${side}`, 'GET', undefined, key); }
+    catch (error) {
+      if (error instanceof HttpFailure) evidence({ phase: 'archive_get_failed', request_id: requestId, side, status: error.status, error_code: error.code, reason: error.reason, observed_at: new Date().toISOString() });
+      throw error;
+    }
     assert.equal(result.status, 200); assert(result.raw.length); archives[side] = result.raw;
     evidence({ request_id: requestId, side, status: result.status, bytes: result.raw.length, sha256: sha256(result.raw) });
   }
