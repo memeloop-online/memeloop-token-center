@@ -23,6 +23,11 @@ jobs:
       - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020
         with:
           node-version: 24.18.0
+      - name: Install trusted BLAKE3 fixture oracle
+        run: |
+          sudo apt-get update
+          sudo apt-get install --no-install-recommends -y b3sum
+          b3sum --version
       - name: Generate isolated credentials
         run: |
           service_token=$(openssl rand -hex 32)

@@ -3,7 +3,7 @@ import assert from 'node:assert/strict';
 import { createHash, randomUUID } from 'node:crypto';
 import { readFileSync } from 'node:fs';
 import { setTimeout as delay } from 'node:timers/promises';
-import { exactFixtureMetadata, fixtureIdentity, verifyPublishedContents, verifyRetirementProof } from './retirement-contract.ts';
+import { blake3, boundManifest, exactFixtureMetadata, fixtureIdentity, verifyPublishedContents, verifyRetirementProof } from './retirement-contract.ts';
 
 type Value = Record<string, any>;
 export class HttpFailure extends Error {
@@ -134,14 +134,15 @@ export async function runImageContract(options: { messages?: (nonce: string) => 
   if (matched.length !== 1) { evidence({ session_list_count: listing.sessions?.length, matching_request_count: matched.length, request_id: requestId, worker_role: 'all' }); throw new Error('same request did not appear in session projection'); }
   if (retired.length) {
     const identity = fixtureIdentity(requestId, issued.key_id);
-    const authority = record.semantic_archive; assert(authority, 'retired raw lacks authorized semantic authority');
+    const current = object((await http.request(`/self/v1/requests/${requestId}`, 'GET', undefined, key)).raw);
+    assert.equal(current.request_id, requestId); const authority = current.semantic_archive; assert(authority, 'retired raw lacks authorized semantic authority');
     const revision = authority.manifest_revision, leaf = authority.semantic_head?.node_hash;
     assert(typeof revision === 'string' && /^[1-9][0-9]*$/.test(revision));
     const prefix = `tenants/${identity.tenant_id}/semantic/v2/requests/${requestId}/`;
+    const scope = { ...identity, revision, leaf, lengths: { request: Buffer.byteLength(requestWire), response: body.length }, digests: { request: blake3(Buffer.from(requestWire)), response: blake3(body) } };
     const publication = exactFixtureMetadata(`${prefix}${revision}.json`);
     const receipt = exactFixtureMetadata(`${prefix}${revision}-coverage.json`);
-    const manifest = exactFixtureMetadata(publication.manifest.object_locator);
-    const scope = { ...identity, revision, leaf, lengths: { request: Buffer.byteLength(requestWire), response: body.length } };
+    const manifest = boundManifest(publication, scope);
     for (const side of retired) verifyRetirementProof(scope, side, exactFixtureMetadata(`${prefix}retired-${side}.json`), receipt, publication, manifest);
     const expected = messages.map((message) => { assert.equal(typeof message.content, 'string'); return { role: message.role, text: message.content }; });
     const assistant = decode(body).trim().split('\n\n').filter((frame) => frame.startsWith('data: ') && frame !== 'data: [DONE]').map((frame) => JSON.parse(frame.slice(6))).flatMap((frame) => frame.choices ?? []).map((choice) => choice.delta?.content ?? '').join('');

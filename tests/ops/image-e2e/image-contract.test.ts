@@ -61,19 +61,21 @@ test('shared HTTP client preserves authorization status errors and complete resp
 });
 
 test('retired raw requires same identity side generation dual sources and complete manifest', async () => {
-  const { preciseJson, verifyRetirementProof } = await import('./retirement-contract.ts');
+  const { blake3, preciseJson, verifyRetirementProof } = await import('./retirement-contract.ts');
   const tenant = '11111111-1111-4111-8111-111111111111', request = '22222222-2222-4222-8222-222222222222';
-  const hash = 'a'.repeat(64), leaf = 'b'.repeat(64), revision = '18446744073709551614';
+  const hash = blake3(Buffer.alloc(32)), leaf = 'b'.repeat(64), revision = '18446744073709551614';
   assert.equal(preciseJson(`{"revision":${revision}}`).revision, revision);
-  const source = { object_locator: `tenants/${tenant}/cas/v1/blake3/aa/${hash}`, blake3_digest: hash, size_bytes: 32 };
+  const source = { object_locator: `tenants/${tenant}/cas/v1/blake3/${hash.slice(0,2)}/${hash}`, blake3_digest: hash, size_bytes: 32 };
   const coverage = { observed_terminal: true, projection_state: 'complete', gaps: [], omissions: [] };
-  const scope = { tenant_id: tenant, request_id: request, leaf, revision, lengths: { request: 32, response: 32 } };
+  const scope = { tenant_id: tenant, request_id: request, leaf, revision, lengths: { request: 32, response: 32 }, digests: { request: hash, response: hash } };
   const publication = { format_version: 2, tenant_id: tenant, request_id: request, revision, projection_version: 2, manifest: source };
   const manifest = { ...publication, semantic_head: { node_hash: leaf }, coverage, raw_sources: { request: source, response: source } };
   const receipt = { format_version: 2, publication, binding: { tenant_id: tenant, request_id: request, node_hash: leaf, projected_at: 1 }, coverage, raw_sources: manifest.raw_sources };
-  const fence = { format_version: 1, tenant_id: tenant, request_id: request, side: 'request', source, semantic_revision: revision, semantic_leaf: leaf, release_generation: request };
+  const fence = { format_version: 1, tenant_id: tenant, request_id: request, side: 'request', source, semantic_revision: revision, semantic_leaf: leaf, release_generation: '00000000-0000-0000-ffff-fffffffffffe' };
   verifyRetirementProof(scope, 'request', fence, receipt, publication, manifest);
   for (const mutate of [
+    (v: any) => { const changed = blake3(Buffer.alloc(32, 1)); for (const name of ['request', 'response']) { v.manifest.raw_sources[name].blake3_digest = changed; v.manifest.raw_sources[name].object_locator = `tenants/${tenant}/cas/v1/blake3/${changed.slice(0,2)}/${changed}`; } },
+    (v: any) => v.fence.release_generation = request,
     (v: any) => v.fence.side = 'response',
     (v: any) => v.fence.tenant_id = request,
     (v: any) => v.fence.semantic_revision = '1',
@@ -88,4 +90,22 @@ test('retired raw requires same identity side generation dual sources and comple
     const value = structuredClone({ fence, receipt, publication, manifest }); mutate(value);
     assert.throws(() => verifyRetirementProof(scope, 'request', value.fence, value.receipt, value.publication, value.manifest));
   }
+});
+
+test('retired canonical oracle reads formal text and rejects wrong content or cursor stalling', async () => {
+  const { verifyPublishedContents } = await import('./retirement-contract.ts');
+  const coverage = { observed_terminal: true, projection_state: 'complete', gaps: [] };
+  const fixture = (badText = false, stalled = false) => ({ request: async (path: string) => {
+    const query = new URL(path, 'http://fixture.invalid').searchParams; let value: any;
+    if (query.has('parts_cursor')) {
+      const id = query.get('parts_cursor'); value = { manifest_revision: '1', instance_id: id, role: id === 'u' ? 'user' : 'assistant', parts: [{ fields: [{ name: 'text', format: 'text', content_cursor: id }] }], next_cursor: stalled ? id : null };
+    } else if (query.has('content_cursor')) {
+      const id = query.get('content_cursor'); value = { manifest_revision: '1', instance_id: id, field: 'text', byte_offset: 0, text: badText ? 'wrong' : id === 'u' ? 'synthetic😀' : 'reply', complete: true, next_cursor: null };
+    } else value = { status: 'published', manifest_revision: '1', coverage, instances: ['u', 'a'].map((id) => ({ request_id: 'request', instance_id: id, atom_cursor: id })) };
+    return { raw: Buffer.from(JSON.stringify(value) + '\n') };
+  } });
+  const expected = [{ role: 'user', text: 'synthetic😀' }, { role: 'assistant', text: 'reply' }];
+  await verifyPublishedContents(fixture(), 'key', 'session', 'request', '1', expected);
+  await assert.rejects(verifyPublishedContents(fixture(true), 'key', 'session', 'request', '1', expected));
+  await assert.rejects(verifyPublishedContents(fixture(false, true), 'key', 'session', 'request', '1', expected));
 });
