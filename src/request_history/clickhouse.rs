@@ -17,6 +17,23 @@ pub struct ClickHouse {
     password: String,
 }
 
+fn transport_unavailable(stage: &'static str, error: reqwest::Error) -> HistoryError {
+    // Only static stages and reqwest classifications are safe to record: errors
+    // may contain endpoint credentials, query text or response bodies.
+    tracing::warn!(
+        operation = "request_history_transport",
+        stage,
+        is_builder = error.is_builder(),
+        is_connect = error.is_connect(),
+        is_timeout = error.is_timeout(),
+        is_body = error.is_body(),
+        is_decode = error.is_decode(),
+        is_request = error.is_request(),
+        "request history transport unavailable"
+    );
+    HistoryError::Unavailable
+}
+
 impl ClickHouse {
     pub fn from_env(client: impl HttpClientSource + 'static) -> Result<Option<Self>, HistoryError> {
         Self::from_env_role(client, "WRITER")
@@ -101,7 +118,7 @@ impl ClickHouse {
         let response = self
             .client
             .http_client(ClientOptions::default())
-            .map_err(|_| HistoryError::Unavailable)?
+            .map_err(|error| transport_unavailable("client_build", error))?
             .post(self.endpoint.clone())
             .basic_auth(&self.user, Some(&self.password))
             .header("X-ClickHouse-Database", &self.database)
@@ -109,7 +126,7 @@ impl ClickHouse {
             .body(body)
             .send()
             .await
-            .map_err(|_| HistoryError::Unavailable)?;
+            .map_err(|error| transport_unavailable("request_send", error))?;
         if !response.status().is_success()
             || response
                 .headers()
@@ -138,7 +155,7 @@ impl ClickHouse {
         while let Some(chunk) = response
             .chunk()
             .await
-            .map_err(|_| HistoryError::Unavailable)?
+            .map_err(|error| transport_unavailable("rows_response_body", error))?
         {
             pending.extend_from_slice(&chunk);
             let mut consumed = 0;
@@ -164,8 +181,13 @@ impl ClickHouse {
             .await?
             .bytes()
             .await
-            .map_err(|_| HistoryError::Unavailable)?;
+            .map_err(|error| transport_unavailable("initialize_response_body", error))?;
         if !response.iter().all(u8::is_ascii_whitespace) {
+            tracing::warn!(
+                operation = "request_history_transport",
+                stage = "initialize_nonempty_response",
+                "request history transport unavailable"
+            );
             return Err(HistoryError::Unavailable);
         }
         for column in [
@@ -187,8 +209,13 @@ impl ClickHouse {
                 .await?
                 .bytes()
                 .await
-                .map_err(|_| HistoryError::Unavailable)?;
+                .map_err(|error| transport_unavailable("alter_response_body", error))?;
             if !response.iter().all(u8::is_ascii_whitespace) {
+                tracing::warn!(
+                    operation = "request_history_transport",
+                    stage = "alter_nonempty_response",
+                    "request history transport unavailable"
+                );
                 return Err(HistoryError::Unavailable);
             }
         }
@@ -228,8 +255,13 @@ impl ClickHouse {
             .await?
             .bytes()
             .await
-            .map_err(|_| HistoryError::Unavailable)?;
+            .map_err(|error| transport_unavailable("append_response_body", error))?;
         if !response.iter().all(u8::is_ascii_whitespace) {
+            tracing::warn!(
+                operation = "request_history_transport",
+                stage = "append_nonempty_response",
+                "request history transport unavailable"
+            );
             return Err(HistoryError::Unavailable);
         }
         Ok(())
