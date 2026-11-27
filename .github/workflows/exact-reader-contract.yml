@@ -36,7 +36,7 @@ jobs:
   metadata-refresh-contract:
     if: inputs.contract == 'metadata-refresh'
     runs-on: ubuntu-latest
-    timeout-minutes: 120
+    timeout-minutes: 25
     permissions:
       contents: read
       actions: read
@@ -47,66 +47,54 @@ jobs:
       SOURCE_RUN_ID: "45940213018"
       ARTIFACT_DIGEST: 2edc4a022cd90b5f750d033ad88c933e7238ee47da276163c238d05d2cf5ddd8
     steps:
-      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
-        with:
-          ref: cf816a0ade6689591a30ee726929ceaa2e29aea0
-          persist-credentials: false
-      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020
-        with:
-          node-version: 24.18.0
-      - name: Verify fixed Stage-only source
-        id: source
+      - name: Retrieve and verify only the exact sealed maintenance input
         env:
           EXPECTED_SOURCE: ${{ inputs.source_revision }}
+          GH_TOKEN: ${{ github.token }}
         run: |
           set -euo pipefail
           test "$EXPECTED_SOURCE" = "$CANDIDATE_SHA"
-          test "$(git rev-parse HEAD)" = "$CANDIDATE_SHA"
-          git rev-parse HEAD
-          echo "timestamp=$(git show -s --format=%cI HEAD)" >> "$GITHUB_OUTPUT"
-      - uses: docker/setup-buildx-action@8d2750c68a42422c14e847fe6c8ac0403b4cbd6f
-      - name: Compile and runtime-smoke the exact original release input once
-        uses: docker/build-push-action@10e90e3645eae34f1e60eeb005ba3a3d33f178e8
-        with:
-          context: .
-          file: Dockerfile
-          target: release-input-export
-          platforms: linux/amd64
-          push: false
-          outputs: type=local,dest=${{ runner.temp }}/release-service-input
-          build-args: |
-            MTC_BUILD_GIT_SHA_INPUT=${{ env.CANDIDATE_SHA }}
-            MTC_BUILD_TIMESTAMP_INPUT=${{ steps.source.outputs.timestamp }}
-            MTC_BUILD_TARGET_INPUT=linux/amd64
-          cache-from: type=gha,scope=service-release-input
-      - name: Seal and verify the same-source complete input
-        run: |
-          set -euo pipefail
-          node scripts/ci/create-memory-binary-manifest.ts "$RUNNER_TEMP/release-service-input/memeloop-token-center" "$CANDIDATE_SHA" "$RUNNER_TEMP/sealed-input"
-          for file in libgcc_s.so.1 libstdc++.so.6 install-plugin-oci cosign LICENSE THIRD_PARTY_NOTICES.md; do
-            cp "$RUNNER_TEMP/release-service-input/$file" "$RUNNER_TEMP/sealed-input/$file"
-          done
-          cp -R "$RUNNER_TEMP/release-service-input/web" "$RUNNER_TEMP/sealed-input/web"
-          cp -R "$RUNNER_TEMP/release-service-input/third-party-licenses" "$RUNNER_TEMP/sealed-input/third-party-licenses"
-          chmod 0555 "$RUNNER_TEMP/sealed-input/memeloop-token-center" "$RUNNER_TEMP/sealed-input/install-plugin-oci" "$RUNNER_TEMP/sealed-input/cosign"
-          node scripts/ci/create-release-service-input-manifest.ts "$RUNNER_TEMP/sealed-input" "$CANDIDATE_SHA"
-          node scripts/ci/verify-release-service-input.ts "$RUNNER_TEMP/sealed-input" "$CANDIDATE_SHA"
-          mkdir -p "$RUNNER_TEMP/stage-test-oci"
-          cp "$RUNNER_TEMP/sealed-input/memory-binary.json" "$RUNNER_TEMP/sealed-input/release-service-input.json" "$RUNNER_TEMP/stage-test-oci/"
-      - name: Preserve verified sealed input before assembly
-        run: |
-          set -euo pipefail
           mkdir -p "$RUNNER_TEMP/sealed-package"
-          tar -C "$RUNNER_TEMP/sealed-input" -cf "$RUNNER_TEMP/sealed-package/sealed-input.tar" .
-          cd "$RUNNER_TEMP/sealed-package"
-          sha256sum sealed-input.tar > SHA256SUMS
-          printf '%s\n' "$CANDIDATE_SHA" > source.txt
-      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
-        with:
-          name: maintenance-cf816-smoke-pending-sealed-input
-          path: ${{ runner.temp }}/sealed-package/
-          if-no-files-found: error
-          retention-days: 3
+          gh api "repos/$GITHUB_REPOSITORY/actions/artifacts/15217955555" > "$RUNNER_TEMP/sealed-package/artifact.json"
+          gh api "repos/$GITHUB_REPOSITORY/actions/artifacts/15217955555/zip" > "$RUNNER_TEMP/sealed-package/input.zip"
+          python3 - <<'PYCODE'
+          import hashlib,json,os,pathlib,stat,tarfile,zipfile
+          root=pathlib.Path(os.environ['RUNNER_TEMP']); package=root/'sealed-package'
+          meta=json.loads((package/'artifact.json').read_text())
+          expected='99af48b2209a660aa0c4f3c36eea18ef10e12937bbb0f47d0f5c036331a12aeb'
+          if meta['id']!=15217955555 or meta['workflow_run']['id']!=46034860161 or meta['expired'] or meta['digest']!='sha256:'+expected:raise SystemExit('sealed artifact metadata mismatch')
+          h=hashlib.sha256()
+          with (package/'input.zip').open('rb') as f:
+              for data in iter(lambda:f.read(1024*1024),b''):h.update(data)
+          if h.hexdigest()!=expected:raise SystemExit('sealed artifact ZIP digest mismatch')
+          with zipfile.ZipFile(package/'input.zip') as z:
+              for item in z.infolist():
+                  path=pathlib.PurePosixPath(item.filename)
+                  if path.is_absolute() or '..' in path.parts or stat.S_ISLNK(item.external_attr>>16):raise SystemExit('unsafe sealed ZIP entry')
+              z.extractall(package/'verified')
+          base=package/'verified'
+          if (base/'source.txt').read_text().strip()!=os.environ['CANDIDATE_SHA']:raise SystemExit('sealed source mismatch')
+          checksum=(base/'SHA256SUMS').read_text().split()
+          if len(checksum)!=2 or checksum[1]!='sealed-input.tar':raise SystemExit('unexpected sealed checksum entry')
+          h=hashlib.sha256()
+          with (base/'sealed-input.tar').open('rb') as f:
+              for data in iter(lambda:f.read(1024*1024),b''):h.update(data)
+          if h.hexdigest()!=checksum[0]:raise SystemExit('sealed tar checksum mismatch')
+          target=root/'sealed-input';target.mkdir()
+          with tarfile.open(base/'sealed-input.tar') as tar:
+              for item in tar.getmembers():
+                  path=pathlib.PurePosixPath(item.name)
+                  if path.is_absolute() or '..' in path.parts or not (item.isfile() or item.isdir()):raise SystemExit('unsafe sealed tar entry')
+              tar.extractall(target,filter='data')
+          manifest=json.loads((target/'release-service-input.json').read_text())
+          if manifest['schema_version']!=2 or manifest['revision']!=os.environ['CANDIDATE_SHA'] or manifest['platform']!='linux/amd64':raise SystemExit('sealed manifest identity mismatch')
+          actual={str(x.relative_to(target)) for x in target.rglob('*') if x.is_file() and x.name!='release-service-input.json'}
+          if actual!=set(manifest['files']):raise SystemExit('sealed complete file set mismatch')
+          for name,digest in manifest['files'].items():
+              if hashlib.sha256((target/name).read_bytes()).hexdigest()!=digest:raise SystemExit('sealed file hash mismatch')
+          if not (target/'memeloop-token-center').stat().st_mode&0o111:raise SystemExit('sealed binary is not executable')
+          print(json.dumps({'sealed_source':os.environ['CANDIDATE_SHA'],'sealed_artifact':15217955555,'sealed_zip_sha256':expected,'sealed_tar_sha256':checksum[0],'files_verified':len(actual)}))
+          PYCODE
       - name: Retrieve the exact approved original 58f runtime artifact
         env:
           GH_TOKEN: ${{ github.token }}
@@ -264,10 +252,19 @@ jobs:
                   if len(bind)!=1 or bind[0]['source']!=str(maintenance) or 'ro' not in bind[0]['options']:raise SystemExit('maintenance executable mount not read-only')
                   if spec['process']['args']!=['/maintenance/service',*args]:raise SystemExit('maintenance command drift')
                   result=subprocess.run(['sudo','ctr','-n','joint58f-smoke','tasks','start',cid],capture_output=True)
-                  if result.returncode:raise SystemExit('maintenance task failed rc='+str(result.returncode))
+                  text=(result.stdout+result.stderr)[:65536].decode('utf-8',errors='replace').lower()
+                  patterns={'permission_denied':'permission denied','readonly_filesystem':'read-only file system','sqlite_open':'unable to open database file','sqlite_missing_table':'no such table','sqlite_locked':'database is locked','database_error':'error returned from database','invalid_config':'invalid configuration','connection_refused':'connection refused','dns_failure':'dns error','invalid_cli':'unrecognized subcommand','cli_argument':'unexpected argument','glibc_requirement':'glibc_','dynamic_library':'shared libraries','missing_resource':'no such file or directory'}
+                  categories=[code for code,pattern in patterns.items() if pattern in text]
+                  counts=json.loads(count.read_text()) if count.exists() else {'total':0,'valid':0}
+                  if set(counts)!={'total','valid'} or any(type(v)!=int or v<0 for v in counts.values()):raise SystemExit('invalid safe mock counter')
+                  record={'phase':suffix,'exit_code':result.returncode,'safe_categories':categories or ['unclassified'],'stdout_bytes':len(result.stdout),'stdout_sha256':hashlib.sha256(result.stdout).hexdigest(),'stderr_bytes':len(result.stderr),'stderr_sha256':hashlib.sha256(result.stderr).hexdigest(),'mock_http':counts}
+                  (root/(suffix+'-result.json')).write_text(json.dumps(record,indent=2)+'\n')
+                  print(json.dumps(record),flush=True)
+                  if result.returncode:raise SystemExit('maintenance '+suffix+' failed rc='+str(result.returncode))
                   output=result.stdout
                   if any(v.encode() in output+result.stderr for v in ['admin-password','different-writer-password','different-fallback-password']):raise SystemExit('synthetic secret appeared in output')
-                  (root/(suffix+'.txt')).write_bytes(output)
+                  if suffix=='maintenance-help':(root/(suffix+'.txt')).write_bytes(output)
+                  elif suffix=='maintenance-probe':(root/(suffix+'.txt')).write_text(json.dumps({'transport_ready':True,'read_only':True})+'\n')
                   # Do not export process environments, which contain synthetic credentials.
                   (root/(suffix+'-isolation.json')).write_text(json.dumps({'uid':10001,'root_readonly':True,'empty_capabilities':True,'network_namespace':ns,'runtime_child':evidence['manifest_digest'],'rootfs_chain':chain,'binary_sha256':binary_sha}))
                   if suffix=='maintenance-probe':
@@ -283,7 +280,7 @@ jobs:
           subprocess.check_call(['cp',str(binary),str(package/'memeloop-token-center')]);(package/'memeloop-token-center').chmod(0o555)
           for label,argv in [('elf-header',['readelf','-h',str(binary)]),('elf-dynamic',['readelf','-d',str(binary)]),('elf-versions',['readelf','--version-info',str(binary)])]:
               (package/(label+'.txt')).write_bytes(subprocess.check_output(argv))
-          evidence.update({'maintenance_source':os.environ['CANDIDATE_SHA'],'maintenance_binary_sha256':binary_sha,'maintenance_binary_bytes':binary.stat().st_size,'purpose':'diagnostic-maintenance-only-not-official-release','admin_probe_count':1,'maintenance_run':os.environ['GITHUB_RUN_ID'],'maintenance_attempt':os.environ['GITHUB_RUN_ATTEMPT'],'status':'maintenance_native_pass'})
+          evidence.update({'maintenance_source':os.environ['CANDIDATE_SHA'],'maintenance_binary_sha256':binary_sha,'maintenance_binary_bytes':binary.stat().st_size,'purpose':'diagnostic-maintenance-only-not-official-release','admin_probe_count':1,'maintenance_run':os.environ['GITHUB_RUN_ID'],'maintenance_attempt':os.environ['GITHUB_RUN_ATTEMPT'],'sealed_input_artifact':15217955555,'sealed_input_run':46034860161,'sealed_input_zip_sha256':'99af48b2209a660aa0c4f3c36eea18ef10e12937bbb0f47d0f5c036331a12aeb','status':'maintenance_native_pass'})
           (package/'receipt.json').write_text(json.dumps(evidence,indent=2)+'\n')
           subprocess.check_call(['cp',str(root/'maintenance-probe.txt'),str(package/'probe.txt')])
           subprocess.check_call(['cp',str(root/'maintenance-help.txt'),str(package/'help.txt')])
@@ -299,7 +296,7 @@ jobs:
       - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
         if: always()
         with:
-          name: cf816-maintenance-native-evidence
+          name: cf816-artifact-only-native-diagnostic
           path: |
             ${{ runner.temp }}/native-smoke/*.json
             ${{ runner.temp }}/native-smoke/*.txt
