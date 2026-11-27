@@ -17,7 +17,14 @@ type Reader = (path: string, params: Row) => Promise<any>;
 export const ACCOUNT_FIELDS = ['id', 'name', 'driver', 'status', 'route_count', 'created_at'];
 export const ROUTE_FIELDS = ['id', 'public_model', 'upstream_model', 'protocol', 'enabled',
   'upstream_account_id', 'upstream_account_ids', 'candidate_upstream_account_ids'];
-const pick = (row: Row, fields: readonly string[]) => Object.fromEntries(fields.map(key => [key, row[key] ?? null]));
+const pick = (row: Row, fields: readonly string[]) => {
+  if (row === null || typeof row !== 'object' || Array.isArray(row)) throw new TypeError('metadata row must be an object');
+  return Object.fromEntries(fields.map(key => [key, row[key] ?? null]));
+};
+const required = (row: Row, key: string) => {
+  if (!Object.hasOwn(row, key)) throw new TypeError('required metadata field is absent');
+  return row[key];
+};
 class MetadataReadError extends Error {
   constructor(code: string) { super('metadata read failed'); this.name = code; }
 }
@@ -42,15 +49,18 @@ export async function readPages(read: Reader, path: string, fields: readonly str
   let cursor: Row = {}, pages = 0;
   while (true) {
     const response = await read(path, { limit: 100, ...cursor });
-    const page = Array.isArray(response) ? response : response.items;
+    const page = Array.isArray(response) ? response : response?.items;
+    if (!Array.isArray(page)) throw new TypeError('metadata page must be an array');
     pages++;
     if (!page.length) return [rows, pages];
     for (const row of page) {
+      const selected = pick(row, fields);
+      required(row, 'id');
       if (seen.has(row.id)) throw new Error('pagination repeated an ID; snapshot not published');
       seen.add(row.id);
-      rows.push(pick(row, fields));
+      rows.push(selected);
     }
-    cursor = { before_created_at: page.at(-1).created_at, before_id: page.at(-1).id };
+    cursor = { before_created_at: required(page.at(-1), 'created_at'), before_id: required(page.at(-1), 'id') };
   }
 }
 
@@ -102,7 +112,11 @@ export function metadataReader(base: string, token: string, tenant: string, fetc
     }
     if (!response.ok) throw new MetadataReadError('HTTPError');
     try { return await response.json(); }
-    catch (error) { throw new MetadataReadError(error instanceof SyntaxError ? 'JSONDecodeError' : 'URLError'); }
+    catch (error) {
+      const code = error instanceof SyntaxError ? 'JSONDecodeError'
+        : error instanceof Error && ['TimeoutError', 'AbortError'].includes(error.name) ? 'TimeoutError' : 'URLError';
+      throw new MetadataReadError(code);
+    }
   };
 }
 
@@ -234,6 +248,10 @@ export function publish(outputDir: string, snapshot: Row, report: Row, write = p
 
 class CliArgumentError extends Error {}
 export async function main(argv = process.argv.slice(2)) {
+  if (argv.includes('--help') || argv.includes('-h')) {
+    console.log('Usage: node metadata-refresh.ts --state-dir STATE [--snapshot SNAPSHOT | --base-url URL --context CONTEXT --namespace NAMESPACE --secret SECRET]\nOptions: --secret-key service-token --tenant default --canonical PATH --evidence PATH --output-dir PATH');
+    return;
+  }
   const names = ['snapshot', 'base-url', 'context', 'namespace', 'secret', 'secret-key', 'tenant', 'state-dir', 'canonical', 'evidence', 'output-dir'];
   let args: Record<string, string | undefined>;
   try {

@@ -4,6 +4,8 @@ import { mkdtempSync, readFileSync, statSync, rmSync, existsSync } from 'node:fs
 import { tmpdir } from 'node:os';
 import { join, basename } from 'node:path';
 import test from 'node:test';
+import { spawnSync } from 'node:child_process';
+import { fileURLToPath } from 'node:url';
 import * as m from './metadata-refresh.ts';
 
 function snapshot() {
@@ -108,10 +110,12 @@ test('valid JSON with invalid catalog shape fails before replacing latest', asyn
     const initial = snapshot();
     m.publish(root, initial, m.render(initial, { records: [] }, { entries: [] }));
     const original = readFileSync(join(root, 'latest.json'));
-    await assert.rejects(async () => {
-      const collected = await m.collectMetadata(syntheticReader('{"models":null}'));
-      m.publish(root, collected, m.render(collected, { records: [] }, { entries: [] }));
-    });
+    for (const body of ['{"models":null}', '[]', 'null']) {
+      await assert.rejects(async () => {
+        const collected = await m.collectMetadata(syntheticReader(body));
+        m.publish(root, collected, m.render(collected, { records: [] }, { entries: [] }));
+      });
+    }
     assert.deepEqual(readFileSync(join(root, 'latest.json')), original);
   } finally { rmSync(root, { recursive: true, force: true }); }
 });
@@ -121,8 +125,44 @@ test('known I/O failures preserve safe persisted error classifications', async (
     ['HTTPError', async () => new Response('', { status: 503 })],
     ['URLError', async () => { throw new TypeError('SYNTHETIC_SECRET'); }],
     ['TimeoutError', async () => { throw new DOMException('SYNTHETIC_SECRET', 'TimeoutError'); }],
+    ['TimeoutError', async () => new Response(new ReadableStream({
+      start(controller) { controller.error(new DOMException('SYNTHETIC_SECRET', 'TimeoutError')); },
+    }))],
   ] as const) {
     await assert.rejects(m.metadataReader('https://example.invalid/internal/v1/', 'SYNTHETIC_TOKEN', 'synthetic', fetcher)('upstreams', {}),
       error => error instanceof Error && error.name === name && !error.message.includes('SYNTHETIC_SECRET'));
   }
+});
+
+
+test('CLI help exits zero, argument mistakes exit two without credential output', () => {
+  const script = fileURLToPath(new URL('./metadata-refresh.ts', import.meta.url));
+  for (const args of [['--help'], ['-h']]) {
+    const child = spawnSync(process.execPath, [script, ...args], { encoding: 'utf8' });
+    assert.equal(child.status, 0);
+    assert.match(child.stdout, /Usage:/);
+  }
+  for (const args of [[], ['--unknown'], ['--state-dir']]) {
+    const child = spawnSync(process.execPath, [script, ...args], { encoding: 'utf8' });
+    assert.equal(child.status, 2);
+    assert.equal(JSON.parse(child.stdout).status, 'failed');
+  }
+});
+
+test('invalid pagination shape or missing cursor never replaces latest', async () => {
+  const root = mkdtempSync(join(tmpdir(), 'metadata-pagination-'));
+  try {
+    const initial = snapshot();
+    m.publish(root, initial, m.render(initial, { records: [] }, { entries: [] }));
+    const original = readFileSync(join(root, 'latest.json'));
+    for (const response of [{ items: {} }, { items: { length: 0 } }, {}, null,
+      [{ created_at: 1 }], [{ id: 'synthetic-a' }], [null], [[]], ['not-a-row']]) {
+      await assert.rejects(async () => {
+        const [accounts] = await m.readPages(async () => response, 'upstreams', m.ACCOUNT_FIELDS);
+        const collected = { ...initial, accounts };
+        m.publish(root, collected, m.render(collected, { records: [] }, { entries: [] }));
+      });
+      assert.deepEqual(readFileSync(join(root, 'latest.json')), original);
+    }
+  } finally { rmSync(root, { recursive: true, force: true }); }
 });
