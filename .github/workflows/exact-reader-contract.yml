@@ -41,23 +41,29 @@ jobs:
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
         with:
-          ref: 24480de2c24d52e8593511bdd8a197b130135bd7
+          ref: 11876a2614fd1146a303f86749ac27bac50fb99e
           persist-credentials: false
       - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020
         with:
           node-version: 24.18.0
-      - name: Verify four exact Node shared image contracts
+      - name: Install trusted system BLAKE3 checksum tool
         run: |
           set -euo pipefail
-          test "$(git rev-parse HEAD)" = 24480de2c24d52e8593511bdd8a197b130135bd7
+          sudo apt-get update
+          sudo apt-get install --no-install-recommends -y b3sum
+          b3sum --version
+      - name: Verify six exact Node shared image contracts
+        run: |
+          set -euo pipefail
+          test "$(git rev-parse HEAD)" = 11876a2614fd1146a303f86749ac27bac50fb99e
           node --test --test-reporter=tap tests/ops/image-e2e/image-contract.test.ts 2>&1 | tee "$RUNNER_TEMP/image-proxy-unit.log"
-          grep -Fx '# pass 4' "$RUNNER_TEMP/image-proxy-unit.log"
+          grep -Fx '# pass 6' "$RUNNER_TEMP/image-proxy-unit.log"
           grep -Fx '# fail 0' "$RUNNER_TEMP/image-proxy-unit.log"
           grep -Fx '# skipped 0' "$RUNNER_TEMP/image-proxy-unit.log"
       - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
         if: always()
         with:
-          name: image-contract-24480-four-unit-contracts
+          name: image-contract-11876-six-unit-contracts
           path: ${{ runner.temp }}/image-proxy-unit.log
           if-no-files-found: error
           retention-days: 7
