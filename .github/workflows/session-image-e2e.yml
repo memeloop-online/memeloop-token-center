@@ -72,7 +72,7 @@ jobs:
           docker logs --tail 40 image-e2e-service
           exit 1
       - name: Verify semantic pages, media and tenant isolation
-        run: python3 tests/ops/session-image-e2e/verify.py
+        run: node tests/ops/session-image-e2e/verify.ts
       - name: Safe projection diagnostics
         if: failure()
         run: |

@@ -72,15 +72,15 @@ jobs:
           docker logs --tail 40 image-e2e-service
           exit 1
       - name: Verify stream, request, usage, session and both archives
-        run: python3 tests/ops/image-e2e/verify.py
+        run: node tests/ops/image-e2e/verify.ts
       - name: Verify slow object publication preserves complete stream
         env:
           E2E_FAULT_MODE: slow
-        run: python3 tests/ops/image-e2e/verify.py
+        run: node tests/ops/image-e2e/verify.ts
       - name: Verify unavailable object publication preserves complete stream
         env:
           E2E_FAULT_MODE: fail
-        run: python3 tests/ops/image-e2e/verify.py
+        run: node tests/ops/image-e2e/verify.ts
       - name: Safe diagnostics
         if: failure()
         run: docker ps -a --filter name=image-e2e --format '{{.Names}} {{.Status}}'
