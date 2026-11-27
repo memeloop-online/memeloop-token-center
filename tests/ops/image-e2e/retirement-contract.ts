@@ -89,30 +89,16 @@ export async function verifyPublishedContents(http: any, key: string, sessionId:
   }
   const actual: { role: string; text: string }[] = [];
   for (const instance of instances) {
-    assert.equal(instance.request_id, requestId); let parts = await get('?' + new URLSearchParams({ parts_cursor: instance.atom_cursor })); let text = '';
-    for (;;) {
-      assert.equal(parts.manifest_revision, revision); assert.equal(parts.instance_id, instance.instance_id);
-      for (const part of parts.parts) {
-        assert(!part.media, 'retired image fixture requires explicit media oracle');
-        for (const field of part.fields ?? []) {
-          assert.equal(field.format, 'text'); assert(field.content_cursor); let cursor = field.content_cursor; let offset = 0;
-          for (;;) {
-            const query = '?' + new URLSearchParams({ content_cursor: cursor }); assert(!cursors.has(query)); cursors.add(query); assert(++reads <= 1024);
-            const response = await http.request(path + query, 'GET', undefined, key);
-            const frames = utf8(response.raw).split(/\r?\n/).filter(Boolean).map((line: string) => preciseJson(line)); assert(frames.length);
-            for (const frame of frames) {
-              assert.equal(frame.manifest_revision, revision); assert.equal(frame.instance_id, instance.instance_id); assert.equal(frame.byte_offset, offset);
-              assert.equal(frame.field, field.name); assert.equal(typeof frame.text, 'string'); text += frame.text; offset += Buffer.byteLength(frame.text);
-            }
-            const last = frames.at(-1)!; if (last.complete === true) { assert(!last.next_cursor); break; }
-            assert(last.next_cursor); cursor = last.next_cursor;
-          }
-        }
-      }
-      if (!parts.next_cursor) break;
-      parts = await get('?' + new URLSearchParams({ parts_cursor: parts.next_cursor }));
+    assert.equal(instance.request_id, requestId); assert(typeof instance.atom_cursor === 'string');
+    // Both the fixed image and current API expose this authorized atom reader.
+    // Do not probe unsupported parts parameters or fall back after an error.
+    const atom = await get('?' + new URLSearchParams({ atom_cursor: instance.atom_cursor }));
+    assert.equal(atom.role, instance.role); assert(Array.isArray(atom.parts)); let text = '';
+    for (const [index, part] of atom.parts.entries()) {
+      assert.equal(part.part_index, index); assert.equal(part.kind, 'text'); assert.equal(typeof part.text, 'string');
+      text += part.text;
     }
-    actual.push({ role: parts.role, text });
+    actual.push({ role: atom.role, text });
   }
   assert.deepEqual(actual, expected, 'formal semantic API content differs from synthetic request/response');
 }

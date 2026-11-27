@@ -92,16 +92,14 @@ test('retired raw requires same identity side generation dual sources and comple
   }
 });
 
-test('retired canonical oracle reads formal text and rejects wrong content or cursor stalling', async () => {
+test('retired canonical oracle reads the shared formal atom API and rejects wrong content or cursor stalling', async () => {
   const { verifyPublishedContents } = await import('./retirement-contract.ts');
   const coverage = { observed_terminal: true, projection_state: 'complete', gaps: [] };
   const fixture = (badText = false, stalled = false) => ({ request: async (path: string) => {
     const query = new URL(path, 'http://fixture.invalid').searchParams; let value: any;
-    if (query.has('parts_cursor')) {
-      const id = query.get('parts_cursor'); value = { manifest_revision: '1', instance_id: id, role: id === 'u' ? 'user' : 'assistant', parts: [{ fields: [{ name: 'text', format: 'text', content_cursor: id }] }], next_cursor: stalled ? id : null };
-    } else if (query.has('content_cursor')) {
-      const id = query.get('content_cursor'); value = { manifest_revision: '1', instance_id: id, field: 'text', byte_offset: 0, text: badText ? 'wrong' : id === 'u' ? 'synthetic😀' : 'reply', complete: true, next_cursor: null };
-    } else value = { status: 'published', manifest_revision: '1', coverage, instances: ['u', 'a'].map((id) => ({ request_id: 'request', instance_id: id, atom_cursor: id })) };
+    if (query.has('atom_cursor')) {
+      const id = query.get('atom_cursor'); value = { role: id === 'u' ? 'user' : 'assistant', parts: [{ part_index: 0, kind: 'text', text: badText ? 'wrong' : id === 'u' ? 'synthetic😀' : 'reply' }] };
+    } else value = { status: 'published', manifest_revision: '1', coverage, next_cursor: stalled ? 'same-page' : null, instances: ['u', 'a'].map((id) => ({ request_id: 'request', instance_id: id, atom_cursor: id, role: id === 'u' ? 'user' : 'assistant' })) };
     return { raw: Buffer.from(JSON.stringify(value) + '\n') };
   } });
   const expected = [{ role: 'user', text: 'synthetic😀' }, { role: 'assistant', text: 'reply' }];
