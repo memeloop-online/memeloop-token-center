@@ -41,7 +41,7 @@ jobs:
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
         with:
-          ref: 11876a2614fd1146a303f86749ac27bac50fb99e
+          ref: 74e5a6e42088b815cdc5f028e7d4b4f166d8ba65
           persist-credentials: false
       - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020
         with:
@@ -55,7 +55,7 @@ jobs:
       - name: Verify six exact Node shared image contracts
         run: |
           set -euo pipefail
-          test "$(git rev-parse HEAD)" = 11876a2614fd1146a303f86749ac27bac50fb99e
+          test "$(git rev-parse HEAD)" = 74e5a6e42088b815cdc5f028e7d4b4f166d8ba65
           node --test --test-reporter=tap tests/ops/image-e2e/image-contract.test.ts 2>&1 | tee "$RUNNER_TEMP/image-proxy-unit.log"
           grep -Fx '# pass 6' "$RUNNER_TEMP/image-proxy-unit.log"
           grep -Fx '# fail 0' "$RUNNER_TEMP/image-proxy-unit.log"
@@ -63,7 +63,7 @@ jobs:
       - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
         if: always()
         with:
-          name: image-contract-11876-six-unit-contracts
+          name: image-contract-74e5-six-unit-contracts
           path: ${{ runner.temp }}/image-proxy-unit.log
           if-no-files-found: error
           retention-days: 7
