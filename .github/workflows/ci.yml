@@ -688,6 +688,7 @@ jobs:
             # changes, on an empty smoke database. Keep the boundary fixed so the
             # upgrade still exercises history activation as migrations advance.
             sql 'BEGIN;
+              DROP TABLE upstream_oauth_rejected_generations;
               ALTER TABLE request_history_baseline_runs DROP COLUMN read_model_version;
               ALTER TABLE request_history_baseline_runs DROP COLUMN activation_epoch;
               ALTER TABLE request_history_baseline_runs DROP COLUMN chunk_count;
