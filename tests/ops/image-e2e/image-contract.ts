@@ -3,6 +3,7 @@ import assert from 'node:assert/strict';
 import { createHash, randomUUID } from 'node:crypto';
 import { readFileSync } from 'node:fs';
 import { setTimeout as delay } from 'node:timers/promises';
+import { exactFixtureMetadata, fixtureIdentity, verifyPublishedContents, verifyRetirementProof } from './retirement-contract.ts';
 
 type Value = Record<string, any>;
 export class HttpFailure extends Error {
@@ -72,12 +73,15 @@ export async function runImageContract(options: { messages?: (nonce: string) => 
   const upstream = await http.post('/internal/v1/upstreams', { tenant_external_id: tenant, name: model, driver: 'http-json', config: { base_url: 'http://127.0.0.1:18082/scenario/normal', network_scope: 'private' }, credential: { type: 'none' } });
   const route = await http.post('/internal/v1/model-routes', { tenant_external_id: tenant, public_model: model, upstream_account_id: upstream.id, upstream_model: model, protocol: 'openai', priority: 0, custom_model_confirmed: true });
   await http.post(`/internal/v1/prices/USD/${model}`, { input_per_million: '0.01', output_per_million: '0.02' });
-  const key = (await http.post('/internal/v1/keys', { tenant_external_id: tenant, principal_external_id: tenant, alias: 'isolated image e2e', currency: 'USD', initial_balance: '100', route_ids: [route.id], policy: keyPolicy })).key as string;
+  const issued = (await http.post('/internal/v1/keys', { tenant_external_id: tenant, principal_external_id: tenant, alias: 'isolated image e2e', currency: 'USD', initial_balance: '100', route_ids: [route.id], policy: keyPolicy }));
+  const key = issued.key as string;
+  const messages = options.messages?.(nonce) ?? [{ role: 'user', content: `synthetic image e2e ${nonce}` }];
+  const requestWire = JSON.stringify({ model, messages, stream: true, max_tokens: 1, benchmark: { mode: 'stream', bytes: 4096, chunk_bytes: 4096, delay_ms: 0 } });
   const fault = client('http://127.0.0.1:19001', '');
   const mode = process.env.E2E_FAULT_MODE ?? 'normal';
   if (mode !== 'normal') await fault.request(`/__test__/${mode}`);
   // This is the real authenticated HTTP request, not a fabricated archive row.
-  const response = await fetch('http://127.0.0.1:18080/v1/chat/completions', { method: 'POST', headers: { authorization: `Bearer ${key}`, 'content-type': 'application/json', 'x-mtc-conversation-id': session, 'accept-encoding': 'identity' }, body: JSON.stringify({ model, messages: options.messages?.(nonce) ?? [{ role: 'user', content: `synthetic image e2e ${nonce}` }], stream: true, max_tokens: 1, benchmark: { mode: 'stream', bytes: 4096, chunk_bytes: 4096, delay_ms: 0 } }), signal: AbortSignal.timeout(60_000) });
+  const response = await fetch('http://127.0.0.1:18080/v1/chat/completions', { method: 'POST', headers: { authorization: `Bearer ${key}`, 'content-type': 'application/json', 'x-mtc-conversation-id': session, 'accept-encoding': 'identity' }, body: requestWire, signal: AbortSignal.timeout(60_000) });
   const requestId = response.headers.get('x-mtc-request-id'); const body = Buffer.from(await response.arrayBuffer());
   assert.equal(response.status, 200); assert(requestId); verifyStream(body);
   if (mode !== 'normal') {
@@ -100,17 +104,20 @@ export async function runImageContract(options: { messages?: (nonce: string) => 
   assert(record, 'request terminal, usage and archive did not converge'); assert.equal(record.request_id, requestId);
   assert.equal(record.usage.tokens.input_tokens, 2); assert.equal(record.usage.tokens.output_tokens, 1);
   const archives = {} as Record<'request' | 'response', Buffer>;
+  const retired: ('request' | 'response')[] = [];
   for (const side of ['request', 'response'] as const) {
     let result;
     try { result = await http.request(`/self/v1/requests/${requestId}/archive/${side}`, 'GET', undefined, key); }
     catch (error) {
       if (error instanceof HttpFailure) evidence({ phase: 'archive_get_failed', request_id: requestId, side, status: error.status, error_code: error.code, reason: error.reason, observed_at: new Date().toISOString() });
+      if (error instanceof HttpFailure && error.status === 409 && error.code === 'archive_content_unavailable' && error.reason === 'raw_retired_semantic_archive') { retired.push(side); continue; }
       throw error;
     }
     assert.equal(result.status, 200); assert(result.raw.length); archives[side] = result.raw;
     evidence({ request_id: requestId, side, status: result.status, bytes: result.raw.length, sha256: sha256(result.raw) });
   }
-  verifyArchiveCopies(nonce, body, archives);
+  if (archives.request) assert.deepEqual(archives.request, Buffer.from(requestWire));
+  if (archives.response) assert.deepEqual(archives.response, body);
   let matched: string[] = [], listing: Value = {}, sessionStatus = 0;
   for (let attempt = 0; attempt < 90; attempt++) {
     listing = object((await http.request('/self/v1/sessions?limit=100', 'GET', undefined, key)).raw); matched = [];
@@ -125,6 +132,24 @@ export async function runImageContract(options: { messages?: (nonce: string) => 
     await delay(2000);
   }
   if (matched.length !== 1) { evidence({ session_list_count: listing.sessions?.length, matching_request_count: matched.length, request_id: requestId, worker_role: 'all' }); throw new Error('same request did not appear in session projection'); }
+  if (retired.length) {
+    const identity = fixtureIdentity(requestId, issued.key_id);
+    const authority = record.semantic_archive; assert(authority, 'retired raw lacks authorized semantic authority');
+    const revision = authority.manifest_revision, leaf = authority.semantic_head?.node_hash;
+    assert(typeof revision === 'string' && /^[1-9][0-9]*$/.test(revision));
+    const prefix = `tenants/${identity.tenant_id}/semantic/v2/requests/${requestId}/`;
+    const publication = exactFixtureMetadata(`${prefix}${revision}.json`);
+    const receipt = exactFixtureMetadata(`${prefix}${revision}-coverage.json`);
+    const manifest = exactFixtureMetadata(publication.manifest.object_locator);
+    const scope = { ...identity, revision, leaf, lengths: { request: Buffer.byteLength(requestWire), response: body.length } };
+    for (const side of retired) verifyRetirementProof(scope, side, exactFixtureMetadata(`${prefix}retired-${side}.json`), receipt, publication, manifest);
+    const expected = messages.map((message) => { assert.equal(typeof message.content, 'string'); return { role: message.role, text: message.content }; });
+    const assistant = decode(body).trim().split('\n\n').filter((frame) => frame.startsWith('data: ') && frame !== 'data: [DONE]').map((frame) => JSON.parse(frame.slice(6))).flatMap((frame) => frame.choices ?? []).map((choice) => choice.delta?.content ?? '').join('');
+    expected.push({ role: 'assistant', text: assistant });
+    await verifyPublishedContents(http, key, matched[0], requestId, revision, expected);
+    fixtureIdentity(requestId, issued.key_id); // Recheck SQL ownership/one charge after the full user-facing read.
+    evidence({ phase: 'retired_archive_verified', request_id: requestId, sides: retired, revision, dual_source_receipts: true, formal_content_exact: true, upstream_count: 1, ledger_count: 1 });
+  }
   evidence({ request_id: requestId, session_status: sessionStatus, usage: record.usage, archive_complete: true });
   return { http, nonce, key, requestId, sessionId: matched[0] };
 }

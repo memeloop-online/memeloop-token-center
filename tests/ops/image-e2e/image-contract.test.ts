@@ -59,3 +59,33 @@ test('shared HTTP client preserves authorization status errors and complete resp
     for (const payload of ['invalid-json', JSON.stringify({ error: { code: 'untrusted secret', reason: 'untrusted secret' } }), 'x'.repeat(4097)]) assert.deepEqual(await errorFacts(new Response(payload)), { code: 'unknown', reason: 'unknown' });
   } finally { server.closeAllConnections(); await new Promise<void>((resolve) => server.close(() => resolve())); }
 });
+
+test('retired raw requires same identity side generation dual sources and complete manifest', async () => {
+  const { preciseJson, verifyRetirementProof } = await import('./retirement-contract.ts');
+  const tenant = '11111111-1111-4111-8111-111111111111', request = '22222222-2222-4222-8222-222222222222';
+  const hash = 'a'.repeat(64), leaf = 'b'.repeat(64), revision = '18446744073709551614';
+  assert.equal(preciseJson(`{"revision":${revision}}`).revision, revision);
+  const source = { object_locator: `tenants/${tenant}/cas/v1/blake3/aa/${hash}`, blake3_digest: hash, size_bytes: 32 };
+  const coverage = { observed_terminal: true, projection_state: 'complete', gaps: [], omissions: [] };
+  const scope = { tenant_id: tenant, request_id: request, leaf, revision, lengths: { request: 32, response: 32 } };
+  const publication = { format_version: 2, tenant_id: tenant, request_id: request, revision, projection_version: 2, manifest: source };
+  const manifest = { ...publication, semantic_head: { node_hash: leaf }, coverage, raw_sources: { request: source, response: source } };
+  const receipt = { format_version: 2, publication, binding: { tenant_id: tenant, request_id: request, node_hash: leaf, projected_at: 1 }, coverage, raw_sources: manifest.raw_sources };
+  const fence = { format_version: 1, tenant_id: tenant, request_id: request, side: 'request', source, semantic_revision: revision, semantic_leaf: leaf, release_generation: request };
+  verifyRetirementProof(scope, 'request', fence, receipt, publication, manifest);
+  for (const mutate of [
+    (v: any) => v.fence.side = 'response',
+    (v: any) => v.fence.tenant_id = request,
+    (v: any) => v.fence.semantic_revision = '1',
+    (v: any) => v.fence.semantic_leaf = hash,
+    (v: any) => v.fence.release_generation = '00000000-0000-0000-0000-000000000000',
+    (v: any) => v.fence.source.blake3_digest = leaf,
+    (v: any) => v.receipt.raw_sources.response.size_bytes = 31,
+    (v: any) => v.manifest.coverage.gaps = ['missing'],
+    (v: any) => v.receipt.coverage.projection_state = 'partial',
+    (v: any) => v.manifest.semantic_head.node_hash = hash,
+  ]) {
+    const value = structuredClone({ fence, receipt, publication, manifest }); mutate(value);
+    assert.throws(() => verifyRetirementProof(scope, 'request', value.fence, value.receipt, value.publication, value.manifest));
+  }
+});
