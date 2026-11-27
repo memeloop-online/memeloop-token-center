@@ -880,8 +880,7 @@ SELECT bucket_kind, name, day_bucket, requests, successful_requests,
         let mut errors = Vec::new();
         for ((bucket_kind, raw_name, day_bucket), accumulator) in projections {
             let name = if bucket_kind == "day" {
-                chrono::DateTime::from_timestamp(day_bucket.saturating_mul(86_400), 0)
-                    .map(|value| value.format("%Y-%m-%d").to_string())
+                super::super::time::format_legacy_stats_day(day_bucket)
                     .unwrap_or_else(|| "unknown".to_owned())
             } else {
                 raw_name

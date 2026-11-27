@@ -68,7 +68,7 @@ async fn unary_with_rejection(
     method: Method,
     rejection: Option<(uuid::Uuid, i64)>,
 ) -> Result<Vec<u8>, &'static str> {
-    let now = chrono::Utc::now().timestamp_millis();
+    let now = crate::db::unix_millis();
     credential.validate(now).map_err(|_| "credential_invalid")?;
     crate::oauth::cursor_account_id(credential).map_err(|_| "credential_invalid")?;
     let UpstreamCredential::OAuth { access_token, .. } = credential else {

@@ -1982,12 +1982,8 @@ async fn postgres_partition_maintenance_skips_default_overlap_and_continues() {
             .unwrap();
     }
 
-    let today = Utc::now().date_naive();
-    let today_start = today
-        .and_hms_opt(0, 0, 0)
-        .unwrap()
-        .and_utc()
-        .timestamp_millis();
+    let today = crate::db::time::utc_day_from_millis(unix_millis()).unwrap();
+    let today_start = crate::db::time::utc_midnight_millis(today).unwrap();
     sqlx::query(
         "INSERT INTO request_records_default (id, created_at, payload) VALUES ($1, $2, $3)",
     )
@@ -2007,7 +2003,10 @@ async fn postgres_partition_maintenance_skips_default_overlap_and_continues() {
         report.blocked_partitions,
         vec![BlockedPartition {
             table: "request_records".to_owned(),
-            partition: format!("request_records_{}", today.format("%Y%m%d")),
+            partition: format!(
+                "request_records_{}",
+                crate::db::time::format_utc_day(today, true).unwrap()
+            ),
             day: today,
         }]
     );
@@ -2027,9 +2026,12 @@ async fn postgres_partition_maintenance_skips_default_overlap_and_continues() {
             .ends_with("request_records_default")
     );
 
-    let tomorrow = today.checked_add_days(Days::new(1)).unwrap();
+    let tomorrow = crate::db::time::utc_day_add(today, 1).unwrap();
     for table in ["request_records", "request_events"] {
-        let expected = format!("{table}_{}", tomorrow.format("%Y%m%d"));
+        let expected = format!(
+            "{table}_{}",
+            crate::db::time::format_utc_day(tomorrow, true).unwrap()
+        );
         let created: Option<String> = sqlx::query_scalar("SELECT to_regclass($1)::TEXT")
             .bind(format!("{schema}.{expected}"))
             .fetch_one(&mut *transaction)
