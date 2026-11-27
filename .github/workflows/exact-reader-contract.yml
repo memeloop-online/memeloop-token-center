@@ -37,35 +37,54 @@ jobs:
   metadata-refresh-contract:
     if: inputs.contract == 'metadata-refresh'
     runs-on: ubuntu-24.04
-    timeout-minutes: 10
+    timeout-minutes: 40
+    env:
+      CARGO_BUILD_JOBS: "2"
+      CARGO_INCREMENTAL: "0"
+      CARGO_PROFILE_DEV_DEBUG: "0"
+      CARGO_PROFILE_TEST_DEBUG: "0"
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
         with:
-          ref: 74e5a6e42088b815cdc5f028e7d4b4f166d8ba65
+          ref: 67181e2730529677ea0f17a495d30db6a87637f9
           persist-credentials: false
+      - uses: dtolnay/rust-toolchain@4360b52568e2003a75bf9bc1d59f33a8e3fc893c
+        with:
+          toolchain: 1.95.0
+          targets: wasm32-unknown-unknown
       - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020
         with:
           node-version: 24.18.0
-      - name: Install trusted system BLAKE3 checksum tool
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6
+        with:
+          shared-key: memory-release
+      - uses: ./.github/actions/checkout-plugin-examples
+      - name: Verify three exact history transport contracts
         run: |
           set -euo pipefail
-          sudo apt-get update
-          sudo apt-get install --no-install-recommends -y b3sum
-          b3sum --version
-      - name: Verify six exact Node shared image contracts
-        run: |
-          set -euo pipefail
-          test "$(git rev-parse HEAD)" = 74e5a6e42088b815cdc5f028e7d4b4f166d8ba65
-          node --test --test-reporter=tap tests/ops/image-e2e/image-contract.test.ts 2>&1 | tee "$RUNNER_TEMP/image-proxy-unit.log"
-          grep -Fx '# pass 6' "$RUNNER_TEMP/image-proxy-unit.log"
-          grep -Fx '# fail 0' "$RUNNER_TEMP/image-proxy-unit.log"
-          grep -Fx '# skipped 0' "$RUNNER_TEMP/image-proxy-unit.log"
+          test "${{ inputs.source_revision }}" = 67181e2730529677ea0f17a495d30db6a87637f9
+          test "$(git rev-parse HEAD)" = 67181e2730529677ea0f17a495d30db6a87637f9
+          git rev-parse HEAD
+          mkdir -p "$RUNNER_TEMP/history-transport"
+          failures=0
+          while IFS='|' read -r target selector; do
+            log="$RUNNER_TEMP/history-transport/${selector//::/_}.log"
+            args=(--lib)
+            if [ "$target" = cli ]; then args=(--test request_history_cli); fi
+            if ! cargo test --locked "${args[@]}" "$selector" -- --exact --nocapture 2>&1 | tee "$log"; then failures=1; fi
+            if ! grep -E '^test result: ok\. 1 passed; 0 failed; 0 ignored;' "$log"; then failures=1; fi
+          done <<'SELECTORS'
+          lib|request_history::clickhouse::transport_probe_tests::request_history_transport_diagnostic_excludes_dynamic_error_content
+          lib|request_history::clickhouse::transport_probe_tests::request_history_transport_probe_is_fixed_read_only_and_rejects_wrong_rows
+          cli|request_history_cli_transport_probe_uses_bootstrap_admin_identity
+          SELECTORS
+          exit "$failures"
       - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
         if: always()
         with:
-          name: image-contract-74e5-six-unit-contracts
-          path: ${{ runner.temp }}/image-proxy-unit.log
-          if-no-files-found: error
+          name: history-transport-67181-three-exact
+          path: ${{ runner.temp }}/history-transport/
+          if-no-files-found: warn
           retention-days: 7
 
   orphan-reaper-contract:
