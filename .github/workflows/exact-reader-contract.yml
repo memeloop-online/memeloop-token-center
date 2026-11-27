@@ -39,23 +39,28 @@ jobs:
     timeout-minutes: 120
     permissions:
       contents: read
-    outputs:
-      oci_artifact: ${{ steps.oci.outputs.artifact-id }}
-      oci_digest: ${{ steps.oci.outputs.artifact-digest }}
+      actions: read
     env:
-      CANDIDATE_SHA: 58f8288be9d57591611d28200978935bbee1e3c1
+      CANDIDATE_SHA: cf816a0ade6689591a30ee726929ceaa2e29aea0
+      BASE_RUNTIME_SHA: 58f8288be9d57591611d28200978935bbee1e3c1
+      ARTIFACT_ID: "15172646870"
+      SOURCE_RUN_ID: "45940213018"
+      ARTIFACT_DIGEST: 2edc4a022cd90b5f750d033ad88c933e7238ee47da276163c238d05d2cf5ddd8
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
         with:
-          ref: 58f8288be9d57591611d28200978935bbee1e3c1
+          ref: cf816a0ade6689591a30ee726929ceaa2e29aea0
           persist-credentials: false
       - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020
         with:
           node-version: 24.18.0
       - name: Verify fixed Stage-only source
         id: source
+        env:
+          EXPECTED_SOURCE: ${{ inputs.source_revision }}
         run: |
           set -euo pipefail
+          test "$EXPECTED_SOURCE" = "$CANDIDATE_SHA"
           test "$(git rev-parse HEAD)" = "$CANDIDATE_SHA"
           git rev-parse HEAD
           echo "timestamp=$(git show -s --format=%cI HEAD)" >> "$GITHUB_OUTPUT"
@@ -98,96 +103,13 @@ jobs:
           printf '%s\n' "$CANDIDATE_SHA" > source.txt
       - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
         with:
-          name: stage-smoke-pending-joint58f-sealed-input
+          name: maintenance-cf816-smoke-pending-sealed-input
           path: ${{ runner.temp }}/sealed-package/
           if-no-files-found: error
           retention-days: 3
-      - name: Assemble one Stage-only OCI archive without publishing
-        uses: docker/build-push-action@10e90e3645eae34f1e60eeb005ba3a3d33f178e8
-        with:
-          context: .
-          file: Dockerfile.release
-          platforms: linux/amd64
-          push: false
-          outputs: type=oci,dest=${{ runner.temp }}/stage-test-oci/service-joint58f.oci.tar
-          build-contexts: |
-            release-input=${{ runner.temp }}/sealed-input
-          labels: |
-            org.opencontainers.image.revision=${{ env.CANDIDATE_SHA }}
-            org.opencontainers.image.source=https://github.com/memeloop-online/memeloop-token-center
-            io.memeloop.artifact-purpose=stage-test-only
-          provenance: mode=max
-          sbom: true
-          cache-from: type=gha,scope=service
-      - name: Verify original OCI graph and immutable runtime identity
-        run: |
-          set -euo pipefail
-          python3 - <<'PY'
-          import hashlib,json,os,pathlib,tarfile
-          root=pathlib.Path(os.environ['RUNNER_TEMP'])/'stage-test-oci'
-          archive=root/'service-joint58f.oci.tar'
-          with tarfile.open(archive) as tar:
-              members={m.name.removeprefix('./'):m for m in tar.getmembers() if m.isfile()}
-              def read(name):
-                  f=tar.extractfile(members[name])
-                  if f is None: raise RuntimeError('missing OCI file')
-                  return f.read()
-              index=read('index.json'); (root/'index.json').write_bytes(index)
-              verified=set(); platforms=[]
-              def visit(d):
-                  digest=d['digest']; alg,h=digest.split(':',1)
-                  if alg!='sha256': raise RuntimeError('unsupported digest')
-                  raw=read('blobs/sha256/'+h)
-                  if len(raw)!=d['size'] or hashlib.sha256(raw).hexdigest()!=h: raise RuntimeError('OCI descriptor mismatch')
-                  if digest in verified:return
-                  verified.add(digest)
-                  if 'manifest' in d.get('mediaType','') or 'index' in d.get('mediaType',''):
-                      obj=json.loads(raw)
-                      for child in obj.get('manifests',[]):visit(child)
-                      if 'config' in obj:
-                          visit(obj['config'])
-                          for child in obj.get('layers',[]):visit(child)
-                          config=json.loads(read('blobs/sha256/'+obj['config']['digest'].split(':')[1]))
-                          if config.get('os')=='linux' and config.get('architecture')=='amd64':
-                              if config.get('config',{}).get('Labels',{}).get('org.opencontainers.image.revision')!=os.environ['CANDIDATE_SHA']:raise RuntimeError('revision mismatch')
-                              platforms.append((digest,obj['config']['digest']))
-              for d in json.loads(index)['manifests']:visit(d)
-              if len(platforms)!=1:raise RuntimeError('expected exactly one linux/amd64 runtime')
-              manifest,config=platforms[0]
-              evidence={'purpose':'stage-test-only','source':os.environ['CANDIDATE_SHA'],'run':os.environ['GITHUB_RUN_ID'],'index_digest':'sha256:'+hashlib.sha256(index).hexdigest(),'manifest_digest':manifest,'config_digest':config,'platform':'linux/amd64','descriptors':len(verified)}
-              (root/'oci-identity.json').write_text(json.dumps(evidence,indent=2)+'\n')
-              (root/'expected-config.txt').write_text(config+'\n')
-          h=hashlib.sha256()
-          with archive.open('rb') as f:
-              for chunk in iter(lambda:f.read(1024*1024),b''):h.update(chunk)
-          (root/'SHA256SUMS').write_text(h.hexdigest()+'  service-joint58f.oci.tar\n')
-          print(json.dumps(evidence))
-          PY
-          printf '%s\n' smoke_pending > "$RUNNER_TEMP/stage-test-oci/status.txt"
-      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
-        id: oci
-        with:
-          name: stage-smoke-pending-joint58f-verified-oci
-          path: ${{ runner.temp }}/stage-test-oci/
-          if-no-files-found: error
-          retention-days: 3
-
-  joint58f-native-smoke:
-    needs: metadata-refresh-contract
-    if: inputs.contract == 'metadata-refresh'
-    runs-on: ubuntu-latest
-    timeout-minutes: 20
-    permissions:
-      contents: read
-      actions: read
-    env:
-      CANDIDATE_SHA: 58f8288be9d57591611d28200978935bbee1e3c1
-      ARTIFACT_ID: ${{ needs.metadata-refresh-contract.outputs.oci_artifact }}
-      SOURCE_RUN_ID: ${{ github.run_id }}
-      ARTIFACT_DIGEST: ${{ needs.metadata-refresh-contract.outputs.oci_digest }}
-      GH_TOKEN: ${{ github.token }}
-    steps:
-      - name: Retrieve only the same-run exact verified OCI artifact
+      - name: Retrieve the exact approved original 58f runtime artifact
+        env:
+          GH_TOKEN: ${{ github.token }}
         run: |
           set -euo pipefail
           mkdir -p "$RUNNER_TEMP/native-smoke"
@@ -224,7 +146,8 @@ jobs:
           import gzip,hashlib,io,json,os,pathlib,subprocess,tarfile
           root=pathlib.Path(os.environ['RUNNER_TEMP'])/'native-smoke'; archive=root/'oci/service-joint58f.oci.tar'
           evidence=json.loads((root/'oci/oci-identity.json').read_text())
-          if evidence['source']!=os.environ['CANDIDATE_SHA'] or evidence['run']!=os.environ['SOURCE_RUN_ID'] or evidence['platform']!='linux/amd64':raise SystemExit('OCI source/run/platform mismatch')
+          if evidence['index_digest']!='sha256:12cfaf258c543e42394a239bb46fc7be256903e3c39ac67835511429dea0c5a6' or evidence['manifest_digest']!='sha256:e9025d5b380bd96d556e9be36c3b665465003bc5d3d6122db13796f1b31320ca' or evidence['config_digest']!='sha256:028f4fd3733fae62a26ef445929c6b012ae7d8345b5d91a9f0c1f417da801f51':raise SystemExit('fixed original runtime digest mismatch')
+          if evidence['source']!=os.environ['BASE_RUNTIME_SHA'] or evidence['run']!=os.environ['SOURCE_RUN_ID'] or evidence['platform']!='linux/amd64':raise SystemExit('OCI source/run/platform mismatch')
           def ctr(*args):
               cmd=['sudo','ctr','-n','joint58f-smoke',*args]
               if args!=('tasks','start','joint58f-plugin-runtime'):
@@ -264,7 +187,7 @@ jobs:
               manifest=json.loads(read('blobs/sha256/'+evidence['manifest_digest'].split(':')[1]))
               if manifest['config']['digest']!=evidence['config_digest']:raise SystemExit('manifest/config binding mismatch')
               config=json.loads(read('blobs/sha256/'+evidence['config_digest'].split(':')[1]))
-              if config.get('os')!='linux' or config.get('architecture')!='amd64' or config['config']['Labels']['org.opencontainers.image.revision']!=os.environ['CANDIDATE_SHA']:raise SystemExit('runtime config mismatch')
+              if config.get('os')!='linux' or config.get('architecture')!='amd64' or config['config']['Labels']['org.opencontainers.image.revision']!=os.environ['BASE_RUNTIME_SHA']:raise SystemExit('runtime config mismatch')
               diffs=config['rootfs']['diff_ids']
               if len(diffs)!=len(manifest['layers']):raise SystemExit('rootfs count mismatch')
               for layer,expected in zip(manifest['layers'],diffs):
@@ -304,24 +227,71 @@ jobs:
           for d in diffs[1:]:chain='sha256:'+hashlib.sha256((chain+' '+d).encode()).hexdigest()
           drop_caps=['CAP_CHOWN','CAP_DAC_OVERRIDE','CAP_FSETID','CAP_FOWNER','CAP_MKNOD','CAP_NET_RAW','CAP_SETGID','CAP_SETUID','CAP_SETFCAP','CAP_SETPCAP','CAP_NET_BIND_SERVICE','CAP_SYS_CHROOT','CAP_KILL','CAP_AUDIT_WRITE']
           cap_args=[arg for cap in drop_caps for arg in ['--cap-drop',cap]]
-          for suffix,args in [('help',['--help']),('plugin-runtime',['verify-plugin-runtime'])]:
-              cid='joint58f-'+suffix
-              temp_args=['--mount','type=tmpfs,src=tmpfs,dst=/tmp,options=rw:nosuid:nodev:noexec:mode=1777:size=16m'] if suffix=='plugin-runtime' else []
-              ctr('containers','create','--snapshotter','overlayfs','--read-only','--user','10001:10001',*temp_args,*cap_args,image,cid,'/usr/local/bin/memeloop-token-center',*args)
-              info=json.loads(ctr('containers','info',cid))
-              if info['Image']!=image:raise SystemExit('container image binding mismatch')
-              snap=json.loads(ctr('snapshots','--snapshotter','overlayfs','info',info['SnapshotKey']))
-              if snap.get('Parent')!=chain:raise SystemExit('container rootfs chain mismatch')
-              spec=info['Spec']
-              if not spec['process'].get('noNewPrivileges') or any(spec['process'].get('capabilities',{}).values()):raise SystemExit('container capability/privilege isolation mismatch')
-              if not spec['root']['readonly'] or spec['process']['user']['uid']!=10001 or not any(n['type']=='network' and not n.get('path') for n in spec['linux']['namespaces']):raise SystemExit('container isolation mismatch')
-              temporary=[m for m in spec['mounts'] if m['destination']=='/tmp']
-              if suffix=='plugin-runtime' and (len(temporary)!=1 or temporary[0]['type']!='tmpfs' or temporary[0]['source']!='tmpfs' or not {'rw','nosuid','nodev','noexec','mode=1777','size=16m'}.issubset(set(temporary[0]['options']))):raise SystemExit('private bounded temporary mount mismatch')
-              if suffix=='help' and temporary:raise SystemExit('help runtime changed temporary mounts')
-              (root/(suffix+'-container.json')).write_text(json.dumps(info,indent=2))
-              output=ctr('tasks','start',cid)
-              (root/(suffix+'.txt')).write_bytes(output)
-              ctr('containers','delete',cid)
+          # The candidate release-input bytes are mounted read-only into the original runtime.
+          binary=pathlib.Path(os.environ['RUNNER_TEMP'])/'sealed-input/memeloop-token-center'
+          binary_sha=hashlib.sha256(binary.read_bytes()).hexdigest()
+          maintenance=root/'maintenance';maintenance.mkdir();maintenance.chmod(0o755)
+          subprocess.check_call(['cp',str(binary),str(maintenance/'service')]);(maintenance/'service').chmod(0o555)
+          work=root/'work';work.mkdir();work.chmod(0o700);subprocess.check_call(['sudo','chown','10001:10001',str(work)])
+          ns='cf816-maintenance'
+          subprocess.check_call(['sudo','ip','netns','add',ns])
+          subprocess.check_call(['sudo','ip','-n',ns,'link','set','lo','up'])
+          mock=root/'mock.py'
+          mock.write_text('import http.server,json,pathlib,sys\nclass Handler(http.server.BaseHTTPRequestHandler):\n def log_message(self,*args):pass\n def handle_one_request(self):\n  self.recorded=False\n  return super().handle_one_request()\n def record(self,valid):\n  p=pathlib.Path(sys.argv[1]);x=json.loads(p.read_text()) if p.exists() else {\'total\':0,\'valid\':0}\n  x[\'total\']+=1;x[\'valid\']+=int(valid);p.write_text(json.dumps(x));self.recorded=True\n def send_error(self,*args,**kwargs):\n  if not self.recorded:self.record(False)\n  return super().send_error(*args,**kwargs)\n def do_POST(self):\n  body=self.rfile.read(int(self.headers.get(\'Content-Length\',\'0\')))\n  good=self.path==\'/\' and body==b\'SELECT 1 AS ok FORMAT JSONEachRow\' and self.headers.get(\'Authorization\')==\'Basic YWRtaW46YWRtaW4tcGFzc3dvcmQ=\' and self.headers.get(\'X-ClickHouse-Database\')==\'synthetic\'\n  self.record(good)\n  if not good:self.send_error(400);return\n  self.send_response(200);self.end_headers();self.wfile.write(b\'{"ok":1}\\n\')\nhttp.server.HTTPServer((\'127.0.0.1\',18123),Handler).serve_forever()\n')
+          count=root/'mock-count.txt'
+          server=subprocess.Popen(['sudo','ip','netns','exec',ns,'python3',str(mock),str(count)])
+          import time
+          for _ in range(100):
+              probe=subprocess.run(['sudo','ip','netns','exec',ns,'python3','-c',"import socket;s=socket.create_connection(('127.0.0.1',18123),.1);s.close()"],capture_output=True)
+              if probe.returncode==0:break
+              time.sleep(.05)
+          else:raise SystemExit('isolated synthetic mock not ready')
+          namespace='/run/netns/'+ns
+          envs={'LD_LIBRARY_PATH':'/usr/local/lib','GLIBC_TUNABLES':'glibc.malloc.mmap_threshold=65536','MTC_KEY_PEPPER':'test-pepper-must-have-at-least-32-bytes','MTC_SERVICE_TOKEN':'s'*32,'MTC_DATABASE_URL':'sqlite:///work/probe.db?mode=rwc','MTC_ARCHIVE_BACKEND':'filesystem','MTC_ARCHIVE_PATH':'/work/must-not-initialize-archive','MTC_REQUEST_HISTORY_URL':'http://127.0.0.1:18123','MTC_REQUEST_HISTORY_DATABASE':'synthetic','MTC_REQUEST_HISTORY_ADMIN_USER':'admin','MTC_REQUEST_HISTORY_ADMIN_PASSWORD':'admin-password','MTC_REQUEST_HISTORY_WRITER_USER':'different-writer','MTC_REQUEST_HISTORY_WRITER_PASSWORD':'different-writer-password','MTC_REQUEST_HISTORY_USER':'different-fallback','MTC_REQUEST_HISTORY_PASSWORD':'different-fallback-password'}
+          env_args=[v for k,val in envs.items() for v in ['--env',k+'='+val]]
+          try:
+              for suffix,args in [('maintenance-migrate',['migrate']),('maintenance-help',['--help']),('maintenance-probe',['request-history','probe-transport'])]:
+                  cid='joint58f-'+suffix
+                  mounts=['--mount','type=bind,src='+str(maintenance)+',dst=/maintenance,options=rbind:ro','--mount','type=bind,src='+str(work)+',dst=/work,options=rbind:rw']
+                  ctr('containers','create','--snapshotter','overlayfs','--read-only','--user','10001:10001','--with-ns','network:'+namespace,*mounts,*env_args,*cap_args,image,cid,'/maintenance/service',*args)
+                  info=json.loads(ctr('containers','info',cid));spec=info['Spec']
+                  snap=json.loads(ctr('snapshots','--snapshotter','overlayfs','info',info['SnapshotKey']))
+                  if info['Image']!=image or snap.get('Parent')!=chain:raise SystemExit('maintenance original runtime chain mismatch')
+                  if not spec['root']['readonly'] or spec['process']['user']['uid']!=10001 or not spec['process'].get('noNewPrivileges') or any(spec['process'].get('capabilities',{}).values()):raise SystemExit('maintenance runtime isolation mismatch')
+                  networks=[n for n in spec['linux']['namespaces'] if n['type']=='network']
+                  if len(networks)!=1 or networks[0].get('path')!=namespace:raise SystemExit('maintenance network is not isolated mock namespace')
+                  bind=[m for m in spec['mounts'] if m['destination']=='/maintenance']
+                  if len(bind)!=1 or bind[0]['source']!=str(maintenance) or 'ro' not in bind[0]['options']:raise SystemExit('maintenance executable mount not read-only')
+                  if spec['process']['args']!=['/maintenance/service',*args]:raise SystemExit('maintenance command drift')
+                  result=subprocess.run(['sudo','ctr','-n','joint58f-smoke','tasks','start',cid],capture_output=True)
+                  if result.returncode:raise SystemExit('maintenance task failed rc='+str(result.returncode))
+                  output=result.stdout
+                  if any(v.encode() in output+result.stderr for v in ['admin-password','different-writer-password','different-fallback-password']):raise SystemExit('synthetic secret appeared in output')
+                  (root/(suffix+'.txt')).write_bytes(output)
+                  # Do not export process environments, which contain synthetic credentials.
+                  (root/(suffix+'-isolation.json')).write_text(json.dumps({'uid':10001,'root_readonly':True,'empty_capabilities':True,'network_namespace':ns,'runtime_child':evidence['manifest_digest'],'rootfs_chain':chain,'binary_sha256':binary_sha}))
+                  if suffix=='maintenance-probe':
+                      rows=[json.loads(line) for line in output.decode().splitlines() if line.startswith('{')]
+                      if {'transport_ready':True,'read_only':True} not in rows or not count.exists() or json.loads(count.read_text())!={'total':1,'valid':1}:raise SystemExit('maintenance ADMIN/readonly/request count contract failed')
+                      subprocess.check_output(['sudo','ls','-A',str(work)])
+                      subprocess.check_call(['sudo','test','!','-e',str(work/'must-not-initialize-archive')])
+                  ctr('containers','delete',cid)
+          finally:
+              server.terminate();server.wait(timeout=10)
+          if hashlib.sha256((maintenance/'service').read_bytes()).hexdigest()!=binary_sha:raise SystemExit('mounted maintenance binary changed')
+          package=pathlib.Path(os.environ['RUNNER_TEMP'])/'maintenance-package';package.mkdir()
+          subprocess.check_call(['cp',str(binary),str(package/'memeloop-token-center')]);(package/'memeloop-token-center').chmod(0o555)
+          for label,argv in [('elf-header',['readelf','-h',str(binary)]),('elf-dynamic',['readelf','-d',str(binary)]),('elf-versions',['readelf','--version-info',str(binary)])]:
+              (package/(label+'.txt')).write_bytes(subprocess.check_output(argv))
+          evidence.update({'maintenance_source':os.environ['CANDIDATE_SHA'],'maintenance_binary_sha256':binary_sha,'maintenance_binary_bytes':binary.stat().st_size,'purpose':'diagnostic-maintenance-only-not-official-release','admin_probe_count':1,'maintenance_run':os.environ['GITHUB_RUN_ID'],'maintenance_attempt':os.environ['GITHUB_RUN_ATTEMPT'],'status':'maintenance_native_pass'})
+          (package/'receipt.json').write_text(json.dumps(evidence,indent=2)+'\n')
+          subprocess.check_call(['cp',str(root/'maintenance-probe.txt'),str(package/'probe.txt')])
+          subprocess.check_call(['cp',str(root/'maintenance-help.txt'),str(package/'help.txt')])
+          with tarfile.open(package/'maintenance.tar','w') as tar:
+              for item in sorted(package.iterdir()):
+                  if item.name!='maintenance.tar':tar.add(item,arcname=item.name)
+          h=hashlib.sha256((package/'maintenance.tar').read_bytes()).hexdigest()
+          (package/'SHA256SUMS').write_text(h+'  maintenance.tar\n')
           evidence.update({'status':'smoke_pass','smoke_run':os.environ['GITHUB_RUN_ID'],'artifact_id':os.environ['ARTIFACT_ID'],'artifact_digest':'sha256:'+os.environ['ARTIFACT_DIGEST'],'rootfs_chain':chain,'runtime_image':image,'verified_descriptors':len(verified)})
           (root/'smoke-receipt.json').write_text(json.dumps(evidence,indent=2)+'\n')
           print(json.dumps(evidence))
@@ -329,10 +299,20 @@ jobs:
       - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
         if: always()
         with:
-          name: stage-joint58f-native-smoke-evidence
+          name: cf816-maintenance-native-evidence
           path: |
             ${{ runner.temp }}/native-smoke/*.json
             ${{ runner.temp }}/native-smoke/*.txt
+          if-no-files-found: error
+          retention-days: 3
+
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        with:
+          name: cf816-release-maintenance-native-passed
+          path: |
+            ${{ runner.temp }}/maintenance-package/maintenance.tar
+            ${{ runner.temp }}/maintenance-package/SHA256SUMS
+            ${{ runner.temp }}/maintenance-package/receipt.json
           if-no-files-found: error
           retention-days: 3
 
