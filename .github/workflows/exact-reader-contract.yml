@@ -41,35 +41,28 @@ jobs:
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
         with:
-          ref: 390c1db05f91a24ce75b9127538b71fc11442b0a
+          ref: 3fd9d6ed99c6a1be240cf7c5a0b11bbfd6b1ee6b
           persist-credentials: false
       - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020
         with:
           node-version: 24.18.0
-      - name: Install trusted system BLAKE3 checksum tool
+      - name: Verify eleven offline metadata maintenance contracts
+        env:
+          EXPECTED_SOURCE: ${{ inputs.source_revision }}
         run: |
           set -euo pipefail
-          sudo apt-get update
-          sudo apt-get install --no-install-recommends -y b3sum
-          b3sum --version
-      - name: Typecheck fixed operations source
-        run: |
-          set -euo pipefail
-          npm ci --ignore-scripts
-          npm run typecheck
-      - name: Verify six exact Node shared image contracts
-        run: |
-          set -euo pipefail
-          test "$(git rev-parse HEAD)" = 390c1db05f91a24ce75b9127538b71fc11442b0a
-          node --test --test-reporter=tap tests/ops/image-e2e/image-contract.test.ts 2>&1 | tee "$RUNNER_TEMP/image-proxy-unit.log"
-          grep -Fx '# pass 6' "$RUNNER_TEMP/image-proxy-unit.log"
-          grep -Fx '# fail 0' "$RUNNER_TEMP/image-proxy-unit.log"
-          grep -Fx '# skipped 0' "$RUNNER_TEMP/image-proxy-unit.log"
+          test "$EXPECTED_SOURCE" = 3fd9d6ed99c6a1be240cf7c5a0b11bbfd6b1ee6b
+          test "$(git rev-parse HEAD)" = "$EXPECTED_SOURCE"
+          git rev-parse HEAD
+          node --test --test-reporter=tap scripts/maintenance/test-metadata-refresh.ts 2>&1 | tee "$RUNNER_TEMP/metadata-eleven.log"
+          grep -Fx '# pass 11' "$RUNNER_TEMP/metadata-eleven.log"
+          grep -Fx '# fail 0' "$RUNNER_TEMP/metadata-eleven.log"
+          grep -Fx '# skipped 0' "$RUNNER_TEMP/metadata-eleven.log"
       - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
         if: always()
         with:
-          name: image-contract-390c-typecheck-six-unit-contracts
-          path: ${{ runner.temp }}/image-proxy-unit.log
+          name: metadata3fd9-eleven-offline-contracts
+          path: ${{ runner.temp }}/metadata-eleven.log
           if-no-files-found: error
           retention-days: 7
 
