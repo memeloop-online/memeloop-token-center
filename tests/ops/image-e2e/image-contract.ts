@@ -105,7 +105,7 @@ export async function runImageContract(options: { messages?: (nonce: string) => 
     } catch (error) { if (!(error instanceof HttpFailure)) throw error; }
     await delay(2000);
   }
-  assert(record, 'request terminal, usage and archive did not converge'); assert.equal(record.request_id, requestId);
+  assert(record, requireRetired ? 'same request did not reach observed dual retirement within the existing polling bound' : 'request terminal, usage and archive did not converge'); assert.equal(record.request_id, requestId);
   assert.equal(record.usage.tokens.input_tokens, 2); assert.equal(record.usage.tokens.output_tokens, 1);
   const archives = {} as Record<'request' | 'response', Buffer>;
   const retired: ('request' | 'response')[] = [];
