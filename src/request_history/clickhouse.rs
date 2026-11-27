@@ -175,6 +175,16 @@ impl ClickHouse {
         Ok(rows)
     }
 
+    pub(crate) async fn probe_transport(&self) -> Result<(), HistoryError> {
+        let rows: Vec<Value> = self
+            .rows(BoundQuery::new("SELECT 1 AS ok FORMAT JSONEachRow"))
+            .await?;
+        if rows.as_slice() != [serde_json::json!({"ok": 1})] {
+            return Err(HistoryError::Verification("transport probe response"));
+        }
+        Ok(())
+    }
+
     pub async fn initialize(&self) -> Result<(), HistoryError> {
         let response = self
             .execute(BoundQuery::new(super::SCHEMA), None)
@@ -579,5 +589,88 @@ impl ClickHouse {
 
     pub async fn daily(&self, query: &HistoryQuery) -> Result<Vec<DailyBucket>, HistoryError> {
         self.rows(query.daily_sql()?).await
+    }
+}
+
+#[cfg(test)]
+mod transport_probe_tests {
+    use super::*;
+
+    #[test]
+    fn request_history_transport_diagnostic_excludes_dynamic_error_content() {
+        #[derive(Clone)]
+        struct Output(std::sync::Arc<std::sync::Mutex<Vec<u8>>>);
+        impl std::io::Write for Output {
+            fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+                self.0.lock().unwrap().extend_from_slice(bytes);
+                Ok(bytes.len())
+            }
+            fn flush(&mut self) -> std::io::Result<()> {
+                Ok(())
+            }
+        }
+        let output = Output(Default::default());
+        let writer = output.clone();
+        let subscriber = tracing_subscriber::fmt()
+            .with_ansi(false)
+            .without_time()
+            .with_writer(move || writer.clone())
+            .finish();
+        let error = reqwest::Client::new()
+            .get("http://synthetic-user:password-must-not-appear@invalid.invalid/private-body")
+            .header("x-synthetic", "secret-header\ninvalid")
+            .build()
+            .unwrap_err();
+        tracing::subscriber::with_default(subscriber, || {
+            assert!(matches!(
+                transport_unavailable("client_build", error),
+                HistoryError::Unavailable
+            ));
+        });
+        let bytes = output.0.lock().unwrap();
+        let text = std::str::from_utf8(&bytes).unwrap();
+        assert!(text.contains("client_build"));
+        assert!(text.contains("is_builder=true"));
+        for forbidden in [
+            "synthetic-user",
+            "password-must-not-appear",
+            "invalid.invalid",
+            "private-body",
+            "secret-header",
+        ] {
+            assert!(!text.contains(forbidden));
+        }
+    }
+
+    #[tokio::test]
+    async fn request_history_transport_probe_is_fixed_read_only_and_rejects_wrong_rows() {
+        use axum::{Router, routing::post};
+        for (response, valid) in [
+            ("{\"ok\":1}\n", true),
+            ("", false),
+            ("{\"ok\":0}\n", false),
+            ("{\"ok\":1}\n{\"ok\":1}\n", false),
+        ] {
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let endpoint = format!("http://{}", listener.local_addr().unwrap());
+            let service = Router::new().route(
+                "/",
+                post(move |body: String| async move {
+                    assert_eq!(body, "SELECT 1 AS ok FORMAT JSONEachRow");
+                    response
+                }),
+            );
+            let server = tokio::spawn(async move { axum::serve(listener, service).await.unwrap() });
+            let client = ClickHouse::new(
+                crate::http_settings::HttpClient::default(),
+                &endpoint,
+                "synthetic".into(),
+                "synthetic".into(),
+                "synthetic-password-must-not-be-logged".into(),
+            )
+            .unwrap();
+            assert_eq!(client.probe_transport().await.is_ok(), valid);
+            server.abort();
+        }
     }
 }

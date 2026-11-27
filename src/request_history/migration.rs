@@ -15,6 +15,8 @@ use crate::{
 #[derive(Debug, Subcommand)]
 pub enum HistoryCommand {
     Start,
+    /// Read-only fixed SELECT through the configured history WRITER transport.
+    ProbeTransport,
     /// Verify a consistent source baseline; this does not authorize cutover.
     BaselineSource {
         #[arg(long)]
@@ -255,6 +257,10 @@ pub async fn command(config: &Config, command: HistoryCommand) -> Result<Value, 
     )?
     .ok_or(HistoryError::Invalid("MTC_REQUEST_HISTORY_URL is required"))?;
     match command {
+        HistoryCommand::ProbeTransport => {
+            client.probe_transport().await?;
+            return Ok(json!({"transport_ready":true,"read_only":true}));
+        }
         HistoryCommand::BaselineSource {
             owner,
             page_size,
