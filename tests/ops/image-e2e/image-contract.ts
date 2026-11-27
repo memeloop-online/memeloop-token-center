@@ -6,7 +6,8 @@ import { setTimeout as delay } from 'node:timers/promises';
 
 type Value = Record<string, any>;
 export class HttpFailure extends Error {
-  constructor(readonly status: number) { super(`fixture HTTP ${status}`); }
+  readonly status: number;
+  constructor(status: number) { super(`fixture HTTP ${status}`); this.status = status; }
 }
 export function sha256(bytes: string | Uint8Array): string { return createHash('sha256').update(bytes).digest('hex'); }
 export function decode(bytes: Uint8Array): string { return new TextDecoder('utf-8', { fatal: true }).decode(bytes); }
