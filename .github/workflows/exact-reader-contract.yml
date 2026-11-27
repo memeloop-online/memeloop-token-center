@@ -733,10 +733,10 @@ jobs:
   pg-executor-contract:
     if: inputs.contract == 'pg-executor-959'
     runs-on: ubuntu-24.04
-    timeout-minutes: 40
+    timeout-minutes: 50
     services:
       clickhouse:
-        image: clickhouse/clickhouse-server:25.8
+        image: clickhouse/clickhouse-server@sha256:5311f717b7a3ee1e8ed2c198fee498c636ba6c2da3e39dbe45769088ebc858d0
         env:
           CLICKHOUSE_SKIP_USER_SETUP: "1"
         ports: ["8123:8123"]
@@ -763,7 +763,7 @@ jobs:
         run: '[[ "$SOURCE_REVISION" =~ ^[0-9a-f]{40}$ ]]'
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
         with:
-          ref: ${{ inputs.source_revision }}
+          ref: 58f8288be9d57591611d28200978935bbee1e3c1
           persist-credentials: false
       - uses: dtolnay/rust-toolchain@4360b52568e2003a75bf9bc1d59f33a8e3fc893c
         with:
@@ -777,34 +777,38 @@ jobs:
         with:
           shared-key: memory-release
       - uses: ./.github/actions/checkout-plugin-examples
-      - name: Verify the seven exact owner read lock contracts
+      - name: Verify schema166 joint production library and seven exact contracts
         run: |
           set -euo pipefail
-          test "$(git rev-parse HEAD)" = "0cc0d58c76699a12085a521a50413af2783ec7f7"
+          test "${{ inputs.source_revision }}" = 58f8288be9d57591611d28200978935bbee1e3c1
+          test "$(git rev-parse HEAD)" = 58f8288be9d57591611d28200978935bbee1e3c1
           git rev-parse HEAD
-          cargo check --locked --lib
+          mkdir -p /tmp/schema166-joint
+          curl --fail --silent http://127.0.0.1:8123/?query=SELECT%20version%28%29 | tee /tmp/schema166-joint/clickhouse-version.txt
+          cargo check --locked --all-features --lib 2>&1 | tee /tmp/schema166-joint/production-check.log
           failures=0
-          mkdir -p /tmp/owner-read-lock
-          while IFS= read -r selector; do
-            log="/tmp/owner-read-lock/${selector//::/_}.log"
-            if ! cargo test --locked --lib "$selector" -- --exact --nocapture 2>&1 | tee "$log"; then failures=1; fi
-            if ! grep -F '1 passed; 0 failed; 0 ignored;' "$log"; then failures=1; fi
+          while IFS='|' read -r ignored selector; do
+            log="/tmp/schema166-joint/${selector//::/_}.log"
+            flags=()
+            if [ "$ignored" = ignored ]; then flags=(--ignored); fi
+            if ! cargo test --locked --all-features --lib "$selector" -- --exact "${flags[@]}" --nocapture 2>&1 | tee "$log"; then failures=1; fi
+            if ! grep -E '^test result: ok\. 1 passed; 0 failed; 0 ignored;' "$log"; then failures=1; fi
           done <<'SELECTORS'
-          db::requests::owner::tests::postgres_terminal_owner_read_lock_rechecks_pending_without_update_side_effects
-          db::requests::owner::tests::postgres_reaper_rechecks_renewal_under_lock_and_races_late_finish_once
-          db::requests::owner::tests::postgres_terminal_completion_keeps_owner_reads_on_one_leaf_before_settlement
-          db::requests::operational_terminal::tests::unknown_bridge::sqlite_unknown_bridge_preserves_failures_and_replaces_financial_facts_once
-          db::requests::operational_terminal::tests::unknown_bridge::postgres_unknown_bridge_preserves_failures_and_replaces_financial_facts_once
-          db::requests::operational_terminal::tests::lifecycle_events::sqlite_lifecycle_events_do_not_wait_for_archive_or_financial_projection
-          db::requests::operational_terminal::tests::lifecycle_events::postgres_lifecycle_events_do_not_wait_for_archive_or_financial_projection
+          ignored|plugin::application::oauth_background_tests::postgres_cold_oauth_authority_uses_existing_pool_and_preserves_shared_authority
+          ignored|worker::oauth_pool_tests::postgres_oauth_auto_recovery_uses_existing_pool_while_primary_is_exhausted
+          normal|worker::oauth_role_tests::oauth_rejection_delivery_crosses_gateway_control_and_worker_process_roles
+          ignored|db::requests::conversations::prefix_storage::tests::postgres_prefix_preload_releases_projection_scope_before_graph_receive
+          normal|db::requests::conversations::archive_readiness_tests::postgres_identity_projection_busy_yields_and_preserves_page_cursor
+          ignored|db::history_source_snapshot::tests::request_history_real_services_acceptance_source_baseline_receipts_and_abort
+          ignored|db::history_watermark::tests::postgres_clickhouse_watermark_keeps_frozen_head_across_coalescing_and_switch
           SELECTORS
           exit "$failures"
-      - name: Retain exact owner read lock evidence
+      - name: Retain schema166 joint exact evidence
         if: always()
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
         with:
-          name: owner-read-lock-0cc0
-          path: /tmp/owner-read-lock/
+          name: schema166-ch-joint-58f-exact-contracts
+          path: /tmp/schema166-joint/
           if-no-files-found: warn
           retention-days: 7
 
