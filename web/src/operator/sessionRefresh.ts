@@ -71,6 +71,20 @@ export function drainSessionEventIdentities(queue: Set<string>) {
   return drained;
 }
 
+/** A real start can add a member to a short, unqualified active page. */
+export function sessionEventsStartNewActiveMember(
+  eventIdentities: ReadonlySet<string>,
+  current: ReadonlyArray<SessionIdentity>,
+  keyId: string,
+) {
+  const loaded = new Set(current.map(sessionIdentityKey));
+  return [...eventIdentities].some(value => {
+    const event = JSON.parse(value) as SessionEventIdentity;
+    return event.event_kind === 'started' && event.association === 'confirmed' && event.session_id !== null
+      && (!keyId || keyId === event.key_id) && !loaded.has(sessionIdentityKey({ key_id: event.key_id, session_id: event.session_id }));
+  });
+}
+
 export function sessionSummaryTargets(
   eventIdentities: ReadonlySet<string>,
   state: '' | 'active' | 'has_errors' = '',
