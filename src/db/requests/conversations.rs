@@ -1865,7 +1865,7 @@ impl Database {
             let candidate_branch: Option<String> = row.try_get("branch_id")?;
             let candidate_client: Option<String> = row.try_get("client_name")?;
             let candidate_leaf: Option<String> = row.try_get("leaf_node_hash")?;
-            let previous_hashes = prefix_storage::candidate_hashes(row, &graph)?;
+            let previous_hashes = prefix_storage::candidate_hashes(&row, graph)?;
             let has_previous_semantic_atoms = !previous_hashes.is_empty();
             let is_prefix = candidate_leaf.as_deref().is_some_and(|candidate| {
                 if snapshot.is_some() {
