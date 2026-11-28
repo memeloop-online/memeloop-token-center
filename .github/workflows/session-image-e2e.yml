@@ -59,7 +59,7 @@ jobs:
           for n in $(seq 1 60); do curl -fsS --aws-sigv4 'aws:amz:us-east-1:s3' --user "$RUSTFS_ACCESS_KEY:$RUSTFS_SECRET_KEY" -X PUT http://127.0.0.1:19000/image-e2e && exit 0; sleep 2; done
           exit 1
       - name: Start loopback fault proxy
-        run: python3 tests/ops/image-e2e/object_proxy.py >"$RUNNER_TEMP/object-proxy.log" 2>&1 &
+        run: node tests/ops/image-e2e/object_proxy.ts >"$RUNNER_TEMP/object-proxy.log" 2>&1 &
       - name: Start exact candidate
         env:
           IMAGE: ${{ inputs.image || 'ghcr.io/memeloop-online/memeloop-token-center@sha256:b4184f7f12601fc09a769d0be266b7b1a5d111713c8f2f565e340d637210991a' }}
