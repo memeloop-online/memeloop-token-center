@@ -16,6 +16,8 @@ use crate::{
 #[cfg(test)]
 mod background_actions_tests;
 #[cfg(test)]
+mod oauth_pool_tests;
+#[cfg(test)]
 mod oauth_role_tests;
 
 const MAINTENANCE_INTERVAL: Duration = Duration::from_secs(6 * 60 * 60);
@@ -71,6 +73,15 @@ async fn refresh_expiring_oauth(
     generation: i64,
     blocking: &BlockingTasks,
 ) -> Result<(), AppError> {
+    let mut background = crate::upstream_quota::oauth_recovery::background_state(state);
+    #[cfg(feature = "experimental-plugin-revisions")]
+    if let Some(authority) = &background.application_plugins {
+        if let Some(snapshot) = authority.pin_for_oauth(&background.db).await? {
+            background = background.with_pinned_application_plugins(snapshot);
+        }
+        background.application_plugins_pinned = true;
+    }
+    let state = &background;
     let recovery_key = state
         .db
         .upstream_oauth_refresh_recovery_key(account_id, generation)
@@ -105,6 +116,35 @@ async fn refresh_expiring_oauth(
         }
         result => result.map(|_| ()),
     }
+}
+
+async fn refresh_oauth_batch(
+    state: &AppState,
+    shutdown: &watch::Receiver<bool>,
+    blocking: &BlockingTasks,
+) -> Result<(), AppError> {
+    let refresh_before = crate::db::unix_millis().saturating_add(OAUTH_REFRESH_AHEAD_MILLIS);
+    let accounts = state
+        .routing_persistence_db
+        .list_managed_oauth_refresh_candidates(refresh_before, 20)
+        .await?;
+    for (account_id, generation) in accounts {
+        if *shutdown.borrow() {
+            break;
+        }
+        if let Err(error) = refresh_expiring_oauth(state, account_id, generation, blocking).await {
+            tracing::warn!(%error, %account_id, "worker failed to refresh managed OAuth credential");
+        }
+    }
+    Ok(())
+}
+
+#[cfg(test)]
+pub(crate) async fn run_oauth_batch_for_test(state: &AppState) {
+    let (_sender, shutdown) = watch::channel(false);
+    refresh_oauth_batch(state, &shutdown, &BlockingTasks::new())
+        .await
+        .unwrap();
 }
 
 pub async fn run(state: AppState) {
@@ -663,29 +703,8 @@ pub(crate) async fn run_until_shutdown_with_reaper_period(
         "oauth_refresh",
         OAUTH_REFRESH_INTERVAL,
         async |state: &AppState, shutdown: &watch::Receiver<bool>| {
-            let refresh_before =
-                crate::db::unix_millis().saturating_add(OAUTH_REFRESH_AHEAD_MILLIS);
-            match state
-                .db
-                .list_managed_oauth_refresh_candidates(refresh_before, 20)
-                .await
-            {
-                Ok(accounts) => {
-                    for (account_id, generation) in accounts {
-                        if *shutdown.borrow() {
-                            break;
-                        }
-                        if let Err(error) =
-                            refresh_expiring_oauth(state, account_id, generation, &oauth_blocking)
-                                .await
-                        {
-                            tracing::warn!(%error, %account_id, "worker failed to refresh managed OAuth credential");
-                        }
-                    }
-                }
-                Err(error) => {
-                    tracing::error!(%error, "worker failed to list expiring managed OAuth credentials");
-                }
+            if let Err(error) = refresh_oauth_batch(state, shutdown, &oauth_blocking).await {
+                tracing::error!(%error, "worker failed to list expiring managed OAuth credentials");
             }
         }
     );
