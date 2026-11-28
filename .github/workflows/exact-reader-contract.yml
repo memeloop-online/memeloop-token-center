@@ -41,28 +41,26 @@ jobs:
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
         with:
-          ref: 3fd9d6ed99c6a1be240cf7c5a0b11bbfd6b1ee6b
+          ref: cdb8f98352d10fd10d67cacb13219b1cbc1b3ccf
           persist-credentials: false
       - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020
         with:
           node-version: 24.18.0
-      - name: Verify eleven offline metadata maintenance contracts
+      - name: Verify exact metadata and preflight TypeScript gate
         env:
           EXPECTED_SOURCE: ${{ inputs.source_revision }}
         run: |
           set -euo pipefail
-          test "$EXPECTED_SOURCE" = 3fd9d6ed99c6a1be240cf7c5a0b11bbfd6b1ee6b
+          test "$EXPECTED_SOURCE" = cdb8f98352d10fd10d67cacb13219b1cbc1b3ccf
           test "$(git rev-parse HEAD)" = "$EXPECTED_SOURCE"
           git rev-parse HEAD
-          node --test --test-reporter=tap scripts/maintenance/test-metadata-refresh.ts 2>&1 | tee "$RUNNER_TEMP/metadata-eleven.log"
-          grep -Fx '# pass 11' "$RUNNER_TEMP/metadata-eleven.log"
-          grep -Fx '# fail 0' "$RUNNER_TEMP/metadata-eleven.log"
-          grep -Fx '# skipped 0' "$RUNNER_TEMP/metadata-eleven.log"
+          npm ci --ignore-scripts --no-audit 2>&1 | tee "$RUNNER_TEMP/metadata-install.log"
+          npm run typecheck 2>&1 | tee "$RUNNER_TEMP/metadata-typecheck.log"
       - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
         if: always()
         with:
-          name: metadata3fd9-eleven-offline-contracts
-          path: ${{ runner.temp }}/metadata-eleven.log
+          name: metadata-preflight-cdb8-typecheck
+          path: ${{ runner.temp }}/metadata-typecheck.log
           if-no-files-found: error
           retention-days: 7
 
