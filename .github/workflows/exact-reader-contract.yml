@@ -41,28 +41,32 @@ jobs:
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
         with:
-          ref: 3fd9d6ed99c6a1be240cf7c5a0b11bbfd6b1ee6b
+          ref: 6007228cab4085c5fc756c40f352a8239a639845
           persist-credentials: false
       - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020
         with:
           node-version: 24.18.0
-      - name: Verify eleven offline metadata maintenance contracts
+      - name: Verify fixed mock-service strict types and seven contracts
         env:
           EXPECTED_SOURCE: ${{ inputs.source_revision }}
         run: |
           set -euo pipefail
-          test "$EXPECTED_SOURCE" = 3fd9d6ed99c6a1be240cf7c5a0b11bbfd6b1ee6b
+          test "$EXPECTED_SOURCE" = 6007228cab4085c5fc756c40f352a8239a639845
           test "$(git rev-parse HEAD)" = "$EXPECTED_SOURCE"
           git rev-parse HEAD
-          node --test --test-reporter=tap scripts/maintenance/test-metadata-refresh.ts 2>&1 | tee "$RUNNER_TEMP/metadata-eleven.log"
-          grep -Fx '# pass 11' "$RUNNER_TEMP/metadata-eleven.log"
-          grep -Fx '# fail 0' "$RUNNER_TEMP/metadata-eleven.log"
-          grep -Fx '# skipped 0' "$RUNNER_TEMP/metadata-eleven.log"
+          failures=0
+          if ! npm ci --ignore-scripts --no-audit 2>&1 | tee "$RUNNER_TEMP/mock-service-install.log"; then failures=1; fi
+          if ! npm run typecheck 2>&1 | tee "$RUNNER_TEMP/mock-service-types.log"; then failures=1; fi
+          if ! node --test --test-reporter=tap tests/load/staging-peak/test-mock-service.ts 2>&1 | tee "$RUNNER_TEMP/mock-service-seven.log"; then failures=1; fi
+          grep -Fx '# pass 7' "$RUNNER_TEMP/mock-service-seven.log" || failures=1
+          grep -Fx '# fail 0' "$RUNNER_TEMP/mock-service-seven.log" || failures=1
+          grep -Fx '# skipped 0' "$RUNNER_TEMP/mock-service-seven.log" || failures=1
+          exit "$failures"
       - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
         if: always()
         with:
-          name: metadata3fd9-eleven-offline-contracts
-          path: ${{ runner.temp }}/metadata-eleven.log
+          name: mock-service6007-types-and-seven
+          path: ${{ runner.temp }}/mock-service-*.log
           if-no-files-found: error
           retention-days: 7
 
