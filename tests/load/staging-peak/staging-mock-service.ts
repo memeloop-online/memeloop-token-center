@@ -13,9 +13,9 @@ type Dependencies = {
   remove: (url: string, body: string) => Promise<number>;
 };
 
-export async function startProxy(context: string): Promise<Proxy> {
+export async function startProxy(context: string, executable = 'kubectl'): Promise<Proxy> {
   // kubectl owns the ephemeral port continuously; never probe then release a port.
-  const child = spawn('kubectl', ['--context', context, 'proxy', '--address=127.0.0.1', '--port=0'], { stdio: ['ignore', 'pipe', 'ignore'] });
+  const child = spawn(executable, ['--context', context, 'proxy', '--address=127.0.0.1', '--port=0'], { stdio: ['ignore', 'pipe', 'ignore'] });
   let failedToStart = false;
   child.once('error', () => { failedToStart = true; });
   const stop = async (): Promise<void> => {
@@ -35,9 +35,17 @@ export async function startProxy(context: string): Promise<Proxy> {
       child.once('error', fail);
       child.once('exit', fail);
       child.stdout!.on('data', (chunk) => {
-        output = (output + String(chunk)).slice(-4096);
-        const match = /Starting to serve on 127\.0\.0\.1:(\d+)/u.exec(output);
-        if (match) { clearTimeout(timer); resolve(`http://127.0.0.1:${match[1]}`); }
+        output += String(chunk);
+        if (output.length > 4096) { clearTimeout(timer); reject(new Error('proxy readiness output exceeded limit')); return; }
+        const lines = output.split('\n');
+        output = lines.pop()!;
+        for (const line of lines) {
+          const match = /^Starting to serve on 127\.0\.0\.1:([0-9]+)\r?$/u.exec(line);
+          const port = Number(match?.[1]);
+          if (match && Number.isInteger(port) && port >= 1 && port <= 65535) {
+            clearTimeout(timer); resolve(`http://127.0.0.1:${port}`); return;
+          }
+        }
       });
     });
     requireCondition(child.exitCode === null && child.signalCode === null, 'proxy exited before delete');
@@ -52,9 +60,9 @@ const defaults: Dependencies = {
 };
 
 export async function serviceAction(action: string, meta: Metadata, run: string, uid?: string, deps: Dependencies = defaults): Promise<object> {
-  requireCondition(/^[a-z0-9-]{1,40}$/u.test(run) && ['create', 'delete'].includes(action), 'invalid action or run');
+  requireCondition(/^[a-z0-9-]{1,40}$/u.test(run) && !/[\r\n]/u.test(run) && ['create', 'delete'].includes(action), 'invalid action or run');
   requireCondition(typeof meta.context === 'string' && meta.context.length > 0 && typeof meta.clusterUid === 'string' && typeof meta.namespaceUid === 'string', 'invalid metadata');
-  if (action === 'delete') requireCondition(typeof uid === 'string' && /^[a-f0-9-]{36}$/u.test(uid), 'invalid UID');
+  if (action === 'delete') requireCondition(typeof uid === 'string' && /^[a-f0-9-]{36}$/u.test(uid) && !/[\r\n]/u.test(uid), 'invalid UID');
   const kubectl = (...args: string[]) => deps.kubectl(['--context', meta.context, ...args, '-o', 'json']);
   requireCondition(kubectl('get', 'namespace', 'kube-system').metadata.uid === meta.clusterUid, 'cluster UID mismatch');
   requireCondition(kubectl('get', 'namespace', namespace).metadata.uid === meta.namespaceUid, 'namespace UID mismatch');

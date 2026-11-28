@@ -1,6 +1,9 @@
 import assert from 'node:assert/strict';
 import test from 'node:test';
-import { serviceAction } from './staging-mock-service.ts';
+import { mkdtempSync, writeFileSync, rmSync } from 'node:fs';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
+import { serviceAction, startProxy } from './staging-mock-service.ts';
 
 const meta = { context: 'fixture', clusterUid: 'cluster', namespaceUid: 'namespace' };
 const uid = '12345678-1234-1234-1234-123456789abc';
@@ -75,9 +78,46 @@ test('proxy early exit prevents DELETE', async () => {
 });
 
 test('invalid CLI identity is rejected before any command', async () => {
-  for (const [action, run, value] of [['apply', 'fixture', uid], ['delete', '../other', uid], ['delete', 'fixture', 'wrong']] as const) {
+  for (const [action, run, value] of [['apply', 'fixture', uid], ['delete', '../other', uid], ['delete', 'fixture', 'wrong'], ['delete', 'fixture\n', uid], ['delete', 'fixture', `${uid}\n`]] as const) {
     const f = fixture();
     await assert.rejects(serviceAction(action, meta, run, value, f.deps));
     assert.equal(f.calls.length, 0);
   }
+});
+
+
+test('real proxy child waits for complete fragmented port line and early exit sends nothing', async () => {
+  const directory = mkdtempSync(join(tmpdir(), 'mock-service-proxy-'));
+  const executable = join(directory, 'kubectl');
+  writeFileSync(executable, `#!${process.execPath}
+import http from 'node:http';
+if (process.argv.includes('early-exit')) process.exit(2);
+let count = 0;
+const server = http.createServer((request, response) => {
+  if (request.method !== 'DELETE') process.exit(3);
+  let body = '';
+  request.on('data', chunk => { body += chunk; });
+  request.on('end', () => {
+    count++;
+    response.setHeader('Content-Type', 'application/json');
+    response.end(JSON.stringify({ count, body: JSON.parse(body), port: server.address().port }));
+  });
+});
+server.listen(0, '127.0.0.1', () => {
+  const port = String(server.address().port);
+  process.stdout.write('Starting to serve on 127.0.0.1:' + port.slice(0, 2));
+  setTimeout(() => process.stdout.write(port.slice(2) + '\n'), 100);
+});
+`, { mode: 0o700 });
+  try {
+    const proxy = await startProxy('fixture', executable);
+    try {
+      const response = await fetch(proxy.url + '/fixture', { method: 'DELETE', body: JSON.stringify({ preconditions: { uid } }) });
+      const result = await response.json();
+      assert.equal(result.count, 1);
+      assert.equal(proxy.url, `http://127.0.0.1:${result.port}`);
+      assert.deepEqual(result.body, { preconditions: { uid } });
+    } finally { await proxy.stop(); }
+    await assert.rejects(startProxy('early-exit', executable), /before readiness/);
+  } finally { rmSync(directory, { recursive: true, force: true }); }
 });
