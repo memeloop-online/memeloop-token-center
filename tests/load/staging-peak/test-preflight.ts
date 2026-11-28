@@ -13,7 +13,7 @@ test("accepts pod IPv4 and canonical IPv6", () => {
 });
 for (const [name, mutate] of Object.entries({
   "foreign IP": (f: any) => { f.slice.endpoints[0].addresses = ["10.0.0.9"]; },
-  "address family mismatch": (f: any) => { f.slice.endpoints[0]!.addresses = ["fd00::1"]; },
+  "address family mismatch": (f: any) => { f.slice.endpoints[0].addresses = ["fd00::1"]; },
   "manual controller": (f: any) => { f.slice.metadata.labels["endpointslice.kubernetes.io/managed-by"] = "manual"; },
   "wrong port": (f: any) => { f.slice.ports[0].port = 9999; },
   "both Service UIDs missing": (f: any) => { delete f.service.metadata.uid; delete f.slice.metadata.ownerReferences[0].uid; },
