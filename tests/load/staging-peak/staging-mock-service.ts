@@ -78,6 +78,9 @@ export async function serviceAction(action: string, meta: Metadata, run: string,
 
 if (process.argv[1] && import.meta.url === pathToFileURL(process.argv[1]).href) {
   const [action, path, run, uid] = process.argv.slice(2);
-  try { console.log(JSON.stringify(await serviceAction(action, JSON.parse(readFileSync(path, 'utf8')), run, uid))); }
+  try {
+    if (!action || !path || !run) throw new Error('usage: create|delete metadata.json run [uid]');
+    console.log(JSON.stringify(await serviceAction(action, JSON.parse(readFileSync(path, 'utf8')), run, uid)));
+  }
   catch (error) { console.error(error instanceof Error ? error.message : 'service operation failed'); process.exitCode = 1; }
 }

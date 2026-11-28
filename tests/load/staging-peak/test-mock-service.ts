@@ -35,10 +35,10 @@ test('create preserves exact Service and stdout contract without apply/proxy', a
   const f = fixture();
   assert.deepEqual(await serviceAction('create', meta, 'fixture', undefined, f.deps), { name: 'mtc-peak-fixture-mock', uid, namespaceUid: 'namespace', runId: 'fixture' });
   assert.equal(f.calls.length, 3);
-  const request = JSON.parse(f.calls[2].input!);
+  const request = JSON.parse(f.calls[2]!.input!);
   assert.deepEqual(request.spec, { selector: { 'app.kubernetes.io/part-of': 'mtc-staging-peak', 'mtc.memeloop.ai/peak-run': 'fixture', 'app.kubernetes.io/component': 'mock' }, ports: [{ port: 18080, targetPort: 8080 }] });
   assert.equal(request.metadata.namespace, 'memeloop-token-center-staging');
-  assert(f.calls[2].args.includes('create'));
+  assert(f.calls[2]!.args.includes('create'));
   assert(!f.calls.flatMap(c => c.args).includes('apply'));
   assert.equal(f.counts().proxies, 0);
 });
@@ -75,7 +75,7 @@ test('proxy early exit prevents DELETE', async () => {
 });
 
 test('invalid CLI identity is rejected before any command', async () => {
-  for (const [action, run, value] of [['apply', 'fixture', uid], ['delete', '../other', uid], ['delete', 'fixture', 'wrong']]) {
+  for (const [action, run, value] of [['apply', 'fixture', uid], ['delete', '../other', uid], ['delete', 'fixture', 'wrong']] as const) {
     const f = fixture();
     await assert.rejects(serviceAction(action, meta, run, value, f.deps));
     assert.equal(f.calls.length, 0);
