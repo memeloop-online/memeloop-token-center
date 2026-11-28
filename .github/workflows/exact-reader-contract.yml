@@ -41,7 +41,7 @@ jobs:
       contents: read
       actions: read
     env:
-      CANDIDATE_SHA: ddc7265476e8def02b0bc36d0e54c90986aef960
+      CANDIDATE_SHA: 6024a07fa3f37cf0c2e025bccb2012fc2ad5568b
       BASE_RUNTIME_SHA: 58f8288be9d57591611d28200978935bbee1e3c1
       ARTIFACT_ID: "15172646870"
       SOURCE_RUN_ID: "45940213018"
@@ -49,7 +49,7 @@ jobs:
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
         with:
-          ref: ddc7265476e8def02b0bc36d0e54c90986aef960
+          ref: 6024a07fa3f37cf0c2e025bccb2012fc2ad5568b
           persist-credentials: false
       - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020
         with:
@@ -117,7 +117,7 @@ jobs:
       - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
         id: sealed
         with:
-          name: maintenance-ddc-feature-smoke-pending-sealed-input
+          name: maintenance-formal6024-feature-smoke-pending-sealed-input
           path: ${{ runner.temp }}/sealed-package/
           if-no-files-found: error
           retention-days: 3
@@ -268,17 +268,26 @@ jobs:
               time.sleep(.05)
           else:raise SystemExit('isolated synthetic mock not ready')
           namespace='/run/netns/'+ns
-          envs={'LD_LIBRARY_PATH':'/usr/local/lib','GLIBC_TUNABLES':'glibc.malloc.mmap_threshold=65536','MTC_KEY_PEPPER':'test-pepper-must-have-at-least-32-bytes','MTC_SERVICE_TOKEN':'s'*32,'MTC_DATABASE_URL':'sqlite:///work/probe.db?mode=rwc','MTC_ARCHIVE_BACKEND':'filesystem','MTC_ARCHIVE_PATH':'/work/must-not-initialize-archive','MTC_REQUEST_HISTORY_URL':'http://127.0.0.1:18123','MTC_REQUEST_HISTORY_DATABASE':'synthetic','MTC_REQUEST_HISTORY_ADMIN_USER':'admin','MTC_REQUEST_HISTORY_ADMIN_PASSWORD':'admin-password','MTC_REQUEST_HISTORY_WRITER_USER':'different-writer','MTC_REQUEST_HISTORY_WRITER_PASSWORD':'different-writer-password','MTC_REQUEST_HISTORY_USER':'different-fallback','MTC_REQUEST_HISTORY_PASSWORD':'different-fallback-password'}
+          pg_bin=pathlib.Path('/usr/lib/postgresql/16/bin')
+          if not all((pg_bin/name).is_file() for name in ['initdb','pg_ctl','createdb','psql']):raise SystemExit('required PostgreSQL16 tools unavailable')
+          pg_root=pathlib.Path('/tmp')/('history6024-pg-'+os.environ['GITHUB_RUN_ID']+'-'+os.environ['GITHUB_RUN_ATTEMPT'])
+          subprocess.check_call(['sudo','install','-d','-m','0700','-o','postgres','-g','postgres',str(pg_root)])
+          pg_cmd=['sudo','ip','netns','exec',ns,'runuser','-u','postgres','--']
+          subprocess.check_call([*pg_cmd,str(pg_bin/'initdb'),'-D',str(pg_root/'data'),'-U','token_center','--auth=trust','--no-locale','--encoding=UTF8'],stdout=subprocess.DEVNULL)
+          subprocess.check_call([*pg_cmd,str(pg_bin/'pg_ctl'),'-D',str(pg_root/'data'),'-l',str(pg_root/'server.log'),'-o','-h 127.0.0.1 -p 15432 -k '+str(pg_root),'-w','start'],stdout=subprocess.DEVNULL)
+          pg_client=['sudo','ip','netns','exec',ns,str(pg_bin/'psql'),'-h','127.0.0.1','-p','15432','-U','token_center','-d','history6024','-X','-A','-t','-v','ON_ERROR_STOP=1']
+          subprocess.check_call(['sudo','ip','netns','exec',ns,str(pg_bin/'createdb'),'-h','127.0.0.1','-p','15432','-U','token_center','history6024'])
+          envs={'LD_LIBRARY_PATH' :'/usr/local/lib','GLIBC_TUNABLES':'glibc.malloc.mmap_threshold=65536','MTC_KEY_PEPPER':'test-pepper-must-have-at-least-32-bytes','MTC_SERVICE_TOKEN':'s'*32,'MTC_DATABASE_URL':'postgres://token_center@127.0.0.1:15432/history6024','MTC_ARCHIVE_BACKEND':'filesystem','MTC_ARCHIVE_PATH':'/work/must-not-initialize-archive','MTC_REQUEST_HISTORY_URL':'http://127.0.0.1:18123','MTC_REQUEST_HISTORY_DATABASE':'synthetic','MTC_REQUEST_HISTORY_ADMIN_USER':'admin','MTC_REQUEST_HISTORY_ADMIN_PASSWORD':'admin-password','MTC_REQUEST_HISTORY_WRITER_USER':'different-writer','MTC_REQUEST_HISTORY_WRITER_PASSWORD':'different-writer-password','MTC_REQUEST_HISTORY_USER':'different-fallback','MTC_REQUEST_HISTORY_PASSWORD':'different-fallback-password'}
           env_args=[v for k,val in envs.items() for v in ['--env',k+'='+val]]
           try:
-              for suffix,args in [('maintenance-migrate',['migrate']),('maintenance-help',['--help']),('maintenance-feature-help',['request-history','--help']),('maintenance-probe',['request-history','probe-transport']),('maintenance-initialization',['request-history','probe-initialization'])]:
-                  if suffix=='maintenance-initialization':
+              for suffix,args in [('maintenance-migrate',['migrate']),('maintenance-help',['--help']),('maintenance-feature-help',['request-history','--help']),('maintenance-probe',['request-history','probe-transport']),('maintenance-bootstrap',['request-history','bootstrap'])]:
+                  if suffix=='maintenance-bootstrap':
                       schema=pathlib.Path('src/request_history/schema.sql').read_text()
                       prefix='CREATE TABLE IF NOT EXISTS request_history_v1\n'
                       if not schema.startswith(prefix) or 'request_history_v1' in schema[len(prefix):]:raise SystemExit('reviewed initialization schema identifier mismatch')
-                      table='request_history_initialization_probe_v1'
+                      table='request_history_v1'
                       columns=['stats_filter_cost_micros Nullable(Int64)','stats_model String','stats_protocol LowCardinality(String)','stats_error_code Nullable(String)','stats_upstream_account_id Nullable(UUID)','stats_route_id Nullable(UUID)','stats_duration_ms Nullable(Int64)']
-                      statements=['CREATE TABLE IF NOT EXISTS '+table+'\n'+schema[len(prefix):]]+['ALTER TABLE '+table+' ADD COLUMN IF NOT EXISTS '+column for column in columns]
+                      statements=[schema]+['ALTER TABLE '+table+' ADD COLUMN IF NOT EXISTS '+column for column in columns]
                       expected_file.write_text(json.dumps({'mode':'initialization','sql':statements}))
                       count.unlink(missing_ok=True);checks_file.unlink(missing_ok=True)
                   cid='joint58f-'+suffix
@@ -317,30 +326,50 @@ jobs:
                       if len(flags)!=1 or set(flags[0])!={'method_post','path_root','fixed_query','fixed_sql','admin_auth','database'} or not all(v is True for v in flags[0].values()):raise SystemExit('fixed request boolean proof failed')
                       subprocess.check_output(['sudo','ls','-A',str(work)])
                       subprocess.check_call(['sudo','test','!','-e',str(work/'must-not-initialize-archive')])
-                  if suffix=='maintenance-initialization':
+                  if suffix=='maintenance-bootstrap':
                       rows=[json.loads(line) for line in output.decode().splitlines() if line.startswith('{')]
-                      result_expected={'initialization_probe_completed':True,'table':'request_history_initialization_probe_v1','read_only':False}
-                      if result_expected not in rows or not count.exists() or json.loads(count.read_text())!={'total':8,'valid':8}:raise SystemExit('initialization runtime eight-step contract failed')
+                      reports=[row for row in rows if row.get('capture_version')==1]
+                      if len(reports)!=1 or reports[0].get('mode')!='off' or reports[0].get('pending')!=[] or not reports[0].get('installed'):raise SystemExit('formal bootstrap PG installer did not complete off-mode')
+                      expected_tables={'request_events','request_records','generation_jobs','session_archive_unlinked_requests','proxy_operational_terminals','pending_proxy_settlements','conversation_observations','request_archive_spools','response_archive_spools','request_egress_attempts','request_upstream_transport_diagnostics','generation_stats_facts','generation_assets','request_stats_facts','terminal_projection_outbox','upstream_accounts','session_archive_correlations','key_records','principals','tenants'}
+                      if len(reports[0]['installed'])!=20 or set(reports[0]['installed'])!=expected_tables:raise SystemExit('formal bootstrap PG installation coverage mismatch')
+                      if not count.exists() or json.loads(count.read_text())!={'total':8,'valid':8}:raise SystemExit('formal bootstrap must issue exactly eight CH requests')
                       flags=json.loads(checks_file.read_text()) if checks_file.exists() else []
-                      if len(flags)!=8 or any(set(row)!={'method_post','path_root','fixed_query','fixed_sql','admin_auth','database'} or not all(v is True for v in row.values()) for row in flags):raise SystemExit('initialization exact SQL/order/ADMIN boolean proof failed')
+                      if len(flags)!=8 or any(set(row)!={'method_post','path_root','fixed_query','fixed_sql','admin_auth','database'} or not all(v is True for v in row.values()) for row in flags):raise SystemExit('formal history SQL/order/ADMIN boolean proof failed')
+                      trace=[]
+                      for line in (result.stdout+result.stderr).decode('utf-8',errors='strict').splitlines():
+                          try:value=json.loads(line)
+                          except json.JSONDecodeError:continue
+                          fields=value.get('fields',{})
+                          if fields.get('operation') in ['history_initialization_probe','history_bootstrap_diagnostic']:trace.append(fields)
+                      phases=[row.get('phase') for row in trace if row.get('operation')=='history_bootstrap_diagnostic']
+                      if phases!=['ch_done','pg_capture_started','pg_capture_ok']:raise SystemExit('formal bootstrap CH/PG phase order mismatch')
+                      history=[row for row in trace if row.get('operation')=='history_initialization_probe']
+                      if len(history)!=24 or any(row.get('target_kind')!='history' for row in history):raise SystemExit('formal History target diagnostic count mismatch')
+                      for step in range(8):
+                          if [row.get('phase') for row in history if row.get('step')==step]!=['request_started','response_headers','response_body']:raise SystemExit('formal History diagnostic step mismatch')
+                      state=subprocess.check_output([*pg_client,'-c',"SELECT s.mode || '|' || a.epoch::text FROM request_history_state s JOIN request_history_activation a ON a.id=s.id WHERE s.id=1"],text=True).strip()
+                      if state!='off|0':raise SystemExit('formal bootstrap unexpectedly activated history')
+                      result_expected={'formal_bootstrap_once':True,'pg_state':state,'bootstrap_phases':phases,'history_steps':8,'installed_tables':reports[0]['installed'],'pending':[]}
                       (root/(suffix+'.txt')).write_text(json.dumps(result_expected)+'\n')
+                      (root/'formal-bootstrap-boundary.json').write_text(json.dumps(result_expected,indent=2)+'\n')
                       subprocess.check_output(['sudo','ls','-A',str(work)])
                       subprocess.check_call(['sudo','test','!','-e',str(work/'must-not-initialize-archive')])
                   ctr('containers','delete',cid)
           finally:
               server.terminate();server.wait(timeout=10)
+              subprocess.run([*pg_cmd,str(pg_bin/'pg_ctl'),'-D',str(pg_root/'data'),'-m','immediate','-w','stop'],stdout=subprocess.DEVNULL,check=False)
           if hashlib.sha256((maintenance/'service').read_bytes()).hexdigest()!=binary_sha:raise SystemExit('mounted maintenance binary changed')
           package=pathlib.Path(os.environ['RUNNER_TEMP'])/'maintenance-package';package.mkdir()
           subprocess.check_call(['cp',str(binary),str(package/'memeloop-token-center')]);(package/'memeloop-token-center').chmod(0o555)
           for label,argv in [('elf-header',['readelf','-h',str(binary)]),('elf-dynamic',['readelf','-d',str(binary)]),('elf-versions',['readelf','--version-info',str(binary)])]:
               (package/(label+'.txt')).write_bytes(subprocess.check_output(argv))
-          evidence.update({'maintenance_source':os.environ['CANDIDATE_SHA'],'maintenance_binary_sha256':binary_sha,'maintenance_binary_bytes':binary.stat().st_size,'purpose':'diagnostic-maintenance-only-not-official-release','admin_probe_count':1,'initialization_http_count':8,'maintenance_run':os.environ['GITHUB_RUN_ID'],'maintenance_attempt':os.environ['GITHUB_RUN_ATTEMPT'],'sealed_input_artifact':os.environ['CANDIDATE_SEALED_ID'],'sealed_input_run':os.environ['GITHUB_RUN_ID'],'sealed_input_zip_sha256':os.environ['CANDIDATE_SEALED_DIGEST'],'diagnostic_feature':'history-initialization-diagnostic','status':'maintenance_native_pass'})
+          evidence.update({'maintenance_source':os.environ['CANDIDATE_SHA'],'maintenance_binary_sha256':binary_sha,'maintenance_binary_bytes':binary.stat().st_size,'purpose':'diagnostic-maintenance-only-not-official-release','admin_probe_count':1,'formal_history_http_count':8,'formal_bootstrap_invocations':1,'postgres_installation':'actual_isolated_PG16_off_mode','maintenance_run':os.environ['GITHUB_RUN_ID'],'maintenance_attempt':os.environ['GITHUB_RUN_ATTEMPT'],'sealed_input_artifact':os.environ['CANDIDATE_SEALED_ID'],'sealed_input_run':os.environ['GITHUB_RUN_ID'],'sealed_input_zip_sha256':os.environ['CANDIDATE_SEALED_DIGEST'],'diagnostic_feature':'history-initialization-diagnostic','status':'maintenance_native_pass'})
           evidence.update({'rootfs_chain':chain,'runtime_image':image,'verified_descriptors':len(verified),'build_definition':json.loads((pathlib.Path(os.environ['RUNNER_TEMP'])/'maintenance-build.json').read_text())})
           (package/'receipt.json').write_text(json.dumps(evidence,indent=2)+'\n')
           subprocess.check_call(['cp',str(root/'maintenance-probe.txt'),str(package/'probe.txt')])
           subprocess.check_call(['cp',str(root/'maintenance-help.txt'),str(package/'help.txt')])
           subprocess.check_call(['cp',str(root/'maintenance-feature-help.txt'),str(package/'feature-help.txt')])
-          subprocess.check_call(['cp',str(root/'maintenance-initialization.txt'),str(package/'initialization.txt')])
+          subprocess.check_call(['cp',str(root/'maintenance-bootstrap.txt'),str(package/'formal-bootstrap.txt')])
           with tarfile.open(package/'maintenance.tar','w') as tar:
               for item in sorted(package.iterdir()):
                   if item.name!='maintenance.tar':tar.add(item,arcname=item.name)
@@ -353,7 +382,7 @@ jobs:
       - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
         if: always()
         with:
-          name: ddc-feature-maintenance-native-evidence
+          name: formal6024-feature-maintenance-native-evidence
           path: |
             ${{ runner.temp }}/native-smoke/*.json
             ${{ runner.temp }}/native-smoke/*.txt
@@ -362,7 +391,7 @@ jobs:
 
       - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
         with:
-          name: ddc-feature-release-maintenance-native-passed
+          name: formal6024-feature-release-maintenance-native-passed
           path: |
             ${{ runner.temp }}/maintenance-package/maintenance.tar
             ${{ runner.temp }}/maintenance-package/SHA256SUMS
