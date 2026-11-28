@@ -27,8 +27,8 @@ test('all metadata pages retain only allowlisted fields', async () => {
         credential: 'SYNTHETIC_SECRET', proxy_password: 'SYNTHETIC_SECRET' }];
     }, endpoint, fields);
     assert.deepEqual([rows.length, pages], [2, 3]);
-    assert.equal(calls[1].params.before_id, 'item-1');
-    assert.equal(calls[2].params.before_created_at, 28);
+    assert.equal(calls[1]!.params.before_id, 'item-1');
+    assert.equal(calls[2]!.params.before_created_at, 28);
     assert.equal(JSON.stringify(rows).includes('SYNTHETIC_SECRET'), false);
   }
 });
@@ -48,10 +48,10 @@ test('refresh preserves exact historical evidence and explicit provider scope', 
   const first = m.render(data, canonical, evidence);
   data.metadata_updated_at = '2030-02-01T00:00:00Z';
   const second = m.render(data, canonical, evidence);
-  assert.equal(first.models[0].tested_at, second.models[0].tested_at);
+  assert.equal(first.models[0]!.tested_at, second.models[0]!.tested_at);
   assert.deepEqual(evidence, before);
-  assert.equal(second.models[0].provider_scope, 'unknown_provider_scope');
-  assert.deepEqual(second.models[0].canonical_record_ids, ['record-a']);
+  assert.equal(second.models[0]!.provider_scope, 'unknown_provider_scope');
+  assert.deepEqual(second.models[0]!.canonical_record_ids, ['record-a']);
   assert.equal(second.account_pagination_complete, true);
 });
 
@@ -82,7 +82,7 @@ test('management reads reject remote plaintext, URL credentials and redirected b
 
 test('explicit null catalog collections remain invalid rather than becoming empty evidence', () => {
   const data = snapshot();
-  (data.accounts[0].catalog as Record<string, unknown>).models = null;
+  (data.accounts[0]!.catalog as Record<string, unknown>).models = null;
   assert.throws(() => m.render(data, { records: [] }, { entries: [] }));
 });
 
@@ -99,9 +99,9 @@ function syntheticReader(catalogText: string) {
 
 test('catalog invalid JSON is bounded failed evidence while other accounts remain readable', async () => {
   const result = await m.collectMetadata(syntheticReader('{invalid'));
-  assert.equal(result.accounts[0].catalog_read, 'failed');
-  assert.equal(result.accounts[0].error_type, 'JSONDecodeError');
-  assert.equal(result.accounts[1].catalog_read, 'success');
+  assert.equal(result.accounts[0]!.catalog_read, 'failed');
+  assert.equal(result.accounts[0]!.error_type, 'JSONDecodeError');
+  assert.equal(result.accounts[1]!.catalog_read, 'success');
 });
 
 test('valid JSON with invalid catalog shape fails before replacing latest', async () => {

@@ -38,7 +38,7 @@ const compare = (a: string, b: string) => {
   const left = Array.from(a, c => c.codePointAt(0)!);
   const right = Array.from(b, c => c.codePointAt(0)!);
   for (let i = 0; i < Math.min(left.length, right.length); i++) {
-    if (left[i] !== right[i]) return left[i] - right[i];
+    if (left[i] !== right[i]) return left[i]! - right[i]!;
   }
   return left.length - right.length;
 };
