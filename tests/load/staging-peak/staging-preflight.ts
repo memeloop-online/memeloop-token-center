@@ -78,4 +78,4 @@ export function main(metadataPath: string): void {
   for (const [role, count] of Object.entries(counts)) console.log(role, "verified_endpoints", count);
   console.log("staging identities verified; no load started");
 }
-if (import.meta.url === pathToFileURL(process.argv[1] ?? "").href) main(process.argv[2]);
+if (import.meta.url === pathToFileURL(process.argv[1] ?? "").href) main(process.argv[2]!);
