@@ -287,8 +287,8 @@ impl Database {
             .await?;
         }
         timings.enter(ProjectionStage::AckUpdate);
-        let tenant_id: String = task.try_get("tenant_id")?;
-        let key_id: String = task.try_get("key_id")?;
+        let _tenant_id: String = task.try_get("tenant_id")?;
+        let _key_id: String = task.try_get("key_id")?;
         // The claimed outbox row and its acknowledgement are the financial
         // publication fence; semantic projections also use this event kind.
         let acknowledged = sqlx::query(
