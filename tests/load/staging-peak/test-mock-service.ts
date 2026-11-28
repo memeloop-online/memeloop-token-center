@@ -89,7 +89,7 @@ test('invalid CLI identity is rejected before any command', async () => {
 test('real proxy child waits for complete fragmented port line and early exit sends nothing', async () => {
   const directory = mkdtempSync(join(tmpdir(), 'mock-service-proxy-'));
   const executable = join(directory, 'kubectl');
-  writeFileSync(executable, `#!${process.execPath}
+  writeFileSync(executable, String.raw`#!${process.execPath}
 import http from 'node:http';
 if (process.argv.includes('early-exit')) process.exit(2);
 let count = 0;
