@@ -9,11 +9,11 @@ function fixture() {
 }
 test("accepts pod IPv4 and canonical IPv6", () => {
   const f = fixture(); assert.equal(f.check(), 1);
-  f.slice.addressType = "IPv6"; f.slice.endpoints[0].addresses = ["fd00:0:0:0:0:0:0:1"]; assert.equal(f.check(), 1);
+  f.slice.addressType = "IPv6"; f.slice.endpoints[0]!.addresses = ["fd00:0:0:0:0:0:0:1"]; assert.equal(f.check(), 1);
 });
 for (const [name, mutate] of Object.entries({
   "foreign IP": (f: any) => { f.slice.endpoints[0].addresses = ["10.0.0.9"]; },
-  "address family mismatch": (f: any) => { f.slice.endpoints[0].addresses = ["fd00::1"]; },
+  "address family mismatch": (f: any) => { f.slice.endpoints[0]!.addresses = ["fd00::1"]; },
   "manual controller": (f: any) => { f.slice.metadata.labels["endpointslice.kubernetes.io/managed-by"] = "manual"; },
   "wrong port": (f: any) => { f.slice.ports[0].port = 9999; },
   "both Service UIDs missing": (f: any) => { delete f.service.metadata.uid; delete f.slice.metadata.ownerReferences[0].uid; },
@@ -35,7 +35,7 @@ for (const [name, mutate] of Object.entries({
 })) test(`rejects ${name}`, () => { const f = fixture(); mutate(f); assert.throws(f.check); });
 function clusterFixture() {
   const f = fixture();
-  f.slice.endpoints[0].targetRef.namespace = "memeloop-token-center-staging";
+  f.slice.endpoints[0]!.targetRef.namespace = "memeloop-token-center-staging";
   const meta = { context: "fixture-context", clusterUid: "cluster", namespaceUid: "namespace", gatewaySelector: { app: "gateway" }, controlSelector: { app: "gateway" } };
   const services: any = { ...f.service, spec: { ...f.service.spec, ports: [{ port: 8080, protocol: "TCP" }] } };
   const resources = { slices: [f.slice] };
