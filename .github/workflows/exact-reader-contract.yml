@@ -78,49 +78,54 @@ jobs:
           (root/'Dockerfile.maintenance').write_bytes(derived)
           (root/'maintenance-build.json').write_text(json.dumps({'source':os.environ['CANDIDATE_SHA'],'purpose':'diagnostic-maintenance-only','feature':'history-initialization-diagnostic','default_feature':False,'original_recipe_sha256':hashlib.sha256(source).hexdigest(),'derived_recipe_sha256':hashlib.sha256(derived).hexdigest(),'mutation':'append one diagnostic feature to both original cargo release commands'},indent=2)+'\n')
           PYCODE
-      - name: Compile and runtime-smoke the exact original release input once
-        uses: docker/build-push-action@10e90e3645eae34f1e60eeb005ba3a3d33f178e8
-        with:
-          context: .
-          file: ${{ runner.temp }}/Dockerfile.maintenance
-          target: release-input-export
-          platforms: linux/amd64
-          push: false
-          outputs: type=local,dest=${{ runner.temp }}/release-service-input
-          build-args: |
-            MTC_BUILD_GIT_SHA_INPUT=${{ env.CANDIDATE_SHA }}
-            MTC_BUILD_TIMESTAMP_INPUT=${{ steps.source.outputs.timestamp }}
-            MTC_BUILD_TARGET_INPUT=linux/amd64
-          cache-from: type=gha,scope=service-release-input
-      - name: Seal and verify the same-source complete input
+      - name: Retrieve and verify only the exact sealed maintenance input
+        env:
+          EXPECTED_SOURCE: ${{ inputs.source_revision }}
+          GH_TOKEN: ${{ github.token }}
         run: |
           set -euo pipefail
-          node scripts/ci/create-memory-binary-manifest.ts "$RUNNER_TEMP/release-service-input/memeloop-token-center" "$CANDIDATE_SHA" "$RUNNER_TEMP/sealed-input"
-          for file in libgcc_s.so.1 libstdc++.so.6 install-plugin-oci cosign LICENSE THIRD_PARTY_NOTICES.md; do
-            cp "$RUNNER_TEMP/release-service-input/$file" "$RUNNER_TEMP/sealed-input/$file"
-          done
-          cp -R "$RUNNER_TEMP/release-service-input/web" "$RUNNER_TEMP/sealed-input/web"
-          cp -R "$RUNNER_TEMP/release-service-input/third-party-licenses" "$RUNNER_TEMP/sealed-input/third-party-licenses"
-          chmod 0555 "$RUNNER_TEMP/sealed-input/memeloop-token-center" "$RUNNER_TEMP/sealed-input/install-plugin-oci" "$RUNNER_TEMP/sealed-input/cosign"
-          node scripts/ci/create-release-service-input-manifest.ts "$RUNNER_TEMP/sealed-input" "$CANDIDATE_SHA"
-          node scripts/ci/verify-release-service-input.ts "$RUNNER_TEMP/sealed-input" "$CANDIDATE_SHA"
-          mkdir -p "$RUNNER_TEMP/stage-test-oci"
-          cp "$RUNNER_TEMP/sealed-input/memory-binary.json" "$RUNNER_TEMP/sealed-input/release-service-input.json" "$RUNNER_TEMP/stage-test-oci/"
-      - name: Preserve verified sealed input before assembly
-        run: |
-          set -euo pipefail
+          test "$EXPECTED_SOURCE" = "$CANDIDATE_SHA"
           mkdir -p "$RUNNER_TEMP/sealed-package"
-          tar -C "$RUNNER_TEMP/sealed-input" -cf "$RUNNER_TEMP/sealed-package/sealed-input.tar" .
-          cd "$RUNNER_TEMP/sealed-package"
-          sha256sum sealed-input.tar > SHA256SUMS
-          printf '%s\n' "$CANDIDATE_SHA" > source.txt
-      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
-        id: sealed
-        with:
-          name: maintenance-formal6024-feature-smoke-pending-sealed-input
-          path: ${{ runner.temp }}/sealed-package/
-          if-no-files-found: error
-          retention-days: 3
+          gh api "repos/$GITHUB_REPOSITORY/actions/artifacts/15249943725" > "$RUNNER_TEMP/sealed-package/artifact.json"
+          gh api "repos/$GITHUB_REPOSITORY/actions/artifacts/15249943725/zip" > "$RUNNER_TEMP/sealed-package/input.zip"
+          python3 - <<'PYCODE'
+          import hashlib,json,os,pathlib,stat,tarfile,zipfile
+          root=pathlib.Path(os.environ['RUNNER_TEMP']); package=root/'sealed-package'
+          meta=json.loads((package/'artifact.json').read_text())
+          expected='f2e4fe048e75b6052133ec969dbdfbecc021ef2cddd886c6b44af99401c00190'
+          if meta['id']!=15249943725 or meta['workflow_run']['id']!=46111492726 or meta['expired'] or meta['digest']!='sha256:'+expected:raise SystemExit('sealed artifact metadata mismatch')
+          h=hashlib.sha256()
+          with (package/'input.zip').open('rb') as f:
+              for data in iter(lambda:f.read(1024*1024),b''):h.update(data)
+          if h.hexdigest()!=expected:raise SystemExit('sealed artifact ZIP digest mismatch')
+          with zipfile.ZipFile(package/'input.zip') as z:
+              for item in z.infolist():
+                  path=pathlib.PurePosixPath(item.filename)
+                  if path.is_absolute() or '..' in path.parts or stat.S_ISLNK(item.external_attr>>16):raise SystemExit('unsafe sealed ZIP entry')
+              z.extractall(package/'verified')
+          base=package/'verified'
+          if (base/'source.txt').read_text().strip()!=os.environ['CANDIDATE_SHA']:raise SystemExit('sealed source mismatch')
+          checksum=(base/'SHA256SUMS').read_text().split()
+          if len(checksum)!=2 or checksum[1]!='sealed-input.tar':raise SystemExit('unexpected sealed checksum entry')
+          h=hashlib.sha256()
+          with (base/'sealed-input.tar').open('rb') as f:
+              for data in iter(lambda:f.read(1024*1024),b''):h.update(data)
+          if h.hexdigest()!=checksum[0]:raise SystemExit('sealed tar checksum mismatch')
+          target=root/'sealed-input';target.mkdir()
+          with tarfile.open(base/'sealed-input.tar') as tar:
+              for item in tar.getmembers():
+                  path=pathlib.PurePosixPath(item.name)
+                  if path.is_absolute() or '..' in path.parts or not (item.isfile() or item.isdir()):raise SystemExit('unsafe sealed tar entry')
+              tar.extractall(target,filter='data')
+          manifest=json.loads((target/'release-service-input.json').read_text())
+          if manifest['schema_version']!=2 or manifest['revision']!=os.environ['CANDIDATE_SHA'] or manifest['platform']!='linux/amd64':raise SystemExit('sealed manifest identity mismatch')
+          actual={str(x.relative_to(target)) for x in target.rglob('*') if x.is_file() and x.name!='release-service-input.json'}
+          if actual!=set(manifest['files']):raise SystemExit('sealed complete file set mismatch')
+          for name,digest in manifest['files'].items():
+              if hashlib.sha256((target/name).read_bytes()).hexdigest()!=digest:raise SystemExit('sealed file hash mismatch')
+          if not (target/'memeloop-token-center').stat().st_mode&0o111:raise SystemExit('sealed binary is not executable')
+          print(json.dumps({'sealed_source':os.environ['CANDIDATE_SHA'],'sealed_artifact':15249943725,'sealed_zip_sha256':expected,'sealed_tar_sha256':checksum[0],'files_verified':len(actual)}))
+          PYCODE
       - name: Retrieve the exact approved original 58f runtime artifact
         env:
           GH_TOKEN: ${{ github.token }}
@@ -153,8 +158,8 @@ jobs:
           sha256sum -c SHA256SUMS
       - name: Verify original OCI bytes and native containerd runtime binding offline
         env:
-          CANDIDATE_SEALED_ID: ${{ steps.sealed.outputs.artifact-id }}
-          CANDIDATE_SEALED_DIGEST: ${{ steps.sealed.outputs.artifact-digest }}
+          CANDIDATE_SEALED_ID: "15249943725"
+          CANDIDATE_SEALED_DIGEST: f2e4fe048e75b6052133ec969dbdfbecc021ef2cddd886c6b44af99401c00190
         run: |
           set -euo pipefail
           sudo systemctl start containerd
@@ -251,7 +256,26 @@ jobs:
           subprocess.check_call(['cp',str(binary),str(maintenance/'service')]);(maintenance/'service').chmod(0o555)
           work=root/'work';work.mkdir();work.chmod(0o700);subprocess.check_call(['sudo','chown','10001:10001',str(work)])
           ns='cf816-maintenance'
-          subprocess.check_call(['sudo','ip','netns','add',ns])
+          pg_image='postgres:16-alpine@sha256:f2f98726820d0342055351c6e9d36e705f5bfffb3dd53ff556325114b08afb6d'
+          pg_name='history6024-pg-'+os.environ['GITHUB_RUN_ID']+'-'+os.environ['GITHUB_RUN_ATTEMPT']
+          subprocess.check_call(['docker','pull',pg_image],stdout=subprocess.DEVNULL)
+          subprocess.check_call(['docker','run','-d','--name',pg_name,'--network','none','-e','POSTGRES_USER=token_center','-e','POSTGRES_DB=history6024','-e','POSTGRES_HOST_AUTH_METHOD=trust','-e','POSTGRES_INITDB_ARGS=--encoding=UTF8',pg_image],stdout=subprocess.DEVNULL)
+          import time
+          for _ in range(120):
+              ready=subprocess.run(['docker','exec',pg_name,'pg_isready','-h','127.0.0.1','-U','token_center','-d','history6024'],capture_output=True)
+              if ready.returncode==0:break
+              time.sleep(.5)
+          else:raise SystemExit('pinned isolated PostgreSQL16 not ready')
+          pg_info=json.loads(subprocess.check_output(['docker','inspect',pg_name]))[0]
+          if pg_info['HostConfig']['NetworkMode']!='none' or pg_info['Config']['Image']!=pg_image:raise SystemExit('PG fixture image/network mismatch')
+          pg_pid=pg_info['State']['Pid']
+          subprocess.check_call(['sudo','ip','netns','attach',ns,str(pg_pid)])
+          links=json.loads(subprocess.check_output(['sudo','ip','-n',ns,'-j','link','show']))
+          if {row['ifname'] for row in links}!={'lo'}:raise SystemExit('PG fixture namespace has external interface')
+          pg_client=['docker','exec',pg_name,'psql','-U','token_center','-d','history6024','-X','-A','-t','-v','ON_ERROR_STOP=1']
+          version=subprocess.check_output([*pg_client,'-c','SHOW server_version_num'],text=True).strip()
+          if not version.isdecimal() or int(version)//10000!=16:raise SystemExit('PG fixture is not actual version16')
+          (root/'postgres-fixture.json').write_text(json.dumps({'image':pg_image,'actual_image_id':pg_info['Image'],'server_version_num':version,'network_mode':'none','interfaces':['lo'],'database':'history6024','created_for_run':os.environ['GITHUB_RUN_ID']},indent=2)+'\n')
           subprocess.check_call(['sudo','ip','-n',ns,'link','set','lo','up'])
           mock=root/'mock.py'
           mock.write_text('import http.server,json,pathlib,sys,urllib.parse\nclass Handler(http.server.BaseHTTPRequestHandler):\n def log_message(self,*args):pass\n def handle_one_request(self):\n  self.recorded=False\n  return super().handle_one_request()\n def record(self,valid,checks=None):\n  p=pathlib.Path(sys.argv[1]);x=json.loads(p.read_text()) if p.exists() else {\'total\':0,\'valid\':0}\n  x[\'total\']+=1;x[\'valid\']+=int(valid);p.write_text(json.dumps(x));self.recorded=True\n  expected=[\'method_post\',\'path_root\',\'fixed_query\',\'fixed_sql\',\'admin_auth\',\'database\']\n  flags={name:bool(checks and checks.get(name,False)) for name in expected}\n  q=pathlib.Path(sys.argv[2]);observed=json.loads(q.read_text()) if q.exists() else []\n  if len(observed)<8:observed.append(flags);q.write_text(json.dumps(observed))\n def send_error(self,*args,**kwargs):\n  if not self.recorded:self.record(False)\n  return super().send_error(*args,**kwargs)\n def do_POST(self):\n  body=self.rfile.read(int(self.headers.get(\'Content-Length\',\'0\')))\n  spec=json.loads(pathlib.Path(sys.argv[3]).read_text())\n  state=json.loads(pathlib.Path(sys.argv[1]).read_text()) if pathlib.Path(sys.argv[1]).exists() else {\'total\':0,\'valid\':0}\n  expected_sql=spec[\'sql\'][state[\'total\']] if state[\'total\']<len(spec[\'sql\']) else None\n  try:\n   target=urllib.parse.urlsplit(self.path);pairs=urllib.parse.parse_qsl(target.query,keep_blank_values=True,strict_parsing=True)\n  except ValueError:target=None;pairs=[]\n  expected=[(\'wait_end_of_query\',\'1\'),(\'optimize_move_to_prewhere\',\'0\'),(\'optimize_move_to_prewhere_if_final\',\'0\'),(\'output_format_json_quote_64bit_integers\',\'0\')]\n  checks={\'method_post\':True,\'path_root\':target is not None and target.path==\'/\' and not target.scheme and not target.netloc and not target.fragment,\'fixed_query\':sorted(pairs)==sorted(expected),\'fixed_sql\':expected_sql is not None and body==expected_sql.encode(),\'admin_auth\':self.headers.get(\'Authorization\')==\'Basic YWRtaW46YWRtaW4tcGFzc3dvcmQ=\',\'database\':self.headers.get(\'X-ClickHouse-Database\')==\'synthetic\'}\n  good=all(checks.values());self.record(good,checks)\n  if not good:self.send_error(400);return\n  self.send_response(200);self.end_headers();self.wfile.write(b\'{"ok":1}\\n\' if spec[\'mode\']==\'select\' else b\'\')\nhttp.server.HTTPServer((\'127.0.0.1\',18123),Handler).serve_forever()\n')
@@ -268,16 +292,7 @@ jobs:
               time.sleep(.05)
           else:raise SystemExit('isolated synthetic mock not ready')
           namespace='/run/netns/'+ns
-          pg_bin=pathlib.Path('/usr/lib/postgresql/16/bin')
-          if not all((pg_bin/name).is_file() for name in ['initdb','pg_ctl','createdb','psql']):raise SystemExit('required PostgreSQL16 tools unavailable')
-          pg_root=pathlib.Path('/tmp')/('history6024-pg-'+os.environ['GITHUB_RUN_ID']+'-'+os.environ['GITHUB_RUN_ATTEMPT'])
-          subprocess.check_call(['sudo','install','-d','-m','0700','-o','postgres','-g','postgres',str(pg_root)])
-          pg_cmd=['sudo','ip','netns','exec',ns,'runuser','-u','postgres','--']
-          subprocess.check_call([*pg_cmd,str(pg_bin/'initdb'),'-D',str(pg_root/'data'),'-U','token_center','--auth=trust','--no-locale','--encoding=UTF8'],stdout=subprocess.DEVNULL)
-          subprocess.check_call([*pg_cmd,str(pg_bin/'pg_ctl'),'-D',str(pg_root/'data'),'-l',str(pg_root/'server.log'),'-o','-h 127.0.0.1 -p 15432 -k '+str(pg_root),'-w','start'],stdout=subprocess.DEVNULL)
-          pg_client=['sudo','ip','netns','exec',ns,str(pg_bin/'psql'),'-h','127.0.0.1','-p','15432','-U','token_center','-d','history6024','-X','-A','-t','-v','ON_ERROR_STOP=1']
-          subprocess.check_call(['sudo','ip','netns','exec',ns,str(pg_bin/'createdb'),'-h','127.0.0.1','-p','15432','-U','token_center','history6024'])
-          envs={'LD_LIBRARY_PATH' :'/usr/local/lib','GLIBC_TUNABLES':'glibc.malloc.mmap_threshold=65536','MTC_KEY_PEPPER':'test-pepper-must-have-at-least-32-bytes','MTC_SERVICE_TOKEN':'s'*32,'MTC_DATABASE_URL':'postgres://token_center@127.0.0.1:15432/history6024','MTC_ARCHIVE_BACKEND':'filesystem','MTC_ARCHIVE_PATH':'/work/must-not-initialize-archive','MTC_REQUEST_HISTORY_URL':'http://127.0.0.1:18123','MTC_REQUEST_HISTORY_DATABASE':'synthetic','MTC_REQUEST_HISTORY_ADMIN_USER':'admin','MTC_REQUEST_HISTORY_ADMIN_PASSWORD':'admin-password','MTC_REQUEST_HISTORY_WRITER_USER':'different-writer','MTC_REQUEST_HISTORY_WRITER_PASSWORD':'different-writer-password','MTC_REQUEST_HISTORY_USER':'different-fallback','MTC_REQUEST_HISTORY_PASSWORD':'different-fallback-password'}
+          envs={'LD_LIBRARY_PATH' :'/usr/local/lib','GLIBC_TUNABLES':'glibc.malloc.mmap_threshold=65536','MTC_KEY_PEPPER':'test-pepper-must-have-at-least-32-bytes','MTC_SERVICE_TOKEN':'s'*32,'MTC_DATABASE_URL':'postgres://token_center@127.0.0.1:5432/history6024','MTC_ARCHIVE_BACKEND':'filesystem','MTC_ARCHIVE_PATH':'/work/must-not-initialize-archive','MTC_REQUEST_HISTORY_URL':'http://127.0.0.1:18123','MTC_REQUEST_HISTORY_DATABASE':'synthetic','MTC_REQUEST_HISTORY_ADMIN_USER':'admin','MTC_REQUEST_HISTORY_ADMIN_PASSWORD':'admin-password','MTC_REQUEST_HISTORY_WRITER_USER':'different-writer','MTC_REQUEST_HISTORY_WRITER_PASSWORD':'different-writer-password','MTC_REQUEST_HISTORY_USER':'different-fallback','MTC_REQUEST_HISTORY_PASSWORD':'different-fallback-password'}
           env_args=[v for k,val in envs.items() for v in ['--env',k+'='+val]]
           try:
               for suffix,args in [('maintenance-migrate',['migrate']),('maintenance-help',['--help']),('maintenance-feature-help',['request-history','--help']),('maintenance-probe',['request-history','probe-transport']),('maintenance-bootstrap',['request-history','bootstrap'])]:
@@ -357,13 +372,13 @@ jobs:
                   ctr('containers','delete',cid)
           finally:
               server.terminate();server.wait(timeout=10)
-              subprocess.run([*pg_cmd,str(pg_bin/'pg_ctl'),'-D',str(pg_root/'data'),'-m','immediate','-w','stop'],stdout=subprocess.DEVNULL,check=False)
+              subprocess.run(['docker','rm','-f',pg_name],stdout=subprocess.DEVNULL,check=False)
           if hashlib.sha256((maintenance/'service').read_bytes()).hexdigest()!=binary_sha:raise SystemExit('mounted maintenance binary changed')
           package=pathlib.Path(os.environ['RUNNER_TEMP'])/'maintenance-package';package.mkdir()
           subprocess.check_call(['cp',str(binary),str(package/'memeloop-token-center')]);(package/'memeloop-token-center').chmod(0o555)
           for label,argv in [('elf-header',['readelf','-h',str(binary)]),('elf-dynamic',['readelf','-d',str(binary)]),('elf-versions',['readelf','--version-info',str(binary)])]:
               (package/(label+'.txt')).write_bytes(subprocess.check_output(argv))
-          evidence.update({'maintenance_source':os.environ['CANDIDATE_SHA'],'maintenance_binary_sha256':binary_sha,'maintenance_binary_bytes':binary.stat().st_size,'purpose':'diagnostic-maintenance-only-not-official-release','admin_probe_count':1,'formal_history_http_count':8,'formal_bootstrap_invocations':1,'postgres_installation':'actual_isolated_PG16_off_mode','maintenance_run':os.environ['GITHUB_RUN_ID'],'maintenance_attempt':os.environ['GITHUB_RUN_ATTEMPT'],'sealed_input_artifact':os.environ['CANDIDATE_SEALED_ID'],'sealed_input_run':os.environ['GITHUB_RUN_ID'],'sealed_input_zip_sha256':os.environ['CANDIDATE_SEALED_DIGEST'],'diagnostic_feature':'history-initialization-diagnostic','status':'maintenance_native_pass'})
+          evidence.update({'maintenance_source':os.environ['CANDIDATE_SHA'],'maintenance_binary_sha256':binary_sha,'maintenance_binary_bytes':binary.stat().st_size,'purpose':'diagnostic-maintenance-only-not-official-release','admin_probe_count':1,'formal_history_http_count':8,'formal_bootstrap_invocations':1,'postgres_installation':'actual_isolated_PG16_off_mode','maintenance_run':os.environ['GITHUB_RUN_ID'],'maintenance_attempt':os.environ['GITHUB_RUN_ATTEMPT'],'sealed_input_artifact':os.environ['CANDIDATE_SEALED_ID'],'sealed_input_run':'46111492726','sealed_input_zip_sha256':os.environ['CANDIDATE_SEALED_DIGEST'],'diagnostic_feature':'history-initialization-diagnostic','status':'maintenance_native_pass'})
           evidence.update({'rootfs_chain':chain,'runtime_image':image,'verified_descriptors':len(verified),'build_definition':json.loads((pathlib.Path(os.environ['RUNNER_TEMP'])/'maintenance-build.json').read_text())})
           (package/'receipt.json').write_text(json.dumps(evidence,indent=2)+'\n')
           subprocess.check_call(['cp',str(root/'maintenance-probe.txt'),str(package/'probe.txt')])
