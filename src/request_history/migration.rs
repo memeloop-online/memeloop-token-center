@@ -322,7 +322,28 @@ pub async fn command(config: &Config, command: HistoryCommand) -> Result<Value, 
         }
         HistoryCommand::Bootstrap => {
             client.initialize().await?;
-            return database.history_bootstrap_capture().await;
+            #[cfg(feature = "history-initialization-diagnostic")]
+            tracing::info!(
+                operation = "history_bootstrap_diagnostic",
+                phase = "ch_done"
+            );
+            #[cfg(feature = "history-initialization-diagnostic")]
+            tracing::info!(
+                operation = "history_bootstrap_diagnostic",
+                phase = "pg_capture_started"
+            );
+            let result = database.history_bootstrap_capture().await;
+            #[cfg(feature = "history-initialization-diagnostic")]
+            match &result {
+                Ok(_) => tracing::info!(
+                    operation = "history_bootstrap_diagnostic",
+                    phase = "pg_capture_ok"
+                ),
+                Err(error) => {
+                    tracing::warn!(operation = "history_bootstrap_diagnostic", phase = "pg_capture_failed", diagnostic = %error.safe_diagnostic())
+                }
+            }
+            return result;
         }
         HistoryCommand::PrepareActivation => {
             database.history_prepare_activation().await?;
