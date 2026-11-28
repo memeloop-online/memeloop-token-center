@@ -846,12 +846,27 @@ pub(in crate::api) async fn poll_cursor_oauth(
     }
 }
 
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(in crate::api) struct RefreshUpstreamOAuthQuery {
+    expected_credential_generation: Option<i64>,
+}
+
 pub(in crate::api) async fn refresh_upstream_oauth(
     State(state): State<AppState>,
     headers: HeaderMap,
     Path(account_id): Path<Uuid>,
+    Query(query): Query<RefreshUpstreamOAuthQuery>,
 ) -> Result<impl IntoResponse, AppError> {
     let service = require_service(&headers, &state, "oauth:write").await?;
+    if query
+        .expected_credential_generation
+        .is_some_and(|generation| generation < 1)
+    {
+        return Err(AppError::BadRequest(
+            "expected_credential_generation must be a positive i64".into(),
+        ));
+    }
     let state = state.pin_application_plugins().await?;
     let idempotency_key = headers
         .get("idempotency-key")
@@ -861,7 +876,14 @@ pub(in crate::api) async fn refresh_upstream_oauth(
     if let Some(tenant) = service.tenant_external_id.as_deref() {
         state.db.require_upstream_tenant(account_id, tenant).await?;
     }
-    let mut account = refresh_managed_upstream_oauth(&state, account_id, idempotency_key).await?;
+    let mut account = refresh_managed_upstream_oauth_impl(
+        &state,
+        account_id,
+        idempotency_key,
+        query.expected_credential_generation,
+        None,
+    )
+    .await?;
     super::restrict_transport_proxy_capability(&service, &mut account);
     Ok(Json(super::config_secrets::public_account(
         &state, account,
